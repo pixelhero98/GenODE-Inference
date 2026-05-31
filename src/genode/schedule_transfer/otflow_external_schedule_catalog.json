@@ -1,0 +1,30 @@
+{
+  "ays": {
+    "display_name": "AYS",
+    "source_url": "https://github.com/zju-pi/diff-sampler",
+    "paper_url": "https://arxiv.org/abs/2404.14507",
+    "mapping_status": "implemented",
+    "notes": "Mapped from the published AYS timestep family, using the official 10-step schedule as the reference curve and deterministic resampling for NFE 4, 8, and 12."
+  },
+  "gits": {
+    "display_name": "GITS",
+    "source_url": "https://github.com/zju-pi/diff-sampler",
+    "paper_url": "https://arxiv.org/abs/2405.11326",
+    "mapping_status": "implemented",
+    "notes": "Mapped from the official GITS example schedule in the diff-sampler repo, converted into an OTFlow progression and deterministically resampled for NFE 4, 8, and 12."
+  },
+  "flowts_power_sampling": {
+    "display_name": "FlowTS power sampling",
+    "source_url": "https://github.com/UNITES-Lab/FlowTS",
+    "paper_url": "https://arxiv.org/abs/2411.07506",
+    "mapping_status": "implemented",
+    "notes": "Mapped directly from FlowTS FMTS.py::fast_sample_infill, which applies t = (step / num_timesteps) ** hucfg_Kscale, together with the released run.sh default hucfg_Kscale = 0.03."
+  },
+  "ots": {
+    "display_name": "OTS",
+    "source_url": "https://github.com/scxue/DM-NonUniform",
+    "paper_url": "https://arxiv.org/pdf/2402.17376.pdf",
+    "mapping_status": "implemented",
+    "notes": "Mapped with a lightweight deterministic optimizer derived from the official OTS objective, producing canonical OTFlow time grids for NFE 4, 8, and 12."
+  }
+}

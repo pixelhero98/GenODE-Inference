@@ -1,0 +1,690 @@
+from __future__ import annotations
+
+import json
+import re
+import tempfile
+import unittest
+from unittest import mock
+from pathlib import Path
+
+import genode.evaluation.diffusion_flow_time_reparameterization as runner
+from genode.schedule_transfer.diffusion_flow_schedules import build_schedule_grid
+from genode.evaluation.fm_backbone_registry import materialize_backbone_manifest
+from genode.schedule_transfer.otflow_paper_registry import (
+    BASELINE_SCHEDULE_KEYS,
+    MAIN_NFE_VALUES,
+    METHOD_KEY,
+    TRANSFER_SCHEDULE_KEYS,
+    paper_registry_snapshot,
+    paper_schedule_specs,
+    paper_solver_specs,
+)
+from genode.schedule_transfer.otflow_signal_traces import NATIVE_INFO_GROWTH_TRACE_KEY, NATIVE_SIGNAL_TRACE_KEYS
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class DiffusionFlowPaperPrepTests(unittest.TestCase):
+    def test_registry_exposes_diffusion_flow_method_not_tvd(self) -> None:
+        snapshot = paper_registry_snapshot()
+        self.assertEqual(METHOD_KEY, "diffusion_flow_time_reparameterization")
+        self.assertEqual(snapshot["paper_method"], "diffusion_flow_time_reparameterization")
+        self.assertFalse(any(spec.comparison_role == "paper_method" and spec.key == "tvd" for spec in paper_schedule_specs()))
+        self.assertIn("flowts_power_sampling", {spec.key for spec in paper_schedule_specs()})
+        self.assertNotIn("atss", {spec.key for spec in paper_schedule_specs()})
+
+    def test_schedule_sets_are_exact(self) -> None:
+        self.assertEqual(BASELINE_SCHEDULE_KEYS, ("uniform", "late_power_3", "flowts_power_sampling", "ays", "gits", "ots"))
+        self.assertEqual(TRANSFER_SCHEDULE_KEYS, ("ays", "gits", "ots"))
+
+    def test_registry_exposes_active_baseline_matrix(self) -> None:
+        snapshot = paper_registry_snapshot()
+        self.assertEqual(MAIN_NFE_VALUES, (4, 8, 12))
+        self.assertEqual(snapshot["main_nfe_values"], [4, 8, 12])
+        self.assertEqual(runner.DEFAULT_TARGET_NFE_VALUES, (4, 8, 12))
+        self.assertEqual(snapshot["baseline_schedule_keys"], ["uniform", "late_power_3", "flowts_power_sampling", "ays", "gits", "ots"])
+
+        solver_names = {spec.display_name for spec in paper_solver_specs()}
+        self.assertIn("Euler", solver_names)
+        self.assertIn("Heun / RK2", solver_names)
+        self.assertIn("Midpoint RK2", solver_names)
+        self.assertIn("DPM++2M", solver_names)
+
+    def test_section_15_docs_describe_active_baselines_only(self) -> None:
+        docs_path = PROJECT_ROOT / "docs" / "train20_stratified_hash_opd_plan.html"
+        html = docs_path.read_text(encoding="utf-8")
+
+        for expected in (
+            "uniform",
+            "late_power_3",
+            "flowts_power_sampling",
+            "ays",
+            "gits",
+            "ots",
+            "Euler",
+            "Heun",
+            "RK2",
+            "DPM++2M",
+            "4, 8, 12",
+            "CRPS",
+            "MASE",
+            "single scalar MLP teacher",
+            "20% train",
+            "temporal stratified hash",
+            "validation_tuning",
+            "behavior-balanced",
+        ):
+            self.assertIn(expected, html)
+
+        retired_text = html.lower()
+        self.assertNotIn("soft penalty", retired_text)
+        self.assertNotIn("soft penalties", retired_text)
+        self.assertNotIn("teacher ensemble", retired_text)
+
+    def test_active_schedule_grids_have_endpoints(self) -> None:
+        for key in BASELINE_SCHEDULE_KEYS:
+            grid = build_schedule_grid(key, 4)
+            self.assertIsNotNone(grid, key)
+            self.assertEqual(len(grid), 5)
+            self.assertAlmostEqual(grid[0], 0.0)
+            self.assertAlmostEqual(grid[-1], 1.0)
+            self.assertTrue(all(right > left for left, right in zip(grid, grid[1:])), key)
+
+    def test_active_schedule_grids_reject_non_positive_steps(self) -> None:
+        for key in BASELINE_SCHEDULE_KEYS:
+            for n_steps in (0, -1):
+                with self.assertRaisesRegex(ValueError, "n_steps must be positive"):
+                    build_schedule_grid(key, n_steps)
+
+    def test_scheduler_cases_evaluate_uniform_first(self) -> None:
+        args = runner.build_argparser().parse_args(["--baseline_scheduler_names", "ays,uniform"])
+        cases = runner._scheduler_cases_for_datasets(args, ["electricity"])
+        self.assertEqual([case["scheduler_key"] for case in cases["electricity"]], ["uniform", "ays"])
+
+    def test_aggregate_relative_gain_uses_fraction_units(self) -> None:
+        rows = [
+            {
+                "benchmark_family": "forecast_extrapolation",
+                "split_phase": "locked_test",
+                "seed": 0,
+                "dataset": "electricity",
+                "checkpoint_id": "ck",
+                "backbone_name": "otflow",
+                "train_steps": 20000,
+                "train_budget_label": "20k",
+                "target_nfe": 10,
+                "solver_key": "euler",
+                "scheduler_key": "ays",
+                "experiment_scope": "main",
+                "row_status": "complete",
+                "crps": 3.0,
+            },
+            {
+                "benchmark_family": "forecast_extrapolation",
+                "split_phase": "locked_test",
+                "seed": 0,
+                "dataset": "electricity",
+                "checkpoint_id": "ck",
+                "backbone_name": "otflow",
+                "train_steps": 20000,
+                "train_budget_label": "20k",
+                "target_nfe": 10,
+                "solver_key": "euler",
+                "scheduler_key": "uniform",
+                "experiment_scope": "main",
+                "row_status": "complete",
+                "crps": 4.0,
+            },
+        ]
+
+        summary = runner._aggregate_main_table(rows)["seed_summaries"]
+        by_schedule = {row["scheduler_key"]: row for row in summary}
+
+        self.assertAlmostEqual(runner._safe_relative_gain(3.0, 4.0), 0.25)
+        self.assertAlmostEqual(by_schedule["ays"]["relative_crps_gain_vs_uniform"], 0.25)
+        self.assertAlmostEqual(by_schedule["uniform"]["relative_crps_gain_vs_uniform"], 0.0)
+
+    def test_native_hardness_trace_is_info_growth(self) -> None:
+        self.assertEqual(NATIVE_INFO_GROWTH_TRACE_KEY, "info_growth_hardness_by_step")
+        self.assertIn("info_growth_hardness_by_step", NATIVE_SIGNAL_TRACE_KEYS)
+
+    def test_runner_dry_run_writes_combined_summary(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                ]
+            )
+            payload = runner.run_diffusion_flow_time_reparameterization(args)
+            summary = json.loads((Path(tmpdir) / "combined_summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["runner_mode"], "diffusion_flow_time_reparameterization")
+        self.assertEqual(summary["method_key"], "diffusion_flow_time_reparameterization")
+        self.assertEqual(summary["conditional_generation_datasets"], [])
+        retired_dataset_key = "lo" + "b_datasets"
+        self.assertNotIn(retired_dataset_key, summary)
+        self.assertIn("flowts_power_sampling", summary["baseline_schedule_keys"])
+        self.assertEqual(summary["transfer_schedule_keys"], ["ays", "gits", "ots"])
+
+    def test_conditional_generation_build_row_preserves_full_metrics(self) -> None:
+        row = runner._build_row(
+            benchmark_family="conditional_generation",
+            split_phase="locked_test",
+            seed=0,
+            dataset="sleep_edf",
+            checkpoint={
+                "checkpoint_id": "ck",
+                "checkpoint_path": "outputs/example/model.pt",
+                "backbone_name": "otflow",
+                "train_steps": 20000,
+                "train_budget_label": "20k",
+            },
+            target_nfe=10,
+            runtime_nfe=10,
+            solver_key="euler",
+            scheduler_key="uniform",
+            details={"reference_macro_steps": 10, "schedule_grid_hash": "grid"},
+            metrics={
+                "score_main": 0.4,
+                "tstr_macro_f1": 0.5,
+                "disc_auc": 0.6,
+                "disc_auc_gap": 0.1,
+                "unconditional_w1": 0.2,
+                "conditional_w1": 0.3,
+                "u_l1": 0.7,
+                "c_l1": 0.8,
+                "spread_specific_error": 0.9,
+                "imbalance_specific_error": 1.1,
+                "ret_vol_acf_error": 1.2,
+                "impact_response_error": 0.25,
+                "stage_mismatch_rate": 0.2,
+                "stage_classifier_real_macro_f1": 0.75,
+                "sleep_signal_mae": 0.9,
+                "sleep_spectral_mae": 1.1,
+                "sleep_stage_mismatch_rate": 0.2,
+                "sleep_stage_classifier_real_macro_f1": 0.75,
+                "eval_horizon": 3000,
+                "evaluation_protocol_hash": "protocol",
+                "chosen_t0s_hash": "windows",
+                "chosen_examples_hash": "examples",
+                "stage_counts_json": '{"N2":2}',
+            },
+            row_signature="sig",
+            protocol_hash="hash",
+        )
+
+        for key in (
+            "disc_auc",
+            "disc_auc_gap",
+            "unconditional_w1",
+            "u_l1",
+            "c_l1",
+            "spread_specific_error",
+            "imbalance_specific_error",
+            "ret_vol_acf_error",
+            "impact_response_error",
+            "stage_mismatch_rate",
+            "stage_classifier_real_macro_f1",
+            "sleep_signal_mae",
+            "sleep_spectral_mae",
+            "sleep_stage_mismatch_rate",
+        ):
+            self.assertIn(key, row)
+        self.assertEqual(row["eval_horizon"], 3000)
+        self.assertEqual(row["schedule_grid_hash"], "grid")
+        self.assertEqual(row["chosen_examples_hash"], "examples")
+
+    def test_row_recorder_drops_stale_protocol_rows(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--target_nfe_values",
+                    "10",
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            recorder["fh"].close()
+            row_path = Path(tmpdir) / "rows.jsonl"
+            row_path.write_text('{"protocol_hash":"old","row_status":"complete"}\n', encoding="utf-8")
+
+            args_changed = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--target_nfe_values",
+                    "12",
+                ]
+            )
+            recorder_changed = runner._init_row_recorder(Path(tmpdir), args_changed)
+            recorder_changed["fh"].close()
+            self.assertEqual(row_path.read_text(encoding="utf-8"), "")
+
+    def test_protocol_hash_tracks_data_path_identity(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_a = Path(tmpdir) / "cryptos_a.npz"
+            data_b = Path(tmpdir) / "cryptos_b.npz"
+            data_a.write_bytes(b"a")
+            data_b.write_bytes(b"bb")
+            args_a = runner.build_argparser().parse_args(
+                [
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "cryptos",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--cryptos_path",
+                    str(data_a),
+                ]
+            )
+            args_b = runner.build_argparser().parse_args(
+                [
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "cryptos",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--cryptos_path",
+                    str(data_b),
+                ]
+            )
+            self.assertNotEqual(runner._protocol_config_fingerprint(args_a), runner._protocol_config_fingerprint(args_b))
+
+    def test_preflight_resolves_relative_shared_backbone_root_from_project_root(self) -> None:
+        with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as tmpdir:
+            root = Path(tmpdir)
+            rel_root = root.relative_to(PROJECT_ROOT).as_posix()
+            ckpt_path = root / "forecast" / "electricity" / "model.pt"
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            ckpt_path.write_bytes(b"checkpoint")
+            args = runner.build_argparser().parse_args(
+                [
+                    "--forecast_datasets",
+                    "electricity",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--shared_backbone_root",
+                    rel_root,
+                    "--backbone_manifest",
+                    "",
+                    "--allow_execute",
+                ]
+            )
+
+            runner.validate_execution_preflight(args)
+
+    def test_preflight_rejects_stale_ready_manifest_checkpoint_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "backbone_manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "artifacts": [
+                            {
+                                "backbone_name": "otflow",
+                                "benchmark_family": "forecast_extrapolation",
+                                "dataset_key": "electricity",
+                                "train_steps": 20000,
+                                "train_budget_label": "20k",
+                                "checkpoint_id": "electricity_otflow_forecast_20k_seed0",
+                                "checkpoint_path": "outputs/missing_preflight_checkpoint/model.pt",
+                                "summary_path": "",
+                                "status": "ready",
+                                "seed": 0,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = runner.build_argparser().parse_args(
+                [
+                    "--forecast_datasets",
+                    "electricity",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest_path),
+                    "--allow_execute",
+                ]
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "checkpoint files are missing"):
+                runner.validate_execution_preflight(args)
+
+    def test_protocol_hash_tracks_selected_seeds(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        args_a = runner.build_argparser().parse_args(
+            [
+                "--forecast_datasets",
+                "",
+                "--conditional_generation_datasets",
+                "",
+                "--backbone_manifest",
+                str(manifest),
+                "--seeds",
+                "0",
+            ]
+        )
+        args_b = runner.build_argparser().parse_args(
+            [
+                "--forecast_datasets",
+                "",
+                "--conditional_generation_datasets",
+                "",
+                "--backbone_manifest",
+                str(manifest),
+                "--seeds",
+                "1",
+            ]
+        )
+        self.assertNotEqual(runner._protocol_config_fingerprint(args_a), runner._protocol_config_fingerprint(args_b))
+
+
+    def test_protocol_hash_tracks_train_tuning_sampling_mode(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        args_legacy = runner.build_argparser().parse_args(
+            [
+                "--forecast_datasets",
+                "",
+                "--conditional_generation_datasets",
+                "",
+                "--backbone_manifest",
+                str(manifest),
+                "--split_phase",
+                "train_tuning",
+                "--train_tuning_sampling_mode",
+                "train_window_fraction",
+            ]
+        )
+        args_valnorm = runner.build_argparser().parse_args(
+            [
+                "--forecast_datasets",
+                "",
+                "--conditional_generation_datasets",
+                "",
+                "--backbone_manifest",
+                str(manifest),
+                "--split_phase",
+                "train_tuning",
+                "--train_tuning_sampling_mode",
+                "validation_normalized",
+            ]
+        )
+        self.assertNotEqual(runner._protocol_config_fingerprint(args_legacy), runner._protocol_config_fingerprint(args_valnorm))
+
+    def test_runner_default_split_phase_is_locked_test(self) -> None:
+        args = runner.build_argparser().parse_args([
+            "--forecast_datasets",
+            "",
+            "--conditional_generation_datasets",
+            "",
+        ])
+        self.assertEqual(args.split_phase, "locked_test")
+
+    def test_protocol_hash_tracks_selected_split_phase(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        args_locked = runner.build_argparser().parse_args(
+            [
+                "--forecast_datasets",
+                "",
+                "--conditional_generation_datasets",
+                "",
+                "--backbone_manifest",
+                str(manifest),
+                "--split_phase",
+                "locked_test",
+            ]
+        )
+        args_val = runner.build_argparser().parse_args(
+            [
+                "--forecast_datasets",
+                "",
+                "--conditional_generation_datasets",
+                "",
+                "--backbone_manifest",
+                str(manifest),
+                "--split_phase",
+                "validation_tuning",
+            ]
+        )
+        self.assertNotEqual(runner._protocol_config_fingerprint(args_locked), runner._protocol_config_fingerprint(args_val))
+
+
+    def test_train_tuning_forecast_only_skips_empty_conditional_generation_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "electricity",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--target_nfe_values",
+                    "4",
+                    "--solver_names",
+                    "euler",
+                    "--seeds",
+                    "0",
+                    "--split_phase",
+                    "train_tuning",
+                    "--allow_execute",
+                ]
+            )
+            with mock.patch.object(runner, "validate_execution_preflight"), mock.patch.object(runner, "_run_forecast_phase", return_value=[]), mock.patch.object(
+                runner,
+                "_run_conditional_generation_phase",
+                side_effect=AssertionError("conditional generation should not run for an empty dataset list"),
+            ) as conditional_phase:
+                payload = runner.run_diffusion_flow_time_reparameterization(args)
+
+        conditional_phase.assert_not_called()
+        self.assertEqual(payload["prep"]["split_phase"], "train_tuning")
+
+    def test_train_tuning_rejects_non_empty_conditional_generation_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "cryptos",
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--target_nfe_values",
+                    "4",
+                    "--solver_names",
+                    "euler",
+                    "--seeds",
+                    "0",
+                    "--split_phase",
+                    "train_tuning",
+                    "--allow_execute",
+                ]
+            )
+            with mock.patch.object(runner, "validate_execution_preflight"), mock.patch.object(runner, "_run_forecast_phase", return_value=[]):
+                with self.assertRaisesRegex(ValueError, "train_tuning split is only supported"):
+                    runner.run_diffusion_flow_time_reparameterization(args)
+
+    def test_forecast_phase_uses_requested_split_dataset(self) -> None:
+        class FakeDataset:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def __len__(self) -> int:
+                return 3
+
+        fake_checkpoint = {
+            "model": object(),
+            "cfg": object(),
+            "splits": {"val": FakeDataset("val"), "test": FakeDataset("test")},
+            "checkpoint_path": PROJECT_ROOT / "outputs" / "fake_model.pt",
+            "checkpoint_id": "ck",
+            "backbone_name": "otflow",
+            "train_steps": 20000,
+            "train_budget_label": "20k",
+        }
+
+        def run_for_phase(split_phase: str) -> str:
+            seen = []
+            with tempfile.TemporaryDirectory() as tmpdir:
+                args = runner.build_argparser().parse_args(
+                    [
+                        "--out_root",
+                        tmpdir,
+                        "--forecast_datasets",
+                        "electricity",
+                        "--conditional_generation_datasets",
+                        "",
+                        "--baseline_scheduler_names",
+                        "uniform",
+                        "--target_nfe_values",
+                        "4",
+                        "--solver_names",
+                        "euler",
+                        "--seeds",
+                        "0",
+                        "--split_phase",
+                        split_phase,
+                        "--backbone_manifest",
+                        str(PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"),
+                    ]
+                )
+                recorder = runner._init_row_recorder(Path(tmpdir), args)
+                try:
+                    def fake_eval(model, ds, cfg, **kwargs):
+                        seen.append(ds.name)
+                        return {
+                            "crps": 1.0,
+                            "mse": 1.0,
+                            "mase": 1.0,
+                            "latency_ms_per_sample": 0.0,
+                            "num_eval_samples": 1,
+                            "eval_examples": 3,
+                            "eval_horizon": 168,
+                            "evaluation_protocol_hash": "protocol",
+                            "chosen_examples_hash": "examples",
+                            "realized_nfe": 4,
+                        }
+
+                    with mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint), mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval):
+                        runner._run_forecast_phase(
+                            args,
+                            row_recorder=recorder,
+                            split_phase=split_phase,
+                            seeds=[0],
+                            scheduler_cases_by_dataset={"electricity": [{"scheduler_key": "uniform"}]},
+                        )
+                finally:
+                    recorder["fh"].close()
+            return seen[0]
+
+        self.assertEqual(run_for_phase("validation_tuning"), "val")
+        self.assertEqual(run_for_phase("locked_test"), "test")
+
+    def test_site_specific_ops_scripts_are_not_in_source_release(self) -> None:
+        self.assertFalse((PROJECT_ROOT / "code" / "ops").exists())
+        self.assertFalse(any(PROJECT_ROOT.glob("opsi*")))
+
+    def test_retired_source_trees_are_absent(self) -> None:
+        self.assertFalse((PROJECT_ROOT / "code").exists())
+        self.assertFalse((PROJECT_ROOT / "src" / "old_code").exists())
+        self.assertFalse((PROJECT_ROOT / "old_code").exists())
+
+    def test_legacy_cleanup_targets_are_removed(self) -> None:
+        removed = {
+            "adaptive_noise_sampler_followup.py",
+            "adaptive_deterministic_refinement_followup.py",
+            "build_adaptive_solver_matched_nfe_study.py",
+            "benchmark_otflow_suite.py",
+            "baselines.py",
+            "deepmarket_baselines.py",
+            "temporal_baselines.py",
+            "otflow_baselines.py",
+            "fm_backbone_readiness_audit.py",
+            "merge_otflow_baseline_main_table.py",
+            "otflow_dataset_audit.py",
+            "otflow_rollout_length_review.py",
+        }
+        src_root = PROJECT_ROOT / "src"
+        self.assertFalse(any((src_root / name).exists() for name in removed))
+        source_text = "\n".join(
+            path.read_text(encoding="utf-8") for path in src_root.rglob("*.py") if path.name != Path(__file__).name
+        )
+        for name in removed:
+            if name == "baselines.py":
+                continue
+            self.assertNotIn(name.removesuffix(".py"), source_text)
+
+    def test_retired_generic_naming_tokens_are_absent(self) -> None:
+        retired_patterns = (
+            r"RectifiedFlowL[O]B",
+            r"L[O]BConfig",
+            r"L[O]BDataConfig",
+            r"WindowedL[O]BParamsDataset",
+            r"L[O]B_FAMILY",
+            r"--l[o]b_datasets",
+            r"l[o]b_conditional_generation",
+            r"['\"]l[o]b['\"]",
+            r"[/\\]l[o]b[/\\]",
+            r"models\.otflow_backbone",
+        )
+        source_paths = [
+            *Path(PROJECT_ROOT / "src").rglob("*.py"),
+            *Path(PROJECT_ROOT / "tests").rglob("*.py"),
+            *Path(PROJECT_ROOT / "scripts").rglob("*.py"),
+            PROJECT_ROOT / "README.md",
+            PROJECT_ROOT / "pyproject.toml",
+        ]
+        source_text = "\n".join(
+            path.read_text(encoding="utf-8") for path in source_paths if path.exists() and path != Path(__file__)
+        )
+        for pattern in retired_patterns:
+            self.assertIsNone(re.search(pattern, source_text), pattern)
+
+    def test_backbone_manifest_tracks_40_active_artifacts_without_private_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload = materialize_backbone_manifest(
+                matrix_root=root / "matrix",
+                otflow_reuse_root=root / "reuse",
+                imported_backbone_root=root / "imported",
+                write_path=root / "manifest.json",
+            )
+        self.assertEqual(int(payload.get("artifact_count", 0)), 40)
+        self.assertEqual(int(payload.get("ready_count", -1)), 0)
+        self.assertEqual(int(payload.get("missing_count", 0)), 40)
+
+
+if __name__ == "__main__":
+    unittest.main()
