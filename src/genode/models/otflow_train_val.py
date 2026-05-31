@@ -11,7 +11,7 @@ Adds evaluation helpers:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from contextlib import contextmanager
 import copy
 import hashlib
@@ -39,18 +39,18 @@ CORE_L2_STATS = ("spread", "depth", "imb", "ret")
 # -----------------------------
 # Basics
 # -----------------------------
-_LEGACY_NUMPY_SEED_MODULUS = 2**32
+_NUMPY_SEED_MODULUS = 2**32
 
 
-def _legacy_numpy_seed(seed: int) -> int:
+def _bounded_numpy_seed(seed: int) -> int:
     seed_i = int(seed)
     if seed_i < 0:
         raise ValueError(f"seed must be non-negative, got {seed!r}")
-    return int(seed_i % _LEGACY_NUMPY_SEED_MODULUS)
+    return int(seed_i % _NUMPY_SEED_MODULUS)
 
 
 def seed_all(seed: int = 0):
-    normalized_seed = _legacy_numpy_seed(seed)
+    normalized_seed = _bounded_numpy_seed(seed)
     np.random.seed(normalized_seed)
     torch.manual_seed(normalized_seed)
     torch.cuda.manual_seed_all(normalized_seed)
@@ -149,7 +149,7 @@ def _temporary_eval_seed(seed: int):
     torch_state = torch.random.get_rng_state()
     cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
 
-    normalized_seed = _legacy_numpy_seed(seed)
+    normalized_seed = _bounded_numpy_seed(seed)
     random.seed(normalized_seed)
     np.random.seed(normalized_seed)
     torch.manual_seed(normalized_seed)
@@ -280,6 +280,68 @@ def _compute_training_loss(
     raise RuntimeError("Unexpected model type; OTFlow is the only supported model.")
 
 
+@torch.no_grad()
+def evaluate_average_loss(
+    ds: WindowedParamSequenceDataset,
+    model: torch.nn.Module,
+    cfg: OTFlowConfig,
+    *,
+    model_name: str = "otflow",
+    max_batches: Optional[int] = None,
+    loss_mode: Optional[str] = None,
+    shuffle: bool = False,
+) -> Dict[str, Any]:
+    """Evaluate the mean training objective on a dataset split."""
+    _normalize_model_name(model_name)
+    device = cfg.device
+    loader = make_loader(ds, cfg.batch_size, shuffle=shuffle, drop_last=False)
+    if len(loader) == 0:
+        raise ValueError("Evaluation loader is empty.")
+
+    was_training = bool(model.training)
+    model.eval()
+    total_loss = 0.0
+    total_examples = 0
+    batches = 0
+    try:
+        for batch in loader:
+            hist, tgt, fut, cond, meta = _parse_batch(batch)
+            hist = hist.to(device).float()
+            tgt = tgt.to(device).float()
+            fut = fut.to(device).float() if fut is not None else None
+            cond = cond.to(device).float() if cond is not None else None
+
+            context_len = resolve_context_length(hist.shape[1], horizon=_model_prediction_horizon(model), cfg=cfg)
+            hist = crop_history_window(hist, context_len)
+            loss, logs = _compute_training_loss(
+                model,
+                tgt=tgt,
+                hist=hist,
+                fut=fut,
+                cond=cond,
+                meta=meta,
+                loss_mode=loss_mode,
+            )
+            batch_size = int(hist.shape[0])
+            loss_value = float(logs.get("loss", float(loss.detach())))
+            total_loss += loss_value * float(batch_size)
+            total_examples += batch_size
+            batches += 1
+            if max_batches is not None and batches >= int(max_batches):
+                break
+    finally:
+        if was_training:
+            model.train()
+
+    if total_examples <= 0:
+        raise ValueError("Evaluation produced no examples.")
+    return {
+        "loss": float(total_loss / float(total_examples)),
+        "examples": int(total_examples),
+        "batches": int(batches),
+    }
+
+
 def train_loop(
     ds: WindowedParamSequenceDataset,
     cfg: OTFlowConfig,
@@ -290,6 +352,7 @@ def train_loop(
     optimizer: Optional[torch.optim.Optimizer] = None,
     loss_mode: Optional[str] = None,
     shuffle: bool = True,
+    on_step: Optional[Callable[[int, torch.nn.Module, float, Dict[str, float]], None]] = None,
 ) -> torch.nn.Module:
     """Train a model on next-step prediction in normalized param space.
 
@@ -384,11 +447,15 @@ def train_loop(
         if swa_model is not None and opt_step >= swa_start:
             swa_model.update_parameters(model)
 
+        latest_train_loss = float(logs.get("loss", float(loss.detach())))
+        if on_step is not None:
+            on_step(int(opt_step), model, latest_train_loss, dict(logs))
+
         if opt_step % log_every == 0:
             lr_now = opt.param_groups[0]["lr"]
             print(
                 f"[{model_name}] step {opt_step}/{steps}  "
-                f"loss={logs.get('loss', float(loss.detach())):.4f}  "
+                f"loss={latest_train_loss:.4f}  "
                 f"lr={lr_now:.2e}  details={logs}"
             )
 
@@ -2248,6 +2315,7 @@ __all__ = [
     "resolve_context_length",
     "crop_history_window",
     "sample_training_context_length",
+    "evaluate_average_loss",
     "train_loop",
     "generate_continuation",
     "select_eval_window_starts",

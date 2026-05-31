@@ -27,8 +27,6 @@ from genode.conditional_opd.objectives import (
     crps_mase_reward,
     rewards_by_setting,
     seed_mean_metric_rows,
-    source_balanced_rewards_by_setting,
-    source_balanced_seed_mean_rows,
 )
 from genode.conditional_opd.ser_ptg_reference import SER_PTG_SCHEDULE_KEY, ser_ptg_grid_from_trace
 from genode.conditional_opd.train_conditional_opd import (
@@ -123,49 +121,6 @@ class ConditionalOPDPolicyTests(unittest.TestCase):
         self.assertLess(float(learned["u_mase_best"]), 0.0)
         self.assertAlmostEqual(float(learned["u_comp_best"]), float(learned["teacher_reward"]) if "teacher_reward" in learned else float(learned["u_comp_best"]))
         self.assertGreater(float(learned["u_comp_uniform"]), 0.0)
-
-
-    def test_source_balanced_calibration_reward_keeps_sources_separate(self) -> None:
-        train_rows = [
-            {"solver_key": "euler", "target_nfe": 4, "scheduler_key": "uniform", "seed": 0, "crps": 2.0, "mase": 2.0},
-            {"solver_key": "euler", "target_nfe": 4, "scheduler_key": "ays", "seed": 0, "crps": 1.0, "mase": 1.0},
-            {"solver_key": "euler", "target_nfe": 4, "scheduler_key": "bo_a", "seed": 0, "crps": 0.5, "mase": 0.5},
-        ]
-        val_rows = [
-            {"solver_key": "euler", "target_nfe": 4, "scheduler_key": "uniform", "seed": 0, "crps": 2.0, "mase": 2.0},
-            {"solver_key": "euler", "target_nfe": 4, "scheduler_key": "ays", "seed": 0, "crps": 1.0, "mase": 1.0},
-            {"solver_key": "euler", "target_nfe": 4, "scheduler_key": "bo_a", "seed": 0, "crps": 2.0, "mase": 2.0},
-        ]
-        rewards = source_balanced_rewards_by_setting(
-            {"calibration_train_part": train_rows, "calibration_val_part": val_rows},
-            fixed_schedule_keys=BASELINE_SCHEDULE_KEYS,
-            source_weights={"calibration_train_part": 0.5, "calibration_val_part": 0.5},
-        )
-        self.assertAlmostEqual(rewards[("euler", 4)]["ays"], 0.0)
-        self.assertAlmostEqual(rewards[("euler", 4)]["bo_a"], 0.0)
-        aggregate = source_balanced_seed_mean_rows(
-            {"calibration_train_part": train_rows, "calibration_val_part": val_rows},
-            source_weights={"calibration_train_part": 0.5, "calibration_val_part": 0.5},
-        )
-        bo_row = [row for row in aggregate if row["scheduler_key"] == "bo_a"][0]
-        self.assertEqual(bo_row["calibration_sources"], ["calibration_train_part", "calibration_val_part"])
-        self.assertAlmostEqual(float(bo_row["crps"]), 1.25)
-
-    def test_source_balanced_calibration_reward_requires_both_sources(self) -> None:
-        train_rows = [
-            {"solver_key": "euler", "target_nfe": 4, "scheduler_key": "uniform", "seed": 0, "crps": 2.0, "mase": 2.0},
-            {"solver_key": "euler", "target_nfe": 4, "scheduler_key": "ays", "seed": 0, "crps": 1.0, "mase": 1.0},
-            {"solver_key": "euler", "target_nfe": 4, "scheduler_key": "bo_a", "seed": 0, "crps": 0.5, "mase": 0.5},
-        ]
-        val_rows = [
-            {"solver_key": "euler", "target_nfe": 4, "scheduler_key": "uniform", "seed": 0, "crps": 2.0, "mase": 2.0},
-            {"solver_key": "euler", "target_nfe": 4, "scheduler_key": "ays", "seed": 0, "crps": 1.0, "mase": 1.0},
-        ]
-        with self.assertRaisesRegex(ValueError, "every schedule"):
-            source_balanced_rewards_by_setting(
-                {"calibration_train_part": train_rows, "calibration_val_part": val_rows},
-                fixed_schedule_keys=BASELINE_SCHEDULE_KEYS,
-            )
 
     def test_seed_mean_aggregation_is_row_order_independent(self) -> None:
         rows = [
@@ -557,7 +512,7 @@ class ConditionalOPDPolicyTests(unittest.TestCase):
         self.assertEqual(summary["reward_reference_schedule_keys"], list(BASELINE_SCHEDULE_KEYS))
         self.assertIn("train20_v43_bo_r0_cand000", summary["candidate_schedule_keys"])
         self.assertEqual(summary["teacher_objective"], "ranking_first_best_fixed_composite_with_huber_calibration")
-        self.assertEqual(summary["teacher_selection_protocol"], "v4.2_option_a_bo_heldout_teacher_then_guarded_validation_student")
+        self.assertEqual(summary["teacher_selection_protocol"], "pooled_bo_holdout_teacher_checkpoint")
         self.assertEqual(summary["teacher_checkpoint_selection"]["selection_split"], "teacher_holdout")
         self.assertTrue(summary["teacher_checkpoint_selection"]["history"])
         self.assertIn("teacher_rank_loss", summary["teacher_losses"][-1])

@@ -6,10 +6,8 @@ import csv
 import hashlib
 import json
 import math
-import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
@@ -85,10 +83,10 @@ from genode.evaluation.otflow_evaluation_support import (
     TRAIN_TUNING_PHASE,
     TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED,
     TRAIN_TUNING_SAMPLING_MODES,
-    choose_forecast_train_tuning_indices,
     evaluate_forecast_schedule,
     load_forecast_checkpoint_splits,
     train_tuning_sampler_key,
+    train_tuning_target_example_count,
 )
 from genode.models.otflow_train_val import save_json, seed_all
 from genode.runtime import ProgressBar, resolve_torch_device
@@ -100,8 +98,9 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
 
 
 POOLED_CALIBRATION_PHASE = "pooled_calibration"
+V43_POOLED_CALIBRATION_PROTOCOL = "v4.3_pooled_combined_fraction_calibration"
+V43_POOLED_CALIBRATION_POOL = "train_and_validation_proportional_combined_fraction"
 DEFAULT_OUT_DIR = project_outputs_root() / "train20_v43_pooled_one_round_calibration"
-DEFAULT_V42_F_OUT_DIR = project_outputs_root() / "train20_v42_f_calibration20_fullval_uniform_seedmean"
 DEFAULT_BASELINE_TEST_ROWS = project_outputs_root() / "diffusion_flow_time_reparameterization_full_test" / "rows.csv"
 DEFAULT_STUDENT_BUDGETS: Tuple[int, ...] = (5, 10, 15, 20, 25)
 DEFAULT_CALIBRATION_SEEDS: Tuple[int, ...] = (0, 1)
@@ -119,6 +118,7 @@ POOLED_ROW_FIELDS: Tuple[str, ...] = tuple(
             "calibration_origin_hashes_json",
             "calibration_origin_weighting",
             "calibration_pool",
+            "calibration_protocol",
         ]
     )
 )
@@ -158,11 +158,178 @@ def _weighted_mean(metrics: Sequence[Mapping[str, Any]], key: str) -> float:
     return float(weighted / float(total_weight))
 
 
+def _proportional_origin_counts(origin_sizes: Mapping[str, int], *, fraction: float) -> Dict[str, int]:
+    sizes = {str(origin): int(size) for origin, size in origin_sizes.items()}
+    total = int(sum(sizes.values()))
+    if total <= 0:
+        raise ValueError("Pooled calibration requires at least one available example.")
+    frac = float(fraction)
+    if not math.isfinite(frac) or frac <= 0.0:
+        raise ValueError(f"pooled calibration fraction must be positive, got {fraction!r}.")
+    target = int(math.floor(float(total) * frac + 0.5))
+    target = max(1, min(total, target))
+    counts = {origin: 0 for origin in sizes}
+    raw_parts: List[Tuple[float, str]] = []
+    for origin, size in sizes.items():
+        raw = float(target) * float(size) / float(total)
+        base = min(int(size), int(math.floor(raw)))
+        counts[origin] = int(base)
+        raw_parts.append((raw - float(base), origin))
+    remaining = int(target - sum(counts.values()))
+    for _, origin in sorted(raw_parts, key=lambda item: (-item[0], item[1])):
+        if remaining <= 0:
+            break
+        if counts[origin] >= sizes[origin]:
+            continue
+        counts[origin] += 1
+        remaining -= 1
+    if remaining > 0:
+        for origin, size in sizes.items():
+            while remaining > 0 and counts[origin] < size:
+                counts[origin] += 1
+                remaining -= 1
+    if int(sum(counts.values())) != target:
+        raise ValueError("Could not allocate pooled calibration examples across origins.")
+    return counts
+
+
+def _validation_normalized_train_universe_count(
+    train_total: int,
+    val_total: int,
+    *,
+    train_split_fraction: float,
+    val_split_fraction: float,
+) -> int:
+    return train_tuning_target_example_count(
+        int(train_total),
+        fraction=1.0,
+        sampling_mode=TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED,
+        reference_examples=int(val_total),
+        train_split_fraction=float(train_split_fraction),
+        val_split_fraction=float(val_split_fraction),
+    )
+
+
+def _pooled_calibration_reference_examples(
+    train_total: int,
+    val_total: int,
+    *,
+    train_split_fraction: float,
+    val_split_fraction: float,
+) -> Dict[str, int]:
+    return {
+        "train": _validation_normalized_train_universe_count(
+            int(train_total),
+            int(val_total),
+            train_split_fraction=float(train_split_fraction),
+            val_split_fraction=float(val_split_fraction),
+        ),
+        "validation": int(val_total),
+    }
+
+
+def _stratified_origin_indices(
+    total: int,
+    *,
+    target: int,
+    seed: int,
+    strata: int,
+    dataset: str,
+    origin: str,
+    salt: str,
+) -> np.ndarray:
+    total_count = int(total)
+    target_count = int(target)
+    if total_count <= 0:
+        if target_count == 0:
+            return np.asarray([], dtype=np.int64)
+        raise ValueError(f"Cannot sample {target_count} {origin} examples from an empty split.")
+    if target_count <= 0:
+        return np.asarray([], dtype=np.int64)
+    if target_count >= total_count:
+        return np.arange(total_count, dtype=np.int64)
+
+    strata_count = max(1, min(int(strata), total_count))
+    ranges: List[Tuple[int, int]] = []
+    counts: List[int] = []
+    remainders: List[Tuple[float, int]] = []
+    for stratum in range(strata_count):
+        start = int(math.floor(float(stratum) * float(total_count) / float(strata_count)))
+        end = int(math.floor(float(stratum + 1) * float(total_count) / float(strata_count)))
+        if end <= start:
+            continue
+        size = int(end - start)
+        raw = float(target_count) * float(size) / float(total_count)
+        base = min(size, int(math.floor(raw)))
+        ranges.append((start, end))
+        counts.append(base)
+        remainders.append((raw - float(base), len(ranges) - 1))
+    remaining = int(target_count - sum(counts))
+    for _, idx in sorted(remainders, key=lambda item: (-item[0], item[1])):
+        if remaining <= 0:
+            break
+        start, end = ranges[idx]
+        if counts[idx] >= int(end - start):
+            continue
+        counts[idx] += 1
+        remaining -= 1
+
+    selected: List[int] = []
+    for idx, ((start, end), keep) in enumerate(zip(ranges, counts)):
+        if int(keep) <= 0:
+            continue
+        token = f"{salt}|{origin}|{dataset}|{int(seed)}|{idx}|{start}|{end}|{target_count}"
+        local_seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
+        rng = np.random.default_rng(local_seed)
+        chosen = rng.choice(int(end - start), size=int(keep), replace=False) + int(start)
+        selected.extend(int(value) for value in chosen.tolist())
+    return np.asarray(sorted(selected), dtype=np.int64)
+
+
+def pooled_calibration_origin_indices(
+    train_total: int,
+    val_total: int,
+    *,
+    fraction: float,
+    seed: int,
+    strata: int,
+    dataset: str,
+    train_split_fraction: float = DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION,
+    val_split_fraction: float = DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION,
+) -> Tuple[np.ndarray, np.ndarray]:
+    reference_examples = _pooled_calibration_reference_examples(
+        int(train_total),
+        int(val_total),
+        train_split_fraction=float(train_split_fraction),
+        val_split_fraction=float(val_split_fraction),
+    )
+    counts = _proportional_origin_counts(reference_examples, fraction=float(fraction))
+    train_indices = _stratified_origin_indices(
+        int(train_total),
+        target=int(counts["train"]),
+        seed=int(seed),
+        strata=int(strata),
+        dataset=str(dataset),
+        origin="train",
+        salt="v43_pooled_combined_fraction_train",
+    )
+    val_indices = _stratified_origin_indices(
+        int(val_total),
+        target=int(counts["validation"]),
+        seed=int(seed) + 1_000_003,
+        strata=int(strata),
+        dataset=str(dataset),
+        origin="validation",
+        salt="v43_pooled_combined_fraction_val",
+    )
+    return train_indices, val_indices
+
+
 def combine_origin_metrics(train_metrics: Mapping[str, Any], val_metrics: Mapping[str, Any]) -> Dict[str, Any]:
-    """Combine Train20 and former validation metrics into one pooled row."""
+    """Combine sampled train and validation metrics into one pooled row."""
     origins = [
-        {"origin": "train20", "metrics": dict(train_metrics)},
-        {"origin": "former_val", "metrics": dict(val_metrics)},
+        {"origin": "train", "metrics": dict(train_metrics)},
+        {"origin": "validation", "metrics": dict(val_metrics)},
     ]
     metrics = [item["metrics"] for item in origins]
     origin_counts = {item["origin"]: int(item["metrics"].get("eval_examples", 0) or 0) for item in origins}
@@ -170,6 +337,8 @@ def combine_origin_metrics(train_metrics: Mapping[str, Any], val_metrics: Mappin
     total_examples = int(sum(origin_counts.values()))
     payload = {
         "pool": POOLED_CALIBRATION_PHASE,
+        "protocol": V43_POOLED_CALIBRATION_PROTOCOL,
+        "calibration_pool": V43_POOLED_CALIBRATION_POOL,
         "origin_counts": origin_counts,
         "origin_hashes": origin_hashes,
         "origin_protocol_hashes": {
@@ -249,7 +418,7 @@ def write_fixed_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
     summary = {
         "status": "ready",
         "artifact": "v43_fixed_reference_schedule_summary",
-        "protocol": "v4.3_pooled_one_round_calibration",
+        "protocol": V43_POOLED_CALIBRATION_PROTOCOL,
         "dataset": str(args.dataset),
         "baseline_schedule": True,
         "fixed_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
@@ -288,23 +457,30 @@ def evaluate_pooled_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]
     splits = checkpoint["splits"]
     train_ds = splits["train"]
     val_ds = splits["val"]
-    train_reference_examples = int(len(val_ds))
+    reference_examples = _pooled_calibration_reference_examples(
+        int(len(train_ds)),
+        int(len(val_ds)),
+        train_split_fraction=float(args.train_tuning_train_split_fraction),
+        val_split_fraction=float(args.train_tuning_val_split_fraction),
+    )
+    normalized_train_universe = int(reference_examples["train"])
+    validation_reference_examples = int(reference_examples["validation"])
+    combined_reference_examples = int(normalized_train_universe + validation_reference_examples)
     rows: List[Dict[str, Any]] = []
     total_cells = len(seeds) * len(schedule_keys) * len(solvers) * len(target_nfes)
     with ProgressBar(total_cells, "Pooled inference cells") as progress:
         for seed in seeds:
-            train_indices = choose_forecast_train_tuning_indices(
-                train_ds,
+            origin_seed = int(args.train_tuning_seed) + int(seed)
+            train_indices, val_indices = pooled_calibration_origin_indices(
+                int(len(train_ds)),
+                int(len(val_ds)),
                 fraction=float(args.eval_train_fraction),
-                seed=int(args.train_tuning_seed) + int(seed),
+                seed=origin_seed,
                 strata=int(args.train_tuning_strata),
                 dataset=str(args.dataset),
-                sampling_mode=str(args.train_tuning_sampling_mode),
-                reference_examples=train_reference_examples,
                 train_split_fraction=float(args.train_tuning_train_split_fraction),
                 val_split_fraction=float(args.train_tuning_val_split_fraction),
             )
-            val_indices = np.arange(int(len(val_ds)), dtype=np.int64)
             for schedule_key in schedule_keys:
                 for solver in solvers:
                     for target_nfe in target_nfes:
@@ -321,7 +497,7 @@ def evaluate_pooled_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]
                             seed=int(seed),
                             example_indices=train_indices,
                             batch_size=int(args.forecast_eval_batch_size),
-                            progress_label=f"{label_base} train20",
+                            progress_label=f"{label_base} train",
                         )
                         val_metrics = evaluate_forecast_schedule(
                             model,
@@ -334,7 +510,7 @@ def evaluate_pooled_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]
                             seed=int(seed),
                             example_indices=val_indices,
                             batch_size=int(args.forecast_eval_batch_size),
-                            progress_label=f"{label_base} former_val",
+                            progress_label=f"{label_base} validation",
                         )
                         pooled = combine_origin_metrics(train_metrics, val_metrics)
                         row = _schedule_row(
@@ -347,28 +523,35 @@ def evaluate_pooled_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]
                             protocol_hash=_hash_payload(
                                 {
                                     "phase": POOLED_CALIBRATION_PHASE,
+                                    "protocol": V43_POOLED_CALIBRATION_PROTOCOL,
+                                    "calibration_pool": V43_POOLED_CALIBRATION_POOL,
                                     "schedule_summary": str(resolve_project_path(str(args.schedule_summary))),
                                     "seed": int(seed),
                                     "solver": str(solver),
                                     "target_nfe": int(target_nfe),
+                                    "normalized_train_reference_examples": normalized_train_universe,
+                                    "validation_reference_examples": validation_reference_examples,
+                                    "train_target_examples": int(len(train_indices)),
+                                    "validation_target_examples": int(len(val_indices)),
                                 }
                             ),
                         )
                         row.update(
                             {
                                 "train_tuning_fraction": float(args.eval_train_fraction),
-                                "train_tuning_seed": int(args.train_tuning_seed) + int(seed),
+                                "train_tuning_seed": origin_seed,
                                 "train_tuning_strata": int(args.train_tuning_strata),
-                                "train_tuning_sampler": train_tuning_sampler_key(str(args.train_tuning_sampling_mode)),
-                                "train_tuning_sampling_mode": str(args.train_tuning_sampling_mode),
-                                "train_tuning_reference_examples": int(train_reference_examples),
-                                "train_tuning_target_examples": int(len(train_indices)),
+                                "train_tuning_sampler": f"v43_pooled_{train_tuning_sampler_key(TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED)}",
+                                "train_tuning_sampling_mode": TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED,
+                                "train_tuning_reference_examples": int(combined_reference_examples),
+                                "train_tuning_target_examples": int(len(train_indices) + len(val_indices)),
                                 "train_tuning_train_split_fraction": float(args.train_tuning_train_split_fraction),
                                 "train_tuning_val_split_fraction": float(args.train_tuning_val_split_fraction),
                                 "calibration_origin_counts_json": json.dumps(pooled["calibration_origin_counts"], sort_keys=True, separators=(",", ":")),
                                 "calibration_origin_hashes_json": json.dumps(pooled["calibration_origin_hashes"], sort_keys=True, separators=(",", ":")),
                                 "calibration_origin_weighting": "example_count_weighted",
-                                "calibration_pool": "train20_plus_full_former_val",
+                                "calibration_pool": V43_POOLED_CALIBRATION_POOL,
+                                "calibration_protocol": V43_POOLED_CALIBRATION_PROTOCOL,
                             }
                         )
                         rows.append(row)
@@ -379,14 +562,19 @@ def evaluate_pooled_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]
     summary = {
         "status": "ready",
         "artifact": "v43_pooled_calibration_rows",
-        "protocol": "v4.3_pooled_one_round_calibration",
+        "protocol": V43_POOLED_CALIBRATION_PROTOCOL,
         "dataset": str(args.dataset),
         "schedule_summary": str(resolve_project_path(str(args.schedule_summary))),
         "row_csv": str(row_csv),
         "split_phase": POOLED_CALIBRATION_PHASE,
         "schedule_keys": schedule_keys,
         "seeds": list(seeds),
-        "origin_policy": "Train20 sampled examples plus all former validation examples, re-evaluated together",
+        "origin_policy": "Proportional train and validation samples whose counts sum to the rounded combined calibration target",
+        "calibration_pool": V43_POOLED_CALIBRATION_POOL,
+        "calibration_fraction": float(args.eval_train_fraction),
+        "normalized_train_reference_examples": int(normalized_train_universe),
+        "validation_reference_examples": int(validation_reference_examples),
+        "combined_reference_examples": int(combined_reference_examples),
         "row_count": int(len(rows)),
     }
     save_json(summary, str(out_dir / f"{Path(str(args.row_csv_name)).stem}_summary.json"))
@@ -412,6 +600,10 @@ def _clean_pooled_rows(
         if str(row.get("split_phase")) != POOLED_CALIBRATION_PHASE:
             continue
         if str(row.get("dataset")) != str(dataset):
+            continue
+        if str(row.get("calibration_pool")) != V43_POOLED_CALIBRATION_POOL:
+            continue
+        if str(row.get("calibration_protocol")) != V43_POOLED_CALIBRATION_PROTOCOL:
             continue
         try:
             seed = int(row.get("seed", -1))
@@ -702,7 +894,7 @@ def _write_selected_schedule_summary(
     summary = {
         "status": "ready",
         "artifact": "v43_selected_seed_mean_student_schedule_summary",
-        "protocol": "v4.3_pooled_one_round_calibration",
+        "protocol": V43_POOLED_CALIBRATION_PROTOCOL,
         "dataset": str(schedule_summary.get("dataset")),
         "selection": dict(selection),
         "selected_source_schedule_key": selected_key,
@@ -734,9 +926,10 @@ def train_v43_policy(args: argparse.Namespace) -> Dict[str, Any]:
     if bool(args.dry_run):
         summary = {
             "status": "dry_run",
-            "protocol": "v4.3_pooled_one_round_calibration",
+            "protocol": V43_POOLED_CALIBRATION_PROTOCOL,
             "dataset": str(args.dataset),
             "split_phase": POOLED_CALIBRATION_PHASE,
+            "calibration_pool": V43_POOLED_CALIBRATION_POOL,
             "calibration_seeds": list(calibration_seeds),
             "student_seeds": list(student_seeds),
             "student_initialization": SER_PTG_SCHEDULE_KEY,
@@ -744,7 +937,6 @@ def train_v43_policy(args: argparse.Namespace) -> Dict[str, Any]:
             "reward_reference_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
             "reward_reference_source": "pooled_recomputed_rows_only",
             "uses_validation_selection": False,
-            "uses_source_balanced_rewards": False,
             "final_selector": "pooled_teacher_utility_with_hard_geometry_guard",
             "lowest_internal_loss_selector_used": False,
         }
@@ -854,7 +1046,7 @@ def train_v43_policy(args: argparse.Namespace) -> Dict[str, Any]:
             "diagnostic_split": POOLED_CALIBRATION_PHASE,
             "uses_validation_labels": False,
             "teacher_holdout_source": "pooled_bo_candidate_rows_only",
-            "reference_thresholds_from_v42": {
+            "reference_teacher_thresholds": {
                 "pairwise_accuracy": 0.8214,
                 "spearman": 0.7679,
                 "top_k_recall": 0.8667,
@@ -931,7 +1123,7 @@ def train_v43_policy(args: argparse.Namespace) -> Dict[str, Any]:
     schedule_summary = {
         "status": "ready",
         "artifact": "v43_seed_mean_student_schedule_summary",
-        "protocol": "v4.3_pooled_one_round_calibration",
+        "protocol": V43_POOLED_CALIBRATION_PROTOCOL,
         "dataset": str(args.dataset),
         "baseline_schedule": False,
         "student_initialization": SER_PTG_SCHEDULE_KEY,
@@ -958,20 +1150,20 @@ def train_v43_policy(args: argparse.Namespace) -> Dict[str, Any]:
             "setting_dim": int(setting_dim),
             "teacher_input_dim": int(teacher_input_dim),
             "max_macro_steps": int(max_macro_steps),
-            "protocol": "v4.3_pooled_one_round_calibration",
+            "protocol": V43_POOLED_CALIBRATION_PROTOCOL,
             **checkpoint_payload,
         },
         out_dir / "conditional_opd_v43.pt",
     )
     summary = {
         "status": "ready",
-        "protocol": "v4.3_pooled_one_round_calibration",
+        "protocol": V43_POOLED_CALIBRATION_PROTOCOL,
         "dataset": str(args.dataset),
         "split_phase": POOLED_CALIBRATION_PHASE,
+        "calibration_pool": V43_POOLED_CALIBRATION_POOL,
         "calibration_seeds": list(calibration_seeds),
         "student_seeds": list(student_seeds),
         "uses_validation_selection": False,
-        "uses_source_balanced_rewards": False,
         "reward_reference_source": "pooled_recomputed_rows_only",
         "reward_reference_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
         "teacher_anchor_schedule_keys": list(teacher_anchor_keys),
@@ -1012,19 +1204,6 @@ def train_v43_policy(args: argparse.Namespace) -> Dict[str, Any]:
     return summary
 
 
-def _archive_v42_f_output(path: Path, *, allow_execute: bool, commands: List[List[str]]) -> str:
-    resolved = resolve_project_path(str(path))
-    if not resolved.exists():
-        return ""
-    archive_root = project_outputs_root() / "archive" / f"pre_v43_{time.strftime('%Y%m%d_%H%M%S')}"
-    target = archive_root / resolved.name
-    commands.append(["archive_output_root", str(resolved), str(target)])
-    if allow_execute:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(resolved), str(target))
-    return str(target)
-
-
 def run_train20_v43_pooled_calibration(args: argparse.Namespace) -> Dict[str, Any]:
     calibration_seeds = tuple(_parse_int_csv(args.calibration_seeds))
     student_seeds = tuple(_parse_int_csv(args.student_seeds))
@@ -1041,9 +1220,6 @@ def run_train20_v43_pooled_calibration(args: argparse.Namespace) -> Dict[str, An
     project_dir = resolve_project_path(".")
     allow_execute = bool(args.allow_execute)
     commands: List[List[str]] = []
-    archived_v42_f = ""
-    if bool(args.archive_v42_f_output):
-        archived_v42_f = _archive_v42_f_output(resolve_project_path(str(args.v42_f_out_dir)), allow_execute=allow_execute, commands=commands)
     if allow_execute:
         out_dir.mkdir(parents=True, exist_ok=True)
     else:
@@ -1315,16 +1491,16 @@ def run_train20_v43_pooled_calibration(args: argparse.Namespace) -> Dict[str, An
     summary = {
         "status": "ready" if allow_execute else "dry_run",
         "artifact": "train20_v43_pooled_one_round_calibration",
-        "protocol": "v4.3_pooled_one_round_calibration",
+        "protocol": V43_POOLED_CALIBRATION_PROTOCOL,
         "dataset": str(args.dataset),
         "out_dir": str(out_dir),
-        "archived_v42_f_output_root": archived_v42_f,
+        "calibration_pool": V43_POOLED_CALIBRATION_POOL,
+        "calibration_fraction": float(args.eval_train_fraction),
         "calibration_seeds": list(calibration_seeds),
         "student_seeds": list(student_seeds),
         "locked_test_seeds": list(locked_test_seeds),
         "strict_v43_protocol": bool(args.strict_v43_protocol),
         "uses_validation_selection": False,
-        "uses_source_balanced_rewards": False,
         "student_initialization": SER_PTG_SCHEDULE_KEY,
         "final_selector": "pooled_teacher_utility_with_hard_geometry_guard",
         "lowest_internal_loss_selector_used": False,
@@ -1403,9 +1579,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--otflow_train_steps", type=int, default=20000)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--skip_locked_test", action="store_true", default=False)
-    parser.add_argument("--archive_v42_f_output", action="store_true", default=False)
-    parser.add_argument("--no_archive_v42_f_output", action="store_false", dest="archive_v42_f_output")
-    parser.add_argument("--v42_f_out_dir", default=str(DEFAULT_V42_F_OUT_DIR))
     parser.add_argument("--strict_v43_protocol", action="store_true", default=False)
     parser.add_argument("--dry_run", action="store_true", default=False)
     parser.add_argument("--allow_execute", action="store_true", default=False)

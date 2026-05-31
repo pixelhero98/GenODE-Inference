@@ -43,16 +43,6 @@ class GenODEInterfaceTests(unittest.TestCase):
             scripts["genode-run-train20-v43-pooled-calibration"],
             "genode.conditional_opd.train20_v43_pooled_calibration:main",
         )
-        self.assertNotIn("genode-run-train20-v4-bo-selection", scripts)
-        self.assertNotIn("genode-run-train20-v42-no-val-selection", scripts)
-        self.assertNotIn("genode-run-train20-v42-f-final-retrain", scripts)
-        self.assertNotIn("genode-run-train20-expanded-opd-selection", scripts)
-        self.assertNotIn("genode-train-density-opd", scripts)
-        self.assertNotIn("genode-train-mlp-flow-opd", scripts)
-        self.assertNotIn("genode-run-clean-opd-selection", scripts)
-        self.assertNotIn("genode-build-expanded-candidate-summary", scripts)
-        self.assertNotIn("genode-evaluate-student-schedules", scripts)
-        self.assertNotIn("genode-review-plan-html", scripts)
         self.assertEqual(scripts["genode-build-ser-ptg-reference"], "genode.conditional_opd.ser_ptg_reference:main")
         self.assertEqual(scripts["genode-evaluate-schedule-summary"], "genode.conditional_opd.evaluate_schedule_summary:main")
         for target in scripts.values():
@@ -66,13 +56,6 @@ class GenODEInterfaceTests(unittest.TestCase):
     def test_auto_device_uses_cpu_without_cuda(self) -> None:
         with mock.patch("torch.cuda.is_available", return_value=False):
             self.assertEqual(resolve_torch_device("auto").type, "cpu")
-
-    def test_v4_orchestration_modules_are_legacy_only(self) -> None:
-        importlib.import_module("genode.conditional_opd.legacy.train20_v4_bo_selection")
-        importlib.import_module("genode.conditional_opd.legacy.train20_v42_no_val_selection")
-        importlib.import_module("genode.conditional_opd.legacy.train20_v42_f_final_retrain")
-        with self.assertRaises(ModuleNotFoundError):
-            importlib.import_module("genode.conditional_opd.train20_v4_bo_selection")
 
     def test_no_upstream_namespace_imports_remain_in_source(self) -> None:
         offenders = []

@@ -75,7 +75,7 @@ CONDITIONAL_GENERATION_PHYSICAL_BATCH_SIZE_BY_DATASET: Dict[str, int] = {
     "es_mbp_10": 8,
     SLEEP_EDF_DATASET_KEY: 2,
 }
-LEGACY_BASELINE_MODEL_CONFIG_KEYS = {
+IGNORED_BASELINE_MODEL_CONFIG_KEYS = {
     "baseline_latent_dim",
     "vae_kl_weight",
     "timegan_supervision_weight",
@@ -709,7 +709,7 @@ def load_checkpoint_model(ckpt_path: Path, device: torch.device) -> Tuple[OTFlow
         checkpoint_values = dict(cfg_dict.get(section_name, {}))
         if section_name == "model":
             checkpoint_values = {
-                key: value for key, value in checkpoint_values.items() if key not in LEGACY_BASELINE_MODEL_CONFIG_KEYS
+                key: value for key, value in checkpoint_values.items() if key not in IGNORED_BASELINE_MODEL_CONFIG_KEYS
             }
         section_values.update(checkpoint_values)
         if section_name == "train":

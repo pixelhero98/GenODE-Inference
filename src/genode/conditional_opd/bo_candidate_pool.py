@@ -29,8 +29,6 @@ from genode.conditional_opd.models import solver_macro_steps
 from genode.conditional_opd.objectives import (
     rewards_by_setting,
     seed_mean_metric_rows,
-    source_balanced_rewards_by_setting,
-    source_balanced_seed_mean_rows,
 )
 from genode.conditional_opd.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
 from genode.data.otflow_paths import project_outputs_root, resolve_project_path
@@ -209,49 +207,6 @@ def _observations_by_cell(
 
 
 
-def _observations_by_cell_source_balanced(
-    *,
-    observed_schedule_summaries: Sequence[str | Path],
-    candidate_rows_by_source: Mapping[str, Sequence[Mapping[str, Any]]],
-    fixed_reference_rows_by_source: Mapping[str, Sequence[Mapping[str, Any]]],
-) -> Dict[Tuple[str, int], List[Tuple[Tuple[float, ...], float]]]:
-    if not observed_schedule_summaries:
-        return {}
-    if not candidate_rows_by_source or not all(candidate_rows_by_source.values()):
-        return {}
-    _, schedules = load_schedules(observed_schedule_summaries)
-    theta_by_key: Dict[str, Dict[Tuple[str, int], Tuple[float, ...]]] = {
-        str(schedule["scheduler_key"]): _candidate_schedule_thetas(schedule)
-        for schedule in schedules
-        if str(schedule.get("candidate_source")) == "bayesian_optimization"
-    }
-    source_rows: Dict[str, List[Mapping[str, Any]]] = {}
-    for source_name, candidate_rows in candidate_rows_by_source.items():
-        fixed_rows = list(fixed_reference_rows_by_source.get(str(source_name), []) or [])
-        if not fixed_rows:
-            raise ValueError(f"Missing fixed reference rows for calibration source {source_name!r}.")
-        source_rows[str(source_name)] = [*fixed_rows, *list(candidate_rows)]
-    rewards = source_balanced_rewards_by_setting(
-        source_rows,
-        fixed_schedule_keys=BASELINE_SCHEDULE_KEYS,
-        source_weights={name: 1.0 for name in source_rows},
-    )
-    aggregate_candidate_rows = source_balanced_seed_mean_rows(
-        {name: list(rows) for name, rows in candidate_rows_by_source.items()},
-        source_weights={name: 1.0 for name in candidate_rows_by_source},
-    )
-    out: Dict[Tuple[str, int], List[Tuple[Tuple[float, ...], float]]] = {}
-    for row in aggregate_candidate_rows:
-        schedule_key = str(row["scheduler_key"])
-        setting = (str(row["solver_key"]), int(row["target_nfe"]))
-        if schedule_key not in theta_by_key or setting not in theta_by_key[schedule_key]:
-            continue
-        if setting not in rewards or schedule_key not in rewards[setting]:
-            continue
-        out.setdefault(setting, []).append((theta_by_key[schedule_key][setting], float(rewards[setting][schedule_key])))
-    return out
-
-
 def _select_diverse_rows(thetas: np.ndarray, scores: np.ndarray, *, count: int) -> List[int]:
     order = list(np.argsort(-scores))
     selected: List[int] = []
@@ -338,26 +293,17 @@ def build_bo_candidate_pool(
     observed_schedule_summaries: Sequence[str | Path] = (),
     observed_rows: Sequence[Mapping[str, Any]] = (),
     fixed_reference_rows: Sequence[Mapping[str, Any]] = (),
-    observed_rows_by_source: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
-    fixed_reference_rows_by_source: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     density_grid_size: int = DEFAULT_DENSITY_GRID_SIZE,
     theta_bound: float = DEFAULT_BO_THETA_BOUND,
     sobol_pool: int = DEFAULT_BO_SOBOL_POOL,
 ) -> Dict[str, Any]:
     require_botorch()
     reference_grids = _load_reference_grids(reference_schedule_summary)
-    if observed_rows_by_source and fixed_reference_rows_by_source:
-        observations = _observations_by_cell_source_balanced(
-            observed_schedule_summaries=observed_schedule_summaries,
-            candidate_rows_by_source=observed_rows_by_source,
-            fixed_reference_rows_by_source=fixed_reference_rows_by_source,
-        )
-    else:
-        observations = _observations_by_cell(
-            observed_schedule_summaries=observed_schedule_summaries,
-            candidate_rows=observed_rows,
-            fixed_reference_rows=fixed_reference_rows,
-        )
+    observations = _observations_by_cell(
+        observed_schedule_summaries=observed_schedule_summaries,
+        candidate_rows=observed_rows,
+        fixed_reference_rows=fixed_reference_rows,
+    )
     settings = _settings(reference_grids)
     per_cell: Dict[Tuple[str, int], List[Tuple[float, ...]]] = {}
     acquisition: Dict[str, Any] = {}
@@ -413,25 +359,6 @@ def build_bo_candidate_pool(
 
 
 def build_and_write_bo_candidate_pool(args: argparse.Namespace) -> Dict[str, Any]:
-    observed_rows_by_source: Dict[str, Sequence[Mapping[str, Any]]] = {}
-    fixed_reference_rows_by_source: Dict[str, Sequence[Mapping[str, Any]]] = {}
-    observed_train_csv = str(getattr(args, "observed_train_rows_csv", "")).strip()
-    observed_validation_csv = str(getattr(args, "observed_validation_rows_csv", "")).strip()
-    if observed_train_csv or observed_validation_csv:
-        if not observed_train_csv or not observed_validation_csv:
-            raise ValueError("Source-balanced BO observations require both observed train and validation rows.")
-        fixed_train_csv = str(getattr(args, "fixed_train_rows_csv", "")).strip()
-        fixed_validation_csv = str(getattr(args, "fixed_validation_rows_csv", "")).strip()
-        if not fixed_train_csv or not fixed_validation_csv:
-            raise ValueError("Source-balanced BO observations require both fixed train and validation reference rows.")
-        observed_rows_by_source = {
-            "calibration_train_part": _read_rows_csv(observed_train_csv),
-            "calibration_val_part": _read_rows_csv(observed_validation_csv),
-        }
-        fixed_reference_rows_by_source = {
-            "calibration_train_part": _read_rows_csv(fixed_train_csv),
-            "calibration_val_part": _read_rows_csv(fixed_validation_csv),
-        }
     pool = build_bo_candidate_pool(
         dataset=str(args.dataset),
         reference_schedule_summary=str(args.reference_schedule_summary),
@@ -441,8 +368,6 @@ def build_and_write_bo_candidate_pool(args: argparse.Namespace) -> Dict[str, Any
         observed_schedule_summaries=_parse_csv(str(args.observed_schedule_summaries)),
         observed_rows=_read_rows_csv(args.observed_rows_csv),
         fixed_reference_rows=_read_rows_csv(args.fixed_reference_rows_csv),
-        observed_rows_by_source=observed_rows_by_source,
-        fixed_reference_rows_by_source=fixed_reference_rows_by_source,
         density_grid_size=int(args.density_grid_size),
         theta_bound=float(args.theta_bound),
         sobol_pool=int(args.sobol_pool),
@@ -460,10 +385,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--observed_schedule_summaries", default="")
     parser.add_argument("--observed_rows_csv", default="")
     parser.add_argument("--fixed_reference_rows_csv", default="")
-    parser.add_argument("--observed_train_rows_csv", default="")
-    parser.add_argument("--observed_validation_rows_csv", default="")
-    parser.add_argument("--fixed_train_rows_csv", default="")
-    parser.add_argument("--fixed_validation_rows_csv", default="")
     parser.add_argument("--out_path", default=str(project_outputs_root() / "train20_v43_pooled_bo" / "candidate_pool_schedule_summary.json"))
     parser.add_argument("--active_round", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)

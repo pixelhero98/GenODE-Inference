@@ -38,17 +38,17 @@ pre{margin:10px 0 16px;background:#111827;color:#f9fafb;border-radius:9px;paddin
 <div class="page">
 <header>
   <h1>GIPO V4.3: Pooled One-Round Calibration</h1>
-  <p class="muted">Clean implementation plan after V4.2 val-select, V4.2 no-val, and V4.2-F diagnosis. The goal is one consistent optimization distribution, one teacher, one student, and no final validation selection.</p>
+  <p class="muted">Canonical implementation plan for one consistent optimization distribution, one teacher, one student, and no final validation selection.</p>
 </header>
 <main>
 
 <section>
   <h2>0. Final decision</h2>
   <div class="callout ok">
-    <strong>Use one pooled calibration run.</strong> Treat <code>20% stratified train</code> and the former validation set as one optimization set. Run one BO phase with the same total observation budget as the previous two-round design. Train one ranking-first teacher and one SER-initialized student. Select the final student by teacher utility under a hard geometry guard, not by lowest internal loss.
+    <strong>Use one pooled calibration run.</strong> Treat <code>20% of train + validation</code> as one optimization set, sampled proportionally from both splits. Run one BO phase with the configured candidate budget. Train one ranking-first teacher and one SER-initialized student. Select the final student by teacher utility under a hard geometry guard, not by lowest internal loss.
   </div>
   <div class="grid">
-    <div class="card"><span class="k">Set</span><br><code>C = Train20 + former_val</code></div>
+    <div class="card"><span class="k">Set</span><br><code>C = 20% combined pool</code></div>
     <div class="card"><span class="k">BO</span><br>one pooled phase</div>
     <div class="card"><span class="k">Teacher</span><br>one composite ranker</div>
     <div class="card"><span class="k">Student</span><br>one SER-initialized policy</div>
@@ -56,20 +56,20 @@ pre{margin:10px 0 16px;background:#111827;color:#f9fafb;border-radius:9px;paddin
 </section>
 
 <section>
-  <h2>1. Lessons transferred from V4.2</h2>
+  <h2>1. Design constraints</h2>
   <table>
     <thead><tr><th>Observation</th><th>Implementation implication for V4.3</th></tr></thead>
     <tbody>
       <tr>
-        <td>V4.2 val-select and V4.2 no-val selected the same guarded steps20 policy and had identical locked-test aggregate metrics.</td>
-        <td>No separate validation policy selection is needed. Use the former validation set as calibration data, not as a selector.</td>
+        <td>Validation-only policy selection is not part of the canonical workflow.</td>
+        <td>No separate validation policy selection is needed. Use sampled validation examples as calibration data, not as a selector.</td>
       </tr>
       <tr>
         <td>The unguarded steps25 teacher-top looked attractive internally but was geometry-riskier and worse.</td>
         <td>The geometry guard is a hard feasibility constraint and must be applied after seed-mean projection.</td>
       </tr>
       <tr>
-        <td>V4.2-F changed too many things at once: BO-only teacher rows, uniform student initialization, and lowest-internal-loss final selection.</td>
+        <td>BO-only teacher rows, uniform student initialization, and lowest-internal-loss final selection are not canonical.</td>
         <td>Keep fixed schedules as teacher anchors, initialize the student from SER-PTG, and select by guarded teacher utility.</td>
       </tr>
     </tbody>
@@ -79,20 +79,19 @@ pre{margin:10px 0 16px;background:#111827;color:#f9fafb;border-radius:9px;paddin
 <section>
   <h2>2. Calibration data</h2>
   <pre>C = calib_pool
-  = 20% stratified original train
-  + full former validation</pre>
+  = round(0.20 * (|train| + |validation|)) examples
+  with proportional stratified samples from train and validation</pre>
   <ul>
     <li>Use <code>C</code> for fixed references, BO candidate evaluation, teacher rows, and student optimization.</li>
-    <li>Keep <code>origin ∈ {train20, former_val}</code> only as audit metadata.</li>
+    <li>Keep <code>origin ∈ {train, validation}</code> only as audit metadata.</li>
     <li>Do not use origin-specific rewards, origin-specific teachers, or origin-specific student selection.</li>
   </ul>
 </section>
 
 <section>
   <h2>3. One BO phase</h2>
-  <p>Use one pooled BO buffer. “Same observations as previous two rounds” means the same total number of evaluated candidate families, but evaluated against the single calibration pool.</p>
-  <pre>old total observations = old_stage1_candidates + old_stage2_candidates
-V4.3 observations      = one pooled candidate set of the same total size</pre>
+  <p>Use one pooled BO buffer. Evaluate the configured candidate-family budget against the single calibration pool.</p>
+  <pre>V4.3 observations = one pooled candidate set</pre>
   <table>
     <thead><tr><th>Component</th><th>Rule</th></tr></thead>
     <tbody>
@@ -192,7 +191,7 @@ V4.3 observations      = one pooled candidate set of the same total size</pre>
     <li>Report CRPS, MASE, wins vs uniform, gap to per-cell best fixed, geometry diagnostics, and latency.</li>
   </ol>
   <div class="callout warn">
-    <strong>Do not choose among V4.2 no-val, V4.2-F, and V4.3 by locked-test result.</strong> V4.3 must be frozen before the locked-test run.
+    <strong>Do not choose among implementation variants by locked-test result.</strong> V4.3 must be frozen before the locked-test run.
   </div>
 </section>
 
@@ -200,14 +199,14 @@ V4.3 observations      = one pooled candidate set of the same total size</pre>
   <h2>9. Minimal pseudocode</h2>
   <pre># V4.3 pooled one-round calibration
 
-C = make_calib_pool(train20_stratified, former_validation)
+C = make_calib_pool(train_split, validation_split, fraction=0.20)
 fixed_rows = eval_fixed_schedules(C)      # also teacher anchors
 ser_row    = eval_ser_ptg(C)              # anchor and initialization reference
 
 candidates = build_one_phase_candidates(
     base="SER-PTG",
     basis="7D_lowrank",
-    total_budget=old_stage1_budget + old_stage2_budget,
+    total_budget=configured_candidate_budget,
     mix=["ser_zero", "hand_bumps", "sobol", "one_logei_batch"]
 )
 bo_rows = eval_candidates(C, candidates)
@@ -255,7 +254,7 @@ locked_test_once(final_schedule)</pre>
   <table>
     <thead><tr><th>Check</th><th>Pass criterion</th></tr></thead>
     <tbody>
-      <tr><td>Teacher ranking</td><td>held-out pairwise and top-k at least as strong as V4.2; best-fixed crossing should recover relative to V4.2-F.</td></tr>
+      <tr><td>Teacher ranking</td><td>held-out pairwise, top-k, and best-fixed crossing diagnostics meet the configured acceptance thresholds.</td></tr>
       <tr><td>Student selection</td><td>selected by guarded teacher utility, not lowest internal loss.</td></tr>
       <tr><td>Geometry</td><td>final seed-mean schedule passes all current thresholds.</td></tr>
       <tr><td>Locked test</td><td>one frozen V4.3 schedule only.</td></tr>

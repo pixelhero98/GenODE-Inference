@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -12,6 +13,7 @@ from genode.data.otflow_forecast_data import build_monash_forecast_splits
 from genode.data.otflow_monash_datasets import default_manifest_path, download_monash_dataset
 from genode.data.otflow_paths import project_paper_dataset_root, resolve_project_path
 from genode.evaluation.fm_backbone_registry import (
+    ACTIVE_FORECAST_BACKBONE_BUDGETS,
     BACKBONE_NAME_OTFLOW,
     build_backbone_checkpoint_id,
     expected_artifact_root,
@@ -20,7 +22,7 @@ from genode.evaluation.fm_backbone_registry import (
     train_budget_label,
 )
 from genode.models.config import OTFlowConfig
-from genode.models.otflow_train_val import save_json, seed_all, train_loop
+from genode.models.otflow_train_val import evaluate_average_loss, save_json, seed_all, train_loop
 from genode.runtime import resolve_torch_device
 
 DEFAULT_DATASET = "san_francisco_traffic"
@@ -39,7 +41,20 @@ def _json_ready_stats(stats: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def build_sf_traffic_cfg(args: argparse.Namespace) -> OTFlowConfig:
+def _forecast_spec(dataset: str):
+    plans = experiment_plan_by_key()
+    if str(dataset) not in plans:
+        raise KeyError(f"Unknown dataset={dataset!r}; expected one of {sorted(plans)}.")
+    spec = plans[str(dataset)]
+    if str(spec.benchmark_family) != FORECAST_FAMILY:
+        raise ValueError(
+            f"Backbone training currently supports forecast datasets only; "
+            f"{dataset!r} has benchmark_family={spec.benchmark_family!r}."
+        )
+    return spec
+
+
+def build_forecast_cfg(args: argparse.Namespace) -> OTFlowConfig:
     spec = experiment_plan_by_key()[str(args.dataset)]
     cfg = OTFlowConfig()
     cfg.apply_overrides(
@@ -73,6 +88,10 @@ def build_sf_traffic_cfg(args: argparse.Namespace) -> OTFlowConfig:
     return cfg
 
 
+def build_sf_traffic_cfg(args: argparse.Namespace) -> OTFlowConfig:
+    return build_forecast_cfg(args)
+
+
 def ensure_forecast_dataset(dataset_root: Path, dataset: str, *, prepare: bool) -> None:
     manifest = default_manifest_path(dataset_root, dataset)
     if manifest.exists():
@@ -84,14 +103,88 @@ def ensure_forecast_dataset(dataset_root: Path, dataset: str, *, prepare: bool) 
     download_monash_dataset(dataset_root, dataset)
 
 
+def _parse_checkpoint_steps(raw: str | Sequence[int] | None, *, dataset: str, max_steps: int) -> Tuple[int, ...]:
+    if raw is None or str(raw).strip() == "":
+        planned = ACTIVE_FORECAST_BACKBONE_BUDGETS.get(str(dataset), ())
+        steps = [int(value) for value in planned if int(value) <= int(max_steps)]
+        if not steps:
+            steps = [int(max_steps)]
+        return tuple(sorted(set(steps)))
+    if isinstance(raw, str):
+        values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    else:
+        values = [int(value) for value in raw]
+    invalid = [value for value in values if value <= 0 or value > int(max_steps)]
+    if invalid:
+        raise ValueError(f"Checkpoint steps must be in [1, {int(max_steps)}], got {invalid}.")
+    return tuple(sorted(set(values)))
+
+
+def _clone_state_dict_cpu(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+
+def _checkpoint_cfg_for_budget(cfg: OTFlowConfig, train_steps: int) -> OTFlowConfig:
+    checkpoint_cfg = copy.deepcopy(cfg)
+    checkpoint_cfg.apply_overrides(steps=int(train_steps))
+    return checkpoint_cfg
+
+
+def _save_backbone_artifact(
+    *,
+    artifact_root: Path,
+    cfg: OTFlowConfig,
+    state_dict: Mapping[str, torch.Tensor],
+    dataset: str,
+    spec: Any,
+    seed: int,
+    budget_steps: int,
+    split_stats: Mapping[str, Any],
+    selection: Mapping[str, Any],
+) -> Dict[str, Any]:
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    checkpoint_id = build_backbone_checkpoint_id(
+        backbone_name=BACKBONE_NAME_OTFLOW,
+        benchmark_family=FORECAST_FAMILY,
+        dataset_key=str(dataset),
+        train_steps=int(budget_steps),
+        seed=int(seed),
+    )
+    checkpoint_path = artifact_root / "model.pt"
+    checkpoint_cfg = _checkpoint_cfg_for_budget(cfg, int(budget_steps))
+    torch.save(
+        {"cfg": checkpoint_cfg.to_dict(), "model_state": dict(state_dict)},
+        checkpoint_path,
+    )
+    metadata = {
+        "checkpoint_id": checkpoint_id,
+        "dataset_key": str(dataset),
+        "benchmark_family": FORECAST_FAMILY,
+        "backbone_name": BACKBONE_NAME_OTFLOW,
+        "train_steps": int(budget_steps),
+        "train_budget_label": train_budget_label(int(budget_steps)),
+        "seed": int(seed),
+        "history_len": int(spec.history_len),
+        "future_block_len": int(spec.future_block_len),
+        "cond_dim": 0,
+        "checkpoint_path": str(checkpoint_path),
+        "metadata_path": str(artifact_root / "checkpoint_metadata.json"),
+        "summary_path": str(artifact_root / "artifact_summary.json"),
+        "split_stats": {**_json_ready_stats(dict(split_stats)), "cond_dim": 0},
+        "cfg": checkpoint_cfg.to_dict(),
+        "selection": dict(selection),
+    }
+    save_json(metadata, str(artifact_root / "checkpoint_metadata.json"))
+    save_json(metadata, str(artifact_root / "artifact_summary.json"))
+    return metadata
+
+
 def train_backbone(args: argparse.Namespace) -> Dict[str, Any]:
-    if str(args.dataset) != DEFAULT_DATASET:
-        raise ValueError("genODE v1 backbone training is scoped to san_francisco_traffic.")
     seed_all(int(args.seed))
     dataset_root = resolve_project_path(str(args.dataset_root))
+    spec = _forecast_spec(str(args.dataset))
     ensure_forecast_dataset(dataset_root, str(args.dataset), prepare=bool(args.prepare_data))
-    cfg = build_sf_traffic_cfg(args)
-    spec = experiment_plan_by_key()[str(args.dataset)]
+    cfg = build_forecast_cfg(args)
     splits = build_monash_forecast_splits(
         dataset_root=dataset_root,
         dataset_key=str(args.dataset),
@@ -101,65 +194,163 @@ def train_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         stride_train=int(args.stride_train),
         time_feature_mode="gap_elapsed",
     )
+    checkpoint_steps = _parse_checkpoint_steps(
+        getattr(args, "checkpoint_steps", None),
+        dataset=str(args.dataset),
+        max_steps=int(args.steps),
+    )
+    checkpoint_step_set = set(int(value) for value in checkpoint_steps)
+    val_every = int(getattr(args, "val_every", 0) or 0)
+    val_max_batches = getattr(args, "val_max_batches", None)
+    if val_max_batches is not None:
+        val_max_batches = int(val_max_batches)
+
+    best: Dict[str, Any] = {
+        "score": None,
+        "state_dict": None,
+        "step": 0,
+        "metric_source": None,
+        "validation": None,
+        "train_loss": None,
+        "error": None,
+        "validation_available": False,
+    }
+    exported: List[Dict[str, Any]] = []
+
+    def _record_candidate(
+        *,
+        step: int,
+        model: torch.nn.Module,
+        train_loss: float,
+        validation: Optional[Mapping[str, Any]],
+        error: Optional[BaseException],
+    ) -> None:
+        if validation is not None:
+            score = float(validation["loss"])
+            metric_source = "validation_loss"
+            best["validation_available"] = True
+        else:
+            if bool(best.get("validation_available")):
+                return
+            score = float(train_loss)
+            metric_source = "train_loss_fallback"
+        if best["score"] is None or score < float(best["score"]):
+            best.update(
+                {
+                    "score": float(score),
+                    "state_dict": _clone_state_dict_cpu(model),
+                    "step": int(step),
+                    "metric_source": metric_source,
+                    "validation": None if validation is None else dict(validation),
+                    "train_loss": float(train_loss),
+                    "error": None if error is None else f"{type(error).__name__}: {error}",
+                }
+            )
+
+    def _export_budget(step: int) -> None:
+        if best["state_dict"] is None:
+            raise RuntimeError(f"No checkpoint candidate is available at step {int(step)}.")
+        artifact_root = expected_artifact_root(
+            project_backbone_matrix_root(),
+            backbone_name=BACKBONE_NAME_OTFLOW,
+            benchmark_family=FORECAST_FAMILY,
+            dataset_key=str(args.dataset),
+            train_steps=int(step),
+        )
+        selection = {
+            "selection_metric": str(best["metric_source"]),
+            "selection_score": float(best["score"]),
+            "selected_step": int(best["step"]),
+            "export_step": int(step),
+            "validation": best["validation"],
+            "train_loss_at_selected_step": best["train_loss"],
+            "fallback_error": best["error"],
+        }
+        metadata = _save_backbone_artifact(
+            artifact_root=artifact_root,
+            cfg=cfg,
+            state_dict=best["state_dict"],
+            dataset=str(args.dataset),
+            spec=spec,
+            seed=int(args.seed),
+            budget_steps=int(step),
+            split_stats=dict(splits.get("stats", {})),
+            selection=selection,
+        )
+        exported.append(
+            {
+                "train_steps": int(step),
+                "train_budget_label": train_budget_label(int(step)),
+                "checkpoint_path": str(artifact_root / "model.pt"),
+                "metadata_path": str(artifact_root / "checkpoint_metadata.json"),
+                "checkpoint_id": str(metadata["checkpoint_id"]),
+                "selected_step": int(best["step"]),
+                "selection_metric": str(best["metric_source"]),
+                "selection_score": float(best["score"]),
+            }
+        )
+
+    def _on_step(step: int, model: torch.nn.Module, train_loss: float, logs: Dict[str, float]) -> None:
+        del logs
+        should_validate = int(step) in checkpoint_step_set or (val_every > 0 and int(step) % val_every == 0)
+        validation = None
+        error = None
+        if should_validate:
+            try:
+                validation = evaluate_average_loss(
+                    splits["val"],
+                    model,
+                    cfg,
+                    model_name="otflow",
+                    max_batches=val_max_batches,
+                    shuffle=False,
+                )
+            except Exception as exc:
+                error = exc
+        _record_candidate(
+            step=int(step),
+            model=model,
+            train_loss=float(train_loss),
+            validation=validation,
+            error=error,
+        )
+        if int(step) in checkpoint_step_set:
+            _export_budget(int(step))
+
     model = train_loop(
         splits["train"],
         cfg,
         model_name="otflow",
         steps=int(args.steps),
         log_every=int(args.log_every),
+        on_step=_on_step,
     )
-    artifact_root = expected_artifact_root(
+    del model
+    manifest = materialize_backbone_manifest(budget_steps=checkpoint_steps, seed=int(args.seed))
+    final_artifact_root = expected_artifact_root(
         project_backbone_matrix_root(),
         backbone_name=BACKBONE_NAME_OTFLOW,
         benchmark_family=FORECAST_FAMILY,
         dataset_key=str(args.dataset),
-        train_steps=int(args.steps),
+        train_steps=int(checkpoint_steps[-1]),
     )
-    artifact_root.mkdir(parents=True, exist_ok=True)
-    checkpoint_id = build_backbone_checkpoint_id(
-        backbone_name=BACKBONE_NAME_OTFLOW,
-        benchmark_family=FORECAST_FAMILY,
-        dataset_key=str(args.dataset),
-        train_steps=int(args.steps),
-        seed=int(args.seed),
-    )
-    checkpoint_path = artifact_root / "model.pt"
-    torch.save({"cfg": cfg.to_dict(), "model_state": model.state_dict()}, checkpoint_path)
-    metadata = {
-        "checkpoint_id": checkpoint_id,
-        "dataset_key": str(args.dataset),
-        "benchmark_family": FORECAST_FAMILY,
-        "backbone_name": BACKBONE_NAME_OTFLOW,
-        "train_steps": int(args.steps),
-        "train_budget_label": train_budget_label(int(args.steps)),
-        "seed": int(args.seed),
-        "history_len": int(spec.history_len),
-        "future_block_len": int(spec.future_block_len),
-        "cond_dim": 0,
-        "checkpoint_path": str(checkpoint_path),
-        "metadata_path": str(artifact_root / "checkpoint_metadata.json"),
-        "summary_path": str(artifact_root / "artifact_summary.json"),
-        "split_stats": {**_json_ready_stats(dict(splits.get("stats", {}))), "cond_dim": 0},
-        "cfg": cfg.to_dict(),
-    }
-    save_json(metadata, str(artifact_root / "checkpoint_metadata.json"))
-    save_json(metadata, str(artifact_root / "artifact_summary.json"))
-    manifest = materialize_backbone_manifest(budget_steps=(int(args.steps),), seed=int(args.seed))
     summary = {
         "status": "ready",
-        "checkpoint_path": str(checkpoint_path),
-        "metadata_path": str(artifact_root / "checkpoint_metadata.json"),
+        "checkpoint_path": str(final_artifact_root / "model.pt"),
+        "metadata_path": str(final_artifact_root / "checkpoint_metadata.json"),
         "manifest_path": str(project_backbone_matrix_root() / "backbone_manifest.json"),
         "manifest_ready_count": int(manifest.get("ready_count", 0)),
         "dataset": str(args.dataset),
         "train_steps": int(args.steps),
+        "checkpoint_steps": [int(value) for value in checkpoint_steps],
+        "exported": exported,
     }
-    save_json(summary, str(artifact_root / "training_summary.json"))
+    save_json(summary, str(final_artifact_root / "training_summary.json"))
     return summary
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train the standalone genODE SF traffic OT flow-matching backbone.")
+    parser = argparse.ArgumentParser(description="Train standalone genODE forecast OT flow-matching backbones.")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
     parser.add_argument("--device", default="auto")
@@ -179,6 +370,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--stride_train", type=int, default=1)
     parser.add_argument("--log_every", type=int, default=200)
+    parser.add_argument("--val_every", type=int, default=200)
+    parser.add_argument("--val_max_batches", type=int, default=None)
+    parser.add_argument(
+        "--checkpoint_steps",
+        default="",
+        help="Comma-separated budget milestones to export. Defaults to active forecast backbone budgets <= --steps.",
+    )
     parser.add_argument("--prepare_data", action="store_true", default=True)
     parser.add_argument("--no_prepare_data", dest="prepare_data", action="store_false")
     parser.add_argument("--use_amp", action="store_true", default=True)

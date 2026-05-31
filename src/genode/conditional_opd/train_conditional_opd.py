@@ -1116,7 +1116,7 @@ def train_conditional_opd(args: argparse.Namespace) -> Dict[str, Any]:
             "late_biased_demo_schedules": list(late_biased_demo_schedules),
             "late_biased_demo_weight": float(late_biased_demo_weight),
             "teacher_objective": "ranking_first_best_fixed_composite_with_huber_calibration",
-            "teacher_selection_protocol": "v4.2_option_a_bo_heldout_teacher_then_guarded_validation_student",
+            "teacher_selection_protocol": "pooled_bo_holdout_teacher_checkpoint",
             "teacher_loss_config": {
                 "rank_temperature": float(args.teacher_rank_temperature),
                 "regression_weight": float(args.teacher_regression_weight),
@@ -1453,7 +1453,7 @@ def train_conditional_opd(args: argparse.Namespace) -> Dict[str, Any]:
             rewards=rewards,
             teacher_fixed_schedule_keys=teacher_fixed_schedule_keys,
         ),
-        "teacher_selection_protocol": "v4.2_option_a_bo_heldout_teacher_then_guarded_validation_student",
+        "teacher_selection_protocol": "pooled_bo_holdout_teacher_checkpoint",
         "teacher_checkpoint_selection": teacher_checkpoint_selection,
         "teacher_losses": teacher_losses,
         "teacher_diagnostics": teacher_diagnostics,

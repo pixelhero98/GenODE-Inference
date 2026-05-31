@@ -49,7 +49,7 @@ genode-run-train20-v43-pooled-calibration
 
 It implements:
 
-- calibration pool `C = Train20 + full former_val`
+- calibration pool `C = 20% of (train + validation)`, sampled proportionally from each split
 - calibration seeds `0,1` by default
 - student and locked-test seeds `0,1,2` by default
 - fixed references `uniform,late_power_3,flowts_power_sampling,ays,gits,ots`
