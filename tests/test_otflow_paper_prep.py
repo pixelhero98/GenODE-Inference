@@ -50,34 +50,27 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertIn("Midpoint RK2", solver_names)
         self.assertIn("DPM++2M", solver_names)
 
-    def test_section_15_docs_describe_active_baselines_only(self) -> None:
-        docs_path = PROJECT_ROOT / "docs" / "train20_stratified_hash_opd_plan.html"
-        html = docs_path.read_text(encoding="utf-8")
+    def test_context_conditional_docs_describe_active_support_path(self) -> None:
+        docs_path = PROJECT_ROOT / "docs" / "context_conditional_opd.md"
+        text = docs_path.read_text(encoding="utf-8")
 
         for expected in (
+            "Context-Conditional OPD",
             "uniform",
             "late_power_3",
             "flowts_power_sampling",
             "ays",
             "gits",
             "ots",
-            "Euler",
-            "Heun",
-            "RK2",
-            "DPM++2M",
-            "4, 8, 12",
-            "CRPS",
-            "MASE",
-            "single scalar MLP teacher",
-            "20% train",
-            "temporal stratified hash",
-            "validation_tuning",
-            "behavior-balanced",
+            "SER",
+            "context-disjoint",
+            "series-disjoint",
+            "calibration guard",
+            "oracle_context",
+            "best_static",
         ):
-            self.assertIn(expected, html)
-
-        retired_text = html.lower()
-        self.assertNotIn("soft penalty", retired_text)
+            self.assertIn(expected, text)
+        retired_text = text.lower()
         self.assertNotIn("soft penalties", retired_text)
         self.assertNotIn("teacher ensemble", retired_text)
 

@@ -30,9 +30,8 @@ def crps_mase_reward(
 ) -> float:
     """Equal-weight lower-is-better CRPS/MASE utility with no soft regularizers.
 
-    ``crps_center`` and ``mase_center`` are reference metrics. In the Train20 OPD
-    protocol they are the best fixed-baseline metrics for the same solver/NFE
-    cell, not medians over generated candidates.
+    ``crps_center`` and ``mase_center`` are reference metrics for the same
+    solver/NFE cell, usually fixed-support baselines used in reporting.
     """
     c = _finite_positive(crps)
     m = _finite_positive(mase)
@@ -124,9 +123,8 @@ def build_fixed_reference_table(
 ) -> Dict[SettingKey, Dict[str, object]]:
     """Build per-setting best-fixed and uniform reference metrics.
 
-    V4.1 uses best fixed CRPS/MASE as the optimization reference and keeps the
-    uniform comparison as a diagnostic. Input rows may be seed-level or already
-    seed-aggregated; output values are based on seed means.
+    Input rows may be seed-level or already seed-aggregated; output values are
+    based on seed means.
     """
     fixed_keys = tuple(str(key) for key in fixed_schedule_keys)
     fixed_key_set = set(fixed_keys)
@@ -169,7 +167,7 @@ def reward_columns_for_row(
     *,
     eps: float = DEFAULT_REWARD_EPS,
 ) -> Dict[str, float | str | int | None]:
-    """Return materialized V4.1 utility/reference columns for one seed-mean row."""
+    """Return materialized utility/reference columns for one seed-mean row."""
     crps = _finite_positive(row["crps"])
     mase = _finite_positive(row["mase"])
     best_fixed_crps = _finite_positive(reference["best_fixed_crps"])
@@ -217,7 +215,7 @@ def attach_reward_columns(
     fixed_schedule_keys: Sequence[str],
     eps: float = DEFAULT_REWARD_EPS,
 ) -> List[Dict[str, object]]:
-    """Attach V4.1 best-fixed and uniform utility columns to seed-mean rows."""
+    """Attach best-fixed and uniform utility columns to seed-mean rows."""
     seed_mean_rows = _maybe_seed_mean_metric_rows(rows)
     references = build_fixed_reference_table(seed_mean_rows, fixed_schedule_keys=fixed_schedule_keys)
     out: List[Dict[str, object]] = []

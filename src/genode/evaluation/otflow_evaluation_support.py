@@ -328,6 +328,56 @@ def _parse_forecast_batch(batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[t
     raise ValueError(f"Unexpected forecast batch format with {len(batch)} items.")
 
 
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None or str(value) == "":
+        return None
+    return int(value)
+
+
+def _forecast_example_detail_metadata(
+    ds,
+    example_idx: int,
+    meta: Any,
+    *,
+    dataset_key: str,
+    split_phase: str,
+) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    if hasattr(ds, "example_metadata"):
+        try:
+            loaded = ds.example_metadata(int(example_idx))
+            if isinstance(loaded, Mapping):
+                metadata.update(dict(loaded))
+        except Exception:
+            metadata = {}
+    if isinstance(meta, Mapping):
+        metadata.update(dict(meta))
+    dataset = str(
+        dataset_key
+        or metadata.get("dataset")
+        or metadata.get("dataset_key")
+        or getattr(ds, "dataset_key", "")
+    )
+    split = str(
+        split_phase
+        or metadata.get("split_phase")
+        or metadata.get("split")
+        or getattr(ds, "split_name", "")
+    )
+    series_idx = int(metadata.get("series_idx", example_idx))
+    return {
+        "dataset": dataset,
+        "split_phase": split,
+        "example_idx": int(example_idx),
+        "series_id": str(metadata.get("series_id", f"series_{series_idx}")),
+        "series_idx": int(series_idx),
+        "target_t": int(metadata.get("target_t", example_idx)),
+        "history_start": metadata.get("history_start", ""),
+        "history_stop": metadata.get("history_stop", ""),
+        "target_stop": metadata.get("target_stop", ""),
+    }
+
+
 def selection_metric_for_family(benchmark_family: str) -> str:
     if str(benchmark_family) == FORECAST_FAMILY:
         return "crps"
@@ -1114,16 +1164,28 @@ def evaluate_forecast_schedule(
     time_grid: Sequence[float],
     num_eval_samples: int,
     seed: int,
+    target_nfe: Optional[int] = None,
+    scheduler_key: str = "",
+    dataset_key: str = "",
+    split_phase: str = "",
+    checkpoint_id: str = "",
     example_indices: Optional[Sequence[int]] = None,
     batch_size: int = 1,
     progress_label: str = "",
+    return_per_example_rows: bool = False,
+    return_context_embeddings: bool = False,
+    context_embedding_kind: str = "ctx_summary",
 ) -> Dict[str, Any]:
     device = cfg.train.device
     mse_values: List[float] = []
     crps_values: List[float] = []
     mase_values: List[float] = []
     latencies: List[float] = []
+    per_example_rows: List[Dict[str, Any]] = []
+    context_embeddings: Dict[str, List[float]] = {}
     effective_batch_size = max(1, int(batch_size))
+    if return_context_embeddings and hasattr(model, "eval"):
+        model.eval()
     backup = _apply_sample_overrides(model, cfg, solver=str(solver_name), time_grid=tuple(float(x) for x in time_grid))
     try:
         selected_examples = (
@@ -1137,6 +1199,26 @@ def evaluate_forecast_schedule(
         if invalid:
             raise ValueError(f"example_indices contains out-of-range entries: {invalid}")
         example_list = [int(idx) for idx in selected_examples.tolist()]
+        example_payload = [int(idx) for idx in selected_examples.tolist()]
+        encoded_protocol = json.dumps(
+            {
+                "batch_size": int(effective_batch_size),
+                "checkpoint_id": str(checkpoint_id),
+                "example_indices": example_payload,
+                "num_eval_samples": int(num_eval_samples),
+                "runtime_nfe": int(runtime_nfe),
+                "scheduler_key": str(scheduler_key),
+                "solver_name": str(solver_name),
+                "target_nfe": None if target_nfe is None else int(target_nfe),
+                "time_grid": [float(x) for x in time_grid],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        evaluation_protocol_hash = hashlib.sha256(encoded_protocol.encode("utf-8")).hexdigest()
+        chosen_examples_hash = hashlib.sha256(json.dumps(example_payload, separators=(",", ":")).encode("utf-8")).hexdigest()
+        realized_nfe = int(runtime_nfe) * int(solver_eval_multiplier(str(solver_name)))
+        resolved_target_nfe = int(realized_nfe if target_nfe is None else target_nfe)
         chunk_starts = list(range(0, len(example_list), effective_batch_size))
         progress_enabled = bool(str(progress_label).strip()) and len(chunk_starts) > 1
         with ProgressBar(len(chunk_starts), str(progress_label), enabled=progress_enabled) as progress:
@@ -1145,9 +1227,19 @@ def evaluate_forecast_schedule(
                 hist_rows: List[torch.Tensor] = []
                 true_blocks: List[np.ndarray] = []
                 mase_scales: List[float] = []
+                metadata_rows: List[Dict[str, Any]] = []
                 for example_idx in chunk_indices:
-                    hist_t, tgt_t, fut_t, _ = _parse_forecast_batch(ds[int(example_idx)])
+                    hist_t, tgt_t, fut_t, meta = _parse_forecast_batch(ds[int(example_idx)])
                     hist_rows.append(hist_t.float())
+                    metadata_rows.append(
+                        _forecast_example_detail_metadata(
+                            ds,
+                            int(example_idx),
+                            meta,
+                            dataset_key=str(dataset_key),
+                            split_phase=str(split_phase),
+                        )
+                    )
                     true_parts = [tgt_t[None, :]]
                     if fut_t is not None:
                         true_parts.append(fut_t)
@@ -1155,6 +1247,40 @@ def evaluate_forecast_schedule(
                     true_blocks.append(ds.denormalize_block(true_block_norm, int(example_idx)).reshape(-1))
                     mase_scales.append(float(ds.mase_denom(int(example_idx))))
                 hist = torch.stack(hist_rows, dim=0).to(device).float()
+                chunk_context_embeddings: Optional[np.ndarray] = None
+                if return_context_embeddings:
+                    backbone = getattr(model, "backbone", None)
+                    if backbone is None or not hasattr(backbone, "precompute"):
+                        raise ValueError("return_context_embeddings requires model.backbone.precompute(hist).")
+                    cache = backbone.precompute(hist)
+                    if not hasattr(cache, str(context_embedding_kind)):
+                        raise ValueError(f"Unknown context_embedding_kind={context_embedding_kind!r}.")
+                    embedding_tensor = getattr(cache, str(context_embedding_kind))
+                    if not torch.is_tensor(embedding_tensor) or embedding_tensor.ndim != 2:
+                        raise ValueError(f"Context embedding {context_embedding_kind!r} must be a rank-2 tensor.")
+                    chunk_context_embeddings = embedding_tensor.detach().cpu().numpy().astype(np.float32)
+                chunk_context_ids: List[str] = []
+                if return_per_example_rows or return_context_embeddings:
+                    from genode.conditional_opd.context_conditional import stable_context_id
+
+                    for metadata in metadata_rows:
+                        chunk_context_ids.append(
+                            stable_context_id(
+                                dataset=str(metadata["dataset"]),
+                                split_phase=str(metadata["split_phase"]),
+                                example_idx=int(metadata["example_idx"]),
+                                series_id=str(metadata["series_id"]),
+                                series_idx=int(metadata["series_idx"]),
+                                target_t=int(metadata["target_t"]),
+                                history_start=_optional_int(metadata.get("history_start")),
+                                history_stop=_optional_int(metadata.get("history_stop")),
+                            )
+                        )
+                    if chunk_context_embeddings is not None:
+                        for context_idx, context_id in enumerate(chunk_context_ids):
+                            context_embeddings[context_id] = [
+                                float(value) for value in chunk_context_embeddings[context_idx].astype(np.float32).tolist()
+                            ]
                 chunk_draws: List[np.ndarray] = []
                 for sample_idx in range(int(num_eval_samples)):
                     seed_all(int(seed) + 1_000_000 * int(chunk_start) + int(sample_idx))
@@ -1176,39 +1302,88 @@ def evaluate_forecast_schedule(
                 for row_idx, true_block_raw in enumerate(true_blocks):
                     samples = samples_by_example[:, row_idx, :]
                     pred_mean = samples.mean(axis=0)
-                    mse_values.append(float(np.mean((pred_mean - true_block_raw) ** 2)))
-                    crps_values.append(_empirical_crps(samples, true_block_raw))
-                    mase_values.append(_point_mase(pred_mean, true_block_raw, mase_scales[row_idx]))
+                    mse = float(np.mean((pred_mean - true_block_raw) ** 2))
+                    crps = _empirical_crps(samples, true_block_raw)
+                    mase = _point_mase(pred_mean, true_block_raw, mase_scales[row_idx])
+                    mse_values.append(mse)
+                    crps_values.append(crps)
+                    mase_values.append(mase)
+                    if return_per_example_rows:
+                        from genode.conditional_opd.context_conditional import schedule_grid_hash
+
+                        metadata = metadata_rows[row_idx]
+                        context_id = chunk_context_ids[row_idx]
+                        sample_seed_values = [
+                            int(seed) + 1_000_000 * int(chunk_start) + int(sample_idx)
+                            for sample_idx in range(int(num_eval_samples))
+                        ]
+                        row_signature_payload = {
+                            "context_id": str(context_id),
+                            "evaluation_protocol_hash": str(evaluation_protocol_hash),
+                            "scheduler_key": str(scheduler_key),
+                            "seed": int(seed),
+                            "solver_key": str(solver_name),
+                            "target_nfe": int(resolved_target_nfe),
+                        }
+                        row_signature = hashlib.sha256(
+                            json.dumps(row_signature_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                        ).hexdigest()
+                        per_example_rows.append(
+                            {
+                                "dataset": str(metadata["dataset"]),
+                                "split_phase": str(metadata["split_phase"]),
+                                "seed": int(seed),
+                                "solver_key": str(solver_name),
+                                "target_nfe": int(resolved_target_nfe),
+                                "runtime_nfe": int(runtime_nfe),
+                                "realized_nfe": int(realized_nfe),
+                                "scheduler_key": str(scheduler_key),
+                                "schedule_grid_hash": schedule_grid_hash(time_grid),
+                                "example_idx": int(metadata["example_idx"]),
+                                "series_id": str(metadata["series_id"]),
+                                "series_idx": int(metadata["series_idx"]),
+                                "target_t": int(metadata["target_t"]),
+                                "history_start": metadata.get("history_start", ""),
+                                "history_stop": metadata.get("history_stop", ""),
+                                "target_stop": metadata.get("target_stop", ""),
+                                "context_id": str(context_id),
+                                "context_embedding_id": str(context_id) if return_context_embeddings else "",
+                                "checkpoint_id": str(checkpoint_id),
+                                "crps": float(crps),
+                                "mase": float(mase),
+                                "mse": float(mse),
+                                "num_eval_samples": int(num_eval_samples),
+                                "eval_horizon": int(getattr(ds, "horizon", 1)),
+                                "batch_size": int(effective_batch_size),
+                                "sample_seed_start": int(sample_seed_values[0]) if sample_seed_values else int(seed),
+                                "sample_seed_values_json": json.dumps(sample_seed_values, separators=(",", ":")),
+                                "chosen_examples_hash": str(chosen_examples_hash),
+                                "evaluation_protocol_hash": str(evaluation_protocol_hash),
+                                "row_signature": str(row_signature),
+                            }
+                        )
                 progress.update()
     finally:
         _restore_sample_overrides(model, cfg, backup)
     latency_arr = np.asarray(latencies, dtype=np.float64)
-    example_payload = [int(idx) for idx in selected_examples.tolist()]
-    encoded_protocol = json.dumps(
-        {
-            "batch_size": int(effective_batch_size),
-            "example_indices": example_payload,
-            "num_eval_samples": int(num_eval_samples),
-            "runtime_nfe": int(runtime_nfe),
-            "solver_name": str(solver_name),
-            "time_grid": [float(x) for x in time_grid],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    chosen_examples_hash = hashlib.sha256(json.dumps(example_payload, separators=(",", ":")).encode("utf-8")).hexdigest()
-    return {
+    result = {
         "crps": float(np.mean(np.asarray(crps_values, dtype=np.float64))) if crps_values else float("nan"),
         "mse": float(np.mean(np.asarray(mse_values, dtype=np.float64))) if mse_values else float("nan"),
         "mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else float("nan"),
         "latency_ms_per_sample": float(1000.0 * latency_arr.mean()) if latency_arr.size > 0 else float("nan"),
         "eval_examples": int(len(example_payload)),
         "eval_horizon": int(getattr(ds, "horizon", 1)),
-        "evaluation_protocol_hash": hashlib.sha256(encoded_protocol.encode("utf-8")).hexdigest(),
+        "evaluation_protocol_hash": str(evaluation_protocol_hash),
         "chosen_examples_hash": str(chosen_examples_hash),
         "num_eval_samples": int(num_eval_samples),
-        "realized_nfe": int(runtime_nfe) * int(solver_eval_multiplier(str(solver_name))),
+        "realized_nfe": int(realized_nfe),
     }
+    if return_per_example_rows:
+        result["per_example_rows"] = per_example_rows
+    if return_context_embeddings:
+        result["context_embeddings"] = context_embeddings
+        result["context_embedding_kind"] = str(context_embedding_kind)
+    return result
 
 
 __all__ = [

@@ -1,6 +1,6 @@
 # genODE
 
-genODE contains source code for schedule optimization on OTFlow forecasting backbones. The active Train20 workflow is V4.3 pooled calibration: fixed schedules, SER-PTG, and BO candidates are all re-evaluated on one calibration distribution before training a ranking-first teacher and a SER-initialized student.
+genODE contains source code for context-conditional schedule selection on OTFlow forecasting backbones. The active OPD workflow trains a frozen-backbone teacher and categorical student over measured fixed/SER support schedules using per-context rows and frozen context embeddings.
 
 ## Source Layout
 
@@ -8,7 +8,7 @@ genODE contains source code for schedule optimization on OTFlow forecasting back
 - `src/genode/models/`: OTFlow configuration, conditioning, backbone modules, training, and model utilities.
 - `src/genode/schedule_transfer/`: fixed schedule grids, registries, table helpers, signal traces, and diagnostics.
 - `src/genode/evaluation/`: checkpoint loading, schedule evaluation, solver mappings, and sampling helpers.
-- `src/genode/conditional_opd/`: conditional OPD teacher/student models, pooled calibration, SER-PTG references, and BO candidates.
+- `src/genode/conditional_opd/`: context-conditional OPD teacher/student models, SER-PTG references, fixed/SER schedule evaluation, and locked-test reporting.
 - `scripts/`: thin command-line wrappers for packaged entry points.
 
 ## Installation
@@ -39,49 +39,64 @@ The default backbone manifest path is:
 outputs/backbone_matrix/backbone_manifest.json
 ```
 
-## V4.3 Pooled Calibration
+## Context-Conditional OPD
 
 The main public entry point is:
 
 ```bash
-genode-run-train20-v43-pooled-calibration
+genode-train-context-conditional-opd
 ```
 
-It implements:
+This path implements:
 
-- calibration pool `C = 20% of (train + validation)`, sampled proportionally from each split
-- calibration seeds `0,1` by default
-- student and locked-test seeds `0,1,2` by default
-- fixed references `uniform,late_power_3,flowts_power_sampling,ays,gits,ots`
-- SER-PTG teacher anchor and student initialization
-- one 32-family BO candidate buffer
-- teacher utility selection under a hard geometry guard
+- per-example fixed/SER context rows with `series_id`, `target_t`, and stable `context_id`
+- frozen context embeddings from the frozen forecast backbone
+- uniform-anchored rewards paired inside exact context/seed/solver/NFE groups
+- teacher checkpoint selection by context-disjoint and series-disjoint top-1/top-2 support diagnostics
+- categorical student training with teacher-guided top-1/top-2 support CE
+- calibration-holdout non-regression guard against the best static fixed/SER support per solver/NFE
+- calibration-holdout fixed-support oracle headroom diagnostics
 
-Dry run:
+The calibration row/embedding artifacts are intentionally reusable. Once fixed/SER
+context rows and context embeddings exist, future teacher/student changes can be
+verified by rerunning only the trainer and reporter:
 
 ```bash
-genode-run-train20-v43-pooled-calibration --skip_locked_test
+genode-train-context-conditional-opd \
+  --rows_csv outputs/context_calibration_rows.csv \
+  --context_embeddings_npz outputs/context_embeddings.npz \
+  --schedule_summary_json outputs/ser_ptg_schedule_summary.json \
+  --out_dir outputs/context_policy \
+  --support_schedule_keys uniform,late_power_3,flowts_power_sampling,ays,gits,ots,ser_ptg_local_defect_eta005
 ```
 
-Full run:
+Locked-test reporting is reporting-only and applies the frozen calibration guard
+stored in the student checkpoint:
 
 ```bash
-genode-run-train20-v43-pooled-calibration --allow_execute
+genode-report-context-locked-test \
+  --context_student_checkpoint outputs/context_policy/context_student.pt \
+  --training_summary outputs/context_policy/context_conditional_summary.json \
+  --locked_context_rows outputs/locked_fixed_context_rows.csv,outputs/locked_ser_context_rows.csv \
+  --locked_context_embeddings_npz outputs/locked_context_embeddings.npz \
+  --out_dir outputs/context_locked_report
 ```
 
-Useful explicit settings:
+To generate reusable fixed/SER context rows, run schedule evaluation with context
+row writing enabled:
 
 ```bash
-genode-run-train20-v43-pooled-calibration \
-  --dataset san_francisco_traffic \
-  --solver_names euler,heun,midpoint_rk2,dpmpp2m \
-  --target_nfe_values 4,8,12 \
-  --device auto \
-  --forecast_eval_batch_size 64 \
-  --allow_execute
+genode-run-schedules \
+  --forecast_datasets solar_energy_10m \
+  --split_phase train_tuning \
+  --baseline_scheduler_names uniform,late_power_3,flowts_power_sampling,ays,gits,ots \
+  --write_forecast_context_rows \
+  --device auto
 ```
 
-`--device auto` uses CUDA when PyTorch reports CUDA availability and CPU otherwise. Use `--strict_v43_protocol` to reject non-canonical seed sets.
+For a larger context pool, pass an explicit trainer sample count such as
+`--context_sample_count 288` after generating enough per-context rows. `--device
+auto` uses CUDA when PyTorch reports CUDA availability and CPU otherwise.
 
 ## Other Entry Points
 
@@ -89,7 +104,7 @@ genode-run-train20-v43-pooled-calibration \
 genode-train-backbone --dataset san_francisco_traffic --device auto
 genode-run-schedules --forecast_datasets san_francisco_traffic --conditional_generation_datasets '' --split_phase validation_tuning --device auto
 genode-build-ser-ptg-reference --dataset san_francisco_traffic --device auto
-genode-evaluate-schedule-summary --schedule_summary outputs/example/selected_schedule_summary.json --split_phase locked_test --device auto
+genode-evaluate-schedule-summary --schedule_summary outputs/example/ser_schedule_summary.json --split_phase validation_tuning --write_context_rows --device auto
 ```
 
 ## Development Checks

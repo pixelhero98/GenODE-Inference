@@ -407,7 +407,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--reference_macro_factor", type=float, default=4.0)
     parser.add_argument(
         "--out_dir",
-        default=str(project_outputs_root() / "train20_v43_pooled_one_round_calibration" / "ser_ptg_reference"),
+        default=str(project_outputs_root() / "ser_ptg_reference"),
     )
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
     parser.add_argument("--shared_backbone_root", default=str(DEFAULT_SHARED_BACKBONE_ROOT))

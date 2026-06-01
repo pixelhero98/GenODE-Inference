@@ -68,6 +68,7 @@ from genode.data.otflow_paths import (
 )
 from genode.models.otflow_train_val import save_json
 from genode.runtime import resolve_torch_device
+from genode.conditional_opd.context_conditional import load_context_embedding_table, save_context_embedding_table
 
 RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_v3"
 DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
@@ -154,6 +155,46 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "train_tuning_target_examples",
     "train_tuning_train_split_fraction",
     "train_tuning_val_split_fraction",
+)
+
+FORECAST_CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
+    "benchmark_family",
+    "parent_row_signature",
+    "protocol_hash",
+    "dataset",
+    "split_phase",
+    "seed",
+    "solver_key",
+    "target_nfe",
+    "runtime_nfe",
+    "realized_nfe",
+    "scheduler_key",
+    "schedule_grid_hash",
+    "example_idx",
+    "series_id",
+    "series_idx",
+    "target_t",
+    "history_start",
+    "history_stop",
+    "target_stop",
+    "context_id",
+    "context_embedding_id",
+    "checkpoint_id",
+    "crps",
+    "mase",
+    "mse",
+    "num_eval_samples",
+    "eval_horizon",
+    "batch_size",
+    "sample_seed_start",
+    "sample_seed_values_json",
+    "chosen_examples_hash",
+    "evaluation_protocol_hash",
+    "row_signature",
+    "train_tuning_fraction",
+    "train_tuning_seed",
+    "train_tuning_strata",
+    "train_tuning_sampler",
 )
 
 
@@ -272,6 +313,8 @@ def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
         "dataset_seed": int(cli_args.dataset_seed),
         "num_eval_samples": int(cli_args.num_eval_samples),
         "forecast_eval_batch_size": int(cli_args.forecast_eval_batch_size),
+        "write_forecast_context_rows": bool(getattr(cli_args, "write_forecast_context_rows", False)),
+        "context_embedding_kind": str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
         "eval_horizon": int(cli_args.eval_horizon),
         "eval_windows_val": int(cli_args.eval_windows_val),
         "eval_windows_test": int(cli_args.eval_windows_test),
@@ -325,6 +368,27 @@ def _write_row_csv(csv_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             writer.writerow({field: row.get(field) for field in ROW_RECORD_FIELDS})
 
 
+def _write_context_row_csv(csv_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(FORECAST_CONTEXT_ROW_FIELDS))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field) for field in FORECAST_CONTEXT_ROW_FIELDS})
+
+
+def _load_context_rows(csv_path: Path) -> Dict[str, Dict[str, Any]]:
+    rows: Dict[str, Dict[str, Any]] = {}
+    if not csv_path.exists():
+        return rows
+    with csv_path.open("r", newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            signature = str(row.get("row_signature", "")).strip()
+            if signature:
+                rows[signature] = dict(row)
+    return rows
+
+
 def _load_rows(jsonl_path: Path, *, protocol_hash: str) -> Dict[Tuple[Any, ...], Dict[str, Any]]:
     rows: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     if not jsonl_path.exists():
@@ -345,6 +409,8 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
     out_root.mkdir(parents=True, exist_ok=True)
     jsonl_path = out_root / str(getattr(cli_args, "row_jsonl_name", "rows.jsonl"))
     csv_path = out_root / str(getattr(cli_args, "row_csv_name", "rows.csv"))
+    context_csv_path = out_root / str(getattr(cli_args, "forecast_context_row_csv_name", "forecast_context_rows.csv"))
+    context_embeddings_path = out_root / str(getattr(cli_args, "forecast_context_embeddings_npz_name", "forecast_context_embeddings.npz"))
     protocol_hash = _protocol_config_fingerprint(cli_args)
     run_config_path = out_root / "run_config.json"
     previous_config = json.loads(run_config_path.read_text(encoding="utf-8")) if run_config_path.exists() else {}
@@ -363,7 +429,23 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
     )
     if rows_by_key:
         _write_row_csv(csv_path, list(rows_by_key.values()))
-    return {"out_root": out_root, "jsonl_path": jsonl_path, "csv_path": csv_path, "fh": fh, "rows_by_key": rows_by_key, "protocol_hash": protocol_hash}
+    context_rows_by_signature = _load_context_rows(context_csv_path) if can_resume else {}
+    existing_context_embeddings = load_context_embedding_table(context_embeddings_path) if can_resume and context_embeddings_path.exists() else {}
+    if context_rows_by_signature:
+        _write_context_row_csv(context_csv_path, list(context_rows_by_signature.values()))
+    return {
+        "out_root": out_root,
+        "jsonl_path": jsonl_path,
+        "csv_path": csv_path,
+        "context_csv_path": context_csv_path,
+        "context_embeddings_path": context_embeddings_path,
+        "fh": fh,
+        "rows_by_key": rows_by_key,
+        "context_rows_by_signature": context_rows_by_signature,
+        "context_embeddings": existing_context_embeddings,
+        "context_embedding_metadata": {},
+        "protocol_hash": protocol_hash,
+    }
 
 
 def _append_row_record(row_recorder: Mapping[str, Any], row: Mapping[str, Any]) -> None:
@@ -373,6 +455,32 @@ def _append_row_record(row_recorder: Mapping[str, Any], row: Mapping[str, Any]) 
     row_recorder["fh"].write(json.dumps(row_dict, sort_keys=True) + "\n")
     row_recorder["fh"].flush()
     _write_row_csv(Path(row_recorder["csv_path"]), list(row_recorder["rows_by_key"].values()))
+
+
+def _append_forecast_context_records(
+    row_recorder: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    context_embeddings: Mapping[str, Sequence[float]],
+    metadata: Mapping[str, Any],
+) -> None:
+    if not rows and not context_embeddings:
+        return
+    rows_by_signature = row_recorder["context_rows_by_signature"]
+    for row in rows:
+        signature = str(row.get("row_signature", "")).strip()
+        if not signature:
+            continue
+        rows_by_signature[signature] = dict(row)
+    row_recorder["context_embeddings"].update({str(key): list(value) for key, value in context_embeddings.items()})
+    row_recorder["context_embedding_metadata"].update(dict(metadata))
+    _write_context_row_csv(Path(row_recorder["context_csv_path"]), list(rows_by_signature.values()))
+    if row_recorder["context_embeddings"]:
+        save_context_embedding_table(
+            Path(row_recorder["context_embeddings_path"]),
+            row_recorder["context_embeddings"],
+            metadata=row_recorder["context_embedding_metadata"],
+        )
 
 
 def _existing_complete_row(row_recorder: Mapping[str, Any], row_key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
@@ -577,12 +685,20 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                             cfg,
                             solver_name=str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
                             runtime_nfe=int(runtime_nfe),
+                            target_nfe=int(target_nfe),
                             time_grid=details["time_grid"],
                             num_eval_samples=int(cli_args.num_eval_samples),
                             seed=int(eval_seed),
+                            scheduler_key=str(scheduler_key),
+                            dataset_key=str(dataset),
+                            split_phase=str(split_phase),
+                            checkpoint_id=str(checkpoint["checkpoint_id"]),
                             example_indices=chosen_examples,
                             batch_size=int(cli_args.forecast_eval_batch_size),
                             progress_label=f"{split_phase} {dataset} {scheduler_key} seed={seed} {solver_key}/{target_nfe}",
+                            return_per_example_rows=bool(getattr(cli_args, "write_forecast_context_rows", False)),
+                            return_context_embeddings=bool(getattr(cli_args, "write_forecast_context_rows", False)),
+                            context_embedding_kind=str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
                         )
                         if scheduler_key != UNIFORM_SCHEDULER_KEY and cell_uniform_metrics is not None:
                             metrics = dict(metrics)
@@ -604,6 +720,42 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                 }
                             )
                         _append_row_record(row_recorder, row)
+                        if bool(getattr(cli_args, "write_forecast_context_rows", False)):
+                            context_rows = []
+                            for detail_row in list(metrics.get("per_example_rows", []) or []):
+                                copied_detail = dict(detail_row)
+                                copied_detail.update(
+                                    {
+                                        "benchmark_family": FORECAST_FAMILY,
+                                        "parent_row_signature": str(case["row_signature"]),
+                                        "protocol_hash": str(row_recorder["protocol_hash"]),
+                                    }
+                                )
+                                if str(split_phase) == TRAIN_TUNING_PHASE:
+                                    copied_detail.update(
+                                        {
+                                            "train_tuning_fraction": float(cli_args.eval_train_fraction),
+                                            "train_tuning_seed": int(cli_args.train_tuning_seed) + int(seed) + 1_000 * dataset_idx,
+                                            "train_tuning_strata": int(cli_args.train_tuning_strata),
+                                            "train_tuning_sampler": train_tuning_sampler_key(str(cli_args.train_tuning_sampling_mode)),
+                                        }
+                                    )
+                                context_rows.append(copied_detail)
+                            _append_forecast_context_records(
+                                row_recorder,
+                                context_rows,
+                                context_embeddings=dict(metrics.get("context_embeddings", {}) or {}),
+                                metadata={
+                                    "checkpoint_id": str(checkpoint["checkpoint_id"]),
+                                    "dataset": str(dataset),
+                                    "split_phase": str(split_phase),
+                                    "context_embedding_kind": str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
+                                    "history_len": int(getattr(cfg, "history_len", 0)),
+                                    "horizon": int(getattr(eval_ds, "horizon", 1)),
+                                    "chosen_examples_hash": str(metrics.get("chosen_examples_hash", "")),
+                                    "evaluation_protocol_hash": str(metrics.get("evaluation_protocol_hash", "")),
+                                },
+                            )
                         rows.append(row)
                         if scheduler_key == UNIFORM_SCHEDULER_KEY:
                             cell_uniform_metrics = row
@@ -803,6 +955,10 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--dataset_seed", type=int, default=0)
     ap.add_argument("--num_eval_samples", type=int, default=5)
     ap.add_argument("--forecast_eval_batch_size", type=int, default=64)
+    ap.add_argument("--write_forecast_context_rows", action="store_true", default=False)
+    ap.add_argument("--forecast_context_row_csv_name", type=str, default="forecast_context_rows.csv")
+    ap.add_argument("--forecast_context_embeddings_npz_name", type=str, default="forecast_context_embeddings.npz")
+    ap.add_argument("--context_embedding_kind", type=str, choices=("ctx_summary", "summary"), default="ctx_summary")
     ap.add_argument("--calibration_trace_samples", type=int, default=1)
     ap.add_argument("--eval_horizon", type=int, default=0)
     ap.add_argument("--eval_train_fraction", type=float, default=0.20)

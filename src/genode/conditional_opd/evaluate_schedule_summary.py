@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from genode.conditional_opd.models import validate_time_grid
+from genode.conditional_opd.context_conditional import load_context_embedding_table, save_context_embedding_table
 from genode.conditional_opd.objectives import attach_reward_columns, crps_mase_reward, rewards_by_setting, seed_mean_metric_rows
 from genode.conditional_opd.ser_ptg_reference import SER_PTG_SCHEDULE_KEY, grid_geometry
 from genode.data.otflow_paths import (
@@ -128,6 +129,46 @@ SCHEDULE_ROW_FIELDS: Tuple[str, ...] = (
     "validity_flags_json",
 )
 
+CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
+    "benchmark_family",
+    "parent_row_signature",
+    "protocol_hash",
+    "dataset",
+    "split_phase",
+    "seed",
+    "solver_key",
+    "target_nfe",
+    "runtime_nfe",
+    "realized_nfe",
+    "scheduler_key",
+    "schedule_grid_hash",
+    "example_idx",
+    "series_id",
+    "series_idx",
+    "target_t",
+    "history_start",
+    "history_stop",
+    "target_stop",
+    "context_id",
+    "context_embedding_id",
+    "checkpoint_id",
+    "crps",
+    "mase",
+    "mse",
+    "num_eval_samples",
+    "eval_horizon",
+    "batch_size",
+    "sample_seed_start",
+    "sample_seed_values_json",
+    "chosen_examples_hash",
+    "evaluation_protocol_hash",
+    "row_signature",
+    "train_tuning_fraction",
+    "train_tuning_seed",
+    "train_tuning_strata",
+    "train_tuning_sampler",
+)
+
 
 def _parse_csv(text: str) -> List[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
@@ -213,6 +254,8 @@ def _protocol_hash(args: argparse.Namespace) -> str:
         "target_nfe_values": _parse_int_csv(str(args.target_nfe_values)),
         "num_eval_samples": int(args.num_eval_samples),
         "forecast_eval_batch_size": int(args.forecast_eval_batch_size),
+        "write_context_rows": bool(getattr(args, "write_context_rows", False)),
+        "context_embedding_kind": str(getattr(args, "context_embedding_kind", "ctx_summary")),
         "eval_train_fraction": float(getattr(args, "eval_train_fraction", 0.20)),
         "train_tuning_seed": int(getattr(args, "train_tuning_seed", 0)),
         "train_tuning_strata": int(getattr(args, "train_tuning_strata", 20)),
@@ -381,6 +424,27 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({field: row.get(field) for field in SCHEDULE_ROW_FIELDS})
+
+
+def _write_context_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(CONTEXT_ROW_FIELDS))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field) for field in CONTEXT_ROW_FIELDS})
+
+
+def _load_context_rows(path: Path) -> Dict[str, Dict[str, Any]]:
+    rows: Dict[str, Dict[str, Any]] = {}
+    if not path.exists():
+        return rows
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            signature = str(row.get("row_signature", "")).strip()
+            if signature:
+                rows[signature] = dict(row)
+    return rows
 
 
 def _schedule_row(
@@ -932,9 +996,17 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
     row_jsonl_name = str(args.row_jsonl_name or default_jsonl)
     csv_path = out_dir / row_csv_name
     jsonl_path = out_dir / row_jsonl_name
+    context_csv_path = out_dir / str(args.context_row_csv_name or f"context_{row_csv_name}")
+    context_embeddings_path = out_dir / str(args.context_embeddings_npz_name or "context_embeddings.npz")
     rows_by_key = _load_existing_rows(jsonl_path, protocol_hash=protocol_hash)
     if rows_by_key:
         _write_csv(csv_path, list(rows_by_key.values()))
+    context_rows_by_signature = _load_context_rows(context_csv_path) if bool(args.write_context_rows) else {}
+    context_embeddings: Dict[str, Sequence[float]] = (
+        load_context_embedding_table(context_embeddings_path)
+        if bool(args.write_context_rows) and context_embeddings_path.exists()
+        else {}
+    )
     dataset_root = resolve_project_path(str(args.dataset_root))
     shared_backbone_root = resolve_project_path(str(args.shared_backbone_root))
     device = resolve_torch_device(str(args.device))
@@ -993,12 +1065,20 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                             cfg,
                             solver_name=str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
                             runtime_nfe=int(prediction["runtime_nfe"]),
+                            target_nfe=int(target_nfe),
                             time_grid=prediction["time_grid"],
                             num_eval_samples=int(args.num_eval_samples),
                             seed=int(eval_seed),
+                            scheduler_key=str(schedule_key),
+                            dataset_key=str(args.dataset),
+                            split_phase=str(split_phase),
+                            checkpoint_id=str(checkpoint["checkpoint_id"]),
                             example_indices=chosen_examples,
                             batch_size=int(args.forecast_eval_batch_size),
                             progress_label=f"{split_phase} {schedule_key} seed={seed} {solver_key}/{target_nfe}",
+                            return_per_example_rows=bool(args.write_context_rows),
+                            return_context_embeddings=bool(args.write_context_rows),
+                            context_embedding_kind=str(args.context_embedding_kind),
                         )
                         row = _schedule_row(
                             seed=int(seed),
@@ -1027,6 +1107,41 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                         fh.write(json.dumps(row, sort_keys=True) + "\n")
                         fh.flush()
                         _write_csv(csv_path, list(rows_by_key.values()))
+                        if bool(args.write_context_rows):
+                            for detail_row in list(metrics.get("per_example_rows", []) or []):
+                                copied_detail = dict(detail_row)
+                                copied_detail.update(
+                                    {
+                                        "benchmark_family": FORECAST_FAMILY,
+                                        "parent_row_signature": str(row.get("row_signature", "")),
+                                        "protocol_hash": str(protocol_hash),
+                                    }
+                                )
+                                if split_phase == TRAIN_TUNING_PHASE:
+                                    copied_detail.update(
+                                        {
+                                            "train_tuning_fraction": float(args.eval_train_fraction),
+                                            "train_tuning_seed": int(args.train_tuning_seed) + int(seed),
+                                            "train_tuning_strata": int(args.train_tuning_strata),
+                                            "train_tuning_sampler": train_tuning_sampler_key(str(args.train_tuning_sampling_mode)),
+                                        }
+                                    )
+                                context_rows_by_signature[str(copied_detail["row_signature"])] = copied_detail
+                            context_embeddings.update(dict(metrics.get("context_embeddings", {}) or {}))
+                            _write_context_csv(context_csv_path, list(context_rows_by_signature.values()))
+                            if context_embeddings:
+                                save_context_embedding_table(
+                                    context_embeddings_path,
+                                    context_embeddings,
+                                    metadata={
+                                        "checkpoint_id": str(checkpoint["checkpoint_id"]),
+                                        "dataset": str(args.dataset),
+                                        "split_phase": str(split_phase),
+                                        "context_embedding_kind": str(args.context_embedding_kind),
+                                        "chosen_examples_hash": str(metrics.get("chosen_examples_hash", "")),
+                                        "evaluation_protocol_hash": str(metrics.get("evaluation_protocol_hash", "")),
+                                    },
+                                )
                         progress.update()
     rows = list(rows_by_key.values())
     summary: Dict[str, Any] = {
@@ -1049,6 +1164,10 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
         ),
         "row_csv": str(csv_path),
         "row_jsonl": str(jsonl_path),
+        "context_row_csv": str(context_csv_path) if bool(args.write_context_rows) else "",
+        "context_embeddings_npz": str(context_embeddings_path) if bool(args.write_context_rows) else "",
+        "context_row_count": int(len(context_rows_by_signature)) if bool(args.write_context_rows) else 0,
+        "context_embedding_count": int(len(context_embeddings)) if bool(args.write_context_rows) else 0,
         "schedule_summaries": _aggregate_schedule_rows(rows),
     }
     if split_phase == TRAIN_TUNING_PHASE:
@@ -1140,6 +1259,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--target_nfe_values", default=",".join(str(x) for x in DEFAULT_TARGET_NFES))
     parser.add_argument("--num_eval_samples", type=int, default=5)
     parser.add_argument("--forecast_eval_batch_size", type=int, default=64)
+    parser.add_argument("--write_context_rows", action="store_true", default=False)
+    parser.add_argument("--context_row_csv_name", default="")
+    parser.add_argument("--context_embeddings_npz_name", default="")
+    parser.add_argument("--context_embedding_kind", choices=("ctx_summary", "summary"), default="ctx_summary")
     parser.add_argument("--eval_train_fraction", type=float, default=0.20)
     parser.add_argument("--train_tuning_seed", type=int, default=0)
     parser.add_argument("--train_tuning_strata", type=int, default=20)

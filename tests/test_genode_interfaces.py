@@ -28,8 +28,8 @@ class GenODEInterfaceTests(unittest.TestCase):
             {
                 "genode-train-backbone",
                 "genode-run-schedules",
-                "genode-train-conditional-opd",
-                "genode-run-train20-v43-pooled-calibration",
+                "genode-train-context-conditional-opd",
+                "genode-report-context-locked-test",
                 "genode-build-ser-ptg-reference",
                 "genode-evaluate-schedule-summary",
                 "genode-build-hardness-figure",
@@ -38,12 +38,9 @@ class GenODEInterfaceTests(unittest.TestCase):
         )
         self.assertEqual(scripts["genode-train-backbone"], "genode.training.train_backbone:main")
         self.assertEqual(scripts["genode-run-schedules"], "genode.evaluation.diffusion_flow_time_reparameterization:main")
-        self.assertEqual(scripts["genode-train-conditional-opd"], "genode.conditional_opd.train_conditional_opd:main")
-        self.assertEqual(
-            scripts["genode-run-train20-v43-pooled-calibration"],
-            "genode.conditional_opd.train20_v43_pooled_calibration:main",
-        )
         self.assertEqual(scripts["genode-build-ser-ptg-reference"], "genode.conditional_opd.ser_ptg_reference:main")
+        self.assertEqual(scripts["genode-train-context-conditional-opd"], "genode.conditional_opd.train_context_conditional_opd:main")
+        self.assertEqual(scripts["genode-report-context-locked-test"], "genode.conditional_opd.report_context_locked_test:main")
         self.assertEqual(scripts["genode-evaluate-schedule-summary"], "genode.conditional_opd.evaluate_schedule_summary:main")
         for target in scripts.values():
             module_name, func_name = str(target).split(":", 1)

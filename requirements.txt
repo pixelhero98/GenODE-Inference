@@ -2,7 +2,5 @@ numpy==2.4.2
 scipy>=1.11
 matplotlib>=3.8,<4
 torch==2.10.0
-botorch>=0.17
-gpytorch>=1.15
 wfdb>=4.1
 pyedflib>=0.1.38

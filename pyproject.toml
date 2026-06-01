@@ -15,8 +15,6 @@ dependencies = [
   "scipy>=1.11",
   "matplotlib>=3.8,<4",
   "torch==2.10.0",
-  "botorch>=0.17",
-  "gpytorch>=1.15",
   "wfdb>=4.1",
   "pyedflib>=0.1.38",
 ]
@@ -24,8 +22,8 @@ dependencies = [
 [project.scripts]
 genode-run-schedules = "genode.evaluation.diffusion_flow_time_reparameterization:main"
 genode-train-backbone = "genode.training.train_backbone:main"
-genode-train-conditional-opd = "genode.conditional_opd.train_conditional_opd:main"
-genode-run-train20-v43-pooled-calibration = "genode.conditional_opd.train20_v43_pooled_calibration:main"
+genode-train-context-conditional-opd = "genode.conditional_opd.train_context_conditional_opd:main"
+genode-report-context-locked-test = "genode.conditional_opd.report_context_locked_test:main"
 genode-build-ser-ptg-reference = "genode.conditional_opd.ser_ptg_reference:main"
 genode-evaluate-schedule-summary = "genode.conditional_opd.evaluate_schedule_summary:main"
 genode-build-hardness-figure = "genode.visualization.build_hardness_mismatch_figure:main"
