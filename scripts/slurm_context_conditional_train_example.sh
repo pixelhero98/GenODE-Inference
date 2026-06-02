@@ -50,5 +50,4 @@ python -m genode.conditional_opd.train_context_conditional_opd \
   --series_holdout_fraction "${GENODE_SERIES_HOLDOUT_FRACTION:-0.20}" \
   --teacher_checkpoint_every "${GENODE_TEACHER_CHECKPOINT_EVERY:-100}" \
   --teacher_steps "${GENODE_TEACHER_STEPS:-500}" \
-  --student_steps "${GENODE_STUDENT_STEPS:-500}" \
-  --support_choice_margin "${GENODE_SUPPORT_CHOICE_MARGIN:-0.001}"
+  --student_steps "${GENODE_STUDENT_STEPS:-500}"

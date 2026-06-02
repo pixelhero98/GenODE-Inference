@@ -97,7 +97,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--context_sample_count", type=int, default=0)
     parser.add_argument("--context_holdout_fraction", type=float, default=0.20)
     parser.add_argument("--series_holdout_fraction", type=float, default=0.20)
-    parser.add_argument("--holdout_fraction", type=float, default=None, help="Deprecated alias for --context_holdout_fraction.")
     parser.add_argument("--density_bin_count", type=int, default=DEFAULT_DENSITY_BIN_COUNT)
     parser.add_argument("--teacher_steps", type=int, default=500)
     parser.add_argument("--teacher_checkpoint_every", type=int, default=100)
@@ -141,10 +140,11 @@ def train_context_conditional_opd(args: argparse.Namespace) -> Dict[str, Any]:
     selected_context_ids = set(sample_context_ids_stratified(rewarded_rows, sample_count=sample_count, seed=int(args.seed)))
     sampled_rows = [row for row in rewarded_rows if context_id_from_row(row) in selected_context_ids]
 
-    context_holdout_fraction = float(args.context_holdout_fraction)
-    if getattr(args, "holdout_fraction", None) is not None:
-        context_holdout_fraction = float(args.holdout_fraction)
-    context_fit_pool_rows, context_holdout_rows = split_rows_by_context_holdout(sampled_rows, holdout_fraction=context_holdout_fraction, seed=int(args.seed))
+    context_fit_pool_rows, context_holdout_rows = split_rows_by_context_holdout(
+        sampled_rows,
+        holdout_fraction=float(args.context_holdout_fraction),
+        seed=int(args.seed),
+    )
     fit_rows, series_holdout_rows = split_rows_by_series_holdout(
         context_fit_pool_rows,
         holdout_fraction=float(args.series_holdout_fraction),

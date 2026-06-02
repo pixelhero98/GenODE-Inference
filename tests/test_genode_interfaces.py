@@ -46,6 +46,15 @@ class GenODEInterfaceTests(unittest.TestCase):
             module_name, func_name = str(target).split(":", 1)
             self.assertTrue(callable(getattr(importlib.import_module(module_name), func_name)))
 
+    def test_deprecated_context_cli_flags_are_removed(self) -> None:
+        from genode.conditional_opd.report_context_locked_test import build_argparser as build_report_argparser
+        from genode.conditional_opd.train_context_conditional_opd import build_argparser as build_train_argparser
+
+        train_options = {option for action in build_train_argparser()._actions for option in action.option_strings}
+        report_options = {option for action in build_report_argparser()._actions for option in action.option_strings}
+        self.assertNotIn("--" + "holdout_fraction", train_options)
+        self.assertNotIn("--" + "support_schedule_keys", report_options)
+
     def test_auto_device_uses_cuda_when_available(self) -> None:
         with mock.patch("torch.cuda.is_available", return_value=True):
             self.assertEqual(resolve_torch_device("auto").type, "cuda")

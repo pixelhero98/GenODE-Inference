@@ -374,8 +374,6 @@ class ContextDensityOPDContractTests(unittest.TestCase):
                     str(embeddings_path),
                     "--out_dir",
                     str(root / "report"),
-                    "--support_schedule_keys",
-                    "uniform",
                     "--seeds",
                     "0",
                     "--solver_names",

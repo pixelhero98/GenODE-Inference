@@ -10,3 +10,4 @@
 - Locked-test reporting must only apply the frozen density policy and should never tune thresholds, choose checkpoints, or refit density metadata from locked-test metrics.
 - GPU Slurm jobs should request explicit CPU and memory resources instead of relying on cluster defaults.
 - Git ignore rules for local data and outputs should be anchored at the repository root so source packages such as `src/genode/data` are never hidden.
+- Deprecated CLI flags must be removed from tests, docs, and Slurm examples in the same cleanup as the parser change; stale argparse inputs otherwise turn canonicalization into a test failure.

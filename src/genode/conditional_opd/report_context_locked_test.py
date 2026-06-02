@@ -343,7 +343,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--locked_context_rows", required=True, help="Comma-separated locked-test context-row CSVs used only to enumerate contexts.")
     parser.add_argument("--locked_context_embeddings_npz", required=True)
     parser.add_argument("--out_dir", required=True)
-    parser.add_argument("--support_schedule_keys", default="", help="Deprecated and ignored; continuous density policies do not select support rows.")
     parser.add_argument("--baseline_rows", default="")
     parser.add_argument("--comparator_rows", default="")
     parser.add_argument("--dataset", default="solar_energy_10m")
