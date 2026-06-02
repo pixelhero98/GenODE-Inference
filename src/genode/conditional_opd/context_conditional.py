@@ -5,7 +5,7 @@ import csv
 import hashlib
 import json
 import math
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
@@ -15,8 +15,19 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from genode.conditional_opd.density_representation import (
+    DEFAULT_DENSITY_BIN_COUNT,
+    DENSITY_PROTOCOL,
+    density_log_features,
+    density_mass_hash,
+    density_mass_to_time_grid,
+    density_metadata,
+    grid_to_density_mass,
+    reference_grid_hash,
+    uniform_reference_grid,
+    validate_reference_grid,
+)
 from genode.conditional_opd.models import (
-    grid_to_intervals,
     setting_features,
     solver_macro_steps,
     validate_time_grid,
@@ -29,16 +40,15 @@ MetricRow = Mapping[str, Any]
 ContextPairKey = Tuple[str, str, int, str, int | None]
 ScheduleGridKey = Tuple[str, str, int]
 
-CONTEXT_CONDITIONAL_PROTOCOL = "context_conditional_opd_v1"
-DEFAULT_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = tuple(BASELINE_SCHEDULE_KEYS) + (SER_PTG_SCHEDULE_KEY,)
-CONTEXT_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPPORT_SCHEDULE_KEYS
+CONTEXT_CONDITIONAL_PROTOCOL = "context_density_opd_v1"
+DEFAULT_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = tuple(BASELINE_SCHEDULE_KEYS) + (SER_PTG_SCHEDULE_KEY,)
+DEFAULT_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
+CONTEXT_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
 DEFAULT_CONTEXT_CALIBRATION_TOTAL = 120
 DEFAULT_CONTEXT_CALIBRATION_VALIDATION_FRACTION = 0.20
 MIN_CONTEXT_CALIBRATION_TOTAL = 72
 MAX_CONTEXT_CALIBRATION_TOTAL = 144
-DEFAULT_SUPPORT_CHOICE_MARGIN = 0.001
-DEFAULT_TEACHER_SELECTION_MIN_PAIRWISE_ACCURACY = 0.65
-DEFAULT_TEACHER_SELECTION_MIN_SPEARMAN = 0.0
+DEFAULT_TEACHER_TARGET_TEMPERATURE = 0.05
 
 
 def _finite_positive(value: Any, *, label: str) -> float:
@@ -69,7 +79,6 @@ def stable_context_id(
     history_start: int | None = None,
     history_stop: int | None = None,
 ) -> str:
-    """Stable context key based only on historical-window identity."""
     return _json_hash(
         {
             "dataset": str(dataset),
@@ -83,6 +92,15 @@ def stable_context_id(
         },
         prefix="ctx",
     )
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or str(value) == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def context_id_from_row(row: MetricRow) -> str:
@@ -129,15 +147,6 @@ def series_key_from_row(row: MetricRow) -> str:
     raise ValueError("Rows require series_id or series_idx for series-disjoint diagnostics.")
 
 
-def _optional_int(value: Any) -> int | None:
-    if value is None or str(value) == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def context_pair_key(row: MetricRow, *, pair_on_seed: bool = True) -> ContextPairKey:
     seed = _optional_int(row.get("seed")) if pair_on_seed else None
     return (
@@ -149,6 +158,24 @@ def context_pair_key(row: MetricRow, *, pair_on_seed: bool = True) -> ContextPai
     )
 
 
+def validate_context_support_schedule_keys(
+    support_schedule_keys: Sequence[str],
+    *,
+    allowed_schedule_keys: Sequence[str] = DEFAULT_SUPERVISION_SCHEDULE_KEYS,
+) -> Tuple[str, ...]:
+    keys = tuple(str(key) for key in support_schedule_keys)
+    if not keys:
+        raise ValueError("support_schedule_keys must not be empty.")
+    bo_like = sorted(key for key in keys if "bo" in key.lower() or "candidate" in key.lower())
+    if bo_like:
+        raise ValueError(f"Context-conditional density supervision must not include BO/candidate schedules: {bo_like}")
+    allowed = {str(key) for key in allowed_schedule_keys}
+    unsupported = sorted(set(keys) - allowed)
+    if unsupported:
+        raise ValueError(f"Context-conditional density supervision is fixed/SER only; unsupported schedules: {unsupported}")
+    return keys
+
+
 def attach_uniform_context_rewards(
     rows: Iterable[MetricRow],
     *,
@@ -157,14 +184,9 @@ def attach_uniform_context_rewards(
     pair_on_seed: bool = True,
     eps: float = DEFAULT_REWARD_EPS,
 ) -> List[Dict[str, Any]]:
-    """Attach uniform-anchored rewards without crossing context keys.
-
-    Rows are paired inside exact `(dataset, solver, nfe, context_id, seed)` cells
-    by default. Set `pair_on_seed=False` only after explicit seed aggregation.
-    """
     materialized = [dict(row) for row in rows]
     support_keys = validate_context_support_schedule_keys(
-        CONTEXT_SUPPORT_SCHEDULE_KEYS if support_schedule_keys is None else support_schedule_keys
+        DEFAULT_SUPERVISION_SCHEDULE_KEYS if support_schedule_keys is None else support_schedule_keys
     )
     support = {str(key) for key in support_keys}
     uniform_key = str(uniform_schedule_key)
@@ -172,29 +194,24 @@ def attach_uniform_context_rewards(
     for row in materialized:
         schedule_key = str(row["scheduler_key"])
         if schedule_key not in support:
-            raise ValueError(f"Unsupported context-conditional schedule row {schedule_key!r}; expected fixed/SER support.")
+            raise ValueError(f"Unsupported context density supervision row {schedule_key!r}; expected fixed/SER support.")
         row["context_id"] = context_id_from_row(row)
         grouped[context_pair_key(row, pair_on_seed=pair_on_seed)].append(row)
 
     out: List[Dict[str, Any]] = []
     for key, group in sorted(grouped.items(), key=lambda item: item[0]):
-        support_counts = Counter(str(row["scheduler_key"]) for row in group)
-        duplicate_or_missing = {schedule: int(support_counts.get(schedule, 0)) for schedule in sorted(support) if int(support_counts.get(schedule, 0)) != 1}
-        if duplicate_or_missing:
+        counts = {schedule: 0 for schedule in support}
+        for row in group:
+            counts[str(row["scheduler_key"])] = counts.get(str(row["scheduler_key"]), 0) + 1
+        bad_counts = {schedule: int(counts.get(schedule, 0)) for schedule in sorted(support) if int(counts.get(schedule, 0)) != 1}
+        if bad_counts:
             raise ValueError(
                 "Uniform-anchored context rewards require exactly one row for every support schedule "
-                f"in paired context {key}; counts={duplicate_or_missing}."
+                f"in paired context {key}; counts={bad_counts}."
             )
-        observed_group_keys = set(support_counts)
-        missing_group_keys = sorted(support - observed_group_keys)
-        if missing_group_keys:
-            raise ValueError(f"Context reward group {key} is missing support schedules: {missing_group_keys}")
         uniform_rows = [row for row in group if str(row["scheduler_key"]) == uniform_key]
         if len(uniform_rows) != 1:
-            raise ValueError(
-                "Uniform-anchored context rewards require exactly one uniform row "
-                f"for paired context {key}, got {len(uniform_rows)}."
-            )
+            raise ValueError(f"Uniform-anchored context rewards require exactly one uniform row in paired context {key}.")
         uniform_crps = _finite_positive(uniform_rows[0]["crps"], label="uniform_crps")
         uniform_mase = _finite_positive(uniform_rows[0]["mase"], label="uniform_mase")
         e = float(eps)
@@ -217,24 +234,6 @@ def attach_uniform_context_rewards(
             )
             out.append(copied)
     return out
-
-
-def validate_context_support_schedule_keys(
-    support_schedule_keys: Sequence[str],
-    *,
-    allowed_schedule_keys: Sequence[str] = CONTEXT_SUPPORT_SCHEDULE_KEYS,
-) -> Tuple[str, ...]:
-    keys = tuple(str(key) for key in support_schedule_keys)
-    if not keys:
-        raise ValueError("support_schedule_keys must not be empty.")
-    allowed = {str(key) for key in allowed_schedule_keys}
-    bo_like = sorted(key for key in keys if "bo" in key.lower() or "candidate" in key.lower())
-    if bo_like:
-        raise ValueError(f"Context-conditional support must not include BO/candidate schedules: {bo_like}")
-    unsupported = sorted(set(keys) - allowed)
-    if unsupported:
-        raise ValueError(f"Context-conditional support is fixed/SER only; unsupported schedules: {unsupported}")
-    return keys
 
 
 def split_rows_by_context_holdout(
@@ -310,19 +309,11 @@ def recommended_context_calibration_count(
     min_total: int = MIN_CONTEXT_CALIBRATION_TOTAL,
     max_total: int = MAX_CONTEXT_CALIBRATION_TOTAL,
 ) -> int:
-    """Return the capped context count for per-context fixed/SER calibration.
-
-    The default keeps solar-style context-cell evaluation around 30k rows for
-    7 schedules, 12 cells, and 3 seeds, instead of expanding to the full pool.
-    """
     available = int(available_contexts)
     if available <= 0:
         raise ValueError("available_contexts must be positive.")
     cap = min(int(max_total), max(int(min_total), 12 * int(cells)))
-    if normalized_combined_reference is None:
-        requested = int(default_total)
-    else:
-        requested = int(round(0.20 * float(normalized_combined_reference)))
+    requested = int(default_total) if normalized_combined_reference is None else int(round(0.20 * float(normalized_combined_reference)))
     target = min(cap, max(int(min_total), requested))
     return int(min(available, target))
 
@@ -353,7 +344,6 @@ def sample_context_ids_stratified(
     sample_count: int | None = None,
     seed: int = 0,
 ) -> List[str]:
-    """Sample contexts with deterministic series/temporal stratification."""
     by_context: Dict[str, Dict[str, Any]] = {}
     for row in rows:
         context_id = context_id_from_row(row)
@@ -365,7 +355,6 @@ def sample_context_ids_stratified(
     target = int(min(len(by_context), max(1, target)))
     if target >= len(by_context):
         return sorted(by_context)
-
     strata: Dict[Tuple[str, int], List[str]] = defaultdict(list)
     for context_id, row in by_context.items():
         series = str(row.get("series_id", row.get("series_idx", "")))
@@ -373,24 +362,21 @@ def sample_context_ids_stratified(
             target_t = int(row.get("target_t", 0))
         except (TypeError, ValueError):
             target_t = 0
-        temporal_bin = int(math.floor(float(target_t) / 24.0))
-        strata[(series, temporal_bin)].append(context_id)
-
+        strata[(series, int(math.floor(float(target_t) / 24.0)))].append(context_id)
     rng = np.random.default_rng(int(seed))
     selected: List[str] = []
     stratum_items = sorted(strata.items(), key=lambda item: item[0])
-    raw_allocations: List[Tuple[float, int, int]] = []
+    allocations: List[Tuple[float, int, int]] = []
     for idx, (_, ids) in enumerate(stratum_items):
         raw = float(target) * float(len(ids)) / float(len(by_context))
         base = min(len(ids), int(math.floor(raw)))
-        raw_allocations.append((raw - base, idx, base))
-    counts = [base for _, _, base in raw_allocations]
+        allocations.append((raw - base, idx, base))
+    counts = [base for _, _, base in allocations]
     remaining = int(target - sum(counts))
-    for _, idx, _ in sorted(raw_allocations, key=lambda item: (-item[0], item[1])):
+    for _, idx, _ in sorted(allocations, key=lambda item: (-item[0], item[1])):
         if remaining <= 0:
             break
-        ids = stratum_items[idx][1]
-        if counts[idx] < len(ids):
+        if counts[idx] < len(stratum_items[idx][1]):
             counts[idx] += 1
             remaining -= 1
     for (_, ids), keep in zip(stratum_items, counts):
@@ -416,6 +402,9 @@ class EmbeddingNormalizer:
         ids = [str(context_id) for context_id in context_ids]
         if not ids:
             raise ValueError("Embedding normalization requires at least one train context.")
+        missing = sorted(context_id for context_id in ids if context_id not in embeddings)
+        if missing:
+            raise KeyError(f"Missing context embeddings for train contexts: {missing[:8]}")
         matrix = np.asarray([embeddings[context_id] for context_id in ids], dtype=np.float32)
         mean = matrix.mean(axis=0)
         std = matrix.std(axis=0)
@@ -431,6 +420,43 @@ class EmbeddingNormalizer:
     def transform_table(self, embeddings: Mapping[str, Sequence[float]]) -> Dict[str, np.ndarray]:
         return {str(context_id): self.transform_one(vector) for context_id, vector in embeddings.items()}
 
+    def to_payload(self) -> Dict[str, Any]:
+        return {"mean": self.mean.astype(float).tolist(), "std": self.std.astype(float).tolist()}
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "EmbeddingNormalizer":
+        return cls(mean=np.asarray(payload["mean"], dtype=np.float32), std=np.asarray(payload["std"], dtype=np.float32))
+
+
+@dataclass(frozen=True)
+class DensityFeatureNormalizer:
+    mean: np.ndarray
+    std: np.ndarray
+
+    @classmethod
+    def fit(cls, density_masses: Iterable[Sequence[float]], *, reference_time_grid: Sequence[float]) -> "DensityFeatureNormalizer":
+        features = [density_log_features(mass, reference_time_grid=reference_time_grid) for mass in density_masses]
+        if not features:
+            raise ValueError("Density feature normalization requires at least one density mass.")
+        matrix = np.asarray(features, dtype=np.float32)
+        mean = matrix.mean(axis=0)
+        std = matrix.std(axis=0)
+        std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
+        return cls(mean=mean.astype(np.float32), std=std)
+
+    def transform_one(self, density_mass: Sequence[float], *, reference_time_grid: Sequence[float]) -> np.ndarray:
+        features = density_log_features(density_mass, reference_time_grid=reference_time_grid)
+        if features.shape != self.mean.shape:
+            raise ValueError(f"Density feature shape {features.shape} does not match normalizer shape {self.mean.shape}.")
+        return ((features - self.mean) / self.std).astype(np.float32)
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {"mean": self.mean.astype(float).tolist(), "std": self.std.astype(float).tolist()}
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "DensityFeatureNormalizer":
+        return cls(mean=np.asarray(payload["mean"], dtype=np.float32), std=np.asarray(payload["std"], dtype=np.float32))
+
 
 def save_context_embedding_table(
     path: str | Path,
@@ -441,10 +467,10 @@ def save_context_embedding_table(
     resolved = Path(path)
     resolved.parent.mkdir(parents=True, exist_ok=True)
     sorted_ids = sorted(str(key) for key in embeddings)
+    if not sorted_ids:
+        raise ValueError("Cannot save an empty context embedding table.")
     max_id_len = max(1, max(len(context_id) for context_id in sorted_ids))
     context_ids = np.asarray(sorted_ids, dtype=f"<U{max_id_len}")
-    if context_ids.size == 0:
-        raise ValueError("Cannot save an empty context embedding table.")
     matrix = np.asarray([embeddings[str(context_id)] for context_id in context_ids.tolist()], dtype=np.float32)
     np.savez_compressed(resolved, context_ids=context_ids, embeddings=matrix)
     manifest = {
@@ -481,143 +507,6 @@ def remapped_series_index(row: MetricRow, series_index_map: Mapping[str, int]) -
     return int(series_index_map[key])
 
 
-class ContextScheduleTeacherMLP(nn.Module):
-    """Teacher scorer for `(solver, nfe, support interval, series, context)`."""
-
-    def __init__(
-        self,
-        *,
-        setting_dim: int,
-        max_macro_steps: int,
-        context_dim: int,
-        num_series: int,
-        series_embedding_dim: int = 32,
-        hidden_dim: int = 256,
-        hidden_layers: int = 3,
-    ):
-        super().__init__()
-        self.max_macro_steps = int(max_macro_steps)
-        self.context_dim = int(context_dim)
-        self.num_series = int(num_series)
-        self.unknown_series_index = int(num_series)
-        self.series_embedding = nn.Embedding(int(num_series) + 1, int(series_embedding_dim))
-        input_dim = int(setting_dim) + int(max_macro_steps) + int(context_dim) + int(series_embedding_dim)
-        self.net = _mlp(input_dim, int(hidden_dim), 1, int(hidden_layers))
-
-    def forward(
-        self,
-        setting_feature_batch: torch.Tensor,
-        interval_batch: torch.Tensor,
-        series_index_batch: torch.Tensor,
-        context_embedding_batch: torch.Tensor,
-    ) -> torch.Tensor:
-        features = self._features(setting_feature_batch, interval_batch, series_index_batch, context_embedding_batch)
-        return self.net(features).squeeze(-1)
-
-    def _features(
-        self,
-        setting_feature_batch: torch.Tensor,
-        interval_batch: torch.Tensor,
-        series_index_batch: torch.Tensor,
-        context_embedding_batch: torch.Tensor,
-    ) -> torch.Tensor:
-        if setting_feature_batch.ndim != 2:
-            raise ValueError("setting_feature_batch must be 2D.")
-        if interval_batch.ndim != 2 or interval_batch.shape[-1] != self.max_macro_steps:
-            raise ValueError("interval_batch must be 2D with max_macro_steps columns.")
-        if context_embedding_batch.ndim != 2 or context_embedding_batch.shape[-1] != self.context_dim:
-            raise ValueError("context_embedding_batch must be 2D with context_dim columns.")
-        series = series_index_batch.to(device=setting_feature_batch.device, dtype=torch.long).reshape(-1)
-        series = torch.where(
-            (series >= 0) & (series < self.num_series),
-            series,
-            torch.full_like(series, self.unknown_series_index),
-        )
-        series_emb = self.series_embedding(series)
-        context_embedding_batch = context_embedding_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype)
-        interval_batch = interval_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype)
-        return torch.cat([setting_feature_batch, interval_batch, series_emb, context_embedding_batch], dim=-1)
-
-
-class ContextSupportStudentMLP(nn.Module):
-    """Categorical support policy over measured fixed/SER schedule keys."""
-
-    def __init__(
-        self,
-        *,
-        setting_dim: int,
-        context_dim: int,
-        num_series: int,
-        support_schedule_keys: Sequence[str],
-        series_embedding_dim: int = 32,
-        hidden_dim: int = 128,
-        hidden_layers: int = 2,
-    ):
-        super().__init__()
-        keys = validate_context_support_schedule_keys(support_schedule_keys)
-        self.support_schedule_keys = keys
-        self.context_dim = int(context_dim)
-        self.num_series = int(num_series)
-        self.unknown_series_index = int(num_series)
-        self.series_embedding = nn.Embedding(int(num_series) + 1, int(series_embedding_dim))
-        input_dim = int(setting_dim) + int(context_dim) + int(series_embedding_dim)
-        self.net = _mlp(input_dim, int(hidden_dim), len(keys), int(hidden_layers))
-
-    def logits(
-        self,
-        setting_feature_batch: torch.Tensor,
-        series_index_batch: torch.Tensor,
-        context_embedding_batch: torch.Tensor,
-    ) -> torch.Tensor:
-        if setting_feature_batch.ndim != 2:
-            raise ValueError("setting_feature_batch must be 2D.")
-        if context_embedding_batch.ndim != 2 or context_embedding_batch.shape[-1] != self.context_dim:
-            raise ValueError("context_embedding_batch must be 2D with context_dim columns.")
-        series = series_index_batch.to(device=setting_feature_batch.device, dtype=torch.long).reshape(-1)
-        series = torch.where(
-            (series >= 0) & (series < self.num_series),
-            series,
-            torch.full_like(series, self.unknown_series_index),
-        )
-        series_emb = self.series_embedding(series)
-        context_embedding_batch = context_embedding_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype)
-        return self.net(torch.cat([setting_feature_batch, series_emb, context_embedding_batch], dim=-1))
-
-    def probabilities(
-        self,
-        setting_feature_batch: torch.Tensor,
-        series_index_batch: torch.Tensor,
-        context_embedding_batch: torch.Tensor,
-    ) -> torch.Tensor:
-        return F.softmax(self.logits(setting_feature_batch, series_index_batch, context_embedding_batch), dim=-1)
-
-
-def _mlp(input_dim: int, hidden_dim: int, output_dim: int, hidden_layers: int) -> nn.Sequential:
-    layers: List[nn.Module] = []
-    dim = int(input_dim)
-    for _ in range(int(hidden_layers)):
-        layers.extend([nn.Linear(dim, int(hidden_dim)), nn.SiLU()])
-        dim = int(hidden_dim)
-    layers.append(nn.Linear(dim, int(output_dim)))
-    return nn.Sequential(*layers)
-
-
-def padded_intervals_from_grid(
-    solver_key: str,
-    target_nfe: int,
-    grid: Sequence[float],
-    *,
-    max_macro_steps: int,
-    device: torch.device | str = "cpu",
-) -> torch.Tensor:
-    macro_steps = solver_macro_steps(str(solver_key), int(target_nfe))
-    checked = validate_time_grid(grid, macro_steps=macro_steps)
-    intervals = torch.zeros(int(max_macro_steps), dtype=torch.float32, device=device)
-    raw = torch.tensor(grid_to_intervals(checked), dtype=torch.float32, device=device)
-    intervals[: raw.numel()] = raw
-    return intervals
-
-
 def grid_for_schedule(
     schedule_key: str,
     solver_key: str,
@@ -637,61 +526,142 @@ def grid_for_schedule(
     raise KeyError(f"Missing schedule grid for {(key, str(solver_key), int(target_nfe))}.")
 
 
-def _teacher_training_tensors(
-    rows: Sequence[MetricRow],
+def density_mass_for_row(
+    row: MetricRow,
     *,
-    context_embeddings: Mapping[str, Sequence[float]],
-    series_index_map: Mapping[str, int],
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
-    max_macro_steps: int,
-    device: torch.device | str,
-    series_unknown_probability: float = 0.0,
-    seed: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[ContextPairKey], List[str]]:
-    setting_rows: List[torch.Tensor] = []
-    interval_rows: List[torch.Tensor] = []
-    series_rows: List[int] = []
-    context_rows: List[np.ndarray] = []
-    targets: List[float] = []
-    pair_keys: List[ContextPairKey] = []
-    schedule_keys: List[str] = []
-    rng = np.random.default_rng(int(seed))
-    unknown_index = int(len(series_index_map))
-    unknown_probability = min(1.0, max(0.0, float(series_unknown_probability)))
-    for row in rows:
-        context_id = context_id_from_row(row)
-        if context_id not in context_embeddings:
-            raise KeyError(f"Missing context embedding for {context_id}.")
-        solver = str(row["solver_key"])
-        target_nfe = int(row["target_nfe"])
-        schedule_key = str(row["scheduler_key"])
-        grid = grid_for_schedule(schedule_key, solver, target_nfe, schedule_grids=schedule_grids)
-        setting_rows.append(setting_features(solver, target_nfe))
-        interval_rows.append(
-            padded_intervals_from_grid(
-                solver,
-                target_nfe,
-                grid,
-                max_macro_steps=int(max_macro_steps),
-            )
+    reference_time_grid: Sequence[float],
+) -> Tuple[float, ...]:
+    solver = str(row["solver_key"])
+    target_nfe = int(row["target_nfe"])
+    grid = grid_for_schedule(str(row["scheduler_key"]), solver, target_nfe, schedule_grids=schedule_grids)
+    return grid_to_density_mass(grid, reference_time_grid=reference_time_grid, macro_steps=solver_macro_steps(solver, target_nfe))
+
+
+class ContextScheduleTeacherMLP(nn.Module):
+    """Teacher scorer for `(solver, nfe, density, series, context)`."""
+
+    def __init__(
+        self,
+        *,
+        setting_dim: int,
+        density_dim: int,
+        context_dim: int,
+        num_series: int,
+        series_embedding_dim: int = 32,
+        hidden_dim: int = 256,
+        hidden_layers: int = 3,
+    ):
+        super().__init__()
+        self.setting_dim = int(setting_dim)
+        self.density_dim = int(density_dim)
+        self.context_dim = int(context_dim)
+        self.num_series = int(num_series)
+        self.unknown_series_index = int(num_series)
+        self.series_embedding = nn.Embedding(int(num_series) + 1, int(series_embedding_dim))
+        input_dim = int(setting_dim) + int(density_dim) + int(series_embedding_dim) + int(context_dim)
+        layers: List[nn.Module] = []
+        dim = input_dim
+        for _ in range(int(hidden_layers)):
+            layers.extend([nn.Linear(dim, int(hidden_dim)), nn.SiLU()])
+            dim = int(hidden_dim)
+        layers.append(nn.Linear(dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(
+        self,
+        setting_feature_batch: torch.Tensor,
+        density_feature_batch: torch.Tensor,
+        series_index_batch: torch.Tensor,
+        context_embedding_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        series_index_batch = series_index_batch.reshape(-1)
+        batch = int(setting_feature_batch.shape[0])
+        if setting_feature_batch.ndim != 2 or setting_feature_batch.shape[-1] != self.setting_dim:
+            raise ValueError("setting_feature_batch must be 2D with setting_dim columns.")
+        if density_feature_batch.ndim != 2 or density_feature_batch.shape[-1] != self.density_dim:
+            raise ValueError("density_feature_batch must be 2D with density_dim columns.")
+        if context_embedding_batch.ndim != 2 or context_embedding_batch.shape[-1] != self.context_dim:
+            raise ValueError("context_embedding_batch must be 2D with context_dim columns.")
+        if density_feature_batch.shape[0] != batch or context_embedding_batch.shape[0] != batch or series_index_batch.shape[0] != batch:
+            raise ValueError("Teacher feature batches must share the same batch dimension.")
+        series_idx = torch.clamp(series_index_batch.to(dtype=torch.long, device=setting_feature_batch.device), min=0, max=self.unknown_series_index)
+        series_emb = self.series_embedding(series_idx)
+        features = torch.cat(
+            [
+                setting_feature_batch,
+                density_feature_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype),
+                series_emb.to(dtype=setting_feature_batch.dtype),
+                context_embedding_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype),
+            ],
+            dim=-1,
         )
-        series_idx = remapped_series_index(row, series_index_map)
-        if unknown_probability > 0.0 and rng.random() < unknown_probability:
-            series_idx = unknown_index
-        series_rows.append(series_idx)
-        context_rows.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
-        targets.append(float(row["u_comp_uniform"]))
-        pair_keys.append(context_pair_key(row, pair_on_seed=True))
-        schedule_keys.append(schedule_key)
-    return (
-        torch.stack(setting_rows, dim=0).to(device=device),
-        torch.stack(interval_rows, dim=0).to(device=device),
-        torch.tensor(series_rows, dtype=torch.long, device=device),
-        torch.tensor(np.stack(context_rows, axis=0), dtype=torch.float32, device=device),
-        torch.tensor(targets, dtype=torch.float32, device=device),
-        pair_keys,
-        schedule_keys,
-    )
+        return self.net(features).squeeze(-1)
+
+
+class ContextDensityStudentMLP(nn.Module):
+    """Context-conditioned continuous density policy over normalized solver time."""
+
+    def __init__(
+        self,
+        *,
+        setting_dim: int,
+        density_dim: int,
+        context_dim: int,
+        num_series: int,
+        series_embedding_dim: int = 32,
+        hidden_dim: int = 128,
+        hidden_layers: int = 2,
+    ):
+        super().__init__()
+        self.setting_dim = int(setting_dim)
+        self.density_dim = int(density_dim)
+        self.context_dim = int(context_dim)
+        self.num_series = int(num_series)
+        self.unknown_series_index = int(num_series)
+        self.series_embedding = nn.Embedding(int(num_series) + 1, int(series_embedding_dim))
+        input_dim = int(setting_dim) + int(series_embedding_dim) + int(context_dim)
+        layers: List[nn.Module] = []
+        dim = input_dim
+        for _ in range(int(hidden_layers)):
+            layers.extend([nn.Linear(dim, int(hidden_dim)), nn.SiLU()])
+            dim = int(hidden_dim)
+        layers.append(nn.Linear(dim, int(density_dim)))
+        self.net = nn.Sequential(*layers)
+
+    def logits(
+        self,
+        setting_feature_batch: torch.Tensor,
+        series_index_batch: torch.Tensor,
+        context_embedding_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        series_index_batch = series_index_batch.reshape(-1)
+        batch = int(setting_feature_batch.shape[0])
+        if setting_feature_batch.ndim != 2 or setting_feature_batch.shape[-1] != self.setting_dim:
+            raise ValueError("setting_feature_batch must be 2D with setting_dim columns.")
+        if context_embedding_batch.ndim != 2 or context_embedding_batch.shape[-1] != self.context_dim:
+            raise ValueError("context_embedding_batch must be 2D with context_dim columns.")
+        if context_embedding_batch.shape[0] != batch or series_index_batch.shape[0] != batch:
+            raise ValueError("Student feature batches must share the same batch dimension.")
+        series_idx = torch.clamp(series_index_batch.to(dtype=torch.long, device=setting_feature_batch.device), min=0, max=self.unknown_series_index)
+        series_emb = self.series_embedding(series_idx)
+        features = torch.cat(
+            [
+                setting_feature_batch,
+                series_emb.to(dtype=setting_feature_batch.dtype),
+                context_embedding_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype),
+            ],
+            dim=-1,
+        )
+        return self.net(features)
+
+    def density_mass(
+        self,
+        setting_feature_batch: torch.Tensor,
+        series_index_batch: torch.Tensor,
+        context_embedding_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.softmax(self.logits(setting_feature_batch, series_index_batch, context_embedding_batch), dim=-1)
 
 
 def _pair_indices(
@@ -748,17 +718,7 @@ def pairwise_rank_loss(
 
 def _rank_values_desc(values: Mapping[str, float]) -> Dict[str, float]:
     ordered = sorted(values.items(), key=lambda item: (-float(item[1]), str(item[0])))
-    ranks: Dict[str, float] = {}
-    pos = 0
-    while pos < len(ordered):
-        end = pos + 1
-        while end < len(ordered) and float(ordered[end][1]) == float(ordered[pos][1]):
-            end += 1
-        avg_rank = float(pos + end - 1) / 2.0
-        for idx in range(pos, end):
-            ranks[str(ordered[idx][0])] = avg_rank
-        pos = end
-    return ranks
+    return {str(key): float(idx) for idx, (key, _) in enumerate(ordered)}
 
 
 def _spearman_for_scores(pred_by_schedule: Mapping[str, float], target_by_schedule: Mapping[str, float]) -> float:
@@ -776,53 +736,57 @@ def _spearman_for_scores(pred_by_schedule: Mapping[str, float], target_by_schedu
     return float(np.corrcoef(pred, target)[0, 1])
 
 
-def _support_choice_metrics(
-    pred_values: Sequence[float],
-    target_values: Sequence[float],
-    pair_keys: Sequence[ContextPairKey],
-    schedule_keys: Sequence[str],
-) -> Dict[str, Any]:
-    by_key_schedule: Dict[Tuple[str, str, int, str], Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
-    for idx, key in enumerate(pair_keys):
-        seed_mean_key = (str(key[0]), str(key[1]), int(key[2]), str(key[3]))
-        by_key_schedule[seed_mean_key][str(schedule_keys[idx])].append(int(idx))
-    correct = 0
-    top2_hits = 0
-    total = 0
-    spearman_values: List[float] = []
-    for schedule_to_indices in by_key_schedule.values():
-        if len(schedule_to_indices) < 2:
-            continue
-        pred_by_schedule = {
-            schedule: float(np.mean(np.asarray([float(pred_values[idx]) for idx in indices], dtype=np.float64)))
-            for schedule, indices in schedule_to_indices.items()
-        }
-        target_by_schedule = {
-            schedule: float(np.mean(np.asarray([float(target_values[idx]) for idx in indices], dtype=np.float64)))
-            for schedule, indices in schedule_to_indices.items()
-        }
-        actual_order = sorted(target_by_schedule, key=lambda schedule: (-float(target_by_schedule[schedule]), str(schedule)))
-        pred_order = sorted(pred_by_schedule, key=lambda schedule: (-float(pred_by_schedule[schedule]), str(schedule)))
-        actual_top1 = str(actual_order[0])
-        pred_top1 = str(pred_order[0])
-        pred_top2 = {str(schedule) for schedule in pred_order[:2]}
-        correct += int(actual_top1 == pred_top1)
-        top2_hits += int(actual_top1 in pred_top2)
-        spearman_values.append(_spearman_for_scores(pred_by_schedule, target_by_schedule))
-        total += 1
-    if total <= 0:
-        return {
-            "support_top1_accuracy": None,
-            "support_top2_recall": None,
-            "spearman_rank_correlation": None,
-            "support_choice_group_count": 0,
-        }
-    return {
-        "support_top1_accuracy": float(correct / total),
-        "support_top2_recall": float(top2_hits / total),
-        "spearman_rank_correlation": float(np.mean(np.asarray(spearman_values, dtype=np.float64))) if spearman_values else None,
-        "support_choice_group_count": int(total),
-    }
+def _teacher_training_tensors(
+    rows: Sequence[MetricRow],
+    *,
+    context_embeddings: Mapping[str, Sequence[float]],
+    series_index_map: Mapping[str, int],
+    schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
+    reference_time_grid: Sequence[float],
+    density_normalizer: DensityFeatureNormalizer,
+    device: torch.device | str,
+    series_unknown_probability: float = 0.0,
+    seed: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[ContextPairKey], List[str], List[Tuple[float, ...]]]:
+    setting_rows: List[torch.Tensor] = []
+    density_rows: List[np.ndarray] = []
+    series_rows: List[int] = []
+    context_rows: List[np.ndarray] = []
+    targets: List[float] = []
+    pair_keys: List[ContextPairKey] = []
+    schedule_keys: List[str] = []
+    density_masses: List[Tuple[float, ...]] = []
+    rng = np.random.default_rng(int(seed))
+    unknown_index = int(len(series_index_map))
+    unknown_probability = min(1.0, max(0.0, float(series_unknown_probability)))
+    for row in rows:
+        context_id = context_id_from_row(row)
+        if context_id not in context_embeddings:
+            raise KeyError(f"Missing context embedding for {context_id}.")
+        solver = str(row["solver_key"])
+        target_nfe = int(row["target_nfe"])
+        mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
+        setting_rows.append(setting_features(solver, target_nfe))
+        density_rows.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
+        series_idx = remapped_series_index(row, series_index_map)
+        if unknown_probability > 0.0 and rng.random() < unknown_probability:
+            series_idx = unknown_index
+        series_rows.append(series_idx)
+        context_rows.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
+        targets.append(float(row["u_comp_uniform"]))
+        pair_keys.append(context_pair_key(row, pair_on_seed=True))
+        schedule_keys.append(str(row["scheduler_key"]))
+        density_masses.append(mass)
+    return (
+        torch.stack(setting_rows, dim=0).to(device=device),
+        torch.tensor(np.stack(density_rows, axis=0), dtype=torch.float32, device=device),
+        torch.tensor(series_rows, dtype=torch.long, device=device),
+        torch.tensor(np.stack(context_rows, axis=0), dtype=torch.float32, device=device),
+        torch.tensor(targets, dtype=torch.float32, device=device),
+        pair_keys,
+        schedule_keys,
+        density_masses,
+    )
 
 
 def context_teacher_diagnostics(
@@ -831,8 +795,9 @@ def context_teacher_diagnostics(
     *,
     context_embeddings: Mapping[str, Sequence[float]],
     series_index_map: Mapping[str, int],
-    schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None = None,
-    max_macro_steps: int = 12,
+    schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
+    reference_time_grid: Sequence[float],
+    density_normalizer: DensityFeatureNormalizer,
     rank_temperature: float = 0.5,
     regression_weight: float = 0.25,
     pair_margin: float = 0.0,
@@ -845,7 +810,6 @@ def context_teacher_diagnostics(
     contexts = {context_id_from_row(row) for row in rows}
     series_keys = {series_key_from_row(row) for row in rows}
     schedules = {str(row["scheduler_key"]) for row in rows}
-    split_phases = sorted({str(row.get("split_phase", row.get("split", ""))) for row in rows})
     fit_context_set = {str(value) for value in fit_context_ids}
     fit_series_set = {str(value) for value in fit_series_keys}
     base: Dict[str, Any] = {
@@ -855,44 +819,30 @@ def context_teacher_diagnostics(
         "series_count": int(len(series_keys)),
         "schedule_count": int(len(schedules)),
         "schedule_keys": sorted(schedules),
-        "split_phases": split_phases,
+        "split_phases": sorted({str(row.get("split_phase", row.get("split", ""))) for row in rows}),
         "fit_context_overlap_count": int(len(contexts & fit_context_set)),
         "fit_series_overlap_count": int(len(series_keys & fit_series_set)),
         "uses_validation_labels": False,
     }
     if not rows:
-        base.update(
-            {
-                "rank_loss": None,
-                "huber_loss": None,
-                "total_loss": None,
-                "pairwise_accuracy": None,
-                "pair_count": 0,
-                "top1_schedule_agreement": None,
-                "top1_group_count": 0,
-                "support_top1_accuracy": None,
-                "support_top2_recall": None,
-                "spearman_rank_correlation": None,
-                "support_choice_group_count": 0,
-            }
-        )
+        base.update({"rank_loss": None, "huber_loss": None, "total_loss": None, "pairwise_accuracy": None, "pair_count": 0, "spearman_rank_correlation": None})
         return base
-
     was_training = bool(teacher.training)
     teacher.eval()
     with torch.no_grad():
-        sx, ix, series_idx, cx, targets, pair_keys, schedule_keys = _teacher_training_tensors(
+        sx, dx, series_idx, cx, targets, pair_keys, schedule_keys, _ = _teacher_training_tensors(
             rows,
             context_embeddings=context_embeddings,
             series_index_map=series_index_map,
             schedule_grids=schedule_grids,
-            max_macro_steps=int(max_macro_steps),
+            reference_time_grid=reference_time_grid,
+            density_normalizer=density_normalizer,
             device=device,
         )
         if not pair_on_seed:
             pair_keys = [key[:4] + (None,) for key in pair_keys]
         left, right, sign = _pair_indices(targets, pair_keys, margin=float(pair_margin), device=sx.device)
-        pred = teacher(sx, ix, series_idx, cx)
+        pred = teacher(sx, dx, series_idx, cx)
         rank = pairwise_rank_loss(pred, left, right, sign, temperature=float(rank_temperature))
         huber = F.smooth_l1_loss(pred, targets)
         total = rank + float(regression_weight) * huber
@@ -903,9 +853,32 @@ def context_teacher_diagnostics(
             pairwise_accuracy = None
         pred_values = [float(value) for value in pred.detach().cpu().tolist()]
         target_values = [float(value) for value in targets.detach().cpu().tolist()]
-        support_metrics = _support_choice_metrics(pred_values, target_values, pair_keys, schedule_keys)
     if was_training:
         teacher.train()
+
+    by_group_schedule: Dict[Tuple[str, str, int, str], Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
+    for idx, key in enumerate(pair_keys):
+        by_group_schedule[(str(key[0]), str(key[1]), int(key[2]), str(key[3]))][str(schedule_keys[idx])].append(int(idx))
+    spearman_values: List[float] = []
+    best_candidate_hits = 0
+    best_candidate_total = 0
+    for schedule_to_indices in by_group_schedule.values():
+        if len(schedule_to_indices) < 2:
+            continue
+        pred_by_schedule = {
+            schedule: float(np.mean(np.asarray([pred_values[idx] for idx in indices], dtype=np.float64)))
+            for schedule, indices in schedule_to_indices.items()
+        }
+        target_by_schedule = {
+            schedule: float(np.mean(np.asarray([target_values[idx] for idx in indices], dtype=np.float64)))
+            for schedule, indices in schedule_to_indices.items()
+        }
+        spearman_values.append(_spearman_for_scores(pred_by_schedule, target_by_schedule))
+        best_candidate_hits += int(
+            sorted(pred_by_schedule, key=lambda schedule: (-pred_by_schedule[schedule], schedule))[0]
+            == sorted(target_by_schedule, key=lambda schedule: (-target_by_schedule[schedule], schedule))[0]
+        )
+        best_candidate_total += 1
     base.update(
         {
             "rank_loss": float(rank.detach().cpu().item()),
@@ -913,9 +886,9 @@ def context_teacher_diagnostics(
             "total_loss": float(total.detach().cpu().item()),
             "pairwise_accuracy": pairwise_accuracy,
             "pair_count": int(left.numel()),
-            "top1_schedule_agreement": support_metrics["support_top1_accuracy"],
-            "top1_group_count": int(support_metrics["support_choice_group_count"]),
-            **support_metrics,
+            "spearman_rank_correlation": float(np.mean(np.asarray(spearman_values, dtype=np.float64))) if spearman_values else None,
+            "best_candidate_agreement": None if best_candidate_total == 0 else float(best_candidate_hits / best_candidate_total),
+            "candidate_group_count": int(best_candidate_total),
         }
     )
     return base
@@ -926,124 +899,67 @@ def _selected_context_teacher_checkpoint(
     checkpoint_states: Mapping[int, Mapping[str, torch.Tensor]],
     *,
     required_split_names: Sequence[str] = (),
-    min_pairwise_accuracy: float = DEFAULT_TEACHER_SELECTION_MIN_PAIRWISE_ACCURACY,
-    min_spearman: float = DEFAULT_TEACHER_SELECTION_MIN_SPEARMAN,
 ) -> Tuple[Dict[str, Any], Mapping[str, torch.Tensor] | None]:
     if not checkpoint_history:
         return (
             {
                 "selection_protocol": "final_checkpoint_no_diagnostics",
-                "selection_split": "none",
+                "selection_metric": "final_step",
                 "selected_step": None,
                 "history": [],
                 "uses_validation_labels": False,
             },
             None,
         )
-    split_names = sorted(
-        {
-            str(name)
-            for entry in checkpoint_history
-            for name, diag in dict(entry.get("diagnostics", {})).items()
-            if diag.get("support_top1_accuracy") is not None
-        }
-    )
-    missing_required = [str(name) for name in required_split_names if str(name) not in split_names]
-    if missing_required:
-        raise ValueError(f"Teacher checkpoint selection requires usable diagnostics for all splits; missing {missing_required}.")
-    scored_history: List[Dict[str, Any]] = []
+    required = tuple(str(name) for name in required_split_names)
+    scored: List[Dict[str, Any]] = []
     best_entry: Dict[str, Any] | None = None
-    best_key: Tuple[float, float, float, float, float, int] | None = None
-    constraints = {
-        "min_pairwise_accuracy": float(min_pairwise_accuracy),
-        "min_spearman": float(min_spearman),
-    }
+    best_key: Tuple[float, float, float, int] | None = None
     for entry in checkpoint_history:
-        copied = dict(entry)
-        diagnostics = {str(k): dict(v) for k, v in dict(entry.get("diagnostics", {})).items()}
-        pairwise_accuracies: List[float] = []
-        spearman_values: List[float] = []
-        huber_values: List[float] = []
-        top1_values: List[float] = []
-        top2_values: List[float] = []
-        constraint_failures: List[str] = []
-        for split in split_names:
-            diag = diagnostics.get(split, {})
-            top1 = diag.get("support_top1_accuracy")
-            top2 = diag.get("support_top2_recall")
-            pairwise = diag.get("pairwise_accuracy")
-            spearman = diag.get("spearman_rank_correlation")
-            huber = diag.get("huber_loss")
-            if top1 is None or top2 is None:
-                constraint_failures.append(f"{split}:missing_support_choice_metric")
-            else:
-                top1_values.append(float(top1))
-                top2_values.append(float(top2))
-            if pairwise is None or float(pairwise) < float(min_pairwise_accuracy):
-                constraint_failures.append(f"{split}:pairwise_accuracy_below_{float(min_pairwise_accuracy):.4f}")
-            else:
-                pairwise_accuracies.append(float(pairwise))
-            if spearman is None or float(spearman) <= float(min_spearman):
-                constraint_failures.append(f"{split}:spearman_not_above_{float(min_spearman):.4f}")
-            else:
-                spearman_values.append(float(spearman))
-            if huber is not None:
-                huber_values.append(float(huber))
-        worst_acc = float(min(pairwise_accuracies)) if pairwise_accuracies else 0.0
-        support_choice_terms = top1_values + top2_values
-        support_choice_score = (
-            float(np.mean(np.asarray(support_choice_terms, dtype=np.float64)))
-            if len(support_choice_terms) == 2 * len(split_names)
-            else None
-        )
-        worst_top1 = float(min(top1_values)) if top1_values else 0.0
-        mean_pairwise = float(np.mean(np.asarray(pairwise_accuracies, dtype=np.float64))) if pairwise_accuracies else 0.0
-        mean_spearman = float(np.mean(np.asarray(spearman_values, dtype=np.float64))) if spearman_values else 0.0
-        mean_huber = float(np.mean(np.asarray(huber_values, dtype=np.float64))) if huber_values else float("inf")
-        thresholds_passed = support_choice_score is not None and not constraint_failures
-        copied["diagnostics"] = diagnostics
-        copied["worst_split_pairwise_accuracy"] = worst_acc
-        copied["support_choice_score"] = support_choice_score
-        copied["worst_split_support_top1_accuracy"] = worst_top1
-        copied["mean_pairwise_accuracy"] = mean_pairwise
-        copied["mean_spearman_rank_correlation"] = mean_spearman
-        copied["mean_huber_loss"] = mean_huber
-        copied["selection_constraints_passed"] = bool(thresholds_passed)
-        copied["selection_constraint_failures"] = constraint_failures
-        scored_history.append(copied)
-        if not thresholds_passed:
+        diagnostics = {str(key): dict(value) for key, value in dict(entry.get("diagnostics", {})).items()}
+        missing = [name for name in required if diagnostics.get(name, {}).get("total_loss") is None]
+        if missing:
+            copied = dict(entry)
+            copied["selection_constraints_passed"] = False
+            copied["selection_constraint_failures"] = [f"{name}:missing_total_loss" for name in missing]
+            scored.append(copied)
             continue
+        active_names = required or tuple(sorted(name for name, diag in diagnostics.items() if diag.get("total_loss") is not None))
+        losses = [float(diagnostics[name]["total_loss"]) for name in active_names]
+        pairwise_values = [float(diagnostics[name]["pairwise_accuracy"]) for name in active_names if diagnostics[name].get("pairwise_accuracy") is not None]
+        spearman_values = [float(diagnostics[name]["spearman_rank_correlation"]) for name in active_names if diagnostics[name].get("spearman_rank_correlation") is not None]
+        copied = dict(entry)
+        copied["diagnostics"] = diagnostics
+        copied["selection_constraints_passed"] = True
+        copied["selection_constraint_failures"] = []
+        copied["mean_diagnostic_total_loss"] = float(np.mean(np.asarray(losses, dtype=np.float64)))
+        copied["mean_pairwise_accuracy"] = float(np.mean(np.asarray(pairwise_values, dtype=np.float64))) if pairwise_values else 0.0
+        copied["mean_spearman_rank_correlation"] = float(np.mean(np.asarray(spearman_values, dtype=np.float64))) if spearman_values else 0.0
+        scored.append(copied)
         key = (
-            -float(support_choice_score),
-            -worst_top1,
-            -mean_pairwise,
-            -mean_spearman,
-            mean_huber,
+            float(copied["mean_diagnostic_total_loss"]),
+            -float(copied["mean_pairwise_accuracy"]),
+            -float(copied["mean_spearman_rank_correlation"]),
             int(copied["step"]),
         )
         if best_key is None or key < best_key:
             best_key = key
             best_entry = copied
     if best_entry is None:
-        raise ValueError(
-            "Teacher checkpoint selection found no checkpoint satisfying support-choice constraints; "
-            f"constraints={constraints}, scored_steps={[entry.get('step') for entry in scored_history]}."
-        )
+        raise ValueError("Teacher checkpoint selection found no checkpoint with all required diagnostic split losses.")
     selected_step = int(best_entry["step"])
-    selected_state = checkpoint_states.get(selected_step)
     return (
         {
-            "selection_protocol": "context_series_support_choice_teacher_checkpoint",
+            "selection_protocol": "context_series_density_teacher_checkpoint",
             "selection_split": "context_and_series_teacher_holdouts",
-            "selected_step": int(selected_step),
-            "selection_metric": "context_series_support_top1_top2",
-            "selection_constraints": constraints,
-            "selected_support_choice_score": best_entry.get("support_choice_score"),
-            "tie_breaker": "higher_worst_split_top1_then_pairwise_then_spearman_then_lower_huber_then_earlier_step",
+            "selection_metric": "mean_context_series_total_loss",
+            "selected_step": selected_step,
+            "selected_mean_diagnostic_total_loss": best_entry.get("mean_diagnostic_total_loss"),
+            "tie_breaker": "higher_pairwise_then_higher_spearman_then_earlier_step",
             "uses_validation_labels": False,
-            "history": scored_history,
+            "history": scored,
         },
-        selected_state,
+        checkpoint_states.get(selected_step),
     )
 
 
@@ -1053,8 +969,9 @@ def train_context_teacher(
     *,
     context_embeddings: Mapping[str, Sequence[float]],
     series_index_map: Mapping[str, int],
-    schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None = None,
-    max_macro_steps: int = 12,
+    schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
+    reference_time_grid: Sequence[float],
+    density_normalizer: DensityFeatureNormalizer,
     steps: int = 500,
     lr: float = 1e-3,
     rank_temperature: float = 0.5,
@@ -1064,26 +981,22 @@ def train_context_teacher(
     require_rank_pairs: bool = True,
     diagnostic_splits: Mapping[str, Sequence[MetricRow]] | None = None,
     teacher_checkpoint_every: int = 100,
-    teacher_selection_min_pairwise_accuracy: float = DEFAULT_TEACHER_SELECTION_MIN_PAIRWISE_ACCURACY,
-    teacher_selection_min_spearman: float = DEFAULT_TEACHER_SELECTION_MIN_SPEARMAN,
     series_unknown_probability: float = 0.0,
     seed: int = 0,
-    allowed_schedule_keys: Sequence[str] = CONTEXT_SUPPORT_SCHEDULE_KEYS,
+    allowed_schedule_keys: Sequence[str] = DEFAULT_SUPERVISION_SCHEDULE_KEYS,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
     if not rows:
         raise ValueError("Teacher training requires at least one context reward row.")
-    validate_context_support_schedule_keys(
-        sorted({str(row["scheduler_key"]) for row in rows}),
-        allowed_schedule_keys=allowed_schedule_keys,
-    )
+    validate_context_support_schedule_keys(sorted({str(row["scheduler_key"]) for row in rows}), allowed_schedule_keys=allowed_schedule_keys)
     teacher.to(device)
-    sx, ix, series_idx, cx, targets, pair_keys, _ = _teacher_training_tensors(
+    sx, dx, series_idx, cx, targets, pair_keys, _, _ = _teacher_training_tensors(
         rows,
         context_embeddings=context_embeddings,
         series_index_map=series_index_map,
         schedule_grids=schedule_grids,
-        max_macro_steps=int(max_macro_steps),
+        reference_time_grid=reference_time_grid,
+        density_normalizer=density_normalizer,
         device=device,
         series_unknown_probability=float(series_unknown_probability),
         seed=int(seed),
@@ -1101,7 +1014,7 @@ def train_context_teacher(
     fit_series_keys = sorted({series_key_from_row(row) for row in rows})
     checkpoint_every = max(1, int(teacher_checkpoint_every))
     for step in range(int(steps)):
-        pred = teacher(sx, ix, series_idx, cx)
+        pred = teacher(sx, dx, series_idx, cx)
         rank = pairwise_rank_loss(pred, left, right, sign, temperature=float(rank_temperature))
         huber = F.smooth_l1_loss(pred, targets)
         loss = rank + float(regression_weight) * huber
@@ -1121,7 +1034,6 @@ def train_context_teacher(
                 }
             )
         if diagnostic_splits and (step == 0 or step == int(steps) - 1 or (step + 1) % checkpoint_every == 0):
-            step_value = int(step + 1)
             diagnostics = {
                 str(name): context_teacher_diagnostics(
                     teacher,
@@ -1129,7 +1041,8 @@ def train_context_teacher(
                     context_embeddings=context_embeddings,
                     series_index_map=series_index_map,
                     schedule_grids=schedule_grids,
-                    max_macro_steps=int(max_macro_steps),
+                    reference_time_grid=reference_time_grid,
+                    density_normalizer=density_normalizer,
                     rank_temperature=float(rank_temperature),
                     regression_weight=float(regression_weight),
                     pair_margin=float(pair_margin),
@@ -1141,480 +1054,231 @@ def train_context_teacher(
                 )
                 for name, split_rows in diagnostic_splits.items()
             }
+            step_value = int(step + 1)
             checkpoint_history.append({"step": step_value, "diagnostics": diagnostics})
             checkpoint_states[step_value] = copy.deepcopy(teacher.state_dict())
     checkpoint_selection, selected_state = _selected_context_teacher_checkpoint(
         checkpoint_history,
         checkpoint_states,
-        required_split_names=tuple(diagnostic_splits or ()),
-        min_pairwise_accuracy=float(teacher_selection_min_pairwise_accuracy),
-        min_spearman=float(teacher_selection_min_spearman),
+        required_split_names=tuple(diagnostic_splits.keys()) if diagnostic_splits else (),
     )
     if selected_state is not None:
         teacher.load_state_dict(selected_state)
     return {
-        "losses": losses,
+        "teacher_objective": "pairwise_rank_plus_huber_regression",
+        "teacher_target": "u_comp_uniform",
+        "teacher_density_feature": "train_normalized_log_density",
         "teacher_pair_count": int(left.numel()),
-        "teacher_row_count": int(len(rows)),
-        "context_count": int(len({context_id_from_row(row) for row in rows})),
-        "reward_protocol": CONTEXT_CONDITIONAL_PROTOCOL,
-        "series_unknown_probability": float(series_unknown_probability),
-        "checkpoint_selection": checkpoint_selection,
-        "_selected_state_dict": selected_state,
+        "rank_temperature": float(rank_temperature),
+        "regression_weight": float(regression_weight),
+        "pair_margin": float(pair_margin),
+        "losses": losses,
+        "teacher_checkpoint_selection": checkpoint_selection,
+        "fit_context_count": int(len(fit_context_ids)),
+        "fit_series_count": int(len(fit_series_keys)),
     }
 
 
-def support_student_ce_loss(student_logits: torch.Tensor, target_distribution: torch.Tensor) -> torch.Tensor:
-    if student_logits.ndim != 2 or target_distribution.ndim != 2:
-        raise ValueError("student_logits and target_distribution must be 2D tensors.")
-    if student_logits.shape != target_distribution.shape:
-        raise ValueError("student_logits and target_distribution shapes must match.")
-    log_probs = F.log_softmax(student_logits, dim=-1)
-    return -(target_distribution.to(device=student_logits.device, dtype=student_logits.dtype) * log_probs).sum(dim=-1).mean()
-
-
-def _context_setting_key(row: MetricRow) -> Tuple[str, str, int, str]:
-    return (
-        str(row.get("dataset", row.get("dataset_key", ""))),
-        str(row["solver_key"]),
-        int(row["target_nfe"]),
-        context_id_from_row(row),
-    )
-
-
-def _support_groups_by_context_setting(
-    rows: Sequence[MetricRow],
-    support_schedule_keys: Sequence[str],
-) -> List[Tuple[Tuple[str, str, int, str], Dict[str, List[Dict[str, Any]]], Dict[str, Any]]]:
-    support = tuple(str(key) for key in support_schedule_keys)
-    grouped: Dict[Tuple[str, str, int, str], Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
-    refs: Dict[Tuple[str, str, int, str], Dict[str, Any]] = {}
-    for row in rows:
-        schedule = str(row["scheduler_key"])
-        if schedule not in set(support):
-            continue
-        key = _context_setting_key(row)
-        copied = dict(row)
-        copied["context_id"] = key[3]
-        grouped[key][schedule].append(copied)
-        refs.setdefault(key, copied)
-    out: List[Tuple[Tuple[str, str, int, str], Dict[str, List[Dict[str, Any]]], Dict[str, Any]]] = []
-    for key in sorted(grouped):
-        schedule_rows = {schedule: list(grouped[key].get(schedule, [])) for schedule in support}
-        missing = [schedule for schedule, items in schedule_rows.items() if not items]
-        if missing:
-            raise ValueError(f"Student support target group {key} is missing support schedules: {missing}")
-        out.append((key, schedule_rows, refs[key]))
+def _series_with_dynamic_unknown(base_series_idx: torch.Tensor, *, unknown_index: int, dropout: float) -> torch.Tensor:
+    probability = min(1.0, max(0.0, float(dropout)))
+    if probability <= 0.0 or base_series_idx.numel() == 0:
+        return base_series_idx
+    mask = torch.rand(base_series_idx.shape, device=base_series_idx.device) < probability
+    out = base_series_idx.clone()
+    out[mask] = int(unknown_index)
     return out
 
 
-def _mean_observed_utility(rows: Sequence[Mapping[str, Any]], *, schedule_key: str, context_key: Tuple[str, str, int, str]) -> float:
-    values = [float(row["u_comp_uniform"]) for row in rows if row.get("u_comp_uniform") not in (None, "")]
-    if not values:
-        raise ValueError(f"Missing observed u_comp_uniform for schedule {schedule_key!r} in context setting {context_key}.")
-    return float(np.mean(np.asarray(values, dtype=np.float64)))
-
-
-def _apply_series_unknown_dropout(
-    series_idx: torch.Tensor,
-    *,
-    unknown_index: int,
-    probability: float,
-) -> torch.Tensor:
-    p = min(1.0, max(0.0, float(probability)))
-    if p <= 0.0 or series_idx.numel() == 0:
-        return series_idx
-    mask = torch.rand(series_idx.shape, device=series_idx.device) < p
-    return torch.where(mask, torch.full_like(series_idx, int(unknown_index)), series_idx)
-
-
-def build_teacher_guided_support_targets(
+def build_teacher_weighted_density_targets(
     teacher: ContextScheduleTeacherMLP,
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
     series_index_map: Mapping[str, int],
-    support_schedule_keys: Sequence[str],
-    schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None = None,
-    max_macro_steps: int = 12,
-    support_choice_margin: float = DEFAULT_SUPPORT_CHOICE_MARGIN,
+    schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
+    reference_time_grid: Sequence[float],
+    density_normalizer: DensityFeatureNormalizer,
+    supervision_schedule_keys: Sequence[str] | None = None,
+    temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
     device: torch.device | str = "cpu",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    support_keys = validate_context_support_schedule_keys(tuple(str(key) for key in support_schedule_keys))
-    groups = _support_groups_by_context_setting(rows, support_keys)
-    if not groups:
-        raise ValueError("Student target construction requires at least one complete context/support group.")
-    teacher.to(device)
-    teacher.eval()
+    observed_keys = {str(row["scheduler_key"]) for row in rows}
+    supervision_keys = validate_context_support_schedule_keys(
+        sorted(observed_keys) if supervision_schedule_keys is None else supervision_schedule_keys
+    )
+    supervision_set = set(supervision_keys)
+    validate_context_support_schedule_keys(sorted(observed_keys))
+    unsupported_observed = sorted(observed_keys - supervision_set)
+    if unsupported_observed:
+        raise ValueError(f"Rows contain schedules outside supervision_schedule_keys: {unsupported_observed}")
+    grouped: Dict[ContextPairKey, List[MetricRow]] = defaultdict(list)
+    for row in rows:
+        grouped[context_pair_key(row, pair_on_seed=True)].append(row)
+    if not grouped:
+        raise ValueError("Student target construction requires at least one context group.")
     setting_rows: List[torch.Tensor] = []
     series_rows: List[int] = []
     context_rows: List[np.ndarray] = []
-    target_rows: List[np.ndarray] = []
-    target_source_counts: Counter[str] = Counter()
-    selected_target_counts: Counter[str] = Counter()
-    teacher_top1_counts: Counter[str] = Counter()
-    observed_top1_counts: Counter[str] = Counter()
-    margin = float(support_choice_margin)
-    with torch.no_grad():
-        for key, schedule_rows, ref in groups:
-            _, solver, target_nfe, context_id = key
-            if context_id not in context_embeddings:
-                raise KeyError(f"Missing context embedding for {context_id}.")
-            setting = setting_features(solver, target_nfe)
-            context_np = np.asarray(context_embeddings[context_id], dtype=np.float32)
-            context = torch.tensor(context_np[None, :], dtype=torch.float32, device=device)
-            series_value = remapped_series_index(ref, series_index_map)
-            series = torch.tensor([series_value], dtype=torch.long, device=device)
-            observed_utilities = {
-                schedule: _mean_observed_utility(schedule_rows[schedule], schedule_key=schedule, context_key=key)
-                for schedule in support_keys
-            }
-            teacher_utilities: Dict[str, float] = {}
-            for schedule in support_keys:
-                grid = grid_for_schedule(schedule, solver, target_nfe, schedule_grids=schedule_grids)
-                interval = padded_intervals_from_grid(
-                    solver,
-                    target_nfe,
-                    grid,
-                    max_macro_steps=int(max_macro_steps),
-                    device=device,
-                )[None, :]
-                teacher_utilities[schedule] = float(teacher(setting[None, :].to(device), interval, series, context)[0].detach().cpu().item())
-            teacher_order = sorted(support_keys, key=lambda schedule: (-float(teacher_utilities[schedule]), str(schedule)))
-            observed_order = sorted(support_keys, key=lambda schedule: (-float(observed_utilities[schedule]), str(schedule)))
-            teacher_top1 = str(teacher_order[0])
-            observed_top1 = str(observed_order[0])
-            teacher_top1_counts[teacher_top1] += 1
-            observed_top1_counts[observed_top1] += 1
-            teacher_accepted = float(observed_utilities[teacher_top1]) >= float(observed_utilities[observed_top1]) - margin
-            source = "teacher_accepted" if teacher_accepted else "observed_fallback"
-            source_order = teacher_order if teacher_accepted else observed_order
-            source_values = teacher_utilities if teacher_accepted else observed_utilities
-            top1 = str(source_order[0])
-            target = np.zeros(len(support_keys), dtype=np.float32)
-            if len(source_order) > 1 and float(source_values[top1]) - float(source_values[str(source_order[1])]) <= margin:
-                top2 = str(source_order[1])
-                target[support_keys.index(top1)] = 0.6
-                target[support_keys.index(top2)] = 0.4
-                target_source_counts[f"{source}_top2"] += 1
-            else:
-                target[support_keys.index(top1)] = 1.0
-                target_source_counts[f"{source}_top1"] += 1
-            selected_target_counts[top1] += 1
-            setting_rows.append(setting)
-            series_rows.append(int(series_value))
-            context_rows.append(context_np)
-            target_rows.append(target)
+    target_masses: List[np.ndarray] = []
+    entropy_values: List[float] = []
+    candidate_counts: List[int] = []
+    teacher.eval()
+    for _, group in sorted(grouped.items(), key=lambda item: item[0]):
+        counts: Dict[str, int] = {key: 0 for key in supervision_keys}
+        for row in group:
+            key = str(row["scheduler_key"])
+            counts[key] = counts.get(key, 0) + 1
+        bad_counts = {key: count for key, count in counts.items() if count != 1}
+        if bad_counts:
+            raise ValueError(f"Teacher-weighted density targets require exactly one row per supervision schedule; counts={bad_counts}.")
+        first = group[0]
+        context_id = context_id_from_row(first)
+        if context_id not in context_embeddings:
+            raise KeyError(f"Missing context embedding for {context_id}.")
+        solver = str(first["solver_key"])
+        target_nfe = int(first["target_nfe"])
+        masses: List[Tuple[float, ...]] = []
+        utilities: List[float] = []
+        with torch.no_grad():
+            for row in group:
+                mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
+                density_feature = density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid)
+                util = teacher(
+                    setting_features(solver, target_nfe)[None, :].to(device=device),
+                    torch.tensor(density_feature[None, :], dtype=torch.float32, device=device),
+                    torch.tensor([remapped_series_index(row, series_index_map)], dtype=torch.long, device=device),
+                    torch.tensor(np.asarray(context_embeddings[context_id], dtype=np.float32)[None, :], dtype=torch.float32, device=device),
+                )[0]
+                masses.append(mass)
+                utilities.append(float(util.detach().cpu().item()))
+        logits = np.asarray(utilities, dtype=np.float64) / max(float(temperature), 1e-6)
+        logits = logits - float(np.max(logits))
+        weights = np.exp(logits)
+        weights = weights / max(float(np.sum(weights)), 1e-12)
+        mixture = np.zeros(len(reference_time_grid) - 1, dtype=np.float64)
+        for weight, mass in zip(weights, masses):
+            mixture += float(weight) * np.asarray(mass, dtype=np.float64)
+        mixture = mixture / max(float(np.sum(mixture)), 1e-12)
+        setting_rows.append(setting_features(solver, target_nfe))
+        series_rows.append(remapped_series_index(first, series_index_map))
+        context_rows.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
+        target_masses.append(mixture.astype(np.float32))
+        entropy_values.append(float(-np.sum(weights * np.log(np.maximum(weights, 1e-12)))))
+        candidate_counts.append(int(len(group)))
+    summary = {
+        "target_protocol": "teacher_weighted_density_mle",
+        "teacher_temperature": float(temperature),
+        "context_setting_count": int(len(target_masses)),
+        "mean_teacher_candidate_entropy": float(np.mean(np.asarray(entropy_values, dtype=np.float64))) if entropy_values else 0.0,
+        "mean_candidate_count": float(np.mean(np.asarray(candidate_counts, dtype=np.float64))) if candidate_counts else 0.0,
+        "supervision_schedule_keys": list(supervision_keys),
+        "density_protocol": DENSITY_PROTOCOL,
+    }
     return (
         torch.stack(setting_rows, dim=0).to(device=device),
         torch.tensor(series_rows, dtype=torch.long, device=device),
         torch.tensor(np.stack(context_rows, axis=0), dtype=torch.float32, device=device),
-        torch.tensor(np.stack(target_rows, axis=0), dtype=torch.float32, device=device),
-        {
-            "target_protocol": "teacher_guided_top1_top2_support_ce",
-            "support_choice_margin": float(margin),
-            "context_setting_count": int(len(groups)),
-            "support_schedule_keys": list(support_keys),
-            "target_source_counts": {key: int(value) for key, value in sorted(target_source_counts.items())},
-            "selected_target_counts": {key: int(value) for key, value in sorted(selected_target_counts.items())},
-            "teacher_top1_counts": {key: int(value) for key, value in sorted(teacher_top1_counts.items())},
-            "observed_top1_counts": {key: int(value) for key, value in sorted(observed_top1_counts.items())},
-        },
+        torch.tensor(np.stack(target_masses, axis=0), dtype=torch.float32, device=device),
+        summary,
     )
 
 
-def train_context_support_student(
-    student: ContextSupportStudentMLP,
+def train_context_density_student(
+    student: ContextDensityStudentMLP,
     teacher: ContextScheduleTeacherMLP,
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
     series_index_map: Mapping[str, int],
-    support_schedule_keys: Sequence[str],
-    schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None = None,
-    max_macro_steps: int = 12,
+    schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
+    reference_time_grid: Sequence[float],
+    density_normalizer: DensityFeatureNormalizer,
     steps: int = 500,
     lr: float = 1e-3,
-    support_choice_margin: float = DEFAULT_SUPPORT_CHOICE_MARGIN,
-    series_unknown_probability: float = 0.0,
-    seed: int = 0,
+    teacher_temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
+    series_unknown_dropout: float = 0.10,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
-    support_keys = tuple(str(key) for key in support_schedule_keys)
-    support_keys = validate_context_support_schedule_keys(support_keys)
-    if tuple(student.support_schedule_keys) != support_keys:
-        raise ValueError("Student support_schedule_keys do not match training support.")
+    if not rows:
+        raise ValueError("Student density training requires at least one fit row.")
     student.to(device)
     teacher.to(device)
     teacher.eval()
-    for param in teacher.parameters():
-        param.requires_grad_(False)
-
-    sx, base_series_idx, cx, target_probs, target_summary = build_teacher_guided_support_targets(
+    sx, base_series_idx, cx, target_mass, target_summary = build_teacher_weighted_density_targets(
         teacher,
         rows,
         context_embeddings=context_embeddings,
         series_index_map=series_index_map,
-        support_schedule_keys=support_keys,
         schedule_grids=schedule_grids,
-        max_macro_steps=int(max_macro_steps),
-        support_choice_margin=float(support_choice_margin),
+        reference_time_grid=reference_time_grid,
+        density_normalizer=density_normalizer,
+        supervision_schedule_keys=sorted({str(row["scheduler_key"]) for row in rows}),
+        temperature=float(teacher_temperature),
         device=device,
     )
-    unknown_index = int(len(series_index_map))
-    unknown_probability = min(1.0, max(0.0, float(series_unknown_probability)))
     opt = torch.optim.AdamW(student.parameters(), lr=float(lr), weight_decay=1e-4)
     losses: List[Dict[str, Any]] = []
-    torch.manual_seed(int(seed))
     for step in range(int(steps)):
-        train_series_idx = _apply_series_unknown_dropout(
-            base_series_idx,
-            unknown_index=unknown_index,
-            probability=unknown_probability,
-        )
-        logits = student.logits(sx, train_series_idx, cx)
-        loss = support_student_ce_loss(logits, target_probs)
+        series_idx = _series_with_dynamic_unknown(base_series_idx, unknown_index=student.unknown_series_index, dropout=float(series_unknown_dropout))
+        logits = student.logits(sx, series_idx, cx)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        loss = -(target_mass * log_probs).sum(dim=-1).mean()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
         if step == 0 or step == int(steps) - 1 or (step + 1) % max(1, int(steps) // 5) == 0:
             with torch.no_grad():
-                probs = F.softmax(student.logits(sx, base_series_idx, cx), dim=-1)
-                entropy = -(probs * torch.log(torch.clamp(probs, min=1e-12))).sum(dim=-1).mean()
+                entropy = float((-(torch.softmax(logits, dim=-1) * log_probs).sum(dim=-1).mean()).detach().cpu().item())
             losses.append(
                 {
                     "step": int(step + 1),
-                    "student_ce_loss": float(loss.detach().cpu().item()),
-                    "student_mean_entropy": float(entropy.detach().cpu().item()),
-                    "student_objective": "teacher_guided_top1_top2_categorical_ce",
+                    "student_kl_ce_loss": float(loss.detach().cpu().item()),
+                    "student_entropy": entropy,
                 }
             )
     return {
-        "losses": losses,
-        "student_context_setting_count": int(target_summary["context_setting_count"]),
-        "support_schedule_keys": list(support_keys),
-        "student_policy_type": "categorical_support",
-        "student_objective": "teacher_guided_top1_top2_categorical_ce",
+        "student_policy_type": "continuous_density",
+        "student_objective": "teacher_weighted_density_mle_kl",
+        "density_protocol": DENSITY_PROTOCOL,
         "student_target_summary": target_summary,
-        "reward_protocol": CONTEXT_CONDITIONAL_PROTOCOL,
-        "series_unknown_probability": float(series_unknown_probability),
+        "series_unknown_dropout": float(series_unknown_dropout),
         "series_unknown_dropout_mode": "dynamic_per_step",
+        "losses": losses,
     }
 
 
-def build_calibration_holdout_non_regression_guard(
-    student: ContextSupportStudentMLP,
-    rows: Sequence[MetricRow],
+def predict_context_density(
+    student: ContextDensityStudentMLP,
     *,
-    context_embeddings: Mapping[str, Sequence[float]],
+    row: MetricRow,
+    context_embedding: Sequence[float],
     series_index_map: Mapping[str, int],
-    support_schedule_keys: Sequence[str],
-    margin: float = DEFAULT_SUPPORT_CHOICE_MARGIN,
-    source_holdout_names: Sequence[str] = ("context_disjoint", "series_disjoint"),
+    reference_time_grid: Sequence[float],
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
-    support_keys = validate_context_support_schedule_keys(tuple(str(key) for key in support_schedule_keys))
-    if tuple(student.support_schedule_keys) != support_keys:
-        raise ValueError("Student support_schedule_keys do not match calibration guard support.")
-    if not rows:
-        raise ValueError("Calibration non-regression guard requires calibration holdout rows.")
-    locked_rows = [row for row in rows if str(row.get("split_phase", row.get("split", ""))) == "locked_test"]
-    if locked_rows:
-        raise ValueError(f"Calibration non-regression guard refuses locked_test rows; found {len(locked_rows)}.")
-    expected_holdouts = {str(name) for name in source_holdout_names}
-    observed_holdouts = {str(row.get("calibration_holdout_name", "") or "") for row in rows}
-    if "" in observed_holdouts or not observed_holdouts:
-        raise ValueError("Calibration guard rows require explicit calibration_holdout_name provenance.")
-    unknown_holdouts = sorted(observed_holdouts - expected_holdouts)
-    if unknown_holdouts:
-        raise ValueError(f"Calibration guard rows contain unexpected calibration_holdout_name values: {unknown_holdouts}")
-    missing_holdouts = sorted(expected_holdouts - observed_holdouts)
-    if missing_holdouts:
-        raise ValueError(f"Calibration guard rows are missing expected holdout provenance: {missing_holdouts}")
-    grouped: Dict[ContextPairKey, Dict[str, Dict[str, Any]]] = defaultdict(dict)
-    duplicates: List[Dict[str, Any]] = []
-    for row in rows:
-        schedule = str(row["scheduler_key"])
-        if schedule not in set(support_keys):
-            continue
-        key = context_pair_key(row, pair_on_seed=True)
-        if schedule in grouped[key]:
-            duplicates.append({"group": list(key), "scheduler_key": schedule})
-        copied = dict(row)
-        copied["context_id"] = key[3]
-        grouped[key][schedule] = copied
-    if duplicates:
-        raise ValueError(f"Calibration guard rows contain duplicate context/support rows; first={duplicates[:3]}")
-    if not grouped:
-        raise ValueError("Calibration guard rows contain no requested support rows.")
-
-    cell_context_scores: Dict[Tuple[str, int], List[float]] = defaultdict(list)
-    cell_static_scores: Dict[Tuple[str, int], Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
-    cell_oracle_scores: Dict[Tuple[str, int], List[float]] = defaultdict(list)
-    cell_oracle_usage: Dict[Tuple[str, int], Counter[str]] = defaultdict(Counter)
-    cell_holdout_oracle_scores: Dict[Tuple[str, int], Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
-    cell_holdout_static_scores: Dict[Tuple[str, int], Dict[str, Dict[str, List[float]]]] = defaultdict(
-        lambda: defaultdict(lambda: defaultdict(list))
-    )
-    cell_usage: Dict[Tuple[str, int], Counter[str]] = defaultdict(Counter)
-    missing: List[Dict[str, Any]] = []
+    solver = str(row["solver_key"])
+    target_nfe = int(row["target_nfe"])
+    macro_steps = solver_macro_steps(solver, target_nfe)
     student.to(device)
     student.eval()
     with torch.no_grad():
-        for key, schedule_rows in sorted(grouped.items(), key=lambda item: item[0]):
-            _, solver, target_nfe, context_id, _ = key
-            missing_support = [schedule for schedule in support_keys if schedule not in schedule_rows]
-            if missing_support:
-                missing.append({"group": list(key), "missing_schedule_keys": missing_support})
-                continue
-            if context_id not in context_embeddings:
-                raise KeyError(f"Missing calibration guard context embedding for {context_id}.")
-            ref = next(iter(schedule_rows.values()))
-            setting = setting_features(solver, target_nfe)[None, :].to(device)
-            series = torch.tensor([remapped_series_index(ref, series_index_map)], dtype=torch.long, device=device)
-            context = torch.tensor(np.asarray(context_embeddings[context_id], dtype=np.float32)[None, :], dtype=torch.float32, device=device)
-            probabilities = student.probabilities(setting, series, context)[0].detach().cpu().numpy().astype(np.float64)
-            selected_idx = int(np.argmax(probabilities))
-            selected_support = str(support_keys[selected_idx])
-            cell = (str(solver), int(target_nfe))
-            cell_usage[cell][selected_support] += 1
-            cell_context_scores[cell].append(float(schedule_rows[selected_support]["u_comp_uniform"]))
-            schedule_utilities = {schedule: float(schedule_rows[schedule]["u_comp_uniform"]) for schedule in support_keys}
-            oracle_support = sorted(schedule_utilities, key=lambda schedule: (-float(schedule_utilities[schedule]), str(schedule)))[0]
-            oracle_score = float(schedule_utilities[oracle_support])
-            holdout_name = str(ref.get("calibration_holdout_name", ""))
-            cell_oracle_scores[cell].append(oracle_score)
-            cell_oracle_usage[cell][oracle_support] += 1
-            cell_holdout_oracle_scores[cell][holdout_name].append(oracle_score)
-            for schedule in support_keys:
-                utility = float(schedule_utilities[schedule])
-                cell_static_scores[cell][schedule].append(utility)
-                cell_holdout_static_scores[cell][holdout_name][schedule].append(utility)
-    if missing:
-        raise ValueError(f"Calibration guard rows are missing support schedules for {len(missing)} groups; first={missing[:3]}")
-
-    decisions: List[Dict[str, Any]] = []
-    margin_value = float(margin)
-    for cell in sorted(cell_static_scores, key=lambda item: (item[0], item[1])):
-        solver, target_nfe = cell
-        context_values = cell_context_scores.get(cell, [])
-        if not context_values:
-            raise ValueError(f"Calibration guard has no context-student selections for cell {cell}.")
-        context_score = float(np.mean(np.asarray(context_values, dtype=np.float64)))
-        static_means = {
-            schedule: float(np.mean(np.asarray(values, dtype=np.float64)))
-            for schedule, values in sorted(cell_static_scores[cell].items())
-            if values
-        }
-        best_static = sorted(static_means, key=lambda schedule: (-float(static_means[schedule]), str(schedule)))[0]
-        best_static_score = float(static_means[best_static])
-        oracle_values = cell_oracle_scores.get(cell, [])
-        oracle_context_score = float(np.mean(np.asarray(oracle_values, dtype=np.float64))) if oracle_values else None
-        oracle_advantage = (
-            float(oracle_context_score - best_static_score)
-            if oracle_context_score is not None
-            else None
-        )
-        context_capture = (
-            float((context_score - best_static_score) / oracle_advantage)
-            if oracle_advantage is not None and oracle_advantage > 1e-12
-            else None
-        )
-        oracle_by_holdout: Dict[str, Dict[str, Any]] = {}
-        for holdout_name in sorted(cell_holdout_oracle_scores.get(cell, {})):
-            holdout_oracle_values = cell_holdout_oracle_scores[cell][holdout_name]
-            holdout_static_means = {
-                schedule: float(np.mean(np.asarray(values, dtype=np.float64)))
-                for schedule, values in sorted(cell_holdout_static_scores[cell][holdout_name].items())
-                if values
-            }
-            holdout_best_static = sorted(
-                holdout_static_means,
-                key=lambda schedule: (-float(holdout_static_means[schedule]), str(schedule)),
-            )[0]
-            holdout_best_score = float(holdout_static_means[holdout_best_static])
-            holdout_oracle_score = float(np.mean(np.asarray(holdout_oracle_values, dtype=np.float64)))
-            oracle_by_holdout[holdout_name] = {
-                "oracle_context_score": holdout_oracle_score,
-                "best_static_support_schedule_key": str(holdout_best_static),
-                "best_static_score": holdout_best_score,
-                "oracle_context_advantage_vs_best_static": float(holdout_oracle_score - holdout_best_score),
-                "context_group_count": int(len(holdout_oracle_values)),
-            }
-        deploy_context = bool(context_score >= best_static_score + margin_value)
-        decisions.append(
-            {
-                "solver_key": str(solver),
-                "target_nfe": int(target_nfe),
-                "deployed_mode": "context_student" if deploy_context else "static_support",
-                "best_static_support_schedule_key": str(best_static),
-                "fallback_schedule_key": "" if deploy_context else str(best_static),
-                "context_student_score": float(context_score),
-                "best_static_score": float(best_static_score),
-                "score_margin": float(context_score - best_static_score),
-                "oracle_context_score": oracle_context_score,
-                "oracle_context_advantage_vs_best_static": oracle_advantage,
-                "context_student_oracle_capture_fraction": context_capture,
-                "oracle_support_usage": {schedule: int(cell_oracle_usage[cell].get(schedule, 0)) for schedule in support_keys},
-                "oracle_advantage_by_holdout": oracle_by_holdout,
-                "required_margin": float(margin_value),
-                "context_group_count": int(len(context_values)),
-                "static_support_scores": static_means,
-                "student_argmax_support_usage": {schedule: int(cell_usage[cell].get(schedule, 0)) for schedule in support_keys},
-            }
-        )
-    source_context_ids = sorted({context_id_from_row(row) for row in rows})
-    source_split_phases = sorted({str(row.get("split_phase", row.get("split", ""))) for row in rows})
-    source_row_fingerprints = [
-        {
-            "dataset": str(row.get("dataset", row.get("dataset_key", ""))),
-            "split_phase": str(row.get("split_phase", row.get("split", ""))),
-            "seed": str(row.get("seed", "")),
-            "solver_key": str(row.get("solver_key", "")),
-            "target_nfe": int(row.get("target_nfe", 0)),
-            "scheduler_key": str(row.get("scheduler_key", "")),
-            "context_id": context_id_from_row(row),
-            "series_key": series_key_from_row(row),
-            "calibration_holdout_name": str(row.get("calibration_holdout_name", "")),
-            "u_comp_uniform": float(row.get("u_comp_uniform", 0.0)),
-        }
-        for row in rows
-    ]
-    sorted_row_fingerprints = sorted(
-        source_row_fingerprints,
-        key=lambda item: tuple(str(item[key]) for key in sorted(item)),
-    )
-    source_row_hash = hashlib.sha256(
-        json.dumps(sorted_row_fingerprints, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    source_context_ids_hash = hashlib.sha256(
-        json.dumps(source_context_ids, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    support_schedule_keys_hash = hashlib.sha256(
-        json.dumps(list(support_keys), sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    payload_without_id = {
-        "artifact": "calibration_holdout_non_regression_guard",
-        "enabled": True,
-        "reward_key": "u_comp_uniform",
-        "margin": float(margin_value),
-        "support_schedule_keys": list(support_keys),
-        "support_schedule_keys_hash": support_schedule_keys_hash,
-        "source_holdouts": [str(name) for name in source_holdout_names],
-        "observed_calibration_holdout_names": sorted(observed_holdouts),
-        "source_split_phases": source_split_phases,
-        "source_context_count": int(len(source_context_ids)),
-        "source_context_ids_hash": source_context_ids_hash,
-        "source_row_count": int(len(rows)),
-        "source_row_hash": source_row_hash,
-        "cell_decisions": decisions,
-        "cell_decision_map": {f"{item['solver_key']}/{item['target_nfe']}": dict(item) for item in decisions},
-        "locked_test_used_for_selection": False,
-        "locked_test_used_for_guard_construction": False,
+        mass_t = student.density_mass(
+            setting_features(solver, target_nfe)[None, :].to(device=device),
+            torch.tensor([remapped_series_index(row, series_index_map)], dtype=torch.long, device=device),
+            torch.tensor(np.asarray(context_embedding, dtype=np.float32)[None, :], dtype=torch.float32, device=device),
+        )[0]
+    mass = tuple(float(x) for x in mass_t.detach().cpu().numpy().astype(np.float64).tolist())
+    grid = density_mass_to_time_grid(mass, macro_steps=macro_steps, reference_time_grid=reference_time_grid)
+    return {
+        "solver_key": solver,
+        "target_nfe": int(target_nfe),
+        "macro_steps": int(macro_steps),
+        "time_grid": list(grid),
+        "schedule_grid_hash": schedule_grid_hash(grid),
+        "density_mass": [float(x) for x in mass],
+        "density_mass_hash": density_mass_hash(mass, reference_time_grid=reference_time_grid),
+        **density_metadata(reference_time_grid),
     }
-    guard_table_hash = hashlib.sha256(json.dumps(payload_without_id, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-    guard_id = "guard_" + guard_table_hash[:24]
-    return {**payload_without_id, "guard_id": guard_id, "guard_table_hash": guard_table_hash}
 
 
 def read_metric_rows_csv(path: str | Path) -> List[Dict[str, Any]]:
@@ -1624,41 +1288,41 @@ def read_metric_rows_csv(path: str | Path) -> List[Dict[str, Any]]:
 
 __all__ = [
     "CONTEXT_CONDITIONAL_PROTOCOL",
-    "DEFAULT_SUPPORT_SCHEDULE_KEYS",
+    "CONTEXT_SUPPORT_SCHEDULE_KEYS",
     "DEFAULT_CONTEXT_CALIBRATION_TOTAL",
-    "DEFAULT_SUPPORT_CHOICE_MARGIN",
-    "DEFAULT_TEACHER_SELECTION_MIN_PAIRWISE_ACCURACY",
-    "DEFAULT_TEACHER_SELECTION_MIN_SPEARMAN",
+    "DEFAULT_DENSITY_BIN_COUNT",
+    "DEFAULT_SUPPORT_SCHEDULE_KEYS",
+    "DEFAULT_SUPERVISION_SCHEDULE_KEYS",
+    "DEFAULT_TEACHER_TARGET_TEMPERATURE",
     "MAX_CONTEXT_CALIBRATION_TOTAL",
     "MIN_CONTEXT_CALIBRATION_TOTAL",
-    "CONTEXT_SUPPORT_SCHEDULE_KEYS",
+    "ContextDensityStudentMLP",
     "ContextScheduleTeacherMLP",
-    "ContextSupportStudentMLP",
+    "DensityFeatureNormalizer",
     "EmbeddingNormalizer",
     "attach_uniform_context_rewards",
-    "build_calibration_holdout_non_regression_guard",
-    "build_teacher_guided_support_targets",
     "build_series_index_map",
+    "build_teacher_weighted_density_targets",
     "context_calibration_train_val_counts",
     "context_id_from_row",
     "context_pair_key",
     "context_teacher_diagnostics",
+    "density_mass_for_row",
     "grid_for_schedule",
     "load_context_embedding_table",
-    "padded_intervals_from_grid",
     "pairwise_rank_loss",
+    "predict_context_density",
     "read_metric_rows_csv",
     "recommended_context_calibration_count",
     "remapped_series_index",
-    "save_context_embedding_table",
     "sample_context_ids_stratified",
+    "save_context_embedding_table",
     "schedule_grid_hash",
     "series_key_from_row",
     "split_rows_by_context_holdout",
     "split_rows_by_series_holdout",
-    "stable_context_id",
-    "support_student_ce_loss",
-    "train_context_support_student",
+    "train_context_density_student",
     "train_context_teacher",
     "validate_context_support_schedule_keys",
+    "validate_reference_grid",
 ]

@@ -50,29 +50,42 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertIn("Midpoint RK2", solver_names)
         self.assertIn("DPM++2M", solver_names)
 
-    def test_context_conditional_docs_describe_active_support_path(self) -> None:
+    def test_context_conditional_docs_describe_active_density_path(self) -> None:
         docs_path = PROJECT_ROOT / "docs" / "context_conditional_opd.md"
         text = docs_path.read_text(encoding="utf-8")
+        lower = text.lower()
 
+        self.assertRegex(lower, r"continuous[- ]density")
+        self.assertRegex(lower, r"teacher[- ]weighted")
         for expected in (
-            "Context-Conditional OPD",
+            "context-conditional opd",
+            "context_density_opd_v1",
+            "density_mass",
+            "rank",
+            "huber",
             "uniform",
             "late_power_3",
             "flowts_power_sampling",
             "ays",
             "gits",
             "ots",
-            "SER",
+            "ser",
             "context-disjoint",
             "series-disjoint",
-            "calibration guard",
+            "locked-test",
+        ):
+            self.assertIn(expected, lower)
+        for retired in (
+            "categorical support",
+            "top-1/top-2 categorical",
+            "static residual",
             "oracle_context",
             "best_static",
+            "support recall",
+            "soft penalties",
+            "teacher ensemble",
         ):
-            self.assertIn(expected, text)
-        retired_text = text.lower()
-        self.assertNotIn("soft penalties", retired_text)
-        self.assertNotIn("teacher ensemble", retired_text)
+            self.assertNotIn(retired, lower)
 
     def test_active_schedule_grids_have_endpoints(self) -> None:
         for key in BASELINE_SCHEDULE_KEYS:

@@ -1,38 +1,49 @@
-﻿# Context-Conditional OPD
+# Context-Conditional OPD
 
-This path trains schedule selection as a per-context support policy instead of a
-global solver/NFE schedule. The teacher sees `(solver, nfe, support interval,
-series id, frozen context embedding)` and learns uniform-anchored utility. The
-student predicts a categorical support choice over measured fixed/SER schedules
-from `(solver, nfe, series id, frozen context embedding)`.
+This path trains a continuous density policy instead of choosing a measured
+schedule key as the deployed action. The active protocol is
+`context_density_opd_v1`.
 
-The reward target is paired within the same context:
+Measured fixed/SER schedules are supervision candidates only. Every schedule grid
+is converted into canonical `density_mass_v1` on normalized model time:
+
+```text
+reference edges: linspace(0, 1, 129)
+p[j] = integral over reference bin j of the equal-step schedule density
+sum_j p[j] = 1
+```
+
+The teacher sees `(solver, nfe, log_density, series id, frozen context
+embedding)`, where `log_density = log(p / bin_width + 1e-8)` and the
+log-density vector is normalized from teacher-fit rows only. The teacher target
+is uniform anchored:
 
 ```text
 u_comp_uniform = -0.5 * (log(crps / uniform_crps) + log(mase / uniform_mase))
 ```
 
-Rows must not cross solver, NFE, seed, series, target time, or context identity
-when constructing rewards. BO/candidate schedules are intentionally rejected in
-this path; fixed and SER schedules are the measured support.
+Rewards are paired inside exact `(dataset, solver, NFE, context_id, seed)` cells.
+Rows must not cross solver, NFE, seed, series, target time, or context identity.
+BO/candidate schedules are rejected in this path; fixed schedules and SER are
+the measured supervision references.
 
-Teacher checkpoints are selected by support-choice diagnostics on both
-context-disjoint and series-disjoint calibration holdouts, not by scalar loss
-alone. The selected checkpoint must pass pairwise and Spearman sanity checks,
-then maximize the mean of context/series top-1 support accuracy and top-2
-support recall.
+The teacher is trained with pairwise rank loss plus auxiliary Huber regression.
+Teacher checkpoints are selected with context-disjoint and series-disjoint
+calibration diagnostics. Locked-test data is not used for checkpoint selection.
 
-The student is trained with teacher-guided top-1/top-2 categorical CE over the
-measured fixed/SER support. Observed uniform-anchored utility on teacher-fit rows
-rejects clear teacher top-1 mistakes; close top-1/top-2 cases use a 0.6/0.4
-target. Series-unknown augmentation is sampled dynamically during student
-optimization.
+The student predicts a `density_mass` vector from `(solver, nfe, series id,
+frozen context embedding)`. Student targets are teacher-weighted mixtures of the
+measured fixed/SER candidate densities in each context group:
 
-Final deployment is guarded per `(solver, NFE)` using calibration holdout only.
-If the context student does not beat the best static fixed/SER support schedule
-by the configured margin, the frozen policy falls back to that static support
-for the cell. Locked-test reporting only applies the frozen guard table and must
-not construct or alter guard decisions from locked-test metrics.
+```text
+w_i = softmax(teacher_utility_i / temperature)
+target_density = sum_i w_i * density_mass_i
+loss = KL(target_density || student_density)
+```
+
+At deployment, the density is converted to a solver grid by inverse CDF at
+quantiles `0/K, 1/K, ..., K/K`, where `K` is the solver macro-step count for the
+requested solver/NFE cell.
 
 ## Calibration Pool Size
 
@@ -48,24 +59,11 @@ Default for solar-style runs:
 24 context-holdout contexts
 ```
 
-With 12 solver/NFE cells, 7 fixed/SER schedules, and 3 seeds, this is about
-30k context-cell evaluations. If runtime is tight, use 72 total contexts with at
+With 12 solver/NFE cells, 7 fixed/SER schedules, and 3 seeds, this is about 30k
+context-cell evaluations. If runtime is tight, use 72 total contexts with at
 least 18 holdout contexts. If diagnostics are noisy, scale the sampled context
 pool explicitly, for example `--context_sample_count 288`, before changing the
 optimization method.
-
-The calibration guard also records fixed-support oracle headroom on the same
-holdout rows:
-
-```text
-oracle_context = best fixed/SER support per sample/context/cell
-best_static = best static fixed/SER support per solver/NFE cell
-headroom = mean(oracle_context utility - best_static utility)
-```
-
-Small headroom means the measured support itself offers little per-context gain.
-Large headroom with a guarded fallback means the selector is leaving useful
-support signal unrecovered.
 
 ## Entry Point
 
@@ -82,7 +80,7 @@ genode-run-schedules \
 The runner writes `forecast_context_rows.csv` and
 `forecast_context_embeddings.npz` under the output root.
 
-For SER or another precomputed fixed-support schedule summary, use the schedule
+For SER or another precomputed fixed/SER schedule summary, use the schedule
 summary evaluator with context rows enabled:
 
 ```text
@@ -92,12 +90,27 @@ genode-evaluate-schedule-summary \
   --write_context_rows
 ```
 
+Then train the density policy:
+
 ```text
 genode-train-context-conditional-opd \
   --rows_csv <forecast_context_rows.csv> \
   --context_embeddings_npz <context-embeddings.npz> \
   --schedule_summary_json <ser-schedule-summary.json> \
   --out_dir <output-dir>
+```
+
+Locked-test reporting is reporting-only. It applies the frozen student to each
+locked-test context, evaluates the generated context-specific grid, and writes
+aggregate rows for comparison:
+
+```text
+genode-report-context-locked-test \
+  --context_student_checkpoint <output-dir>/context_density_student.pt \
+  --training_summary <output-dir>/context_conditional_summary.json \
+  --locked_context_rows <locked-fixed-context.csv>,<locked-ser-context.csv> \
+  --locked_context_embeddings_npz <locked-context-embeddings.npz> \
+  --out_dir <locked-report-dir>
 ```
 
 Context embeddings must come from the frozen backbone's historical context

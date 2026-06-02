@@ -1,6 +1,6 @@
 # genODE
 
-genODE contains source code for context-conditional schedule selection on OTFlow forecasting backbones. The active OPD workflow trains a frozen-backbone teacher and categorical student over measured fixed/SER support schedules using per-context rows and frozen context embeddings.
+genODE contains source code for context-conditional schedule optimization on OTFlow forecasting backbones. The active OPD workflow trains a frozen-backbone rank+Huber teacher and a continuous-density student using per-context fixed/SER supervision rows and frozen context embeddings.
 
 ## Source Layout
 
@@ -52,10 +52,11 @@ This path implements:
 - per-example fixed/SER context rows with `series_id`, `target_t`, and stable `context_id`
 - frozen context embeddings from the frozen forecast backbone
 - uniform-anchored rewards paired inside exact context/seed/solver/NFE groups
-- teacher checkpoint selection by context-disjoint and series-disjoint top-1/top-2 support diagnostics
-- categorical student training with teacher-guided top-1/top-2 support CE
-- calibration-holdout non-regression guard against the best static fixed/SER support per solver/NFE
-- calibration-holdout fixed-support oracle headroom diagnostics
+- canonical `density_mass_v1` schedules over normalized model time `[0, 1]`
+- teacher features based on train-normalized `log_density = log(p / bin_width + 1e-8)`
+- rank+Huber teacher training over measured fixed/SER density candidates
+- continuous student density training by teacher-weighted MLE/KL targets
+- context-disjoint and series-disjoint diagnostics without locked-test selection
 
 The calibration row/embedding artifacts are intentionally reusable. Once fixed/SER
 context rows and context embeddings exist, future teacher/student changes can be
@@ -70,12 +71,14 @@ genode-train-context-conditional-opd \
   --support_schedule_keys uniform,late_power_3,flowts_power_sampling,ays,gits,ots,ser_ptg_local_defect_eta005
 ```
 
-Locked-test reporting is reporting-only and applies the frozen calibration guard
-stored in the student checkpoint:
+Locked-test reporting is reporting-only. It applies the frozen density student to
+each locked-test context, derives a time grid by inverse CDF, evaluates that
+grid, and never changes teacher checkpoints, student weights, or density
+metadata:
 
 ```bash
 genode-report-context-locked-test \
-  --context_student_checkpoint outputs/context_policy/context_student.pt \
+  --context_student_checkpoint outputs/context_policy/context_density_student.pt \
   --training_summary outputs/context_policy/context_conditional_summary.json \
   --locked_context_rows outputs/locked_fixed_context_rows.csv,outputs/locked_ser_context_rows.csv \
   --locked_context_embeddings_npz outputs/locked_context_embeddings.npz \
