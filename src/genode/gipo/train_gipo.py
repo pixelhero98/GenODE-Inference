@@ -14,8 +14,11 @@ from genode.gipo.policy import (
     DEFAULT_SUPPORT_SCHEDULE_KEYS,
     DEFAULT_TEACHER_MAX_TEMPERATURE,
     DEFAULT_TEACHER_MIN_TEMPERATURE,
+    DEFAULT_TEACHER_HARD_MARGIN,
     DEFAULT_TEACHER_TARGET_ESS,
     DEFAULT_TEACHER_TARGET_TEMPERATURE,
+    STUDENT_TARGET_MODE_MARGIN_HARD_SOFT,
+    STUDENT_TARGET_MODE_SOFT_MIXTURE,
     TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS,
     TEACHER_TEMPERATURE_MODE_FIXED,
     GIPODensityStudentMLP,
@@ -38,7 +41,14 @@ from genode.gipo.policy import (
     validate_gipo_support_schedule_keys,
 )
 from genode.gipo.density_representation import density_metadata, reference_grid_hash, uniform_reference_grid
-from genode.gipo.models import setting_features, solver_macro_steps, validate_time_grid
+from genode.gipo.models import (
+    SETTING_FEATURE_MODE_GIPO_V1,
+    SETTING_FEATURE_MODE_NFE_RICH_V1,
+    setting_feature_dim,
+    solver_macro_steps,
+    validate_setting_feature_mode,
+    validate_time_grid,
+)
 from genode.data.otflow_paths import resolve_project_path
 from genode.models.otflow_train_val import seed_all
 from genode.runtime import resolve_torch_device
@@ -139,6 +149,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher_target_ess", type=float, default=DEFAULT_TEACHER_TARGET_ESS)
     parser.add_argument("--teacher_min_temperature", type=float, default=DEFAULT_TEACHER_MIN_TEMPERATURE)
     parser.add_argument("--teacher_max_temperature", type=float, default=DEFAULT_TEACHER_MAX_TEMPERATURE)
+    parser.add_argument(
+        "--student_target_mode",
+        choices=(STUDENT_TARGET_MODE_SOFT_MIXTURE, STUDENT_TARGET_MODE_MARGIN_HARD_SOFT),
+        default=STUDENT_TARGET_MODE_SOFT_MIXTURE,
+    )
+    parser.add_argument("--teacher_hard_margin", type=float, default=DEFAULT_TEACHER_HARD_MARGIN)
+    parser.add_argument(
+        "--setting_feature_mode",
+        choices=(SETTING_FEATURE_MODE_GIPO_V1, SETTING_FEATURE_MODE_NFE_RICH_V1),
+        default=SETTING_FEATURE_MODE_GIPO_V1,
+    )
+    parser.add_argument("--teacher_utility_crps_weight", type=float, default=0.5)
+    parser.add_argument("--teacher_utility_mase_weight", type=float, default=0.5)
     parser.add_argument("--teacher_rank_temperature", type=float, default=0.5)
     parser.add_argument("--teacher_regression_weight", type=float, default=0.25)
     parser.add_argument("--teacher_pair_margin", type=float, default=0.0)
@@ -151,6 +174,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     seed_all(int(args.seed))
+    setting_feature_mode = validate_setting_feature_mode(str(args.setting_feature_mode))
     rows = read_metric_rows_csv(resolve_project_path(str(args.rows_csv)))
     if not rows:
         raise ValueError("rows_csv contains no rows.")
@@ -167,7 +191,17 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     if missing_support_rows:
         raise ValueError(f"Supervision schedules must have measured context rows; missing rows for {missing_support_rows}")
 
-    rewarded_rows = attach_uniform_gipo_rewards(rows, support_schedule_keys=support_keys, pair_on_seed=True)
+    rewarded_rows = attach_uniform_gipo_rewards(
+        rows,
+        support_schedule_keys=support_keys,
+        utility_crps_weight=float(args.teacher_utility_crps_weight),
+        utility_mase_weight=float(args.teacher_utility_mase_weight),
+        pair_on_seed=True,
+    )
+    teacher_utility_weights = {
+        "crps": float(rewarded_rows[0].get("u_comp_crps_weight", 0.5)),
+        "mase": float(rewarded_rows[0].get("u_comp_mase_weight", 0.5)),
+    }
     available_context_ids = sorted({context_id_from_row(row) for row in rewarded_rows})
     sample_count = int(args.context_sample_count)
     if sample_count <= 0:
@@ -198,7 +232,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
 
     series_index_map = build_series_index_map(fit_rows)
     context_dim = int(next(iter(normalized_embeddings.values())).shape[0])
-    setting_dim = int(setting_features("euler", 4).numel())
+    setting_dim = int(setting_feature_dim(setting_feature_mode))
     reference_time_grid = uniform_reference_grid(int(args.density_bin_count))
     schedule_grids = _load_schedule_summary_grids(_parse_csv(str(args.schedule_summary_json)))
     density_normalizer = DensityFeatureNormalizer.fit(
@@ -227,8 +261,14 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "artifact": "gipo_training_summary",
         "protocol": GIPO_PROTOCOL,
         "student_policy_type": "continuous_density",
-        "student_objective": "teacher_weighted_density_mle_kl",
+        "student_objective": "teacher_weighted_density_mle_kl"
+        if str(args.student_target_mode) == STUDENT_TARGET_MODE_SOFT_MIXTURE
+        else "teacher_weighted_density_margin_hard_soft_kl",
         "teacher_objective": "pairwise_rank_plus_huber_regression",
+        "teacher_utility_weights": teacher_utility_weights,
+        "student_target_mode": str(args.student_target_mode),
+        "teacher_hard_margin": float(args.teacher_hard_margin),
+        "setting_feature_mode": setting_feature_mode,
         "density_representation": density_meta,
         "support_schedule_keys": list(support_keys),
         "sampled_context_count": int(len(selected_context_ids)),
@@ -272,6 +312,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         series_unknown_probability=float(args.series_unknown_dropout),
         seed=int(args.seed),
         allowed_schedule_keys=support_keys,
+        setting_feature_mode=setting_feature_mode,
         device=device,
     )
     student_training = train_gipo_student(
@@ -290,6 +331,9 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         teacher_target_ess=float(args.teacher_target_ess),
         teacher_min_temperature=float(args.teacher_min_temperature),
         teacher_max_temperature=float(args.teacher_max_temperature),
+        student_target_mode=str(args.student_target_mode),
+        teacher_hard_margin=float(args.teacher_hard_margin),
+        setting_feature_mode=setting_feature_mode,
         series_unknown_dropout=float(args.series_unknown_dropout),
         device=device,
     )
@@ -301,6 +345,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "protocol": GIPO_PROTOCOL,
             "teacher_state": teacher.state_dict(),
             "setting_dim": int(setting_dim),
+            "setting_feature_mode": setting_feature_mode,
             "density_dim": int(len(reference_time_grid) - 1),
             "context_dim": int(context_dim),
             "series_index_map": dict(series_index_map),
@@ -317,9 +362,10 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         {
             "protocol": GIPO_PROTOCOL,
             "student_policy_type": "continuous_density",
-            "student_objective": "teacher_weighted_density_mle_kl",
+            "student_objective": student_training.get("student_objective", "teacher_weighted_density_mle_kl"),
             "student_state": student.state_dict(),
             "setting_dim": int(setting_dim),
+            "setting_feature_mode": setting_feature_mode,
             "density_dim": int(len(reference_time_grid) - 1),
             "context_dim": int(context_dim),
             "series_index_map": dict(series_index_map),
@@ -341,6 +387,9 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "reference_grid_hash": reference_grid_hash(reference_time_grid),
         "support_schedule_keys": list(support_keys),
         "teacher_selected_step": teacher_training.get("teacher_checkpoint_selection", {}).get("selected_step"),
+        "student_target_mode": str(args.student_target_mode),
+        "setting_feature_mode": setting_feature_mode,
+        "teacher_utility_weights": teacher_utility_weights,
     }
     policy_id = "gipo_" + hashlib.sha256(
         json.dumps(policy_id_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

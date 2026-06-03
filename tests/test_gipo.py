@@ -16,6 +16,7 @@ from genode.gipo.policy import (
     DensityFeatureNormalizer,
     attach_uniform_gipo_rewards,
     build_series_index_map,
+    build_teacher_weighted_density_prediction_rows,
     build_teacher_weighted_density_targets,
     context_id_from_row,
     gipo_teacher_diagnostics,
@@ -38,7 +39,12 @@ from genode.gipo.density_representation import (
     uniform_reference_grid,
     validate_reference_grid,
 )
-from genode.gipo.models import setting_features
+from genode.gipo.models import (
+    SETTING_FEATURE_MODE_GIPO_V1,
+    SETTING_FEATURE_MODE_NFE_RICH_V1,
+    setting_feature_dim,
+    setting_features,
+)
 from genode.gipo.train_gipo import (
     build_argparser as build_train_argparser,
     train_gipo,
@@ -111,6 +117,19 @@ class _LastBinTeacher(torch.nn.Module):
 
 
 class ContextDensityGIPOContractTests(unittest.TestCase):
+    def test_setting_feature_modes_preserve_legacy_shape_and_add_nfe_features(self) -> None:
+        legacy = setting_features("euler", 4)
+        rich_seen = setting_features("euler", 12, mode=SETTING_FEATURE_MODE_NFE_RICH_V1)
+        rich_unseen = setting_features("euler", 16, mode=SETTING_FEATURE_MODE_NFE_RICH_V1)
+
+        self.assertEqual(SETTING_FEATURE_MODE_GIPO_V1, "gipo_v1")
+        self.assertEqual(int(legacy.numel()), 6)
+        self.assertEqual(setting_feature_dim(), 6)
+        self.assertEqual(setting_feature_dim(SETTING_FEATURE_MODE_NFE_RICH_V1), 9)
+        self.assertEqual(int(rich_seen.numel()), 9)
+        self.assertLessEqual(float(rich_unseen[4]), 1.0)
+        self.assertLessEqual(float(rich_unseen[5]), 1.0)
+
     def test_density_representation_round_trips_mass_and_metadata(self) -> None:
         reference = uniform_reference_grid(4)
         mass = grid_to_density_mass((0.0, 0.25, 0.5, 0.75, 1.0), reference_time_grid=reference, macro_steps=4)
@@ -316,6 +335,57 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         self.assertEqual(student_summary["student_objective"], "teacher_weighted_density_mle_kl")
         self.assertIn("student_kl_ce_loss", student_summary["losses"][-1])
 
+    def test_margin_hard_soft_targets_copy_top_teacher_density(self) -> None:
+        reference = uniform_reference_grid(4)
+        ser_schedule_key = "ser_ptg_local_defect_eta005"
+        rows = [
+            _row(schedule="uniform", context_idx=0, series_id="series_0"),
+            _row(schedule=ser_schedule_key, context_idx=0, series_id="series_0"),
+        ]
+        schedule_grids = {(ser_schedule_key, "euler", 4): (0.0, 0.7, 0.8, 0.9, 1.0)}
+        context_id = context_id_from_row(rows[0])
+        embeddings = {context_id: np.asarray([0.0, 0.0], dtype=np.float32)}
+        series_map = build_series_index_map(rows)
+        normalizer = DensityFeatureNormalizer(
+            mean=np.zeros(4, dtype=np.float32),
+            std=np.ones(4, dtype=np.float32),
+        )
+        teacher = _LastBinTeacher()
+
+        _, _, _, target_mass, target_summary = build_teacher_weighted_density_targets(
+            teacher,
+            rows,
+            context_embeddings=embeddings,
+            series_index_map=series_map,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference,
+            density_normalizer=normalizer,
+            student_target_mode="margin_hard_soft",
+            teacher_hard_margin=0.0,
+        )
+        ser_mass = np.asarray(density_mass_for_row(rows[1], schedule_grids=schedule_grids, reference_time_grid=reference))
+        self.assertEqual(target_summary["student_target_mode"], "margin_hard_soft")
+        self.assertEqual(target_summary["hard_target_count"], 1)
+        self.assertAlmostEqual(target_summary["hard_target_fraction"], 1.0)
+        self.assertTrue(np.allclose(target_mass.detach().cpu().numpy()[0], ser_mass.astype(np.float32), atol=1e-7))
+
+        prediction_rows, oracle_summary = build_teacher_weighted_density_prediction_rows(
+            teacher,
+            rows,
+            context_embeddings=embeddings,
+            series_index_map=series_map,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference,
+            density_normalizer=normalizer,
+            student_target_mode="margin_hard_soft",
+            teacher_hard_margin=0.0,
+        )
+        self.assertEqual(len(prediction_rows), 1)
+        self.assertEqual(prediction_rows[0]["teacher_top_schedule_key"], ser_schedule_key)
+        self.assertTrue(prediction_rows[0]["teacher_hard_target"])
+        self.assertEqual(oracle_summary["hard_target_count"], 1)
+        self.assertEqual(len(prediction_rows[0]["time_grid"]), 5)
+
     def test_adaptive_teacher_temperature_hits_target_ess(self) -> None:
         reference = uniform_reference_grid(4)
         ser_schedule_key = "ser_ptg_local_defect_eta005"
@@ -416,6 +486,8 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             summary = train_gipo(args)
 
             self.assertEqual(summary["status"], "dry_run")
+            self.assertEqual(summary["student_target_mode"], "soft_mixture")
+            self.assertEqual(summary["setting_feature_mode"], SETTING_FEATURE_MODE_GIPO_V1)
             membership = summary["split_membership"]
             self.assertEqual(set(membership), {"fit", "context_disjoint", "series_disjoint"})
             self.assertGreater(membership["fit"]["context_count"], 0)
@@ -610,6 +682,29 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             ("uniform", "ays_reversed", "ser_ptg_local_defect_eta005"),
         )
         self.assertEqual(GIPO_PROTOCOL, "gipo_density_v1")
+
+    def test_teacher_utility_weights_can_emphasize_mase(self) -> None:
+        rows = [
+            _row(schedule="uniform", context_idx=0, crps=2.0, mase=2.0),
+            _row(schedule="ays", context_idx=0, crps=1.0, mase=2.0),
+        ]
+        crps_only = attach_uniform_gipo_rewards(
+            rows,
+            support_schedule_keys=("uniform", "ays"),
+            utility_crps_weight=1.0,
+            utility_mase_weight=0.0,
+        )
+        mase_only = attach_uniform_gipo_rewards(
+            rows,
+            support_schedule_keys=("uniform", "ays"),
+            utility_crps_weight=0.0,
+            utility_mase_weight=1.0,
+        )
+        crps_ays = next(row for row in crps_only if row["scheduler_key"] == "ays")
+        mase_ays = next(row for row in mase_only if row["scheduler_key"] == "ays")
+        self.assertGreater(float(crps_ays["u_comp_uniform"]), 0.0)
+        self.assertAlmostEqual(float(mase_ays["u_comp_uniform"]), 0.0)
+        self.assertEqual(float(mase_ays["u_comp_mase_weight"]), 1.0)
 
 
 if __name__ == "__main__":

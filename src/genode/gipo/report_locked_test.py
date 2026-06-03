@@ -22,6 +22,7 @@ from genode.gipo.policy import (
 )
 from genode.gipo.evaluate_schedule_summary import build_comparison_summary
 from genode.gipo.models import solver_macro_steps
+from genode.gipo.models import SETTING_FEATURE_MODE_GIPO_V1, validate_setting_feature_mode
 from genode.data.otflow_paths import (
     default_backbone_manifest_path,
     project_paper_dataset_root,
@@ -196,6 +197,7 @@ def _load_student_checkpoint(path: str | Path) -> Tuple[GIPODensityStudentMLP, D
     if str(density_meta.get("density_protocol", "")) != "density_mass_v1":
         raise ValueError("GIPO student checkpoint is missing density_mass_v1 metadata.")
     reference_time_grid = tuple(float(x) for x in density_meta["reference_time_grid"])
+    setting_feature_mode = validate_setting_feature_mode(str(payload.get("setting_feature_mode", SETTING_FEATURE_MODE_GIPO_V1)))
     series_index_map = {str(key): int(value) for key, value in dict(payload["series_index_map"]).items()}
     normalizer = EmbeddingNormalizer.from_payload(payload["embedding_normalizer"])
     student = GIPODensityStudentMLP(
@@ -206,6 +208,7 @@ def _load_student_checkpoint(path: str | Path) -> Tuple[GIPODensityStudentMLP, D
     )
     student.load_state_dict(payload["student_state"])
     student.eval()
+    payload["setting_feature_mode"] = setting_feature_mode
     return student, series_index_map, normalizer, reference_time_grid, payload
 
 
@@ -332,6 +335,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 context_embedding=embeddings[context_id],
                 series_index_map=series_index_map,
                 reference_time_grid=reference_time_grid,
+                setting_feature_mode=str(checkpoint_payload.get("setting_feature_mode", SETTING_FEATURE_MODE_GIPO_V1)),
                 device=device,
             )
             example_idx = int(row.get("example_idx", row.get("example_index", 0)))
@@ -380,6 +384,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 "schedule_grid_hash": prediction["schedule_grid_hash"],
                 "density_protocol": prediction["density_protocol"],
                 "reference_grid_hash": prediction["reference_grid_hash"],
+                "setting_feature_mode": prediction["setting_feature_mode"],
             }
             per_context_rows.append(selected_row)
             decision_rows.append(
@@ -443,6 +448,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "mean_crps": float(np.mean(np.asarray(crps_values, dtype=np.float64))) if crps_values else None,
         "mean_mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else None,
         "density_representation": checkpoint_payload.get("density_representation", {}),
+        "setting_feature_mode": checkpoint_payload.get("setting_feature_mode", SETTING_FEATURE_MODE_GIPO_V1),
         "locked_test_used_for_selection": False,
         "comparison_summary_path": "" if comparison is None else str(out_dir / f"{output_prefix}_comparison_summary.json"),
     }
