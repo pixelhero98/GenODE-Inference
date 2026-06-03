@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from genode.conditional_opd.evaluate_schedule_summary import (
+from genode.gipo.evaluate_schedule_summary import (
     SELECTED_STUDENT_SCHEDULE_KEY,
     _protocol_hash,
     build_argparser,
@@ -18,7 +18,7 @@ from genode.conditional_opd.evaluate_schedule_summary import (
     load_schedule_predictions,
     select_best_validation_schedule,
 )
-from genode.conditional_opd.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
+from genode.gipo.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
 from genode.evaluation.otflow_evaluation_support import (
     TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED,
     choose_forecast_train_tuning_indices,
@@ -142,7 +142,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "dataset": "san_francisco_traffic",
                         "schedules": [
                             {
-                                "scheduler_key": "conditional_opd_student_steps20",
+                                "scheduler_key": "gipo_candidate_steps20",
                                 "predictions": [
                                     {
                                         "solver_key": "euler",
@@ -249,9 +249,9 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 }
             )
         for schedule_key, budget, crps, mase in (
-            ("conditional_opd_student_steps20", 20, 1.0, 2.0),
-            ("conditional_opd_student_steps25", 25, 1.0, 2.0),
-            ("conditional_opd_student_steps35", 35, 0.9, 1.9),
+            ("gipo_candidate_steps20", 20, 1.0, 2.0),
+            ("gipo_candidate_steps25", 25, 1.0, 2.0),
+            ("gipo_candidate_steps35", 35, 0.9, 1.9),
             ("ser_ptg_residual_tail_s200_eps030", None, 1.2, 2.2),
         ):
             for seed in (0, 1, 2):
@@ -264,12 +264,12 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "mase": mase,
                 }
                 if budget is not None:
-                    row["opd_step_budget"] = budget
+                    row["gipo_step_budget"] = budget
                 rows.append(row)
         selection = select_best_validation_schedule(rows, reference_rows=fixed_rows)
         self.assertEqual(selection["selection_unit"], "generated_schedule_key")
-        self.assertEqual(selection["selected_schedule_key"], "conditional_opd_student_steps35")
-        self.assertEqual(selection["selected_opd_step_budget"], 35)
+        self.assertEqual(selection["selected_schedule_key"], "gipo_candidate_steps35")
+        self.assertEqual(selection["selected_gipo_step_budget"], 35)
         self.assertEqual(selection["utility_reference"], "best_fixed_baseline_crps_mase")
         self.assertTrue(any(row["scheduler_key"] == "ser_ptg_residual_tail_s200_eps030" for row in selection["schedule_table"]))
         self.assertNotIn("eps_rho", selection["schedule_table"][0])
@@ -288,7 +288,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             }
             for schedule_key in BASELINE_SCHEDULE_KEYS
         ]
-        for schedule_key, budget in (("conditional_opd_student_steps20", 20), ("conditional_opd_student_steps25", 25)):
+        for schedule_key, budget in (("gipo_candidate_steps20", 20), ("gipo_candidate_steps25", 25)):
             for seed in (0, 1, 2):
                 rows.append(
                     {
@@ -296,16 +296,16 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "solver_key": "euler",
                         "target_nfe": 4,
                         "scheduler_key": schedule_key,
-                        "opd_step_budget": budget,
+                        "gipo_step_budget": budget,
                         "crps": 1.0,
                         "mase": 2.0,
                     }
                 )
         selection = select_best_validation_schedule(rows, reference_rows=fixed_rows)
-        self.assertEqual(selection["selected_schedule_key"], "conditional_opd_student_steps20")
+        self.assertEqual(selection["selected_schedule_key"], "gipo_candidate_steps20")
         self.assertEqual(
             selection["tie_break"],
-            "mean_validation_utility_then_mean_min_metric_utility_then_smaller_opd_step_budget_then_scheduler_key",
+            "mean_validation_utility_then_mean_min_metric_utility_then_smaller_gipo_step_budget_then_scheduler_key",
         )
         self.assertIn("mean_min_metric_utility", selection["schedule_table"][0])
 
@@ -326,8 +326,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         # The 25-step schedule has a better worst-metric utility and should win
         # before the smaller-budget tie-break is considered.
         for schedule_key, budget, crps, mase in (
-            ("conditional_opd_student_steps20", 20, 0.5, 2.0),
-            ("conditional_opd_student_steps25", 25, 0.8, 1.25),
+            ("gipo_candidate_steps20", 20, 0.5, 2.0),
+            ("gipo_candidate_steps25", 25, 0.8, 1.25),
         ):
             for seed in (0, 1, 2):
                 rows.append(
@@ -336,20 +336,20 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "solver_key": "euler",
                         "target_nfe": 4,
                         "scheduler_key": schedule_key,
-                        "opd_step_budget": budget,
+                        "gipo_step_budget": budget,
                         "crps": crps,
                         "mase": mase,
                     }
                 )
         selection = select_best_validation_schedule(rows, reference_rows=fixed_rows)
-        self.assertEqual(selection["selected_schedule_key"], "conditional_opd_student_steps25")
+        self.assertEqual(selection["selected_schedule_key"], "gipo_candidate_steps25")
         self.assertGreater(selection["schedule_table"][0]["mean_min_metric_utility"], selection["schedule_table"][1]["mean_min_metric_utility"])
 
     def test_validation_schedule_selection_requires_fixed_reference_rows(self) -> None:
         rows = []
         for schedule_key, budget, crps, mase in (
-            ("conditional_opd_student_steps20", 20, 1.0, 2.0),
-            ("conditional_opd_student_steps25", 25, 0.9, 1.9),
+            ("gipo_candidate_steps20", 20, 1.0, 2.0),
+            ("gipo_candidate_steps25", 25, 0.9, 1.9),
         ):
             for seed in (0, 1, 2):
                 rows.append(
@@ -358,7 +358,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "solver_key": "euler",
                         "target_nfe": 4,
                         "scheduler_key": schedule_key,
-                        "opd_step_budget": budget,
+                        "gipo_step_budget": budget,
                         "crps": crps,
                         "mase": mase,
                     }
@@ -391,8 +391,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "schedules": [
                             {
                                 "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
-                                "schedule_name": "Conditional OPD Student Selected",
-                                "opd_step_budget": 25,
+                                "schedule_name": "GIPO Student Selected",
+                                "gipo_step_budget": 25,
                                 "predictions": [
                                     {
                                         "solver_key": "euler",
@@ -447,10 +447,10 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 ]
             )
             with mock.patch(
-                "genode.conditional_opd.evaluate_schedule_summary.load_forecast_checkpoint_splits",
+                "genode.gipo.evaluate_schedule_summary.load_forecast_checkpoint_splits",
                 return_value=fake_checkpoint,
             ), mock.patch(
-                "genode.conditional_opd.evaluate_schedule_summary.evaluate_forecast_schedule",
+                "genode.gipo.evaluate_schedule_summary.evaluate_forecast_schedule",
                 return_value={
                     "crps": 1.0,
                     "mse": 1.5,
@@ -539,10 +539,10 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 ]
             )
             with mock.patch(
-                "genode.conditional_opd.evaluate_schedule_summary.load_forecast_checkpoint_splits",
+                "genode.gipo.evaluate_schedule_summary.load_forecast_checkpoint_splits",
                 return_value=fake_checkpoint,
             ), mock.patch(
-                "genode.conditional_opd.evaluate_schedule_summary.evaluate_forecast_schedule",
+                "genode.gipo.evaluate_schedule_summary.evaluate_forecast_schedule",
                 return_value={
                     "crps": 1.0,
                     "mse": 1.5,

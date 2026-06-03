@@ -1261,7 +1261,7 @@ def evaluate_forecast_schedule(
                     chunk_context_embeddings = embedding_tensor.detach().cpu().numpy().astype(np.float32)
                 chunk_context_ids: List[str] = []
                 if return_per_example_rows or return_context_embeddings:
-                    from genode.conditional_opd.context_conditional import stable_context_id
+                    from genode.gipo.policy import stable_context_id
 
                     for metadata in metadata_rows:
                         chunk_context_ids.append(
@@ -1309,7 +1309,7 @@ def evaluate_forecast_schedule(
                     crps_values.append(crps)
                     mase_values.append(mase)
                     if return_per_example_rows:
-                        from genode.conditional_opd.context_conditional import schedule_grid_hash
+                        from genode.gipo.policy import schedule_grid_hash
 
                         metadata = metadata_rows[row_idx]
                         context_id = chunk_context_ids[row_idx]

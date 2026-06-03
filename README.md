@@ -1,6 +1,6 @@
 # genODE
 
-genODE contains source code for context-conditional schedule optimization on OTFlow forecasting backbones. The active OPD workflow trains a frozen-backbone rank+Huber teacher and a continuous-density student using per-context fixed/SER supervision rows and frozen context embeddings.
+genODE contains source code for GIPO schedule optimization on OTFlow forecasting backbones. The active workflow trains a frozen-backbone rank+Huber teacher and a continuous-density student using per-context fixed/SER supervision rows and frozen context embeddings.
 
 ## Source Layout
 
@@ -8,7 +8,7 @@ genODE contains source code for context-conditional schedule optimization on OTF
 - `src/genode/models/`: OTFlow configuration, conditioning, backbone modules, training, and model utilities.
 - `src/genode/schedule_transfer/`: fixed schedule grids, registries, table helpers, signal traces, and diagnostics.
 - `src/genode/evaluation/`: checkpoint loading, schedule evaluation, solver mappings, and sampling helpers.
-- `src/genode/conditional_opd/`: context-conditional OPD teacher/student models, SER-PTG references, fixed/SER schedule evaluation, and locked-test reporting.
+- `src/genode/gipo/`: GIPO teacher/student models, SER-PTG references, fixed/SER schedule evaluation, and locked-test reporting.
 - `scripts/`: thin command-line wrappers for packaged entry points.
 
 ## Installation
@@ -39,12 +39,12 @@ The default backbone manifest path is:
 outputs/backbone_matrix/backbone_manifest.json
 ```
 
-## Context-Conditional OPD
+## GIPO
 
 The main public entry point is:
 
 ```bash
-genode-train-context-conditional-opd
+genode-train-gipo
 ```
 
 This path implements:
@@ -63,11 +63,11 @@ context rows and context embeddings exist, future teacher/student changes can be
 verified by rerunning only the trainer and reporter:
 
 ```bash
-genode-train-context-conditional-opd \
+genode-train-gipo \
   --rows_csv outputs/context_calibration_rows.csv \
   --context_embeddings_npz outputs/context_embeddings.npz \
   --schedule_summary_json outputs/ser_ptg_schedule_summary.json \
-  --out_dir outputs/context_policy \
+  --out_dir outputs/gipo_policy \
   --support_schedule_keys uniform,late_power_3,flowts_power_sampling,ays,gits,ots,ser_ptg_local_defect_eta005
 ```
 
@@ -77,12 +77,12 @@ grid, and never changes teacher checkpoints, student weights, or density
 metadata:
 
 ```bash
-genode-report-context-locked-test \
-  --context_student_checkpoint outputs/context_policy/context_density_student.pt \
-  --training_summary outputs/context_policy/context_conditional_summary.json \
-  --locked_context_rows outputs/locked_fixed_context_rows.csv,outputs/locked_ser_context_rows.csv \
-  --locked_context_embeddings_npz outputs/locked_context_embeddings.npz \
-  --out_dir outputs/context_locked_report
+genode-report-gipo-locked-test \
+  --gipo_student_checkpoint outputs/gipo_policy/gipo_student.pt \
+  --training_summary outputs/gipo_policy/gipo_training_summary.json \
+  --context_rows outputs/locked_fixed_context_rows.csv,outputs/locked_ser_context_rows.csv \
+  --context_embeddings_npz outputs/locked_context_embeddings.npz \
+  --out_dir outputs/gipo_locked_report
 ```
 
 To generate reusable fixed/SER context rows, run schedule evaluation with context

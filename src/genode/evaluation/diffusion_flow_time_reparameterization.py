@@ -12,6 +12,7 @@ import torch
 
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
+    EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
     TRANSFER_SCHEDULE_KEYS,
     build_schedule_grid,
     fixed_schedule_shape_statistics,
@@ -68,7 +69,7 @@ from genode.data.otflow_paths import (
 )
 from genode.models.otflow_train_val import save_json
 from genode.runtime import resolve_torch_device
-from genode.conditional_opd.context_conditional import load_context_embedding_table, save_context_embedding_table
+from genode.gipo.policy import load_context_embedding_table, save_context_embedding_table
 
 RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_v3"
 DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
@@ -234,9 +235,9 @@ def _safe_relative_gain(value: Any, baseline_value: Any) -> Optional[float]:
 
 def _parse_schedule_names(text: str) -> List[str]:
     names = [name.strip().lower() for name in parse_csv(text)]
-    unknown = [name for name in names if name not in BASELINE_SCHEDULE_KEYS]
+    unknown = [name for name in names if name not in EXPERIMENTAL_FIXED_SCHEDULE_KEYS]
     if unknown:
-        raise ValueError(f"Unknown active diffusion-flow schedules: {unknown}")
+        raise ValueError(f"Unknown fixed diffusion-flow schedules: {unknown}")
     return names
 
 
@@ -894,7 +895,16 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
 def _aggregate_main_table(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     seed_summaries = _aggregate_seed_rows(rows)
     augmented = augment_rows_with_relative_metrics(seed_summaries)
-    return {"method_key": METHOD_KEY, "row_count": int(len(rows)), "summary_row_count": int(len(augmented)), "schedule_keys": sorted({str(row.get("scheduler_key")) for row in rows}), "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS), "seed_summaries": augmented}
+    return {
+        "method_key": METHOD_KEY,
+        "row_count": int(len(rows)),
+        "summary_row_count": int(len(augmented)),
+        "schedule_keys": sorted({str(row.get("scheduler_key")) for row in rows}),
+        "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
+        "experimental_fixed_schedule_keys": list(EXPERIMENTAL_FIXED_SCHEDULE_KEYS),
+        "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS),
+        "seed_summaries": augmented,
+    }
 
 
 def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
@@ -915,6 +925,7 @@ def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
         "runner_signature": RUNNER_SIGNATURE_VERSION,
         "method_key": METHOD_KEY,
         "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
+        "experimental_fixed_schedule_keys": list(EXPERIMENTAL_FIXED_SCHEDULE_KEYS),
         "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS),
         "scheduled_evaluation_keys": schedules,
         "solver_names": solvers,
@@ -1055,7 +1066,13 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
     seed_summary_key = f"{active_split_phase}_seed_summary"
     save_json(dict(seed_summary_payload), str(out_root / f"{active_split_phase}_seed_summary.json"))
     save_json(dict(main_table_summary), str(out_root / "main_table_summary.json"))
-    schedule_selection = {"method_key": METHOD_KEY, "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS), "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS), "scheduled_evaluation_keys": _parse_schedule_names(str(cli_args.baseline_scheduler_names))}
+    schedule_selection = {
+        "method_key": METHOD_KEY,
+        "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
+        "experimental_fixed_schedule_keys": list(EXPERIMENTAL_FIXED_SCHEDULE_KEYS),
+        "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS),
+        "scheduled_evaluation_keys": _parse_schedule_names(str(cli_args.baseline_scheduler_names)),
+    }
     save_json(dict(schedule_selection), str(out_root / "schedule_selection_summary.json"))
     combined = {"prep": dict(prep_payload), "schedule_selection_summary": dict(schedule_selection), seed_summary_key: dict(seed_summary_payload), "main_table_summary": dict(main_table_summary)}
     save_json(dict(combined), str(out_root / "combined_summary.json"))

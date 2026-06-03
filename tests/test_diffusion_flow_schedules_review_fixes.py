@@ -5,7 +5,14 @@ import unittest
 
 import torch
 
-from genode.schedule_transfer.diffusion_flow_schedules import build_schedule_grid
+from genode.schedule_transfer.diffusion_flow_schedules import (
+    BASELINE_SCHEDULE_KEYS,
+    EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
+    EXPERIMENTAL_REVERSED_SCHEDULE_KEYS,
+    build_schedule_grid,
+    schedule_display_name,
+    schedule_time_alignment,
+)
 from genode.schedule_transfer.otflow_schedule_diagnostics import _collect_rollout_diagnostics
 from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
 
@@ -39,6 +46,28 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
         self.assertAlmostEqual(grid[0], 0.0)
         self.assertAlmostEqual(grid[-1], 1.0)
         self.assertTrue(all(b > a for a, b in zip(grid, grid[1:])))
+
+    def test_experimental_reversed_schedule_grids_are_reversed_counterparts(self) -> None:
+        self.assertNotIn("uniform_reversed", EXPERIMENTAL_REVERSED_SCHEDULE_KEYS)
+        self.assertEqual(EXPERIMENTAL_FIXED_SCHEDULE_KEYS[: len(BASELINE_SCHEDULE_KEYS)], BASELINE_SCHEDULE_KEYS)
+        for schedule_key in EXPERIMENTAL_REVERSED_SCHEDULE_KEYS:
+            base_key = schedule_key.removesuffix("_reversed")
+            with self.subTest(schedule_key=schedule_key):
+                base_grid = build_schedule_grid(base_key, 8)
+                reversed_grid = build_schedule_grid(schedule_key, 8)
+                self.assertIsNotNone(base_grid)
+                self.assertIsNotNone(reversed_grid)
+                assert base_grid is not None
+                assert reversed_grid is not None
+                self.assertEqual(len(reversed_grid), len(base_grid))
+                self.assertAlmostEqual(reversed_grid[0], 0.0)
+                self.assertAlmostEqual(reversed_grid[-1], 1.0)
+                self.assertTrue(all(right > left for left, right in zip(reversed_grid, reversed_grid[1:])))
+                expected = tuple(1.0 - value for value in reversed(base_grid))
+                for observed, target in zip(reversed_grid, expected):
+                    self.assertAlmostEqual(observed, target)
+                self.assertIn("reversed", schedule_display_name(schedule_key).lower())
+                self.assertIn("reversed", schedule_time_alignment(schedule_key))
 
     def test_seed_paired_relative_mase_gain_is_preserved_in_summary_rows(self) -> None:
         rows = [

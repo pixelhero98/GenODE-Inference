@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from genode.conditional_opd.ser_ptg_reference import collect_batched_local_defect_trace
+from genode.gipo.ser_ptg_reference import collect_batched_local_defect_trace
 from genode.models.config import OTFlowConfig
 
 

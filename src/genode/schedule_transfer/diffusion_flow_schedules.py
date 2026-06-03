@@ -16,6 +16,21 @@ from genode.models.otflow_train_val import eval_many_windows
 
 BASELINE_SCHEDULE_KEYS: Tuple[str, ...] = ("uniform", "late_power_3", "flowts_power_sampling", "ays", "gits", "ots")
 TRANSFER_SCHEDULE_KEYS: Tuple[str, ...] = ("ays", "gits", "ots")
+EXPERIMENTAL_REVERSED_SCHEDULE_KEYS: Tuple[str, ...] = (
+    "late_power_3_reversed",
+    "flowts_power_sampling_reversed",
+    "ays_reversed",
+    "gits_reversed",
+    "ots_reversed",
+)
+EXPERIMENTAL_FIXED_SCHEDULE_KEYS: Tuple[str, ...] = BASELINE_SCHEDULE_KEYS + EXPERIMENTAL_REVERSED_SCHEDULE_KEYS
+_REVERSED_SCHEDULE_BASES: Dict[str, str] = {
+    "late_power_3_reversed": "late_power_3",
+    "flowts_power_sampling_reversed": "flowts_power_sampling",
+    "ays_reversed": "ays",
+    "gits_reversed": "gits",
+    "ots_reversed": "ots",
+}
 
 _AYS_REFERENCE_TIMESTEPS: Tuple[int, ...] = (999, 850, 736, 645, 545, 455, 343, 233, 124, 24, 0)
 _GITS_REFERENCE_SIGMAS: Tuple[float, ...] = (80.0, 10.9836, 3.8811, 1.5840, 0.5666, 0.1698, 0.0020)
@@ -31,6 +46,8 @@ _SCHEDULE_TIME_ALIGNMENT: Dict[str, str] = {
     "gits": "runtime_gits_sigma_affine",
     "ots": "runtime_ots_vp_time_affine",
 }
+for _reversed_key, _base_key in _REVERSED_SCHEDULE_BASES.items():
+    _SCHEDULE_TIME_ALIGNMENT[_reversed_key] = f"{_SCHEDULE_TIME_ALIGNMENT[_base_key]}_reversed"
 
 
 def _uniform_grid(n_steps: int) -> Tuple[float, ...]:
@@ -62,6 +79,10 @@ def _ensure_monotone(grid: Sequence[float]) -> Tuple[float, ...]:
     out[0] = 0.0
     out[-1] = 1.0
     return tuple(float(x) for x in out)
+
+
+def _reverse_schedule_grid(grid: Sequence[float]) -> Tuple[float, ...]:
+    return _ensure_monotone([1.0 - float(value) for value in reversed(tuple(grid))])
 
 
 def _resample_reference_progression(progression: Sequence[float], n_steps: int) -> Tuple[float, ...]:
@@ -312,6 +333,11 @@ def _validate_positive_n_steps(n_steps: int) -> int:
 def build_schedule_grid(schedule_key: str, n_steps: int) -> Optional[Tuple[float, ...]]:
     key = str(schedule_key).strip().lower()
     n_steps = _validate_positive_n_steps(int(n_steps))
+    if key in _REVERSED_SCHEDULE_BASES:
+        base_grid = build_schedule_grid(_REVERSED_SCHEDULE_BASES[key], n_steps)
+        if base_grid is None:
+            return None
+        return _reverse_schedule_grid(base_grid)
     if key == "uniform":
         return _ensure_monotone(_uniform_grid(n_steps))
     if key == "late_power_3":
@@ -328,6 +354,8 @@ def build_schedule_grid(schedule_key: str, n_steps: int) -> Optional[Tuple[float
 
 def schedule_display_name(schedule_key: str) -> str:
     key = str(schedule_key).strip().lower()
+    if key in _REVERSED_SCHEDULE_BASES:
+        return f"{schedule_display_name(_REVERSED_SCHEDULE_BASES[key])} reversed"
     names = {
         "uniform": "Time-uniform",
         "late_power_3": "Late-power-3",
@@ -448,6 +476,8 @@ def run_fixed_schedule_variant(
 
 __all__ = [
     "BASELINE_SCHEDULE_KEYS",
+    "EXPERIMENTAL_FIXED_SCHEDULE_KEYS",
+    "EXPERIMENTAL_REVERSED_SCHEDULE_KEYS",
     "TRANSFER_SCHEDULE_KEYS",
     "build_schedule_grid",
     "fixed_schedule_shape_statistics",

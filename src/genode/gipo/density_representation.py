@@ -6,7 +6,7 @@ from typing import Any, Mapping, Sequence, Tuple
 
 import numpy as np
 
-from genode.conditional_opd.models import validate_time_grid
+from genode.gipo.models import validate_time_grid
 
 DENSITY_PROTOCOL = "density_mass_v1"
 DENSITY_DOMAIN = "normalized_model_time_0_1"

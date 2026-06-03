@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "genode"
 version = "0.1.0"
-description = "Independent genODE experiments for conditional schedule optimization on OT flow-matching backbones."
+description = "Independent genODE experiments for GIPO schedule optimization on OT flow-matching backbones."
 readme = "README.md"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
@@ -22,10 +22,10 @@ dependencies = [
 [project.scripts]
 genode-run-schedules = "genode.evaluation.diffusion_flow_time_reparameterization:main"
 genode-train-backbone = "genode.training.train_backbone:main"
-genode-train-context-conditional-opd = "genode.conditional_opd.train_context_conditional_opd:main"
-genode-report-context-locked-test = "genode.conditional_opd.report_context_locked_test:main"
-genode-build-ser-ptg-reference = "genode.conditional_opd.ser_ptg_reference:main"
-genode-evaluate-schedule-summary = "genode.conditional_opd.evaluate_schedule_summary:main"
+genode-train-gipo = "genode.gipo.train_gipo:main"
+genode-report-gipo-locked-test = "genode.gipo.report_locked_test:main"
+genode-build-ser-ptg-reference = "genode.gipo.ser_ptg_reference:main"
+genode-evaluate-schedule-summary = "genode.gipo.evaluate_schedule_summary:main"
 genode-build-hardness-figure = "genode.visualization.build_hardness_mismatch_figure:main"
 genode-build-ptg-figure = "genode.visualization.build_ptg_observed_gain_figure:main"
 

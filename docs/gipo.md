@@ -1,8 +1,8 @@
-# Context-Conditional OPD
+# GIPO
 
 This path trains a continuous density policy instead of choosing a measured
 schedule key as the deployed action. The active protocol is
-`context_density_opd_v1`.
+`gipo_density_v1`.
 
 Measured fixed/SER schedules are supervision candidates only. Every schedule grid
 is converted into canonical `density_mass_v1` on normalized model time:
@@ -93,7 +93,7 @@ genode-evaluate-schedule-summary \
 Then train the density policy:
 
 ```text
-genode-train-context-conditional-opd \
+genode-train-gipo \
   --rows_csv <forecast_context_rows.csv> \
   --context_embeddings_npz <context-embeddings.npz> \
   --schedule_summary_json <ser-schedule-summary.json> \
@@ -105,11 +105,11 @@ locked-test context, evaluates the generated context-specific grid, and writes
 aggregate rows for comparison:
 
 ```text
-genode-report-context-locked-test \
-  --context_student_checkpoint <output-dir>/context_density_student.pt \
-  --training_summary <output-dir>/context_conditional_summary.json \
-  --locked_context_rows <locked-fixed-context.csv>,<locked-ser-context.csv> \
-  --locked_context_embeddings_npz <locked-context-embeddings.npz> \
+genode-report-gipo-locked-test \
+  --gipo_student_checkpoint <output-dir>/gipo_student.pt \
+  --training_summary <output-dir>/gipo_training_summary.json \
+  --context_rows <locked-fixed-context.csv>,<locked-ser-context.csv> \
+  --context_embeddings_npz <locked-context-embeddings.npz> \
   --out_dir <locked-report-dir>
 ```
 

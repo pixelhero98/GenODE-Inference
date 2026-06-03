@@ -15,7 +15,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from genode.conditional_opd.density_representation import (
+from genode.gipo.density_representation import (
     DEFAULT_DENSITY_BIN_COUNT,
     DENSITY_PROTOCOL,
     density_log_features,
@@ -27,28 +27,38 @@ from genode.conditional_opd.density_representation import (
     uniform_reference_grid,
     validate_reference_grid,
 )
-from genode.conditional_opd.models import (
+from genode.gipo.models import (
     setting_features,
     solver_macro_steps,
     validate_time_grid,
 )
-from genode.conditional_opd.objectives import DEFAULT_REWARD_EPS, UNIFORM_SCHEDULE_KEY
-from genode.conditional_opd.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
-from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, build_schedule_grid
+from genode.gipo.objectives import DEFAULT_REWARD_EPS, UNIFORM_SCHEDULE_KEY
+from genode.gipo.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
+from genode.schedule_transfer.diffusion_flow_schedules import (
+    BASELINE_SCHEDULE_KEYS,
+    EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
+    build_schedule_grid,
+)
 
 MetricRow = Mapping[str, Any]
 ContextPairKey = Tuple[str, str, int, str, int | None]
 ScheduleGridKey = Tuple[str, str, int]
 
-CONTEXT_CONDITIONAL_PROTOCOL = "context_density_opd_v1"
+GIPO_PROTOCOL = "gipo_density_v1"
 DEFAULT_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = tuple(BASELINE_SCHEDULE_KEYS) + (SER_PTG_SCHEDULE_KEY,)
 DEFAULT_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
-CONTEXT_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
+GIPO_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
+EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = tuple(EXPERIMENTAL_FIXED_SCHEDULE_KEYS) + (SER_PTG_SCHEDULE_KEY,)
 DEFAULT_CONTEXT_CALIBRATION_TOTAL = 120
 DEFAULT_CONTEXT_CALIBRATION_VALIDATION_FRACTION = 0.20
 MIN_CONTEXT_CALIBRATION_TOTAL = 72
 MAX_CONTEXT_CALIBRATION_TOTAL = 144
 DEFAULT_TEACHER_TARGET_TEMPERATURE = 0.05
+TEACHER_TEMPERATURE_MODE_FIXED = "fixed"
+TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS = "adaptive_ess"
+DEFAULT_TEACHER_TARGET_ESS = 2.5
+DEFAULT_TEACHER_MIN_TEMPERATURE = 0.01
+DEFAULT_TEACHER_MAX_TEMPERATURE = 1.0
 
 
 def _finite_positive(value: Any, *, label: str) -> float:
@@ -56,6 +66,72 @@ def _finite_positive(value: Any, *, label: str) -> float:
     if not math.isfinite(val) or val <= 0.0:
         raise ValueError(f"{label} must be finite and positive, got {value!r}.")
     return val
+
+
+def _summary_percentiles(values: Sequence[float]) -> Dict[str, float]:
+    arr = np.asarray([float(value) for value in values], dtype=np.float64)
+    if arr.size == 0:
+        return {"mean": 0.0, "p05": 0.0, "p50": 0.0, "p95": 0.0}
+    return {
+        "mean": float(np.mean(arr)),
+        "p05": float(np.percentile(arr, 5)),
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+    }
+
+
+def _teacher_candidate_weights(utilities: Sequence[float], *, temperature: float) -> np.ndarray:
+    temp = max(float(temperature), 1e-6)
+    logits = np.asarray(utilities, dtype=np.float64) / temp
+    logits = logits - float(np.max(logits))
+    weights = np.exp(logits)
+    return weights / max(float(np.sum(weights)), 1e-12)
+
+
+def _teacher_candidate_ess(weights: Sequence[float]) -> float:
+    arr = np.asarray(weights, dtype=np.float64)
+    return float(1.0 / max(float(np.sum(np.square(arr))), 1e-12))
+
+
+def _teacher_temperature_for_target_ess(
+    utilities: Sequence[float],
+    *,
+    target_ess: float,
+    min_temperature: float,
+    max_temperature: float,
+) -> float:
+    min_temp = _finite_positive(min_temperature, label="teacher_min_temperature")
+    max_temp = _finite_positive(max_temperature, label="teacher_max_temperature")
+    if min_temp > max_temp:
+        raise ValueError("teacher_min_temperature must be <= teacher_max_temperature.")
+    util_arr = np.asarray(utilities, dtype=np.float64)
+    if util_arr.size == 0:
+        raise ValueError("Adaptive ESS temperature requires at least one teacher utility.")
+    bounded_target = min(float(util_arr.size), max(1.0, _finite_positive(target_ess, label="teacher_target_ess")))
+    low_ess = _teacher_candidate_ess(_teacher_candidate_weights(util_arr, temperature=min_temp))
+    high_ess = _teacher_candidate_ess(_teacher_candidate_weights(util_arr, temperature=max_temp))
+    if bounded_target <= low_ess:
+        return float(min_temp)
+    if bounded_target >= high_ess:
+        return float(max_temp)
+    low = float(min_temp)
+    high = float(max_temp)
+    for _ in range(64):
+        mid = 0.5 * (low + high)
+        mid_ess = _teacher_candidate_ess(_teacher_candidate_weights(util_arr, temperature=mid))
+        if mid_ess < bounded_target:
+            low = mid
+        else:
+            high = mid
+    return float(0.5 * (low + high))
+
+
+def validate_teacher_temperature_mode(mode: str) -> str:
+    value = str(mode).strip()
+    allowed = {TEACHER_TEMPERATURE_MODE_FIXED, TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS}
+    if value not in allowed:
+        raise ValueError(f"teacher_temperature_mode must be one of {sorted(allowed)}, got {mode!r}.")
+    return value
 
 
 def _json_hash(payload: Mapping[str, Any], *, prefix: str) -> str:
@@ -158,25 +234,25 @@ def context_pair_key(row: MetricRow, *, pair_on_seed: bool = True) -> ContextPai
     )
 
 
-def validate_context_support_schedule_keys(
+def validate_gipo_support_schedule_keys(
     support_schedule_keys: Sequence[str],
     *,
-    allowed_schedule_keys: Sequence[str] = DEFAULT_SUPERVISION_SCHEDULE_KEYS,
+    allowed_schedule_keys: Sequence[str] = EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS,
 ) -> Tuple[str, ...]:
     keys = tuple(str(key) for key in support_schedule_keys)
     if not keys:
         raise ValueError("support_schedule_keys must not be empty.")
     bo_like = sorted(key for key in keys if "bo" in key.lower() or "candidate" in key.lower())
     if bo_like:
-        raise ValueError(f"Context-conditional density supervision must not include BO/candidate schedules: {bo_like}")
+        raise ValueError(f"GIPO supervision must not include BO/candidate schedules: {bo_like}")
     allowed = {str(key) for key in allowed_schedule_keys}
     unsupported = sorted(set(keys) - allowed)
     if unsupported:
-        raise ValueError(f"Context-conditional density supervision is fixed/SER only; unsupported schedules: {unsupported}")
+        raise ValueError(f"GIPO supervision is fixed/SER only; unsupported schedules: {unsupported}")
     return keys
 
 
-def attach_uniform_context_rewards(
+def attach_uniform_gipo_rewards(
     rows: Iterable[MetricRow],
     *,
     support_schedule_keys: Sequence[str] | None = None,
@@ -185,7 +261,7 @@ def attach_uniform_context_rewards(
     eps: float = DEFAULT_REWARD_EPS,
 ) -> List[Dict[str, Any]]:
     materialized = [dict(row) for row in rows]
-    support_keys = validate_context_support_schedule_keys(
+    support_keys = validate_gipo_support_schedule_keys(
         DEFAULT_SUPERVISION_SCHEDULE_KEYS if support_schedule_keys is None else support_schedule_keys
     )
     support = {str(key) for key in support_keys}
@@ -194,7 +270,7 @@ def attach_uniform_context_rewards(
     for row in materialized:
         schedule_key = str(row["scheduler_key"])
         if schedule_key not in support:
-            raise ValueError(f"Unsupported context density supervision row {schedule_key!r}; expected fixed/SER support.")
+            raise ValueError(f"Unsupported GIPO supervision row {schedule_key!r}; expected fixed/SER support.")
         row["context_id"] = context_id_from_row(row)
         grouped[context_pair_key(row, pair_on_seed=pair_on_seed)].append(row)
 
@@ -223,7 +299,7 @@ def attach_uniform_context_rewards(
             copied = dict(row)
             copied.update(
                 {
-                    "context_reward_protocol": CONTEXT_CONDITIONAL_PROTOCOL,
+                    "gipo_reward_protocol": GIPO_PROTOCOL,
                     "reward_anchor_schedule_key": uniform_key,
                     "uniform_crps": float(uniform_crps),
                     "uniform_mase": float(uniform_mase),
@@ -475,7 +551,7 @@ def save_context_embedding_table(
     np.savez_compressed(resolved, context_ids=context_ids, embeddings=matrix)
     manifest = {
         "artifact": "context_embedding_table",
-        "protocol": CONTEXT_CONDITIONAL_PROTOCOL,
+        "protocol": GIPO_PROTOCOL,
         "path": str(resolved),
         "context_count": int(context_ids.size),
         "embedding_dim": int(matrix.shape[1]),
@@ -518,7 +594,7 @@ def grid_for_schedule(
     macro_steps = solver_macro_steps(str(solver_key), int(target_nfe))
     if schedule_grids is not None and (key, str(solver_key), int(target_nfe)) in schedule_grids:
         return validate_time_grid(schedule_grids[(key, str(solver_key), int(target_nfe))], macro_steps=macro_steps)
-    if key in BASELINE_SCHEDULE_KEYS:
+    if key in EXPERIMENTAL_FIXED_SCHEDULE_KEYS:
         grid = build_schedule_grid(key, macro_steps)
         if grid is None:
             raise ValueError(f"No fixed schedule grid for {key}.")
@@ -538,7 +614,7 @@ def density_mass_for_row(
     return grid_to_density_mass(grid, reference_time_grid=reference_time_grid, macro_steps=solver_macro_steps(solver, target_nfe))
 
 
-class ContextScheduleTeacherMLP(nn.Module):
+class GIPOScheduleTeacherMLP(nn.Module):
     """Teacher scorer for `(solver, nfe, density, series, context)`."""
 
     def __init__(
@@ -599,7 +675,7 @@ class ContextScheduleTeacherMLP(nn.Module):
         return self.net(features).squeeze(-1)
 
 
-class ContextDensityStudentMLP(nn.Module):
+class GIPODensityStudentMLP(nn.Module):
     """Context-conditioned continuous density policy over normalized solver time."""
 
     def __init__(
@@ -789,8 +865,8 @@ def _teacher_training_tensors(
     )
 
 
-def context_teacher_diagnostics(
-    teacher: ContextScheduleTeacherMLP,
+def gipo_teacher_diagnostics(
+    teacher: GIPOScheduleTeacherMLP,
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
@@ -894,7 +970,7 @@ def context_teacher_diagnostics(
     return base
 
 
-def _selected_context_teacher_checkpoint(
+def _selected_gipo_teacher_checkpoint(
     checkpoint_history: Sequence[Dict[str, Any]],
     checkpoint_states: Mapping[int, Mapping[str, torch.Tensor]],
     *,
@@ -950,7 +1026,7 @@ def _selected_context_teacher_checkpoint(
     selected_step = int(best_entry["step"])
     return (
         {
-            "selection_protocol": "context_series_density_teacher_checkpoint",
+            "selection_protocol": "gipo_teacher_checkpoint",
             "selection_split": "context_and_series_teacher_holdouts",
             "selection_metric": "mean_context_series_total_loss",
             "selected_step": selected_step,
@@ -963,8 +1039,8 @@ def _selected_context_teacher_checkpoint(
     )
 
 
-def train_context_teacher(
-    teacher: ContextScheduleTeacherMLP,
+def train_gipo_teacher(
+    teacher: GIPOScheduleTeacherMLP,
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
@@ -988,7 +1064,7 @@ def train_context_teacher(
 ) -> Dict[str, Any]:
     if not rows:
         raise ValueError("Teacher training requires at least one context reward row.")
-    validate_context_support_schedule_keys(sorted({str(row["scheduler_key"]) for row in rows}), allowed_schedule_keys=allowed_schedule_keys)
+    validate_gipo_support_schedule_keys(sorted({str(row["scheduler_key"]) for row in rows}), allowed_schedule_keys=allowed_schedule_keys)
     teacher.to(device)
     sx, dx, series_idx, cx, targets, pair_keys, _, _ = _teacher_training_tensors(
         rows,
@@ -1035,7 +1111,7 @@ def train_context_teacher(
             )
         if diagnostic_splits and (step == 0 or step == int(steps) - 1 or (step + 1) % checkpoint_every == 0):
             diagnostics = {
-                str(name): context_teacher_diagnostics(
+                str(name): gipo_teacher_diagnostics(
                     teacher,
                     split_rows,
                     context_embeddings=context_embeddings,
@@ -1057,7 +1133,7 @@ def train_context_teacher(
             step_value = int(step + 1)
             checkpoint_history.append({"step": step_value, "diagnostics": diagnostics})
             checkpoint_states[step_value] = copy.deepcopy(teacher.state_dict())
-    checkpoint_selection, selected_state = _selected_context_teacher_checkpoint(
+    checkpoint_selection, selected_state = _selected_gipo_teacher_checkpoint(
         checkpoint_history,
         checkpoint_states,
         required_split_names=tuple(diagnostic_splits.keys()) if diagnostic_splits else (),
@@ -1090,7 +1166,7 @@ def _series_with_dynamic_unknown(base_series_idx: torch.Tensor, *, unknown_index
 
 
 def build_teacher_weighted_density_targets(
-    teacher: ContextScheduleTeacherMLP,
+    teacher: GIPOScheduleTeacherMLP,
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
@@ -1100,14 +1176,25 @@ def build_teacher_weighted_density_targets(
     density_normalizer: DensityFeatureNormalizer,
     supervision_schedule_keys: Sequence[str] | None = None,
     temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
+    temperature_mode: str = TEACHER_TEMPERATURE_MODE_FIXED,
+    target_ess: float = DEFAULT_TEACHER_TARGET_ESS,
+    min_temperature: float = DEFAULT_TEACHER_MIN_TEMPERATURE,
+    max_temperature: float = DEFAULT_TEACHER_MAX_TEMPERATURE,
     device: torch.device | str = "cpu",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    temperature_mode = validate_teacher_temperature_mode(temperature_mode)
+    fixed_temperature = _finite_positive(temperature, label="teacher_temperature")
+    adaptive_target_ess = _finite_positive(target_ess, label="teacher_target_ess")
+    adaptive_min_temperature = _finite_positive(min_temperature, label="teacher_min_temperature")
+    adaptive_max_temperature = _finite_positive(max_temperature, label="teacher_max_temperature")
+    if adaptive_min_temperature > adaptive_max_temperature:
+        raise ValueError("teacher_min_temperature must be <= teacher_max_temperature.")
     observed_keys = {str(row["scheduler_key"]) for row in rows}
-    supervision_keys = validate_context_support_schedule_keys(
+    supervision_keys = validate_gipo_support_schedule_keys(
         sorted(observed_keys) if supervision_schedule_keys is None else supervision_schedule_keys
     )
     supervision_set = set(supervision_keys)
-    validate_context_support_schedule_keys(sorted(observed_keys))
+    validate_gipo_support_schedule_keys(sorted(observed_keys))
     unsupported_observed = sorted(observed_keys - supervision_set)
     if unsupported_observed:
         raise ValueError(f"Rows contain schedules outside supervision_schedule_keys: {unsupported_observed}")
@@ -1121,6 +1208,9 @@ def build_teacher_weighted_density_targets(
     context_rows: List[np.ndarray] = []
     target_masses: List[np.ndarray] = []
     entropy_values: List[float] = []
+    ess_values: List[float] = []
+    max_weight_values: List[float] = []
+    chosen_temperature_values: List[float] = []
     candidate_counts: List[int] = []
     teacher.eval()
     for _, group in sorted(grouped.items(), key=lambda item: item[0]):
@@ -1151,10 +1241,16 @@ def build_teacher_weighted_density_targets(
                 )[0]
                 masses.append(mass)
                 utilities.append(float(util.detach().cpu().item()))
-        logits = np.asarray(utilities, dtype=np.float64) / max(float(temperature), 1e-6)
-        logits = logits - float(np.max(logits))
-        weights = np.exp(logits)
-        weights = weights / max(float(np.sum(weights)), 1e-12)
+        if temperature_mode == TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS:
+            chosen_temperature = _teacher_temperature_for_target_ess(
+                utilities,
+                target_ess=adaptive_target_ess,
+                min_temperature=adaptive_min_temperature,
+                max_temperature=adaptive_max_temperature,
+            )
+        else:
+            chosen_temperature = fixed_temperature
+        weights = _teacher_candidate_weights(utilities, temperature=chosen_temperature)
         mixture = np.zeros(len(reference_time_grid) - 1, dtype=np.float64)
         for weight, mass in zip(weights, masses):
             mixture += float(weight) * np.asarray(mass, dtype=np.float64)
@@ -1164,12 +1260,39 @@ def build_teacher_weighted_density_targets(
         context_rows.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
         target_masses.append(mixture.astype(np.float32))
         entropy_values.append(float(-np.sum(weights * np.log(np.maximum(weights, 1e-12)))))
+        ess_values.append(_teacher_candidate_ess(weights))
+        max_weight_values.append(float(np.max(weights)))
+        chosen_temperature_values.append(float(chosen_temperature))
         candidate_counts.append(int(len(group)))
+    entropy_stats = _summary_percentiles(entropy_values)
+    ess_stats = _summary_percentiles(ess_values)
+    max_weight_stats = _summary_percentiles(max_weight_values)
+    chosen_temperature_stats = _summary_percentiles(chosen_temperature_values)
     summary = {
         "target_protocol": "teacher_weighted_density_mle",
-        "teacher_temperature": float(temperature),
+        "teacher_temperature_mode": temperature_mode,
+        "teacher_temperature": float(fixed_temperature),
+        "teacher_target_ess": float(adaptive_target_ess),
+        "teacher_min_temperature": float(adaptive_min_temperature),
+        "teacher_max_temperature": float(adaptive_max_temperature),
         "context_setting_count": int(len(target_masses)),
-        "mean_teacher_candidate_entropy": float(np.mean(np.asarray(entropy_values, dtype=np.float64))) if entropy_values else 0.0,
+        "mean_teacher_candidate_entropy": entropy_stats["mean"],
+        "teacher_candidate_entropy_mean": entropy_stats["mean"],
+        "teacher_candidate_entropy_p05": entropy_stats["p05"],
+        "teacher_candidate_entropy_p50": entropy_stats["p50"],
+        "teacher_candidate_entropy_p95": entropy_stats["p95"],
+        "teacher_candidate_ess_mean": ess_stats["mean"],
+        "teacher_candidate_ess_p05": ess_stats["p05"],
+        "teacher_candidate_ess_p50": ess_stats["p50"],
+        "teacher_candidate_ess_p95": ess_stats["p95"],
+        "teacher_candidate_max_weight_mean": max_weight_stats["mean"],
+        "teacher_candidate_max_weight_p05": max_weight_stats["p05"],
+        "teacher_candidate_max_weight_p50": max_weight_stats["p50"],
+        "teacher_candidate_max_weight_p95": max_weight_stats["p95"],
+        "teacher_chosen_temperature_mean": chosen_temperature_stats["mean"],
+        "teacher_chosen_temperature_p05": chosen_temperature_stats["p05"],
+        "teacher_chosen_temperature_p50": chosen_temperature_stats["p50"],
+        "teacher_chosen_temperature_p95": chosen_temperature_stats["p95"],
         "mean_candidate_count": float(np.mean(np.asarray(candidate_counts, dtype=np.float64))) if candidate_counts else 0.0,
         "supervision_schedule_keys": list(supervision_keys),
         "density_protocol": DENSITY_PROTOCOL,
@@ -1183,9 +1306,9 @@ def build_teacher_weighted_density_targets(
     )
 
 
-def train_context_density_student(
-    student: ContextDensityStudentMLP,
-    teacher: ContextScheduleTeacherMLP,
+def train_gipo_student(
+    student: GIPODensityStudentMLP,
+    teacher: GIPOScheduleTeacherMLP,
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
@@ -1196,6 +1319,10 @@ def train_context_density_student(
     steps: int = 500,
     lr: float = 1e-3,
     teacher_temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
+    teacher_temperature_mode: str = TEACHER_TEMPERATURE_MODE_FIXED,
+    teacher_target_ess: float = DEFAULT_TEACHER_TARGET_ESS,
+    teacher_min_temperature: float = DEFAULT_TEACHER_MIN_TEMPERATURE,
+    teacher_max_temperature: float = DEFAULT_TEACHER_MAX_TEMPERATURE,
     series_unknown_dropout: float = 0.10,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
@@ -1214,6 +1341,10 @@ def train_context_density_student(
         density_normalizer=density_normalizer,
         supervision_schedule_keys=sorted({str(row["scheduler_key"]) for row in rows}),
         temperature=float(teacher_temperature),
+        temperature_mode=str(teacher_temperature_mode),
+        target_ess=float(teacher_target_ess),
+        min_temperature=float(teacher_min_temperature),
+        max_temperature=float(teacher_max_temperature),
         device=device,
     )
     opt = torch.optim.AdamW(student.parameters(), lr=float(lr), weight_decay=1e-4)
@@ -1247,8 +1378,8 @@ def train_context_density_student(
     }
 
 
-def predict_context_density(
-    student: ContextDensityStudentMLP,
+def predict_gipo_density(
+    student: GIPODensityStudentMLP,
     *,
     row: MetricRow,
     context_embedding: Sequence[float],
@@ -1287,31 +1418,37 @@ def read_metric_rows_csv(path: str | Path) -> List[Dict[str, Any]]:
 
 
 __all__ = [
-    "CONTEXT_CONDITIONAL_PROTOCOL",
-    "CONTEXT_SUPPORT_SCHEDULE_KEYS",
+    "GIPO_PROTOCOL",
+    "GIPO_SUPPORT_SCHEDULE_KEYS",
     "DEFAULT_CONTEXT_CALIBRATION_TOTAL",
     "DEFAULT_DENSITY_BIN_COUNT",
     "DEFAULT_SUPPORT_SCHEDULE_KEYS",
     "DEFAULT_SUPERVISION_SCHEDULE_KEYS",
+    "EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS",
+    "DEFAULT_TEACHER_MAX_TEMPERATURE",
+    "DEFAULT_TEACHER_MIN_TEMPERATURE",
+    "DEFAULT_TEACHER_TARGET_ESS",
     "DEFAULT_TEACHER_TARGET_TEMPERATURE",
     "MAX_CONTEXT_CALIBRATION_TOTAL",
     "MIN_CONTEXT_CALIBRATION_TOTAL",
-    "ContextDensityStudentMLP",
-    "ContextScheduleTeacherMLP",
+    "TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS",
+    "TEACHER_TEMPERATURE_MODE_FIXED",
+    "GIPODensityStudentMLP",
+    "GIPOScheduleTeacherMLP",
     "DensityFeatureNormalizer",
     "EmbeddingNormalizer",
-    "attach_uniform_context_rewards",
+    "attach_uniform_gipo_rewards",
     "build_series_index_map",
     "build_teacher_weighted_density_targets",
     "context_calibration_train_val_counts",
     "context_id_from_row",
     "context_pair_key",
-    "context_teacher_diagnostics",
+    "gipo_teacher_diagnostics",
     "density_mass_for_row",
     "grid_for_schedule",
     "load_context_embedding_table",
     "pairwise_rank_loss",
-    "predict_context_density",
+    "predict_gipo_density",
     "read_metric_rows_csv",
     "recommended_context_calibration_count",
     "remapped_series_index",
@@ -1321,8 +1458,9 @@ __all__ = [
     "series_key_from_row",
     "split_rows_by_context_holdout",
     "split_rows_by_series_holdout",
-    "train_context_density_student",
-    "train_context_teacher",
-    "validate_context_support_schedule_keys",
+    "train_gipo_student",
+    "train_gipo_teacher",
+    "validate_gipo_support_schedule_keys",
+    "validate_teacher_temperature_mode",
     "validate_reference_grid",
 ]

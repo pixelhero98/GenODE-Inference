@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from genode.conditional_opd.models import validate_time_grid
+from genode.gipo.models import validate_time_grid
 from genode.data.otflow_paths import (
     default_backbone_manifest_path,
     project_outputs_root,

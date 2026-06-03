@@ -8,7 +8,11 @@ from unittest import mock
 from pathlib import Path
 
 import genode.evaluation.diffusion_flow_time_reparameterization as runner
-from genode.schedule_transfer.diffusion_flow_schedules import build_schedule_grid
+from genode.schedule_transfer.diffusion_flow_schedules import (
+    EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
+    EXPERIMENTAL_REVERSED_SCHEDULE_KEYS,
+    build_schedule_grid,
+)
 from genode.evaluation.fm_backbone_registry import materialize_backbone_manifest
 from genode.schedule_transfer.otflow_paper_registry import (
     BASELINE_SCHEDULE_KEYS,
@@ -36,6 +40,8 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
     def test_schedule_sets_are_exact(self) -> None:
         self.assertEqual(BASELINE_SCHEDULE_KEYS, ("uniform", "late_power_3", "flowts_power_sampling", "ays", "gits", "ots"))
         self.assertEqual(TRANSFER_SCHEDULE_KEYS, ("ays", "gits", "ots"))
+        self.assertNotIn("uniform_reversed", EXPERIMENTAL_REVERSED_SCHEDULE_KEYS)
+        self.assertEqual(EXPERIMENTAL_FIXED_SCHEDULE_KEYS[: len(BASELINE_SCHEDULE_KEYS)], BASELINE_SCHEDULE_KEYS)
 
     def test_registry_exposes_active_baseline_matrix(self) -> None:
         snapshot = paper_registry_snapshot()
@@ -50,16 +56,16 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertIn("Midpoint RK2", solver_names)
         self.assertIn("DPM++2M", solver_names)
 
-    def test_context_conditional_docs_describe_active_density_path(self) -> None:
-        docs_path = PROJECT_ROOT / "docs" / "context_conditional_opd.md"
+    def test_gipo_docs_describe_active_density_path(self) -> None:
+        docs_path = PROJECT_ROOT / "docs" / "gipo.md"
         text = docs_path.read_text(encoding="utf-8")
         lower = text.lower()
 
         self.assertRegex(lower, r"continuous[- ]density")
         self.assertRegex(lower, r"teacher[- ]weighted")
         for expected in (
-            "context-conditional opd",
-            "context_density_opd_v1",
+            "gipo",
+            "gipo_density_v1",
             "density_mass",
             "rank",
             "huber",
@@ -106,6 +112,13 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         args = runner.build_argparser().parse_args(["--baseline_scheduler_names", "ays,uniform"])
         cases = runner._scheduler_cases_for_datasets(args, ["electricity"])
         self.assertEqual([case["scheduler_key"] for case in cases["electricity"]], ["uniform", "ays"])
+
+    def test_scheduler_cases_accept_explicit_experimental_reversed_keys(self) -> None:
+        args = runner.build_argparser().parse_args(["--baseline_scheduler_names", "ays_reversed,uniform"])
+        cases = runner._scheduler_cases_for_datasets(args, ["electricity"])
+        self.assertEqual([case["scheduler_key"] for case in cases["electricity"]], ["uniform", "ays_reversed"])
+        default_args = runner.build_argparser().parse_args([])
+        self.assertNotIn("ays_reversed", runner._parse_schedule_names(default_args.baseline_scheduler_names))
 
     def test_aggregate_relative_gain_uses_fraction_units(self) -> None:
         rows = [

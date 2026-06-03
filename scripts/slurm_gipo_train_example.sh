@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generic Slurm example for retraining only the context-conditional teacher/student.
+# Generic Slurm example for retraining the GIPO teacher/student.
 #
 # Required environment variables:
 #   GENODE_REPO              repository checkout
@@ -9,7 +9,7 @@
 #   GENODE_CONTEXT_NPZ       reusable context embedding sidecar
 #   GENODE_SER_SUMMARY       SER schedule summary JSON
 
-#SBATCH --job-name=genode_ctx_opd
+#SBATCH --job-name=genode_gipo
 #SBATCH --partition=hopper
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -27,7 +27,7 @@ GENODE_ROWS_CSV=${GENODE_ROWS_CSV:?set GENODE_ROWS_CSV}
 GENODE_CONTEXT_NPZ=${GENODE_CONTEXT_NPZ:?set GENODE_CONTEXT_NPZ}
 GENODE_SER_SUMMARY=${GENODE_SER_SUMMARY:?set GENODE_SER_SUMMARY}
 
-RUN_ROOT=${GENODE_RUN_ROOT:-${GENODE_OUTPUT_ROOT}/context_conditional_support_choice}
+RUN_ROOT=${GENODE_RUN_ROOT:-${GENODE_OUTPUT_ROOT}/gipo_support_choice}
 SUPPORT_KEYS=${GENODE_SUPPORT_KEYS:-uniform,late_power_3,flowts_power_sampling,ays,gits,ots,ser_ptg_local_defect_eta005}
 CONTEXT_SAMPLE_COUNT=${GENODE_CONTEXT_SAMPLE_COUNT:-288}
 
@@ -37,9 +37,9 @@ export PYTHONPATH="${GENODE_REPO}/src"
 export PYTHONDONTWRITEBYTECODE=1
 
 python -m compileall -q src tests scripts
-python -m unittest tests.test_context_conditional_opd tests.test_schedule_summary_evaluator
+python -m unittest tests.test_gipo tests.test_schedule_summary_evaluator
 
-python -m genode.conditional_opd.train_context_conditional_opd \
+python -m genode.gipo.train_gipo \
   --rows_csv "${GENODE_ROWS_CSV}" \
   --context_embeddings_npz "${GENODE_CONTEXT_NPZ}" \
   --schedule_summary_json "${GENODE_SER_SUMMARY}" \
@@ -48,6 +48,12 @@ python -m genode.conditional_opd.train_context_conditional_opd \
   --context_sample_count "${CONTEXT_SAMPLE_COUNT}" \
   --context_holdout_fraction "${GENODE_CONTEXT_HOLDOUT_FRACTION:-0.20}" \
   --series_holdout_fraction "${GENODE_SERIES_HOLDOUT_FRACTION:-0.20}" \
+  --density_bin_count "${GENODE_DENSITY_BIN_COUNT:-128}" \
   --teacher_checkpoint_every "${GENODE_TEACHER_CHECKPOINT_EVERY:-100}" \
   --teacher_steps "${GENODE_TEACHER_STEPS:-500}" \
-  --student_steps "${GENODE_STUDENT_STEPS:-500}"
+  --student_steps "${GENODE_STUDENT_STEPS:-500}" \
+  --teacher_temperature_mode "${GENODE_TEACHER_TEMPERATURE_MODE:-fixed}" \
+  --teacher_temperature "${GENODE_TEACHER_TEMPERATURE:-0.05}" \
+  --teacher_target_ess "${GENODE_TEACHER_TARGET_ESS:-2.5}" \
+  --teacher_min_temperature "${GENODE_TEACHER_MIN_TEMPERATURE:-0.01}" \
+  --teacher_max_temperature "${GENODE_TEACHER_MAX_TEMPERATURE:-1.0}"

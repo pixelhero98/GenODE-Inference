@@ -11,10 +11,10 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from genode.conditional_opd.models import validate_time_grid
-from genode.conditional_opd.context_conditional import load_context_embedding_table, save_context_embedding_table
-from genode.conditional_opd.objectives import attach_reward_columns, crps_mase_reward, rewards_by_setting, seed_mean_metric_rows
-from genode.conditional_opd.ser_ptg_reference import SER_PTG_SCHEDULE_KEY, grid_geometry
+from genode.gipo.models import validate_time_grid
+from genode.gipo.policy import load_context_embedding_table, save_context_embedding_table
+from genode.gipo.objectives import attach_reward_columns, crps_mase_reward, rewards_by_setting, seed_mean_metric_rows
+from genode.gipo.ser_ptg_reference import SER_PTG_SCHEDULE_KEY, grid_geometry
 from genode.data.otflow_paths import (
     default_backbone_manifest_path,
     project_outputs_root,
@@ -51,8 +51,8 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
 
 DEFAULT_SOLVERS: Tuple[str, ...] = ("euler", "heun", "midpoint_rk2", "dpmpp2m")
 DEFAULT_TARGET_NFES: Tuple[int, ...] = (4, 8, 12)
-SELECTED_STUDENT_SCHEDULE_KEY = "conditional_opd_student_selected"
-SELECTED_STUDENT_SCHEDULE_NAME = "Conditional OPD Student Selected"
+SELECTED_STUDENT_SCHEDULE_KEY = "gipo"
+SELECTED_STUDENT_SCHEDULE_NAME = "GIPO"
 EVALUATOR_SIGNATURE_VERSION = "schedule_summary_evaluator_v3"
 
 SCHEDULE_ROW_FIELDS: Tuple[str, ...] = (
@@ -73,7 +73,7 @@ SCHEDULE_ROW_FIELDS: Tuple[str, ...] = (
     "scheduler_variant_key",
     "scheduler_variant_name",
     "schedule_name",
-    "opd_step_budget",
+    "gipo_step_budget",
     "row_signature",
     "selection_metric",
     "selection_metric_value",
@@ -121,7 +121,7 @@ SCHEDULE_ROW_FIELDS: Tuple[str, ...] = (
     "candidate_source",
     "active_round",
     "student_seed",
-    "opd_steps",
+    "gipo_steps",
     "perturbation_type",
     "perturbation_params_json",
     "intervals_json",
@@ -281,8 +281,6 @@ def schedule_display_name_for_key(schedule_key: str) -> str:
         return "SER-PTG local defect eta=0.05"
     if key == SELECTED_STUDENT_SCHEDULE_KEY:
         return SELECTED_STUDENT_SCHEDULE_NAME
-    if key.startswith("conditional_opd_student_steps"):
-        return f"Conditional OPD Student {key.removeprefix('conditional_opd_student_steps')} updates"
     return schedule_display_name(key)
 
 
@@ -310,7 +308,7 @@ def load_schedule_predictions(
             {
                 "scheduler_key": str(payload.get("schedule_key", payload.get("scheduler_key", SELECTED_STUDENT_SCHEDULE_KEY))),
                 "schedule_name": str(payload.get("schedule_name", SELECTED_STUDENT_SCHEDULE_NAME)),
-                "opd_step_budget": payload.get("selected_opd_step_budget"),
+                "gipo_step_budget": payload.get("selected_gipo_step_budget"),
                 "predictions": list(payload.get("predictions", []) or []),
             }
         ]
@@ -320,7 +318,7 @@ def load_schedule_predictions(
             raise ValueError("Schedule summary contains a schedule without scheduler_key.")
         expected_schedule_keys.append(scheduler_key)
         schedule_name = str(schedule.get("schedule_name") or schedule_display_name_for_key(scheduler_key))
-        budget = schedule.get("opd_step_budget", schedule.get("student_opd_steps", schedule.get("selected_opd_step_budget")))
+        budget = schedule.get("gipo_step_budget", schedule.get("student_gipo_steps", schedule.get("selected_gipo_step_budget")))
         for item in list(schedule.get("predictions", []) or []):
             solver_key = str(item.get("solver_key"))
             target_nfe = int(item.get("target_nfe"))
@@ -344,7 +342,7 @@ def load_schedule_predictions(
                 "candidate_source",
                 "active_round",
                 "student_seed",
-                "opd_steps",
+                "gipo_steps",
                 "perturbation_type",
                 "perturbation_params_json",
                 "utility",
@@ -357,7 +355,7 @@ def load_schedule_predictions(
                 {
                     "scheduler_key": scheduler_key,
                     "schedule_name": schedule_name,
-                    "opd_step_budget": None if budget in (None, "") else int(budget),
+                    "gipo_step_budget": None if budget in (None, "") else int(budget),
                     "solver_key": solver_key,
                     "target_nfe": int(target_nfe),
                     "runtime_nfe": int(macro_steps),
@@ -485,7 +483,7 @@ def _schedule_row(
         "scheduler_variant_key": scheduler_key,
         "scheduler_variant_name": str(prediction.get("schedule_name") or schedule_display_name_for_key(scheduler_key)),
         "schedule_name": str(prediction.get("schedule_name") or schedule_display_name_for_key(scheduler_key)),
-        "opd_step_budget": prediction.get("opd_step_budget"),
+        "gipo_step_budget": prediction.get("gipo_step_budget"),
         "row_signature": _row_signature(
             dataset=str(dataset),
             split_phase=str(split_phase),
@@ -528,7 +526,7 @@ def _schedule_row(
         "candidate_source": prediction.get("candidate_source", ""),
         "active_round": prediction.get("active_round", ""),
         "student_seed": prediction.get("student_seed", ""),
-        "opd_steps": prediction.get("opd_steps", prediction.get("opd_step_budget", "")),
+        "gipo_steps": prediction.get("gipo_steps", prediction.get("gipo_step_budget", "")),
         "perturbation_type": prediction.get("perturbation_type", ""),
         "perturbation_params_json": prediction.get("perturbation_params_json", ""),
         "intervals_json": prediction.get(
@@ -572,10 +570,10 @@ def _load_rows_csv(path: str | Path, *, dataset: str, split_phase: Optional[str]
             clean["target_nfe"] = int(target_nfe)
             clean["crps"] = float(crps)
             clean["mase"] = float(mase)
-            for key in ("mse", "latency_ms_per_sample", "realized_nfe", "opd_step_budget"):
+            for key in ("mse", "latency_ms_per_sample", "realized_nfe", "gipo_step_budget"):
                 value = _optional_float(clean.get(key))
                 if value is not None:
-                    clean[key] = int(value) if key in {"realized_nfe", "opd_step_budget"} else float(value)
+                    clean[key] = int(value) if key in {"realized_nfe", "gipo_step_budget"} else float(value)
             rows.append(clean)
     return rows
 
@@ -618,9 +616,9 @@ def _aggregate_schedule_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str
             "n_seeds": int(len(group)),
             "seed_values": sorted(int(row.get("seed", 0)) for row in group),
         }
-        budgets = {int(row["opd_step_budget"]) for row in group if row.get("opd_step_budget") not in (None, "")}
+        budgets = {int(row["gipo_step_budget"]) for row in group if row.get("gipo_step_budget") not in (None, "")}
         if len(budgets) == 1:
-            summary["opd_step_budget"] = int(next(iter(budgets)))
+            summary["gipo_step_budget"] = int(next(iter(budgets)))
         for metric in ("crps", "mase", "mse", "latency_ms_per_sample", "realized_nfe"):
             values = [row.get(metric) for row in group]
             summary[f"{metric}_mean"] = _mean(values)
@@ -722,7 +720,7 @@ def select_best_validation_schedule(
             schedule_metadata.setdefault(
                 schedule_key,
                 {
-                    "opd_step_budget": _optional_int(row.get("opd_step_budget")),
+                    "gipo_step_budget": _optional_int(row.get("gipo_step_budget")),
                 },
             )
             per_cell.append(
@@ -730,7 +728,7 @@ def select_best_validation_schedule(
                     "solver_key": setting[0],
                     "target_nfe": int(setting[1]),
                     "scheduler_key": schedule_key,
-                    "opd_step_budget": _optional_int(row.get("opd_step_budget")),
+                    "gipo_step_budget": _optional_int(row.get("gipo_step_budget")),
                     "validation_utility": float(utility),
                     "u_crps_best": float(u_crps_best),
                     "u_mase_best": float(u_mase_best),
@@ -749,11 +747,11 @@ def select_best_validation_schedule(
     table = []
     for schedule_key, values in scores.items():
         metadata = schedule_metadata.get(schedule_key, {})
-        budget = _optional_int(metadata.get("opd_step_budget"))
+        budget = _optional_int(metadata.get("gipo_step_budget"))
         table.append(
             {
                 "scheduler_key": schedule_key,
-                "opd_step_budget": budget,
+                "gipo_step_budget": budget,
                 "mean_validation_utility": float(np.mean(np.asarray(values, dtype=np.float64))),
                 "mean_u_crps_best": float(np.mean(np.asarray(crps_scores[schedule_key], dtype=np.float64))),
                 "mean_u_mase_best": float(np.mean(np.asarray(mase_scores[schedule_key], dtype=np.float64))),
@@ -765,7 +763,7 @@ def select_best_validation_schedule(
         key=lambda row: (
             -float(row["mean_validation_utility"]),
             -float(row["mean_min_metric_utility"]),
-            10**9 if row.get("opd_step_budget") is None else int(row["opd_step_budget"]),
+            10**9 if row.get("gipo_step_budget") is None else int(row["gipo_step_budget"]),
             str(row["scheduler_key"]),
         )
     )
@@ -776,8 +774,8 @@ def select_best_validation_schedule(
         "utility_reference": utility_reference,
         "fixed_reference_schedule_keys": fixed_reference_schedule_keys,
         "selected_schedule_key": str(selected["scheduler_key"]),
-        "selected_opd_step_budget": _optional_int(selected.get("opd_step_budget")),
-        "tie_break": "mean_validation_utility_then_mean_min_metric_utility_then_smaller_opd_step_budget_then_scheduler_key",
+        "selected_gipo_step_budget": _optional_int(selected.get("gipo_step_budget")),
+        "tie_break": "mean_validation_utility_then_mean_min_metric_utility_then_smaller_gipo_step_budget_then_scheduler_key",
         "schedule_table": table,
         "per_cell_validation_utilities": per_cell,
     }
@@ -799,7 +797,7 @@ def write_selected_schedule_summary(source_summary_path: str | Path, selection: 
         copied = dict(item)
         copied["source_scheduler_key"] = selected_key
         predictions.append(copied)
-    selected_budget = _optional_int(selection.get("selected_opd_step_budget"))
+    selected_budget = _optional_int(selection.get("selected_gipo_step_budget"))
     schedule = {
         "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
         "schedule_name": SELECTED_STUDENT_SCHEDULE_NAME,
@@ -808,13 +806,13 @@ def write_selected_schedule_summary(source_summary_path: str | Path, selection: 
         "predictions": predictions,
     }
     if selected_budget is not None:
-        schedule["opd_step_budget"] = int(selected_budget)
+        schedule["gipo_step_budget"] = int(selected_budget)
     summary = {
         "status": "ready",
         "artifact": "selected_student_schedule_summary",
         "dataset": str(payload.get("dataset")),
         "selection": dict(selection),
-        "selected_opd_step_budget": None if selected_budget is None else int(selected_budget),
+        "selected_gipo_step_budget": None if selected_budget is None else int(selected_budget),
         "selected_source_schedule_key": selected_key,
         "baseline_schedule": False,
         "schedules": [schedule],
@@ -847,8 +845,10 @@ def build_comparison_summary(
     for solver in solver_names:
         for target_nfe in target_nfe_values:
             cell_rows = by_cell.get((str(solver), int(target_nfe)), [])
-            student = next((row for row in cell_rows if row["scheduler_key"] == SELECTED_STUDENT_SCHEDULE_KEY), None)
             student_rows_for_cell = [row for row in cell_rows if str(row["scheduler_key"]) in student_schedule_keys]
+            student = next((row for row in student_rows_for_cell if row["scheduler_key"] == SELECTED_STUDENT_SCHEDULE_KEY), None)
+            if student is None and len(student_schedule_keys) == 1:
+                student = next(iter(student_rows_for_cell), None)
             uniform = next((row for row in cell_rows if row["scheduler_key"] == "uniform"), None)
             ser_ptg = next((row for row in cell_rows if row["scheduler_key"] == SER_PTG_SCHEDULE_KEY), None)
             baselines = [row for row in cell_rows if row["scheduler_key"] in BASELINE_SCHEDULE_KEYS]
