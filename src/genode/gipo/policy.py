@@ -1262,6 +1262,7 @@ def build_teacher_weighted_density_targets(
     top_margin_values: List[float] = []
     candidate_counts: List[int] = []
     hard_target_count = 0
+    teacher.to(device)
     teacher.eval()
     for _, group in sorted(grouped.items(), key=lambda item: item[0]):
         counts: Dict[str, int] = {key: 0 for key in supervision_keys}
@@ -1433,6 +1434,7 @@ def build_teacher_weighted_density_prediction_rows(
     top_margin_values: List[float] = []
     candidate_counts: List[int] = []
     hard_target_count = 0
+    teacher.to(device)
     teacher.eval()
     for _, group in sorted(grouped.items(), key=lambda item: item[0]):
         counts: Dict[str, int] = {key: 0 for key in supervision_keys}

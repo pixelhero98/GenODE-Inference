@@ -180,6 +180,8 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
             "student_target_mode", STUDENT_TARGET_MODE_SOFT_MIXTURE
         )
     )
+    device = resolve_torch_device(str(args.device))
+    teacher.to(device)
     prediction_rows, target_summary = build_teacher_weighted_density_prediction_rows(
         teacher,
         support_rows,
@@ -197,12 +199,10 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
         student_target_mode=student_target_mode,
         teacher_hard_margin=float(args.teacher_hard_margin),
         setting_feature_mode=setting_feature_mode,
-        device=resolve_torch_device(str(args.device)),
+        device=device,
     )
 
     grouped_support = _group_support_rows(support_rows)
-    device = resolve_torch_device(str(args.device))
-    teacher.to(device)
     checkpoint = load_forecast_checkpoint_splits(
         cli_args=args,
         dataset_root=resolve_project_path(str(args.dataset_root)),
