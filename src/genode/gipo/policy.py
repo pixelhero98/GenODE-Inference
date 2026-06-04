@@ -28,7 +28,10 @@ from genode.gipo.density_representation import (
     validate_reference_grid,
 )
 from genode.gipo.models import (
-    SETTING_FEATURE_MODE_GIPO_V1,
+    SERIES_ENCODING_HASH_FOURIER_V1,
+    SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    SettingEncoderConfig,
+    setting_encoder_config_from_payload,
     setting_features,
     solver_macro_steps,
     validate_setting_feature_mode,
@@ -64,6 +67,20 @@ DEFAULT_TEACHER_MAX_TEMPERATURE = 1.0
 STUDENT_TARGET_MODE_SOFT_MIXTURE = "soft_mixture"
 STUDENT_TARGET_MODE_MARGIN_HARD_SOFT = "margin_hard_soft"
 DEFAULT_TEACHER_HARD_MARGIN = 0.05
+MODEL_PAYLOAD_VERSION = 2
+ARCHITECTURE_LIGHT_TRANSFORMER_V1 = "light_transformer_v1"
+DEFAULT_TRANSFORMER_HIDDEN_DIM = 64
+DEFAULT_TRANSFORMER_LAYERS = 2
+DEFAULT_TRANSFORMER_HEADS = 4
+DEFAULT_TRANSFORMER_DROPOUT = 0.05
+SERIES_HASH_FOURIER_DIM = 9
+
+
+def validate_gipo_architecture(value: str) -> str:
+    arch = str(value).strip() or ARCHITECTURE_LIGHT_TRANSFORMER_V1
+    if arch != ARCHITECTURE_LIGHT_TRANSFORMER_V1:
+        raise ValueError(f"GIPO architecture must be {ARCHITECTURE_LIGHT_TRANSFORMER_V1!r}, got {value!r}.")
+    return arch
 
 
 def _normalized_metric_weights(crps_weight: float, mase_weight: float) -> Tuple[float, float]:
@@ -82,6 +99,24 @@ def _finite_positive(value: Any, *, label: str) -> float:
     if not math.isfinite(val) or val <= 0.0:
         raise ValueError(f"{label} must be finite and positive, got {value!r}.")
     return val
+
+
+def validate_teacher_objective_hyperparameters(
+    *,
+    rank_temperature: float,
+    regression_weight: float,
+    pair_margin: float,
+) -> Tuple[float, float, float]:
+    temp = float(rank_temperature)
+    reg = float(regression_weight)
+    margin = float(pair_margin)
+    if not math.isfinite(temp) or temp <= 0.0:
+        raise ValueError(f"teacher_rank_temperature must be finite and positive, got {rank_temperature!r}.")
+    if not math.isfinite(reg) or reg < 0.0:
+        raise ValueError(f"teacher_regression_weight must be finite and nonnegative, got {regression_weight!r}.")
+    if not math.isfinite(margin) or margin < 0.0:
+        raise ValueError(f"teacher_pair_margin must be finite and nonnegative, got {pair_margin!r}.")
+    return temp, reg, margin
 
 
 def _summary_percentiles(values: Sequence[float]) -> Dict[str, float]:
@@ -156,6 +191,26 @@ def validate_student_target_mode(mode: str) -> str:
     if value not in allowed:
         raise ValueError(f"student_target_mode must be one of {sorted(allowed)}, got {mode!r}.")
     return value
+
+
+def _resolve_setting_encoder_config(
+    setting_feature_mode: str,
+    setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None,
+) -> SettingEncoderConfig:
+    if setting_encoder_config is None:
+        return setting_encoder_config_from_payload({"mode": validate_setting_feature_mode(setting_feature_mode)})
+    return setting_encoder_config_from_payload(setting_encoder_config)
+
+
+def _setting_features_for_config(
+    solver_key: str,
+    target_nfe: int,
+    *,
+    setting_feature_mode: str,
+    setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None,
+) -> torch.Tensor:
+    config = _resolve_setting_encoder_config(setting_feature_mode, setting_encoder_config)
+    return setting_features(str(solver_key), int(target_nfe), mode=setting_feature_mode, config=config)
 
 
 def _json_hash(payload: Mapping[str, Any], *, prefix: str) -> str:
@@ -256,6 +311,118 @@ def context_pair_key(row: MetricRow, *, pair_on_seed: bool = True) -> ContextPai
         context_id_from_row(row),
         seed,
     )
+
+
+def _nfe_sequence_key(row: MetricRow) -> Tuple[str, int | None, str, str, str]:
+    return (
+        str(row.get("dataset", row.get("dataset_key", ""))),
+        _optional_int(row.get("seed")),
+        str(row["solver_key"]),
+        context_id_from_row(row),
+        series_key_from_row(row),
+    )
+
+
+def _student_target_groups(rows: Sequence[MetricRow]) -> List[Tuple[ContextPairKey, List[MetricRow]]]:
+    grouped: Dict[ContextPairKey, List[MetricRow]] = defaultdict(list)
+    for row in rows:
+        grouped[context_pair_key(row, pair_on_seed=True)].append(row)
+    return [(key, group) for key, group in sorted(grouped.items(), key=lambda item: item[0])]
+
+
+def student_nfe_sequence_pairs(rows: Sequence[MetricRow]) -> List[Tuple[int, int, float]]:
+    """Return adjacent target rows plus their positive NFE distance."""
+    sequence_items: Dict[Tuple[str, int | None, str, str, str], List[Tuple[int, int]]] = defaultdict(list)
+    for index, (_, group) in enumerate(_student_target_groups(rows)):
+        if not group:
+            continue
+        first = group[0]
+        sequence_items[_nfe_sequence_key(first)].append((int(first["target_nfe"]), int(index)))
+    pairs: List[Tuple[int, int, float]] = []
+    for items in sequence_items.values():
+        ordered = sorted(items, key=lambda item: (int(item[0]), int(item[1])))
+        for left, right in zip(ordered, ordered[1:]):
+            delta = max(1.0, float(int(right[0]) - int(left[0])))
+            pairs.append((int(left[1]), int(right[1]), delta))
+    return pairs
+
+
+def student_nfe_sequence_pair_indices(rows: Sequence[MetricRow]) -> List[Tuple[int, int]]:
+    """Return adjacent target row indices that share context/solver/series and differ only by ordered NFE."""
+    return [(left, right) for left, right, _ in student_nfe_sequence_pairs(rows)]
+
+
+def density_sequence_smoothness_loss(
+    logits: torch.Tensor,
+    pair_indices: Sequence[Tuple[int, int] | Tuple[int, int, float]],
+    *,
+    mode: str = "js",
+) -> torch.Tensor:
+    if not pair_indices:
+        return logits.new_zeros(())
+    left = torch.tensor([int(pair[0]) for pair in pair_indices], dtype=torch.long, device=logits.device)
+    right = torch.tensor([int(pair[1]) for pair in pair_indices], dtype=torch.long, device=logits.device)
+    weights = torch.tensor(
+        [1.0 / max(float(pair[2]), 1.0) if len(pair) >= 3 else 1.0 for pair in pair_indices],
+        dtype=torch.float32,
+        device=logits.device,
+    )
+    weights = weights / torch.clamp(torch.sum(weights), min=1e-12)
+    value = str(mode).strip() or "js"
+    if value == "logit_l2":
+        per_pair = torch.mean(torch.square(logits[left] - logits[right]), dim=-1)
+        return torch.sum(weights * per_pair)
+    if value != "js":
+        raise ValueError("student_nfe_smoothness_mode must be 'js' or 'logit_l2'.")
+    left_probs = torch.softmax(logits[left], dim=-1)
+    right_probs = torch.softmax(logits[right], dim=-1)
+    mixture = 0.5 * (left_probs + right_probs)
+    eps = 1e-8
+    left_kl = torch.sum(left_probs * (torch.log(left_probs + eps) - torch.log(mixture + eps)), dim=-1)
+    right_kl = torch.sum(right_probs * (torch.log(right_probs + eps) - torch.log(mixture + eps)), dim=-1)
+    return torch.sum(weights * (0.5 * (left_kl + right_kl)))
+
+
+def density_sequence_roughness_summary(
+    masses: Sequence[Sequence[float]],
+    pair_indices: Sequence[Tuple[int, int] | Tuple[int, int, float]],
+) -> Dict[str, Any]:
+    if not pair_indices:
+        return {
+            "nfe_sequence_pair_count": 0,
+            "nfe_sequence_delta_mean": 0.0,
+            "nfe_sequence_js_mean": 0.0,
+            "nfe_sequence_js_p95": 0.0,
+            "nfe_sequence_l1_mean": 0.0,
+            "nfe_sequence_l1_p95": 0.0,
+        }
+    js_values: List[float] = []
+    l1_values: List[float] = []
+    delta_values: List[float] = []
+    for pair in pair_indices:
+        left_idx = int(pair[0])
+        right_idx = int(pair[1])
+        delta_values.append(float(pair[2]) if len(pair) >= 3 else 1.0)
+        left = np.asarray(masses[int(left_idx)], dtype=np.float64)
+        right = np.asarray(masses[int(right_idx)], dtype=np.float64)
+        left = left / max(float(np.sum(left)), 1e-12)
+        right = right / max(float(np.sum(right)), 1e-12)
+        mixture = 0.5 * (left + right)
+        js = 0.5 * float(np.sum(left * (np.log(np.maximum(left, 1e-12)) - np.log(np.maximum(mixture, 1e-12)))))
+        js += 0.5 * float(np.sum(right * (np.log(np.maximum(right, 1e-12)) - np.log(np.maximum(mixture, 1e-12)))))
+        js_values.append(js)
+        l1_values.append(float(np.sum(np.abs(left - right))))
+    js_stats = _summary_percentiles(js_values)
+    l1_stats = _summary_percentiles(l1_values)
+    return {
+        "nfe_sequence_pair_count": int(len(pair_indices)),
+        "nfe_sequence_delta_mean": _summary_percentiles(delta_values)["mean"],
+        "nfe_sequence_js_mean": js_stats["mean"],
+        "nfe_sequence_js_p95": js_stats["p95"],
+        "nfe_sequence_l1_mean": l1_stats["mean"],
+        "nfe_sequence_l1_p95": l1_stats["p95"],
+    }
+
 
 
 def validate_gipo_support_schedule_keys(
@@ -612,6 +779,118 @@ def remapped_series_index(row: MetricRow, series_index_map: Mapping[str, int]) -
     return int(series_index_map[key])
 
 
+def _stable_unit_hash(text: str) -> float:
+    digest = hashlib.sha256(str(text).encode("utf-8")).digest()
+    return float(int.from_bytes(digest[:8], "big") / float(2**64 - 1))
+
+
+def series_hash_fourier_features(row: MetricRow | None = None, *, fallback_key: str = "") -> Tuple[float, ...]:
+    missing = 0.0
+    if row is not None:
+        dataset = str(row.get("dataset", row.get("dataset_key", ""))).strip()
+        series_id = str(row.get("series_id", "") or "").strip()
+        series_idx = str(row.get("series_idx", "") or "").strip()
+        if series_id:
+            key = f"{dataset}|series_id:{series_id}"
+        elif series_idx:
+            key = f"{dataset}|series_idx:{series_idx}"
+        else:
+            key = f"{dataset}|missing_series"
+            missing = 1.0
+    else:
+        key = str(fallback_key) or "missing_series"
+        missing = 1.0 if not str(fallback_key).strip() else 0.0
+    phase = 2.0 * math.pi * _stable_unit_hash(key)
+    values: List[float] = []
+    for frequency in (1.0, 2.0, 4.0, 8.0):
+        values.extend([math.sin(frequency * phase), math.cos(frequency * phase)])
+    values.append(float(missing))
+    return tuple(float(value) for value in values)
+
+
+def _series_feature_tensor(
+    series_index_batch: torch.Tensor,
+    *,
+    rows: Sequence[MetricRow] | None = None,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if rows is not None:
+        features = [series_hash_fourier_features(row) for row in rows]
+    else:
+        values = [int(value) for value in series_index_batch.detach().cpu().reshape(-1).tolist()]
+        features = [series_hash_fourier_features(None, fallback_key=f"series_index:{value}") for value in values]
+    return torch.tensor(np.asarray(features, dtype=np.float32), dtype=dtype, device=device)
+
+
+def _target_nfe_tensor(
+    *,
+    rows: Sequence[MetricRow] | None,
+    batch: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if rows is not None:
+        values = [float(row["target_nfe"]) for row in rows]
+    else:
+        values = [float(idx + 1) for idx in range(int(batch))]
+    return torch.tensor(values, dtype=torch.float32, device=device)
+
+
+def _student_target_representative_rows(rows: Sequence[MetricRow]) -> List[MetricRow]:
+    return [group[0] for _, group in _student_target_groups(rows) if group]
+
+
+def student_nfe_sequence_groups(rows: Sequence[MetricRow]) -> List[List[int]]:
+    sequence_items: Dict[Tuple[str, int | None, str, str, str], List[Tuple[int, int]]] = defaultdict(list)
+    for index, (_, group) in enumerate(_student_target_groups(rows)):
+        if not group:
+            continue
+        first = group[0]
+        sequence_items[_nfe_sequence_key(first)].append((int(first["target_nfe"]), int(index)))
+    groups: List[List[int]] = []
+    for items in sequence_items.values():
+        ordered = sorted(items, key=lambda item: (int(item[0]), int(item[1])))
+        if ordered:
+            groups.append([int(index) for _, index in ordered])
+    return groups
+
+
+def nfe_sequence_groups_for_ordered_rows(rows: Sequence[MetricRow]) -> List[List[int]]:
+    sequence_items: Dict[Tuple[str, int | None, str, str, str], List[Tuple[int, int]]] = defaultdict(list)
+    for index, row in enumerate(rows):
+        sequence_items[_nfe_sequence_key(row)].append((int(row["target_nfe"]), int(index)))
+    return [
+        [int(index) for _, index in sorted(items, key=lambda item: (int(item[0]), int(item[1])))]
+        for items in sequence_items.values()
+        if items
+    ]
+
+
+def _teacher_sequence_groups_and_masks(rows: Sequence[MetricRow], *, device: torch.device) -> Tuple[List[List[int]], List[torch.Tensor]]:
+    sequence_items: Dict[Tuple[str, int | None, str, str, str], List[Tuple[int, int]]] = defaultdict(list)
+    for index, row in enumerate(rows):
+        sequence_items[_nfe_sequence_key(row)].append((int(row["target_nfe"]), int(index)))
+    groups: List[List[int]] = []
+    masks: List[torch.Tensor] = []
+    for items in sequence_items.values():
+        ordered_indices = [index for _, index in sorted(items, key=lambda item: (int(item[0]), int(item[1])))]
+        if not ordered_indices:
+            continue
+        group_rows = [rows[index] for index in ordered_indices]
+        mask_values: List[List[bool]] = []
+        for left in group_rows:
+            row_mask: List[bool] = []
+            for right in group_rows:
+                row_mask.append(
+                    str(left.get("scheduler_key", "")) == str(right.get("scheduler_key", ""))
+                    or int(left["target_nfe"]) == int(right["target_nfe"])
+                )
+            mask_values.append(row_mask)
+        groups.append([int(index) for index in ordered_indices])
+        masks.append(torch.tensor(mask_values, dtype=torch.bool, device=device))
+    return groups, masks
+
+
 def grid_for_schedule(
     schedule_key: str,
     solver_key: str,
@@ -643,8 +922,152 @@ def density_mass_for_row(
     return grid_to_density_mass(grid, reference_time_grid=reference_time_grid, macro_steps=solver_macro_steps(solver, target_nfe))
 
 
-class GIPOScheduleTeacherMLP(nn.Module):
-    """Teacher scorer for `(solver, nfe, density, series, context)`."""
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    even_width = int(x.shape[-1] // 2 * 2)
+    if even_width == 0:
+        return x
+    core = x[..., :even_width]
+    rest = x[..., even_width:]
+    first = core[..., 0::2]
+    second = core[..., 1::2]
+    rotated = torch.stack((-second, first), dim=-1).reshape_as(core)
+    return torch.cat([rotated, rest], dim=-1)
+
+
+def _apply_rope_to_heads(x: torch.Tensor, target_nfes: torch.Tensor) -> torch.Tensor:
+    head_dim = int(x.shape[-1])
+    even_width = int(head_dim // 2 * 2)
+    if even_width == 0:
+        return x
+    positions = torch.log(torch.clamp(target_nfes.to(device=x.device, dtype=x.dtype), min=1.0))
+    scale = torch.clamp(torch.max(torch.abs(positions)), min=1.0)
+    phases = (positions / scale)[:, None, None]
+    frequencies = torch.arange(1, even_width // 2 + 1, dtype=x.dtype, device=x.device)[None, None, :]
+    angles = phases * frequencies * math.pi
+    sin = torch.repeat_interleave(torch.sin(angles), repeats=2, dim=-1)
+    cos = torch.repeat_interleave(torch.cos(angles), repeats=2, dim=-1)
+    core = x[..., :even_width]
+    rest = x[..., even_width:]
+    rotated = core * cos + _rotate_half(core) * sin
+    return torch.cat([rotated, rest], dim=-1)
+
+
+class _RelativeNFEAttention(nn.Module):
+    def __init__(self, *, hidden_dim: int, heads: int, dropout: float):
+        super().__init__()
+        if int(hidden_dim) % int(heads) != 0:
+            raise ValueError("Transformer hidden_dim must be divisible by attention heads.")
+        self.hidden_dim = int(hidden_dim)
+        self.heads = int(heads)
+        self.head_dim = int(hidden_dim) // int(heads)
+        self.qkv = nn.Linear(int(hidden_dim), int(hidden_dim) * 3)
+        self.out = nn.Linear(int(hidden_dim), int(hidden_dim))
+        self.relative_bias = nn.Linear(4, int(heads), bias=False)
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, x: torch.Tensor, target_nfes: torch.Tensor, *, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError("Relative NFE attention expects a 2D token matrix.")
+        token_count = int(x.shape[0])
+        if token_count == 0:
+            return x
+        qkv = self.qkv(x).reshape(token_count, 3, self.heads, self.head_dim)
+        q = _apply_rope_to_heads(qkv[:, 0], target_nfes)
+        k = _apply_rope_to_heads(qkv[:, 1], target_nfes)
+        v = qkv[:, 2]
+        scores = torch.einsum("ihd,jhd->hij", q, k) / math.sqrt(float(self.head_dim))
+        log_nfe = torch.log(torch.clamp(target_nfes.to(device=x.device, dtype=x.dtype), min=1.0))
+        rel = log_nfe[:, None] - log_nfe[None, :]
+        rel_features = torch.stack(
+            [
+                rel,
+                torch.abs(rel),
+                torch.sign(rel),
+                (torch.abs(rel) <= 1e-8).to(dtype=x.dtype),
+            ],
+            dim=-1,
+        )
+        scores = scores + self.relative_bias(rel_features).permute(2, 0, 1)
+        if mask is not None:
+            scores = scores.masked_fill(~mask.to(device=x.device, dtype=torch.bool)[None, :, :], -1.0e9)
+        weights = torch.softmax(scores, dim=-1)
+        attended = torch.einsum("hij,jhd->ihd", self.dropout(weights), v).reshape(token_count, self.hidden_dim)
+        return self.out(attended)
+
+
+class _NFETransformerBlock(nn.Module):
+    def __init__(self, *, hidden_dim: int, heads: int, dropout: float):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(int(hidden_dim))
+        self.attn = _RelativeNFEAttention(hidden_dim=int(hidden_dim), heads=int(heads), dropout=float(dropout))
+        self.norm2 = nn.LayerNorm(int(hidden_dim))
+        self.ff = nn.Sequential(
+            nn.Linear(int(hidden_dim), int(hidden_dim) * 4),
+            nn.SiLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim) * 4, int(hidden_dim)),
+        )
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        target_nfes: torch.Tensor,
+        *,
+        sequence_groups: Sequence[Sequence[int]] | None = None,
+        attention_masks: Sequence[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        if sequence_groups is None:
+            sequence_groups = [tuple(range(int(tokens.shape[0])))]
+        out = tokens
+        updated = out.clone()
+        normed = self.norm1(out)
+        for group_idx, group in enumerate(sequence_groups):
+            indices = torch.tensor([int(value) for value in group], dtype=torch.long, device=tokens.device)
+            if indices.numel() == 0:
+                continue
+            mask = None if attention_masks is None or group_idx >= len(attention_masks) else attention_masks[group_idx]
+            attended = self.attn(normed[indices], target_nfes[indices], mask=mask)
+            updated[indices] = out[indices] + self.dropout(attended)
+        out = updated
+        out = out + self.dropout(self.ff(self.norm2(out)))
+        return out
+
+
+class _SequenceTransformerMixin:
+    architecture = ARCHITECTURE_LIGHT_TRANSFORMER_V1
+
+    def _encode_sequence(
+        self,
+        features: torch.Tensor,
+        target_nfes: torch.Tensor,
+        *,
+        sequence_groups: Sequence[Sequence[int]] | None = None,
+        attention_masks: Sequence[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        tokens = self.input_proj(features)
+        for block in self.blocks:
+            tokens = block(tokens, target_nfes, sequence_groups=sequence_groups, attention_masks=attention_masks)
+        return self.final_norm(tokens)
+
+    def model_config(self) -> Dict[str, Any]:
+        return {
+            "architecture": self.architecture,
+            "setting_dim": int(self.setting_dim),
+            "density_dim": int(self.density_dim),
+            "context_dim": int(self.context_dim),
+            "num_series": int(self.num_series),
+            "series_feature_dim": int(self.series_feature_dim),
+            "hidden_dim": int(self.hidden_dim),
+            "hidden_layers": int(self.hidden_layers),
+            "attention_heads": int(self.attention_heads),
+            "dropout": float(self.dropout_probability),
+            "series_encoding": SERIES_ENCODING_HASH_FOURIER_V1,
+        }
+
+
+class GIPOScheduleTeacherLightTransformer(_SequenceTransformerMixin, nn.Module):
+    """Set-conditioned teacher with relative NFE attention over measured candidates."""
 
     def __init__(
         self,
@@ -653,9 +1076,11 @@ class GIPOScheduleTeacherMLP(nn.Module):
         density_dim: int,
         context_dim: int,
         num_series: int,
-        series_embedding_dim: int = 32,
-        hidden_dim: int = 256,
-        hidden_layers: int = 3,
+        series_feature_dim: int = SERIES_HASH_FOURIER_DIM,
+        hidden_dim: int = DEFAULT_TRANSFORMER_HIDDEN_DIM,
+        hidden_layers: int = DEFAULT_TRANSFORMER_LAYERS,
+        attention_heads: int = DEFAULT_TRANSFORMER_HEADS,
+        dropout: float = DEFAULT_TRANSFORMER_DROPOUT,
     ):
         super().__init__()
         self.setting_dim = int(setting_dim)
@@ -663,15 +1088,21 @@ class GIPOScheduleTeacherMLP(nn.Module):
         self.context_dim = int(context_dim)
         self.num_series = int(num_series)
         self.unknown_series_index = int(num_series)
-        self.series_embedding = nn.Embedding(int(num_series) + 1, int(series_embedding_dim))
-        input_dim = int(setting_dim) + int(density_dim) + int(series_embedding_dim) + int(context_dim)
-        layers: List[nn.Module] = []
-        dim = input_dim
-        for _ in range(int(hidden_layers)):
-            layers.extend([nn.Linear(dim, int(hidden_dim)), nn.SiLU()])
-            dim = int(hidden_dim)
-        layers.append(nn.Linear(dim, 1))
-        self.net = nn.Sequential(*layers)
+        self.series_feature_dim = int(series_feature_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.hidden_layers = int(hidden_layers)
+        self.attention_heads = int(attention_heads)
+        self.dropout_probability = float(dropout)
+        input_dim = int(setting_dim) + int(density_dim) + int(context_dim) + int(series_feature_dim)
+        self.input_proj = nn.Sequential(nn.Linear(input_dim, int(hidden_dim)), nn.SiLU())
+        self.blocks = nn.ModuleList(
+            [
+                _NFETransformerBlock(hidden_dim=int(hidden_dim), heads=int(attention_heads), dropout=float(dropout))
+                for _ in range(int(hidden_layers))
+            ]
+        )
+        self.final_norm = nn.LayerNorm(int(hidden_dim))
+        self.head = nn.Linear(int(hidden_dim), 1)
 
     def forward(
         self,
@@ -679,8 +1110,12 @@ class GIPOScheduleTeacherMLP(nn.Module):
         density_feature_batch: torch.Tensor,
         series_index_batch: torch.Tensor,
         context_embedding_batch: torch.Tensor,
+        *,
+        rows: Sequence[MetricRow] | None = None,
+        target_nfe_batch: torch.Tensor | None = None,
+        sequence_groups: Sequence[Sequence[int]] | None = None,
+        attention_masks: Sequence[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        series_index_batch = series_index_batch.reshape(-1)
         batch = int(setting_feature_batch.shape[0])
         if setting_feature_batch.ndim != 2 or setting_feature_batch.shape[-1] != self.setting_dim:
             raise ValueError("setting_feature_batch must be 2D with setting_dim columns.")
@@ -688,24 +1123,30 @@ class GIPOScheduleTeacherMLP(nn.Module):
             raise ValueError("density_feature_batch must be 2D with density_dim columns.")
         if context_embedding_batch.ndim != 2 or context_embedding_batch.shape[-1] != self.context_dim:
             raise ValueError("context_embedding_batch must be 2D with context_dim columns.")
-        if density_feature_batch.shape[0] != batch or context_embedding_batch.shape[0] != batch or series_index_batch.shape[0] != batch:
+        if density_feature_batch.shape[0] != batch or context_embedding_batch.shape[0] != batch:
             raise ValueError("Teacher feature batches must share the same batch dimension.")
-        series_idx = torch.clamp(series_index_batch.to(dtype=torch.long, device=setting_feature_batch.device), min=0, max=self.unknown_series_index)
-        series_emb = self.series_embedding(series_idx)
+        series_features = _series_feature_tensor(
+            series_index_batch,
+            rows=rows,
+            dtype=setting_feature_batch.dtype,
+            device=setting_feature_batch.device,
+        )
+        nfes = target_nfe_batch if target_nfe_batch is not None else _target_nfe_tensor(rows=rows, batch=batch, device=setting_feature_batch.device)
         features = torch.cat(
             [
                 setting_feature_batch,
                 density_feature_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype),
-                series_emb.to(dtype=setting_feature_batch.dtype),
+                series_features,
                 context_embedding_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype),
             ],
             dim=-1,
         )
-        return self.net(features).squeeze(-1)
+        encoded = self._encode_sequence(features, nfes, sequence_groups=sequence_groups, attention_masks=attention_masks)
+        return self.head(encoded).squeeze(-1)
 
 
-class GIPODensityStudentMLP(nn.Module):
-    """Context-conditioned continuous density policy over normalized solver time."""
+class GIPODensityStudentLightTransformer(_SequenceTransformerMixin, nn.Module):
+    """Student density policy with relative NFE attention over context-local NFE blocks."""
 
     def __init__(
         self,
@@ -714,9 +1155,11 @@ class GIPODensityStudentMLP(nn.Module):
         density_dim: int,
         context_dim: int,
         num_series: int,
-        series_embedding_dim: int = 32,
-        hidden_dim: int = 128,
-        hidden_layers: int = 2,
+        series_feature_dim: int = SERIES_HASH_FOURIER_DIM,
+        hidden_dim: int = DEFAULT_TRANSFORMER_HIDDEN_DIM,
+        hidden_layers: int = DEFAULT_TRANSFORMER_LAYERS,
+        attention_heads: int = DEFAULT_TRANSFORMER_HEADS,
+        dropout: float = DEFAULT_TRANSFORMER_DROPOUT,
     ):
         super().__init__()
         self.setting_dim = int(setting_dim)
@@ -724,49 +1167,202 @@ class GIPODensityStudentMLP(nn.Module):
         self.context_dim = int(context_dim)
         self.num_series = int(num_series)
         self.unknown_series_index = int(num_series)
-        self.series_embedding = nn.Embedding(int(num_series) + 1, int(series_embedding_dim))
-        input_dim = int(setting_dim) + int(series_embedding_dim) + int(context_dim)
-        layers: List[nn.Module] = []
-        dim = input_dim
-        for _ in range(int(hidden_layers)):
-            layers.extend([nn.Linear(dim, int(hidden_dim)), nn.SiLU()])
-            dim = int(hidden_dim)
-        layers.append(nn.Linear(dim, int(density_dim)))
-        self.net = nn.Sequential(*layers)
+        self.series_feature_dim = int(series_feature_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.hidden_layers = int(hidden_layers)
+        self.attention_heads = int(attention_heads)
+        self.dropout_probability = float(dropout)
+        input_dim = int(setting_dim) + int(context_dim) + int(series_feature_dim)
+        self.input_proj = nn.Sequential(nn.Linear(input_dim, int(hidden_dim)), nn.SiLU())
+        self.blocks = nn.ModuleList(
+            [
+                _NFETransformerBlock(hidden_dim=int(hidden_dim), heads=int(attention_heads), dropout=float(dropout))
+                for _ in range(int(hidden_layers))
+            ]
+        )
+        self.final_norm = nn.LayerNorm(int(hidden_dim))
+        self.head = nn.Linear(int(hidden_dim), int(density_dim))
 
     def logits(
         self,
         setting_feature_batch: torch.Tensor,
         series_index_batch: torch.Tensor,
         context_embedding_batch: torch.Tensor,
+        *,
+        rows: Sequence[MetricRow] | None = None,
+        target_nfe_batch: torch.Tensor | None = None,
+        sequence_groups: Sequence[Sequence[int]] | None = None,
     ) -> torch.Tensor:
-        series_index_batch = series_index_batch.reshape(-1)
         batch = int(setting_feature_batch.shape[0])
         if setting_feature_batch.ndim != 2 or setting_feature_batch.shape[-1] != self.setting_dim:
             raise ValueError("setting_feature_batch must be 2D with setting_dim columns.")
         if context_embedding_batch.ndim != 2 or context_embedding_batch.shape[-1] != self.context_dim:
             raise ValueError("context_embedding_batch must be 2D with context_dim columns.")
-        if context_embedding_batch.shape[0] != batch or series_index_batch.shape[0] != batch:
+        if context_embedding_batch.shape[0] != batch or series_index_batch.reshape(-1).shape[0] != batch:
             raise ValueError("Student feature batches must share the same batch dimension.")
-        series_idx = torch.clamp(series_index_batch.to(dtype=torch.long, device=setting_feature_batch.device), min=0, max=self.unknown_series_index)
-        series_emb = self.series_embedding(series_idx)
+        series_features = _series_feature_tensor(
+            series_index_batch,
+            rows=rows,
+            dtype=setting_feature_batch.dtype,
+            device=setting_feature_batch.device,
+        )
+        nfes = target_nfe_batch if target_nfe_batch is not None else _target_nfe_tensor(rows=rows, batch=batch, device=setting_feature_batch.device)
         features = torch.cat(
             [
                 setting_feature_batch,
-                series_emb.to(dtype=setting_feature_batch.dtype),
+                series_features,
                 context_embedding_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype),
             ],
             dim=-1,
         )
-        return self.net(features)
+        encoded = self._encode_sequence(features, nfes, sequence_groups=sequence_groups)
+        return self.head(encoded)
 
     def density_mass(
         self,
         setting_feature_batch: torch.Tensor,
         series_index_batch: torch.Tensor,
         context_embedding_batch: torch.Tensor,
+        *,
+        rows: Sequence[MetricRow] | None = None,
+        target_nfe_batch: torch.Tensor | None = None,
+        sequence_groups: Sequence[Sequence[int]] | None = None,
     ) -> torch.Tensor:
-        return torch.softmax(self.logits(setting_feature_batch, series_index_batch, context_embedding_batch), dim=-1)
+        return torch.softmax(
+            self.logits(
+                setting_feature_batch,
+                series_index_batch,
+                context_embedding_batch,
+                rows=rows,
+                target_nfe_batch=target_nfe_batch,
+                sequence_groups=sequence_groups,
+            ),
+            dim=-1,
+        )
+
+
+def build_gipo_teacher_model(
+    *,
+    architecture: str = ARCHITECTURE_LIGHT_TRANSFORMER_V1,
+    setting_dim: int,
+    density_dim: int,
+    context_dim: int,
+    num_series: int,
+    model_config: Mapping[str, Any] | None = None,
+) -> nn.Module:
+    arch = validate_gipo_architecture(architecture)
+    cfg = dict(model_config or {})
+    return GIPOScheduleTeacherLightTransformer(
+        setting_dim=int(setting_dim),
+        density_dim=int(density_dim),
+        context_dim=int(context_dim),
+        num_series=int(num_series),
+        series_feature_dim=int(cfg.get("series_feature_dim", SERIES_HASH_FOURIER_DIM)),
+        hidden_dim=int(cfg.get("hidden_dim", DEFAULT_TRANSFORMER_HIDDEN_DIM)),
+        hidden_layers=int(cfg.get("hidden_layers", cfg.get("transformer_layers", DEFAULT_TRANSFORMER_LAYERS))),
+        attention_heads=int(cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS)),
+        dropout=float(cfg.get("dropout", DEFAULT_TRANSFORMER_DROPOUT)),
+    )
+
+
+def build_gipo_student_model(
+    *,
+    architecture: str = ARCHITECTURE_LIGHT_TRANSFORMER_V1,
+    setting_dim: int,
+    density_dim: int,
+    context_dim: int,
+    num_series: int,
+    model_config: Mapping[str, Any] | None = None,
+) -> nn.Module:
+    arch = validate_gipo_architecture(architecture)
+    cfg = dict(model_config or {})
+    return GIPODensityStudentLightTransformer(
+        setting_dim=int(setting_dim),
+        density_dim=int(density_dim),
+        context_dim=int(context_dim),
+        num_series=int(num_series),
+        series_feature_dim=int(cfg.get("series_feature_dim", SERIES_HASH_FOURIER_DIM)),
+        hidden_dim=int(cfg.get("hidden_dim", DEFAULT_TRANSFORMER_HIDDEN_DIM)),
+        hidden_layers=int(cfg.get("hidden_layers", cfg.get("transformer_layers", DEFAULT_TRANSFORMER_LAYERS))),
+        attention_heads=int(cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS)),
+        dropout=float(cfg.get("dropout", DEFAULT_TRANSFORMER_DROPOUT)),
+    )
+
+
+def model_config_from_model(model: nn.Module) -> Dict[str, Any]:
+    if hasattr(model, "model_config"):
+        return dict(model.model_config())  # type: ignore[attr-defined]
+    raise ValueError("GIPO model is missing canonical architecture metadata.")
+
+
+def _model_architecture(model: nn.Module) -> str:
+    return validate_gipo_architecture(str(getattr(model, "architecture", ARCHITECTURE_LIGHT_TRANSFORMER_V1)))
+
+
+def _teacher_scores(
+    teacher: nn.Module,
+    setting_features_batch: torch.Tensor,
+    density_features_batch: torch.Tensor,
+    series_index_batch: torch.Tensor,
+    context_embedding_batch: torch.Tensor,
+    *,
+    rows: Sequence[MetricRow] | None = None,
+) -> torch.Tensor:
+    _model_architecture(teacher)
+    groups: Sequence[Sequence[int]] | None = None
+    masks: Sequence[torch.Tensor] | None = None
+    if rows is not None:
+        groups, masks = _teacher_sequence_groups_and_masks(rows, device=setting_features_batch.device)
+    return teacher(
+        setting_features_batch,
+        density_features_batch,
+        series_index_batch,
+        context_embedding_batch,
+        rows=rows,
+        sequence_groups=groups,
+        attention_masks=masks,
+    )
+
+
+def _student_logits(
+    student: nn.Module,
+    setting_features_batch: torch.Tensor,
+    series_index_batch: torch.Tensor,
+    context_embedding_batch: torch.Tensor,
+    *,
+    rows: Sequence[MetricRow] | None = None,
+    sequence_groups: Sequence[Sequence[int]] | None = None,
+) -> torch.Tensor:
+    _model_architecture(student)
+    return student.logits(
+        setting_features_batch,
+        series_index_batch,
+        context_embedding_batch,
+        rows=rows,
+        sequence_groups=sequence_groups,
+    )
+
+
+def _student_density_mass(
+    student: nn.Module,
+    setting_features_batch: torch.Tensor,
+    series_index_batch: torch.Tensor,
+    context_embedding_batch: torch.Tensor,
+    *,
+    rows: Sequence[MetricRow] | None = None,
+    sequence_groups: Sequence[Sequence[int]] | None = None,
+) -> torch.Tensor:
+    return torch.softmax(
+        _student_logits(
+            student,
+            setting_features_batch,
+            series_index_batch,
+            context_embedding_batch,
+            rows=rows,
+            sequence_groups=sequence_groups,
+        ),
+        dim=-1,
+    )
 
 
 def _pair_indices(
@@ -816,7 +1412,7 @@ def pairwise_rank_loss(
 ) -> torch.Tensor:
     if left.numel() == 0:
         return pred.new_zeros(())
-    temp = max(float(temperature), 1e-6)
+    temp = _finite_positive(temperature, label="teacher_rank_temperature")
     logits = sign * (pred[left] - pred[right]) / temp
     return F.softplus(-logits).mean()
 
@@ -850,11 +1446,13 @@ def _teacher_training_tensors(
     reference_time_grid: Sequence[float],
     density_normalizer: DensityFeatureNormalizer,
     device: torch.device | str,
-    setting_feature_mode: str = SETTING_FEATURE_MODE_GIPO_V1,
+    setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     series_unknown_probability: float = 0.0,
     seed: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[ContextPairKey], List[str], List[Tuple[float, ...]]]:
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
+    encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     setting_rows: List[torch.Tensor] = []
     density_rows: List[np.ndarray] = []
     series_rows: List[int] = []
@@ -873,7 +1471,7 @@ def _teacher_training_tensors(
         solver = str(row["solver_key"])
         target_nfe = int(row["target_nfe"])
         mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
-        setting_rows.append(setting_features(solver, target_nfe, mode=feature_mode))
+        setting_rows.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
         density_rows.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
         series_idx = remapped_series_index(row, series_index_map)
         if unknown_probability > 0.0 and rng.random() < unknown_probability:
@@ -897,7 +1495,7 @@ def _teacher_training_tensors(
 
 
 def gipo_teacher_diagnostics(
-    teacher: GIPOScheduleTeacherMLP,
+    teacher: nn.Module,
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
@@ -912,10 +1510,17 @@ def gipo_teacher_diagnostics(
     split_name: str = "diagnostic",
     fit_context_ids: Iterable[str] = (),
     fit_series_keys: Iterable[str] = (),
-    setting_feature_mode: str = SETTING_FEATURE_MODE_GIPO_V1,
+    setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
+    encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
+    rank_temperature, regression_weight, pair_margin = validate_teacher_objective_hyperparameters(
+        rank_temperature=rank_temperature,
+        regression_weight=regression_weight,
+        pair_margin=pair_margin,
+    )
     contexts = {context_id_from_row(row) for row in rows}
     series_keys = {series_key_from_row(row) for row in rows}
     schedules = {str(row["scheduler_key"]) for row in rows}
@@ -948,12 +1553,13 @@ def gipo_teacher_diagnostics(
             reference_time_grid=reference_time_grid,
             density_normalizer=density_normalizer,
             setting_feature_mode=feature_mode,
+            setting_encoder_config=encoder_config,
             device=device,
         )
         if not pair_on_seed:
             pair_keys = [key[:4] + (None,) for key in pair_keys]
         left, right, sign = _pair_indices(targets, pair_keys, margin=float(pair_margin), device=sx.device)
-        pred = teacher(sx, dx, series_idx, cx)
+        pred = _teacher_scores(teacher, sx, dx, series_idx, cx, rows=rows)
         rank = pairwise_rank_loss(pred, left, right, sign, temperature=float(rank_temperature))
         huber = F.smooth_l1_loss(pred, targets)
         total = rank + float(regression_weight) * huber
@@ -990,6 +1596,22 @@ def gipo_teacher_diagnostics(
             == sorted(target_by_schedule, key=lambda schedule: (-target_by_schedule[schedule], schedule))[0]
         )
         best_candidate_total += 1
+    sequence_delta_values: List[float] = []
+    sequence_second_diff_values: List[float] = []
+    by_candidate_sequence: Dict[Tuple[str, int | None, str, str, str, str], List[Tuple[int, int]]] = defaultdict(list)
+    for idx, row in enumerate(rows):
+        sequence_key = (*_nfe_sequence_key(row), str(schedule_keys[idx]))
+        by_candidate_sequence[sequence_key].append((int(row["target_nfe"]), int(idx)))
+    for items in by_candidate_sequence.values():
+        ordered = sorted(items, key=lambda item: (int(item[0]), int(item[1])))
+        values = [float(pred_values[idx]) for _, idx in ordered]
+        for left, right in zip(values, values[1:]):
+            sequence_delta_values.append(abs(float(right) - float(left)))
+        if len(values) >= 3:
+            for a, b, c in zip(values, values[1:], values[2:]):
+                sequence_second_diff_values.append(abs(float(c) - 2.0 * float(b) + float(a)))
+    delta_stats = _summary_percentiles(sequence_delta_values)
+    second_stats = _summary_percentiles(sequence_second_diff_values)
     base.update(
         {
             "rank_loss": float(rank.detach().cpu().item()),
@@ -1000,6 +1622,11 @@ def gipo_teacher_diagnostics(
             "spearman_rank_correlation": float(np.mean(np.asarray(spearman_values, dtype=np.float64))) if spearman_values else None,
             "best_candidate_agreement": None if best_candidate_total == 0 else float(best_candidate_hits / best_candidate_total),
             "candidate_group_count": int(best_candidate_total),
+            "teacher_nfe_sequence_candidate_count": int(len(by_candidate_sequence)),
+            "teacher_nfe_adjacent_abs_utility_delta_mean": delta_stats["mean"],
+            "teacher_nfe_adjacent_abs_utility_delta_p95": delta_stats["p95"],
+            "teacher_nfe_second_difference_abs_mean": second_stats["mean"],
+            "teacher_nfe_second_difference_abs_p95": second_stats["p95"],
         }
     )
     return base
@@ -1075,7 +1702,7 @@ def _selected_gipo_teacher_checkpoint(
 
 
 def train_gipo_teacher(
-    teacher: GIPOScheduleTeacherMLP,
+    teacher: nn.Module,
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
@@ -1095,13 +1722,20 @@ def train_gipo_teacher(
     series_unknown_probability: float = 0.0,
     seed: int = 0,
     allowed_schedule_keys: Sequence[str] = DEFAULT_SUPERVISION_SCHEDULE_KEYS,
-    setting_feature_mode: str = SETTING_FEATURE_MODE_GIPO_V1,
+    setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
     if not rows:
         raise ValueError("Teacher training requires at least one context reward row.")
     validate_gipo_support_schedule_keys(sorted({str(row["scheduler_key"]) for row in rows}), allowed_schedule_keys=allowed_schedule_keys)
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
+    encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
+    rank_temperature, regression_weight, pair_margin = validate_teacher_objective_hyperparameters(
+        rank_temperature=rank_temperature,
+        regression_weight=regression_weight,
+        pair_margin=pair_margin,
+    )
     teacher.to(device)
     sx, dx, series_idx, cx, targets, pair_keys, _, _ = _teacher_training_tensors(
         rows,
@@ -1112,6 +1746,7 @@ def train_gipo_teacher(
         density_normalizer=density_normalizer,
         device=device,
         setting_feature_mode=feature_mode,
+        setting_encoder_config=encoder_config,
         series_unknown_probability=float(series_unknown_probability),
         seed=int(seed),
     )
@@ -1128,7 +1763,7 @@ def train_gipo_teacher(
     fit_series_keys = sorted({series_key_from_row(row) for row in rows})
     checkpoint_every = max(1, int(teacher_checkpoint_every))
     for step in range(int(steps)):
-        pred = teacher(sx, dx, series_idx, cx)
+        pred = _teacher_scores(teacher, sx, dx, series_idx, cx, rows=rows)
         rank = pairwise_rank_loss(pred, left, right, sign, temperature=float(rank_temperature))
         huber = F.smooth_l1_loss(pred, targets)
         loss = rank + float(regression_weight) * huber
@@ -1165,6 +1800,7 @@ def train_gipo_teacher(
                     fit_context_ids=fit_context_ids,
                     fit_series_keys=fit_series_keys,
                     setting_feature_mode=feature_mode,
+                    setting_encoder_config=encoder_config,
                     device=device,
                 )
                 for name, split_rows in diagnostic_splits.items()
@@ -1184,6 +1820,8 @@ def train_gipo_teacher(
         "teacher_target": "u_comp_uniform",
         "teacher_density_feature": "train_normalized_log_density",
         "setting_feature_mode": feature_mode,
+        "setting_encoder_mode": encoder_config.mode,
+        "setting_encoder_config": encoder_config.to_payload(),
         "teacher_pair_count": int(left.numel()),
         "rank_temperature": float(rank_temperature),
         "regression_weight": float(regression_weight),
@@ -1206,7 +1844,7 @@ def _series_with_dynamic_unknown(base_series_idx: torch.Tensor, *, unknown_index
 
 
 def build_teacher_weighted_density_targets(
-    teacher: GIPOScheduleTeacherMLP,
+    teacher: nn.Module,
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
@@ -1222,12 +1860,14 @@ def build_teacher_weighted_density_targets(
     max_temperature: float = DEFAULT_TEACHER_MAX_TEMPERATURE,
     student_target_mode: str = STUDENT_TARGET_MODE_SOFT_MIXTURE,
     teacher_hard_margin: float = DEFAULT_TEACHER_HARD_MARGIN,
-    setting_feature_mode: str = SETTING_FEATURE_MODE_GIPO_V1,
+    setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     device: torch.device | str = "cpu",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     temperature_mode = validate_teacher_temperature_mode(temperature_mode)
     target_mode = validate_student_target_mode(student_target_mode)
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
+    encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     fixed_temperature = _finite_positive(temperature, label="teacher_temperature")
     adaptive_target_ess = _finite_positive(target_ess, label="teacher_target_ess")
     adaptive_min_temperature = _finite_positive(min_temperature, label="teacher_min_temperature")
@@ -1246,10 +1886,8 @@ def build_teacher_weighted_density_targets(
     unsupported_observed = sorted(observed_keys - supervision_set)
     if unsupported_observed:
         raise ValueError(f"Rows contain schedules outside supervision_schedule_keys: {unsupported_observed}")
-    grouped: Dict[ContextPairKey, List[MetricRow]] = defaultdict(list)
-    for row in rows:
-        grouped[context_pair_key(row, pair_on_seed=True)].append(row)
-    if not grouped:
+    target_groups = _student_target_groups(rows)
+    if not target_groups:
         raise ValueError("Student target construction requires at least one context group.")
     setting_rows: List[torch.Tensor] = []
     series_rows: List[int] = []
@@ -1264,7 +1902,37 @@ def build_teacher_weighted_density_targets(
     hard_target_count = 0
     teacher.to(device)
     teacher.eval()
-    for _, group in sorted(grouped.items(), key=lambda item: item[0]):
+    score_settings: List[torch.Tensor] = []
+    score_density: List[np.ndarray] = []
+    score_series: List[int] = []
+    score_context: List[np.ndarray] = []
+    score_masses: Dict[int, Tuple[float, ...]] = {}
+    for row in rows:
+        context_id = context_id_from_row(row)
+        if context_id not in context_embeddings:
+            raise KeyError(f"Missing context embedding for {context_id}.")
+        solver = str(row["solver_key"])
+        target_nfe = int(row["target_nfe"])
+        mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
+        score_masses[id(row)] = mass
+        score_settings.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
+        score_density.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
+        score_series.append(remapped_series_index(row, series_index_map))
+        score_context.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
+    with torch.no_grad():
+        score_values = _teacher_scores(
+            teacher,
+            torch.stack(score_settings, dim=0).to(device=device),
+            torch.tensor(np.stack(score_density, axis=0), dtype=torch.float32, device=device),
+            torch.tensor(score_series, dtype=torch.long, device=device),
+            torch.tensor(np.stack(score_context, axis=0), dtype=torch.float32, device=device),
+            rows=rows,
+        )
+    utility_by_row_id = {
+        id(row): float(value)
+        for row, value in zip(rows, score_values.detach().cpu().tolist())
+    }
+    for _, group in target_groups:
         counts: Dict[str, int] = {key: 0 for key in supervision_keys}
         for row in group:
             key = str(row["scheduler_key"])
@@ -1280,19 +1948,10 @@ def build_teacher_weighted_density_targets(
         target_nfe = int(first["target_nfe"])
         masses: List[Tuple[float, ...]] = []
         utilities: List[float] = []
-        setting_row = setting_features(solver, target_nfe, mode=feature_mode)
-        with torch.no_grad():
-            for row in group:
-                mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
-                density_feature = density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid)
-                util = teacher(
-                    setting_row[None, :].to(device=device),
-                    torch.tensor(density_feature[None, :], dtype=torch.float32, device=device),
-                    torch.tensor([remapped_series_index(row, series_index_map)], dtype=torch.long, device=device),
-                    torch.tensor(np.asarray(context_embeddings[context_id], dtype=np.float32)[None, :], dtype=torch.float32, device=device),
-                )[0]
-                masses.append(mass)
-                utilities.append(float(util.detach().cpu().item()))
+        setting_row = setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config)
+        for row in group:
+            masses.append(score_masses[id(row)])
+            utilities.append(float(utility_by_row_id[id(row)]))
         if temperature_mode == TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS:
             chosen_temperature = _teacher_temperature_for_target_ess(
                 utilities,
@@ -1334,6 +1993,8 @@ def build_teacher_weighted_density_targets(
     max_weight_stats = _summary_percentiles(max_weight_values)
     chosen_temperature_stats = _summary_percentiles(chosen_temperature_values)
     top_margin_stats = _summary_percentiles(top_margin_values)
+    sequence_pairs = student_nfe_sequence_pairs(rows)
+    sequence_summary = density_sequence_roughness_summary(target_masses, sequence_pairs)
     summary = {
         "target_protocol": "teacher_weighted_density_mle",
         "student_target_mode": target_mode,
@@ -1346,6 +2007,8 @@ def build_teacher_weighted_density_targets(
         "teacher_min_temperature": float(adaptive_min_temperature),
         "teacher_max_temperature": float(adaptive_max_temperature),
         "setting_feature_mode": feature_mode,
+        "setting_encoder_mode": encoder_config.mode,
+        "setting_encoder_config": encoder_config.to_payload(),
         "context_setting_count": int(len(target_masses)),
         "mean_teacher_candidate_entropy": entropy_stats["mean"],
         "teacher_candidate_entropy_mean": entropy_stats["mean"],
@@ -1371,6 +2034,7 @@ def build_teacher_weighted_density_targets(
         "mean_candidate_count": float(np.mean(np.asarray(candidate_counts, dtype=np.float64))) if candidate_counts else 0.0,
         "supervision_schedule_keys": list(supervision_keys),
         "density_protocol": DENSITY_PROTOCOL,
+        **sequence_summary,
     }
     return (
         torch.stack(setting_rows, dim=0).to(device=device),
@@ -1382,7 +2046,7 @@ def build_teacher_weighted_density_targets(
 
 
 def build_teacher_weighted_density_prediction_rows(
-    teacher: GIPOScheduleTeacherMLP,
+    teacher: nn.Module,
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
@@ -1398,12 +2062,14 @@ def build_teacher_weighted_density_prediction_rows(
     max_temperature: float = DEFAULT_TEACHER_MAX_TEMPERATURE,
     student_target_mode: str = STUDENT_TARGET_MODE_SOFT_MIXTURE,
     teacher_hard_margin: float = DEFAULT_TEACHER_HARD_MARGIN,
-    setting_feature_mode: str = SETTING_FEATURE_MODE_GIPO_V1,
+    setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     device: torch.device | str = "cpu",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     temperature_mode = validate_teacher_temperature_mode(temperature_mode)
     target_mode = validate_student_target_mode(student_target_mode)
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
+    encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     fixed_temperature = _finite_positive(temperature, label="teacher_temperature")
     adaptive_target_ess = _finite_positive(target_ess, label="teacher_target_ess")
     adaptive_min_temperature = _finite_positive(min_temperature, label="teacher_min_temperature")
@@ -1420,10 +2086,8 @@ def build_teacher_weighted_density_prediction_rows(
     if unsupported_observed:
         raise ValueError(f"Rows contain schedules outside supervision_schedule_keys: {unsupported_observed}")
 
-    grouped: Dict[ContextPairKey, List[MetricRow]] = defaultdict(list)
-    for row in rows:
-        grouped[context_pair_key(row, pair_on_seed=True)].append(row)
-    if not grouped:
+    target_groups = _student_target_groups(rows)
+    if not target_groups:
         raise ValueError("Teacher oracle prediction requires at least one context group.")
 
     records: List[Dict[str, Any]] = []
@@ -1434,9 +2098,40 @@ def build_teacher_weighted_density_prediction_rows(
     top_margin_values: List[float] = []
     candidate_counts: List[int] = []
     hard_target_count = 0
+    mixture_masses: List[np.ndarray] = []
     teacher.to(device)
     teacher.eval()
-    for _, group in sorted(grouped.items(), key=lambda item: item[0]):
+    score_settings: List[torch.Tensor] = []
+    score_density: List[np.ndarray] = []
+    score_series: List[int] = []
+    score_context: List[np.ndarray] = []
+    score_masses: Dict[int, Tuple[float, ...]] = {}
+    for row in rows:
+        context_id = context_id_from_row(row)
+        if context_id not in context_embeddings:
+            raise KeyError(f"Missing context embedding for {context_id}.")
+        solver = str(row["solver_key"])
+        target_nfe = int(row["target_nfe"])
+        mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
+        score_masses[id(row)] = mass
+        score_settings.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
+        score_density.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
+        score_series.append(remapped_series_index(row, series_index_map))
+        score_context.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
+    with torch.no_grad():
+        score_values = _teacher_scores(
+            teacher,
+            torch.stack(score_settings, dim=0).to(device=device),
+            torch.tensor(np.stack(score_density, axis=0), dtype=torch.float32, device=device),
+            torch.tensor(score_series, dtype=torch.long, device=device),
+            torch.tensor(np.stack(score_context, axis=0), dtype=torch.float32, device=device),
+            rows=rows,
+        )
+    utility_by_row_id = {
+        id(row): float(value)
+        for row, value in zip(rows, score_values.detach().cpu().tolist())
+    }
+    for _, group in target_groups:
         counts: Dict[str, int] = {key: 0 for key in supervision_keys}
         for row in group:
             key = str(row["scheduler_key"])
@@ -1450,23 +2145,14 @@ def build_teacher_weighted_density_prediction_rows(
             raise KeyError(f"Missing context embedding for {context_id}.")
         solver = str(first["solver_key"])
         target_nfe = int(first["target_nfe"])
-        setting_row = setting_features(solver, target_nfe, mode=feature_mode)
+        setting_row = setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config)
         masses: List[Tuple[float, ...]] = []
         utilities: List[float] = []
         schedule_keys: List[str] = []
-        with torch.no_grad():
-            for row in group:
-                mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
-                density_feature = density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid)
-                util = teacher(
-                    setting_row[None, :].to(device=device),
-                    torch.tensor(density_feature[None, :], dtype=torch.float32, device=device),
-                    torch.tensor([remapped_series_index(row, series_index_map)], dtype=torch.long, device=device),
-                    torch.tensor(np.asarray(context_embeddings[context_id], dtype=np.float32)[None, :], dtype=torch.float32, device=device),
-                )[0]
-                masses.append(mass)
-                utilities.append(float(util.detach().cpu().item()))
-                schedule_keys.append(str(row["scheduler_key"]))
+        for row in group:
+            masses.append(score_masses[id(row)])
+            utilities.append(float(utility_by_row_id[id(row)]))
+            schedule_keys.append(str(row["scheduler_key"]))
         if temperature_mode == TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS:
             chosen_temperature = _teacher_temperature_for_target_ess(
                 utilities,
@@ -1494,6 +2180,7 @@ def build_teacher_weighted_density_prediction_rows(
         for weight, mass in zip(weights, masses):
             mixture += float(weight) * np.asarray(mass, dtype=np.float64)
         mixture = mixture / max(float(np.sum(mixture)), 1e-12)
+        mixture_masses.append(mixture.astype(np.float32))
         macro_steps = solver_macro_steps(solver, target_nfe)
         grid = density_mass_to_time_grid(mixture, macro_steps=macro_steps, reference_time_grid=reference_time_grid)
         entropy = float(-np.sum(weights * np.log(np.maximum(weights, 1e-12))))
@@ -1520,6 +2207,7 @@ def build_teacher_weighted_density_prediction_rows(
                 "density_protocol": DENSITY_PROTOCOL,
                 "reference_grid_hash": reference_grid_hash(reference_time_grid),
                 "setting_feature_mode": feature_mode,
+                "setting_encoder_mode": encoder_config.mode,
                 "teacher_temperature_mode": temperature_mode,
                 "teacher_temperature": float(fixed_temperature),
                 "teacher_target_ess": float(adaptive_target_ess),
@@ -1544,6 +2232,8 @@ def build_teacher_weighted_density_prediction_rows(
     max_weight_stats = _summary_percentiles(max_weight_values)
     chosen_temperature_stats = _summary_percentiles(chosen_temperature_values)
     top_margin_stats = _summary_percentiles(top_margin_values)
+    sequence_pairs = student_nfe_sequence_pairs(rows)
+    sequence_summary = density_sequence_roughness_summary(mixture_masses, sequence_pairs)
     summary = {
         "target_protocol": "teacher_weighted_density_mle",
         "student_target_mode": target_mode,
@@ -1556,6 +2246,8 @@ def build_teacher_weighted_density_prediction_rows(
         "teacher_min_temperature": float(adaptive_min_temperature),
         "teacher_max_temperature": float(adaptive_max_temperature),
         "setting_feature_mode": feature_mode,
+        "setting_encoder_mode": encoder_config.mode,
+        "setting_encoder_config": encoder_config.to_payload(),
         "context_setting_count": int(len(records)),
         "teacher_candidate_entropy_mean": entropy_stats["mean"],
         "teacher_candidate_entropy_p05": entropy_stats["p05"],
@@ -1580,13 +2272,14 @@ def build_teacher_weighted_density_prediction_rows(
         "mean_candidate_count": float(np.mean(np.asarray(candidate_counts, dtype=np.float64))) if candidate_counts else 0.0,
         "supervision_schedule_keys": list(supervision_keys),
         "density_protocol": DENSITY_PROTOCOL,
+        **sequence_summary,
     }
     return records, summary
 
 
 def train_gipo_student(
-    student: GIPODensityStudentMLP,
-    teacher: GIPOScheduleTeacherMLP,
+    student: nn.Module,
+    teacher: nn.Module,
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
@@ -1603,12 +2296,23 @@ def train_gipo_student(
     teacher_max_temperature: float = DEFAULT_TEACHER_MAX_TEMPERATURE,
     student_target_mode: str = STUDENT_TARGET_MODE_SOFT_MIXTURE,
     teacher_hard_margin: float = DEFAULT_TEACHER_HARD_MARGIN,
-    setting_feature_mode: str = SETTING_FEATURE_MODE_GIPO_V1,
+    setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     series_unknown_dropout: float = 0.10,
+    student_nfe_smoothness_weight: float = 0.0,
+    student_nfe_smoothness_mode: str = "js",
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
     if not rows:
         raise ValueError("Student density training requires at least one fit row.")
+    feature_mode = validate_setting_feature_mode(setting_feature_mode)
+    encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
+    smoothness_weight = float(student_nfe_smoothness_weight)
+    if not math.isfinite(smoothness_weight) or smoothness_weight < 0.0:
+        raise ValueError("student_nfe_smoothness_weight must be finite and nonnegative.")
+    smoothness_mode = str(student_nfe_smoothness_mode).strip() or "js"
+    if smoothness_mode not in {"js", "logit_l2"}:
+        raise ValueError("student_nfe_smoothness_mode must be 'js' or 'logit_l2'.")
     student.to(device)
     teacher.to(device)
     teacher.eval()
@@ -1628,16 +2332,29 @@ def train_gipo_student(
         max_temperature=float(teacher_max_temperature),
         student_target_mode=str(student_target_mode),
         teacher_hard_margin=float(teacher_hard_margin),
-        setting_feature_mode=str(setting_feature_mode),
+        setting_feature_mode=feature_mode,
+        setting_encoder_config=encoder_config,
         device=device,
     )
+    sequence_pairs = student_nfe_sequence_pairs(rows)
+    target_rows = _student_target_representative_rows(rows)
+    sequence_groups = nfe_sequence_groups_for_ordered_rows(target_rows)
     opt = torch.optim.AdamW(student.parameters(), lr=float(lr), weight_decay=1e-4)
     losses: List[Dict[str, Any]] = []
     for step in range(int(steps)):
         series_idx = _series_with_dynamic_unknown(base_series_idx, unknown_index=student.unknown_series_index, dropout=float(series_unknown_dropout))
-        logits = student.logits(sx, series_idx, cx)
+        logits = _student_logits(
+            student,
+            sx,
+            series_idx,
+            cx,
+            rows=target_rows,
+            sequence_groups=sequence_groups,
+        )
         log_probs = torch.log_softmax(logits, dim=-1)
-        loss = -(target_mass * log_probs).sum(dim=-1).mean()
+        ce_loss = -(target_mass * log_probs).sum(dim=-1).mean()
+        smoothness_loss = density_sequence_smoothness_loss(logits, sequence_pairs, mode=smoothness_mode)
+        loss = ce_loss + float(smoothness_weight) * smoothness_loss
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -1647,7 +2364,9 @@ def train_gipo_student(
             losses.append(
                 {
                     "step": int(step + 1),
-                    "student_kl_ce_loss": float(loss.detach().cpu().item()),
+                    "student_total_loss": float(loss.detach().cpu().item()),
+                    "student_kl_ce_loss": float(ce_loss.detach().cpu().item()),
+                    "student_nfe_smoothness_loss": float(smoothness_loss.detach().cpu().item()),
                     "student_entropy": entropy,
                 }
             )
@@ -1660,45 +2379,99 @@ def train_gipo_student(
         "student_target_summary": target_summary,
         "series_unknown_dropout": float(series_unknown_dropout),
         "series_unknown_dropout_mode": "dynamic_per_step",
+        "setting_feature_mode": feature_mode,
+        "setting_encoder_mode": encoder_config.mode,
+        "setting_encoder_config": encoder_config.to_payload(),
+        "student_nfe_smoothness_weight": float(smoothness_weight),
+        "student_nfe_smoothness_mode": smoothness_mode,
+        "student_nfe_sequence_pair_count": int(len(sequence_pairs)),
         "losses": losses,
     }
 
 
 def predict_gipo_density(
-    student: GIPODensityStudentMLP,
+    student: nn.Module,
     *,
     row: MetricRow,
     context_embedding: Sequence[float],
     series_index_map: Mapping[str, int],
     reference_time_grid: Sequence[float],
-    setting_feature_mode: str = SETTING_FEATURE_MODE_GIPO_V1,
+    setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
-    solver = str(row["solver_key"])
-    target_nfe = int(row["target_nfe"])
+    return predict_gipo_density_many(
+        student,
+        rows=[row],
+        context_embeddings={context_id_from_row(row): context_embedding},
+        series_index_map=series_index_map,
+        reference_time_grid=reference_time_grid,
+        setting_feature_mode=setting_feature_mode,
+        setting_encoder_config=setting_encoder_config,
+        device=device,
+    )[0]
+
+
+def predict_gipo_density_many(
+    student: nn.Module,
+    *,
+    rows: Sequence[MetricRow],
+    context_embeddings: Mapping[str, Sequence[float]],
+    series_index_map: Mapping[str, int],
+    reference_time_grid: Sequence[float],
+    setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
+    device: torch.device | str = "cpu",
+) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
-    macro_steps = solver_macro_steps(solver, target_nfe)
+    encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
+    setting_rows: List[torch.Tensor] = []
+    series_rows: List[int] = []
+    context_rows: List[np.ndarray] = []
+    for row in rows:
+        context_id = context_id_from_row(row)
+        if context_id not in context_embeddings:
+            raise KeyError(f"Missing context embedding for {context_id}.")
+        setting_rows.append(setting_features(str(row["solver_key"]), int(row["target_nfe"]), mode=feature_mode, config=encoder_config))
+        series_rows.append(remapped_series_index(row, series_index_map))
+        context_rows.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
     student.to(device)
     student.eval()
+    sequence_groups = nfe_sequence_groups_for_ordered_rows(rows)
     with torch.no_grad():
-        mass_t = student.density_mass(
-            setting_features(solver, target_nfe, mode=feature_mode)[None, :].to(device=device),
-            torch.tensor([remapped_series_index(row, series_index_map)], dtype=torch.long, device=device),
-            torch.tensor(np.asarray(context_embedding, dtype=np.float32)[None, :], dtype=torch.float32, device=device),
-        )[0]
-    mass = tuple(float(x) for x in mass_t.detach().cpu().numpy().astype(np.float64).tolist())
-    grid = density_mass_to_time_grid(mass, macro_steps=macro_steps, reference_time_grid=reference_time_grid)
-    return {
-        "solver_key": solver,
-        "target_nfe": int(target_nfe),
-        "macro_steps": int(macro_steps),
-        "time_grid": list(grid),
-        "schedule_grid_hash": schedule_grid_hash(grid),
-        "density_mass": [float(x) for x in mass],
-        "density_mass_hash": density_mass_hash(mass, reference_time_grid=reference_time_grid),
-        "setting_feature_mode": feature_mode,
-        **density_metadata(reference_time_grid),
-    }
+        masses_t = _student_density_mass(
+            student,
+            torch.stack(setting_rows, dim=0).to(device=device),
+            torch.tensor(series_rows, dtype=torch.long, device=device),
+            torch.tensor(np.stack(context_rows, axis=0), dtype=torch.float32, device=device),
+            rows=rows,
+            sequence_groups=sequence_groups,
+        )
+    outputs: List[Dict[str, Any]] = []
+    for row, mass_t in zip(rows, masses_t):
+        solver = str(row["solver_key"])
+        target_nfe = int(row["target_nfe"])
+        macro_steps = solver_macro_steps(solver, target_nfe)
+        mass = tuple(float(x) for x in mass_t.detach().cpu().numpy().astype(np.float64).tolist())
+        grid = density_mass_to_time_grid(mass, macro_steps=macro_steps, reference_time_grid=reference_time_grid)
+        outputs.append(
+            {
+                "solver_key": solver,
+                "target_nfe": int(target_nfe),
+                "macro_steps": int(macro_steps),
+                "time_grid": list(grid),
+                "schedule_grid_hash": schedule_grid_hash(grid),
+                "density_mass": [float(x) for x in mass],
+                "density_mass_hash": density_mass_hash(mass, reference_time_grid=reference_time_grid),
+                "setting_feature_mode": feature_mode,
+                "setting_encoder_mode": encoder_config.mode,
+                "setting_encoder_config": encoder_config.to_payload(),
+                **density_metadata(reference_time_grid),
+            }
+        )
+    return outputs
 
 
 def read_metric_rows_csv(path: str | Path) -> List[Dict[str, Any]]:
@@ -1719,29 +2492,40 @@ __all__ = [
     "DEFAULT_TEACHER_MIN_TEMPERATURE",
     "DEFAULT_TEACHER_TARGET_ESS",
     "DEFAULT_TEACHER_TARGET_TEMPERATURE",
+    "ARCHITECTURE_LIGHT_TRANSFORMER_V1",
+    "DEFAULT_TRANSFORMER_DROPOUT",
+    "DEFAULT_TRANSFORMER_HEADS",
+    "DEFAULT_TRANSFORMER_HIDDEN_DIM",
+    "DEFAULT_TRANSFORMER_LAYERS",
+    "MODEL_PAYLOAD_VERSION",
     "MAX_CONTEXT_CALIBRATION_TOTAL",
     "MIN_CONTEXT_CALIBRATION_TOTAL",
     "STUDENT_TARGET_MODE_MARGIN_HARD_SOFT",
     "STUDENT_TARGET_MODE_SOFT_MIXTURE",
     "TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS",
     "TEACHER_TEMPERATURE_MODE_FIXED",
-    "GIPODensityStudentMLP",
-    "GIPOScheduleTeacherMLP",
+    "GIPODensityStudentLightTransformer",
+    "GIPOScheduleTeacherLightTransformer",
     "DensityFeatureNormalizer",
     "EmbeddingNormalizer",
     "attach_uniform_gipo_rewards",
     "build_series_index_map",
+    "build_gipo_student_model",
+    "build_gipo_teacher_model",
     "build_teacher_weighted_density_prediction_rows",
     "build_teacher_weighted_density_targets",
     "context_calibration_train_val_counts",
     "context_id_from_row",
     "context_pair_key",
+    "density_sequence_roughness_summary",
+    "density_sequence_smoothness_loss",
     "gipo_teacher_diagnostics",
     "density_mass_for_row",
     "grid_for_schedule",
     "load_context_embedding_table",
     "pairwise_rank_loss",
     "predict_gipo_density",
+    "predict_gipo_density_many",
     "read_metric_rows_csv",
     "recommended_context_calibration_count",
     "remapped_series_index",
@@ -1751,10 +2535,16 @@ __all__ = [
     "series_key_from_row",
     "split_rows_by_context_holdout",
     "split_rows_by_series_holdout",
+    "student_nfe_sequence_pair_indices",
+    "student_nfe_sequence_pairs",
+    "nfe_sequence_groups_for_ordered_rows",
+    "series_hash_fourier_features",
     "train_gipo_student",
     "train_gipo_teacher",
+    "validate_gipo_architecture",
     "validate_gipo_support_schedule_keys",
     "validate_student_target_mode",
+    "validate_teacher_objective_hyperparameters",
     "validate_teacher_temperature_mode",
     "validate_reference_grid",
 ]

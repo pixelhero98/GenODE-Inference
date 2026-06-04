@@ -24,6 +24,7 @@ genode-run-schedules = "genode.evaluation.diffusion_flow_time_reparameterization
 genode-train-backbone = "genode.training.train_backbone:main"
 genode-train-gipo = "genode.gipo.train_gipo:main"
 genode-report-gipo-locked-test = "genode.gipo.report_locked_test:main"
+genode-report-gipo-teacher-oracle = "genode.gipo.report_teacher_oracle:main"
 genode-build-ser-ptg-reference = "genode.gipo.ser_ptg_reference:main"
 genode-evaluate-schedule-summary = "genode.gipo.evaluate_schedule_summary:main"
 genode-build-hardness-figure = "genode.visualization.build_hardness_mismatch_figure:main"

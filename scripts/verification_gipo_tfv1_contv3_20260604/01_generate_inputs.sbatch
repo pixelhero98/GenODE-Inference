@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=genode_gap_inputs
+#SBATCH --job-name=genode_tfv1_inputs
 #SBATCH --partition=ampere
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -7,14 +7,14 @@
 #SBATCH --mem=96G
 #SBATCH --gpus=1
 #SBATCH --time=24:00:00
-#SBATCH --output=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_teacher_student_gap_20260603/logs/%x.%j.out
-#SBATCH --error=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_teacher_student_gap_20260603/logs/%x.%j.err
+#SBATCH --output=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_tfv1_contv3_20260604/logs/%x.%j.out
+#SBATCH --error=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_tfv1_contv3_20260604/logs/%x.%j.err
 
 set -euo pipefail
 
-GENODE_REPO=${GENODE_REPO:-/scratch/b35z/pixelhero.b35z/genode/exec/gipo_gap_src_20260603}
+GENODE_REPO=${GENODE_REPO:-/scratch/b35z/pixelhero.b35z/genode/exec/genode_gipo_tfv1_src_20260604}
 GENODE_ENV_DIR=${GENODE_ENV_DIR:-/projects/b35z/genode/envs/genode-py311}
-GENODE_GAP_ROOT=${GENODE_GAP_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_teacher_student_gap_20260603}
+GENODE_TFV1_ROOT=${GENODE_TFV1_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_tfv1_contv3_20260604}
 GENODE_DATASET_ROOT=${GENODE_DATASET_ROOT:-/projects/b35z/genode/paper_datasets}
 GENODE_BACKBONE_MANIFEST=${GENODE_BACKBONE_MANIFEST:-/scratch/b35z/pixelhero.b35z/genode/outputs/backbone_matrix/backbone_manifest.json}
 GENODE_SHARED_BACKBONE_ROOT=${GENODE_SHARED_BACKBONE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/backbone_matrix}
@@ -28,7 +28,7 @@ GENODE_SEEDS=${GENODE_SEEDS:-0,1,2}
 GENODE_NUM_EVAL_SAMPLES=${GENODE_NUM_EVAL_SAMPLES:-5}
 GENODE_FORECAST_EVAL_BATCH_SIZE=${GENODE_FORECAST_EVAL_BATCH_SIZE:-64}
 
-mkdir -p "${GENODE_GAP_ROOT}/logs" "${GENODE_GAP_ROOT}/summary" "${GENODE_GAP_ROOT}/standard_inputs" "${GENODE_GAP_ROOT}/unseen_nfe_inputs"
+mkdir -p "${GENODE_TFV1_ROOT}/logs" "${GENODE_TFV1_ROOT}/summary" "${GENODE_TFV1_ROOT}/standard_inputs" "${GENODE_TFV1_ROOT}/unseen_nfe_inputs"
 
 source "${GENODE_ENV_DIR}/bin/activate"
 cd "${GENODE_REPO}"
@@ -43,7 +43,7 @@ run_fixed_context_rows() {
   local split_phase=$2
   local nfes=$3
   local prefix=$4
-  local out_dir="${GENODE_GAP_ROOT}/${section}/${prefix}_${split_phase%%_*}"
+  local out_dir="${GENODE_TFV1_ROOT}/${section}/${prefix}_${split_phase%%_*}"
   mkdir -p "${out_dir}"
   python -m genode.evaluation.diffusion_flow_time_reparameterization \
     --out_root "${out_dir}" \
@@ -73,7 +73,7 @@ run_fixed_context_rows() {
 build_ser_reference() {
   local section=$1
   local nfes=$2
-  local out_dir="${GENODE_GAP_ROOT}/${section}/ser_reference"
+  local out_dir="${GENODE_TFV1_ROOT}/${section}/ser_reference"
   mkdir -p "${out_dir}"
   python -m genode.gipo.ser_ptg_reference \
     --dataset "${GENODE_DATASET}" \
@@ -96,11 +96,11 @@ run_ser_context_rows() {
   local split_phase=$2
   local nfes=$3
   local prefix=$4
-  local out_dir="${GENODE_GAP_ROOT}/${section}/${prefix}_${split_phase%%_*}"
+  local out_dir="${GENODE_TFV1_ROOT}/${section}/${prefix}_${split_phase%%_*}"
   mkdir -p "${out_dir}"
   python -m genode.gipo.evaluate_schedule_summary \
     --dataset "${GENODE_DATASET}" \
-    --schedule_summary "${GENODE_GAP_ROOT}/${section}/ser_reference/ser_ptg_schedule_summary.json" \
+    --schedule_summary "${GENODE_TFV1_ROOT}/${section}/ser_reference/ser_ptg_schedule_summary.json" \
     --split_phase "${split_phase}" \
     --out_dir "${out_dir}" \
     --dataset_root "${GENODE_DATASET_ROOT}" \
@@ -137,7 +137,7 @@ for split in train_tuning validation_tuning locked_test; do
   run_ser_context_rows unseen_nfe_inputs "${split}" "${GENODE_UNSEEN_NFES}" ser
 done
 
-python scripts/verification_teacher_student_gap_20260603/merge_gap_inputs.py \
-  --root "${GENODE_GAP_ROOT}" \
+python scripts/verification_gipo_tfv1_contv3_20260604/merge_tfv1_inputs.py \
+  --root "${GENODE_TFV1_ROOT}" \
   --standard_nfes "${GENODE_STANDARD_NFES}" \
   --unseen_nfes "${GENODE_UNSEEN_NFES}"

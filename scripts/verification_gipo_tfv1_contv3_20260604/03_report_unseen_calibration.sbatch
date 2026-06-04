@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=genode_gap_report
+#SBATCH --job-name=genode_tfv1_report
 #SBATCH --partition=ampere
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -7,15 +7,14 @@
 #SBATCH --mem=96G
 #SBATCH --gpus=1
 #SBATCH --time=24:00:00
-#SBATCH --output=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_teacher_student_gap_20260603/logs/%x.%j.out
-#SBATCH --error=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_teacher_student_gap_20260603/logs/%x.%j.err
+#SBATCH --output=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_tfv1_contv3_20260604/logs/%x.%j.out
+#SBATCH --error=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_tfv1_contv3_20260604/logs/%x.%j.err
 
 set -euo pipefail
 
-GENODE_REPO=${GENODE_REPO:-/scratch/b35z/pixelhero.b35z/genode/exec/gipo_gap_src_20260603}
+GENODE_REPO=${GENODE_REPO:-/scratch/b35z/pixelhero.b35z/genode/exec/genode_gipo_tfv1_src_20260604}
 GENODE_ENV_DIR=${GENODE_ENV_DIR:-/projects/b35z/genode/envs/genode-py311}
-GENODE_GAP_ROOT=${GENODE_GAP_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_teacher_student_gap_20260603}
-GENODE_REFERENCE_ROOT=${GENODE_REFERENCE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_ess_bins_20260602}
+GENODE_TFV1_ROOT=${GENODE_TFV1_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_tfv1_contv3_20260604}
 GENODE_DATASET_ROOT=${GENODE_DATASET_ROOT:-/projects/b35z/genode/paper_datasets}
 GENODE_BACKBONE_MANIFEST=${GENODE_BACKBONE_MANIFEST:-/scratch/b35z/pixelhero.b35z/genode/outputs/backbone_matrix/backbone_manifest.json}
 GENODE_SHARED_BACKBONE_ROOT=${GENODE_SHARED_BACKBONE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/backbone_matrix}
@@ -27,7 +26,7 @@ GENODE_SEEDS=${GENODE_SEEDS:-0,1,2}
 GENODE_NUM_EVAL_SAMPLES=${GENODE_NUM_EVAL_SAMPLES:-5}
 GENODE_FORECAST_EVAL_BATCH_SIZE=${GENODE_FORECAST_EVAL_BATCH_SIZE:-64}
 
-mkdir -p "${GENODE_GAP_ROOT}/logs" "${GENODE_GAP_ROOT}/calibration_unseen_reports/student" "${GENODE_GAP_ROOT}/calibration_unseen_reports/oracle"
+mkdir -p "${GENODE_TFV1_ROOT}/logs" "${GENODE_TFV1_ROOT}/calibration_unseen_reports/student" "${GENODE_TFV1_ROOT}/calibration_unseen_reports/oracle"
 
 source "${GENODE_ENV_DIR}/bin/activate"
 cd "${GENODE_REPO}"
@@ -37,7 +36,7 @@ export PYTHONDONTWRITEBYTECODE=1
 python -m compileall -q src tests scripts
 python -m unittest tests.test_gipo tests.test_genode_interfaces
 
-UNSEEN_ROOT="${GENODE_GAP_ROOT}/unseen_nfe_inputs"
+UNSEEN_ROOT="${GENODE_TFV1_ROOT}/unseen_nfe_inputs"
 CONTEXT_ROWS="${UNSEEN_ROOT}/validation_context_rows.csv"
 CONTEXT_EMBEDDINGS="${UNSEEN_ROOT}/validation_context_embeddings.npz"
 FIXED_ROWS="${UNSEEN_ROOT}/fixed_validation/fixed_validation_rows.csv"
@@ -49,7 +48,7 @@ COMMON_REPORT_ARGS=(
   --dataset_root "${GENODE_DATASET_ROOT}"
   --shared_backbone_root "${GENODE_SHARED_BACKBONE_ROOT}"
   --backbone_manifest "${GENODE_BACKBONE_MANIFEST}"
-  --output_root "${GENODE_GAP_ROOT}"
+  --output_root "${GENODE_TFV1_ROOT}"
   --otflow_train_steps "${GENODE_OTFLOW_TRAIN_STEPS}"
   --device auto
   --seeds "${GENODE_SEEDS}"
@@ -65,7 +64,7 @@ run_student_report() {
   local run_id=$1
   local run_root=$2
   local run_dir="${run_root}/policy_runs/${run_id}"
-  local out_dir="${GENODE_GAP_ROOT}/calibration_unseen_reports/student/${run_id}"
+  local out_dir="${GENODE_TFV1_ROOT}/calibration_unseen_reports/student/${run_id}"
   if [[ -f "${out_dir}/unseen_validation_gipo_policy_summary.json" ]]; then
     echo "Skipping existing student report ${run_id}"
     return
@@ -86,7 +85,7 @@ run_oracle_report() {
   local run_id=$1
   local run_root=$2
   local run_dir="${run_root}/policy_runs/${run_id}"
-  local out_dir="${GENODE_GAP_ROOT}/calibration_unseen_reports/oracle/${run_id}"
+  local out_dir="${GENODE_TFV1_ROOT}/calibration_unseen_reports/oracle/${run_id}"
   if [[ -f "${out_dir}/unseen_validation_gipo_teacher_oracle_policy_summary.json" ]]; then
     echo "Skipping existing oracle report ${run_id}"
     return
@@ -104,8 +103,8 @@ run_oracle_report() {
     "${COMMON_REPORT_ARGS[@]}"
 }
 
-RUN_IDS=(temp_fixed_005_b128 margin_fixed005_b128 nferich_fixed005_b128 nferich_margin_fixed005_b128 mase06_nferich_margin_fixed005_b128 mase075_nferich_margin_fixed005_b128)
-RUN_ROOTS=("${GENODE_REFERENCE_ROOT}" "${GENODE_GAP_ROOT}" "${GENODE_GAP_ROOT}" "${GENODE_GAP_ROOT}" "${GENODE_GAP_ROOT}" "${GENODE_GAP_ROOT}")
+RUN_IDS=(tfv1_contv3_fixed005_b128 tfv1_contv3_margin_b128 tfv1_contv3_mase06_margin_b128)
+RUN_ROOTS=("${GENODE_TFV1_ROOT}" "${GENODE_TFV1_ROOT}" "${GENODE_TFV1_ROOT}")
 
 for idx in "${!RUN_IDS[@]}"; do
   run_student_report "${RUN_IDS[$idx]}" "${RUN_ROOTS[$idx]}"

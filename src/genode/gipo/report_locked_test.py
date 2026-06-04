@@ -11,18 +11,18 @@ import numpy as np
 import torch
 
 from genode.gipo.policy import (
+    ARCHITECTURE_LIGHT_TRANSFORMER_V1,
     GIPO_PROTOCOL,
-    GIPODensityStudentMLP,
     EmbeddingNormalizer,
+    build_gipo_student_model,
     context_id_from_row,
     load_context_embedding_table,
-    predict_gipo_density,
+    predict_gipo_density_many,
     read_metric_rows_csv,
-    remapped_series_index,
 )
 from genode.gipo.evaluate_schedule_summary import build_comparison_summary
 from genode.gipo.models import solver_macro_steps
-from genode.gipo.models import SETTING_FEATURE_MODE_GIPO_V1, validate_setting_feature_mode
+from genode.gipo.models import SETTING_ENCODER_MODE_CONTINUOUS_V3, setting_encoder_config_from_payload, setting_feature_dim, validate_setting_feature_mode
 from genode.data.otflow_paths import (
     default_backbone_manifest_path,
     project_paper_dataset_root,
@@ -185,7 +185,7 @@ def _filter_rows_to_contexts(
     return filtered
 
 
-def _load_student_checkpoint(path: str | Path) -> Tuple[GIPODensityStudentMLP, Dict[str, int], EmbeddingNormalizer, Tuple[float, ...], Dict[str, Any]]:
+def _load_student_checkpoint(path: str | Path) -> Tuple[Any, Dict[str, int], EmbeddingNormalizer, Tuple[float, ...], Dict[str, Any]]:
     payload = torch.load(resolve_project_path(str(path)), map_location="cpu")
     if str(payload.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError(f"Unsupported GIPO student protocol {payload.get('protocol')!r}; expected {GIPO_PROTOCOL!r}.")
@@ -197,18 +197,39 @@ def _load_student_checkpoint(path: str | Path) -> Tuple[GIPODensityStudentMLP, D
     if str(density_meta.get("density_protocol", "")) != "density_mass_v1":
         raise ValueError("GIPO student checkpoint is missing density_mass_v1 metadata.")
     reference_time_grid = tuple(float(x) for x in density_meta["reference_time_grid"])
-    setting_feature_mode = validate_setting_feature_mode(str(payload.get("setting_feature_mode", SETTING_FEATURE_MODE_GIPO_V1)))
+    setting_feature_mode = validate_setting_feature_mode(str(payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3)))
+    setting_encoder_config = setting_encoder_config_from_payload(
+        payload.get("setting_encoder_config", {"mode": setting_feature_mode})
+    )
+    expected_setting_dim = setting_feature_dim(setting_feature_mode, config=setting_encoder_config)
+    if int(payload["setting_dim"]) != int(expected_setting_dim):
+        raise ValueError(
+            f"GIPO student checkpoint setting_dim={payload['setting_dim']} does not match "
+            f"setting encoder dim {expected_setting_dim} for {setting_encoder_config.mode}."
+        )
     series_index_map = {str(key): int(value) for key, value in dict(payload["series_index_map"]).items()}
     normalizer = EmbeddingNormalizer.from_payload(payload["embedding_normalizer"])
-    student = GIPODensityStudentMLP(
+    student_architecture = str(payload.get("student_architecture", ""))
+    if student_architecture != ARCHITECTURE_LIGHT_TRANSFORMER_V1:
+        raise ValueError(
+            f"GIPO student checkpoints must use {ARCHITECTURE_LIGHT_TRANSFORMER_V1!r}; got {student_architecture!r}."
+        )
+    student_model_config = dict(payload.get("student_model_config", {}) or {})
+    student = build_gipo_student_model(
+        architecture=student_architecture,
         setting_dim=int(payload["setting_dim"]),
         density_dim=int(payload["density_dim"]),
         context_dim=int(payload["context_dim"]),
         num_series=len(series_index_map),
+        model_config=student_model_config,
     )
     student.load_state_dict(payload["student_state"])
     student.eval()
     payload["setting_feature_mode"] = setting_feature_mode
+    payload["setting_encoder_mode"] = setting_encoder_config.mode
+    payload["setting_encoder_config"] = setting_encoder_config.to_payload()
+    payload["student_architecture"] = student_architecture
+    payload["student_model_config"] = student.model_config()
     return student, series_index_map, normalizer, reference_time_grid, payload
 
 
@@ -297,7 +318,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         for row in representatives
     }
     missing_cells = sorted(expected_cells - observed_cells)
-    if split_phase == LOCKED_TEST_PHASE and missing_cells:
+    if missing_cells:
         raise ValueError(f"context rows are missing seed/solver/NFE cells: {missing_cells[:8]}")
 
     raw_embeddings = load_context_embedding_table(resolve_project_path(embeddings_arg))
@@ -324,20 +345,22 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     output_prefix = _output_prefix(split_phase, selection_mode, str(getattr(args, "report_label", "")))
     decision_rows: List[Dict[str, Any]] = []
     per_context_rows: List[Dict[str, Any]] = []
+    predictions = predict_gipo_density_many(
+        student,
+        rows=representatives,
+        context_embeddings=embeddings,
+        series_index_map=series_index_map,
+        reference_time_grid=reference_time_grid,
+        setting_feature_mode=str(checkpoint_payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3)),
+        setting_encoder_config=checkpoint_payload.get("setting_encoder_config"),
+        device=device,
+    )
     with ProgressBar(len(representatives), f"GIPO {split_phase}") as progress:
         for row_idx, row in enumerate(representatives):
             context_id = context_id_from_row(row)
             source_phase = _source_split_phase(row)
             eval_ds = _forecast_dataset_for_source_phase(splits, source_phase)
-            prediction = predict_gipo_density(
-                student,
-                row=row,
-                context_embedding=embeddings[context_id],
-                series_index_map=series_index_map,
-                reference_time_grid=reference_time_grid,
-                setting_feature_mode=str(checkpoint_payload.get("setting_feature_mode", SETTING_FEATURE_MODE_GIPO_V1)),
-                device=device,
-            )
+            prediction = predictions[row_idx]
             example_idx = int(row.get("example_idx", row.get("example_index", 0)))
             solver = str(row["solver_key"])
             target_nfe = int(row["target_nfe"])
@@ -385,6 +408,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 "density_protocol": prediction["density_protocol"],
                 "reference_grid_hash": prediction["reference_grid_hash"],
                 "setting_feature_mode": prediction["setting_feature_mode"],
+                "setting_encoder_mode": prediction["setting_encoder_mode"],
             }
             per_context_rows.append(selected_row)
             decision_rows.append(
@@ -417,9 +441,9 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
             student_rows=comparison_student_rows,
             dataset=dataset,
             split_phase=split_phase,
-            seeds=tuple(sorted({int(row["seed"]) for row in comparison_student_rows})) or seeds,
-            solver_names=tuple(sorted({str(row["solver_key"]) for row in comparison_student_rows})) or solvers,
-            target_nfe_values=tuple(sorted({int(row["target_nfe"]) for row in comparison_student_rows})) or target_nfes,
+            seeds=seeds,
+            solver_names=solvers,
+            target_nfe_values=target_nfes,
         )
         (out_dir / f"{output_prefix}_comparison_summary.json").write_text(
             json.dumps(comparison, indent=2, sort_keys=True),
@@ -448,7 +472,9 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "mean_crps": float(np.mean(np.asarray(crps_values, dtype=np.float64))) if crps_values else None,
         "mean_mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else None,
         "density_representation": checkpoint_payload.get("density_representation", {}),
-        "setting_feature_mode": checkpoint_payload.get("setting_feature_mode", SETTING_FEATURE_MODE_GIPO_V1),
+        "setting_feature_mode": checkpoint_payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3),
+        "setting_encoder_mode": checkpoint_payload.get("setting_encoder_mode", ""),
+        "setting_encoder_config": checkpoint_payload.get("setting_encoder_config", {}),
         "locked_test_used_for_selection": False,
         "comparison_summary_path": "" if comparison is None else str(out_dir / f"{output_prefix}_comparison_summary.json"),
     }

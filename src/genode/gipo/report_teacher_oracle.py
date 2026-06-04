@@ -26,6 +26,7 @@ from genode.evaluation.otflow_evaluation_support import (
 from genode.gipo.density_representation import DENSITY_PROTOCOL
 from genode.gipo.evaluate_schedule_summary import build_comparison_summary
 from genode.gipo.policy import (
+    ARCHITECTURE_LIGHT_TRANSFORMER_V1,
     DEFAULT_TEACHER_HARD_MARGIN,
     DEFAULT_TEACHER_MAX_TEMPERATURE,
     DEFAULT_TEACHER_MIN_TEMPERATURE,
@@ -38,7 +39,7 @@ from genode.gipo.policy import (
     TEACHER_TEMPERATURE_MODE_FIXED,
     DensityFeatureNormalizer,
     EmbeddingNormalizer,
-    GIPOScheduleTeacherMLP,
+    build_gipo_teacher_model,
     build_teacher_weighted_density_prediction_rows,
     context_id_from_row,
     load_context_embedding_table,
@@ -60,7 +61,7 @@ from genode.gipo.report_locked_test import (
     _validate_context_rows,
 )
 from genode.gipo.train_gipo import _load_schedule_summary_grids
-from genode.gipo.models import SETTING_FEATURE_MODE_GIPO_V1, solver_macro_steps, validate_setting_feature_mode
+from genode.gipo.models import SETTING_ENCODER_MODE_CONTINUOUS_V3, setting_encoder_config_from_payload, setting_feature_dim, solver_macro_steps, validate_setting_feature_mode
 from genode.runtime import ProgressBar, resolve_torch_device
 
 GIPO_TEACHER_ORACLE_SCHEDULE_KEY = "gipo_teacher_oracle"
@@ -87,7 +88,7 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 def _load_teacher_checkpoint(
     path: str | Path,
-) -> Tuple[GIPOScheduleTeacherMLP, Dict[str, int], EmbeddingNormalizer, DensityFeatureNormalizer, Tuple[float, ...], Dict[str, Any]]:
+) -> Tuple[Any, Dict[str, int], EmbeddingNormalizer, DensityFeatureNormalizer, Tuple[float, ...], Dict[str, Any]]:
     payload = torch.load(resolve_project_path(str(path)), map_location="cpu")
     if str(payload.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError(f"Unsupported GIPO teacher protocol {payload.get('protocol')!r}; expected {GIPO_PROTOCOL!r}.")
@@ -97,19 +98,40 @@ def _load_teacher_checkpoint(
     if str(density_meta.get("density_protocol", "")) != DENSITY_PROTOCOL:
         raise ValueError("GIPO teacher checkpoint is missing density_mass_v1 metadata.")
     reference_time_grid = tuple(float(x) for x in density_meta["reference_time_grid"])
-    setting_feature_mode = validate_setting_feature_mode(str(payload.get("setting_feature_mode", SETTING_FEATURE_MODE_GIPO_V1)))
+    setting_feature_mode = validate_setting_feature_mode(str(payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3)))
+    setting_encoder_config = setting_encoder_config_from_payload(
+        payload.get("setting_encoder_config", {"mode": setting_feature_mode})
+    )
+    expected_setting_dim = setting_feature_dim(setting_feature_mode, config=setting_encoder_config)
+    if int(payload["setting_dim"]) != int(expected_setting_dim):
+        raise ValueError(
+            f"GIPO teacher checkpoint setting_dim={payload['setting_dim']} does not match "
+            f"setting encoder dim {expected_setting_dim} for {setting_encoder_config.mode}."
+        )
     series_index_map = {str(key): int(value) for key, value in dict(payload["series_index_map"]).items()}
     embedding_normalizer = EmbeddingNormalizer.from_payload(payload["embedding_normalizer"])
     density_normalizer = DensityFeatureNormalizer.from_payload(payload["density_feature_normalizer"])
-    teacher = GIPOScheduleTeacherMLP(
+    teacher_architecture = str(payload.get("teacher_architecture", ""))
+    if teacher_architecture != ARCHITECTURE_LIGHT_TRANSFORMER_V1:
+        raise ValueError(
+            f"GIPO teacher checkpoints must use {ARCHITECTURE_LIGHT_TRANSFORMER_V1!r}; got {teacher_architecture!r}."
+        )
+    teacher_model_config = dict(payload.get("teacher_model_config", {}) or {})
+    teacher = build_gipo_teacher_model(
+        architecture=teacher_architecture,
         setting_dim=int(payload["setting_dim"]),
         density_dim=int(payload["density_dim"]),
         context_dim=int(payload["context_dim"]),
         num_series=len(series_index_map),
+        model_config=teacher_model_config,
     )
     teacher.load_state_dict(payload["teacher_state"])
     teacher.eval()
     payload["setting_feature_mode"] = setting_feature_mode
+    payload["setting_encoder_mode"] = setting_encoder_config.mode
+    payload["setting_encoder_config"] = setting_encoder_config.to_payload()
+    payload["teacher_architecture"] = teacher_architecture
+    payload["teacher_model_config"] = teacher.model_config()
     return teacher, series_index_map, embedding_normalizer, density_normalizer, reference_time_grid, payload
 
 
@@ -152,7 +174,7 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
         for row in support_rows
     }
     missing_cells = sorted(expected_cells - observed_cells)
-    if split_phase == LOCKED_TEST_PHASE and missing_cells:
+    if missing_cells:
         raise ValueError(f"support rows are missing seed/solver/NFE cells: {missing_cells[:8]}")
 
     raw_embeddings = load_context_embedding_table(resolve_project_path(str(args.context_embeddings_npz)))
@@ -163,9 +185,20 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
 
     schedule_grids = _load_schedule_summary_grids(_parse_csv(str(args.schedule_summary_json)))
     support_keys = tuple(str(key) for key in training_summary.get("support_schedule_keys", checkpoint_payload.get("support_schedule_keys", [])))
-    setting_feature_mode = validate_setting_feature_mode(
-        str(getattr(args, "setting_feature_mode", "") or checkpoint_payload.get("setting_feature_mode", SETTING_FEATURE_MODE_GIPO_V1))
-    )
+    override_mode = str(getattr(args, "setting_feature_mode", "") or "").strip()
+    if override_mode:
+        requested_config = setting_encoder_config_from_payload({"mode": override_mode})
+        if requested_config.mode != str(checkpoint_payload.get("setting_encoder_mode", "")):
+            raise ValueError(
+                "Teacher-oracle reporting cannot override the checkpoint setting encoder mode: "
+                f"requested {requested_config.mode}, checkpoint {checkpoint_payload.get('setting_encoder_mode')}."
+            )
+        setting_feature_mode = validate_setting_feature_mode(override_mode)
+    else:
+        setting_feature_mode = validate_setting_feature_mode(
+            str(checkpoint_payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3))
+        )
+    setting_encoder_config = checkpoint_payload.get("setting_encoder_config")
     temperature_mode = str(getattr(args, "teacher_temperature_mode", "") or training_summary.get("teacher_temperature_mode", ""))
     if not temperature_mode:
         temperature_mode = str(
@@ -199,6 +232,7 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
         student_target_mode=student_target_mode,
         teacher_hard_margin=float(args.teacher_hard_margin),
         setting_feature_mode=setting_feature_mode,
+        setting_encoder_config=setting_encoder_config,
         device=device,
     )
 
@@ -278,6 +312,7 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
                 "density_protocol": prediction["density_protocol"],
                 "reference_grid_hash": prediction["reference_grid_hash"],
                 "setting_feature_mode": prediction["setting_feature_mode"],
+                "setting_encoder_mode": prediction["setting_encoder_mode"],
                 "support_schedule_count": int(len(grouped_support.get(key, []))),
                 "teacher_top_schedule_key": prediction["teacher_top_schedule_key"],
                 "teacher_top_margin": prediction["teacher_top_margin"],
@@ -318,9 +353,9 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
             student_rows=comparison_student_rows,
             dataset=dataset,
             split_phase=split_phase,
-            seeds=tuple(sorted({int(row["seed"]) for row in comparison_student_rows})) or seeds,
-            solver_names=tuple(sorted({str(row["solver_key"]) for row in comparison_student_rows})) or solvers,
-            target_nfe_values=tuple(sorted({int(row["target_nfe"]) for row in comparison_student_rows})) or target_nfes,
+            seeds=seeds,
+            solver_names=solvers,
+            target_nfe_values=target_nfes,
         )
         (out_dir / f"{output_prefix}_comparison_summary.json").write_text(
             json.dumps(comparison, indent=2, sort_keys=True),
@@ -344,6 +379,8 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
         "mean_mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else None,
         "density_representation": checkpoint_payload.get("density_representation", {}),
         "setting_feature_mode": setting_feature_mode,
+        "setting_encoder_mode": checkpoint_payload.get("setting_encoder_mode", ""),
+        "setting_encoder_config": checkpoint_payload.get("setting_encoder_config", {}),
         "target_summary": target_summary,
         "locked_test_used_for_selection": False,
         "comparison_summary_path": "" if comparison is None else str(out_dir / f"{output_prefix}_comparison_summary.json"),

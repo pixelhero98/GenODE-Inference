@@ -73,7 +73,7 @@ def _paths(section_root: Path, split: str, prefix: str) -> tuple[Path, Path, Pat
     )
 
 
-def merge_gap_inputs(args: argparse.Namespace) -> dict:
+def merge_tfv1_inputs(args: argparse.Namespace) -> dict:
     root = Path(args.root)
     standard_nfes = {int(value) for value in str(args.standard_nfes).split(",") if value}
     unseen_nfes = {int(value) for value in str(args.unseen_nfes).split(",") if value}
@@ -148,7 +148,7 @@ def merge_gap_inputs(args: argparse.Namespace) -> dict:
         unseen_manifest[f"{split}_context_count"] = len({context_id_from_row(row) for row in rows})
 
     manifest = {
-        "artifact": "gipo_teacher_student_gap_inputs_manifest",
+        "artifact": "gipo_teacher_student_tfv1_inputs_manifest",
         "locked_test_used_for_selection": False,
         "standard_target_nfe_values": sorted(standard_nfes),
         "unseen_target_nfe_values": sorted(unseen_nfes),
@@ -165,7 +165,7 @@ def merge_gap_inputs(args: argparse.Namespace) -> dict:
         **unseen_manifest,
     }
     (root / "summary").mkdir(parents=True, exist_ok=True)
-    (root / "summary" / "gap_inputs_manifest.json").write_text(
+    (root / "summary" / "tfv1_inputs_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True),
         encoding="utf-8",
     )
@@ -173,7 +173,7 @@ def merge_gap_inputs(args: argparse.Namespace) -> dict:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Merge GIPO teacher-student gap verification inputs.")
+    parser = argparse.ArgumentParser(description="Merge GIPO TFv1 continuous-v3 verification inputs.")
     parser.add_argument("--root", required=True)
     parser.add_argument("--standard_nfes", default="4,8,12")
     parser.add_argument("--unseen_nfes", default="6,10,14,16")
@@ -181,7 +181,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    payload = merge_gap_inputs(build_argparser().parse_args())
+    payload = merge_tfv1_inputs(build_argparser().parse_args())
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 

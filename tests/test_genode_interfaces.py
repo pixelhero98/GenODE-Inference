@@ -30,6 +30,7 @@ class GenODEInterfaceTests(unittest.TestCase):
                 "genode-run-schedules",
                 "genode-train-gipo",
                 "genode-report-gipo-locked-test",
+                "genode-report-gipo-teacher-oracle",
                 "genode-build-ser-ptg-reference",
                 "genode-evaluate-schedule-summary",
                 "genode-build-hardness-figure",
@@ -41,6 +42,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertEqual(scripts["genode-build-ser-ptg-reference"], "genode.gipo.ser_ptg_reference:main")
         self.assertEqual(scripts["genode-train-gipo"], "genode.gipo.train_gipo:main")
         self.assertEqual(scripts["genode-report-gipo-locked-test"], "genode.gipo.report_locked_test:main")
+        self.assertEqual(scripts["genode-report-gipo-teacher-oracle"], "genode.gipo.report_teacher_oracle:main")
         self.assertEqual(scripts["genode-evaluate-schedule-summary"], "genode.gipo.evaluate_schedule_summary:main")
         for target in scripts.values():
             module_name, func_name = str(target).split(":", 1)
@@ -61,6 +63,16 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertIn("--context_embeddings_npz", report_options)
         self.assertIn("--split_phase", report_options)
         self.assertIn("--selection_mode", report_options)
+
+    def test_gipo_trainer_accepts_only_transformer_continuous_v3_choices(self) -> None:
+        from genode.gipo.train_gipo import build_argparser as build_train_argparser
+
+        parser = build_train_argparser()
+        choices_by_dest = {action.dest: set(action.choices or []) for action in parser._actions}
+        self.assertEqual(choices_by_dest["teacher_architecture"], {"light_transformer_v1"})
+        self.assertEqual(choices_by_dest["student_architecture"], {"light_transformer_v1"})
+        self.assertEqual(choices_by_dest["setting_encoder_mode"], {"continuous_v3"})
+        self.assertEqual(choices_by_dest["setting_feature_mode"], {"continuous_v3"})
 
     def test_legacy_gipo_namespaces_and_protocols_are_retired(self) -> None:
         data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
