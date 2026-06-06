@@ -11,14 +11,21 @@ import numpy as np
 import torch
 
 from genode.gipo.policy import (
-    ARCHITECTURE_LIGHT_TRANSFORMER_V1,
+    ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
     GIPO_PROTOCOL,
+    MODEL_PAYLOAD_VERSION,
+    TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
     EmbeddingNormalizer,
     build_gipo_student_model,
     context_id_from_row,
     load_context_embedding_table,
+    normalize_teacher_utility_weights,
     predict_gipo_density_many,
     read_metric_rows_csv,
+    validate_gipo_attention_heads,
+    validate_gipo_conditioning_style,
+    validate_gipo_density_token_attention,
+    validate_teacher_metric_target_keys,
 )
 from genode.gipo.evaluate_schedule_summary import build_comparison_summary
 from genode.gipo.models import solver_macro_steps
@@ -189,6 +196,11 @@ def _load_student_checkpoint(path: str | Path) -> Tuple[Any, Dict[str, int], Emb
     payload = torch.load(resolve_project_path(str(path)), map_location="cpu")
     if str(payload.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError(f"Unsupported GIPO student protocol {payload.get('protocol')!r}; expected {GIPO_PROTOCOL!r}.")
+    if int(payload.get("model_payload_version", 0)) != MODEL_PAYLOAD_VERSION:
+        raise ValueError(
+            f"GIPO student checkpoint model_payload_version must be {MODEL_PAYLOAD_VERSION}; "
+            f"got {payload.get('model_payload_version')!r}."
+        )
     if str(payload.get("student_policy_type", "")) != "continuous_density":
         raise ValueError("GIPO locked reporter only accepts continuous_density student checkpoints.")
     if bool(payload.get("locked_test_used_for_selection", False)):
@@ -196,6 +208,19 @@ def _load_student_checkpoint(path: str | Path) -> Tuple[Any, Dict[str, int], Emb
     density_meta = dict(payload.get("density_representation", {}))
     if str(density_meta.get("density_protocol", "")) != "density_mass_v1":
         raise ValueError("GIPO student checkpoint is missing density_mass_v1 metadata.")
+    teacher_training = dict(payload.get("teacher_training", {}) or {})
+    teacher_target = str(teacher_training.get("teacher_target", ""))
+    if teacher_target not in {"metric_vector", "metric_vector_uniform"}:
+        raise ValueError("GIPO student checkpoint must come from a metric-vector teacher.")
+    teacher_metric_targets = validate_teacher_metric_target_keys(teacher_training.get("teacher_metric_targets", ()))
+    if str(teacher_training.get("teacher_scalarization", "")) != TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1:
+        raise ValueError(
+            f"GIPO student checkpoint teacher_scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1!r}."
+        )
+    teacher_utility_weights = dict(payload.get("teacher_utility_weights") or teacher_training.get("teacher_utility_weights") or {})
+    if not teacher_utility_weights:
+        raise ValueError("GIPO student checkpoint is missing teacher_utility_weights.")
+    normalize_teacher_utility_weights(teacher_metric_targets, teacher_utility_weights)
     reference_time_grid = tuple(float(x) for x in density_meta["reference_time_grid"])
     setting_feature_mode = validate_setting_feature_mode(str(payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3)))
     setting_encoder_config = setting_encoder_config_from_payload(
@@ -210,11 +235,14 @@ def _load_student_checkpoint(path: str | Path) -> Tuple[Any, Dict[str, int], Emb
     series_index_map = {str(key): int(value) for key, value in dict(payload["series_index_map"]).items()}
     normalizer = EmbeddingNormalizer.from_payload(payload["embedding_normalizer"])
     student_architecture = str(payload.get("student_architecture", ""))
-    if student_architecture != ARCHITECTURE_LIGHT_TRANSFORMER_V1:
+    if student_architecture != ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1:
         raise ValueError(
-            f"GIPO student checkpoints must use {ARCHITECTURE_LIGHT_TRANSFORMER_V1!r}; got {student_architecture!r}."
+            f"GIPO student checkpoints must use {ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1!r}; got {student_architecture!r}."
         )
     student_model_config = dict(payload.get("student_model_config", {}) or {})
+    validate_gipo_conditioning_style(student_model_config, require_present=True)
+    validate_gipo_density_token_attention(student_model_config, require_present=True)
+    validate_gipo_attention_heads(int(student_model_config.get("attention_heads", -1)))
     student = build_gipo_student_model(
         architecture=student_architecture,
         setting_dim=int(payload["setting_dim"]),
@@ -268,6 +296,28 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str)
             row["mse_std"] = float(np.std(mse))
         out.append(row)
     return out
+
+
+def _numeric_metric_means(rows: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+    excluded = {
+        "seed",
+        "target_nfe",
+        "context_count",
+        "series_idx",
+        "example_idx",
+    }
+    values: Dict[str, List[float]] = defaultdict(list)
+    for row in rows:
+        for key, value in row.items():
+            if str(key) in excluded or str(key).endswith("_std"):
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(numeric):
+                values[str(key)].append(float(numeric))
+    return {key: float(np.mean(np.asarray(items, dtype=np.float64))) for key, items in sorted(values.items()) if items}
 
 
 def _forecast_dataset_for_source_phase(splits: Mapping[str, Any], source_phase: str):
@@ -457,6 +507,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         if split_phase == LOCKED_TEST_PHASE and selection_mode == SELECTION_MODE_REPORTING
         else "gipo_student_calibration_report"
     )
+    comparison_file = f"{output_prefix}_comparison_summary.json"
     summary: Dict[str, Any] = {
         "artifact": artifact_name,
         "protocol": GIPO_PROTOCOL,
@@ -471,12 +522,13 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "missing_expected_cells": missing_cells,
         "mean_crps": float(np.mean(np.asarray(crps_values, dtype=np.float64))) if crps_values else None,
         "mean_mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else None,
+        "metric_means": _numeric_metric_means(aggregate_rows),
         "density_representation": checkpoint_payload.get("density_representation", {}),
         "setting_feature_mode": checkpoint_payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3),
         "setting_encoder_mode": checkpoint_payload.get("setting_encoder_mode", ""),
         "setting_encoder_config": checkpoint_payload.get("setting_encoder_config", {}),
         "locked_test_used_for_selection": False,
-        "comparison_summary_path": "" if comparison is None else str(out_dir / f"{output_prefix}_comparison_summary.json"),
+        "comparison_summary_path": "" if comparison is None else comparison_file,
     }
     (out_dir / f"{output_prefix}_policy_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return summary

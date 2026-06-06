@@ -1,6 +1,6 @@
 # genODE
 
-genODE contains source code for GIPO schedule optimization on OTFlow forecasting backbones. The active workflow trains a frozen-backbone rank+Huber teacher and a continuous-density student using per-context fixed/SER supervision rows and frozen context embeddings.
+genODE contains source code for GIPO schedule optimization on OTFlow forecasting backbones. The active workflow trains a frozen-backbone metric-vector teacher and a continuous-density student using per-context measured schedule rows and frozen context embeddings.
 
 ## Source Layout
 
@@ -51,11 +51,14 @@ This path implements:
 
 - per-example fixed/SER context rows with `series_id`, `target_t`, and stable `context_id`
 - frozen context embeddings from the frozen forecast backbone
-- uniform-anchored rewards paired inside exact context/seed/solver/NFE groups
+- configurable teacher utility columns paired inside exact context/seed/solver/NFE groups
 - canonical `density_mass_v1` schedules over normalized model time `[0, 1]`
-- teacher features based on train-normalized `log_density = log(p / bin_width + 1e-8)`
-- rank+Huber teacher training over measured fixed/SER density candidates
-- continuous student density training by teacher-weighted MLE/KL targets
+- a `density_form_transformer_v1` teacher that attends over density-bin tokens
+- a `density_query_transformer_v1` student that emits one density logit per bin query
+- AdaLN-Zero conditioning from solver/NFE features, series hash-Fourier features, and frozen context embeddings
+- RoPE-style positional rotation in density-bin self-attention
+- rank+Huber teacher training over measured density candidates
+- continuous student density training by teacher-weighted MLE/KL targets, with optional pseudo-NFE student targets
 - context-disjoint and series-disjoint diagnostics without locked-test selection
 
 The calibration row/embedding artifacts are intentionally reusable. Once fixed/SER
@@ -71,6 +74,11 @@ genode-train-gipo \
   --support_schedule_keys uniform,late_power_3,flowts_power_sampling,ays,gits,ots,ser_ptg_local_defect_eta005
 ```
 
+Forecast examples can use the default uniform-anchored utility columns
+`u_crps_uniform,u_mase_uniform`. Other tasks can provide their own utility
+columns with `--teacher_metric_target_keys` and `--teacher_utility_weights`;
+GIPO only requires that larger utility means better downstream performance.
+
 Locked-test reporting is reporting-only. It applies the frozen density student to
 each locked-test context, derives a time grid by inverse CDF, evaluates that
 grid, and never changes teacher checkpoints, student weights, or density
@@ -83,6 +91,17 @@ genode-report-gipo-locked-test \
   --context_rows outputs/locked_fixed_context_rows.csv,outputs/locked_ser_context_rows.csv \
   --context_embeddings_npz outputs/locked_context_embeddings.npz \
   --out_dir outputs/gipo_locked_report
+```
+
+Teacher-oracle reporting is available for diagnosing the teacher/student gap:
+
+```bash
+genode-report-gipo-teacher-oracle \
+  --gipo_teacher_checkpoint outputs/gipo_policy/gipo_teacher.pt \
+  --training_summary outputs/gipo_policy/gipo_training_summary.json \
+  --support_rows outputs/locked_fixed_context_rows.csv,outputs/locked_ser_context_rows.csv \
+  --context_embeddings_npz outputs/locked_context_embeddings.npz \
+  --out_dir outputs/gipo_teacher_oracle_report
 ```
 
 To generate reusable fixed/SER context rows, run schedule evaluation with context

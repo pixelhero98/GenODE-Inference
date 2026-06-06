@@ -11,5 +11,5 @@
 - GPU Slurm jobs should request explicit CPU and memory resources instead of relying on cluster defaults.
 - Git ignore rules for local data and outputs should be anchored at the repository root so source packages such as `src/genode/data` are never hidden.
 - Deprecated CLI flags must be removed from tests, docs, and Slurm examples in the same cleanup as the parser change; stale argparse inputs otherwise turn canonicalization into a test failure.
-- The `/projects/b35z/genode/envs/genode-py311` environment is x86_64. Use `b35z.macs3.isambard` for login-side checks; `b35z.3.isambard` exposes an aarch64 Python ABI and will fail importing the x86_64 NumPy wheel.
+- Remote verification environments must match the Python wheel ABI of installed numeric dependencies; do not mix login nodes or execution nodes with different architectures.
 - Slurm heredoc Python only sees exported shell variables. Pass experiment roots as CLI args or `export` them before inline Python; otherwise final merge/manifest steps can fail after expensive calibration work.

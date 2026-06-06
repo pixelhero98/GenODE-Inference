@@ -1,11 +1,17 @@
 from genode.gipo.policy import (
-    ARCHITECTURE_LIGHT_TRANSFORMER_V1,
-    GIPODensityStudentLightTransformer,
-    GIPOScheduleTeacherLightTransformer,
+    ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+    ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+    CONDITIONING_STYLE_ADALN_ZERO_V1,
+    DENSITY_TOKEN_ATTENTION_ROPE_V1,
+    GIPODensityFormTeacherTransformer,
+    GIPODensityQueryStudentTransformer,
     attach_uniform_gipo_rewards,
     build_gipo_student_model,
     build_gipo_teacher_model,
+    normalize_teacher_utility_weights,
     recommended_context_calibration_count,
+    teacher_utility_weights_for_summary,
+    validate_teacher_metric_target_keys,
 )
 from genode.gipo.density_representation import (
     DENSITY_PROTOCOL,
@@ -22,9 +28,12 @@ from genode.gipo.models import (
 from genode.gipo.objectives import crps_mase_reward
 
 __all__ = [
-    "GIPODensityStudentLightTransformer",
-    "GIPOScheduleTeacherLightTransformer",
-    "ARCHITECTURE_LIGHT_TRANSFORMER_V1",
+    "GIPODensityFormTeacherTransformer",
+    "GIPODensityQueryStudentTransformer",
+    "ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1",
+    "ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1",
+    "CONDITIONING_STYLE_ADALN_ZERO_V1",
+    "DENSITY_TOKEN_ATTENTION_ROPE_V1",
     "SETTING_ENCODER_MODE_CONTINUOUS_V3",
     "DENSITY_PROTOCOL",
     "attach_uniform_gipo_rewards",
@@ -34,8 +43,11 @@ __all__ = [
     "crps_mase_reward",
     "density_mass_to_time_grid",
     "grid_to_density_mass",
+    "normalize_teacher_utility_weights",
     "recommended_context_calibration_count",
     "setting_encoder_config_from_payload",
+    "teacher_utility_weights_for_summary",
     "uniform_reference_grid",
+    "validate_teacher_metric_target_keys",
     "validate_time_grid",
 ]

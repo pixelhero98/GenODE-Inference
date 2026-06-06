@@ -10,6 +10,7 @@ import torch
 
 from genode.gipo.policy import (
     GIPO_PROTOCOL,
+    MODEL_PAYLOAD_VERSION,
     DEFAULT_DENSITY_BIN_COUNT,
     DEFAULT_SUPPORT_SCHEDULE_KEYS,
     DEFAULT_TEACHER_MAX_TEMPERATURE,
@@ -17,7 +18,8 @@ from genode.gipo.policy import (
     DEFAULT_TEACHER_HARD_MARGIN,
     DEFAULT_TEACHER_TARGET_ESS,
     DEFAULT_TEACHER_TARGET_TEMPERATURE,
-    ARCHITECTURE_LIGHT_TRANSFORMER_V1,
+    ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+    ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
     DEFAULT_TRANSFORMER_DROPOUT,
     DEFAULT_TRANSFORMER_HEADS,
     DEFAULT_TRANSFORMER_HIDDEN_DIM,
@@ -33,6 +35,7 @@ from genode.gipo.policy import (
     build_gipo_teacher_model,
     build_series_index_map,
     context_id_from_row,
+    context_pair_key,
     density_mass_for_row,
     load_context_embedding_table,
     read_metric_rows_csv,
@@ -43,7 +46,11 @@ from genode.gipo.policy import (
     split_rows_by_series_holdout,
     train_gipo_student,
     train_gipo_teacher,
+    normalize_teacher_utility_weights,
+    teacher_utility_weights_for_summary,
+    validate_gipo_attention_heads,
     validate_gipo_support_schedule_keys,
+    validate_teacher_metric_target_keys,
     validate_teacher_objective_hyperparameters,
 )
 from genode.gipo.density_representation import density_metadata, reference_grid_hash, uniform_reference_grid
@@ -62,6 +69,23 @@ from genode.runtime import resolve_torch_device
 
 def _parse_csv(text: str) -> List[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
+
+
+def _parse_int_csv(text: str) -> List[int]:
+    return [int(part) for part in _parse_csv(text)]
+
+
+def _parse_float_mapping(text: str) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for part in _parse_csv(text):
+        if "=" not in part:
+            raise ValueError("teacher_utility_weights entries must be name=value pairs.")
+        key, value = part.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError("teacher_utility_weights contains an empty metric name.")
+        out[key] = float(value)
+    return out
 
 
 def _load_schedule_summary_grids(paths: Sequence[str]) -> Dict[Tuple[str, str, int], Tuple[float, ...]]:
@@ -130,12 +154,110 @@ def _split_counts(rows: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
     }
 
 
+def _validate_support_group_counts(rows: Sequence[Mapping[str, Any]], support_schedule_keys: Sequence[str]) -> None:
+    support_keys = tuple(str(key) for key in support_schedule_keys)
+    support_set = set(support_keys)
+    grouped: Dict[Tuple[Any, ...], Dict[str, int]] = {}
+    for row in rows:
+        schedule_key = str(row["scheduler_key"])
+        if schedule_key not in support_set:
+            raise ValueError(f"Supervision row {schedule_key!r} is outside support_schedule_keys.")
+        counts = grouped.setdefault(tuple(context_pair_key(row, pair_on_seed=True)), {key: 0 for key in support_keys})
+        counts[schedule_key] = int(counts.get(schedule_key, 0)) + 1
+    bad = {
+        key: {schedule: count for schedule, count in counts.items() if count != 1}
+        for key, counts in grouped.items()
+        if any(count != 1 for count in counts.values())
+    }
+    if bad:
+        first_key = next(iter(bad))
+        raise ValueError(
+            "GIPO supervision requires exactly one row for every support schedule in each "
+            f"context/seed/solver/NFE group; first bad group={first_key}, counts={bad[first_key]}."
+        )
+
+
 def _source_split_phase(row: Mapping[str, Any]) -> str:
     return str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))).strip()
 
 
 def _raw_split_phase(row: Mapping[str, Any]) -> str:
     return str(row.get("split_phase", row.get("split", ""))).strip()
+
+
+def _validate_student_pseudo_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    target_nfes: Sequence[int],
+    measured_fit_nfes: Sequence[int],
+    fit_context_ids: Sequence[str],
+    fit_series_keys: Sequence[str],
+    support_schedule_keys: Sequence[str],
+) -> List[Dict[str, Any]]:
+    if not rows:
+        raise ValueError("student pseudo rows CSV contains no rows.")
+    target_set = {int(value) for value in target_nfes}
+    if not target_set:
+        raise ValueError("student_pseudo_target_nfe_values must contain at least one NFE.")
+    overlap = sorted(target_set & {int(value) for value in measured_fit_nfes})
+    if overlap:
+        raise ValueError(f"Pseudo target NFEs must be unseen by measured teacher fit rows; overlapping NFEs: {overlap}.")
+    fit_context_set = {str(value) for value in fit_context_ids}
+    fit_series_set = {str(value) for value in fit_series_keys}
+    support_keys = validate_gipo_support_schedule_keys(support_schedule_keys)
+    support_set = set(support_keys)
+    filtered: List[Dict[str, Any]] = []
+    bad_splits: List[str] = []
+    bad_raw_splits: List[str] = []
+    bad_nfes: List[int] = []
+    for row in rows:
+        source_phase = _source_split_phase(row)
+        raw_phase = _raw_split_phase(row)
+        if source_phase != "train_tuning":
+            bad_splits.append(source_phase)
+        if raw_phase and raw_phase != "train_tuning":
+            bad_raw_splits.append(raw_phase)
+        target_nfe = int(row["target_nfe"])
+        if target_nfe not in target_set:
+            bad_nfes.append(target_nfe)
+        schedule_key = str(row["scheduler_key"])
+        if schedule_key not in support_set:
+            raise ValueError(f"Pseudo rows contain schedule {schedule_key!r} outside support_schedule_keys.")
+        context_id = context_id_from_row(row)
+        series_key = series_key_from_row(row)
+        if context_id in fit_context_set and series_key in fit_series_set and target_nfe in target_set:
+            copied = dict(row)
+            copied["context_id"] = context_id
+            copied["source_split_phase"] = source_phase
+            filtered.append(copied)
+    if bad_splits:
+        raise ValueError(f"Student pseudo targets must come from source_split_phase=train_tuning; found {sorted(set(bad_splits))}.")
+    if bad_raw_splits:
+        raise ValueError(f"Student pseudo targets must not use validation/locked raw split rows; found {sorted(set(bad_raw_splits))}.")
+    if bad_nfes:
+        raise ValueError(f"Pseudo rows contain target NFEs outside request: {sorted(set(bad_nfes))}.")
+    if not filtered:
+        raise ValueError("No pseudo rows remain after filtering to teacher/student fit contexts and series.")
+    observed_keys = {str(row["scheduler_key"]) for row in filtered}
+    missing_support = sorted(support_set - observed_keys)
+    if missing_support:
+        raise ValueError(f"Filtered pseudo rows are missing support schedules: {missing_support}.")
+    from genode.gipo.policy import context_pair_key
+
+    counts_by_group: Dict[Tuple[Any, ...], Dict[str, int]] = {}
+    for row in filtered:
+        key = context_pair_key(row, pair_on_seed=True)
+        counts = counts_by_group.setdefault(tuple(key), {schedule: 0 for schedule in support_keys})
+        counts[str(row["scheduler_key"])] = counts.get(str(row["scheduler_key"]), 0) + 1
+    bad_counts = {
+        key: {schedule: count for schedule, count in counts.items() if count != 1}
+        for key, counts in counts_by_group.items()
+        if any(count != 1 for count in counts.values())
+    }
+    if bad_counts:
+        first_key = next(iter(bad_counts))
+        raise ValueError(f"Pseudo rows require exactly one row per support schedule in every context group; first bad group={first_key}, counts={bad_counts[first_key]}.")
+    return filtered
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -154,8 +276,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--student_steps", type=int, default=500)
     parser.add_argument("--teacher_lr", type=float, default=1e-3)
     parser.add_argument("--student_lr", type=float, default=1e-3)
-    parser.add_argument("--teacher_architecture", choices=(ARCHITECTURE_LIGHT_TRANSFORMER_V1,), default=ARCHITECTURE_LIGHT_TRANSFORMER_V1)
-    parser.add_argument("--student_architecture", choices=(ARCHITECTURE_LIGHT_TRANSFORMER_V1,), default=ARCHITECTURE_LIGHT_TRANSFORMER_V1)
+    parser.add_argument("--teacher_architecture", choices=(ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,), default=ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1)
+    parser.add_argument("--student_architecture", choices=(ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,), default=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1)
     parser.add_argument("--transformer_hidden_dim", type=int, default=DEFAULT_TRANSFORMER_HIDDEN_DIM)
     parser.add_argument("--transformer_layers", type=int, default=DEFAULT_TRANSFORMER_LAYERS)
     parser.add_argument("--transformer_heads", type=int, default=DEFAULT_TRANSFORMER_HEADS)
@@ -188,12 +310,27 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--teacher_utility_crps_weight", type=float, default=0.5)
     parser.add_argument("--teacher_utility_mase_weight", type=float, default=0.5)
+    parser.add_argument(
+        "--teacher_metric_target_keys",
+        default="u_crps_uniform,u_mase_uniform",
+        help="Comma-separated utility columns predicted by the metric-vector teacher.",
+    )
+    parser.add_argument(
+        "--teacher_utility_weights",
+        default="",
+        help="Optional comma-separated name=value weights for --teacher_metric_target_keys.",
+    )
     parser.add_argument("--teacher_rank_temperature", type=float, default=0.5)
     parser.add_argument("--teacher_regression_weight", type=float, default=0.25)
     parser.add_argument("--teacher_pair_margin", type=float, default=0.0)
     parser.add_argument("--series_unknown_dropout", type=float, default=0.10)
     parser.add_argument("--student_nfe_smoothness_weight", type=float, default=0.0)
     parser.add_argument("--student_nfe_smoothness_mode", choices=("js", "logit_l2"), default="js")
+    parser.add_argument("--student_pseudo_rows_csv", default="", help="Measured train_tuning physical support rows for unseen-NFE student-only pseudo targets.")
+    parser.add_argument("--student_pseudo_context_embeddings_npz", default="", help="Optional context embeddings for pseudo rows; defaults to --context_embeddings_npz.")
+    parser.add_argument("--student_pseudo_schedule_summary_json", default="", help="Optional schedule summaries for pseudo rows; defaults to --schedule_summary_json.")
+    parser.add_argument("--student_pseudo_target_nfe_values", default="6,10,14,16")
+    parser.add_argument("--student_pseudo_target_weight", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dry_run", action="store_true")
@@ -202,6 +339,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     seed_all(int(args.seed))
+    validate_gipo_attention_heads(int(args.transformer_heads))
     requested_setting_mode = str(args.setting_encoder_mode).strip() or str(args.setting_feature_mode)
     setting_feature_mode = validate_setting_feature_mode(requested_setting_mode)
     rows = read_metric_rows_csv(resolve_project_path(str(args.rows_csv)))
@@ -229,17 +367,35 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     if missing_support_rows:
         raise ValueError(f"Supervision schedules must have measured context rows; missing rows for {missing_support_rows}")
 
-    rewarded_rows = attach_uniform_gipo_rewards(
-        rows,
-        support_schedule_keys=support_keys,
-        utility_crps_weight=float(args.teacher_utility_crps_weight),
-        utility_mase_weight=float(args.teacher_utility_mase_weight),
-        pair_on_seed=True,
+    teacher_metric_target_keys = validate_teacher_metric_target_keys(str(args.teacher_metric_target_keys))
+    explicit_teacher_weights = _parse_float_mapping(str(args.teacher_utility_weights)) if str(args.teacher_utility_weights).strip() else None
+    if explicit_teacher_weights is None and teacher_metric_target_keys == ("u_crps_uniform", "u_mase_uniform"):
+        explicit_teacher_weights = {
+            "u_crps_uniform": float(args.teacher_utility_crps_weight),
+            "u_mase_uniform": float(args.teacher_utility_mase_weight),
+        }
+    teacher_utility_weights = teacher_utility_weights_for_summary(
+        teacher_metric_target_keys,
+        normalize_teacher_utility_weights(teacher_metric_target_keys, explicit_teacher_weights),
     )
-    teacher_utility_weights = {
-        "crps": float(rewarded_rows[0].get("u_comp_crps_weight", 0.5)),
-        "mase": float(rewarded_rows[0].get("u_comp_mase_weight", 0.5)),
-    }
+    forecast_utility_keys = {"u_crps_uniform", "u_mase_uniform"}
+    missing_requested_metric_keys = {key for key in teacher_metric_target_keys if any(key not in row for row in rows)}
+    if missing_requested_metric_keys & forecast_utility_keys:
+        rewarded_rows = attach_uniform_gipo_rewards(
+            rows,
+            support_schedule_keys=support_keys,
+            utility_crps_weight=float(args.teacher_utility_crps_weight),
+            utility_mase_weight=float(args.teacher_utility_mase_weight),
+            pair_on_seed=True,
+        )
+    else:
+        rewarded_rows = [dict(row) for row in rows]
+        for row in rewarded_rows:
+            row["context_id"] = context_id_from_row(row)
+    _validate_support_group_counts(rewarded_rows, support_keys)
+    missing_metric_columns = sorted({key for key in teacher_metric_target_keys if any(key not in row for row in rewarded_rows)})
+    if missing_metric_columns:
+        raise ValueError(f"GIPO rows are missing teacher metric target columns: {missing_metric_columns}")
     available_context_ids = sorted({context_id_from_row(row) for row in rewarded_rows})
     sample_count = int(args.context_sample_count)
     if sample_count <= 0:
@@ -270,6 +426,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         raise KeyError(f"Context embeddings are missing sampled contexts: {missing_embeddings[:8]}")
 
     series_index_map = build_series_index_map(fit_rows)
+    fit_series_keys = sorted({series_key_from_row(row) for row in fit_rows})
     context_dim = int(next(iter(normalized_embeddings.values())).shape[0])
     setting_dim = int(setting_feature_dim(setting_feature_mode, config=setting_encoder_config))
     reference_time_grid = uniform_reference_grid(int(args.density_bin_count))
@@ -281,6 +438,45 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         ),
         reference_time_grid=reference_time_grid,
     )
+    pseudo_rows: List[Dict[str, Any]] = []
+    pseudo_embeddings: Dict[str, Any] | None = None
+    pseudo_schedule_grids: Dict[Tuple[str, str, int], Tuple[float, ...]] | None = None
+    pseudo_target_nfes = _parse_int_csv(str(args.student_pseudo_target_nfe_values))
+    pseudo_target_weight = float(args.student_pseudo_target_weight)
+    if str(args.student_pseudo_rows_csv).strip():
+        pseudo_raw_rows = read_metric_rows_csv(resolve_project_path(str(args.student_pseudo_rows_csv)))
+        pseudo_rows = _validate_student_pseudo_rows(
+            pseudo_raw_rows,
+            target_nfes=pseudo_target_nfes,
+            measured_fit_nfes=sorted({int(row["target_nfe"]) for row in fit_rows}),
+            fit_context_ids=fit_context_ids,
+            fit_series_keys=fit_series_keys,
+            support_schedule_keys=support_keys,
+        )
+        pseudo_embeddings_path = str(args.student_pseudo_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
+        pseudo_raw_embeddings = load_context_embedding_table(resolve_project_path(pseudo_embeddings_path))
+        missing_pseudo_embeddings = sorted({context_id_from_row(row) for row in pseudo_rows} - set(pseudo_raw_embeddings))
+        if missing_pseudo_embeddings:
+            raise KeyError(f"Pseudo context embeddings NPZ is missing contexts: {missing_pseudo_embeddings[:8]}")
+        pseudo_embeddings = embedding_normalizer.transform_table(pseudo_raw_embeddings)
+        pseudo_schedule_grids = dict(schedule_grids)
+        pseudo_summary_paths = _parse_csv(str(args.student_pseudo_schedule_summary_json))
+        if pseudo_summary_paths:
+            pseudo_schedule_grids.update(_load_schedule_summary_grids(pseudo_summary_paths))
+    elif pseudo_target_weight > 0.0:
+        raise ValueError("student_pseudo_target_weight > 0 requires --student_pseudo_rows_csv.")
+    pseudo_distillation_metadata: Dict[str, Any] = {
+        "pseudo_distillation_requested": bool(pseudo_rows),
+        "pseudo_target_weight": float(pseudo_target_weight),
+        "pseudo_target_nfes": [int(value) for value in pseudo_target_nfes],
+        "pseudo_row_count": int(len(pseudo_rows)),
+        "pseudo_context_count": int(len({context_id_from_row(row) for row in pseudo_rows})) if pseudo_rows else 0,
+        "pseudo_series_count": int(len({series_key_from_row(row) for row in pseudo_rows})) if pseudo_rows else 0,
+        "pseudo_context_id_hash": _stable_hash(sorted({context_id_from_row(row) for row in pseudo_rows})) if pseudo_rows else "",
+        "pseudo_series_key_hash": _stable_hash(sorted({series_key_from_row(row) for row in pseudo_rows})) if pseudo_rows else "",
+        "pseudo_split_phases": sorted({_source_split_phase(row) for row in pseudo_rows}) if pseudo_rows else [],
+        "pseudo_support_schedule_keys": list(support_keys) if pseudo_rows else [],
+    }
 
     density_meta = density_metadata(reference_time_grid)
     transformer_model_config = {
@@ -288,6 +484,12 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "hidden_layers": int(args.transformer_layers),
         "attention_heads": int(args.transformer_heads),
         "dropout": float(args.transformer_dropout),
+        "density_feature_mean": density_normalizer.mean.astype(float).tolist(),
+        "density_feature_std": density_normalizer.std.astype(float).tolist(),
+    }
+    teacher_transformer_model_config = {
+        **transformer_model_config,
+        "teacher_metric_targets": list(teacher_metric_target_keys),
     }
     teacher = build_gipo_teacher_model(
         architecture=str(args.teacher_architecture),
@@ -295,7 +497,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         density_dim=int(len(reference_time_grid) - 1),
         context_dim=context_dim,
         num_series=len(series_index_map),
-        model_config=transformer_model_config,
+        model_config=teacher_transformer_model_config,
     )
     student = build_gipo_student_model(
         architecture=str(args.student_architecture),
@@ -316,11 +518,12 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         if str(args.student_target_mode) == STUDENT_TARGET_MODE_SOFT_MIXTURE
         else "teacher_weighted_density_margin_hard_soft_kl",
         "teacher_objective": "pairwise_rank_plus_huber_regression",
-        "model_payload_version": 2,
+        "model_payload_version": MODEL_PAYLOAD_VERSION,
         "teacher_architecture": str(args.teacher_architecture),
         "student_architecture": str(args.student_architecture),
         "teacher_model_config": teacher_model_config,
         "student_model_config": student_model_config,
+        "teacher_metric_targets": list(teacher_metric_target_keys),
         "teacher_utility_weights": teacher_utility_weights,
         "student_target_mode": str(args.student_target_mode),
         "teacher_hard_margin": float(args.teacher_hard_margin),
@@ -329,6 +532,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "setting_encoder_config": setting_encoder_config.to_payload(),
         "density_representation": density_meta,
         "support_schedule_keys": list(support_keys),
+        "pseudo_distillation": pseudo_distillation_metadata,
         "sampled_context_count": int(len(selected_context_ids)),
         "split_counts": {
             "fit": _split_counts(fit_rows),
@@ -372,6 +576,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         allowed_schedule_keys=support_keys,
         setting_feature_mode=setting_feature_mode,
         setting_encoder_config=setting_encoder_config,
+        teacher_utility_weights=teacher_utility_weights,
         device=device,
     )
     student_training = train_gipo_student(
@@ -390,6 +595,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         teacher_target_ess=float(args.teacher_target_ess),
         teacher_min_temperature=float(args.teacher_min_temperature),
         teacher_max_temperature=float(args.teacher_max_temperature),
+        teacher_utility_weights=teacher_utility_weights,
         student_target_mode=str(args.student_target_mode),
         teacher_hard_margin=float(args.teacher_hard_margin),
         setting_feature_mode=setting_feature_mode,
@@ -397,6 +603,10 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         series_unknown_dropout=float(args.series_unknown_dropout),
         student_nfe_smoothness_weight=float(args.student_nfe_smoothness_weight),
         student_nfe_smoothness_mode=str(args.student_nfe_smoothness_mode),
+        pseudo_rows=pseudo_rows,
+        pseudo_context_embeddings=pseudo_embeddings,
+        pseudo_schedule_grids=pseudo_schedule_grids,
+        pseudo_target_weight=float(pseudo_target_weight),
         device=device,
     )
 
@@ -405,7 +615,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     torch.save(
         {
             "protocol": GIPO_PROTOCOL,
-            "model_payload_version": 2,
+            "model_payload_version": MODEL_PAYLOAD_VERSION,
             "teacher_architecture": str(args.teacher_architecture),
             "teacher_model_config": teacher_model_config,
             "teacher_state": teacher.state_dict(),
@@ -420,7 +630,9 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "density_feature_normalizer": density_normalizer.to_payload(),
             "density_representation": density_meta,
             "support_schedule_keys": list(support_keys),
+            "teacher_utility_weights": teacher_utility_weights,
             "teacher_training": teacher_training,
+            "pseudo_distillation": pseudo_distillation_metadata,
             "locked_test_used_for_selection": False,
         },
         teacher_path,
@@ -428,7 +640,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     torch.save(
         {
             "protocol": GIPO_PROTOCOL,
-            "model_payload_version": 2,
+            "model_payload_version": MODEL_PAYLOAD_VERSION,
             "student_policy_type": "continuous_density",
             "student_architecture": str(args.student_architecture),
             "student_model_config": student_model_config,
@@ -445,9 +657,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "density_feature_normalizer": density_normalizer.to_payload(),
             "density_representation": density_meta,
             "support_schedule_keys": list(support_keys),
-            "teacher_checkpoint": str(teacher_path),
+            "teacher_utility_weights": teacher_utility_weights,
+            "teacher_checkpoint": teacher_path.name,
             "teacher_training": teacher_training,
             "student_training": student_training,
+            "pseudo_distillation": pseudo_distillation_metadata,
             "locked_test_used_for_selection": False,
         },
         student_path,
@@ -455,16 +669,16 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
 
     policy_id_payload = {
         "protocol": GIPO_PROTOCOL,
-        "student_path": str(student_path),
         "reference_grid_hash": reference_grid_hash(reference_time_grid),
         "support_schedule_keys": list(support_keys),
-        "teacher_selected_step": teacher_training.get("teacher_checkpoint_selection", {}).get("selected_step"),
+            "teacher_selected_step": teacher_training.get("teacher_checkpoint_selection", {}).get("selected_step"),
         "student_target_mode": str(args.student_target_mode),
         "setting_feature_mode": setting_feature_mode,
         "setting_encoder_config": setting_encoder_config.to_payload(),
         "teacher_architecture": str(args.teacher_architecture),
         "student_architecture": str(args.student_architecture),
         "teacher_utility_weights": teacher_utility_weights,
+        "pseudo_distillation": pseudo_distillation_metadata,
     }
     policy_id = "gipo_" + hashlib.sha256(
         json.dumps(policy_id_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -473,8 +687,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         **summary_base,
         "status": "completed",
         "policy_id": policy_id,
-        "gipo_teacher_checkpoint": str(teacher_path),
-        "gipo_student_checkpoint": str(student_path),
+        "gipo_teacher_checkpoint": teacher_path.name,
+        "gipo_student_checkpoint": student_path.name,
         "teacher_training": teacher_training,
         "student_training": student_training,
     }

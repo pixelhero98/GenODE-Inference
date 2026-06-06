@@ -13,33 +13,52 @@ p[j] = integral over reference bin j of the equal-step schedule density
 sum_j p[j] = 1
 ```
 
-The teacher sees `(solver, nfe, log_density, series id, frozen context
-embedding)`, where `log_density = log(p / bin_width + 1e-8)` and the
-log-density vector is normalized from teacher-fit rows only. The teacher target
-is uniform anchored:
+GIPO uses the same conditioning vector `z` for teacher and student:
 
 ```text
-u_comp_uniform = -0.5 * (log(crps / uniform_crps) + log(mase / uniform_mase))
+z = setting_features(solver, NFE) + series_hash_fourier(dataset, series_id) + frozen_context_embedding
 ```
+
+The canonical teacher is `density_form_transformer_v1`. It turns each measured
+candidate density into ordered bin tokens:
+
+```text
+[log(rho_j + eps), normalized_log_density_j, t_j, delta_t_j]
+```
+
+The condition vector is applied with DiT-style `adaln_zero_v1` modulation. The
+teacher then performs RoPE-enabled self-attention over density-bin tokens and
+returns a metric utility vector. The default forecast target columns are
+`u_crps_uniform,u_mase_uniform`, but the trainer accepts arbitrary utility
+columns through `--teacher_metric_target_keys`. The only convention is that
+larger utility means better downstream performance.
 
 Rewards are paired inside exact `(dataset, solver, NFE, context_id, seed)` cells.
 Rows must not cross solver, NFE, seed, series, target time, or context identity.
-BO/candidate schedules are rejected in this path; fixed schedules and SER are
-the measured supervision references.
+BO/candidate schedules are rejected in this path; measured fixed schedules and
+SER are the default forecast supervision references.
 
-The teacher is trained with pairwise rank loss plus auxiliary Huber regression.
-Teacher checkpoints are selected with context-disjoint and series-disjoint
-calibration diagnostics. Locked-test data is not used for checkpoint selection.
+The teacher is trained with pairwise rank loss over the scalarized utility plus
+auxiliary Huber regression on the metric vector. Teacher checkpoints are
+selected with context-disjoint and series-disjoint calibration diagnostics.
+Locked-test data is not used for checkpoint selection.
 
-The student predicts a `density_mass` vector from `(solver, nfe, series id,
-frozen context embedding)`. Student targets are teacher-weighted mixtures of the
-measured fixed/SER candidate densities in each context group:
+The canonical student is `density_query_transformer_v1`. It builds one query
+token per density bin from `(t_j, delta_t_j)`, applies the same AdaLN-Zero
+conditioning, performs RoPE-enabled bin self-attention, emits one logit per bin,
+and normalizes with softmax. Student targets are teacher-weighted mixtures of
+the measured candidate densities in each context group:
 
 ```text
 w_i = softmax(teacher_utility_i / temperature)
 target_density = sum_i w_i * density_mass_i
 loss = KL(target_density || student_density)
 ```
+
+Optional pseudo-NFE distillation is student-only: after teacher selection,
+teacher-scored measured physical densities at held-out NFEs can be added to the
+student target set with a down-weighted loss. Pseudo rows must come from
+training/calibration splits, not validation reporting rows or locked-test rows.
 
 At deployment, the density is converted to a solver grid by inverse CDF at
 quantiles `0/K, 1/K, ..., K/K`, where `K` is the solver macro-step count for the
@@ -100,6 +119,17 @@ genode-train-gipo \
   --out_dir <output-dir>
 ```
 
+For non-forecast tasks, provide precomputed utility columns and weights:
+
+```text
+genode-train-gipo \
+  --rows_csv <rows-with-utility-columns.csv> \
+  --context_embeddings_npz <context-embeddings.npz> \
+  --out_dir <output-dir> \
+  --teacher_metric_target_keys u_accuracy_gain,u_latency_gain \
+  --teacher_utility_weights u_accuracy_gain=0.8,u_latency_gain=0.2
+```
+
 Locked-test reporting is reporting-only. It applies the frozen student to each
 locked-test context, evaluates the generated context-specific grid, and writes
 aggregate rows for comparison:
@@ -111,6 +141,19 @@ genode-report-gipo-locked-test \
   --context_rows <locked-fixed-context.csv>,<locked-ser-context.csv> \
   --context_embeddings_npz <locked-context-embeddings.npz> \
   --out_dir <locked-report-dir>
+```
+
+Teacher-oracle reporting evaluates teacher-weighted density targets directly and
+is the canonical diagnostic for measuring the gap between teacher utility and
+student generation:
+
+```text
+genode-report-gipo-teacher-oracle \
+  --gipo_teacher_checkpoint <output-dir>/gipo_teacher.pt \
+  --training_summary <output-dir>/gipo_training_summary.json \
+  --support_rows <locked-fixed-context.csv>,<locked-ser-context.csv> \
+  --context_embeddings_npz <locked-context-embeddings.npz> \
+  --out_dir <teacher-oracle-report-dir>
 ```
 
 Context embeddings must come from the frozen backbone's historical context

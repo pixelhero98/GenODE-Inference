@@ -26,13 +26,14 @@ from genode.evaluation.otflow_evaluation_support import (
 from genode.gipo.density_representation import DENSITY_PROTOCOL
 from genode.gipo.evaluate_schedule_summary import build_comparison_summary
 from genode.gipo.policy import (
-    ARCHITECTURE_LIGHT_TRANSFORMER_V1,
+    ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
     DEFAULT_TEACHER_HARD_MARGIN,
     DEFAULT_TEACHER_MAX_TEMPERATURE,
     DEFAULT_TEACHER_MIN_TEMPERATURE,
     DEFAULT_TEACHER_TARGET_ESS,
     DEFAULT_TEACHER_TARGET_TEMPERATURE,
     GIPO_PROTOCOL,
+    MODEL_PAYLOAD_VERSION,
     STUDENT_TARGET_MODE_MARGIN_HARD_SOFT,
     STUDENT_TARGET_MODE_SOFT_MIXTURE,
     TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS,
@@ -43,7 +44,13 @@ from genode.gipo.policy import (
     build_teacher_weighted_density_prediction_rows,
     context_id_from_row,
     load_context_embedding_table,
+    normalize_teacher_utility_weights,
     read_metric_rows_csv,
+    validate_gipo_attention_heads,
+    validate_gipo_conditioning_style,
+    validate_gipo_density_token_attention,
+    validate_gipo_teacher_output,
+    validate_teacher_metric_target_keys,
 )
 from genode.gipo.report_locked_test import (
     SELECTION_MODE_CALIBRATION,
@@ -52,6 +59,7 @@ from genode.gipo.report_locked_test import (
     _evaluation_seed_from_row,
     _filter_rows_to_contexts,
     _forecast_dataset_for_source_phase,
+    _numeric_metric_means,
     _output_prefix,
     _parse_csv,
     _parse_int_csv,
@@ -92,6 +100,11 @@ def _load_teacher_checkpoint(
     payload = torch.load(resolve_project_path(str(path)), map_location="cpu")
     if str(payload.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError(f"Unsupported GIPO teacher protocol {payload.get('protocol')!r}; expected {GIPO_PROTOCOL!r}.")
+    if int(payload.get("model_payload_version", 0)) != MODEL_PAYLOAD_VERSION:
+        raise ValueError(
+            f"GIPO teacher checkpoint model_payload_version must be {MODEL_PAYLOAD_VERSION}; "
+            f"got {payload.get('model_payload_version')!r}."
+        )
     if bool(payload.get("locked_test_used_for_selection", False)):
         raise ValueError("GIPO teacher checkpoint indicates locked_test was used for selection.")
     density_meta = dict(payload.get("density_representation", {}))
@@ -112,11 +125,15 @@ def _load_teacher_checkpoint(
     embedding_normalizer = EmbeddingNormalizer.from_payload(payload["embedding_normalizer"])
     density_normalizer = DensityFeatureNormalizer.from_payload(payload["density_feature_normalizer"])
     teacher_architecture = str(payload.get("teacher_architecture", ""))
-    if teacher_architecture != ARCHITECTURE_LIGHT_TRANSFORMER_V1:
+    if teacher_architecture != ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1:
         raise ValueError(
-            f"GIPO teacher checkpoints must use {ARCHITECTURE_LIGHT_TRANSFORMER_V1!r}; got {teacher_architecture!r}."
+            f"GIPO teacher checkpoints must use {ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1!r}; got {teacher_architecture!r}."
         )
     teacher_model_config = dict(payload.get("teacher_model_config", {}) or {})
+    validate_gipo_conditioning_style(teacher_model_config, require_present=True)
+    validate_gipo_density_token_attention(teacher_model_config, require_present=True)
+    validate_gipo_attention_heads(int(teacher_model_config.get("attention_heads", -1)))
+    validate_gipo_teacher_output(teacher_model_config, require_present=True)
     teacher = build_gipo_teacher_model(
         architecture=teacher_architecture,
         setting_dim=int(payload["setting_dim"]),
@@ -213,6 +230,21 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
             "student_target_mode", STUDENT_TARGET_MODE_SOFT_MIXTURE
         )
     )
+    teacher_utility_weights = dict(
+        training_summary.get("teacher_utility_weights")
+        or checkpoint_payload.get("teacher_utility_weights")
+        or dict(training_summary.get("teacher_training", {}) or {}).get("teacher_utility_weights")
+        or {}
+    )
+    if not teacher_utility_weights:
+        raise ValueError("Teacher-oracle reporting requires teacher_utility_weights for metric-vector scalarization.")
+    teacher_metric_targets = validate_teacher_metric_target_keys(
+        dict(checkpoint_payload.get("teacher_model_config", {}) or {}).get(
+            "teacher_metric_targets",
+            dict(training_summary.get("teacher_training", {}) or {}).get("teacher_metric_targets"),
+        )
+    )
+    normalize_teacher_utility_weights(teacher_metric_targets, teacher_utility_weights)
     device = resolve_torch_device(str(args.device))
     teacher.to(device)
     prediction_rows, target_summary = build_teacher_weighted_density_prediction_rows(
@@ -229,6 +261,7 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
         target_ess=float(args.teacher_target_ess),
         min_temperature=float(args.teacher_min_temperature),
         max_temperature=float(args.teacher_max_temperature),
+        teacher_utility_weights=teacher_utility_weights or None,
         student_target_mode=student_target_mode,
         teacher_hard_margin=float(args.teacher_hard_margin),
         setting_feature_mode=setting_feature_mode,
@@ -326,6 +359,7 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
                     **selected_row,
                     "density_mass_json": json.dumps(prediction["density_mass"], separators=(",", ":")),
                     "teacher_utilities_json": prediction["teacher_utilities_json"],
+                    "teacher_metric_utilities_json": prediction["teacher_metric_utilities_json"],
                     "teacher_weights_json": prediction["teacher_weights_json"],
                     "macro_steps": int(prediction["macro_steps"]),
                     "policy_source": "frozen_gipo_teacher_oracle",
@@ -364,6 +398,7 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
 
     crps_values = [float(row["crps"]) for row in aggregate_rows]
     mase_values = [float(row["mase"]) for row in aggregate_rows]
+    comparison_file = f"{output_prefix}_comparison_summary.json"
     summary = {
         "artifact": "gipo_teacher_oracle_report",
         "protocol": GIPO_PROTOCOL,
@@ -377,13 +412,14 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
         "missing_expected_cells": missing_cells,
         "mean_crps": float(np.mean(np.asarray(crps_values, dtype=np.float64))) if crps_values else None,
         "mean_mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else None,
+        "metric_means": _numeric_metric_means(aggregate_rows),
         "density_representation": checkpoint_payload.get("density_representation", {}),
         "setting_feature_mode": setting_feature_mode,
         "setting_encoder_mode": checkpoint_payload.get("setting_encoder_mode", ""),
         "setting_encoder_config": checkpoint_payload.get("setting_encoder_config", {}),
         "target_summary": target_summary,
         "locked_test_used_for_selection": False,
-        "comparison_summary_path": "" if comparison is None else str(out_dir / f"{output_prefix}_comparison_summary.json"),
+        "comparison_summary_path": "" if comparison is None else comparison_file,
     }
     (out_dir / f"{output_prefix}_policy_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return summary

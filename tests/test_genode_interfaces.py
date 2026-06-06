@@ -64,13 +64,13 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertIn("--split_phase", report_options)
         self.assertIn("--selection_mode", report_options)
 
-    def test_gipo_trainer_accepts_only_transformer_continuous_v3_choices(self) -> None:
+    def test_gipo_trainer_accepts_only_density_form_query_continuous_v3_choices(self) -> None:
         from genode.gipo.train_gipo import build_argparser as build_train_argparser
 
         parser = build_train_argparser()
         choices_by_dest = {action.dest: set(action.choices or []) for action in parser._actions}
-        self.assertEqual(choices_by_dest["teacher_architecture"], {"light_transformer_v1"})
-        self.assertEqual(choices_by_dest["student_architecture"], {"light_transformer_v1"})
+        self.assertEqual(choices_by_dest["teacher_architecture"], {"density_form_transformer_v1"})
+        self.assertEqual(choices_by_dest["student_architecture"], {"density_query_transformer_v1"})
         self.assertEqual(choices_by_dest["setting_encoder_mode"], {"continuous_v3"})
         self.assertEqual(choices_by_dest["setting_feature_mode"], {"continuous_v3"})
 
@@ -126,6 +126,27 @@ class GenODEInterfaceTests(unittest.TestCase):
                 text = path.read_text(encoding="utf-8").lower()
                 for pattern in retired_patterns:
                     if pattern.lower() in text:
+                        offenders.append(f"{path.relative_to(PROJECT_ROOT)}:{pattern}")
+        self.assertEqual(offenders, [])
+
+    def test_retired_gipo_transformer_workflow_names_do_not_remain(self) -> None:
+        offenders = []
+        retired_patterns = (
+            "light_" + "transformer_v1",
+            "gipo_tfv" + "1",
+            "tfv" + "1_" + "cont" + "v3",
+            "verification_gipo_tfv" + "1_" + "cont" + "v3",
+            "genode_tfv" + "1",
+            "GENODE_TFV" + "1_ROOT",
+        )
+        checked_suffixes = {".py", ".sh", ".sbatch"}
+        for root in (PROJECT_ROOT / "src", PROJECT_ROOT / "tests", PROJECT_ROOT / "scripts"):
+            for path in root.rglob("*"):
+                if path.suffix not in checked_suffixes:
+                    continue
+                text = path.read_text(encoding="utf-8")
+                for pattern in retired_patterns:
+                    if pattern in text:
                         offenders.append(f"{path.relative_to(PROJECT_ROOT)}:{pattern}")
         self.assertEqual(offenders, [])
 
