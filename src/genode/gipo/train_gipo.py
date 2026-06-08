@@ -11,6 +11,7 @@ import torch
 from genode.gipo.policy import (
     GIPO_PROTOCOL,
     MODEL_PAYLOAD_VERSION,
+    SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
     DEFAULT_DENSITY_BIN_COUNT,
     DEFAULT_SUPPORT_SCHEDULE_KEYS,
     DEFAULT_TEACHER_MAX_TEMPERATURE,
@@ -18,12 +19,20 @@ from genode.gipo.policy import (
     DEFAULT_TEACHER_HARD_MARGIN,
     DEFAULT_TEACHER_TARGET_ESS,
     DEFAULT_TEACHER_TARGET_TEMPERATURE,
+    DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS,
+    DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE,
+    DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS,
+    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+    STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
+    STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
     ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
     ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
     DEFAULT_TRANSFORMER_DROPOUT,
     DEFAULT_TRANSFORMER_HEADS,
     DEFAULT_TRANSFORMER_HIDDEN_DIM,
     DEFAULT_TRANSFORMER_LAYERS,
+    CONDITIONING_STYLE_ADALN_ZERO_V1,
+    CONDITIONING_STYLE_ADDITIVE_MLP_V1,
     STUDENT_TARGET_MODE_MARGIN_HARD_SOFT,
     STUDENT_TARGET_MODE_SOFT_MIXTURE,
     TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS,
@@ -37,12 +46,16 @@ from genode.gipo.policy import (
     context_id_from_row,
     context_pair_key,
     density_mass_for_row,
+    density_family_for_schedule_key,
     load_context_embedding_table,
+    nfe_sequence_diagnostic_summary,
     read_metric_rows_csv,
     recommended_context_calibration_count,
     sample_context_ids_stratified,
+    select_gipo_teacher_checkpoint,
     series_key_from_row,
     split_rows_by_context_holdout,
+    split_rows_by_density_family_holdout,
     split_rows_by_series_holdout,
     train_gipo_student,
     train_gipo_teacher,
@@ -50,6 +63,8 @@ from genode.gipo.policy import (
     teacher_utility_weights_for_summary,
     validate_gipo_attention_heads,
     validate_gipo_support_schedule_keys,
+    validate_student_checkpoint_selection_mode,
+    validate_teacher_checkpoint_selection_mode,
     validate_teacher_metric_target_keys,
     validate_teacher_objective_hyperparameters,
 )
@@ -65,6 +80,17 @@ from genode.gipo.models import (
 from genode.data.otflow_paths import resolve_project_path
 from genode.models.otflow_train_val import seed_all
 from genode.runtime import resolve_torch_device
+
+CANONICAL_DENSITY_BIN_COUNT = 64
+CANONICAL_TEACHER_SELECTION_COMPONENT_WEIGHTS: Dict[str, float] = {
+    "context": 0.25,
+    "density_family": 0.25,
+    "unseen_nfe": 0.50,
+}
+CANONICAL_TEACHER_RANK_TEMPERATURE = 0.5
+CANONICAL_TEACHER_REGRESSION_WEIGHT = 0.25
+CANONICAL_TEACHER_PAIR_MARGIN = 0.0
+CANONICAL_SERIES_HOLDOUT_FRACTION = 0.20
 
 
 def _parse_csv(text: str) -> List[str]:
@@ -86,6 +112,79 @@ def _parse_float_mapping(text: str) -> Dict[str, float]:
             raise ValueError("teacher_utility_weights contains an empty metric name.")
         out[key] = float(value)
     return out
+
+
+def _rows_for_target_nfes(rows: Sequence[Mapping[str, Any]], target_nfes: Sequence[int]) -> List[Dict[str, Any]]:
+    allowed = {int(value) for value in target_nfes}
+    return [dict(row) for row in rows if int(row["target_nfe"]) in allowed]
+
+
+def _rows_without_schedule_keys(rows: Sequence[Mapping[str, Any]], schedule_keys: Sequence[str]) -> List[Dict[str, Any]]:
+    excluded = {str(value) for value in schedule_keys}
+    return [dict(row) for row in rows if str(row["scheduler_key"]) not in excluded]
+
+
+def _history_by_step(training_summary: Mapping[str, Any]) -> Dict[int, Dict[str, Any]]:
+    selection = dict(training_summary.get("teacher_checkpoint_selection", {}))
+    out: Dict[int, Dict[str, Any]] = {}
+    for entry in list(selection.get("history", []) or []):
+        if not bool(entry.get("selection_constraints_passed", True)):
+            continue
+        out[int(entry["step"])] = dict(entry)
+    return out
+
+
+def _select_weighted_normalized_regret_step(
+    *,
+    context_density_training: Mapping[str, Any],
+    unseen_nfe_training: Mapping[str, Any],
+    component_weights: Mapping[str, float],
+) -> Dict[str, Any]:
+    context_history = _history_by_step(context_density_training)
+    unseen_history = _history_by_step(unseen_nfe_training)
+    common_steps = sorted(set(context_history) & set(unseen_history))
+    if not common_steps:
+        raise ValueError("Weighted normalized-regret checkpoint selection found no common checkpoint steps.")
+    required_splits = (
+        "context_disjoint",
+        "density_family_holdout",
+        "unseen_nfe_holdout",
+    )
+    combined_history: List[Dict[str, Any]] = []
+    for step in common_steps:
+        context_diagnostics = dict(context_history[step].get("diagnostics", {}) or {})
+        unseen_diagnostics = dict(unseen_history[step].get("diagnostics", {}) or {})
+        diagnostics = {
+            "context_disjoint": dict(context_diagnostics.get("context_disjoint", {}) or {}),
+            "density_family_holdout": dict(context_diagnostics.get("density_family_holdout", {}) or {}),
+            "unseen_nfe_holdout": dict(unseen_diagnostics.get("unseen_nfe_holdout", {}) or {}),
+        }
+        combined_history.append({"step": int(step), "diagnostics": diagnostics})
+    weights = {key: float(component_weights.get(key, 0.0)) for key in DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS}
+    total = sum(weights.values())
+    if total <= 0.0:
+        raise ValueError("Weighted normalized-regret checkpoint selection requires a positive component weight total.")
+    weights = {key: value / total for key, value in weights.items()}
+    split_weights = {
+        "context": float(weights["context"]),
+        "density_family": float(weights["density_family"]),
+        "unseen_nfe_holdout": float(weights["unseen_nfe"]),
+    }
+    selection = select_gipo_teacher_checkpoint(
+        combined_history,
+        required_split_names=required_splits,
+        selection_mode=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+        component_weights=split_weights,
+    )
+    return {
+        **selection,
+        "selection_component_axis_weights": dict(weights),
+        "uses_unseen_nfe_selection_diagnostics": True,
+        "component_histories": {
+            "context_density": context_density_training.get("teacher_checkpoint_selection", {}).get("history", []),
+            "unseen_nfe": unseen_nfe_training.get("teacher_checkpoint_selection", {}).get("history", []),
+        },
+    }
 
 
 def _load_schedule_summary_grids(paths: Sequence[str]) -> Dict[Tuple[str, str, int], Tuple[float, ...]]:
@@ -185,81 +284,6 @@ def _raw_split_phase(row: Mapping[str, Any]) -> str:
     return str(row.get("split_phase", row.get("split", ""))).strip()
 
 
-def _validate_student_pseudo_rows(
-    rows: Sequence[Mapping[str, Any]],
-    *,
-    target_nfes: Sequence[int],
-    measured_fit_nfes: Sequence[int],
-    fit_context_ids: Sequence[str],
-    fit_series_keys: Sequence[str],
-    support_schedule_keys: Sequence[str],
-) -> List[Dict[str, Any]]:
-    if not rows:
-        raise ValueError("student pseudo rows CSV contains no rows.")
-    target_set = {int(value) for value in target_nfes}
-    if not target_set:
-        raise ValueError("student_pseudo_target_nfe_values must contain at least one NFE.")
-    overlap = sorted(target_set & {int(value) for value in measured_fit_nfes})
-    if overlap:
-        raise ValueError(f"Pseudo target NFEs must be unseen by measured teacher fit rows; overlapping NFEs: {overlap}.")
-    fit_context_set = {str(value) for value in fit_context_ids}
-    fit_series_set = {str(value) for value in fit_series_keys}
-    support_keys = validate_gipo_support_schedule_keys(support_schedule_keys)
-    support_set = set(support_keys)
-    filtered: List[Dict[str, Any]] = []
-    bad_splits: List[str] = []
-    bad_raw_splits: List[str] = []
-    bad_nfes: List[int] = []
-    for row in rows:
-        source_phase = _source_split_phase(row)
-        raw_phase = _raw_split_phase(row)
-        if source_phase != "train_tuning":
-            bad_splits.append(source_phase)
-        if raw_phase and raw_phase != "train_tuning":
-            bad_raw_splits.append(raw_phase)
-        target_nfe = int(row["target_nfe"])
-        if target_nfe not in target_set:
-            bad_nfes.append(target_nfe)
-        schedule_key = str(row["scheduler_key"])
-        if schedule_key not in support_set:
-            raise ValueError(f"Pseudo rows contain schedule {schedule_key!r} outside support_schedule_keys.")
-        context_id = context_id_from_row(row)
-        series_key = series_key_from_row(row)
-        if context_id in fit_context_set and series_key in fit_series_set and target_nfe in target_set:
-            copied = dict(row)
-            copied["context_id"] = context_id
-            copied["source_split_phase"] = source_phase
-            filtered.append(copied)
-    if bad_splits:
-        raise ValueError(f"Student pseudo targets must come from source_split_phase=train_tuning; found {sorted(set(bad_splits))}.")
-    if bad_raw_splits:
-        raise ValueError(f"Student pseudo targets must not use validation/locked raw split rows; found {sorted(set(bad_raw_splits))}.")
-    if bad_nfes:
-        raise ValueError(f"Pseudo rows contain target NFEs outside request: {sorted(set(bad_nfes))}.")
-    if not filtered:
-        raise ValueError("No pseudo rows remain after filtering to teacher/student fit contexts and series.")
-    observed_keys = {str(row["scheduler_key"]) for row in filtered}
-    missing_support = sorted(support_set - observed_keys)
-    if missing_support:
-        raise ValueError(f"Filtered pseudo rows are missing support schedules: {missing_support}.")
-    from genode.gipo.policy import context_pair_key
-
-    counts_by_group: Dict[Tuple[Any, ...], Dict[str, int]] = {}
-    for row in filtered:
-        key = context_pair_key(row, pair_on_seed=True)
-        counts = counts_by_group.setdefault(tuple(key), {schedule: 0 for schedule in support_keys})
-        counts[str(row["scheduler_key"])] = counts.get(str(row["scheduler_key"]), 0) + 1
-    bad_counts = {
-        key: {schedule: count for schedule, count in counts.items() if count != 1}
-        for key, counts in counts_by_group.items()
-        if any(count != 1 for count in counts.values())
-    }
-    if bad_counts:
-        first_key = next(iter(bad_counts))
-        raise ValueError(f"Pseudo rows require exactly one row per support schedule in every context group; first bad group={first_key}, counts={bad_counts[first_key]}.")
-    return filtered
-
-
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train GIPO continuous-density from per-example fixed/SER rows.")
     parser.add_argument("--rows_csv", required=True, help="Per-example fixed/SER metric rows CSV.")
@@ -269,19 +293,62 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--support_schedule_keys", default="", help="Comma-separated fixed/SER supervision keys. Defaults to observed row keys.")
     parser.add_argument("--context_sample_count", type=int, default=0)
     parser.add_argument("--context_holdout_fraction", type=float, default=0.20)
-    parser.add_argument("--series_holdout_fraction", type=float, default=0.20)
     parser.add_argument("--density_bin_count", type=int, default=DEFAULT_DENSITY_BIN_COUNT)
     parser.add_argument("--teacher_steps", type=int, default=500)
     parser.add_argument("--teacher_checkpoint_every", type=int, default=100)
+    parser.add_argument(
+        "--teacher_checkpoint_selection_mode",
+        choices=(TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,),
+        default=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+    )
+    parser.add_argument("--teacher_loss_log_every", type=int, default=0)
+    parser.add_argument("--teacher_selection_temperature", type=float, default=DEFAULT_TEACHER_TARGET_TEMPERATURE)
+    parser.add_argument(
+        "--teacher_density_holdout_schedule_keys",
+        default=",".join(DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS),
+        help="Comma-separated fixed/SER support keys held out from the selector teacher for density-family diagnostics.",
+    )
+    parser.add_argument(
+        "--teacher_unseen_selection_rows_csv",
+        default="",
+        help="Optional unseen train_tuning rows used only for weighted normalized-regret teacher selection diagnostics.",
+    )
+    parser.add_argument(
+        "--teacher_unseen_selection_context_embeddings_npz",
+        default="",
+        help="Context embeddings for --teacher_unseen_selection_rows_csv; defaults to --context_embeddings_npz.",
+    )
+    parser.add_argument(
+        "--teacher_unseen_selection_schedule_summary_json",
+        default="",
+        help="Schedule summaries for unseen selection rows, such as unseen SER references.",
+    )
+    parser.add_argument("--teacher_unseen_selection_target_nfe_values", default="6,10,14,16")
     parser.add_argument("--student_steps", type=int, default=500)
+    parser.add_argument("--student_log_every", type=int, default=0)
+    parser.add_argument("--student_checkpoint_every", type=int, default=100)
+    parser.add_argument(
+        "--student_checkpoint_selection",
+        choices=(STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,),
+        default=STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+    )
+    parser.add_argument("--student_selection_holdout_fraction", type=float, default=0.10)
     parser.add_argument("--teacher_lr", type=float, default=1e-3)
     parser.add_argument("--student_lr", type=float, default=1e-3)
-    parser.add_argument("--teacher_architecture", choices=(ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,), default=ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1)
-    parser.add_argument("--student_architecture", choices=(ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,), default=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1)
     parser.add_argument("--transformer_hidden_dim", type=int, default=DEFAULT_TRANSFORMER_HIDDEN_DIM)
     parser.add_argument("--transformer_layers", type=int, default=DEFAULT_TRANSFORMER_LAYERS)
     parser.add_argument("--transformer_heads", type=int, default=DEFAULT_TRANSFORMER_HEADS)
     parser.add_argument("--transformer_dropout", type=float, default=DEFAULT_TRANSFORMER_DROPOUT)
+    parser.add_argument(
+        "--gipo_conditioning_style",
+        choices=(CONDITIONING_STYLE_ADDITIVE_MLP_V1, CONDITIONING_STYLE_ADALN_ZERO_V1),
+        default=CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+    )
+    parser.add_argument(
+        "--allow_noncanonical_conditioning",
+        action="store_true",
+        help="Explicitly allow noncanonical GIPO conditioning styles for sidecar comparisons.",
+    )
     parser.add_argument(
         "--teacher_temperature_mode",
         choices=(TEACHER_TEMPERATURE_MODE_FIXED, TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS),
@@ -297,17 +364,6 @@ def build_argparser() -> argparse.ArgumentParser:
         default=STUDENT_TARGET_MODE_SOFT_MIXTURE,
     )
     parser.add_argument("--teacher_hard_margin", type=float, default=DEFAULT_TEACHER_HARD_MARGIN)
-    parser.add_argument(
-        "--setting_encoder_mode",
-        choices=(SETTING_ENCODER_MODE_CONTINUOUS_V3,),
-        default=SETTING_ENCODER_MODE_CONTINUOUS_V3,
-        help="Checkpoint-persisted setting encoder.",
-    )
-    parser.add_argument(
-        "--setting_feature_mode",
-        choices=(SETTING_ENCODER_MODE_CONTINUOUS_V3,),
-        default=SETTING_ENCODER_MODE_CONTINUOUS_V3,
-    )
     parser.add_argument("--teacher_utility_crps_weight", type=float, default=0.5)
     parser.add_argument("--teacher_utility_mase_weight", type=float, default=0.5)
     parser.add_argument(
@@ -320,17 +376,7 @@ def build_argparser() -> argparse.ArgumentParser:
         default="",
         help="Optional comma-separated name=value weights for --teacher_metric_target_keys.",
     )
-    parser.add_argument("--teacher_rank_temperature", type=float, default=0.5)
-    parser.add_argument("--teacher_regression_weight", type=float, default=0.25)
-    parser.add_argument("--teacher_pair_margin", type=float, default=0.0)
-    parser.add_argument("--series_unknown_dropout", type=float, default=0.10)
-    parser.add_argument("--student_nfe_smoothness_weight", type=float, default=0.0)
-    parser.add_argument("--student_nfe_smoothness_mode", choices=("js", "logit_l2"), default="js")
-    parser.add_argument("--student_pseudo_rows_csv", default="", help="Measured train_tuning physical support rows for unseen-NFE student-only pseudo targets.")
-    parser.add_argument("--student_pseudo_context_embeddings_npz", default="", help="Optional context embeddings for pseudo rows; defaults to --context_embeddings_npz.")
-    parser.add_argument("--student_pseudo_schedule_summary_json", default="", help="Optional schedule summaries for pseudo rows; defaults to --schedule_summary_json.")
-    parser.add_argument("--student_pseudo_target_nfe_values", default="6,10,14,16")
-    parser.add_argument("--student_pseudo_target_weight", type=float, default=0.0)
+    parser.add_argument("--student_weight_decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dry_run", action="store_true")
@@ -339,8 +385,18 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     seed_all(int(args.seed))
+    density_bin_count = int(getattr(args, "density_bin_count", CANONICAL_DENSITY_BIN_COUNT))
+    if density_bin_count != CANONICAL_DENSITY_BIN_COUNT:
+        raise ValueError(f"Canonical GIPO training requires density_bin_count={CANONICAL_DENSITY_BIN_COUNT}; got {density_bin_count}.")
     validate_gipo_attention_heads(int(args.transformer_heads))
-    requested_setting_mode = str(args.setting_encoder_mode).strip() or str(args.setting_feature_mode)
+    conditioning_style = str(args.gipo_conditioning_style).strip() or CONDITIONING_STYLE_ADDITIVE_MLP_V1
+    allow_noncanonical_conditioning = bool(getattr(args, "allow_noncanonical_conditioning", False))
+    if conditioning_style != CONDITIONING_STYLE_ADDITIVE_MLP_V1 and not allow_noncanonical_conditioning:
+        raise ValueError(
+            f"Noncanonical GIPO conditioning style {conditioning_style!r} requires "
+            "--allow_noncanonical_conditioning."
+        )
+    requested_setting_mode = SETTING_ENCODER_MODE_CONTINUOUS_V3
     setting_feature_mode = validate_setting_feature_mode(requested_setting_mode)
     rows = read_metric_rows_csv(resolve_project_path(str(args.rows_csv)))
     if not rows:
@@ -352,10 +408,13 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     ]
     if locked_rows:
         raise ValueError(f"GIPO training refuses locked_test rows in rows_csv; found {len(locked_rows)} locked-test rows.")
+    observed_source_phases = sorted({_source_split_phase(row) for row in rows if _source_split_phase(row)})
+    if observed_source_phases and observed_source_phases != ["train_tuning"]:
+        raise ValueError(f"GIPO training rows_csv must contain only train_tuning source rows; found {observed_source_phases}.")
     validate_teacher_objective_hyperparameters(
-        rank_temperature=float(args.teacher_rank_temperature),
-        regression_weight=float(args.teacher_regression_weight),
-        pair_margin=float(args.teacher_pair_margin),
+        rank_temperature=CANONICAL_TEACHER_RANK_TEMPERATURE,
+        regression_weight=CANONICAL_TEACHER_REGRESSION_WEIGHT,
+        pair_margin=CANONICAL_TEACHER_PAIR_MARGIN,
     )
     support_keys = (
         validate_gipo_support_schedule_keys(_parse_csv(str(args.support_schedule_keys)))
@@ -403,34 +462,170 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     selected_context_ids = set(sample_context_ids_stratified(rewarded_rows, sample_count=sample_count, seed=int(args.seed)))
     sampled_rows = [row for row in rewarded_rows if context_id_from_row(row) in selected_context_ids]
 
+    selection_mode = validate_teacher_checkpoint_selection_mode(str(args.teacher_checkpoint_selection_mode))
+    if selection_mode != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1:
+        raise ValueError(
+            f"Canonical GIPO training requires teacher_checkpoint_selection_mode={TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1!r}."
+        )
+    uses_weighted_selection = selection_mode == TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
+    student_selection_mode = validate_student_checkpoint_selection_mode(str(args.student_checkpoint_selection))
+    if student_selection_mode != STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1:
+        raise ValueError(
+            f"Canonical GIPO training requires student_checkpoint_selection={STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1!r}."
+        )
+    selection_component_weights = dict(CANONICAL_TEACHER_SELECTION_COMPONENT_WEIGHTS)
+    if selection_mode == TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1:
+        expected_weights = {"context": 0.25, "density_family": 0.25, "unseen_nfe": 0.50}
+        bad_weights = {
+            key: selection_component_weights.get(key)
+            for key, expected in expected_weights.items()
+            if abs(float(selection_component_weights.get(key, 0.0)) - float(expected)) > 1e-9
+        }
+        if bad_weights:
+            raise ValueError(
+                "weighted_normalized_regret_v1 requires J_CDN weights "
+                "context=0.25,density_family=0.25,unseen_nfe=0.50."
+            )
+        sampled_target_nfes = sorted({int(row["target_nfe"]) for row in sampled_rows})
+        if sampled_target_nfes != [4, 8, 12]:
+            raise ValueError(
+                "weighted_normalized_regret_v1 final teacher/student fitting expects seen calibration NFEs [4, 8, 12]; "
+                f"found {sampled_target_nfes}."
+            )
+    unseen_selection_rows: List[Dict[str, Any]] = []
+    unseen_selection_target_nfes = _parse_int_csv(str(args.teacher_unseen_selection_target_nfe_values))
+    if selection_mode == TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1 and not str(args.teacher_unseen_selection_rows_csv).strip():
+        raise ValueError("weighted_normalized_regret_v1 requires --teacher_unseen_selection_rows_csv for unseen-NFE selection diagnostics.")
+    if str(args.teacher_unseen_selection_rows_csv).strip():
+        unseen_raw_rows = read_metric_rows_csv(resolve_project_path(str(args.teacher_unseen_selection_rows_csv)))
+        if not unseen_raw_rows:
+            raise ValueError("teacher_unseen_selection_rows_csv contains no rows.")
+        unseen_locked_rows = [
+            row
+            for row in unseen_raw_rows
+            if _source_split_phase(row) == "locked_test" or _raw_split_phase(row) == "locked_test"
+        ]
+        if unseen_locked_rows:
+            raise ValueError(
+                "Teacher unseen selection diagnostics refuse locked_test rows; "
+                f"found {len(unseen_locked_rows)} locked-test rows."
+            )
+        bad_unseen_source_phases = sorted(
+            {
+                _source_split_phase(row)
+                for row in unseen_raw_rows
+                if _source_split_phase(row) != "train_tuning"
+            }
+        )
+        if bad_unseen_source_phases:
+            raise ValueError(
+                "Teacher unseen selection diagnostics require train_tuning source rows; "
+                f"found {bad_unseen_source_phases}."
+            )
+        unseen_filtered_rows = _rows_for_target_nfes(unseen_raw_rows, unseen_selection_target_nfes)
+        if not unseen_filtered_rows:
+            raise ValueError(
+                "teacher_unseen_selection_rows_csv has no rows after filtering to "
+                f"teacher_unseen_selection_target_nfe_values={unseen_selection_target_nfes}."
+            )
+        missing_unseen_metric_keys = {
+            key
+            for key in teacher_metric_target_keys
+            if any(key not in row for row in unseen_filtered_rows)
+        }
+        if missing_unseen_metric_keys & forecast_utility_keys:
+            unseen_rewarded_rows = attach_uniform_gipo_rewards(
+                unseen_filtered_rows,
+                support_schedule_keys=support_keys,
+                utility_crps_weight=float(args.teacher_utility_crps_weight),
+                utility_mase_weight=float(args.teacher_utility_mase_weight),
+                pair_on_seed=True,
+            )
+        else:
+            unseen_rewarded_rows = [dict(row) for row in unseen_filtered_rows]
+            for row in unseen_rewarded_rows:
+                row["context_id"] = context_id_from_row(row)
+        _validate_support_group_counts(unseen_rewarded_rows, support_keys)
+        missing_unseen_columns = sorted(
+            {key for key in teacher_metric_target_keys if any(key not in row for row in unseen_rewarded_rows)}
+        )
+        if missing_unseen_columns:
+            raise ValueError(f"Teacher unseen selection rows are missing metric target columns: {missing_unseen_columns}")
+        unseen_context_ids = set(
+            sample_context_ids_stratified(
+                unseen_rewarded_rows,
+                sample_count=min(sample_count, len({context_id_from_row(row) for row in unseen_rewarded_rows})),
+                seed=int(args.seed) + 404,
+            )
+        )
+        unseen_selection_rows = [row for row in unseen_rewarded_rows if context_id_from_row(row) in unseen_context_ids]
+    density_holdout_requested = _parse_csv(str(args.teacher_density_holdout_schedule_keys))
+    if "uniform" in {str(key) for key in density_holdout_requested}:
+        raise ValueError("density-family holdout must not include uniform; uniform is the reward anchor.")
+    support_set = set(support_keys)
+    missing_density_holdout_keys = sorted(set(density_holdout_requested) - support_set)
+    if missing_density_holdout_keys and tuple(density_holdout_requested) == DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS:
+        density_holdout_keys: List[str] = []
+    elif missing_density_holdout_keys:
+        raise ValueError(f"density-family holdout keys must be in support_schedule_keys; unsupported={missing_density_holdout_keys}.")
+    else:
+        density_holdout_keys = list(density_holdout_requested)
+
     context_fit_pool_rows, context_holdout_rows = split_rows_by_context_holdout(
         sampled_rows,
         holdout_fraction=float(args.context_holdout_fraction),
         seed=int(args.seed),
     )
-    fit_rows, series_holdout_rows = split_rows_by_series_holdout(
+    series_fit_pool_rows, series_holdout_rows = split_rows_by_series_holdout(
         context_fit_pool_rows,
-        holdout_fraction=float(args.series_holdout_fraction),
+        holdout_fraction=CANONICAL_SERIES_HOLDOUT_FRACTION,
         seed=int(args.seed),
     )
-    if not fit_rows:
+    if not series_fit_pool_rows:
         raise ValueError("Teacher fitting requires at least one row after context and series holdouts.")
-    setting_encoder_config = setting_encoder_config_for_rows(fit_rows, mode=setting_feature_mode)
+    density_selection_fit_rows, density_holdout_rows, density_holdout_metadata = split_rows_by_density_family_holdout(
+        series_fit_pool_rows,
+        holdout_schedule_keys=density_holdout_keys,
+        support_schedule_keys=support_keys,
+    )
+    selection_support_schedule_keys = tuple(key for key in support_keys if key not in set(density_holdout_keys))
+    context_holdout_diagnostic_rows = _rows_without_schedule_keys(context_holdout_rows, density_holdout_keys)
+    series_holdout_diagnostic_rows = _rows_without_schedule_keys(series_holdout_rows, density_holdout_keys)
+    if uses_weighted_selection and not density_holdout_rows and not bool(args.dry_run):
+        raise ValueError("weighted_normalized_regret_v1 selection requires non-empty density-family holdout rows.")
+    selector_fit_rows = density_selection_fit_rows
+    final_fit_rows = [dict(row) for row in sampled_rows] if uses_weighted_selection else [dict(row) for row in series_fit_pool_rows]
+    if not selector_fit_rows:
+        raise ValueError("Teacher selection fitting requires at least one row after context, series, and density-family holdouts.")
+    if not final_fit_rows:
+        raise ValueError("Final teacher fitting requires at least one eligible non-test calibration row.")
+    setting_encoder_config = setting_encoder_config_for_rows(final_fit_rows, mode=setting_feature_mode)
 
     context_embeddings = load_context_embedding_table(resolve_project_path(str(args.context_embeddings_npz)))
+    fit_rows = final_fit_rows
     fit_context_ids = sorted({context_id_from_row(row) for row in fit_rows})
     embedding_normalizer = EmbeddingNormalizer.fit(context_embeddings, fit_context_ids)
     normalized_embeddings = embedding_normalizer.transform_table(context_embeddings)
     missing_embeddings = sorted({context_id_from_row(row) for row in sampled_rows} - set(normalized_embeddings))
     if missing_embeddings:
         raise KeyError(f"Context embeddings are missing sampled contexts: {missing_embeddings[:8]}")
+    if unseen_selection_rows:
+        unseen_embeddings_path = str(args.teacher_unseen_selection_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
+        unseen_raw_embeddings = load_context_embedding_table(resolve_project_path(unseen_embeddings_path))
+        missing_unseen_embeddings = sorted({context_id_from_row(row) for row in unseen_selection_rows} - set(unseen_raw_embeddings))
+        if missing_unseen_embeddings:
+            raise KeyError(f"Unseen selection context embeddings are missing contexts: {missing_unseen_embeddings[:8]}")
+        normalized_embeddings.update(embedding_normalizer.transform_table(unseen_raw_embeddings))
 
     series_index_map = build_series_index_map(fit_rows)
     fit_series_keys = sorted({series_key_from_row(row) for row in fit_rows})
     context_dim = int(next(iter(normalized_embeddings.values())).shape[0])
     setting_dim = int(setting_feature_dim(setting_feature_mode, config=setting_encoder_config))
-    reference_time_grid = uniform_reference_grid(int(args.density_bin_count))
+    reference_time_grid = uniform_reference_grid(density_bin_count)
     schedule_grids = _load_schedule_summary_grids(_parse_csv(str(args.schedule_summary_json)))
+    unseen_schedule_summary_paths = _parse_csv(str(args.teacher_unseen_selection_schedule_summary_json))
+    if unseen_schedule_summary_paths:
+        schedule_grids.update(_load_schedule_summary_grids(unseen_schedule_summary_paths))
     density_normalizer = DensityFeatureNormalizer.fit(
         (
             density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
@@ -438,33 +633,13 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         ),
         reference_time_grid=reference_time_grid,
     )
+    density_family_diagnostic_rows = [dict(row) for row in density_holdout_rows]
+    unseen_nfe_diagnostic_rows = _rows_without_schedule_keys(unseen_selection_rows, density_holdout_keys)
     pseudo_rows: List[Dict[str, Any]] = []
     pseudo_embeddings: Dict[str, Any] | None = None
     pseudo_schedule_grids: Dict[Tuple[str, str, int], Tuple[float, ...]] | None = None
-    pseudo_target_nfes = _parse_int_csv(str(args.student_pseudo_target_nfe_values))
-    pseudo_target_weight = float(args.student_pseudo_target_weight)
-    if str(args.student_pseudo_rows_csv).strip():
-        pseudo_raw_rows = read_metric_rows_csv(resolve_project_path(str(args.student_pseudo_rows_csv)))
-        pseudo_rows = _validate_student_pseudo_rows(
-            pseudo_raw_rows,
-            target_nfes=pseudo_target_nfes,
-            measured_fit_nfes=sorted({int(row["target_nfe"]) for row in fit_rows}),
-            fit_context_ids=fit_context_ids,
-            fit_series_keys=fit_series_keys,
-            support_schedule_keys=support_keys,
-        )
-        pseudo_embeddings_path = str(args.student_pseudo_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
-        pseudo_raw_embeddings = load_context_embedding_table(resolve_project_path(pseudo_embeddings_path))
-        missing_pseudo_embeddings = sorted({context_id_from_row(row) for row in pseudo_rows} - set(pseudo_raw_embeddings))
-        if missing_pseudo_embeddings:
-            raise KeyError(f"Pseudo context embeddings NPZ is missing contexts: {missing_pseudo_embeddings[:8]}")
-        pseudo_embeddings = embedding_normalizer.transform_table(pseudo_raw_embeddings)
-        pseudo_schedule_grids = dict(schedule_grids)
-        pseudo_summary_paths = _parse_csv(str(args.student_pseudo_schedule_summary_json))
-        if pseudo_summary_paths:
-            pseudo_schedule_grids.update(_load_schedule_summary_grids(pseudo_summary_paths))
-    elif pseudo_target_weight > 0.0:
-        raise ValueError("student_pseudo_target_weight > 0 requires --student_pseudo_rows_csv.")
+    pseudo_target_nfes = [6, 10, 14, 16]
+    pseudo_target_weight = 0.0
     pseudo_distillation_metadata: Dict[str, Any] = {
         "pseudo_distillation_requested": bool(pseudo_rows),
         "pseudo_target_weight": float(pseudo_target_weight),
@@ -477,6 +652,16 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "pseudo_split_phases": sorted({_source_split_phase(row) for row in pseudo_rows}) if pseudo_rows else [],
         "pseudo_support_schedule_keys": list(support_keys) if pseudo_rows else [],
     }
+    student_selector_fit_rows = [dict(row) for row in fit_rows]
+    student_selector_validation_rows: List[Dict[str, Any]] = []
+    if student_selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1:
+        student_selector_fit_rows, student_selector_validation_rows = split_rows_by_context_holdout(
+            fit_rows,
+            holdout_fraction=float(args.student_selection_holdout_fraction),
+            seed=int(args.seed) + 20_000,
+        )
+        if not student_selector_fit_rows or not student_selector_validation_rows:
+            raise ValueError("student validation CE checkpoint selection requires non-empty selector fit and validation rows.")
 
     density_meta = density_metadata(reference_time_grid)
     transformer_model_config = {
@@ -484,6 +669,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "hidden_layers": int(args.transformer_layers),
         "attention_heads": int(args.transformer_heads),
         "dropout": float(args.transformer_dropout),
+        "conditioning_style": conditioning_style,
+        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "density_feature_mean": density_normalizer.mean.astype(float).tolist(),
         "density_feature_std": density_normalizer.std.astype(float).tolist(),
     }
@@ -491,22 +678,32 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         **transformer_model_config,
         "teacher_metric_targets": list(teacher_metric_target_keys),
     }
-    teacher = build_gipo_teacher_model(
-        architecture=str(args.teacher_architecture),
-        setting_dim=setting_dim,
-        density_dim=int(len(reference_time_grid) - 1),
-        context_dim=context_dim,
-        num_series=len(series_index_map),
-        model_config=teacher_transformer_model_config,
-    )
-    student = build_gipo_student_model(
-        architecture=str(args.student_architecture),
-        setting_dim=setting_dim,
-        density_dim=int(len(reference_time_grid) - 1),
-        context_dim=context_dim,
-        num_series=len(series_index_map),
-        model_config=transformer_model_config,
-    )
+    def _build_teacher_instance(seed_offset: int = 0):
+        seed_all(int(args.seed) + int(seed_offset))
+        return build_gipo_teacher_model(
+            architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+            setting_dim=setting_dim,
+            density_dim=int(len(reference_time_grid) - 1),
+            context_dim=context_dim,
+            num_series=len(series_index_map),
+            model_config=teacher_transformer_model_config,
+            allow_noncanonical_conditioning=allow_noncanonical_conditioning,
+        )
+
+    def _build_student_instance(seed_offset: int = 0):
+        seed_all(int(args.seed) + int(seed_offset))
+        return build_gipo_student_model(
+            architecture=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+            setting_dim=setting_dim,
+            density_dim=int(len(reference_time_grid) - 1),
+            context_dim=context_dim,
+            num_series=len(series_index_map),
+            model_config=transformer_model_config,
+            allow_noncanonical_conditioning=allow_noncanonical_conditioning,
+        )
+
+    teacher = _build_teacher_instance(0)
+    student = _build_student_instance(10_000)
     teacher_model_config = teacher.model_config()
     student_model_config = student.model_config()
 
@@ -519,14 +716,29 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         else "teacher_weighted_density_margin_hard_soft_kl",
         "teacher_objective": "pairwise_rank_plus_huber_regression",
         "model_payload_version": MODEL_PAYLOAD_VERSION,
-        "teacher_architecture": str(args.teacher_architecture),
-        "student_architecture": str(args.student_architecture),
+        "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+        "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
         "teacher_model_config": teacher_model_config,
         "student_model_config": student_model_config,
         "teacher_metric_targets": list(teacher_metric_target_keys),
         "teacher_utility_weights": teacher_utility_weights,
+        "teacher_checkpoint_selection_mode": selection_mode,
+        "teacher_selection_axis_weights": selection_component_weights,
+        "teacher_selection_temperature": float(args.teacher_selection_temperature),
+        "teacher_loss_log_every": int(args.teacher_loss_log_every),
+        "teacher_checkpoint_every": int(args.teacher_checkpoint_every),
         "student_target_mode": str(args.student_target_mode),
+        "student_checkpoint_selection_mode": student_selection_mode,
+        "student_log_every": int(args.student_log_every),
+        "student_checkpoint_every": int(args.student_checkpoint_every),
+        "student_selection_holdout_fraction": float(args.student_selection_holdout_fraction),
         "teacher_hard_margin": float(args.teacher_hard_margin),
+        "gipo_conditioning_style": conditioning_style,
+        "noncanonical_conditioning_allowed": allow_noncanonical_conditioning,
+        "student_weight_decay": float(args.student_weight_decay),
+        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
+        "series_unknown_dropout": 0.0,
+        "series_unknown_dropout_mode": "disabled_no_series_conditioning",
         "setting_feature_mode": setting_feature_mode,
         "setting_encoder_mode": setting_encoder_config.mode,
         "setting_encoder_config": setting_encoder_config.to_payload(),
@@ -534,15 +746,65 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "support_schedule_keys": list(support_keys),
         "pseudo_distillation": pseudo_distillation_metadata,
         "sampled_context_count": int(len(selected_context_ids)),
+        "density_family_holdout": {
+            **density_holdout_metadata,
+            "density_family_holdout_requested_schedule_keys": list(density_holdout_requested),
+            "density_family_holdout_missing_requested_schedule_keys": list(missing_density_holdout_keys),
+            "selection_support_schedule_keys": list(selection_support_schedule_keys),
+            "density_family_diagnostic_row_count": int(len(density_family_diagnostic_rows)),
+        },
+        "unseen_nfe_selection": {
+            "protocol": "unseen_train_tuning_selection_diagnostic_v1",
+            "enabled": bool(unseen_selection_rows),
+            "target_nfes": [int(value) for value in unseen_selection_target_nfes],
+            "raw_csv": str(args.teacher_unseen_selection_rows_csv),
+            "context_embeddings_npz": str(args.teacher_unseen_selection_context_embeddings_npz or args.context_embeddings_npz),
+            "schedule_summary_json": str(args.teacher_unseen_selection_schedule_summary_json),
+            "source_row_count": int(len(unseen_selection_rows)),
+            "diagnostic": _split_counts(unseen_nfe_diagnostic_rows),
+            "excluded_density_holdout_schedule_keys": list(density_holdout_keys),
+            "used_for_final_fitting": False,
+            "locked_test_used_for_selection": False,
+        },
         "split_counts": {
             "fit": _split_counts(fit_rows),
+            "final_fit": _split_counts(final_fit_rows),
+            "selector_fit": _split_counts(selector_fit_rows),
             "context_disjoint": _split_counts(context_holdout_rows),
+            "context_disjoint_diagnostic": _split_counts(context_holdout_diagnostic_rows),
             "series_disjoint": _split_counts(series_holdout_rows),
+            "series_disjoint_diagnostic": _split_counts(series_holdout_diagnostic_rows),
+            "density_family_holdout": _split_counts(density_holdout_rows),
+            "density_family_diagnostic": _split_counts(density_family_diagnostic_rows),
+            "unseen_nfe_selection": _split_counts(unseen_selection_rows),
+            "unseen_nfe_diagnostic": _split_counts(unseen_nfe_diagnostic_rows),
+            "student_selector_fit": _split_counts(student_selector_fit_rows),
+            "student_selector_validation": _split_counts(student_selector_validation_rows),
         },
         "split_membership": {
             "fit": _split_membership_summary(fit_rows),
+            "final_fit": _split_membership_summary(final_fit_rows),
+            "selector_fit": _split_membership_summary(selector_fit_rows),
             "context_disjoint": _split_membership_summary(context_holdout_rows),
+            "context_disjoint_diagnostic": _split_membership_summary(context_holdout_diagnostic_rows),
             "series_disjoint": _split_membership_summary(series_holdout_rows),
+            "series_disjoint_diagnostic": _split_membership_summary(series_holdout_diagnostic_rows),
+            "density_family_holdout": _split_membership_summary(density_holdout_rows),
+            "density_family_diagnostic": _split_membership_summary(density_family_diagnostic_rows),
+            "unseen_nfe_selection": _split_membership_summary(unseen_selection_rows),
+            "unseen_nfe_diagnostic": _split_membership_summary(unseen_nfe_diagnostic_rows),
+            "student_selector_fit": _split_membership_summary(student_selector_fit_rows),
+            "student_selector_validation": _split_membership_summary(student_selector_validation_rows),
+        },
+        "nfe_sequence_diagnostics": {
+            "raw_rows": nfe_sequence_diagnostic_summary(rewarded_rows),
+            "sampled_rows": nfe_sequence_diagnostic_summary(sampled_rows),
+            "fit_rows": nfe_sequence_diagnostic_summary(fit_rows),
+            "selector_fit_rows": nfe_sequence_diagnostic_summary(selector_fit_rows),
+            "unseen_nfe_selection_rows": nfe_sequence_diagnostic_summary(unseen_selection_rows),
+            "unseen_nfe_diagnostic_rows": nfe_sequence_diagnostic_summary(unseen_nfe_diagnostic_rows),
+            "student_selector_fit_rows": nfe_sequence_diagnostic_summary(student_selector_fit_rows),
+            "student_selector_validation_rows": nfe_sequence_diagnostic_summary(student_selector_validation_rows),
         },
         "locked_test_used_for_selection": False,
     }
@@ -552,63 +814,280 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         return {**summary_base, "status": "dry_run"}
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    diagnostic_splits = {"context_disjoint": context_holdout_rows}
-    if series_holdout_rows:
-        diagnostic_splits["series_disjoint"] = series_holdout_rows
     device = resolve_torch_device(str(args.device))
-    teacher_training = train_gipo_teacher(
-        teacher,
-        fit_rows,
-        context_embeddings=normalized_embeddings,
-        series_index_map=series_index_map,
-        schedule_grids=schedule_grids,
-        reference_time_grid=reference_time_grid,
-        density_normalizer=density_normalizer,
-        steps=int(args.teacher_steps),
-        lr=float(args.teacher_lr),
-        rank_temperature=float(args.teacher_rank_temperature),
-        regression_weight=float(args.teacher_regression_weight),
-        pair_margin=float(args.teacher_pair_margin),
-        diagnostic_splits=diagnostic_splits,
-        teacher_checkpoint_every=int(args.teacher_checkpoint_every),
-        series_unknown_probability=float(args.series_unknown_dropout),
-        seed=int(args.seed),
-        allowed_schedule_keys=support_keys,
-        setting_feature_mode=setting_feature_mode,
-        setting_encoder_config=setting_encoder_config,
-        teacher_utility_weights=teacher_utility_weights,
-        device=device,
-    )
-    student_training = train_gipo_student(
-        student,
-        teacher,
-        fit_rows,
-        context_embeddings=normalized_embeddings,
-        series_index_map=series_index_map,
-        schedule_grids=schedule_grids,
-        reference_time_grid=reference_time_grid,
-        density_normalizer=density_normalizer,
-        steps=int(args.student_steps),
-        lr=float(args.student_lr),
-        teacher_temperature=float(args.teacher_temperature),
-        teacher_temperature_mode=str(args.teacher_temperature_mode),
-        teacher_target_ess=float(args.teacher_target_ess),
-        teacher_min_temperature=float(args.teacher_min_temperature),
-        teacher_max_temperature=float(args.teacher_max_temperature),
-        teacher_utility_weights=teacher_utility_weights,
-        student_target_mode=str(args.student_target_mode),
-        teacher_hard_margin=float(args.teacher_hard_margin),
-        setting_feature_mode=setting_feature_mode,
-        setting_encoder_config=setting_encoder_config,
-        series_unknown_dropout=float(args.series_unknown_dropout),
-        student_nfe_smoothness_weight=float(args.student_nfe_smoothness_weight),
-        student_nfe_smoothness_mode=str(args.student_nfe_smoothness_mode),
-        pseudo_rows=pseudo_rows,
-        pseudo_context_embeddings=pseudo_embeddings,
-        pseudo_schedule_grids=pseudo_schedule_grids,
-        pseudo_target_weight=float(pseudo_target_weight),
-        device=device,
-    )
+
+    def _train_teacher_pass(
+        *,
+        seed_offset: int,
+        pass_name: str,
+        pass_fit_rows: Sequence[Mapping[str, Any]],
+        diagnostic_splits: Mapping[str, Sequence[Mapping[str, Any]]],
+        diagnostic_candidate_schedule_keys: Mapping[str, Sequence[str]] | None = None,
+        steps: int,
+        checkpoint_selection_mode: str,
+    ) -> Dict[str, Any]:
+        if not pass_fit_rows:
+            raise ValueError(f"{pass_name} teacher pass requires non-empty fit rows.")
+        active_diagnostics = {name: [dict(row) for row in split] for name, split in diagnostic_splits.items() if split}
+        pass_teacher = _build_teacher_instance(seed_offset)
+        return train_gipo_teacher(
+            pass_teacher,
+            pass_fit_rows,
+            context_embeddings=normalized_embeddings,
+            series_index_map=series_index_map,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference_time_grid,
+            density_normalizer=density_normalizer,
+            steps=int(steps),
+            lr=float(args.teacher_lr),
+            rank_temperature=CANONICAL_TEACHER_RANK_TEMPERATURE,
+            regression_weight=CANONICAL_TEACHER_REGRESSION_WEIGHT,
+            pair_margin=CANONICAL_TEACHER_PAIR_MARGIN,
+            diagnostic_splits=active_diagnostics,
+            diagnostic_candidate_schedule_keys=diagnostic_candidate_schedule_keys,
+            teacher_checkpoint_every=int(args.teacher_checkpoint_every),
+            teacher_loss_log_every=int(args.teacher_loss_log_every),
+            teacher_checkpoint_selection_mode=checkpoint_selection_mode,
+            teacher_selection_temperature=float(args.teacher_selection_temperature),
+            teacher_selection_axis_weights=selection_component_weights,
+            series_unknown_probability=0.0,
+            seed=int(args.seed) + int(seed_offset),
+            allowed_schedule_keys=support_keys,
+            setting_feature_mode=setting_feature_mode,
+            setting_encoder_config=setting_encoder_config,
+            teacher_utility_weights=teacher_utility_weights,
+            device=device,
+        )
+
+    if uses_weighted_selection:
+        context_density_diagnostics = {
+            "context_disjoint": context_holdout_diagnostic_rows,
+            "density_family_holdout": density_family_diagnostic_rows,
+        }
+        if not context_holdout_diagnostic_rows:
+            raise ValueError("weighted_normalized_regret_v1 selection requires non-empty context_disjoint diagnostic rows.")
+        if not density_family_diagnostic_rows:
+            raise ValueError("weighted_normalized_regret_v1 selection requires non-empty density_family_holdout diagnostic rows.")
+        if not unseen_nfe_diagnostic_rows:
+            raise ValueError("weighted_normalized_regret_v1 requires non-empty unseen-NFE diagnostic rows.")
+        context_density_training = _train_teacher_pass(
+            seed_offset=101,
+            pass_name="context_density_selector",
+            pass_fit_rows=selector_fit_rows,
+            diagnostic_splits=context_density_diagnostics,
+            diagnostic_candidate_schedule_keys={
+                "context_disjoint": selection_support_schedule_keys,
+                "density_family_holdout": density_holdout_keys,
+            },
+            steps=int(args.teacher_steps),
+            checkpoint_selection_mode=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+        )
+        unseen_nfe_training = _train_teacher_pass(
+            seed_offset=102,
+            pass_name="unseen_nfe_selector",
+            pass_fit_rows=selector_fit_rows,
+            diagnostic_splits={"unseen_nfe_holdout": unseen_nfe_diagnostic_rows},
+            diagnostic_candidate_schedule_keys={"unseen_nfe_holdout": selection_support_schedule_keys},
+            steps=int(args.teacher_steps),
+            checkpoint_selection_mode=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+        )
+        checkpoint_selection = _select_weighted_normalized_regret_step(
+            context_density_training=context_density_training,
+            component_weights=selection_component_weights,
+            unseen_nfe_training=unseen_nfe_training,
+        )
+        selected_step = int(checkpoint_selection["selected_step"])
+        teacher = _build_teacher_instance(0)
+        final_teacher_training = train_gipo_teacher(
+            teacher,
+            fit_rows,
+            context_embeddings=normalized_embeddings,
+            series_index_map=series_index_map,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference_time_grid,
+            density_normalizer=density_normalizer,
+            steps=selected_step,
+            lr=float(args.teacher_lr),
+            rank_temperature=CANONICAL_TEACHER_RANK_TEMPERATURE,
+            regression_weight=CANONICAL_TEACHER_REGRESSION_WEIGHT,
+            pair_margin=CANONICAL_TEACHER_PAIR_MARGIN,
+            diagnostic_splits={},
+            teacher_checkpoint_every=int(args.teacher_checkpoint_every),
+            teacher_loss_log_every=int(args.teacher_loss_log_every),
+            teacher_checkpoint_selection_mode=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+            teacher_selection_temperature=float(args.teacher_selection_temperature),
+            series_unknown_probability=0.0,
+            seed=int(args.seed),
+            allowed_schedule_keys=support_keys,
+            setting_feature_mode=setting_feature_mode,
+            setting_encoder_config=setting_encoder_config,
+            teacher_utility_weights=teacher_utility_weights,
+            device=device,
+        )
+        final_retrain_metadata = {
+            "enabled": True,
+            "selected_step": int(selected_step),
+            "fit_source": "all_sampled_non_locked_seen_calibration_rows",
+            "fit_row_count": int(len(fit_rows)),
+            "fit_context_count": int(len({context_id_from_row(row) for row in fit_rows})),
+            "fit_schedule_count": int(len({str(row["scheduler_key"]) for row in fit_rows})),
+            "unseen_selection_diagnostics_used": bool(unseen_nfe_training),
+            "locked_test_used_for_selection": False,
+        }
+        teacher_training = {
+            **final_teacher_training,
+            "teacher_checkpoint_selection": checkpoint_selection,
+            "teacher_checkpoint_selection_mode": selection_mode,
+            "teacher_final_retrain": final_retrain_metadata,
+            "final_teacher_retrain": final_retrain_metadata,
+            "teacher_selection_passes": {
+                "context_density": context_density_training,
+                "unseen_nfe": unseen_nfe_training,
+            },
+        }
+    else:
+        diagnostic_splits = {"context_disjoint": context_holdout_rows}
+        if series_holdout_rows:
+            diagnostic_splits["series_disjoint"] = series_holdout_diagnostic_rows
+        diagnostic_splits = {name: split for name, split in diagnostic_splits.items() if split}
+        teacher = _build_teacher_instance(0)
+        teacher_training = train_gipo_teacher(
+            teacher,
+            fit_rows,
+            context_embeddings=normalized_embeddings,
+            series_index_map=series_index_map,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference_time_grid,
+            density_normalizer=density_normalizer,
+            steps=int(args.teacher_steps),
+            lr=float(args.teacher_lr),
+            rank_temperature=CANONICAL_TEACHER_RANK_TEMPERATURE,
+            regression_weight=CANONICAL_TEACHER_REGRESSION_WEIGHT,
+            pair_margin=CANONICAL_TEACHER_PAIR_MARGIN,
+            diagnostic_splits=diagnostic_splits,
+            teacher_checkpoint_every=int(args.teacher_checkpoint_every),
+            teacher_loss_log_every=int(args.teacher_loss_log_every),
+            teacher_checkpoint_selection_mode=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+            teacher_selection_temperature=float(args.teacher_selection_temperature),
+            series_unknown_probability=0.0,
+            seed=int(args.seed),
+            allowed_schedule_keys=support_keys,
+            setting_feature_mode=setting_feature_mode,
+            setting_encoder_config=setting_encoder_config,
+            teacher_utility_weights=teacher_utility_weights,
+            device=device,
+        )
+        teacher_training["teacher_final_retrain"] = {"enabled": False}
+        teacher_training["final_teacher_retrain"] = {"enabled": False}
+
+    def _train_student_instance(
+        student_model: torch.nn.Module,
+        pass_rows: Sequence[Mapping[str, Any]],
+        *,
+        steps: int,
+        validation_rows: Sequence[Mapping[str, Any]] | None = None,
+        checkpoint_selection_mode: str,
+    ) -> Dict[str, Any]:
+        return train_gipo_student(
+            student_model,
+            teacher,
+            pass_rows,
+            context_embeddings=normalized_embeddings,
+            series_index_map=series_index_map,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference_time_grid,
+            density_normalizer=density_normalizer,
+            steps=int(steps),
+            lr=float(args.student_lr),
+            teacher_temperature=float(args.teacher_temperature),
+            teacher_temperature_mode=str(args.teacher_temperature_mode),
+            teacher_target_ess=float(args.teacher_target_ess),
+            teacher_min_temperature=float(args.teacher_min_temperature),
+            teacher_max_temperature=float(args.teacher_max_temperature),
+            teacher_utility_weights=teacher_utility_weights,
+            student_target_mode=str(args.student_target_mode),
+            teacher_hard_margin=float(args.teacher_hard_margin),
+            setting_feature_mode=setting_feature_mode,
+            setting_encoder_config=setting_encoder_config,
+            series_unknown_dropout=0.0,
+            student_weight_decay=float(args.student_weight_decay),
+            student_nfe_smoothness_weight=0.0,
+            student_nfe_smoothness_mode="js",
+            pseudo_rows=pseudo_rows,
+            pseudo_context_embeddings=pseudo_embeddings,
+            pseudo_schedule_grids=pseudo_schedule_grids,
+            pseudo_target_weight=float(pseudo_target_weight),
+            validation_rows=validation_rows,
+            validation_context_embeddings=normalized_embeddings,
+            student_log_every=int(args.student_log_every),
+            student_checkpoint_every=int(args.student_checkpoint_every),
+            student_checkpoint_selection_mode=checkpoint_selection_mode,
+            device=device,
+        )
+
+    if student_selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1:
+        selector_student = _build_student_instance(10_000)
+        student_selection_training = _train_student_instance(
+            selector_student,
+            student_selector_fit_rows,
+            steps=int(args.student_steps),
+            validation_rows=student_selector_validation_rows,
+            checkpoint_selection_mode=STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+        )
+        student_checkpoint_selection = dict(student_selection_training.get("student_checkpoint_selection", {}) or {})
+        selected_student_step = int(student_checkpoint_selection.get("selected_step") or 0)
+        if selected_student_step <= 0:
+            raise ValueError("student validation CE checkpoint selection did not produce a positive selected step.")
+        student = _build_student_instance(10_000)
+        student_training = _train_student_instance(
+            student,
+            fit_rows,
+            steps=selected_student_step,
+            checkpoint_selection_mode=STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
+        )
+        student_final_retrain = {
+            "enabled": True,
+            "performed": True,
+            "protocol": "gipo_student_final_retrain_v1",
+            "selection_protocol": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+            "selected_step": int(selected_student_step),
+            "selector_max_steps": int(args.student_steps),
+            "selector_fit_row_count": int(len(student_selector_fit_rows)),
+            "selector_fit_context_count": int(len({context_id_from_row(row) for row in student_selector_fit_rows})),
+            "selector_validation_row_count": int(len(student_selector_validation_rows)),
+            "selector_validation_context_count": int(len({context_id_from_row(row) for row in student_selector_validation_rows})),
+            "final_fit_source": "all_eligible_train_tuning_rows_after_teacher_selection",
+            "final_fit_row_count": int(len(fit_rows)),
+            "final_fit_context_count": int(len({context_id_from_row(row) for row in fit_rows})),
+            "student_selection_holdout_fraction": float(args.student_selection_holdout_fraction),
+            "locked_test_used_for_selection": False,
+        }
+        student_training = {
+            **student_training,
+            "student_checkpoint_selection_mode": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+            "student_checkpoint_selection": student_checkpoint_selection,
+            "student_selection_pass": student_selection_training,
+            "student_selector_training": student_selection_training,
+            "student_validation_split": {
+                "protocol": "context_disjoint_student_validation_v1",
+                "fit_row_count": int(len(student_selector_fit_rows)),
+                "fit_context_count": int(len({context_id_from_row(row) for row in student_selector_fit_rows})),
+                "validation_row_count": int(len(student_selector_validation_rows)),
+                "validation_context_count": int(len({context_id_from_row(row) for row in student_selector_validation_rows})),
+                "holdout_fraction": float(args.student_selection_holdout_fraction),
+                "locked_test_used_for_selection": False,
+            },
+            "student_validation_used_for_selection": True,
+            "locked_test_used_for_selection": False,
+            "student_final_retrain": student_final_retrain,
+        }
+    else:
+        student_training = _train_student_instance(
+            student,
+            fit_rows,
+            steps=int(args.student_steps),
+            checkpoint_selection_mode=STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
+        )
 
     teacher_path = out_dir / "gipo_teacher.pt"
     student_path = out_dir / "gipo_student.pt"
@@ -616,7 +1095,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         {
             "protocol": GIPO_PROTOCOL,
             "model_payload_version": MODEL_PAYLOAD_VERSION,
-            "teacher_architecture": str(args.teacher_architecture),
+            "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
             "teacher_model_config": teacher_model_config,
             "teacher_state": teacher.state_dict(),
             "setting_dim": int(setting_dim),
@@ -632,6 +1111,17 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "support_schedule_keys": list(support_keys),
             "teacher_utility_weights": teacher_utility_weights,
             "teacher_training": teacher_training,
+            "teacher_checkpoint_selection_mode": selection_mode,
+            "teacher_checkpoint_selection": teacher_training.get("teacher_checkpoint_selection", {}),
+            "student_checkpoint_selection_mode": student_selection_mode,
+            "student_checkpoint_selection": student_training.get("student_checkpoint_selection", {}),
+            "student_final_retrain": student_training.get("student_final_retrain", {}),
+            "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
+            "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
+            "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
+            "series_unknown_dropout": 0.0,
+            "series_unknown_dropout_mode": "disabled_no_series_conditioning",
+            "nfe_sequence_diagnostics": summary_base["nfe_sequence_diagnostics"],
             "pseudo_distillation": pseudo_distillation_metadata,
             "locked_test_used_for_selection": False,
         },
@@ -642,7 +1132,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "protocol": GIPO_PROTOCOL,
             "model_payload_version": MODEL_PAYLOAD_VERSION,
             "student_policy_type": "continuous_density",
-            "student_architecture": str(args.student_architecture),
+            "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
             "student_model_config": student_model_config,
             "student_objective": student_training.get("student_objective", "teacher_weighted_density_mle_kl"),
             "student_state": student.state_dict(),
@@ -661,6 +1151,17 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "teacher_checkpoint": teacher_path.name,
             "teacher_training": teacher_training,
             "student_training": student_training,
+            "teacher_checkpoint_selection_mode": selection_mode,
+            "teacher_checkpoint_selection": teacher_training.get("teacher_checkpoint_selection", {}),
+            "student_checkpoint_selection_mode": student_selection_mode,
+            "student_checkpoint_selection": student_training.get("student_checkpoint_selection", {}),
+            "student_final_retrain": student_training.get("student_final_retrain", {}),
+            "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
+            "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
+            "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
+            "series_unknown_dropout": 0.0,
+            "series_unknown_dropout_mode": "disabled_no_series_conditioning",
+            "nfe_sequence_diagnostics": summary_base["nfe_sequence_diagnostics"],
             "pseudo_distillation": pseudo_distillation_metadata,
             "locked_test_used_for_selection": False,
         },
@@ -671,13 +1172,22 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "protocol": GIPO_PROTOCOL,
         "reference_grid_hash": reference_grid_hash(reference_time_grid),
         "support_schedule_keys": list(support_keys),
-            "teacher_selected_step": teacher_training.get("teacher_checkpoint_selection", {}).get("selected_step"),
+        "teacher_selected_step": teacher_training.get("teacher_checkpoint_selection", {}).get("selected_step"),
         "student_target_mode": str(args.student_target_mode),
         "setting_feature_mode": setting_feature_mode,
         "setting_encoder_config": setting_encoder_config.to_payload(),
-        "teacher_architecture": str(args.teacher_architecture),
-        "student_architecture": str(args.student_architecture),
+        "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+        "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+        "teacher_model_config": teacher_model_config,
+        "student_model_config": student_model_config,
         "teacher_utility_weights": teacher_utility_weights,
+        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
+        "teacher_checkpoint_selection_mode": selection_mode,
+        "student_checkpoint_selection_mode": student_selection_mode,
+        "student_checkpoint_selection": student_training.get("student_checkpoint_selection", {}),
+        "student_final_retrain": student_training.get("student_final_retrain", {}),
+        "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
+        "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
         "pseudo_distillation": pseudo_distillation_metadata,
     }
     policy_id = "gipo_" + hashlib.sha256(
@@ -690,6 +1200,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "gipo_teacher_checkpoint": teacher_path.name,
         "gipo_student_checkpoint": student_path.name,
         "teacher_training": teacher_training,
+        "teacher_checkpoint_selection": teacher_training.get("teacher_checkpoint_selection", {}),
+        "student_checkpoint_selection": student_training.get("student_checkpoint_selection", {}),
+        "student_final_retrain": student_training.get("student_final_retrain", {}),
+        "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
+        "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
         "student_training": student_training,
     }
     (out_dir / "gipo_training_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")

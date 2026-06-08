@@ -52,13 +52,15 @@ This path implements:
 - per-example fixed/SER context rows with `series_id`, `target_t`, and stable `context_id`
 - frozen context embeddings from the frozen forecast backbone
 - configurable teacher utility columns paired inside exact context/seed/solver/NFE groups
-- canonical `density_mass_v1` schedules over normalized model time `[0, 1]`
+- canonical 64-bin `density_mass_v1` schedules over normalized model time `[0, 1]`
 - a `density_form_transformer_v1` teacher that attends over density-bin tokens
 - a `density_query_transformer_v1` student that emits one density logit per bin query
-- AdaLN-Zero conditioning from solver/NFE features, series hash-Fourier features, and frozen context embeddings
+- strict `additive_mlp_v1` context-only conditioning from solver/NFE features and frozen context embeddings
 - RoPE-style positional rotation in density-bin self-attention
 - rank+Huber teacher training over measured density candidates
-- continuous student density training by teacher-weighted MLE/KL targets, with optional pseudo-NFE student targets
+- teacher checkpoint selection by `weighted_normalized_regret_v1` over context, density-family, and unseen-NFE calibration holdouts
+- continuous student density training by teacher-weighted MLE/KL targets
+- student checkpoint selection by `validation_ce_v1`
 - context-disjoint and series-disjoint diagnostics without locked-test selection
 
 The calibration row/embedding artifacts are intentionally reusable. Once fixed/SER
@@ -71,6 +73,8 @@ genode-train-gipo \
   --context_embeddings_npz outputs/context_embeddings.npz \
   --schedule_summary_json outputs/ser_ptg_schedule_summary.json \
   --out_dir outputs/gipo_policy \
+  --gipo_conditioning_style additive_mlp_v1 \
+  --density_bin_count 64 \
   --support_schedule_keys uniform,late_power_3,flowts_power_sampling,ays,gits,ots,ser_ptg_local_defect_eta005
 ```
 
@@ -78,6 +82,13 @@ Forecast examples can use the default uniform-anchored utility columns
 `u_crps_uniform,u_mase_uniform`. Other tasks can provide their own utility
 columns with `--teacher_metric_target_keys` and `--teacher_utility_weights`;
 GIPO only requires that larger utility means better downstream performance.
+Series identity is used for grouping, split diagnostics, and reporting only; it
+is not part of teacher or student conditioning.
+
+Canonical verification scripts train one 64-bin additive policy and report both
+seen-NFE locked and unseen-NFE locked student panels without locked-test
+selection. AdaLN is retained only as an explicit noncanonical sidecar with
+`--allow_noncanonical_conditioning`.
 
 Locked-test reporting is reporting-only. It applies the frozen density student to
 each locked-test context, derives a time grid by inverse CDF, evaluates that
@@ -93,7 +104,8 @@ genode-report-gipo-locked-test \
   --out_dir outputs/gipo_locked_report
 ```
 
-Teacher-oracle reporting is available for diagnosing the teacher/student gap:
+Teacher-oracle reporting remains available as a local diagnostic, but it is not
+part of the final canonical student-policy stream:
 
 ```bash
 genode-report-gipo-teacher-oracle \

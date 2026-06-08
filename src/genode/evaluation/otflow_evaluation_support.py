@@ -1164,6 +1164,7 @@ def evaluate_forecast_schedule(
     time_grid: Sequence[float],
     num_eval_samples: int,
     seed: int,
+    logical_seed: Optional[int] = None,
     target_nfe: Optional[int] = None,
     scheduler_key: str = "",
     dataset_key: str = "",
@@ -1184,12 +1185,14 @@ def evaluate_forecast_schedule(
     per_example_rows: List[Dict[str, Any]] = []
     context_embeddings: Dict[str, List[float]] = {}
     effective_batch_size = max(1, int(batch_size))
+    evaluation_seed = int(seed)
+    logical_panel_seed = int(evaluation_seed if logical_seed is None else logical_seed)
     if return_context_embeddings and hasattr(model, "eval"):
         model.eval()
     backup = _apply_sample_overrides(model, cfg, solver=str(solver_name), time_grid=tuple(float(x) for x in time_grid))
     try:
         selected_examples = (
-            choose_forecast_example_indices(ds, 0, int(seed))
+            choose_forecast_example_indices(ds, 0, int(logical_panel_seed))
             if example_indices is None
             else np.asarray([int(idx) for idx in example_indices], dtype=np.int64)
         )
@@ -1283,7 +1286,7 @@ def evaluate_forecast_schedule(
                             ]
                 chunk_draws: List[np.ndarray] = []
                 for sample_idx in range(int(num_eval_samples)):
-                    seed_all(int(seed) + 1_000_000 * int(chunk_start) + int(sample_idx))
+                    seed_all(int(evaluation_seed) + 1_000_000 * int(chunk_start) + int(sample_idx))
                     if device.type == "cuda" and torch.cuda.is_available():
                         torch.cuda.synchronize(device)
                     start = time.perf_counter()
@@ -1314,14 +1317,13 @@ def evaluate_forecast_schedule(
                         metadata = metadata_rows[row_idx]
                         context_id = chunk_context_ids[row_idx]
                         sample_seed_values = [
-                            int(seed) + 1_000_000 * int(chunk_start) + int(sample_idx)
+                            int(evaluation_seed) + 1_000_000 * int(chunk_start) + int(sample_idx)
                             for sample_idx in range(int(num_eval_samples))
                         ]
                         row_signature_payload = {
                             "context_id": str(context_id),
-                            "evaluation_protocol_hash": str(evaluation_protocol_hash),
+                            "logical_seed": int(logical_panel_seed),
                             "scheduler_key": str(scheduler_key),
-                            "seed": int(seed),
                             "solver_key": str(solver_name),
                             "target_nfe": int(resolved_target_nfe),
                         }
@@ -1332,7 +1334,9 @@ def evaluate_forecast_schedule(
                             {
                                 "dataset": str(metadata["dataset"]),
                                 "split_phase": str(metadata["split_phase"]),
-                                "seed": int(seed),
+                                "seed": int(logical_panel_seed),
+                                "logical_seed": int(logical_panel_seed),
+                                "evaluation_seed": int(evaluation_seed),
                                 "solver_key": str(solver_name),
                                 "target_nfe": int(resolved_target_nfe),
                                 "runtime_nfe": int(runtime_nfe),
@@ -1355,7 +1359,7 @@ def evaluate_forecast_schedule(
                                 "num_eval_samples": int(num_eval_samples),
                                 "eval_horizon": int(getattr(ds, "horizon", 1)),
                                 "batch_size": int(effective_batch_size),
-                                "sample_seed_start": int(sample_seed_values[0]) if sample_seed_values else int(seed),
+                                "sample_seed_start": int(sample_seed_values[0]) if sample_seed_values else int(evaluation_seed),
                                 "sample_seed_values_json": json.dumps(sample_seed_values, separators=(",", ":")),
                                 "chosen_examples_hash": str(chosen_examples_hash),
                                 "evaluation_protocol_hash": str(evaluation_protocol_hash),

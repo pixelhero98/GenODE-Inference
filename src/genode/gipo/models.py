@@ -11,8 +11,8 @@ SOLVER_TO_ID: Dict[str, int] = {"euler": 0, "heun": 1, "midpoint_rk2": 2, "dpmpp
 TARGET_NFES: Tuple[int, ...] = (4, 8, 12)
 DEFAULT_NFE_REFERENCE = 16
 SETTING_ENCODER_MODE_CONTINUOUS_V3 = "continuous_v3"
-SERIES_ENCODING_HASH_FOURIER_V1 = "hash_fourier_v1"
-DEFAULT_SERIES_ENCODING = SERIES_ENCODING_HASH_FOURIER_V1
+SERIES_ENCODING_NONE_CONTEXT_ONLY = "none_context_only"
+DEFAULT_SERIES_ENCODING = SERIES_ENCODING_NONE_CONTEXT_ONLY
 SOLVER_METADATA_VERSION = "solver_metadata_v1"
 
 
@@ -76,6 +76,16 @@ def validate_setting_encoder_mode(mode: str) -> str:
     return validate_setting_feature_mode(mode)
 
 
+def validate_series_encoding(value: str | None = None) -> str:
+    encoding = str(value or SERIES_ENCODING_NONE_CONTEXT_ONLY).strip()
+    if encoding != SERIES_ENCODING_NONE_CONTEXT_ONLY:
+        raise ValueError(
+            f"GIPO setting encoder requires series_encoding={SERIES_ENCODING_NONE_CONTEXT_ONLY!r}; "
+            f"got {encoding!r}."
+        )
+    return encoding
+
+
 def _positive_sorted_ints(values: Sequence[Any], *, label: str) -> Tuple[int, ...]:
     out = tuple(sorted({int(value) for value in values}))
     if not out or any(value <= 0 for value in out):
@@ -129,12 +139,13 @@ def build_setting_encoder_config(
         nfe_reference=reference,
         rope_frequencies=rope,
         solver_metadata_version=version,
-        series_encoding=str(series_encoding).strip() or SERIES_ENCODING_HASH_FOURIER_V1,
+        series_encoding=validate_series_encoding(series_encoding),
     )
 
 
 def setting_encoder_config_from_payload(payload: Mapping[str, Any] | SettingEncoderConfig | None) -> SettingEncoderConfig:
     if isinstance(payload, SettingEncoderConfig):
+        validate_series_encoding(payload.series_encoding)
         return payload
     data = dict(payload or {})
     mode = str(data.get("mode", data.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3)))

@@ -71,7 +71,7 @@ from genode.models.otflow_train_val import save_json
 from genode.runtime import resolve_torch_device
 from genode.gipo.policy import load_context_embedding_table, save_context_embedding_table
 
-RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_v3"
+RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_v4"
 DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
 DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = (4, 8, 12)
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
@@ -165,6 +165,8 @@ FORECAST_CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "dataset",
     "split_phase",
     "seed",
+    "logical_seed",
+    "evaluation_seed",
     "solver_key",
     "target_nfe",
     "runtime_nfe",
@@ -690,6 +692,7 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                             time_grid=details["time_grid"],
                             num_eval_samples=int(cli_args.num_eval_samples),
                             seed=int(eval_seed),
+                            logical_seed=int(seed),
                             scheduler_key=str(scheduler_key),
                             dataset_key=str(dataset),
                             split_phase=str(split_phase),

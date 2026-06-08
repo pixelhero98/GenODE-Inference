@@ -631,6 +631,82 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertEqual(run_for_phase("validation_tuning"), "val")
         self.assertEqual(run_for_phase("locked_test"), "test")
 
+    def test_forecast_phase_passes_logical_seed_separately_from_sampling_seed(self) -> None:
+        class FakeDataset:
+            def __len__(self) -> int:
+                return 10
+
+        fake_checkpoint = {
+            "model": object(),
+            "cfg": object(),
+            "splits": {"train": FakeDataset(), "val": FakeDataset(), "test": FakeDataset()},
+            "checkpoint_path": PROJECT_ROOT / "model.pt",
+            "checkpoint_id": "ck",
+            "backbone_name": "otflow",
+            "train_steps": 20000,
+            "train_budget_label": "20k",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "electricity",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--target_nfe_values",
+                    "4,8",
+                    "--solver_names",
+                    "euler",
+                    "--seeds",
+                    "5",
+                    "--split_phase",
+                    "validation_tuning",
+                    "--eval_windows_val",
+                    "1",
+                    "--backbone_manifest",
+                    str(PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"),
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            calls = []
+
+            def fake_eval(model, ds, cfg, **kwargs):
+                del model, ds, cfg
+                calls.append(dict(kwargs))
+                return {
+                    "crps": 1.0,
+                    "mse": 1.0,
+                    "mase": 1.0,
+                    "latency_ms_per_sample": 0.0,
+                    "num_eval_samples": 1,
+                    "eval_examples": 1,
+                    "eval_horizon": 168,
+                    "evaluation_protocol_hash": "protocol",
+                    "chosen_examples_hash": "examples",
+                    "realized_nfe": int(kwargs["target_nfe"]),
+                }
+
+            try:
+                with mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint), mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval):
+                    runner._run_forecast_phase(
+                        args,
+                        row_recorder=recorder,
+                        split_phase="validation_tuning",
+                        seeds=[5],
+                        scheduler_cases_by_dataset={"electricity": [{"scheduler_key": "uniform"}]},
+                    )
+            finally:
+                recorder["fh"].close()
+
+        self.assertEqual(
+            [(call["target_nfe"], call["seed"], call["logical_seed"]) for call in calls],
+            [(4, 5, 5), (8, 1005, 5)],
+        )
+
     def test_site_specific_ops_scripts_are_not_in_source_release(self) -> None:
         self.assertFalse((PROJECT_ROOT / "code" / "ops").exists())
         self.assertFalse(any(PROJECT_ROOT.glob("opsi*")))

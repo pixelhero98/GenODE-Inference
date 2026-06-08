@@ -36,6 +36,7 @@ from genode.gipo.policy import (
     MODEL_PAYLOAD_VERSION,
     STUDENT_TARGET_MODE_MARGIN_HARD_SOFT,
     STUDENT_TARGET_MODE_SOFT_MIXTURE,
+    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
     TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS,
     TEACHER_TEMPERATURE_MODE_FIXED,
     DensityFeatureNormalizer,
@@ -50,6 +51,8 @@ from genode.gipo.policy import (
     validate_gipo_conditioning_style,
     validate_gipo_density_token_attention,
     validate_gipo_teacher_output,
+    validate_gipo_teacher_training_metadata,
+    validate_teacher_checkpoint_selection_mode,
     validate_teacher_metric_target_keys,
 )
 from genode.gipo.report_locked_test import (
@@ -66,10 +69,13 @@ from genode.gipo.report_locked_test import (
     _read_csvs,
     _selection_split,
     _source_split_phase,
+    _teacher_final_retrain_metadata,
     _validate_context_rows,
 )
+from genode.gipo.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
 from genode.gipo.train_gipo import _load_schedule_summary_grids
 from genode.gipo.models import SETTING_ENCODER_MODE_CONTINUOUS_V3, setting_encoder_config_from_payload, setting_feature_dim, solver_macro_steps, validate_setting_feature_mode
+from genode.schedule_transfer.diffusion_flow_schedules import EXPERIMENTAL_FIXED_SCHEDULE_KEYS
 from genode.runtime import ProgressBar, resolve_torch_device
 
 GIPO_TEACHER_ORACLE_SCHEDULE_KEY = "gipo_teacher_oracle"
@@ -96,6 +102,8 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 def _load_teacher_checkpoint(
     path: str | Path,
+    *,
+    allow_noncanonical_conditioning: bool = False,
 ) -> Tuple[Any, Dict[str, int], EmbeddingNormalizer, DensityFeatureNormalizer, Tuple[float, ...], Dict[str, Any]]:
     payload = torch.load(resolve_project_path(str(path)), map_location="cpu")
     if str(payload.get("protocol", "")) != GIPO_PROTOCOL:
@@ -107,6 +115,7 @@ def _load_teacher_checkpoint(
         )
     if bool(payload.get("locked_test_used_for_selection", False)):
         raise ValueError("GIPO teacher checkpoint indicates locked_test was used for selection.")
+    validate_gipo_teacher_training_metadata(payload.get("teacher_training", {}) or {})
     density_meta = dict(payload.get("density_representation", {}))
     if str(density_meta.get("density_protocol", "")) != DENSITY_PROTOCOL:
         raise ValueError("GIPO teacher checkpoint is missing density_mass_v1 metadata.")
@@ -130,7 +139,11 @@ def _load_teacher_checkpoint(
             f"GIPO teacher checkpoints must use {ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1!r}; got {teacher_architecture!r}."
         )
     teacher_model_config = dict(payload.get("teacher_model_config", {}) or {})
-    validate_gipo_conditioning_style(teacher_model_config, require_present=True)
+    validate_gipo_conditioning_style(
+        teacher_model_config,
+        require_present=True,
+        allow_noncanonical=bool(allow_noncanonical_conditioning),
+    )
     validate_gipo_density_token_attention(teacher_model_config, require_present=True)
     validate_gipo_attention_heads(int(teacher_model_config.get("attention_heads", -1)))
     validate_gipo_teacher_output(teacher_model_config, require_present=True)
@@ -141,6 +154,7 @@ def _load_teacher_checkpoint(
         context_dim=int(payload["context_dim"]),
         num_series=len(series_index_map),
         model_config=teacher_model_config,
+        allow_noncanonical_conditioning=bool(allow_noncanonical_conditioning),
     )
     teacher.load_state_dict(payload["teacher_state"])
     teacher.eval()
@@ -166,15 +180,41 @@ def _group_support_rows(rows: Sequence[Mapping[str, Any]]) -> Dict[tuple[str, st
     return grouped
 
 
+def _validate_teacher_oracle_support_schedule_keys(keys: Sequence[str]) -> Tuple[str, ...]:
+    support_keys = tuple(str(key) for key in keys)
+    fixed = set(EXPERIMENTAL_FIXED_SCHEDULE_KEYS)
+    if not any(key in fixed for key in support_keys) or SER_PTG_SCHEDULE_KEY not in set(support_keys):
+        raise ValueError("Teacher-oracle support rows require fixed + SER support schedule keys.")
+    return support_keys
+
+
 def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
     teacher, series_index_map, embedding_normalizer, density_normalizer, reference_time_grid, checkpoint_payload = _load_teacher_checkpoint(
-        str(args.gipo_teacher_checkpoint)
+        str(args.gipo_teacher_checkpoint),
+        allow_noncanonical_conditioning=bool(getattr(args, "allow_noncanonical_conditioning", False)),
     )
     training_summary = json.loads(resolve_project_path(str(args.training_summary)).read_text(encoding="utf-8"))
     if str(training_summary.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError("training_summary protocol does not match GIPO.")
     if bool(training_summary.get("locked_test_used_for_selection", False)):
         raise ValueError("training_summary indicates locked_test was used for selection.")
+    required_checkpoint_selection_mode = str(getattr(args, "require_teacher_checkpoint_selection_mode", "") or "").strip()
+    if required_checkpoint_selection_mode:
+        required_checkpoint_selection_mode = validate_teacher_checkpoint_selection_mode(required_checkpoint_selection_mode)
+        actual_selection_mode = str(
+            checkpoint_payload.get("teacher_checkpoint_selection_mode")
+            or training_summary.get("teacher_checkpoint_selection_mode")
+            or ""
+        )
+        if actual_selection_mode != required_checkpoint_selection_mode:
+            raise ValueError(
+                f"GIPO teacher-oracle reporter requires teacher_checkpoint_selection_mode={required_checkpoint_selection_mode!r}; "
+                f"got {actual_selection_mode!r}."
+            )
+        if required_checkpoint_selection_mode == TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1:
+            final_retrain = _teacher_final_retrain_metadata(checkpoint_payload, training_summary)
+            if final_retrain.get("enabled") is not True:
+                raise ValueError("GIPO teacher-oracle reporter requires final teacher retrain metadata for weighted-normalized-regret checkpoints.")
 
     selection_mode = str(getattr(args, "selection_mode", SELECTION_MODE_REPORTING))
     split_phase = str(getattr(args, "split_phase", LOCKED_TEST_PHASE))
@@ -201,7 +241,9 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
     embeddings = embedding_normalizer.transform_table(raw_embeddings)
 
     schedule_grids = _load_schedule_summary_grids(_parse_csv(str(args.schedule_summary_json)))
-    support_keys = tuple(str(key) for key in training_summary.get("support_schedule_keys", checkpoint_payload.get("support_schedule_keys", [])))
+    support_keys = _validate_teacher_oracle_support_schedule_keys(
+        tuple(str(key) for key in training_summary.get("support_schedule_keys", checkpoint_payload.get("support_schedule_keys", [])))
+    )
     override_mode = str(getattr(args, "setting_feature_mode", "") or "").strip()
     if override_mode:
         requested_config = setting_encoder_config_from_payload({"mode": override_mode})
@@ -414,9 +456,12 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
         "mean_mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else None,
         "metric_means": _numeric_metric_means(aggregate_rows),
         "density_representation": checkpoint_payload.get("density_representation", {}),
+        "conditioning_style": dict(checkpoint_payload.get("teacher_model_config", {}) or {}).get("conditioning_style", ""),
         "setting_feature_mode": setting_feature_mode,
         "setting_encoder_mode": checkpoint_payload.get("setting_encoder_mode", ""),
         "setting_encoder_config": checkpoint_payload.get("setting_encoder_config", {}),
+        "teacher_checkpoint_selection_mode": checkpoint_payload.get("teacher_checkpoint_selection_mode", training_summary.get("teacher_checkpoint_selection_mode", "")),
+        "teacher_final_retrain": _teacher_final_retrain_metadata(checkpoint_payload, training_summary),
         "target_summary": target_summary,
         "locked_test_used_for_selection": False,
         "comparison_summary_path": "" if comparison is None else comparison_file,
@@ -434,6 +479,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--schedule_summary_json", default="", help="Comma-separated schedule summaries for non-fixed references such as SER.")
     parser.add_argument("--split_phase", default=LOCKED_TEST_PHASE)
     parser.add_argument("--selection_mode", choices=(SELECTION_MODE_REPORTING, SELECTION_MODE_CALIBRATION), default=SELECTION_MODE_REPORTING)
+    parser.add_argument("--require_teacher_checkpoint_selection_mode", default="")
+    parser.add_argument(
+        "--allow_noncanonical_conditioning",
+        action="store_true",
+        help="Explicitly allow noncanonical GIPO conditioning checkpoints for sidecar comparisons.",
+    )
     parser.add_argument("--report_label", default="teacher_oracle")
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--baseline_rows", default="")

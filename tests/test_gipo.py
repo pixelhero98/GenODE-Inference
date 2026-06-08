@@ -14,11 +14,16 @@ from genode.gipo.policy import (
     ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
     ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
     CONDITIONING_STYLE_ADALN_ZERO_V1,
+    CONDITIONING_STYLE_ADDITIVE_MLP_V1,
     DENSITY_TOKEN_ATTENTION_ROPE_V1,
     GIPO_PROTOCOL,
     GIPODensityFormTeacherTransformer,
     GIPODensityQueryStudentTransformer,
     MODEL_PAYLOAD_VERSION,
+    SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
+    STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+    STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
+    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
     TEACHER_METRIC_TARGET_KEYS,
     TEACHER_OUTPUT_METRIC_VECTOR_V1,
     TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
@@ -30,17 +35,23 @@ from genode.gipo.policy import (
     build_teacher_weighted_density_prediction_rows,
     build_teacher_weighted_density_targets,
     context_id_from_row,
+    density_family_for_schedule_key,
     density_sequence_smoothness_loss,
     gipo_teacher_diagnostics,
     density_mass_for_row,
+    nfe_sequence_diagnostic_summary,
+    logical_seed_from_row,
     predict_gipo_density,
     predict_gipo_density_many,
     save_context_embedding_table,
-    series_hash_fourier_features,
+    split_rows_by_density_family_holdout,
+    teacher_selection_candidate_group_key,
     student_nfe_sequence_pair_indices,
     student_nfe_sequence_pairs,
     train_gipo_student,
     train_gipo_teacher,
+    validate_density_family_holdout_schedule_keys,
+    validate_gipo_conditioning_style,
     validate_gipo_support_schedule_keys,
     validate_teacher_objective_hyperparameters,
     _apply_density_bin_rope,
@@ -135,6 +146,24 @@ def _teacher_training_payload() -> dict:
         "teacher_metric_targets": list(TEACHER_METRIC_TARGET_KEYS),
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
         "teacher_utility_weights": {"crps": 0.5, "mase": 0.5},
+        "teacher_checkpoint_selection": {
+            "selection_protocol": TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+            "selection_mode": TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+            "selection_metric": "weighted_normalized_regret_v1_score",
+            "selected_step": 1,
+            "uses_validation_labels": False,
+            "locked_test_used_for_selection": False,
+        },
+        "teacher_final_retrain": {
+            "enabled": True,
+            "selected_step": 1,
+            "locked_test_used_for_selection": False,
+        },
+        "final_teacher_retrain": {
+            "enabled": True,
+            "selected_step": 1,
+            "locked_test_used_for_selection": False,
+        },
     }
 
 
@@ -183,7 +212,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         continuous = setting_features("euler", 10, mode=SETTING_ENCODER_MODE_CONTINUOUS_V3, config=continuous_config)
 
         self.assertEqual(setting_feature_dim(SETTING_ENCODER_MODE_CONTINUOUS_V3, config=continuous_config), int(continuous.numel()))
-        self.assertEqual(continuous_config.to_payload()["series_encoding"], "hash_fourier_v1")
+        self.assertEqual(continuous_config.to_payload()["series_encoding"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
         rope = continuous[-4:].reshape(2, 2)
         self.assertTrue(torch.allclose(torch.sum(rope * rope, dim=1), torch.ones(2), atol=1e-6))
         self.assertEqual(continuous_config.to_payload()["rope_frequencies"], [1.0, 2.0])
@@ -197,14 +226,133 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "setting_feature_mode"):
             setting_features("euler", 6, mode="nfe_" + "sequence_v2", config=continuous_config)
 
-    def test_hash_fourier_series_features_are_not_ordinal(self) -> None:
-        first = _row(schedule="uniform", series_id="series_a", context_idx=0)
-        second = _row(schedule="uniform", series_id="series_a", context_idx=999)
-        third = _row(schedule="uniform", series_id="series_b", context_idx=1)
+    def test_series_identity_is_not_part_of_gipo_conditioning(self) -> None:
+        torch.manual_seed(21)
+        base = _row(schedule="uniform", series_id="series_a", context_idx=0)
+        changed = dict(base)
+        changed["series_id"] = "series_b"
+        changed["series_idx"] = 99
+        sx = torch.stack(
+            [
+                setting_features(base["solver_key"], base["target_nfe"], mode=SETTING_ENCODER_MODE_CONTINUOUS_V3),
+                setting_features(changed["solver_key"], changed["target_nfe"], mode=SETTING_ENCODER_MODE_CONTINUOUS_V3),
+            ]
+        )
+        series_idx = torch.tensor([0, 1], dtype=torch.long)
+        context = torch.tensor([[0.1, 0.2], [0.1, 0.2]], dtype=torch.float32)
+        density = torch.tensor([[1.0, 0.0, -0.5, -1.0], [1.0, 0.0, -0.5, -1.0]], dtype=torch.float32)
+        student = GIPODensityQueryStudentTransformer(setting_dim=int(sx.shape[1]), density_dim=4, context_dim=2, num_series=2, hidden_dim=16, hidden_layers=1, attention_heads=4, dropout=0.0)
+        teacher = GIPODensityFormTeacherTransformer(setting_dim=int(sx.shape[1]), density_dim=4, context_dim=2, num_series=2, hidden_dim=16, hidden_layers=1, attention_heads=4, dropout=0.0)
+        student.eval()
+        teacher.eval()
 
-        self.assertEqual(series_hash_fourier_features(first), series_hash_fourier_features(second))
-        self.assertNotEqual(series_hash_fourier_features(first), series_hash_fourier_features(third))
-        self.assertEqual(len(series_hash_fourier_features(first)), 9)
+        with torch.no_grad():
+            student_logits = student.logits(sx, series_idx, context, rows=[base, changed])
+            teacher_scores = teacher(sx, density, series_idx, context, rows=[base, changed])
+
+        self.assertTrue(torch.allclose(student_logits[0], student_logits[1], atol=1e-6))
+        self.assertTrue(torch.allclose(teacher_scores[0], teacher_scores[1], atol=1e-6))
+        self.assertEqual(student.model_config()["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
+        self.assertEqual(teacher.model_config()["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
+
+    def test_legacy_conditioning_style_is_rejected(self) -> None:
+        legacy_style = CONDITIONING_STYLE_ADALN_ZERO_V1
+        model_kwargs = {
+            "setting_dim": 2,
+            "density_dim": 4,
+            "context_dim": 2,
+            "num_series": 1,
+            "hidden_dim": 16,
+            "hidden_layers": 1,
+            "attention_heads": 4,
+            "dropout": 0.0,
+            "conditioning_style": legacy_style,
+        }
+
+        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+            validate_gipo_conditioning_style({"conditioning_style": legacy_style})
+        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+            GIPODensityQueryStudentTransformer(**model_kwargs)
+        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+            GIPODensityFormTeacherTransformer(**model_kwargs)
+        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+            build_gipo_student_model(
+                architecture=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+                setting_dim=2,
+                density_dim=4,
+                context_dim=2,
+                num_series=1,
+                model_config={"conditioning_style": legacy_style},
+            )
+        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+            build_gipo_teacher_model(
+                architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+                setting_dim=2,
+                density_dim=4,
+                context_dim=2,
+                num_series=1,
+                model_config={"conditioning_style": legacy_style},
+            )
+
+        self.assertEqual(
+            validate_gipo_conditioning_style(
+                {"conditioning_style": legacy_style},
+                allow_noncanonical=True,
+            ),
+            CONDITIONING_STYLE_ADALN_ZERO_V1,
+        )
+        student = GIPODensityQueryStudentTransformer(
+            **model_kwargs,
+            allow_noncanonical_conditioning=True,
+        )
+        teacher = GIPODensityFormTeacherTransformer(
+            **model_kwargs,
+            allow_noncanonical_conditioning=True,
+        )
+        self.assertEqual(student.model_config()["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+        self.assertEqual(teacher.model_config()["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+        built_student = build_gipo_student_model(
+            architecture=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+            setting_dim=2,
+            density_dim=4,
+            context_dim=2,
+            num_series=1,
+            model_config={"conditioning_style": legacy_style},
+            allow_noncanonical_conditioning=True,
+        )
+        built_teacher = build_gipo_teacher_model(
+            architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+            setting_dim=2,
+            density_dim=4,
+            context_dim=2,
+            num_series=1,
+            model_config={"conditioning_style": legacy_style},
+            allow_noncanonical_conditioning=True,
+        )
+        sx = torch.zeros(2, 2)
+        series_idx = torch.zeros(2, dtype=torch.long)
+        context = torch.ones(2, 2)
+        density = torch.zeros(2, 4)
+        with torch.no_grad():
+            self.assertEqual(built_student.logits(sx, series_idx, context).shape, (2, 4))
+            self.assertEqual(built_teacher(sx, density, series_idx, context).shape, (2, len(TEACHER_METRIC_TARGET_KEYS)))
+
+    def test_nfe_sequence_diagnostics_detect_multi_nfe_groups(self) -> None:
+        rows: list[dict] = []
+        for nfe in (4, 8, 12):
+            rows.extend(
+                [
+                    _row(schedule="uniform", context_idx=0, target_nfe=nfe, series_id="series_0"),
+                    _row(schedule="ays", context_idx=0, target_nfe=nfe, series_id="series_0"),
+                ]
+            )
+
+        summary = nfe_sequence_diagnostic_summary(rows)
+
+        self.assertEqual(summary["observed_target_nfes"], [4, 8, 12])
+        self.assertEqual(summary["nfe_sequence_pair_count"], 2)
+        self.assertEqual(summary["sequence_multi_nfe_group_count"], 1)
+        self.assertEqual(summary["physical_multi_nfe_group_count"], 1)
 
     def test_nfe_sequence_pairs_and_smoothness_loss_are_ordered_by_budget(self) -> None:
         rows: list[dict] = []
@@ -227,6 +375,27 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(student_nfe_sequence_pairs(sparse_rows), [(0, 1, 8.0)])
+
+    def test_nfe_sequence_pairs_use_logical_seed_not_sampling_seed(self) -> None:
+        rows: list[dict] = []
+        for target_nfe, evaluation_seed in ((4, 0), (8, 1000), (12, 2000)):
+            uniform = _row(schedule="uniform", seed=evaluation_seed, context_idx=0, target_nfe=target_nfe, series_id="series_0")
+            uniform["logical_seed"] = 0
+            uniform["evaluation_seed"] = evaluation_seed
+            uniform["parent_row_signature"] = f"solar_energy_10m|train_tuning|0|{target_nfe}|euler|uniform|ckpt"
+            rows.append(uniform)
+
+        self.assertEqual(logical_seed_from_row(rows[0]), 0)
+        self.assertEqual(rows[1]["seed"], 1000)
+        self.assertEqual(student_nfe_sequence_pair_indices(rows), [(0, 1), (1, 2)])
+
+        parent_only_rows: list[dict] = []
+        for target_nfe, evaluation_seed in ((4, 0), (8, 1000), (12, 2000)):
+            row = _row(schedule="uniform", seed=evaluation_seed, context_idx=1, target_nfe=target_nfe, series_id="series_1")
+            row["parent_row_signature"] = f"solar_energy_10m|train_tuning|2|{target_nfe}|euler|uniform|ckpt"
+            parent_only_rows.append(row)
+        self.assertEqual([logical_seed_from_row(row) for row in parent_only_rows], [2, 2, 2])
+        self.assertEqual(student_nfe_sequence_pairs(parent_only_rows), [(0, 1, 4.0), (1, 2, 4.0)])
 
     def test_density_query_student_conditions_without_cross_row_attention(self) -> None:
         torch.manual_seed(7)
@@ -252,6 +421,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             hidden_layers=1,
             attention_heads=4,
             dropout=0.0,
+            conditioning_style=CONDITIONING_STYLE_ADDITIVE_MLP_V1,
         )
         student.eval()
 
@@ -261,28 +431,10 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             changed_context = student.logits(sx[:1], series_idx[:1], context[1:2], rows=rows[:1])[0]
 
         self.assertTrue(torch.allclose(batch_first, single_first, atol=1e-6))
-        self.assertTrue(torch.allclose(single_first, changed_context, atol=1e-6))
+        self.assertFalse(torch.allclose(single_first, changed_context))
         self.assertEqual(student.architecture, ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1)
-        self.assertEqual(student.model_config()["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+        self.assertEqual(student.model_config()["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
         self.assertEqual(student.model_config()["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE_V1)
-        condition = student._condition_embedding(sx, series_idx, context, rows=rows)
-        modulation_chunks = student.blocks[0].adaLN_modulation(condition).chunk(6, dim=-1)
-        self.assertEqual([tuple(chunk.shape) for chunk in modulation_chunks], [(2, 16)] * 6)
-        for block in student.blocks:
-            self.assertTrue(torch.allclose(block.adaLN_modulation[-1].weight, torch.zeros_like(block.adaLN_modulation[-1].weight)))
-            self.assertTrue(torch.allclose(block.adaLN_modulation[-1].bias, torch.zeros_like(block.adaLN_modulation[-1].bias)))
-
-        hidden = int(student.hidden_dim)
-        with torch.no_grad():
-            for block in student.blocks:
-                final = block.adaLN_modulation[-1]
-                final.bias[2 * hidden : 3 * hidden].fill_(1.0)
-                final.weight[0:hidden, :].zero_()
-                for channel in range(hidden):
-                    final.weight[channel, channel] = 0.05
-            changed_context_after_modulation = student.logits(sx[:1], series_idx[:1], context[1:2], rows=rows[:1])[0]
-
-        self.assertFalse(torch.allclose(single_first, changed_context_after_modulation))
 
     def test_density_form_teacher_attends_density_bins_under_conditioning(self) -> None:
         torch.manual_seed(8)
@@ -290,7 +442,17 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             _row(schedule="uniform", context_idx=0, target_nfe=4, series_id="series_0"),
             _row(schedule="ays", context_idx=1, target_nfe=8, series_id="series_1"),
         ]
-        teacher = GIPODensityFormTeacherTransformer(setting_dim=2, density_dim=4, context_dim=2, num_series=2, hidden_dim=16, hidden_layers=1, attention_heads=4, dropout=0.0)
+        teacher = GIPODensityFormTeacherTransformer(
+            setting_dim=2,
+            density_dim=4,
+            context_dim=2,
+            num_series=2,
+            hidden_dim=16,
+            hidden_layers=1,
+            attention_heads=4,
+            dropout=0.0,
+            conditioning_style=CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+        )
         teacher.eval()
         setting = torch.tensor([[0.1, 0.2], [0.3, -0.1]], dtype=torch.float32)
         density = torch.tensor([[2.0, 0.0, -1.0, -2.0], [-2.0, -1.0, 0.0, 2.0]], dtype=torch.float32)
@@ -306,18 +468,82 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         self.assertTrue(torch.allclose(score_batch[0], score_single, atol=1e-6))
         self.assertFalse(torch.allclose(score_single, score_reversed_density))
         self.assertEqual(teacher.architecture, ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1)
-        self.assertEqual(teacher.model_config()["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+        self.assertEqual(teacher.model_config()["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
         self.assertEqual(teacher.model_config()["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE_V1)
         self.assertEqual(teacher.model_config()["teacher_output"], TEACHER_OUTPUT_METRIC_VECTOR_V1)
         self.assertEqual(teacher.model_config()["teacher_metric_targets"], list(TEACHER_METRIC_TARGET_KEYS))
         self.assertEqual(teacher.model_config()["teacher_scalarization"], TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1)
-        for block in teacher.blocks:
-            self.assertTrue(torch.allclose(block.adaLN_modulation[-1].weight, torch.zeros_like(block.adaLN_modulation[-1].weight)))
-            self.assertTrue(torch.allclose(block.adaLN_modulation[-1].bias, torch.zeros_like(block.adaLN_modulation[-1].bias)))
         identical_logits = torch.zeros(3, 4)
         rough_logits = torch.tensor([[4.0, 0.0, 0.0, 0.0], [0.0, 4.0, 0.0, 0.0], [0.0, 0.0, 4.0, 0.0]])
         self.assertAlmostEqual(float(density_sequence_smoothness_loss(identical_logits, [(0, 1), (1, 2)])), 0.0, places=6)
         self.assertGreater(float(density_sequence_smoothness_loss(rough_logits, [(0, 1), (1, 2)])), 0.0)
+
+    def test_additive_conditioning_changes_student_logits_immediately(self) -> None:
+        torch.manual_seed(18)
+        rows = [
+            _row(schedule="uniform", context_idx=0, target_nfe=4, series_id="series_0"),
+            _row(schedule="uniform", context_idx=1, target_nfe=4, series_id="series_0"),
+        ]
+        config = build_setting_encoder_config(
+            mode=SETTING_ENCODER_MODE_CONTINUOUS_V3,
+            observed_target_nfes=(4, 8, 12),
+            nfe_reference=12,
+            rope_frequencies=(1.0, 2.0),
+        )
+        sx = torch.stack([setting_features(row["solver_key"], row["target_nfe"], mode=SETTING_ENCODER_MODE_CONTINUOUS_V3, config=config) for row in rows])
+        series_idx = torch.tensor([0, 0], dtype=torch.long)
+        context = torch.tensor([[0.1, 0.2], [4.0, -3.0]], dtype=torch.float32)
+        student = GIPODensityQueryStudentTransformer(
+            setting_dim=int(sx.shape[1]),
+            density_dim=4,
+            context_dim=2,
+            num_series=1,
+            hidden_dim=16,
+            hidden_layers=1,
+            attention_heads=4,
+            dropout=0.0,
+            conditioning_style=CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+        )
+        student.eval()
+
+        with torch.no_grad():
+            batch_first = student.logits(sx, series_idx, context, rows=rows)[0]
+            single_first = student.logits(sx[:1], series_idx[:1], context[:1], rows=rows[:1])[0]
+            changed_context = student.logits(sx[:1], series_idx[:1], context[1:2], rows=rows[:1])[0]
+
+        self.assertTrue(torch.allclose(batch_first, single_first, atol=1e-6))
+        self.assertFalse(torch.allclose(single_first, changed_context))
+        self.assertEqual(student.model_config()["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+
+    def test_additive_conditioning_changes_teacher_score_immediately(self) -> None:
+        torch.manual_seed(19)
+        rows = [_row(schedule="uniform", context_idx=0, target_nfe=4, series_id="series_0")]
+        teacher = GIPODensityFormTeacherTransformer(
+            setting_dim=2,
+            density_dim=4,
+            context_dim=2,
+            num_series=1,
+            hidden_dim=16,
+            hidden_layers=1,
+            attention_heads=4,
+            dropout=0.0,
+            conditioning_style=CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+        )
+        teacher.eval()
+        setting = torch.tensor([[0.1, 0.2]], dtype=torch.float32)
+        density = torch.tensor([[2.0, 0.0, -1.0, -2.0]], dtype=torch.float32)
+        series = torch.tensor([0], dtype=torch.long)
+        context = torch.tensor([[0.5, -0.5]], dtype=torch.float32)
+        changed_context = torch.tensor([[3.0, -2.0]], dtype=torch.float32)
+
+        with torch.no_grad():
+            score = teacher(setting, density, series, context, rows=rows)[0]
+            changed_score = teacher(setting, density, series, changed_context, rows=rows)[0]
+            reversed_score = teacher(setting, torch.flip(density, dims=[1]), series, context, rows=rows)[0]
+
+        self.assertFalse(torch.allclose(score, changed_score))
+        self.assertFalse(torch.allclose(score, reversed_score))
+        self.assertEqual(teacher.model_config()["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
 
     def test_density_bin_rope_rotates_qk_by_bin_position(self) -> None:
         q = torch.zeros(1, 4, 1, 4)
@@ -344,18 +570,15 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             hidden_layers=1,
             attention_heads=4,
             dropout=0.0,
+            conditioning_style=CONDITIONING_STYLE_ADDITIVE_MLP_V1,
         )
         block = student.blocks[0]
         tokens = torch.randn(1, 4, 16)
-        condition = torch.randn(1, 16)
-        hidden = int(student.hidden_dim)
-        with torch.no_grad():
-            block.adaLN_modulation[-1].bias[2 * hidden : 3 * hidden].fill_(1.0)
 
         with torch.no_grad():
-            with_rope = block(tokens, condition)
+            with_rope = block(tokens)
             with mock.patch("genode.gipo.policy._apply_density_bin_rope", lambda x: x):
-                without_rope = block(tokens, condition)
+                without_rope = block(tokens)
 
         self.assertFalse(torch.allclose(with_rope, without_rope))
 
@@ -445,6 +668,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             lr=1e-3,
             diagnostic_splits={"context_disjoint": holdout_rows},
             teacher_checkpoint_every=1,
+            teacher_checkpoint_selection_mode=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
             allowed_schedule_keys=("uniform", "ays"),
         )
 
@@ -457,7 +681,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         self.assertGreater(summary["teacher_pair_count"], 0)
         self.assertIn("teacher_rank_loss", summary["losses"][-1])
         self.assertIn("teacher_huber_loss", summary["losses"][-1])
-        self.assertEqual(summary["teacher_checkpoint_selection"]["selection_metric"], "mean_context_series_total_loss")
+        self.assertEqual(summary["teacher_checkpoint_selection"]["selection_metric"], "weighted_normalized_regret_v1_score")
 
         diagnostics = gipo_teacher_diagnostics(
             teacher,
@@ -572,11 +796,129 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             lr=1e-3,
             teacher_temperature=0.05,
             series_unknown_dropout=0.0,
+            student_weight_decay=0.0,
         )
         self.assertEqual(student_summary["student_policy_type"], "continuous_density")
         self.assertEqual(student_summary["student_objective"], "teacher_weighted_density_mle_kl")
         self.assertEqual(student_summary["teacher_utility_weights"], {"crps": 0.5, "mase": 0.5})
+        self.assertEqual(student_summary["student_weight_decay"], 0.0)
         self.assertIn("student_kl_ce_loss", student_summary["losses"][-1])
+
+    def test_student_validation_checkpoint_selection_metadata(self) -> None:
+        torch.manual_seed(5)
+        reference = uniform_reference_grid(4)
+        ser_schedule_key = "ser_ptg_local_defect_eta005"
+        train_rows = [
+            _row(schedule="uniform", context_idx=0, series_id="series_0"),
+            _row(schedule=ser_schedule_key, context_idx=0, series_id="series_0"),
+        ]
+        validation_rows = [
+            _row(schedule="uniform", context_idx=1, series_id="series_0"),
+            _row(schedule=ser_schedule_key, context_idx=1, series_id="series_0"),
+        ]
+        schedule_grids = {
+            (ser_schedule_key, "euler", 4): (0.0, 0.7, 0.8, 0.9, 1.0),
+        }
+        embeddings = {
+            context_id_from_row(train_rows[0]): np.asarray([0.0, 0.0], dtype=np.float32),
+            context_id_from_row(validation_rows[0]): np.asarray([1.0, 0.0], dtype=np.float32),
+        }
+        series_map = build_series_index_map(train_rows)
+        normalizer = DensityFeatureNormalizer(
+            mean=np.zeros(4, dtype=np.float32),
+            std=np.ones(4, dtype=np.float32),
+        )
+        teacher = _LastBinTeacher()
+        student = GIPODensityQueryStudentTransformer(
+            setting_dim=int(setting_features("euler", 4).numel()),
+            density_dim=4,
+            context_dim=2,
+            num_series=len(series_map),
+            hidden_dim=16,
+            hidden_layers=1,
+            attention_heads=4,
+            dropout=0.0,
+        )
+
+        student_summary = train_gipo_student(
+            student,
+            teacher,
+            train_rows,
+            context_embeddings=embeddings,
+            series_index_map=series_map,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference,
+            density_normalizer=normalizer,
+            steps=3,
+            lr=1e-3,
+            teacher_temperature=0.05,
+            series_unknown_dropout=0.0,
+            student_weight_decay=0.0,
+            validation_rows=validation_rows,
+            student_log_every=1,
+            student_checkpoint_every=1,
+            student_checkpoint_selection_mode=STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+        )
+
+        selection = student_summary["student_checkpoint_selection"]
+        self.assertEqual(selection["selection_protocol"], STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1)
+        self.assertIn(selection["selected_step"], {1, 2, 3})
+        self.assertEqual(len(selection["history"]), 3)
+        self.assertFalse(selection["locked_test_used_for_selection"])
+        self.assertEqual(student_summary["student_checkpoint_selection_mode"], STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1)
+        self.assertTrue(student_summary["student_validation_used_for_selection"])
+        self.assertFalse(student_summary["locked_test_used_for_selection"])
+        self.assertEqual(student_summary["student_log_every"], 1)
+        self.assertEqual(student_summary["student_checkpoint_every"], 1)
+        self.assertIn("student_loss_tail_slope", student_summary)
+        self.assertEqual(
+            student_summary["student_validation_target_summary"]["student_validation_context_count"],
+            1,
+        )
+
+    def test_student_validation_checkpoint_selection_rejects_locked_rows(self) -> None:
+        reference = uniform_reference_grid(4)
+        rows = [
+            _row(schedule="uniform", context_idx=0, series_id="series_0"),
+            _row(schedule="ays", context_idx=0, series_id="series_0"),
+        ]
+        locked_validation = [
+            _row(schedule="uniform", context_idx=1, series_id="series_0", split_phase="locked_test"),
+            _row(schedule="ays", context_idx=1, series_id="series_0", split_phase="locked_test"),
+        ]
+        embeddings = {
+            context_id_from_row(rows[0]): np.asarray([0.0, 0.0], dtype=np.float32),
+            context_id_from_row(locked_validation[0]): np.asarray([1.0, 0.0], dtype=np.float32),
+        }
+        series_map = build_series_index_map(rows)
+        normalizer = DensityFeatureNormalizer(
+            mean=np.zeros(4, dtype=np.float32),
+            std=np.ones(4, dtype=np.float32),
+        )
+        student = GIPODensityQueryStudentTransformer(
+            setting_dim=int(setting_features("euler", 4).numel()),
+            density_dim=4,
+            context_dim=2,
+            num_series=len(series_map),
+            hidden_dim=16,
+            hidden_layers=1,
+            attention_heads=4,
+            dropout=0.0,
+        )
+        with self.assertRaisesRegex(ValueError, "locked_test"):
+            train_gipo_student(
+                student,
+                _LastBinTeacher(),
+                rows,
+                context_embeddings=embeddings,
+                series_index_map=series_map,
+                schedule_grids={},
+                reference_time_grid=reference,
+                density_normalizer=normalizer,
+                steps=1,
+                validation_rows=locked_validation,
+                student_checkpoint_selection_mode=STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+            )
 
     def test_student_training_can_apply_nfe_sequence_smoothness(self) -> None:
         torch.manual_seed(3)
@@ -691,25 +1033,6 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             places=5,
         )
         self.assertEqual(student_summary["student_pseudo_target_summary"]["pseudo_target_nfes"], [6])
-
-    def test_pseudo_target_validation_rejects_non_train_tuning_rows(self) -> None:
-        from genode.gipo.train_gipo import _validate_student_pseudo_rows
-
-        fit_row = _row(schedule="uniform", context_idx=0, series_id="series_0", target_nfe=4)
-        pseudo_rows = [
-            _row(schedule="uniform", context_idx=0, series_id="series_0", target_nfe=6, split_phase="validation_tuning"),
-            _row(schedule="ays", context_idx=0, series_id="series_0", target_nfe=6, split_phase="validation_tuning"),
-        ]
-
-        with self.assertRaisesRegex(ValueError, "train_tuning"):
-            _validate_student_pseudo_rows(
-                pseudo_rows,
-                target_nfes=(6,),
-                measured_fit_nfes=(4,),
-                fit_context_ids=(context_id_from_row(fit_row),),
-                fit_series_keys=("series_0",),
-                support_schedule_keys=("uniform", "ays"),
-            )
 
     def test_margin_hard_soft_targets_copy_top_teacher_density(self) -> None:
         reference = uniform_reference_grid(4)
@@ -889,6 +1212,315 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "teacher_pair_margin"):
             validate_teacher_objective_hyperparameters(rank_temperature=0.5, regression_weight=0.25, pair_margin=-1.0)
 
+    def test_density_family_holdout_runs_after_reward_construction(self) -> None:
+        rows = [
+            _row(schedule="uniform", context_idx=0, crps=2.0, mase=2.0),
+            _row(schedule="ays", context_idx=0, crps=1.0, mase=1.2),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "after uniform-anchored reward construction"):
+            split_rows_by_density_family_holdout(
+                rows,
+                holdout_schedule_keys=("ays",),
+                support_schedule_keys=("uniform", "ays"),
+            )
+
+        rewarded = attach_uniform_gipo_rewards(rows, support_schedule_keys=("uniform", "ays"))
+        fit_rows, holdout_rows, metadata = split_rows_by_density_family_holdout(
+            rewarded,
+            holdout_schedule_keys=("ays",),
+            support_schedule_keys=("uniform", "ays"),
+        )
+
+        self.assertEqual([row["scheduler_key"] for row in fit_rows], ["uniform"])
+        self.assertEqual([row["scheduler_key"] for row in holdout_rows], ["ays"])
+        self.assertIn("gipo_reward_protocol", holdout_rows[0])
+        self.assertIn("u_comp_uniform", holdout_rows[0])
+        self.assertEqual(metadata["density_family_holdout_schedule_keys"], ["ays"])
+        self.assertEqual(metadata["density_family_fit_row_count"], 1)
+        self.assertEqual(metadata["density_family_holdout_row_count"], 1)
+
+    def test_density_family_holdout_refuses_uniform_anchor(self) -> None:
+        with self.assertRaisesRegex(ValueError, "uniform|reward anchor"):
+            validate_density_family_holdout_schedule_keys(
+                ("uniform",),
+                support_schedule_keys=("uniform", "ays"),
+            )
+
+    def test_weighted_normalized_regret_uses_j_cd_cdn_and_unseen_diagnostics(self) -> None:
+        from genode.gipo.train_gipo import _select_weighted_normalized_regret_step
+
+        def _training(split_regrets: dict[str, dict[int, float]]) -> dict:
+            steps = sorted({step for values in split_regrets.values() for step in values})
+            return {
+                "teacher_checkpoint_selection": {
+                    "history": [
+                        {
+                            "step": step,
+                            "selection_constraints_passed": True,
+                            "diagnostics": {
+                                split_name: {
+                                    "validation_soft_regret": float(values[step]),
+                                    "validation_top1_regret": float(values[step]),
+                                    "best_candidate_agreement": 1.0,
+                                    "spearman_rank_correlation": 1.0,
+                                    "rank_loss": float(values[step]),
+                                    "huber_loss": float(values[step]),
+                                    "total_loss": float(values[step]),
+                                    "complete_candidate_group_count": 1,
+                                }
+                                for split_name, values in split_regrets.items()
+                                if step in values
+                            },
+                        }
+                        for step in steps
+                    ]
+                }
+            }
+
+        selection = _select_weighted_normalized_regret_step(
+            context_density_training=_training(
+                {
+                    "context_disjoint": {1: 10.0, 2: 0.0, 3: 0.0},
+                    "density_family_holdout": {1: 10.0, 2: 0.0, 3: 0.0},
+                }
+            ),
+            unseen_nfe_training=_training({"unseen_nfe_holdout": {1: 0.0, 2: 1000.0, 3: 0.0}}),
+            component_weights={"context": 0.25, "density_family": 0.25, "unseen_nfe": 0.50},
+        )
+
+        self.assertEqual(selection["selection_protocol"], TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1)
+        self.assertEqual(selection["selected_step"], 3)
+        self.assertTrue(selection["uses_unseen_nfe_selection_diagnostics"])
+        self.assertEqual(
+            selection["selected_component_weights"],
+            {"context_disjoint": 0.25, "density_family_holdout": 0.25, "unseen_nfe_holdout": 0.5},
+        )
+        self.assertEqual(
+            selection["selected_normalized_regret_values"],
+            {"context_disjoint": 0.0, "density_family_holdout": 0.0, "unseen_nfe_holdout": 0.0},
+        )
+        by_step = {int(entry["step"]): entry for entry in selection["history"] if entry.get("selection_constraints_passed")}
+        self.assertAlmostEqual(by_step[1]["weighted_normalized_regret_v1_score"], 0.5)
+        self.assertAlmostEqual(by_step[2]["weighted_normalized_regret_v1_score"], 0.5)
+        self.assertAlmostEqual(by_step[3]["weighted_normalized_regret_v1_score"], 0.0)
+
+    def test_teacher_oracle_support_rows_require_fixed_and_ser_support(self) -> None:
+        from genode.gipo.report_teacher_oracle import _validate_teacher_oracle_support_schedule_keys
+
+        ser_key = "ser_ptg_local_defect_eta005"
+        self.assertEqual(
+            _validate_teacher_oracle_support_schedule_keys(("uniform", ser_key)),
+            ("uniform", ser_key),
+        )
+        with self.assertRaisesRegex(ValueError, "fixed \\+ SER"):
+            _validate_teacher_oracle_support_schedule_keys(("uniform",))
+        with self.assertRaisesRegex(ValueError, "fixed \\+ SER"):
+            _validate_teacher_oracle_support_schedule_keys((ser_key,))
+
+    def test_final_teacher_retrain_metadata_is_persisted(self) -> None:
+        def _fake_teacher_training(*args, **kwargs) -> dict:
+            del args
+            split_names = tuple(dict(kwargs.get("diagnostic_splits", {}) or {}))
+            history = [
+                {
+                    "step": step,
+                    "selection_constraints_passed": True,
+                    "diagnostics": {
+                        split_name: {
+                            "validation_soft_regret": regret,
+                            "validation_top1_regret": regret,
+                            "best_candidate_agreement": 1.0,
+                            "spearman_rank_correlation": 1.0,
+                            "rank_loss": regret,
+                            "huber_loss": regret,
+                            "total_loss": regret,
+                            "complete_candidate_group_count": 1,
+                        }
+                        for split_name in split_names
+                    },
+                }
+                for step, regret in ((1, 1.0), (2, 0.1))
+            ]
+            mode = str(kwargs.get("teacher_checkpoint_selection_mode", TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1))
+            return {
+                "teacher_objective": "pairwise_rank_plus_huber_regression",
+                "teacher_target": "metric_vector",
+                "teacher_metric_targets": list(TEACHER_METRIC_TARGET_KEYS),
+                "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
+                "teacher_utility_weights": {"crps": 0.5, "mase": 0.5},
+                "teacher_checkpoint_selection": {
+                    "selection_protocol": mode,
+                    "selection_mode": mode,
+                    "selection_metric": "mean_context_series_total_loss",
+                    "selected_step": int(kwargs.get("steps", 1)),
+                    "uses_validation_labels": False,
+                    "locked_test_used_for_selection": False,
+                    "history": history,
+                },
+            }
+
+        def _fake_student_training(*args, **kwargs) -> dict:
+            del args
+            mode = str(kwargs.get("student_checkpoint_selection_mode", STUDENT_CHECKPOINT_SELECTION_FINAL_STEP))
+            steps = int(kwargs.get("steps", 1))
+            selected_step = 2 if mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1 else steps
+            return {
+                "student_objective": "teacher_weighted_density_mle_kl",
+                "student_checkpoint_selection_mode": mode,
+                "student_checkpoint_selection": {
+                    "selection_protocol": mode,
+                    "selection_mode": mode,
+                    "selection_metric": "validation_ce_loss"
+                    if mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
+                    else "final_step",
+                    "selected_step": selected_step,
+                    "history": [
+                        {"step": 1, "validation_ce_loss": 1.0, "train_ce_loss": 1.0},
+                        {"step": 2, "validation_ce_loss": 0.5, "train_ce_loss": 0.4},
+                    ]
+                    if mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
+                    else [],
+                    "uses_validation_labels": False,
+                    "locked_test_used_for_selection": False,
+                },
+                "student_final_retrain": {"enabled": False},
+                "student_target_summary": {
+                    "teacher_temperature_mode": "fixed",
+                    "student_target_mode": "soft_mixture",
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            rows: list[dict] = []
+            unseen_rows: list[dict] = []
+            embeddings: dict[str, np.ndarray] = {}
+            unseen_embeddings: dict[str, np.ndarray] = {}
+            for context_idx in range(6):
+                series_id = f"series_{context_idx}"
+                for target_nfe in (4, 8, 12):
+                    for schedule, crps in (("uniform", 2.0), ("ays", 1.0 + 0.01 * context_idx)):
+                        row = _row(
+                            schedule=schedule,
+                            context_idx=context_idx,
+                            target_nfe=target_nfe,
+                            crps=crps,
+                            mase=crps,
+                            series_id=series_id,
+                        )
+                        rows.append(row)
+                        embeddings[context_id_from_row(row)] = np.asarray([float(context_idx), 1.0], dtype=np.float32)
+                for target_nfe in (6, 10, 14, 16):
+                    for schedule, crps in (("uniform", 2.1), ("ays", 1.1 + 0.01 * context_idx)):
+                        row = _row(
+                            schedule=schedule,
+                            context_idx=context_idx,
+                            target_nfe=target_nfe,
+                            crps=crps,
+                            mase=crps,
+                            series_id=series_id,
+                        )
+                        unseen_rows.append(row)
+                        unseen_embeddings[context_id_from_row(row)] = np.asarray([float(context_idx), 1.0], dtype=np.float32)
+            rows_path = root / "rows.csv"
+            embeddings_path = root / "embeddings.npz"
+            unseen_rows_path = root / "unseen_rows.csv"
+            unseen_embeddings_path = root / "unseen_embeddings.npz"
+            out_dir = root / "policy"
+            _write_rows_csv(rows_path, rows)
+            save_context_embedding_table(embeddings_path, embeddings)
+            _write_rows_csv(unseen_rows_path, unseen_rows)
+            save_context_embedding_table(unseen_embeddings_path, unseen_embeddings)
+            args = build_train_argparser().parse_args(
+                [
+                    "--rows_csv",
+                    str(rows_path),
+                    "--context_embeddings_npz",
+                    str(embeddings_path),
+                    "--out_dir",
+                    str(out_dir),
+                    "--support_schedule_keys",
+                    "uniform,ays",
+                    "--teacher_density_holdout_schedule_keys",
+                    "ays",
+                    "--teacher_unseen_selection_rows_csv",
+                    str(unseen_rows_path),
+                    "--teacher_unseen_selection_context_embeddings_npz",
+                    str(unseen_embeddings_path),
+                    "--context_sample_count",
+                    "6",
+                    "--context_holdout_fraction",
+                    "0.25",
+                    "--teacher_steps",
+                    "2",
+                    "--teacher_checkpoint_every",
+                    "1",
+                    "--student_steps",
+                    "3",
+                    "--student_checkpoint_selection",
+                    "validation_ce_v1",
+                    "--student_selection_holdout_fraction",
+                    "0.25",
+                    "--student_log_every",
+                    "1",
+                    "--student_checkpoint_every",
+                    "1",
+                    "--transformer_hidden_dim",
+                    "16",
+                    "--transformer_layers",
+                    "1",
+                    "--transformer_heads",
+                    "4",
+                    "--transformer_dropout",
+                    "0",
+                    "--student_weight_decay",
+                    "0",
+                    "--device",
+                    "cpu",
+                ]
+            )
+
+            with mock.patch("genode.gipo.train_gipo.train_gipo_teacher", side_effect=_fake_teacher_training) as teacher_mock:
+                with mock.patch("genode.gipo.train_gipo.train_gipo_student", side_effect=_fake_student_training) as student_mock:
+                    summary = train_gipo(args)
+
+            teacher_payload = torch.load(out_dir / "gipo_teacher.pt", map_location="cpu")
+            student_payload = torch.load(out_dir / "gipo_student.pt", map_location="cpu")
+
+            self.assertEqual(teacher_mock.call_count, 3)
+            self.assertEqual(student_mock.call_count, 2)
+            self.assertTrue(summary["teacher_final_retrain"]["enabled"])
+            self.assertTrue(summary["final_teacher_retrain"]["enabled"])
+            self.assertTrue(summary["student_final_retrain"]["enabled"])
+            self.assertEqual(summary["student_final_retrain"]["selected_step"], 2)
+            self.assertEqual(
+                summary["student_checkpoint_selection"]["selection_protocol"],
+                STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+            )
+            self.assertIn("student_selector_training", summary["student_training"])
+            self.assertTrue(summary["student_training"]["student_validation_used_for_selection"])
+            self.assertEqual(summary["teacher_final_retrain"]["selected_step"], 2)
+            self.assertEqual(
+                summary["teacher_checkpoint_selection"]["selection_protocol"],
+                TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+            )
+            for payload in (teacher_payload, student_payload):
+                self.assertTrue(payload["teacher_final_retrain"]["enabled"])
+                self.assertTrue(payload["final_teacher_retrain"]["enabled"])
+                self.assertTrue(payload["student_final_retrain"]["enabled"])
+                self.assertEqual(payload["student_final_retrain"]["selected_step"], 2)
+                self.assertTrue(payload["teacher_training"]["teacher_final_retrain"]["enabled"])
+                self.assertTrue(payload["teacher_training"]["final_teacher_retrain"]["enabled"])
+                self.assertEqual(
+                    payload["teacher_checkpoint_selection"]["selection_protocol"],
+                    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+                )
+                self.assertEqual(
+                    payload["teacher_training"]["teacher_checkpoint_selection"]["selection_protocol"],
+                    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+                )
+
     def test_gipo_trainer_refuses_locked_test_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -969,16 +1601,25 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             rows: list[dict] = []
+            unseen_rows: list[dict] = []
             embeddings: dict[str, np.ndarray] = {}
             for context_idx in range(8):
                 series_id = f"series_{context_idx // 2}"
-                for schedule, crps in (("uniform", 2.0), ("ays", 1.0 + 0.01 * context_idx)):
-                    row = _row(schedule=schedule, context_idx=context_idx, crps=crps, series_id=series_id)
-                    rows.append(row)
-                embeddings[context_id_from_row(rows[-1])] = np.asarray([float(context_idx), 1.0], dtype=np.float32)
+                for target_nfe in (4, 8, 12):
+                    for schedule, crps in (("uniform", 2.0), ("ays", 1.0 + 0.01 * context_idx)):
+                        row = _row(schedule=schedule, context_idx=context_idx, target_nfe=target_nfe, crps=crps, series_id=series_id)
+                        rows.append(row)
+                        embeddings[context_id_from_row(row)] = np.asarray([float(context_idx), 1.0], dtype=np.float32)
+                for target_nfe in (6, 10, 14, 16):
+                    for schedule, crps in (("uniform", 2.1), ("ays", 1.1 + 0.01 * context_idx)):
+                        row = _row(schedule=schedule, context_idx=context_idx, target_nfe=target_nfe, crps=crps, series_id=series_id)
+                        unseen_rows.append(row)
+                        embeddings[context_id_from_row(row)] = np.asarray([float(context_idx), 1.0], dtype=np.float32)
             rows_path = root / "rows.csv"
+            unseen_rows_path = root / "unseen_rows.csv"
             embeddings_path = root / "embeddings.npz"
             _write_rows_csv(rows_path, rows)
+            _write_rows_csv(unseen_rows_path, unseen_rows)
             save_context_embedding_table(embeddings_path, embeddings)
             args = build_train_argparser().parse_args(
                 [
@@ -991,7 +1632,13 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "--support_schedule_keys",
                     "uniform,ays",
                     "--context_sample_count",
-                    "8",
+                    "24",
+                    "--teacher_unseen_selection_rows_csv",
+                    str(unseen_rows_path),
+                    "--gipo_conditioning_style",
+                    CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+                    "--student_weight_decay",
+                    "0",
                     "--dry_run",
                 ]
             )
@@ -1002,33 +1649,104 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             self.assertEqual(summary["student_target_mode"], "soft_mixture")
             self.assertEqual(summary["teacher_architecture"], ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1)
             self.assertEqual(summary["student_architecture"], ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1)
+            self.assertEqual(summary["gipo_conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(summary["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(summary["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(summary["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
+            self.assertEqual(summary["teacher_model_config"]["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
+            self.assertEqual(summary["student_model_config"]["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
+            self.assertEqual(summary["series_unknown_dropout"], 0.0)
+            self.assertEqual(summary["student_weight_decay"], 0.0)
             self.assertEqual(summary["setting_feature_mode"], SETTING_ENCODER_MODE_CONTINUOUS_V3)
             self.assertEqual(summary["setting_encoder_mode"], SETTING_ENCODER_MODE_CONTINUOUS_V3)
+            self.assertIn("fit_rows", summary["nfe_sequence_diagnostics"])
             membership = summary["split_membership"]
-            self.assertEqual(set(membership), {"fit", "context_disjoint", "series_disjoint"})
+            self.assertTrue({"fit", "context_disjoint", "series_disjoint"}.issubset(set(membership)))
+            self.assertIn("density_family_holdout", membership)
             self.assertGreater(membership["fit"]["context_count"], 0)
             self.assertGreater(membership["context_disjoint"]["context_count"], 0)
             self.assertGreater(membership["series_disjoint"]["series_count"], 0)
             self.assertEqual(len(membership["fit"]["context_id_hash"]), 64)
             self.assertIn("context_ids", membership["context_disjoint"])
 
+            adaln_without_opt_in = build_train_argparser().parse_args(
+                [
+                    "--rows_csv",
+                    str(rows_path),
+                    "--context_embeddings_npz",
+                    str(embeddings_path),
+                    "--out_dir",
+                    str(root / "policy_adaln_rejected"),
+                    "--support_schedule_keys",
+                    "uniform,ays",
+                    "--teacher_unseen_selection_rows_csv",
+                    str(unseen_rows_path),
+                    "--gipo_conditioning_style",
+                    CONDITIONING_STYLE_ADALN_ZERO_V1,
+                    "--dry_run",
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "allow_noncanonical_conditioning"):
+                train_gipo(adaln_without_opt_in)
+
+            adaln_args = build_train_argparser().parse_args(
+                [
+                    "--rows_csv",
+                    str(rows_path),
+                    "--context_embeddings_npz",
+                    str(embeddings_path),
+                    "--out_dir",
+                    str(root / "policy_adaln"),
+                    "--support_schedule_keys",
+                    "uniform,ays",
+                    "--context_sample_count",
+                    "24",
+                    "--teacher_unseen_selection_rows_csv",
+                    str(unseen_rows_path),
+                    "--gipo_conditioning_style",
+                    CONDITIONING_STYLE_ADALN_ZERO_V1,
+                    "--allow_noncanonical_conditioning",
+                    "--student_weight_decay",
+                    "0",
+                    "--dry_run",
+                ]
+            )
+            adaln_summary = train_gipo(adaln_args)
+            self.assertEqual(adaln_summary["status"], "dry_run")
+            self.assertEqual(adaln_summary["gipo_conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertTrue(adaln_summary["noncanonical_conditioning_allowed"])
+            self.assertEqual(adaln_summary["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(adaln_summary["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+
     def test_gipo_trainer_accepts_custom_utility_metric_columns_without_forecast_rewards(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             rows: list[dict] = []
+            unseen_rows: list[dict] = []
             embeddings: dict[str, np.ndarray] = {}
             for context_idx in range(8):
                 series_id = f"series_{context_idx // 2}"
-                for schedule, utility in (("uniform", 0.0), ("ays", 0.25 + 0.01 * context_idx)):
-                    row = _row(schedule=schedule, context_idx=context_idx, series_id=series_id)
-                    row.pop("crps")
-                    row.pop("mase")
-                    row["u_custom_score"] = float(utility)
-                    rows.append(row)
-                    embeddings[context_id_from_row(row)] = np.asarray([float(context_idx), 1.0], dtype=np.float32)
+                for target_nfe in (4, 8, 12):
+                    for schedule, utility in (("uniform", 0.0), ("ays", 0.25 + 0.01 * context_idx)):
+                        row = _row(schedule=schedule, context_idx=context_idx, target_nfe=target_nfe, series_id=series_id)
+                        row.pop("crps")
+                        row.pop("mase")
+                        row["u_custom_score"] = float(utility)
+                        rows.append(row)
+                        embeddings[context_id_from_row(row)] = np.asarray([float(context_idx), 1.0], dtype=np.float32)
+                for target_nfe in (6, 10, 14, 16):
+                    for schedule, utility in (("uniform", 0.0), ("ays", 0.20 + 0.01 * context_idx)):
+                        row = _row(schedule=schedule, context_idx=context_idx, target_nfe=target_nfe, series_id=series_id)
+                        row.pop("crps")
+                        row.pop("mase")
+                        row["u_custom_score"] = float(utility)
+                        unseen_rows.append(row)
+                        embeddings[context_id_from_row(row)] = np.asarray([float(context_idx), 1.0], dtype=np.float32)
             rows_path = root / "rows.csv"
+            unseen_rows_path = root / "unseen_rows.csv"
             embeddings_path = root / "embeddings.npz"
             _write_rows_csv(rows_path, rows)
+            _write_rows_csv(unseen_rows_path, unseen_rows)
             save_context_embedding_table(embeddings_path, embeddings)
             args = build_train_argparser().parse_args(
                 [
@@ -1041,7 +1759,9 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "--support_schedule_keys",
                     "uniform,ays",
                     "--context_sample_count",
-                    "8",
+                    "24",
+                    "--teacher_unseen_selection_rows_csv",
+                    str(unseen_rows_path),
                     "--teacher_metric_target_keys",
                     "u_custom_score",
                     "--teacher_utility_weights",
@@ -1061,6 +1781,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             rows: list[dict] = []
+            unseen_rows: list[dict] = []
             embeddings: dict[str, np.ndarray] = {}
             for context_idx in range(8):
                 for target_nfe in (4, 8, 12):
@@ -1068,9 +1789,16 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                         row = _row(schedule=schedule, context_idx=context_idx, target_nfe=target_nfe, crps=crps, series_id=f"series_{context_idx // 2}")
                         rows.append(row)
                         embeddings[context_id_from_row(row)] = np.asarray([float(context_idx), 1.0], dtype=np.float32)
+                for target_nfe in (6, 10, 14, 16):
+                    for schedule, crps in (("uniform", 2.1), ("ays", 1.1 + 0.01 * context_idx)):
+                        row = _row(schedule=schedule, context_idx=context_idx, target_nfe=target_nfe, crps=crps, series_id=f"series_{context_idx // 2}")
+                        unseen_rows.append(row)
+                        embeddings[context_id_from_row(row)] = np.asarray([float(context_idx), 1.0], dtype=np.float32)
             rows_path = root / "rows.csv"
+            unseen_rows_path = root / "unseen_rows.csv"
             embeddings_path = root / "embeddings.npz"
             _write_rows_csv(rows_path, rows)
+            _write_rows_csv(unseen_rows_path, unseen_rows)
             save_context_embedding_table(embeddings_path, embeddings)
             args = build_train_argparser().parse_args(
                 [
@@ -1083,9 +1811,9 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "--support_schedule_keys",
                     "uniform,ays",
                     "--context_sample_count",
-                    "8",
-                    "--setting_encoder_mode",
-                    SETTING_ENCODER_MODE_CONTINUOUS_V3,
+                    "24",
+                    "--teacher_unseen_selection_rows_csv",
+                    str(unseen_rows_path),
                     "--dry_run",
                 ]
             )
@@ -1098,6 +1826,9 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             self.assertEqual(summary["setting_encoder_mode"], SETTING_ENCODER_MODE_CONTINUOUS_V3)
             self.assertEqual(summary["setting_encoder_config"]["observed_target_nfes"], [4, 8, 12])
             self.assertIn("rope_frequencies", summary["setting_encoder_config"])
+            fit_diag = summary["nfe_sequence_diagnostics"]["fit_rows"]
+            self.assertGreater(fit_diag["nfe_sequence_pair_count"], 0)
+            self.assertGreater(fit_diag["physical_multi_nfe_group_count"], 0)
 
     def test_student_checkpoint_roundtrip_uses_persisted_setting_encoder_config(self) -> None:
         from genode.gipo.report_locked_test import _load_student_checkpoint
@@ -1153,7 +1884,8 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             self.assertEqual(payload["student_architecture"], ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1)
             self.assertEqual(payload["setting_encoder_mode"], SETTING_ENCODER_MODE_CONTINUOUS_V3)
             self.assertEqual(payload["setting_encoder_config"]["rope_frequencies"], [1.0, 2.0])
-            self.assertEqual(payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(payload["student_model_config"]["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
             self.assertEqual(payload["student_model_config"]["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE_V1)
 
             bad_path = root / "bad_gipo_student.pt"
@@ -1165,10 +1897,61 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
 
             additive_path = root / "additive_gipo_student.pt"
             additive_payload = torch.load(checkpoint_path, map_location="cpu")
-            additive_payload["student_model_config"]["conditioning_style"] = "dit_" + "additive_v1"
+            additive_student = GIPODensityQueryStudentTransformer(
+                setting_dim=setting_dim,
+                density_dim=4,
+                context_dim=2,
+                num_series=1,
+                hidden_dim=16,
+                hidden_layers=1,
+                attention_heads=4,
+                dropout=0.0,
+                conditioning_style=CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+            )
+            additive_payload["student_model_config"] = additive_student.model_config()
+            additive_payload["student_state"] = additive_student.state_dict()
             torch.save(additive_payload, additive_path)
-            with self.assertRaisesRegex(ValueError, "adaln_zero_v1"):
-                _load_student_checkpoint(additive_path)
+            _, _, _, _, additive_loaded_payload = _load_student_checkpoint(additive_path)
+            self.assertEqual(additive_loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+
+            legacy_style_path = root / "legacy_gipo_student.pt"
+            legacy_style_payload = torch.load(checkpoint_path, map_location="cpu")
+            legacy_style_payload["student_model_config"]["conditioning_style"] = "ada" + "ln_zero_v1"
+            torch.save(legacy_style_payload, legacy_style_path)
+            with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+                _load_student_checkpoint(legacy_style_path)
+
+            adaln_path = root / "adaln_gipo_student.pt"
+            adaln_payload = torch.load(checkpoint_path, map_location="cpu")
+            adaln_student = GIPODensityQueryStudentTransformer(
+                setting_dim=setting_dim,
+                density_dim=4,
+                context_dim=2,
+                num_series=1,
+                hidden_dim=16,
+                hidden_layers=1,
+                attention_heads=4,
+                dropout=0.0,
+                conditioning_style=CONDITIONING_STYLE_ADALN_ZERO_V1,
+                allow_noncanonical_conditioning=True,
+            )
+            adaln_payload["student_model_config"] = adaln_student.model_config()
+            adaln_payload["student_state"] = adaln_student.state_dict()
+            torch.save(adaln_payload, adaln_path)
+            with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+                _load_student_checkpoint(adaln_path)
+            _, _, _, _, adaln_loaded_payload = _load_student_checkpoint(
+                adaln_path,
+                allow_noncanonical_conditioning=True,
+            )
+            self.assertEqual(adaln_loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+
+            unknown_style_path = root / "unknown_style_gipo_student.pt"
+            unknown_style_payload = torch.load(checkpoint_path, map_location="cpu")
+            unknown_style_payload["student_model_config"]["conditioning_style"] = "dit_" + "additive_v1"
+            torch.save(unknown_style_payload, unknown_style_path)
+            with self.assertRaisesRegex(ValueError, "conditioning_style"):
+                _load_student_checkpoint(unknown_style_path)
 
             additive_attention_path = root / "additive_attention_gipo_student.pt"
             additive_attention_payload = torch.load(checkpoint_path, map_location="cpu")
@@ -1197,6 +1980,15 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             torch.save(bad_heads_payload, bad_heads_path)
             with self.assertRaisesRegex(ValueError, "attention_heads=4"):
                 _load_student_checkpoint(bad_heads_path)
+
+            legacy_selection_path = root / "legacy_selection_gipo_student.pt"
+            legacy_selection_payload = torch.load(checkpoint_path, map_location="cpu")
+            legacy_selection_payload["teacher_training"]["teacher_checkpoint_selection"][
+                "selection_protocol"
+            ] = "diagnostic_" + "loss_v1"
+            torch.save(legacy_selection_payload, legacy_selection_path)
+            with self.assertRaisesRegex(ValueError, "weighted_normalized_regret_v1"):
+                _load_student_checkpoint(legacy_selection_path)
 
     def test_nondefault_transformer_architecture_roundtrips_from_checkpoint_config(self) -> None:
         from genode.gipo.report_locked_test import _load_student_checkpoint
@@ -1231,6 +2023,8 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                 "series_index_map": {"series_0": 0},
                 "embedding_normalizer": {"mean": [0.0, 0.0], "std": [1.0, 1.0]},
                 "density_representation": density_metadata(reference),
+                "teacher_training": _teacher_training_payload(),
+                "teacher_utility_weights": {"crps": 0.5, "mase": 0.5},
                 "locked_test_used_for_selection": False,
             }
             student_path = root / "student.pt"
@@ -1243,8 +2037,6 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
                     "student_model_config": student.model_config(),
                     "student_state": student.state_dict(),
-                    "teacher_training": _teacher_training_payload(),
-                    "teacher_utility_weights": {"crps": 0.5, "mase": 0.5},
                 },
                 student_path,
             )
@@ -1268,12 +2060,14 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             self.assertEqual(loaded_student.hidden_dim, 24)
             self.assertEqual(loaded_student.attention_heads, 4)
             self.assertEqual(student_payload["student_model_config"]["hidden_dim"], 24)
-            self.assertEqual(student_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(student_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(student_payload["student_model_config"]["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
             self.assertEqual(student_payload["student_model_config"]["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE_V1)
             self.assertEqual(loaded_teacher.hidden_dim, 28)
             self.assertEqual(loaded_teacher.attention_heads, 4)
             self.assertEqual(teacher_payload["teacher_model_config"]["hidden_dim"], 28)
-            self.assertEqual(teacher_payload["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(teacher_payload["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(teacher_payload["teacher_model_config"]["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
             self.assertEqual(teacher_payload["teacher_model_config"]["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE_V1)
             self.assertEqual(teacher_payload["teacher_model_config"]["teacher_output"], TEACHER_OUTPUT_METRIC_VECTOR_V1)
             self.assertEqual(teacher_payload["teacher_model_config"]["teacher_metric_targets"], list(TEACHER_METRIC_TARGET_KEYS))
@@ -1329,6 +2123,8 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                         std=np.ones(4, dtype=np.float32),
                     ).to_payload(),
                     "density_representation": density_metadata(reference),
+                    "teacher_training": _teacher_training_payload(),
+                    "teacher_utility_weights": {"crps": 0.5, "mase": 0.5},
                     "locked_test_used_for_selection": False,
                 },
                 checkpoint_path,
@@ -1337,7 +2133,8 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             self.assertEqual(loaded_teacher.setting_dim, setting_dim)
             self.assertEqual(payload["teacher_architecture"], ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1)
             self.assertEqual(payload["setting_encoder_mode"], SETTING_ENCODER_MODE_CONTINUOUS_V3)
-            self.assertEqual(payload["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(payload["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(payload["teacher_model_config"]["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
             self.assertEqual(payload["teacher_model_config"]["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE_V1)
             self.assertEqual(payload["teacher_model_config"]["teacher_output"], TEACHER_OUTPUT_METRIC_VECTOR_V1)
             self.assertEqual(payload["teacher_model_config"]["teacher_metric_targets"], list(TEACHER_METRIC_TARGET_KEYS))
@@ -1352,10 +2149,61 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
 
             additive_path = root / "additive_gipo_teacher.pt"
             additive_payload = torch.load(checkpoint_path, map_location="cpu")
-            additive_payload["teacher_model_config"]["conditioning_style"] = "dit_" + "additive_v1"
+            additive_teacher = GIPODensityFormTeacherTransformer(
+                setting_dim=setting_dim,
+                density_dim=4,
+                context_dim=2,
+                num_series=1,
+                hidden_dim=16,
+                hidden_layers=1,
+                attention_heads=4,
+                dropout=0.0,
+                conditioning_style=CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+            )
+            additive_payload["teacher_model_config"] = additive_teacher.model_config()
+            additive_payload["teacher_state"] = additive_teacher.state_dict()
             torch.save(additive_payload, additive_path)
-            with self.assertRaisesRegex(ValueError, "adaln_zero_v1"):
-                _load_teacher_checkpoint(additive_path)
+            _, _, _, _, _, additive_loaded_payload = _load_teacher_checkpoint(additive_path)
+            self.assertEqual(additive_loaded_payload["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+
+            legacy_style_path = root / "legacy_gipo_teacher.pt"
+            legacy_style_payload = torch.load(checkpoint_path, map_location="cpu")
+            legacy_style_payload["teacher_model_config"]["conditioning_style"] = "ada" + "ln_zero_v1"
+            torch.save(legacy_style_payload, legacy_style_path)
+            with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+                _load_teacher_checkpoint(legacy_style_path)
+
+            adaln_path = root / "adaln_gipo_teacher.pt"
+            adaln_payload = torch.load(checkpoint_path, map_location="cpu")
+            adaln_teacher = GIPODensityFormTeacherTransformer(
+                setting_dim=setting_dim,
+                density_dim=4,
+                context_dim=2,
+                num_series=1,
+                hidden_dim=16,
+                hidden_layers=1,
+                attention_heads=4,
+                dropout=0.0,
+                conditioning_style=CONDITIONING_STYLE_ADALN_ZERO_V1,
+                allow_noncanonical_conditioning=True,
+            )
+            adaln_payload["teacher_model_config"] = adaln_teacher.model_config()
+            adaln_payload["teacher_state"] = adaln_teacher.state_dict()
+            torch.save(adaln_payload, adaln_path)
+            with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+                _load_teacher_checkpoint(adaln_path)
+            _, _, _, _, _, adaln_loaded_payload = _load_teacher_checkpoint(
+                adaln_path,
+                allow_noncanonical_conditioning=True,
+            )
+            self.assertEqual(adaln_loaded_payload["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+
+            unknown_style_path = root / "unknown_style_gipo_teacher.pt"
+            unknown_style_payload = torch.load(checkpoint_path, map_location="cpu")
+            unknown_style_payload["teacher_model_config"]["conditioning_style"] = "dit_" + "additive_v1"
+            torch.save(unknown_style_payload, unknown_style_path)
+            with self.assertRaisesRegex(ValueError, "conditioning_style"):
+                _load_teacher_checkpoint(unknown_style_path)
 
             additive_attention_path = root / "additive_attention_gipo_teacher.pt"
             additive_attention_payload = torch.load(checkpoint_path, map_location="cpu")
@@ -1391,6 +2239,15 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             torch.save(scalar_output_payload, scalar_output_path)
             with self.assertRaisesRegex(ValueError, "teacher_output"):
                 _load_teacher_checkpoint(scalar_output_path)
+
+            legacy_selection_path = root / "legacy_selection_gipo_teacher.pt"
+            legacy_selection_payload = torch.load(checkpoint_path, map_location="cpu")
+            legacy_selection_payload["teacher_training"]["teacher_checkpoint_selection"][
+                "selection_protocol"
+            ] = "diagnostic_" + "loss_v1"
+            torch.save(legacy_selection_payload, legacy_selection_path)
+            with self.assertRaisesRegex(ValueError, "weighted_normalized_regret_v1"):
+                _load_teacher_checkpoint(legacy_selection_path)
 
     def test_locked_reporter_rejects_legacy_categorical_protocol(self) -> None:
         from genode.gipo.report_locked_test import (

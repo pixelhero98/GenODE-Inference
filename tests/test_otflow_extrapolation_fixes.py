@@ -248,6 +248,111 @@ class ExtrapolationFixesTest(unittest.TestCase):
         )
         self.assertEqual(metrics["eval_examples"], 4296)
 
+    def test_forecast_context_rows_keep_logical_and_sampling_seeds(self) -> None:
+        cfg = OTFlowConfig(
+            device=torch.device("cpu"),
+            levels=1,
+            token_dim=1,
+            history_len=2,
+            hidden_dim=8,
+            dropout=0.0,
+            ctx_heads=1,
+            ctx_layers=1,
+            use_amp=False,
+        )
+
+        class DummyDataset:
+            dataset_key = "electricity"
+            split_name = "validation_tuning"
+            horizon = 1
+
+            def __len__(self) -> int:
+                return 1
+
+            def __getitem__(self, idx: int):
+                del idx
+                return (
+                    torch.zeros(2, 1),
+                    torch.tensor([1.0]),
+                    {
+                        "series_id": "series_0",
+                        "series_idx": 0,
+                        "target_t": 42,
+                        "history_start": 40,
+                        "history_stop": 42,
+                    },
+                )
+
+            def denormalize_block(self, block, idx: int):
+                del idx
+                return np.asarray(block, dtype=np.float32)
+
+            def mase_denom(self, idx: int) -> float:
+                del idx
+                return 1.0
+
+        class DummyModel:
+            def __init__(self, cfg):
+                self.cfg = cfg
+
+            def sample_future(self, hist, steps=None, solver=None):
+                del steps, solver
+                return torch.zeros(hist.shape[0], 1, 1, device=hist.device)
+
+        context_rows = []
+        for target_nfe, evaluation_seed in ((4, 1003), (8, 2003), (12, 3003)):
+            metrics = evaluate_forecast_schedule(
+                DummyModel(cfg),
+                DummyDataset(),
+                cfg,
+                solver_name="euler",
+                runtime_nfe=target_nfe,
+                target_nfe=target_nfe,
+                time_grid=tuple(np.linspace(0.0, 1.0, target_nfe + 1).tolist()),
+                num_eval_samples=2,
+                seed=evaluation_seed,
+                logical_seed=3,
+                scheduler_key="uniform",
+                dataset_key="electricity",
+                split_phase="validation_tuning",
+                checkpoint_id="ck",
+                example_indices=np.asarray([0], dtype=np.int64),
+                return_per_example_rows=True,
+            )
+            row = metrics["per_example_rows"][0]
+            self.assertEqual(row["seed"], 3)
+            self.assertEqual(row["logical_seed"], 3)
+            self.assertEqual(row["evaluation_seed"], evaluation_seed)
+            self.assertEqual(row["sample_seed_start"], evaluation_seed)
+            self.assertEqual(json.loads(row["sample_seed_values_json"]), [evaluation_seed, evaluation_seed + 1])
+            context_rows.append(row)
+
+        self.assertEqual(len({row["row_signature"] for row in context_rows}), 3)
+
+        repeated = evaluate_forecast_schedule(
+            DummyModel(cfg),
+            DummyDataset(),
+            cfg,
+            solver_name="euler",
+            runtime_nfe=4,
+            target_nfe=4,
+            time_grid=tuple(np.linspace(0.0, 1.0, 5).tolist()),
+            num_eval_samples=1,
+            seed=9999,
+            logical_seed=3,
+            scheduler_key="uniform",
+            dataset_key="electricity",
+            split_phase="validation_tuning",
+            checkpoint_id="ck",
+            example_indices=np.asarray([0], dtype=np.int64),
+            return_per_example_rows=True,
+        )["per_example_rows"][0]
+        self.assertEqual(repeated["row_signature"], context_rows[0]["row_signature"])
+
+        from genode.gipo.policy import student_nfe_sequence_pairs
+
+        self.assertEqual(student_nfe_sequence_pairs(context_rows), [(0, 1, 4.0), (1, 2, 4.0)])
+
     def test_collect_forecast_calibration_handles_sample_seed_above_numpy_limit(self) -> None:
         cfg = OTFlowConfig(
             device=torch.device("cpu"),

@@ -1,0 +1,39 @@
+{
+  "archive_policy": "non_destructive_local_move",
+  "archived_script_roots": [
+    {
+      "archived_relative_path": "scripts/legacy_archive_20260608/verification_gipo_additive_locked_20260606",
+      "original_relative_path": "scripts/verification_gipo_additive_locked_20260606"
+    },
+    {
+      "archived_relative_path": "scripts/legacy_archive_20260608/verification_gipo_additive_locked_multiaxis_20260606",
+      "original_relative_path": "scripts/verification_gipo_additive_locked_multiaxis_20260606"
+    },
+    {
+      "archived_relative_path": "scripts/legacy_archive_20260608/verification_gipo_adaln_locked_multiaxis_ab_20260607",
+      "original_relative_path": "scripts/verification_gipo_adaln_locked_multiaxis_ab_20260607"
+    },
+    {
+      "archived_relative_path": "scripts/legacy_archive_20260608/verification_gipo_locked_multiaxis_b64_ab_20260607",
+      "original_relative_path": "scripts/verification_gipo_locked_multiaxis_b64_ab_20260607"
+    },
+    {
+      "archived_relative_path": "scripts/legacy_archive_20260608/verification_gipo_locked_multiaxis_b64_optim_20260607",
+      "original_relative_path": "scripts/verification_gipo_locked_multiaxis_b64_optim_20260607"
+    },
+    {
+      "archived_relative_path": "scripts/legacy_archive_20260608/verification_gipo_seen_ablation_20260606",
+      "original_relative_path": "scripts/verification_gipo_seen_ablation_20260606"
+    },
+    {
+      "archived_relative_path": "scripts/legacy_archive_20260608/verification_gipo_balanced_seen_multinfe_20260606",
+      "original_relative_path": "scripts/verification_gipo_balanced_seen_multinfe_20260606"
+    },
+    {
+      "archived_relative_path": "scripts/legacy_archive_20260608/verification_gipo_probe_2_6_20260606",
+      "original_relative_path": "scripts/verification_gipo_probe_2_6_20260606"
+    }
+  ],
+  "artifact": "legacy_gipo_script_archive_manifest",
+  "created_at_utc": "2026-06-08T10:19:22.1842363Z"
+}

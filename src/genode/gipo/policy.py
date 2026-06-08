@@ -28,7 +28,6 @@ from genode.gipo.density_representation import (
     validate_reference_grid,
 )
 from genode.gipo.models import (
-    SERIES_ENCODING_HASH_FOURIER_V1,
     SETTING_ENCODER_MODE_CONTINUOUS_V3,
     SettingEncoderConfig,
     setting_encoder_config_from_payload,
@@ -67,20 +66,37 @@ DEFAULT_TEACHER_MAX_TEMPERATURE = 1.0
 STUDENT_TARGET_MODE_SOFT_MIXTURE = "soft_mixture"
 STUDENT_TARGET_MODE_MARGIN_HARD_SOFT = "margin_hard_soft"
 DEFAULT_TEACHER_HARD_MARGIN = 0.05
-MODEL_PAYLOAD_VERSION = 3
+MODEL_PAYLOAD_VERSION = 4
 ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1 = "density_form_transformer_v1"
 ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1 = "density_query_transformer_v1"
+CONDITIONING_STYLE_ADDITIVE_MLP_V1 = "additive_mlp_v1"
 CONDITIONING_STYLE_ADALN_ZERO_V1 = "adaln_zero_v1"
+NONCANONICAL_CONDITIONING_STYLES: Tuple[str, ...] = (CONDITIONING_STYLE_ADALN_ZERO_V1,)
 DENSITY_TOKEN_ATTENTION_ROPE_V1 = "bin_self_attention_rope_v1"
 TEACHER_OUTPUT_METRIC_VECTOR_V1 = "metric_vector_v1"
 TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1 = "weighted_metric_average_v1"
 DEFAULT_TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = ("u_crps_uniform", "u_mase_uniform")
 TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = DEFAULT_TEACHER_METRIC_TARGET_KEYS
+TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1 = "weighted_normalized_regret_v1"
+DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
+STUDENT_CHECKPOINT_SELECTION_FINAL_STEP = "final_step"
+STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1 = "validation_ce_v1"
+DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
+DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS: Dict[str, float] = {
+    "context": 0.25,
+    "density_family": 0.25,
+    "unseen_nfe": 0.50,
+}
+DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS: Tuple[str, ...] = (
+    "flowts_power_sampling",
+    "flowts_power_sampling_reversed",
+)
 DEFAULT_TRANSFORMER_HIDDEN_DIM = 64
 DEFAULT_TRANSFORMER_LAYERS = 2
 DEFAULT_TRANSFORMER_HEADS = 4
 DEFAULT_TRANSFORMER_DROPOUT = 0.05
-SERIES_HASH_FOURIER_DIM = 9
+SERIES_CONDITIONING_NONE_CONTEXT_ONLY = "none_context_only"
+SERIES_CONDITIONING_DIM = 0
 
 
 def validate_gipo_architecture(value: str, *, role: str | None = None) -> str:
@@ -100,18 +116,78 @@ def validate_gipo_architecture(value: str, *, role: str | None = None) -> str:
     return arch
 
 
-def validate_gipo_conditioning_style(model_config: Mapping[str, Any] | None, *, require_present: bool = False) -> str:
+def validate_gipo_conditioning_style(
+    model_config: Mapping[str, Any] | None,
+    *,
+    require_present: bool = False,
+    allow_noncanonical: bool = False,
+) -> str:
     if not model_config or "conditioning_style" not in model_config:
         if require_present:
-            raise ValueError(f"GIPO density transformer checkpoints require conditioning_style={CONDITIONING_STYLE_ADALN_ZERO_V1!r}.")
-        return CONDITIONING_STYLE_ADALN_ZERO_V1
+            raise ValueError(
+                f"GIPO density transformer checkpoints require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP_V1!r}."
+            )
+        return CONDITIONING_STYLE_ADDITIVE_MLP_V1
     style = str(model_config["conditioning_style"]).strip()
-    if style != CONDITIONING_STYLE_ADALN_ZERO_V1:
+    if style == CONDITIONING_STYLE_ADDITIVE_MLP_V1:
+        return style
+    if allow_noncanonical and style in NONCANONICAL_CONDITIONING_STYLES:
+        return style
+    if style in NONCANONICAL_CONDITIONING_STYLES:
         raise ValueError(
-            f"GIPO density transformers require conditioning_style={CONDITIONING_STYLE_ADALN_ZERO_V1!r}; "
+            f"GIPO density transformers require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP_V1!r} by default; "
+            f"got noncanonical style {style!r}. Pass the explicit noncanonical opt-in to use it."
+        )
+    else:
+        raise ValueError(
+            f"GIPO density transformers require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP_V1!r}; "
             f"got {style!r}."
         )
-    return style
+
+
+def validate_teacher_checkpoint_selection_mode(value: str) -> str:
+    mode = str(value).strip() or DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE
+    allowed = {TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1}
+    if mode not in allowed:
+        raise ValueError(f"Unsupported teacher checkpoint selection mode {mode!r}; expected one of {sorted(allowed)}.")
+    return mode
+
+
+def validate_student_checkpoint_selection_mode(value: str) -> str:
+    mode = str(value).strip() or DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE
+    allowed = {
+        STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
+        STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+    }
+    if mode not in allowed:
+        raise ValueError(f"Unsupported student checkpoint selection mode {mode!r}; expected one of {sorted(allowed)}.")
+    return mode
+
+
+def validate_gipo_teacher_training_metadata(metadata: Mapping[str, Any] | None) -> Dict[str, Any]:
+    teacher_training = dict(metadata or {})
+    teacher_target = str(teacher_training.get("teacher_target", ""))
+    if teacher_target not in {"metric_vector", "metric_vector_uniform"}:
+        raise ValueError("GIPO checkpoint must come from a metric-vector teacher.")
+    teacher_metric_targets = validate_teacher_metric_target_keys(teacher_training.get("teacher_metric_targets", ()))
+    if str(teacher_training.get("teacher_scalarization", "")) != TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1:
+        raise ValueError(
+            f"GIPO checkpoint teacher_scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1!r}."
+        )
+    selection = dict(teacher_training.get("teacher_checkpoint_selection", {}) or {})
+    if str(selection.get("selection_protocol", "")) != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1:
+        raise ValueError(
+            f"GIPO checkpoints must use teacher checkpoint selection "
+            f"{TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1!r}."
+        )
+    if bool(selection.get("uses_validation_labels", False)):
+        raise ValueError("GIPO teacher checkpoint selection metadata must not use validation labels.")
+    return {
+        "teacher_target": teacher_target,
+        "teacher_metric_targets": teacher_metric_targets,
+        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
+        "teacher_checkpoint_selection": selection,
+    }
 
 
 def validate_gipo_density_token_attention(model_config: Mapping[str, Any] | None, *, require_present: bool = False) -> str:
@@ -152,6 +228,16 @@ def validate_gipo_attention_heads(attention_heads: int) -> int:
     if heads != DEFAULT_TRANSFORMER_HEADS:
         raise ValueError(f"GIPO density transformers require attention_heads={DEFAULT_TRANSFORMER_HEADS}; got {heads}.")
     return heads
+
+
+def validate_series_conditioning(value: str | None = None) -> str:
+    conditioning = str(value or SERIES_CONDITIONING_NONE_CONTEXT_ONLY).strip()
+    if conditioning != SERIES_CONDITIONING_NONE_CONTEXT_ONLY:
+        raise ValueError(
+            f"GIPO density transformers require series_conditioning={SERIES_CONDITIONING_NONE_CONTEXT_ONLY!r}; "
+            f"got {conditioning!r}."
+        )
+    return conditioning
 
 
 def _normalized_metric_weights(crps_weight: float, mase_weight: float) -> Tuple[float, float]:
@@ -423,6 +509,50 @@ def context_id_from_row(row: MetricRow) -> str:
     )
 
 
+def logical_seed_from_row(row: MetricRow) -> int | None:
+    explicit = row.get("logical_seed", "")
+    if explicit is not None and str(explicit).strip() != "":
+        return int(explicit)
+    parent = str(row.get("parent_row_signature", "") or "")
+    parts = parent.split("|")
+    if len(parts) >= 3:
+        try:
+            return int(parts[2])
+        except (TypeError, ValueError):
+            pass
+    return _optional_int(row.get("seed"))
+
+
+def evaluation_seed_from_row(row: MetricRow) -> int | None:
+    explicit = row.get("evaluation_seed", "")
+    if explicit is not None and str(explicit).strip() != "":
+        return int(explicit)
+    parent = str(row.get("parent_row_signature", "") or "")
+    parts = parent.split("|")
+    if len(parts) >= 3:
+        try:
+            return int(parts[2])
+        except (TypeError, ValueError):
+            pass
+    return _optional_int(row.get("seed"))
+
+
+def realized_nfe_from_row(row: MetricRow) -> int | None:
+    explicit = row.get("realized_nfe", "")
+    if explicit is not None and str(explicit).strip() != "":
+        return int(explicit)
+    actual = row.get("actual_nfe", "")
+    if actual is not None and str(actual).strip() != "":
+        return int(actual)
+    runtime = row.get("runtime_nfe", "")
+    if runtime is not None and str(runtime).strip() != "":
+        return int(runtime)
+    target = row.get("target_nfe", "")
+    if target is not None and str(target).strip() != "":
+        return int(target)
+    return None
+
+
 def series_key_from_row(row: MetricRow) -> str:
     series_id = str(row.get("series_id", "") or "").strip()
     if series_id:
@@ -434,7 +564,7 @@ def series_key_from_row(row: MetricRow) -> str:
 
 
 def context_pair_key(row: MetricRow, *, pair_on_seed: bool = True) -> ContextPairKey:
-    seed = _optional_int(row.get("seed")) if pair_on_seed else None
+    seed = logical_seed_from_row(row) if pair_on_seed else None
     return (
         str(row.get("dataset", row.get("dataset_key", ""))),
         str(row["solver_key"]),
@@ -444,10 +574,35 @@ def context_pair_key(row: MetricRow, *, pair_on_seed: bool = True) -> ContextPai
     )
 
 
+def teacher_selection_candidate_group_key(row: MetricRow) -> Tuple[str, str, int, int | None, int | None, int | None]:
+    return (
+        context_id_from_row(row),
+        str(row["solver_key"]),
+        int(row["target_nfe"]),
+        realized_nfe_from_row(row),
+        logical_seed_from_row(row),
+        evaluation_seed_from_row(row),
+    )
+
+
+complete_candidate_group_key = teacher_selection_candidate_group_key
+
+
+def complete_candidate_group_payload(key: Tuple[str, str, int, int | None, int | None, int | None]) -> Dict[str, Any]:
+    return {
+        "context_id": str(key[0]),
+        "solver_key": str(key[1]),
+        "target_nfe": int(key[2]),
+        "realized_nfe": None if key[3] is None else int(key[3]),
+        "logical_seed": None if key[4] is None else int(key[4]),
+        "evaluation_seed": None if key[5] is None else int(key[5]),
+    }
+
+
 def _nfe_sequence_key(row: MetricRow) -> Tuple[str, int | None, str, str, str]:
     return (
         str(row.get("dataset", row.get("dataset_key", ""))),
-        _optional_int(row.get("seed")),
+        logical_seed_from_row(row),
         str(row["solver_key"]),
         context_id_from_row(row),
         series_key_from_row(row),
@@ -555,6 +710,53 @@ def density_sequence_roughness_summary(
     }
 
 
+def _physical_nfe_sequence_key(row: MetricRow) -> Tuple[Any, ...]:
+    return (
+        str(row.get("dataset", row.get("dataset_key", ""))),
+        str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))),
+        _optional_int(row.get("seed")),
+        str(row["solver_key"]),
+        row.get("example_idx", row.get("example_index", "")),
+        series_key_from_row(row),
+        row.get("target_t", ""),
+        _optional_int(row.get("history_start")),
+        _optional_int(row.get("history_stop")),
+    )
+
+
+def nfe_sequence_diagnostic_summary(rows: Sequence[MetricRow]) -> Dict[str, Any]:
+    sequence_groups: Dict[Tuple[str, int | None, str, str, str], set[int]] = defaultdict(set)
+    physical_groups: Dict[Tuple[Any, ...], set[int]] = defaultdict(set)
+    for row in rows:
+        nfe = int(row["target_nfe"])
+        sequence_groups[_nfe_sequence_key(row)].add(nfe)
+        physical_groups[_physical_nfe_sequence_key(row)].add(nfe)
+    sequence_nfe_sets: Dict[Tuple[int, ...], int] = defaultdict(int)
+    physical_nfe_sets: Dict[Tuple[int, ...], int] = defaultdict(int)
+    for nfes in sequence_groups.values():
+        sequence_nfe_sets[tuple(sorted(nfes))] += 1
+    for nfes in physical_groups.values():
+        physical_nfe_sets[tuple(sorted(nfes))] += 1
+    return {
+        "row_count": int(len(rows)),
+        "observed_target_nfes": sorted({int(row["target_nfe"]) for row in rows}),
+        "split_phases": sorted({str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) for row in rows}),
+        "nfe_sequence_pair_count": int(len(student_nfe_sequence_pairs(rows))),
+        "sequence_group_count": int(len(sequence_groups)),
+        "sequence_multi_nfe_group_count": int(sum(1 for nfes in sequence_groups.values() if len(nfes) > 1)),
+        "sequence_nfe_sets_top": [
+            {"nfes": list(nfes), "count": int(count)}
+            for nfes, count in sorted(sequence_nfe_sets.items(), key=lambda item: (-item[1], item[0]))[:8]
+        ],
+        "physical_group_count": int(len(physical_groups)),
+        "physical_multi_nfe_group_count": int(sum(1 for nfes in physical_groups.values() if len(nfes) > 1)),
+        "physical_nfe_sets_top": [
+            {"nfes": list(nfes), "count": int(count)}
+            for nfes, count in sorted(physical_nfe_sets.items(), key=lambda item: (-item[1], item[0]))[:8]
+        ],
+    }
+
+
 
 def validate_gipo_support_schedule_keys(
     support_schedule_keys: Sequence[str],
@@ -572,6 +774,90 @@ def validate_gipo_support_schedule_keys(
     if unsupported:
         raise ValueError(f"GIPO supervision is fixed/SER only; unsupported schedules: {unsupported}")
     return keys
+
+
+def density_family_for_schedule_key(schedule_key: str) -> str:
+    key = str(schedule_key).strip()
+    if key == UNIFORM_SCHEDULE_KEY:
+        return "uniform_anchor"
+    if key == SER_PTG_SCHEDULE_KEY:
+        return "ser_oracle"
+    suffix = "_reversed"
+    return key[: -len(suffix)] if key.endswith(suffix) else key
+
+
+def validate_density_family_holdout_schedule_keys(
+    holdout_schedule_keys: Sequence[str],
+    *,
+    support_schedule_keys: Sequence[str],
+) -> Tuple[str, ...]:
+    keys = tuple(str(key).strip() for key in holdout_schedule_keys if str(key).strip())
+    if not keys:
+        return ()
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicates:
+        raise ValueError(f"density-family holdout schedule keys must be unique; duplicates={duplicates}.")
+    if UNIFORM_SCHEDULE_KEY in keys:
+        raise ValueError("density-family holdout must not include uniform; uniform is the reward anchor.")
+    support = set(validate_gipo_support_schedule_keys(support_schedule_keys))
+    unsupported = sorted(set(keys) - support)
+    if unsupported:
+        raise ValueError(f"density-family holdout keys must be in support_schedule_keys; unsupported={unsupported}.")
+    return keys
+
+
+def split_rows_by_density_family_holdout(
+    rows: Sequence[MetricRow],
+    *,
+    holdout_schedule_keys: Sequence[str],
+    support_schedule_keys: Sequence[str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    keys = validate_density_family_holdout_schedule_keys(
+        holdout_schedule_keys,
+        support_schedule_keys=support_schedule_keys,
+    )
+    holdout_set = set(keys)
+    if holdout_set:
+        unrewarded_count = sum(
+            1
+            for row in rows
+            if str(row.get("gipo_reward_protocol", "")).strip() != GIPO_PROTOCOL
+            or "u_comp_uniform" not in row
+        )
+        if unrewarded_count:
+            raise ValueError(
+                "density-family holdout must run after uniform-anchored reward construction; "
+                f"found {unrewarded_count} unrewarded rows."
+            )
+    fit_rows: List[Dict[str, Any]] = []
+    holdout_rows: List[Dict[str, Any]] = []
+    missing_rewards = [
+        str(row["scheduler_key"])
+        for row in rows
+        if str(row["scheduler_key"]) in holdout_set
+        and ("gipo_reward_protocol" not in row or "u_comp_uniform" not in row)
+    ]
+    if missing_rewards:
+        raise ValueError(
+            "Density-family holdout must run after uniform-anchored reward construction; "
+            f"missing reward columns for schedules {sorted(set(missing_rewards))}."
+        )
+    for row in rows:
+        copied = dict(row)
+        schedule_key = str(copied["scheduler_key"])
+        copied["density_family"] = density_family_for_schedule_key(schedule_key)
+        if schedule_key in holdout_set:
+            holdout_rows.append(copied)
+        else:
+            fit_rows.append(copied)
+    metadata = {
+        "density_family_holdout_schedule_keys": list(keys),
+        "density_family_holdout_families": sorted({density_family_for_schedule_key(key) for key in keys}),
+        "density_family_holdout_row_count": int(len(holdout_rows)),
+        "density_family_fit_row_count": int(len(fit_rows)),
+        "reward_anchor_schedule_key": UNIFORM_SCHEDULE_KEY,
+    }
+    return fit_rows, holdout_rows, metadata
 
 
 def attach_uniform_gipo_rewards(
@@ -910,50 +1196,6 @@ def remapped_series_index(row: MetricRow, series_index_map: Mapping[str, int]) -
     return int(series_index_map[key])
 
 
-def _stable_unit_hash(text: str) -> float:
-    digest = hashlib.sha256(str(text).encode("utf-8")).digest()
-    return float(int.from_bytes(digest[:8], "big") / float(2**64 - 1))
-
-
-def series_hash_fourier_features(row: MetricRow | None = None, *, fallback_key: str = "") -> Tuple[float, ...]:
-    missing = 0.0
-    if row is not None:
-        dataset = str(row.get("dataset", row.get("dataset_key", ""))).strip()
-        series_id = str(row.get("series_id", "") or "").strip()
-        series_idx = str(row.get("series_idx", "") or "").strip()
-        if series_id:
-            key = f"{dataset}|series_id:{series_id}"
-        elif series_idx:
-            key = f"{dataset}|series_idx:{series_idx}"
-        else:
-            key = f"{dataset}|missing_series"
-            missing = 1.0
-    else:
-        key = str(fallback_key) or "missing_series"
-        missing = 1.0 if not str(fallback_key).strip() else 0.0
-    phase = 2.0 * math.pi * _stable_unit_hash(key)
-    values: List[float] = []
-    for frequency in (1.0, 2.0, 4.0, 8.0):
-        values.extend([math.sin(frequency * phase), math.cos(frequency * phase)])
-    values.append(float(missing))
-    return tuple(float(value) for value in values)
-
-
-def _series_feature_tensor(
-    series_index_batch: torch.Tensor,
-    *,
-    rows: Sequence[MetricRow] | None = None,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    if rows is not None:
-        features = [series_hash_fourier_features(row) for row in rows]
-    else:
-        values = [int(value) for value in series_index_batch.detach().cpu().reshape(-1).tolist()]
-        features = [series_hash_fourier_features(None, fallback_key=f"series_index:{value}") for value in values]
-    return torch.tensor(np.asarray(features, dtype=np.float32), dtype=dtype, device=device)
-
-
 def _student_target_representative_rows(rows: Sequence[MetricRow]) -> List[MetricRow]:
     return [group[0] for _, group in _student_target_groups(rows) if group]
 
@@ -1061,43 +1303,54 @@ class _DensityTokenRoPESelfAttention(nn.Module):
 
 
 class _DensityTokenTransformerBlock(nn.Module):
-    def __init__(self, *, hidden_dim: int, heads: int, dropout: float):
+    def __init__(self, *, hidden_dim: int, heads: int, dropout: float, conditioning_style: str):
         super().__init__()
         if int(hidden_dim) % int(heads) != 0:
             raise ValueError("Transformer hidden_dim must be divisible by attention heads.")
         hidden = int(hidden_dim)
-        self.norm1 = nn.LayerNorm(hidden, elementwise_affine=False)
+        self.conditioning_style = validate_gipo_conditioning_style(
+            {"conditioning_style": conditioning_style},
+            allow_noncanonical=True,
+        )
+        self.norm1 = nn.LayerNorm(hidden)
         self.attn = _DensityTokenRoPESelfAttention(hidden_dim=hidden, heads=int(heads), dropout=float(dropout))
-        self.norm2 = nn.LayerNorm(hidden, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(hidden)
         self.ff = nn.Sequential(
             nn.Linear(hidden, hidden * 4),
             nn.SiLU(),
             nn.Dropout(float(dropout)),
             nn.Linear(hidden * 4, hidden),
         )
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden, 6 * hidden),
-        )
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
         self.dropout = nn.Dropout(float(dropout))
+        self.adaln_modulation = None
+        if self.conditioning_style == CONDITIONING_STYLE_ADALN_ZERO_V1:
+            modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden, 6 * hidden))
+            nn.init.zeros_(modulation[-1].weight)
+            nn.init.zeros_(modulation[-1].bias)
+            self.adaln_modulation = modulation
 
     @staticmethod
     def _modulate(tokens: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         return tokens * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-    def forward(self, tokens: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, condition: torch.Tensor | None = None) -> torch.Tensor:
         if tokens.ndim != 3:
             raise ValueError("Density token attention expects a [batch, bins, hidden] tensor.")
-        if condition.ndim != 2 or condition.shape[0] != tokens.shape[0] or condition.shape[-1] != tokens.shape[-1]:
-            raise ValueError("AdaLN-Zero conditioning expects a [batch, hidden] tensor aligned with density tokens.")
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(condition).chunk(6, dim=-1)
-        normed = self._modulate(self.norm1(tokens), shift_msa, scale_msa)
-        attended = self.attn(normed)
-        tokens = tokens + gate_msa.unsqueeze(1) * self.dropout(attended)
-        ff_in = self._modulate(self.norm2(tokens), shift_mlp, scale_mlp)
-        tokens = tokens + gate_mlp.unsqueeze(1) * self.dropout(self.ff(ff_in))
+        if self.conditioning_style == CONDITIONING_STYLE_ADALN_ZERO_V1:
+            if condition is None or condition.ndim != 2 or condition.shape[0] != tokens.shape[0] or condition.shape[-1] != tokens.shape[-1]:
+                raise ValueError("AdaLN conditioning expects a [batch, hidden] tensor aligned with density tokens.")
+            if self.adaln_modulation is None:
+                raise RuntimeError("AdaLN modulation layer is not initialized.")
+            shift_attn, scale_attn, gate_attn, shift_ff, scale_ff, gate_ff = self.adaln_modulation(condition).chunk(6, dim=-1)
+            tokens = tokens + gate_attn.unsqueeze(1) * self.dropout(
+                self.attn(self._modulate(self.norm1(tokens), shift_attn, scale_attn))
+            )
+            tokens = tokens + gate_ff.unsqueeze(1) * self.dropout(
+                self.ff(self._modulate(self.norm2(tokens), shift_ff, scale_ff))
+            )
+            return tokens
+        tokens = tokens + self.dropout(self.attn(self.norm1(tokens)))
+        tokens = tokens + self.dropout(self.ff(self.norm2(tokens)))
         return tokens
 
 
@@ -1115,18 +1368,11 @@ class _DensityConditioningMixin:
             raise ValueError("setting_feature_batch must be 2D with setting_dim columns.")
         if context_embedding_batch.ndim != 2 or context_embedding_batch.shape[-1] != self.context_dim:
             raise ValueError("context_embedding_batch must be 2D with context_dim columns.")
-        if context_embedding_batch.shape[0] != batch or series_index_batch.reshape(-1).shape[0] != batch:
+        if context_embedding_batch.shape[0] != batch:
             raise ValueError("GIPO conditioning batches must share the same batch dimension.")
-        series_features = _series_feature_tensor(
-            series_index_batch,
-            rows=rows,
-            dtype=setting_feature_batch.dtype,
-            device=setting_feature_batch.device,
-        )
         z = torch.cat(
             [
                 setting_feature_batch,
-                series_features,
                 context_embedding_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype),
             ],
             dim=-1,
@@ -1135,8 +1381,17 @@ class _DensityConditioningMixin:
 
     def _encode_density_tokens(self, tokens: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
         out = tokens
-        for block in self.blocks:
-            out = block(out, condition)
+        if condition.ndim != 2 or condition.shape[0] != tokens.shape[0] or condition.shape[-1] != tokens.shape[-1]:
+            raise ValueError("GIPO conditioning expects a [batch, hidden] tensor aligned with density tokens.")
+        if self.conditioning_style == CONDITIONING_STYLE_ADDITIVE_MLP_V1:
+            out = out + condition.unsqueeze(1)
+            for block in self.blocks:
+                out = block(out)
+        elif self.conditioning_style == CONDITIONING_STYLE_ADALN_ZERO_V1:
+            for block in self.blocks:
+                out = block(out, condition)
+        else:
+            raise ValueError(f"Unsupported GIPO conditioning style {self.conditioning_style!r}.")
         return self.final_norm(out)
 
     def model_config(self) -> Dict[str, Any]:
@@ -1147,12 +1402,12 @@ class _DensityConditioningMixin:
             "context_dim": int(self.context_dim),
             "num_series": int(self.num_series),
             "series_feature_dim": int(self.series_feature_dim),
+            "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
             "hidden_dim": int(self.hidden_dim),
             "hidden_layers": int(self.hidden_layers),
             "attention_heads": int(self.attention_heads),
             "dropout": float(self.dropout_probability),
-            "series_encoding": SERIES_ENCODING_HASH_FOURIER_V1,
-            "conditioning_style": CONDITIONING_STYLE_ADALN_ZERO_V1,
+            "conditioning_style": self.conditioning_style,
             "density_token_attention": DENSITY_TOKEN_ATTENTION_ROPE_V1,
             "density_feature_mean": self.density_feature_mean.detach().cpu().numpy().astype(float).tolist()
             if hasattr(self, "density_feature_mean")
@@ -1184,11 +1439,13 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
         density_dim: int,
         context_dim: int,
         num_series: int,
-        series_feature_dim: int = SERIES_HASH_FOURIER_DIM,
+        series_feature_dim: int = SERIES_CONDITIONING_DIM,
         hidden_dim: int = DEFAULT_TRANSFORMER_HIDDEN_DIM,
         hidden_layers: int = DEFAULT_TRANSFORMER_LAYERS,
         attention_heads: int = DEFAULT_TRANSFORMER_HEADS,
         dropout: float = DEFAULT_TRANSFORMER_DROPOUT,
+        conditioning_style: str = CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+        allow_noncanonical_conditioning: bool = False,
         density_feature_mean: Sequence[float] | None = None,
         density_feature_std: Sequence[float] | None = None,
         teacher_metric_targets: Sequence[str] = TEACHER_METRIC_TARGET_KEYS,
@@ -1197,13 +1454,17 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
         self.setting_dim = int(setting_dim)
         self.density_dim = int(density_dim)
         self.context_dim = int(context_dim)
-        self.num_series = int(num_series)
-        self.unknown_series_index = int(num_series)
-        self.series_feature_dim = int(series_feature_dim)
+        self.num_series = 0
+        self.unknown_series_index = 0
+        self.series_feature_dim = SERIES_CONDITIONING_DIM
         self.hidden_dim = int(hidden_dim)
         self.hidden_layers = int(hidden_layers)
         self.attention_heads = validate_gipo_attention_heads(int(attention_heads))
         self.dropout_probability = float(dropout)
+        self.conditioning_style = validate_gipo_conditioning_style(
+            {"conditioning_style": conditioning_style},
+            allow_noncanonical=bool(allow_noncanonical_conditioning),
+        )
         self.teacher_metric_targets = validate_teacher_metric_target_keys(teacher_metric_targets)
         mean = np.zeros(int(density_dim), dtype=np.float32) if density_feature_mean is None else np.asarray(density_feature_mean, dtype=np.float32)
         std = np.ones(int(density_dim), dtype=np.float32) if density_feature_std is None else np.asarray(density_feature_std, dtype=np.float32)
@@ -1212,7 +1473,7 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
         std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
         self.register_buffer("density_feature_mean", torch.tensor(mean, dtype=torch.float32))
         self.register_buffer("density_feature_std", torch.tensor(std, dtype=torch.float32))
-        condition_dim = int(setting_dim) + int(context_dim) + int(series_feature_dim)
+        condition_dim = int(setting_dim) + int(context_dim)
         self.condition_mlp = nn.Sequential(
             nn.Linear(condition_dim, int(hidden_dim)),
             nn.SiLU(),
@@ -1222,7 +1483,12 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
         self.bin_geometry_proj = nn.Linear(2, int(hidden_dim))
         self.blocks = nn.ModuleList(
             [
-                _DensityTokenTransformerBlock(hidden_dim=int(hidden_dim), heads=int(self.attention_heads), dropout=float(dropout))
+                _DensityTokenTransformerBlock(
+                    hidden_dim=int(hidden_dim),
+                    heads=int(self.attention_heads),
+                    dropout=float(dropout),
+                    conditioning_style=self.conditioning_style,
+                )
                 for _ in range(int(hidden_layers))
             ]
         )
@@ -1279,24 +1545,30 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
         density_dim: int,
         context_dim: int,
         num_series: int,
-        series_feature_dim: int = SERIES_HASH_FOURIER_DIM,
+        series_feature_dim: int = SERIES_CONDITIONING_DIM,
         hidden_dim: int = DEFAULT_TRANSFORMER_HIDDEN_DIM,
         hidden_layers: int = DEFAULT_TRANSFORMER_LAYERS,
         attention_heads: int = DEFAULT_TRANSFORMER_HEADS,
         dropout: float = DEFAULT_TRANSFORMER_DROPOUT,
+        conditioning_style: str = CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+        allow_noncanonical_conditioning: bool = False,
     ):
         super().__init__()
         self.setting_dim = int(setting_dim)
         self.density_dim = int(density_dim)
         self.context_dim = int(context_dim)
-        self.num_series = int(num_series)
-        self.unknown_series_index = int(num_series)
-        self.series_feature_dim = int(series_feature_dim)
+        self.num_series = 0
+        self.unknown_series_index = 0
+        self.series_feature_dim = SERIES_CONDITIONING_DIM
         self.hidden_dim = int(hidden_dim)
         self.hidden_layers = int(hidden_layers)
         self.attention_heads = validate_gipo_attention_heads(int(attention_heads))
         self.dropout_probability = float(dropout)
-        condition_dim = int(setting_dim) + int(context_dim) + int(series_feature_dim)
+        self.conditioning_style = validate_gipo_conditioning_style(
+            {"conditioning_style": conditioning_style},
+            allow_noncanonical=bool(allow_noncanonical_conditioning),
+        )
+        condition_dim = int(setting_dim) + int(context_dim)
         self.condition_mlp = nn.Sequential(
             nn.Linear(condition_dim, int(hidden_dim)),
             nn.SiLU(),
@@ -1305,7 +1577,12 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
         self.query_proj = nn.Sequential(nn.Linear(2, int(hidden_dim)), nn.SiLU(), nn.Linear(int(hidden_dim), int(hidden_dim)))
         self.blocks = nn.ModuleList(
             [
-                _DensityTokenTransformerBlock(hidden_dim=int(hidden_dim), heads=int(self.attention_heads), dropout=float(dropout))
+                _DensityTokenTransformerBlock(
+                    hidden_dim=int(hidden_dim),
+                    heads=int(self.attention_heads),
+                    dropout=float(dropout),
+                    conditioning_style=self.conditioning_style,
+                )
                 for _ in range(int(hidden_layers))
             ]
         )
@@ -1364,10 +1641,15 @@ def build_gipo_teacher_model(
     context_dim: int,
     num_series: int,
     model_config: Mapping[str, Any] | None = None,
+    allow_noncanonical_conditioning: bool = False,
 ) -> nn.Module:
     validate_gipo_architecture(architecture, role="teacher")
     cfg = dict(model_config or {})
-    validate_gipo_conditioning_style(cfg)
+    conditioning_style = validate_gipo_conditioning_style(
+        cfg,
+        allow_noncanonical=bool(allow_noncanonical_conditioning),
+    )
+    validate_series_conditioning(cfg.get("series_conditioning"))
     validate_gipo_density_token_attention(cfg)
     validate_gipo_teacher_output(cfg, require_present=False)
     return GIPODensityFormTeacherTransformer(
@@ -1375,11 +1657,13 @@ def build_gipo_teacher_model(
         density_dim=int(density_dim),
         context_dim=int(context_dim),
         num_series=int(num_series),
-        series_feature_dim=int(cfg.get("series_feature_dim", SERIES_HASH_FOURIER_DIM)),
+        series_feature_dim=SERIES_CONDITIONING_DIM,
         hidden_dim=int(cfg.get("hidden_dim", DEFAULT_TRANSFORMER_HIDDEN_DIM)),
         hidden_layers=int(cfg.get("hidden_layers", cfg.get("transformer_layers", DEFAULT_TRANSFORMER_LAYERS))),
         attention_heads=validate_gipo_attention_heads(int(cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS))),
         dropout=float(cfg.get("dropout", DEFAULT_TRANSFORMER_DROPOUT)),
+        conditioning_style=conditioning_style,
+        allow_noncanonical_conditioning=bool(allow_noncanonical_conditioning),
         density_feature_mean=cfg.get("density_feature_mean"),
         density_feature_std=cfg.get("density_feature_std"),
         teacher_metric_targets=validate_teacher_metric_target_keys(cfg.get("teacher_metric_targets", TEACHER_METRIC_TARGET_KEYS)),
@@ -1394,21 +1678,28 @@ def build_gipo_student_model(
     context_dim: int,
     num_series: int,
     model_config: Mapping[str, Any] | None = None,
+    allow_noncanonical_conditioning: bool = False,
 ) -> nn.Module:
     validate_gipo_architecture(architecture, role="student")
     cfg = dict(model_config or {})
-    validate_gipo_conditioning_style(cfg)
+    conditioning_style = validate_gipo_conditioning_style(
+        cfg,
+        allow_noncanonical=bool(allow_noncanonical_conditioning),
+    )
+    validate_series_conditioning(cfg.get("series_conditioning"))
     validate_gipo_density_token_attention(cfg)
     return GIPODensityQueryStudentTransformer(
         setting_dim=int(setting_dim),
         density_dim=int(density_dim),
         context_dim=int(context_dim),
         num_series=int(num_series),
-        series_feature_dim=int(cfg.get("series_feature_dim", SERIES_HASH_FOURIER_DIM)),
+        series_feature_dim=SERIES_CONDITIONING_DIM,
         hidden_dim=int(cfg.get("hidden_dim", DEFAULT_TRANSFORMER_HIDDEN_DIM)),
         hidden_layers=int(cfg.get("hidden_layers", cfg.get("transformer_layers", DEFAULT_TRANSFORMER_LAYERS))),
         attention_heads=validate_gipo_attention_heads(int(cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS))),
         dropout=float(cfg.get("dropout", DEFAULT_TRANSFORMER_DROPOUT)),
+        conditioning_style=conditioning_style,
+        allow_noncanonical_conditioning=bool(allow_noncanonical_conditioning),
     )
 
 
@@ -1686,9 +1977,6 @@ def _teacher_training_tensors(
     pair_keys: List[ContextPairKey] = []
     schedule_keys: List[str] = []
     density_masses: List[Tuple[float, ...]] = []
-    rng = np.random.default_rng(int(seed))
-    unknown_index = int(len(series_index_map))
-    unknown_probability = min(1.0, max(0.0, float(series_unknown_probability)))
     for row in rows:
         context_id = context_id_from_row(row)
         if context_id not in context_embeddings:
@@ -1698,10 +1986,7 @@ def _teacher_training_tensors(
         mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
         setting_rows.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
         density_rows.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
-        series_idx = remapped_series_index(row, series_index_map)
-        if unknown_probability > 0.0 and rng.random() < unknown_probability:
-            series_idx = unknown_index
-        series_rows.append(series_idx)
+        series_rows.append(0)
         context_rows.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
         pair_keys.append(context_pair_key(row, pair_on_seed=True))
         schedule_keys.append(str(row["scheduler_key"]))
@@ -1737,6 +2022,8 @@ def gipo_teacher_diagnostics(
     setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     teacher_utility_weights: Mapping[str, float] | None = None,
+    complete_candidate_schedule_keys: Sequence[str] | None = None,
+    teacher_selection_temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
@@ -1746,9 +2033,15 @@ def gipo_teacher_diagnostics(
         regression_weight=regression_weight,
         pair_margin=pair_margin,
     )
+    selection_temperature = _finite_positive(teacher_selection_temperature, label="teacher_selection_temperature")
     contexts = {context_id_from_row(row) for row in rows}
     series_keys = {series_key_from_row(row) for row in rows}
     schedules = {str(row["scheduler_key"]) for row in rows}
+    expected_candidate_schedules = (
+        tuple(str(key) for key in complete_candidate_schedule_keys)
+        if complete_candidate_schedule_keys is not None
+        else tuple(sorted(schedules))
+    )
     fit_context_set = {str(value) for value in fit_context_ids}
     fit_series_set = {str(value) for value in fit_series_keys}
     base: Dict[str, Any] = {
@@ -1758,14 +2051,41 @@ def gipo_teacher_diagnostics(
         "series_count": int(len(series_keys)),
         "schedule_count": int(len(schedules)),
         "schedule_keys": sorted(schedules),
+        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "split_phases": sorted({str(row.get("split_phase", row.get("split", ""))) for row in rows}),
         "fit_context_overlap_count": int(len(contexts & fit_context_set)),
         "fit_series_overlap_count": int(len(series_keys & fit_series_set)),
         "setting_feature_mode": feature_mode,
         "uses_validation_labels": False,
+        "teacher_selection_temperature": float(selection_temperature),
+        "complete_candidate_group_key_schema": [
+            "context_id",
+            "solver_key",
+            "target_nfe",
+            "realized_nfe",
+            "logical_seed",
+            "evaluation_seed",
+        ],
+        "complete_candidate_schedule_keys": list(expected_candidate_schedules),
     }
     if not rows:
-        base.update({"rank_loss": None, "huber_loss": None, "total_loss": None, "pairwise_accuracy": None, "pair_count": 0, "spearman_rank_correlation": None})
+        base.update(
+            {
+                "rank_loss": None,
+                "huber_loss": None,
+                "total_loss": None,
+                "pairwise_accuracy": None,
+                "pair_count": 0,
+                "spearman_rank_correlation": None,
+                "best_candidate_agreement": None,
+                "candidate_group_count": 0,
+                "complete_candidate_group_count": 0,
+                "soft_regret": None,
+                "top1_regret": None,
+                "validation_soft_regret": None,
+                "validation_top1_regret": None,
+            }
+        )
         return base
     teacher_metric_target_keys = teacher_metric_target_keys_for_model(teacher)
     was_training = bool(teacher.training)
@@ -1794,15 +2114,15 @@ def gipo_teacher_diagnostics(
         targets = _scalarize_teacher_metric_values(metric_targets, target_weights, target_keys=teacher_metric_target_keys)
         if not pair_on_seed:
             pair_keys = [key[:4] + (None,) for key in pair_keys]
-        left, right, sign = _pair_indices(targets, pair_keys, margin=float(pair_margin), device=sx.device)
+        rank_left, rank_right, rank_sign = _pair_indices(targets, pair_keys, margin=float(pair_margin), device=sx.device)
         metric_pred = _teacher_metric_scores(teacher, sx, dx, series_idx, cx, rows=rows)
         pred = _scalarize_teacher_metric_values(metric_pred, target_weights, target_keys=teacher_metric_target_keys)
-        rank = pairwise_rank_loss(pred, left, right, sign, temperature=float(rank_temperature))
+        rank = pairwise_rank_loss(pred, rank_left, rank_right, rank_sign, temperature=float(rank_temperature))
         huber = F.smooth_l1_loss(metric_pred, metric_targets)
         total = rank + float(regression_weight) * huber
-        if left.numel() > 0:
-            predicted_sign = torch.sign(pred[left] - pred[right])
-            pairwise_accuracy = float((predicted_sign == sign).to(torch.float32).mean().detach().cpu().item())
+        if rank_left.numel() > 0:
+            predicted_sign = torch.sign(pred[rank_left] - pred[rank_right])
+            pairwise_accuracy = float((predicted_sign == rank_sign).to(torch.float32).mean().detach().cpu().item())
         else:
             pairwise_accuracy = None
         pred_values = [float(value) for value in pred.detach().cpu().tolist()]
@@ -1811,29 +2131,83 @@ def gipo_teacher_diagnostics(
     if was_training:
         teacher.train()
 
-    by_group_schedule: Dict[Tuple[str, str, int, str], Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
-    for idx, key in enumerate(pair_keys):
-        by_group_schedule[(str(key[0]), str(key[1]), int(key[2]), str(key[3]))][str(schedule_keys[idx])].append(int(idx))
+    expected_schedule_set = set(expected_candidate_schedules)
+    candidate_groups: Dict[Tuple[str, str, int, int | None, int | None, int | None], Dict[str, List[int]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    unexpected_schedule_groups = 0
+    for idx, row in enumerate(rows):
+        schedule = str(schedule_keys[idx])
+        if expected_schedule_set and schedule not in expected_schedule_set:
+            unexpected_schedule_groups += 1
+            continue
+        candidate_groups[teacher_selection_candidate_group_key(row)][schedule].append(int(idx))
     spearman_values: List[float] = []
     best_candidate_hits = 0
     best_candidate_total = 0
-    for schedule_to_indices in by_group_schedule.values():
-        if len(schedule_to_indices) < 2:
+    soft_regret_values: List[float] = []
+    top1_regret_values: List[float] = []
+    oracle_utility_values: List[float] = []
+    teacher_expected_utility_values: List[float] = []
+    selected_utility_values: List[float] = []
+    incomplete_candidate_groups = 0
+    duplicate_schedule_groups = 0
+    missing_schedule_groups = 0
+    complete_group_examples: List[Dict[str, Any]] = []
+    for group_key, schedule_to_indices in candidate_groups.items():
+        missing_schedules = [
+            schedule
+            for schedule in expected_candidate_schedules
+            if len(schedule_to_indices.get(schedule, [])) != 1
+        ]
+        if missing_schedules:
+            incomplete_candidate_groups += 1
+            missing_schedule_groups += 1
             continue
-        pred_by_schedule = {
-            schedule: float(np.mean(np.asarray([pred_values[idx] for idx in indices], dtype=np.float64)))
-            for schedule, indices in schedule_to_indices.items()
-        }
-        target_by_schedule = {
-            schedule: float(np.mean(np.asarray([target_values[idx] for idx in indices], dtype=np.float64)))
-            for schedule, indices in schedule_to_indices.items()
-        }
-        spearman_values.append(_spearman_for_scores(pred_by_schedule, target_by_schedule))
-        best_candidate_hits += int(
-            sorted(pred_by_schedule, key=lambda schedule: (-pred_by_schedule[schedule], schedule))[0]
-            == sorted(target_by_schedule, key=lambda schedule: (-target_by_schedule[schedule], schedule))[0]
+        if any(len(indices) != 1 for indices in schedule_to_indices.values()):
+            duplicate_schedule_groups += 1
+            continue
+        ordered = list(expected_candidate_schedules)
+        if len(ordered) < 2:
+            incomplete_candidate_groups += 1
+            continue
+        group_indices = [schedule_to_indices[schedule][0] for schedule in ordered]
+        group_pred = np.asarray([pred_values[idx] for idx in group_indices], dtype=np.float64)
+        group_target = np.asarray([target_values[idx] for idx in group_indices], dtype=np.float64)
+        shifted = group_pred / float(selection_temperature)
+        shifted = shifted - float(np.max(shifted))
+        exp_values = np.exp(shifted)
+        weights = exp_values / max(float(np.sum(exp_values)), 1e-12)
+        oracle_utility = float(np.max(group_target))
+        top_idx = sorted(range(len(ordered)), key=lambda pos: (-float(group_pred[pos]), ordered[pos]))[0]
+        oracle_idx = sorted(range(len(ordered)), key=lambda pos: (-float(group_target[pos]), ordered[pos]))[0]
+        selected_utility = float(group_target[top_idx])
+        expected_utility = float(np.dot(weights, group_target))
+        top1_regret = float(max(0.0, oracle_utility - selected_utility))
+        soft_regret = float(max(0.0, oracle_utility - expected_utility))
+        top1_regret_values.append(top1_regret)
+        soft_regret_values.append(soft_regret)
+        oracle_utility_values.append(oracle_utility)
+        teacher_expected_utility_values.append(expected_utility)
+        selected_utility_values.append(selected_utility)
+        spearman_values.append(
+            _spearman_for_scores(
+                {schedule: float(group_pred[pos]) for pos, schedule in enumerate(ordered)},
+                {schedule: float(group_target[pos]) for pos, schedule in enumerate(ordered)},
+            )
         )
+        best_candidate_hits += int(top_idx == oracle_idx)
         best_candidate_total += 1
+        if len(complete_group_examples) < 16:
+            complete_group_examples.append(
+                {
+                    **complete_candidate_group_payload(group_key),
+                    "teacher_top_schedule_key": str(ordered[top_idx]),
+                    "oracle_top_schedule_key": str(ordered[oracle_idx]),
+                    "soft_regret": soft_regret,
+                    "top1_regret": top1_regret,
+                }
+            )
     sequence_delta_values: List[float] = []
     sequence_second_diff_values: List[float] = []
     by_candidate_sequence: Dict[Tuple[str, int | None, str, str, str, str], List[Tuple[int, int]]] = defaultdict(list)
@@ -1843,13 +2217,15 @@ def gipo_teacher_diagnostics(
     for items in by_candidate_sequence.values():
         ordered = sorted(items, key=lambda item: (int(item[0]), int(item[1])))
         values = [float(pred_values[idx]) for _, idx in ordered]
-        for left, right in zip(values, values[1:]):
-            sequence_delta_values.append(abs(float(right) - float(left)))
+        for left_value, right_value in zip(values, values[1:]):
+            sequence_delta_values.append(abs(float(right_value) - float(left_value)))
         if len(values) >= 3:
             for a, b, c in zip(values, values[1:], values[2:]):
                 sequence_second_diff_values.append(abs(float(c) - 2.0 * float(b) + float(a)))
     delta_stats = _summary_percentiles(sequence_delta_values)
     second_stats = _summary_percentiles(sequence_second_diff_values)
+    soft_regret_stats = _summary_percentiles(soft_regret_values)
+    top1_regret_stats = _summary_percentiles(top1_regret_values)
     base.update(
         {
             "rank_loss": float(rank.detach().cpu().item()),
@@ -1860,10 +2236,32 @@ def gipo_teacher_diagnostics(
             },
             "total_loss": float(total.detach().cpu().item()),
             "pairwise_accuracy": pairwise_accuracy,
-            "pair_count": int(left.numel()),
+            "pair_count": int(rank_left.numel()),
             "spearman_rank_correlation": float(np.mean(np.asarray(spearman_values, dtype=np.float64))) if spearman_values else None,
             "best_candidate_agreement": None if best_candidate_total == 0 else float(best_candidate_hits / best_candidate_total),
             "candidate_group_count": int(best_candidate_total),
+            "complete_candidate_group_count": int(len(soft_regret_values)),
+            "complete_candidate_group_raw_count": int(len(candidate_groups)),
+            "complete_candidate_group_incomplete_count": int(incomplete_candidate_groups),
+            "complete_candidate_group_missing_schedule_count": int(missing_schedule_groups),
+            "complete_candidate_group_duplicate_schedule_count": int(duplicate_schedule_groups),
+            "complete_candidate_group_unexpected_schedule_row_count": int(unexpected_schedule_groups),
+            "complete_candidate_group_regret_examples": complete_group_examples,
+            "selection_candidate_group_count": int(len(soft_regret_values)),
+            "selection_candidate_group_raw_count": int(len(candidate_groups)),
+            "selection_candidate_incomplete_group_count": int(incomplete_candidate_groups),
+            "selection_candidate_duplicate_schedule_group_count": int(duplicate_schedule_groups),
+            "soft_regret": None if not soft_regret_values else soft_regret_stats["mean"],
+            "soft_regret_p95": None if not soft_regret_values else soft_regret_stats["p95"],
+            "top1_regret": None if not top1_regret_values else top1_regret_stats["mean"],
+            "top1_regret_p95": None if not top1_regret_values else top1_regret_stats["p95"],
+            "validation_soft_regret": None if not soft_regret_values else soft_regret_stats["mean"],
+            "validation_soft_regret_p95": None if not soft_regret_values else soft_regret_stats["p95"],
+            "validation_top1_regret": None if not top1_regret_values else top1_regret_stats["mean"],
+            "validation_top1_regret_p95": None if not top1_regret_values else top1_regret_stats["p95"],
+            "validation_oracle_utility_mean": _summary_percentiles(oracle_utility_values)["mean"],
+            "validation_teacher_expected_utility_mean": _summary_percentiles(teacher_expected_utility_values)["mean"],
+            "validation_teacher_top1_utility_mean": _summary_percentiles(selected_utility_values)["mean"],
             "teacher_nfe_sequence_candidate_count": int(len(by_candidate_sequence)),
             "teacher_nfe_adjacent_abs_utility_delta_mean": delta_stats["mean"],
             "teacher_nfe_adjacent_abs_utility_delta_p95": delta_stats["p95"],
@@ -1879,68 +2277,248 @@ def _selected_gipo_teacher_checkpoint(
     checkpoint_states: Mapping[int, Mapping[str, torch.Tensor]],
     *,
     required_split_names: Sequence[str] = (),
+    selection_mode: str = DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE,
+    component_weights: Mapping[str, float] | None = None,
 ) -> Tuple[Dict[str, Any], Mapping[str, torch.Tensor] | None]:
+    mode = validate_teacher_checkpoint_selection_mode(selection_mode)
+
+    def _component_weight(name: str, weights: Mapping[str, float]) -> float:
+        split = str(name)
+        if split in weights:
+            return float(weights[split])
+        if split.startswith("context"):
+            return float(weights.get("context", weights.get(split, 0.0)))
+        if split.startswith("density_family"):
+            return float(weights.get("density_family", weights.get(split, 0.0)))
+        if split.startswith("unseen_nfe"):
+            return float(weights.get("unseen_nfe", weights.get(split, 0.0)))
+        return float(weights.get(split, 0.0))
+
     if not checkpoint_history:
         return (
             {
                 "selection_protocol": "final_checkpoint_no_diagnostics",
+                "selection_mode": mode,
                 "selection_metric": "final_step",
                 "selected_step": None,
                 "history": [],
                 "uses_validation_labels": False,
+                "locked_test_used_for_selection": False,
             },
             None,
         )
+
     required = tuple(str(name) for name in required_split_names)
     scored: List[Dict[str, Any]] = []
-    best_entry: Dict[str, Any] | None = None
-    best_key: Tuple[float, float, float, int] | None = None
+    required_metric_names = ("validation_soft_regret",)
     for entry in checkpoint_history:
         diagnostics = {str(key): dict(value) for key, value in dict(entry.get("diagnostics", {})).items()}
-        missing = [name for name in required if diagnostics.get(name, {}).get("total_loss") is None]
+        missing: List[str] = []
+        for name in required:
+            diag = diagnostics.get(name, {})
+            for metric_name in required_metric_names:
+                if diag.get(metric_name) is None:
+                    missing.append(f"{name}:missing_{metric_name}")
+            if int(diag.get("complete_candidate_group_count", 0) or 0) <= 0:
+                missing.append(f"{name}:no_complete_candidate_groups")
         if missing:
             copied = dict(entry)
             copied["selection_constraints_passed"] = False
-            copied["selection_constraint_failures"] = [f"{name}:missing_total_loss" for name in missing]
+            copied["selection_constraint_failures"] = missing
             scored.append(copied)
             continue
-        active_names = required or tuple(sorted(name for name, diag in diagnostics.items() if diag.get("total_loss") is not None))
-        losses = [float(diagnostics[name]["total_loss"]) for name in active_names]
+        active_names = required or tuple(
+            sorted(
+                name
+                for name, diag in diagnostics.items()
+                if all(diag.get(metric_name) is not None for metric_name in required_metric_names)
+            )
+        )
+        if not active_names:
+            copied = dict(entry)
+            copied["selection_constraints_passed"] = False
+            copied["selection_constraint_failures"] = ["no_active_diagnostic_splits"]
+            scored.append(copied)
+            continue
+        losses = [
+            float(diagnostics[name]["total_loss"])
+            for name in active_names
+            if diagnostics[name].get("total_loss") is not None
+        ]
+        rank_values = [float(diagnostics[name]["rank_loss"]) for name in active_names if diagnostics[name].get("rank_loss") is not None]
+        huber_values = [float(diagnostics[name]["huber_loss"]) for name in active_names if diagnostics[name].get("huber_loss") is not None]
         pairwise_values = [float(diagnostics[name]["pairwise_accuracy"]) for name in active_names if diagnostics[name].get("pairwise_accuracy") is not None]
         spearman_values = [float(diagnostics[name]["spearman_rank_correlation"]) for name in active_names if diagnostics[name].get("spearman_rank_correlation") is not None]
+        agreement_values = [float(diagnostics[name]["best_candidate_agreement"]) for name in active_names if diagnostics[name].get("best_candidate_agreement") is not None]
+        soft_regret_values = [float(diagnostics[name]["validation_soft_regret"]) for name in active_names if diagnostics[name].get("validation_soft_regret") is not None]
+        top1_regret_values = [float(diagnostics[name]["validation_top1_regret"]) for name in active_names if diagnostics[name].get("validation_top1_regret") is not None]
         copied = dict(entry)
         copied["diagnostics"] = diagnostics
         copied["selection_constraints_passed"] = True
         copied["selection_constraint_failures"] = []
-        copied["mean_diagnostic_total_loss"] = float(np.mean(np.asarray(losses, dtype=np.float64)))
+        copied["mean_diagnostic_total_loss"] = float(np.mean(np.asarray(losses, dtype=np.float64))) if losses else 0.0
+        copied["mean_rank_loss"] = float(np.mean(np.asarray(rank_values, dtype=np.float64))) if rank_values else 0.0
+        copied["mean_huber_loss"] = float(np.mean(np.asarray(huber_values, dtype=np.float64))) if huber_values else 0.0
         copied["mean_pairwise_accuracy"] = float(np.mean(np.asarray(pairwise_values, dtype=np.float64))) if pairwise_values else 0.0
         copied["mean_spearman_rank_correlation"] = float(np.mean(np.asarray(spearman_values, dtype=np.float64))) if spearman_values else 0.0
+        copied["mean_best_candidate_agreement"] = float(np.mean(np.asarray(agreement_values, dtype=np.float64))) if agreement_values else 0.0
+        copied["mean_validation_soft_regret"] = float(np.mean(np.asarray(soft_regret_values, dtype=np.float64))) if soft_regret_values else None
+        copied["mean_validation_top1_regret"] = float(np.mean(np.asarray(top1_regret_values, dtype=np.float64))) if top1_regret_values else None
+        copied["selection_active_splits"] = list(active_names)
         scored.append(copied)
-        key = (
-            float(copied["mean_diagnostic_total_loss"]),
-            -float(copied["mean_pairwise_accuracy"]),
-            -float(copied["mean_spearman_rank_correlation"]),
-            int(copied["step"]),
-        )
-        if best_key is None or key < best_key:
-            best_key = key
-            best_entry = copied
-    if best_entry is None:
-        raise ValueError("Teacher checkpoint selection found no checkpoint with all required diagnostic split losses.")
+
+    valid_entries = [entry for entry in scored if bool(entry.get("selection_constraints_passed", False))]
+    if not valid_entries:
+        raise ValueError("Weighted normalized regret selection found no valid checkpoint candidates.")
+    active_splits = tuple(required or tuple(valid_entries[0].get("selection_active_splits", ()) or ()))
+    if not active_splits:
+        raise ValueError("Weighted normalized regret selection found no active diagnostic splits.")
+
+    raw_by_split: Dict[str, Dict[int, float]] = {}
+    for name in active_splits:
+        split_values: Dict[int, float] = {}
+        for entry in valid_entries:
+            diag = dict(dict(entry.get("diagnostics", {}) or {}).get(name, {}) or {})
+            if diag.get("validation_soft_regret") is None:
+                raise ValueError(f"Weighted normalized regret selection missing validation_soft_regret for split {name!r}.")
+            split_values[int(entry["step"])] = float(diag["validation_soft_regret"])
+        raw_by_split[name] = split_values
+
+    ranges: Dict[str, Dict[str, float]] = {}
+    normalized_by_split: Dict[str, Dict[int, float]] = {}
+    for name, values in raw_by_split.items():
+        lo = min(float(value) for value in values.values())
+        hi = max(float(value) for value in values.values())
+        ranges[name] = {"min": float(lo), "max": float(hi), "span": float(hi - lo)}
+        if hi - lo <= 1e-12:
+            normalized_by_split[name] = {int(step): 0.0 for step in values}
+        else:
+            normalized_by_split[name] = {
+                int(step): (float(value) - lo) / (hi - lo)
+                for step, value in values.items()
+            }
+
+    if component_weights:
+        raw_weights = {name: max(0.0, _component_weight(name, dict(component_weights or {}))) for name in active_splits}
+    else:
+        raw_weights = {
+            name: (
+                0.25
+                if str(name).startswith("context") or str(name).startswith("density_family")
+                else 0.50
+                if str(name).startswith("unseen_nfe")
+                else 0.0
+            )
+            for name in active_splits
+        }
+    weight_sum = sum(float(value) for value in raw_weights.values())
+    if weight_sum <= 0.0:
+        raw_weights = {name: 1.0 for name in active_splits}
+        weight_sum = float(len(active_splits))
+    normalized_weights = {name: float(value) / weight_sum for name, value in raw_weights.items()}
+
+    for entry in valid_entries:
+        step = int(entry["step"])
+        raw_values = {name: float(raw_by_split[name][step]) for name in active_splits}
+        normalized_values = {name: float(normalized_by_split[name][step]) for name in active_splits}
+        weighted_score = float(sum(float(normalized_weights[name]) * float(normalized_values[name]) for name in active_splits))
+        minimax_score = float(max(normalized_values.values())) if normalized_values else 0.0
+        raw_mean = float(np.mean(np.asarray(list(raw_values.values()), dtype=np.float64))) if raw_values else 0.0
+        entry["selection_raw_regret_values"] = dict(raw_values)
+        entry["selection_normalized_regret_values"] = dict(normalized_values)
+        entry["selection_component_values"] = dict(normalized_values)
+        entry["selection_component_ranges"] = dict(ranges)
+        entry["selection_component_weights"] = dict(normalized_weights)
+        entry["weighted_normalized_regret_v1_score"] = weighted_score
+        entry["checkpoint_selection_score"] = weighted_score
+        entry["minimax_normalized_regret"] = minimax_score
+        entry["raw_mean_validation_soft_regret"] = raw_mean
+
+    best_entry = min(
+        valid_entries,
+        key=lambda entry: (
+            float(entry["weighted_normalized_regret_v1_score"]),
+            float(entry["minimax_normalized_regret"]),
+            float(entry["raw_mean_validation_soft_regret"]),
+            int(entry["step"]),
+        ),
+    )
     selected_step = int(best_entry["step"])
     return (
         {
-            "selection_protocol": "gipo_teacher_checkpoint",
-            "selection_split": "context_and_series_teacher_holdouts",
-            "selection_metric": "mean_context_series_total_loss",
+            "selection_protocol": mode,
+            "selection_split": "teacher_holdouts",
+            "selection_metric": "weighted_normalized_regret_v1_score",
+            "selection_mode": mode,
             "selected_step": selected_step,
             "selected_mean_diagnostic_total_loss": best_entry.get("mean_diagnostic_total_loss"),
-            "tie_breaker": "higher_pairwise_then_higher_spearman_then_earlier_step",
+            "selected_mean_validation_soft_regret": best_entry.get("mean_validation_soft_regret"),
+            "selected_mean_validation_top1_regret": best_entry.get("mean_validation_top1_regret"),
+            "selected_mean_best_candidate_agreement": best_entry.get("mean_best_candidate_agreement"),
+            "selected_mean_spearman_rank_correlation": best_entry.get("mean_spearman_rank_correlation"),
+            "selected_mean_rank_loss": best_entry.get("mean_rank_loss"),
+            "selected_mean_huber_loss": best_entry.get("mean_huber_loss"),
+            "selected_weighted_normalized_regret_v1_score": best_entry.get("weighted_normalized_regret_v1_score"),
+            "selected_normalized_regret_values": best_entry.get("selection_normalized_regret_values", {}),
+            "selected_raw_regret_values": best_entry.get("selection_raw_regret_values", {}),
+            "selected_regret_normalization_ranges": best_entry.get("selection_component_ranges", {}),
+            "selected_minimax_normalized_regret": best_entry.get("minimax_normalized_regret"),
+            "selected_raw_mean_validation_soft_regret": best_entry.get("raw_mean_validation_soft_regret"),
+            "selected_checkpoint_selection_score": best_entry.get("checkpoint_selection_score"),
+            "selected_component_values": best_entry.get("selection_component_values", {}),
+            "selected_component_weights": best_entry.get("selection_component_weights", {}),
+            "tie_breaker": "weighted_score_then_minimax_normalized_regret_then_raw_mean_regret_then_earlier_step",
             "uses_validation_labels": False,
+            "locked_test_used_for_selection": False,
             "history": scored,
         },
         checkpoint_states.get(selected_step),
     )
+
+
+def select_gipo_teacher_checkpoint(
+    checkpoint_history: Sequence[Dict[str, Any]],
+    *,
+    required_split_names: Sequence[str] = (),
+    selection_mode: str = DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE,
+    component_weights: Mapping[str, float] | None = None,
+) -> Dict[str, Any]:
+    selection, _ = _selected_gipo_teacher_checkpoint(
+        checkpoint_history,
+        {},
+        required_split_names=required_split_names,
+        selection_mode=selection_mode,
+        component_weights=component_weights,
+    )
+    return selection
+
+
+def _should_log_step(step_index: int, steps: int, log_every: int | None) -> bool:
+    total_steps = int(steps)
+    step_value = int(step_index) + 1
+    if step_value == 1 or step_value == total_steps:
+        return True
+    cadence = int(log_every or 0)
+    if cadence <= 0:
+        cadence = max(1, total_steps // 5)
+    return step_value % max(1, cadence) == 0
+
+
+def _loss_tail_slope(losses: Sequence[Mapping[str, Any]], key: str, *, tail_count: int = 5) -> float | None:
+    points = [
+        (float(entry["step"]), float(entry[key]))
+        for entry in list(losses)[-max(2, int(tail_count)) :]
+        if entry.get("step") is not None and entry.get(key) is not None
+    ]
+    if len(points) < 2:
+        return None
+    x = np.asarray([point[0] for point in points], dtype=np.float64)
+    y = np.asarray([point[1] for point in points], dtype=np.float64)
+    x = x - float(np.mean(x))
+    denom = float(np.sum(x * x))
+    if denom <= 0.0:
+        return None
+    return float(np.sum(x * (y - float(np.mean(y)))) / denom)
 
 
 def train_gipo_teacher(
@@ -1960,7 +2538,12 @@ def train_gipo_teacher(
     pair_on_seed: bool = True,
     require_rank_pairs: bool = True,
     diagnostic_splits: Mapping[str, Sequence[MetricRow]] | None = None,
+    diagnostic_candidate_schedule_keys: Mapping[str, Sequence[str]] | None = None,
     teacher_checkpoint_every: int = 100,
+    teacher_loss_log_every: int = 0,
+    teacher_checkpoint_selection_mode: str = DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE,
+    teacher_selection_temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
+    teacher_selection_axis_weights: Mapping[str, float] | None = None,
     series_unknown_probability: float = 0.0,
     seed: int = 0,
     allowed_schedule_keys: Sequence[str] = DEFAULT_SUPERVISION_SCHEDULE_KEYS,
@@ -1980,6 +2563,8 @@ def train_gipo_teacher(
         pair_margin=pair_margin,
     )
     teacher_metric_target_keys = teacher_metric_target_keys_for_model(teacher)
+    selection_mode = validate_teacher_checkpoint_selection_mode(teacher_checkpoint_selection_mode)
+    selection_temperature = _finite_positive(teacher_selection_temperature, label="teacher_selection_temperature")
     teacher.to(device)
     sx, dx, series_idx, cx, metric_targets, pair_keys, _, _ = _teacher_training_tensors(
         rows,
@@ -1992,7 +2577,7 @@ def train_gipo_teacher(
         setting_feature_mode=feature_mode,
         setting_encoder_config=encoder_config,
         teacher_metric_target_keys=teacher_metric_target_keys,
-        series_unknown_probability=float(series_unknown_probability),
+        series_unknown_probability=0.0,
         seed=int(seed),
     )
     target_weights = _teacher_metric_weights(
@@ -2015,6 +2600,10 @@ def train_gipo_teacher(
     checkpoint_states: Dict[int, Mapping[str, torch.Tensor]] = {}
     fit_context_ids = sorted({context_id_from_row(row) for row in rows})
     fit_series_keys = sorted({series_key_from_row(row) for row in rows})
+    diagnostic_candidate_schedule_map = {
+        str(name): tuple(str(key) for key in keys)
+        for name, keys in dict(diagnostic_candidate_schedule_keys or {}).items()
+    }
     checkpoint_every = max(1, int(teacher_checkpoint_every))
     for step in range(int(steps)):
         metric_pred = _teacher_metric_scores(teacher, sx, dx, series_idx, cx, rows=rows)
@@ -2025,7 +2614,7 @@ def train_gipo_teacher(
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
-        if step == 0 or step == int(steps) - 1 or (step + 1) % max(1, int(steps) // 5) == 0:
+        if _should_log_step(step, int(steps), int(teacher_loss_log_every)):
             losses.append(
                 {
                     "step": int(step + 1),
@@ -2058,6 +2647,8 @@ def train_gipo_teacher(
                     setting_feature_mode=feature_mode,
                     setting_encoder_config=encoder_config,
                     teacher_utility_weights=teacher_utility_weights,
+                    complete_candidate_schedule_keys=diagnostic_candidate_schedule_map.get(str(name)),
+                    teacher_selection_temperature=float(selection_temperature),
                     device=device,
                 )
                 for name, split_rows in diagnostic_splits.items()
@@ -2069,9 +2660,24 @@ def train_gipo_teacher(
         checkpoint_history,
         checkpoint_states,
         required_split_names=tuple(diagnostic_splits.keys()) if diagnostic_splits else (),
+        selection_mode=selection_mode,
+        component_weights=teacher_selection_axis_weights,
     )
     if selected_state is not None:
         teacher.load_state_dict(selected_state)
+    final_teacher_retrain = {
+        "protocol": "gipo_teacher_finalization_v1",
+        "performed": False,
+        "reason": "selected_checkpoint_state_restored" if selected_state is not None else "final_checkpoint_state_retained",
+        "selected_checkpoint_step": checkpoint_selection.get("selected_step"),
+        "selection_protocol": checkpoint_selection.get("selection_protocol"),
+        "selection_metric": checkpoint_selection.get("selection_metric"),
+        "uses_validation_labels": False,
+        "locked_test_used_for_selection": False,
+        "fit_row_count": int(len(rows)),
+        "fit_context_count": int(len(fit_context_ids)),
+        "fit_series_count": int(len(fit_series_keys)),
+    }
     return {
         "teacher_objective": "pairwise_rank_plus_huber_regression",
         "teacher_target": "metric_vector",
@@ -2083,6 +2689,9 @@ def train_gipo_teacher(
             {key: float(value) for key, value in zip(teacher_metric_target_keys, target_weights[0].detach().cpu().tolist())},
         ),
         "teacher_density_feature": "train_normalized_log_density",
+        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
+        "series_unknown_probability": 0.0,
+        "series_unknown_probability_mode": "disabled_no_series_conditioning",
         "setting_feature_mode": feature_mode,
         "setting_encoder_mode": encoder_config.mode,
         "setting_encoder_config": encoder_config.to_payload(),
@@ -2091,20 +2700,24 @@ def train_gipo_teacher(
         "regression_weight": float(regression_weight),
         "pair_margin": float(pair_margin),
         "losses": losses,
+        "teacher_loss_tail_slope": _loss_tail_slope(losses, "teacher_total_loss"),
+        "teacher_optimizer": {
+            "optimizer": "AdamW",
+            "lr": float(lr),
+            "weight_decay": 1e-4,
+            "steps": int(steps),
+            "teacher_loss_log_every": int(teacher_loss_log_every),
+            "teacher_checkpoint_every": int(checkpoint_every),
+        },
+        "teacher_loss_log_every": int(teacher_loss_log_every),
+        "teacher_checkpoint_every": int(checkpoint_every),
         "teacher_checkpoint_selection": checkpoint_selection,
+        "teacher_checkpoint_selection_mode": selection_mode,
+        "teacher_selection_temperature": float(selection_temperature),
+        "final_teacher_retrain": final_teacher_retrain,
         "fit_context_count": int(len(fit_context_ids)),
         "fit_series_count": int(len(fit_series_keys)),
     }
-
-
-def _series_with_dynamic_unknown(base_series_idx: torch.Tensor, *, unknown_index: int, dropout: float) -> torch.Tensor:
-    probability = min(1.0, max(0.0, float(dropout)))
-    if probability <= 0.0 or base_series_idx.numel() == 0:
-        return base_series_idx
-    mask = torch.rand(base_series_idx.shape, device=base_series_idx.device) < probability
-    out = base_series_idx.clone()
-    out[mask] = int(unknown_index)
-    return out
 
 
 def build_teacher_weighted_density_targets(
@@ -2183,7 +2796,7 @@ def build_teacher_weighted_density_targets(
         score_masses[id(row)] = mass
         score_settings.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
         score_density.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
-        score_series.append(remapped_series_index(row, series_index_map))
+        score_series.append(0)
         score_context.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
     with torch.no_grad():
         metric_score_values = _teacher_metric_scores(
@@ -2254,7 +2867,7 @@ def build_teacher_weighted_density_targets(
             mixture += float(weight) * np.asarray(mass, dtype=np.float64)
         mixture = mixture / max(float(np.sum(mixture)), 1e-12)
         setting_rows.append(setting_row)
-        series_rows.append(remapped_series_index(first, series_index_map))
+        series_rows.append(0)
         context_rows.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
         target_masses.append(mixture.astype(np.float32))
         entropy_values.append(float(-np.sum(weights * np.log(np.maximum(weights, 1e-12)))))
@@ -2291,6 +2904,7 @@ def build_teacher_weighted_density_targets(
         "setting_feature_mode": feature_mode,
         "setting_encoder_mode": encoder_config.mode,
         "setting_encoder_config": encoder_config.to_payload(),
+        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "context_setting_count": int(len(target_masses)),
         "mean_teacher_candidate_entropy": entropy_stats["mean"],
         "teacher_candidate_entropy_mean": entropy_stats["mean"],
@@ -2400,7 +3014,7 @@ def build_teacher_weighted_density_prediction_rows(
         score_masses[id(row)] = mass
         score_settings.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
         score_density.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
-        score_series.append(remapped_series_index(row, series_index_map))
+        score_series.append(0)
         score_context.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
     with torch.no_grad():
         metric_score_values = _teacher_metric_scores(
@@ -2562,6 +3176,7 @@ def build_teacher_weighted_density_prediction_rows(
         "setting_feature_mode": feature_mode,
         "setting_encoder_mode": encoder_config.mode,
         "setting_encoder_config": encoder_config.to_payload(),
+        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "context_setting_count": int(len(records)),
         "teacher_candidate_entropy_mean": entropy_stats["mean"],
         "teacher_candidate_entropy_p05": entropy_stats["p05"],
@@ -2613,13 +3228,19 @@ def train_gipo_student(
     teacher_hard_margin: float = DEFAULT_TEACHER_HARD_MARGIN,
     setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
-    series_unknown_dropout: float = 0.10,
+    series_unknown_dropout: float = 0.0,
+    student_weight_decay: float = 1e-4,
     student_nfe_smoothness_weight: float = 0.0,
     student_nfe_smoothness_mode: str = "js",
     pseudo_rows: Sequence[MetricRow] | None = None,
     pseudo_context_embeddings: Mapping[str, Sequence[float]] | None = None,
     pseudo_schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None = None,
     pseudo_target_weight: float = 0.0,
+    validation_rows: Sequence[MetricRow] | None = None,
+    validation_context_embeddings: Mapping[str, Sequence[float]] | None = None,
+    student_log_every: int = 0,
+    student_checkpoint_every: int = 100,
+    student_checkpoint_selection_mode: str = STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
     if not rows:
@@ -2629,12 +3250,27 @@ def train_gipo_student(
     smoothness_weight = float(student_nfe_smoothness_weight)
     if not math.isfinite(smoothness_weight) or smoothness_weight < 0.0:
         raise ValueError("student_nfe_smoothness_weight must be finite and nonnegative.")
+    weight_decay = float(student_weight_decay)
+    if not math.isfinite(weight_decay) or weight_decay < 0.0:
+        raise ValueError("student_weight_decay must be finite and nonnegative.")
     smoothness_mode = str(student_nfe_smoothness_mode).strip() or "js"
     if smoothness_mode not in {"js", "logit_l2"}:
         raise ValueError("student_nfe_smoothness_mode must be 'js' or 'logit_l2'.")
     pseudo_weight = float(pseudo_target_weight)
     if not math.isfinite(pseudo_weight) or pseudo_weight < 0.0:
         raise ValueError("student_pseudo_target_weight must be finite and nonnegative.")
+    selection_mode = validate_student_checkpoint_selection_mode(student_checkpoint_selection_mode)
+    checkpoint_every = max(1, int(student_checkpoint_every))
+    validation_fit_rows = [dict(row) for row in (validation_rows or [])]
+    if selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1 and not validation_fit_rows:
+        raise ValueError("student validation CE checkpoint selection requires non-empty validation_rows.")
+    locked_validation_rows = [
+        row
+        for row in validation_fit_rows
+        if str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) == "locked_test"
+    ]
+    if locked_validation_rows:
+        raise ValueError("student checkpoint selection refuses locked_test validation rows.")
     student.to(device)
     teacher.to(device)
     teacher.eval()
@@ -2704,10 +3340,82 @@ def train_gipo_student(
             "pseudo_target_nfes": sorted({int(row["target_nfe"]) for row in pseudo_target_rows}),
             "pseudo_split_phases": sorted({str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) for row in (pseudo_rows or [])}),
         }
-    opt = torch.optim.AdamW(student.parameters(), lr=float(lr), weight_decay=1e-4)
+    validation_sx: torch.Tensor | None = None
+    validation_base_series_idx: torch.Tensor | None = None
+    validation_cx: torch.Tensor | None = None
+    validation_target_mass: torch.Tensor | None = None
+    validation_target_rows: List[MetricRow] = []
+    validation_target_summary: Dict[str, Any] = {
+        "student_validation_context_setting_count": 0,
+        "student_validation_context_count": 0,
+    }
+    if validation_fit_rows:
+        validation_embeddings = validation_context_embeddings if validation_context_embeddings is not None else context_embeddings
+        validation_sx, validation_base_series_idx, validation_cx, validation_target_mass, built_validation_summary = build_teacher_weighted_density_targets(
+            teacher,
+            validation_fit_rows,
+            context_embeddings=validation_embeddings,
+            series_index_map=series_index_map,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference_time_grid,
+            density_normalizer=density_normalizer,
+            supervision_schedule_keys=sorted({str(row["scheduler_key"]) for row in validation_fit_rows}),
+            temperature=float(teacher_temperature),
+            temperature_mode=str(teacher_temperature_mode),
+            target_ess=float(teacher_target_ess),
+            min_temperature=float(teacher_min_temperature),
+            max_temperature=float(teacher_max_temperature),
+            teacher_utility_weights=teacher_utility_weights,
+            student_target_mode=str(student_target_mode),
+            teacher_hard_margin=float(teacher_hard_margin),
+            setting_feature_mode=feature_mode,
+            setting_encoder_config=encoder_config,
+            device=device,
+        )
+        validation_target_rows = _student_target_representative_rows(validation_fit_rows)
+        validation_target_summary = {
+            **built_validation_summary,
+            "student_validation_context_setting_count": int(validation_target_mass.shape[0]),
+            "student_validation_context_count": int(len({context_id_from_row(row) for row in validation_fit_rows})),
+            "student_validation_row_count": int(len(validation_fit_rows)),
+            "student_validation_split_phases": sorted(
+                {str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) for row in validation_fit_rows}
+            ),
+        }
+    opt = torch.optim.AdamW(student.parameters(), lr=float(lr), weight_decay=weight_decay)
     losses: List[Dict[str, Any]] = []
+    checkpoint_history: List[Dict[str, Any]] = []
+    checkpoint_states: Dict[int, Mapping[str, torch.Tensor]] = {}
+
+    def _evaluate_student_ce(
+        eval_sx: torch.Tensor,
+        eval_series_idx: torch.Tensor,
+        eval_cx: torch.Tensor,
+        eval_target_mass: torch.Tensor,
+        eval_rows: Sequence[MetricRow],
+    ) -> Tuple[float, float]:
+        was_training = bool(student.training)
+        student.eval()
+        with torch.no_grad():
+            eval_logits = _student_logits(
+                student,
+                eval_sx,
+                eval_series_idx,
+                eval_cx,
+                rows=eval_rows,
+            )
+            eval_log_probs = torch.log_softmax(eval_logits, dim=-1)
+            eval_ce = float((-(eval_target_mass * eval_log_probs).sum(dim=-1).mean()).detach().cpu().item())
+            eval_entropy = float(
+                (-(torch.softmax(eval_logits, dim=-1) * eval_log_probs).sum(dim=-1).mean()).detach().cpu().item()
+            )
+        if was_training:
+            student.train()
+        return eval_ce, eval_entropy
+
+    student.train()
     for step in range(int(steps)):
-        series_idx = _series_with_dynamic_unknown(base_series_idx, unknown_index=student.unknown_series_index, dropout=float(series_unknown_dropout))
+        series_idx = base_series_idx
         logits = _student_logits(
             student,
             sx,
@@ -2723,11 +3431,7 @@ def train_gipo_student(
             assert pseudo_base_series_idx is not None
             assert pseudo_cx is not None
             assert pseudo_target_mass is not None
-            pseudo_series_idx = _series_with_dynamic_unknown(
-                pseudo_base_series_idx,
-                unknown_index=student.unknown_series_index,
-                dropout=float(series_unknown_dropout),
-            )
+            pseudo_series_idx = pseudo_base_series_idx
             pseudo_logits = _student_logits(
                 student,
                 pseudo_sx,
@@ -2742,20 +3446,105 @@ def train_gipo_student(
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
-        if step == 0 or step == int(steps) - 1 or (step + 1) % max(1, int(steps) // 5) == 0:
-            with torch.no_grad():
-                entropy = float((-(torch.softmax(logits, dim=-1) * log_probs).sum(dim=-1).mean()).detach().cpu().item())
+        should_log = _should_log_step(step, int(steps), int(student_log_every))
+        should_checkpoint = (
+            selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
+            and _should_log_step(step, int(steps), checkpoint_every)
+        )
+        train_ce_for_checkpoint: float | None = None
+        train_entropy_for_checkpoint: float | None = None
+        if should_log or should_checkpoint:
+            train_ce_for_checkpoint, train_entropy_for_checkpoint = _evaluate_student_ce(
+                sx,
+                base_series_idx,
+                cx,
+                target_mass,
+                target_rows,
+            )
+        if should_log:
             losses.append(
                 {
                     "step": int(step + 1),
                     "student_total_loss": float(loss.detach().cpu().item()),
                     "student_kl_ce_loss": float(ce_loss.detach().cpu().item()),
+                    "student_eval_kl_ce_loss": float(train_ce_for_checkpoint),
                     "student_pseudo_kl_ce_loss": float(pseudo_ce_loss.detach().cpu().item()),
                     "student_pseudo_weighted_loss": float((float(pseudo_weight) * pseudo_ce_loss).detach().cpu().item()),
                     "student_nfe_smoothness_loss": float(smoothness_loss.detach().cpu().item()),
-                    "student_entropy": entropy,
+                    "student_entropy": float(train_entropy_for_checkpoint),
                 }
             )
+        if should_checkpoint:
+            assert validation_sx is not None
+            assert validation_base_series_idx is not None
+            assert validation_cx is not None
+            assert validation_target_mass is not None
+            validation_ce, validation_entropy = _evaluate_student_ce(
+                validation_sx,
+                validation_base_series_idx,
+                validation_cx,
+                validation_target_mass,
+                validation_target_rows,
+            )
+            step_value = int(step + 1)
+            checkpoint_history.append(
+                {
+                    "step": step_value,
+                    "train_ce_loss": float(train_ce_for_checkpoint),
+                    "validation_ce_loss": float(validation_ce),
+                    "train_entropy": float(train_entropy_for_checkpoint),
+                    "validation_entropy": float(validation_entropy),
+                    "selection_constraints_passed": True,
+                    "selection_constraint_failures": [],
+                    "locked_test_used_for_selection": False,
+                }
+            )
+            checkpoint_states[step_value] = copy.deepcopy(student.state_dict())
+    if selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1:
+        if not checkpoint_history:
+            raise ValueError("Student validation CE checkpoint selection found no checkpoints.")
+        selected_checkpoint = min(
+            checkpoint_history,
+            key=lambda entry: (
+                float(entry["validation_ce_loss"]),
+                float(entry["train_ce_loss"]),
+                int(entry["step"]),
+            ),
+        )
+        selected_step = int(selected_checkpoint["step"])
+        selected_state = checkpoint_states.get(selected_step)
+        if selected_state is not None:
+            student.load_state_dict(selected_state)
+        student_checkpoint_selection = {
+            "selection_protocol": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+            "selection_mode": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+            "selection_metric": "validation_ce_loss",
+            "selected_step": int(selected_step),
+            "selected_validation_ce_loss": float(selected_checkpoint["validation_ce_loss"]),
+            "selected_train_ce_loss": float(selected_checkpoint["train_ce_loss"]),
+            "selected_validation_entropy": float(selected_checkpoint["validation_entropy"]),
+            "selected_train_entropy": float(selected_checkpoint["train_entropy"]),
+            "tie_breaker": "train_ce_then_earlier_step",
+            "history": checkpoint_history,
+            "student_checkpoint_every": int(checkpoint_every),
+            "validation_row_count": int(len(validation_fit_rows)),
+            "validation_context_count": int(len({context_id_from_row(row) for row in validation_fit_rows})),
+            "uses_validation_labels": False,
+            "uses_student_validation_targets": True,
+            "locked_test_used_for_selection": False,
+        }
+    else:
+        student_checkpoint_selection = {
+            "selection_protocol": STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
+            "selection_mode": STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
+            "selection_metric": "final_step",
+            "selected_step": int(steps),
+            "history": [],
+            "student_checkpoint_every": int(checkpoint_every),
+            "uses_validation_labels": False,
+            "uses_student_validation_targets": False,
+            "locked_test_used_for_selection": False,
+        }
     return {
         "student_policy_type": "continuous_density",
         "student_objective": "teacher_weighted_density_mle_kl"
@@ -2763,12 +3552,15 @@ def train_gipo_student(
         else "teacher_weighted_density_margin_hard_soft_kl",
         "density_protocol": DENSITY_PROTOCOL,
         "student_target_summary": target_summary,
+        "student_validation_target_summary": validation_target_summary,
         "student_pseudo_target_summary": pseudo_summary,
         "teacher_utility_weights": dict(target_summary.get("teacher_utility_weights", {})),
         "pseudo_distillation_used": bool(pseudo_enabled),
         "pseudo_target_weight": float(pseudo_weight),
-        "series_unknown_dropout": float(series_unknown_dropout),
-        "series_unknown_dropout_mode": "dynamic_per_step",
+        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
+        "series_unknown_dropout": 0.0,
+        "series_unknown_dropout_mode": "disabled_no_series_conditioning",
+        "student_weight_decay": float(weight_decay),
         "setting_feature_mode": feature_mode,
         "setting_encoder_mode": encoder_config.mode,
         "setting_encoder_config": encoder_config.to_payload(),
@@ -2776,6 +3568,36 @@ def train_gipo_student(
         "student_nfe_smoothness_mode": smoothness_mode,
         "student_nfe_sequence_pair_count": int(len(sequence_pairs)),
         "losses": losses,
+        "student_loss_tail_slope": _loss_tail_slope(losses, "student_kl_ce_loss"),
+        "student_eval_loss_tail_slope": _loss_tail_slope(losses, "student_eval_kl_ce_loss"),
+        "student_optimizer": {
+            "optimizer": "AdamW",
+            "lr": float(lr),
+            "weight_decay": float(weight_decay),
+            "steps": int(steps),
+            "student_log_every": int(student_log_every),
+            "student_checkpoint_every": int(checkpoint_every),
+            "student_checkpoint_selection_mode": selection_mode,
+        },
+        "student_log_every": int(student_log_every),
+        "student_checkpoint_every": int(checkpoint_every),
+        "student_checkpoint_selection_mode": selection_mode,
+        "student_checkpoint_selection": student_checkpoint_selection,
+        "student_validation_split": {
+            "protocol": "context_disjoint_student_validation_v1",
+            "validation_row_count": int(len(validation_fit_rows)),
+            "validation_context_count": int(len({context_id_from_row(row) for row in validation_fit_rows})) if validation_fit_rows else 0,
+            "locked_test_used_for_selection": False,
+        },
+        "student_validation_used_for_selection": bool(selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1),
+        "locked_test_used_for_selection": False,
+        "student_final_retrain": {
+            "enabled": False,
+            "performed": False,
+            "selected_step": int(student_checkpoint_selection.get("selected_step") or int(steps)),
+            "selection_protocol": selection_mode,
+            "locked_test_used_for_selection": False,
+        },
     }
 
 
@@ -2825,7 +3647,7 @@ def predict_gipo_density_many(
         if context_id not in context_embeddings:
             raise KeyError(f"Missing context embedding for {context_id}.")
         setting_rows.append(setting_features(str(row["solver_key"]), int(row["target_nfe"]), mode=feature_mode, config=encoder_config))
-        series_rows.append(remapped_series_index(row, series_index_map))
+        series_rows.append(0)
         context_rows.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
     student.to(device)
     student.eval()
@@ -2880,9 +3702,13 @@ __all__ = [
     "DEFAULT_TEACHER_MIN_TEMPERATURE",
     "DEFAULT_TEACHER_TARGET_ESS",
     "DEFAULT_TEACHER_TARGET_TEMPERATURE",
+    "DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS",
+    "DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE",
+    "DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE",
+    "DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS",
     "ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1",
     "ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1",
-    "CONDITIONING_STYLE_ADALN_ZERO_V1",
+    "CONDITIONING_STYLE_ADDITIVE_MLP_V1",
     "DENSITY_TOKEN_ATTENTION_ROPE_V1",
     "DEFAULT_TRANSFORMER_DROPOUT",
     "DEFAULT_TRANSFORMER_HEADS",
@@ -2891,10 +3717,15 @@ __all__ = [
     "MODEL_PAYLOAD_VERSION",
     "MAX_CONTEXT_CALIBRATION_TOTAL",
     "MIN_CONTEXT_CALIBRATION_TOTAL",
+    "SERIES_CONDITIONING_DIM",
+    "SERIES_CONDITIONING_NONE_CONTEXT_ONLY",
     "STUDENT_TARGET_MODE_MARGIN_HARD_SOFT",
     "STUDENT_TARGET_MODE_SOFT_MIXTURE",
+    "STUDENT_CHECKPOINT_SELECTION_FINAL_STEP",
+    "STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1",
     "TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS",
     "TEACHER_TEMPERATURE_MODE_FIXED",
+    "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1",
     "GIPODensityFormTeacherTransformer",
     "GIPODensityQueryStudentTransformer",
     "DensityFeatureNormalizer",
@@ -2908,12 +3739,14 @@ __all__ = [
     "context_calibration_train_val_counts",
     "context_id_from_row",
     "context_pair_key",
+    "density_family_for_schedule_key",
     "density_sequence_roughness_summary",
     "density_sequence_smoothness_loss",
     "gipo_teacher_diagnostics",
     "density_mass_for_row",
     "grid_for_schedule",
     "load_context_embedding_table",
+    "nfe_sequence_diagnostic_summary",
     "pairwise_rank_loss",
     "predict_gipo_density",
     "predict_gipo_density_many",
@@ -2923,17 +3756,28 @@ __all__ = [
     "sample_context_ids_stratified",
     "save_context_embedding_table",
     "schedule_grid_hash",
+    "select_gipo_teacher_checkpoint",
     "series_key_from_row",
+    "logical_seed_from_row",
+    "evaluation_seed_from_row",
+    "realized_nfe_from_row",
+    "teacher_selection_candidate_group_key",
     "split_rows_by_context_holdout",
+    "split_rows_by_density_family_holdout",
     "split_rows_by_series_holdout",
     "student_nfe_sequence_pair_indices",
     "student_nfe_sequence_pairs",
-    "series_hash_fourier_features",
     "train_gipo_student",
     "train_gipo_teacher",
     "validate_gipo_architecture",
+    "validate_gipo_teacher_training_metadata",
     "validate_gipo_support_schedule_keys",
+    "validate_density_family_holdout_schedule_keys",
+    "validate_series_conditioning",
     "validate_student_target_mode",
+    "validate_teacher_checkpoint_selection_mode",
+    "validate_student_checkpoint_selection_mode",
+    "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1",
     "validate_teacher_objective_hyperparameters",
     "validate_teacher_temperature_mode",
     "validate_reference_grid",

@@ -10,7 +10,7 @@ from genode.gipo.models import validate_time_grid
 
 DENSITY_PROTOCOL = "density_mass_v1"
 DENSITY_DOMAIN = "normalized_model_time_0_1"
-DEFAULT_DENSITY_BIN_COUNT = 128
+DEFAULT_DENSITY_BIN_COUNT = 64
 DEFAULT_DENSITY_EPS = 1e-12
 DEFAULT_LOG_DENSITY_EPS = 1e-8
 

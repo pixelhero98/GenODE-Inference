@@ -14,7 +14,7 @@ from genode.gipo.policy import (
     ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
     GIPO_PROTOCOL,
     MODEL_PAYLOAD_VERSION,
-    TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
+    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
     EmbeddingNormalizer,
     build_gipo_student_model,
     context_id_from_row,
@@ -25,7 +25,8 @@ from genode.gipo.policy import (
     validate_gipo_attention_heads,
     validate_gipo_conditioning_style,
     validate_gipo_density_token_attention,
-    validate_teacher_metric_target_keys,
+    validate_teacher_checkpoint_selection_mode,
+    validate_gipo_teacher_training_metadata,
 )
 from genode.gipo.evaluate_schedule_summary import build_comparison_summary
 from genode.gipo.models import solver_macro_steps
@@ -192,7 +193,11 @@ def _filter_rows_to_contexts(
     return filtered
 
 
-def _load_student_checkpoint(path: str | Path) -> Tuple[Any, Dict[str, int], EmbeddingNormalizer, Tuple[float, ...], Dict[str, Any]]:
+def _load_student_checkpoint(
+    path: str | Path,
+    *,
+    allow_noncanonical_conditioning: bool = False,
+) -> Tuple[Any, Dict[str, int], EmbeddingNormalizer, Tuple[float, ...], Dict[str, Any]]:
     payload = torch.load(resolve_project_path(str(path)), map_location="cpu")
     if str(payload.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError(f"Unsupported GIPO student protocol {payload.get('protocol')!r}; expected {GIPO_PROTOCOL!r}.")
@@ -209,14 +214,8 @@ def _load_student_checkpoint(path: str | Path) -> Tuple[Any, Dict[str, int], Emb
     if str(density_meta.get("density_protocol", "")) != "density_mass_v1":
         raise ValueError("GIPO student checkpoint is missing density_mass_v1 metadata.")
     teacher_training = dict(payload.get("teacher_training", {}) or {})
-    teacher_target = str(teacher_training.get("teacher_target", ""))
-    if teacher_target not in {"metric_vector", "metric_vector_uniform"}:
-        raise ValueError("GIPO student checkpoint must come from a metric-vector teacher.")
-    teacher_metric_targets = validate_teacher_metric_target_keys(teacher_training.get("teacher_metric_targets", ()))
-    if str(teacher_training.get("teacher_scalarization", "")) != TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1:
-        raise ValueError(
-            f"GIPO student checkpoint teacher_scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1!r}."
-        )
+    teacher_training_meta = validate_gipo_teacher_training_metadata(teacher_training)
+    teacher_metric_targets = teacher_training_meta["teacher_metric_targets"]
     teacher_utility_weights = dict(payload.get("teacher_utility_weights") or teacher_training.get("teacher_utility_weights") or {})
     if not teacher_utility_weights:
         raise ValueError("GIPO student checkpoint is missing teacher_utility_weights.")
@@ -240,7 +239,11 @@ def _load_student_checkpoint(path: str | Path) -> Tuple[Any, Dict[str, int], Emb
             f"GIPO student checkpoints must use {ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1!r}; got {student_architecture!r}."
         )
     student_model_config = dict(payload.get("student_model_config", {}) or {})
-    validate_gipo_conditioning_style(student_model_config, require_present=True)
+    validate_gipo_conditioning_style(
+        student_model_config,
+        require_present=True,
+        allow_noncanonical=bool(allow_noncanonical_conditioning),
+    )
     validate_gipo_density_token_attention(student_model_config, require_present=True)
     validate_gipo_attention_heads(int(student_model_config.get("attention_heads", -1)))
     student = build_gipo_student_model(
@@ -250,6 +253,7 @@ def _load_student_checkpoint(path: str | Path) -> Tuple[Any, Dict[str, int], Emb
         context_dim=int(payload["context_dim"]),
         num_series=len(series_index_map),
         model_config=student_model_config,
+        allow_noncanonical_conditioning=bool(allow_noncanonical_conditioning),
     )
     student.load_state_dict(payload["student_state"])
     student.eval()
@@ -259,6 +263,19 @@ def _load_student_checkpoint(path: str | Path) -> Tuple[Any, Dict[str, int], Emb
     payload["student_architecture"] = student_architecture
     payload["student_model_config"] = student.model_config()
     return student, series_index_map, normalizer, reference_time_grid, payload
+
+
+def _teacher_final_retrain_metadata(
+    checkpoint_payload: Mapping[str, Any],
+    training_summary: Mapping[str, Any],
+) -> Dict[str, Any]:
+    return dict(
+        checkpoint_payload.get("teacher_final_retrain")
+        or checkpoint_payload.get("final_teacher_retrain")
+        or training_summary.get("teacher_final_retrain")
+        or training_summary.get("final_teacher_retrain")
+        or {}
+    )
 
 
 def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str) -> List[Dict[str, Any]]:
@@ -340,12 +357,32 @@ def _output_prefix(split_phase: str, selection_mode: str, report_label: str = ""
 
 
 def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
-    student, series_index_map, normalizer, reference_time_grid, checkpoint_payload = _load_student_checkpoint(str(args.gipo_student_checkpoint))
+    student, series_index_map, normalizer, reference_time_grid, checkpoint_payload = _load_student_checkpoint(
+        str(args.gipo_student_checkpoint),
+        allow_noncanonical_conditioning=bool(getattr(args, "allow_noncanonical_conditioning", False)),
+    )
     training_summary = json.loads(resolve_project_path(str(args.training_summary)).read_text(encoding="utf-8"))
     if str(training_summary.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError("training_summary protocol does not match continuous-density GIPO.")
     if bool(training_summary.get("locked_test_used_for_selection", False)):
         raise ValueError("training_summary indicates locked_test was used for selection.")
+    required_checkpoint_selection_mode = str(getattr(args, "require_teacher_checkpoint_selection_mode", "") or "").strip()
+    if required_checkpoint_selection_mode:
+        required_checkpoint_selection_mode = validate_teacher_checkpoint_selection_mode(required_checkpoint_selection_mode)
+        actual_selection_mode = str(
+            checkpoint_payload.get("teacher_checkpoint_selection_mode")
+            or training_summary.get("teacher_checkpoint_selection_mode")
+            or ""
+        )
+        if actual_selection_mode != required_checkpoint_selection_mode:
+            raise ValueError(
+                f"GIPO reporter requires teacher_checkpoint_selection_mode={required_checkpoint_selection_mode!r}; "
+                f"got {actual_selection_mode!r}."
+            )
+        if required_checkpoint_selection_mode == TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1:
+            final_retrain = _teacher_final_retrain_metadata(checkpoint_payload, training_summary)
+            if final_retrain.get("enabled") is not True:
+                raise ValueError("GIPO reporter requires final teacher retrain metadata for weighted-normalized-regret checkpoints.")
 
     selection_mode = str(getattr(args, "selection_mode", SELECTION_MODE_REPORTING))
     split_phase = str(getattr(args, "split_phase", LOCKED_TEST_PHASE))
@@ -517,16 +554,21 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "split_phase": split_phase,
         "selection_mode": selection_mode,
         "source_split_phases": sorted({_source_split_phase(row) for row in representatives}),
+        "target_nfe_values": [int(value) for value in target_nfes],
         "context_row_count": int(len(per_context_rows)),
         "aggregate_row_count": int(len(aggregate_rows)),
         "missing_expected_cells": missing_cells,
+        "missing_cell_count": int(len(missing_cells)),
         "mean_crps": float(np.mean(np.asarray(crps_values, dtype=np.float64))) if crps_values else None,
         "mean_mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else None,
         "metric_means": _numeric_metric_means(aggregate_rows),
         "density_representation": checkpoint_payload.get("density_representation", {}),
+        "conditioning_style": dict(checkpoint_payload.get("student_model_config", {}) or {}).get("conditioning_style", ""),
         "setting_feature_mode": checkpoint_payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3),
         "setting_encoder_mode": checkpoint_payload.get("setting_encoder_mode", ""),
         "setting_encoder_config": checkpoint_payload.get("setting_encoder_config", {}),
+        "teacher_checkpoint_selection_mode": checkpoint_payload.get("teacher_checkpoint_selection_mode", training_summary.get("teacher_checkpoint_selection_mode", "")),
+        "teacher_final_retrain": _teacher_final_retrain_metadata(checkpoint_payload, training_summary),
         "locked_test_used_for_selection": False,
         "comparison_summary_path": "" if comparison is None else comparison_file,
     }
@@ -542,6 +584,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--context_embeddings_npz", default="", help="Context embedding table for --context_rows.")
     parser.add_argument("--split_phase", default=LOCKED_TEST_PHASE, help="Report split label: locked_test, validation_tuning, train_tuning, context_disjoint, or series_disjoint.")
     parser.add_argument("--selection_mode", choices=(SELECTION_MODE_REPORTING, SELECTION_MODE_CALIBRATION), default=SELECTION_MODE_REPORTING)
+    parser.add_argument("--require_teacher_checkpoint_selection_mode", default="")
+    parser.add_argument(
+        "--allow_noncanonical_conditioning",
+        action="store_true",
+        help="Explicitly allow noncanonical GIPO conditioning checkpoints for sidecar comparisons.",
+    )
     parser.add_argument("--report_label", default="")
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--baseline_rows", default="")

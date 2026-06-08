@@ -136,6 +136,8 @@ CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "dataset",
     "split_phase",
     "seed",
+    "logical_seed",
+    "evaluation_seed",
     "solver_key",
     "target_nfe",
     "runtime_nfe",
@@ -1069,6 +1071,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                             time_grid=prediction["time_grid"],
                             num_eval_samples=int(args.num_eval_samples),
                             seed=int(eval_seed),
+                            logical_seed=int(seed),
                             scheduler_key=str(schedule_key),
                             dataset_key=str(args.dataset),
                             split_phase=str(split_phase),
@@ -1115,6 +1118,8 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                                         "benchmark_family": FORECAST_FAMILY,
                                         "parent_row_signature": str(row.get("row_signature", "")),
                                         "protocol_hash": str(protocol_hash),
+                                        "logical_seed": int(copied_detail.get("logical_seed", seed)),
+                                        "evaluation_seed": int(copied_detail.get("evaluation_seed", eval_seed)),
                                     }
                                 )
                                 if split_phase == TRAIN_TUNING_PHASE:
