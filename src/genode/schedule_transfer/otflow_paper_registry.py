@@ -15,7 +15,6 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
 MAIN_NFE_VALUES: Tuple[int, ...] = (4, 8, 12)
 APPENDIX_NFE_VALUES: Tuple[int, ...] = (6, 8, 20, 24)
 METHOD_KEY = "diffusion_flow_time_reparameterization"
-PAPER_METHOD_KEY = METHOD_KEY
 PAPER_MAIN_SIGNAL_FAMILY = "native_info_growth"
 
 
@@ -139,7 +138,6 @@ __all__ = [
     "MAIN_NFE_VALUES",
     "METHOD_KEY",
     "PAPER_MAIN_SIGNAL_FAMILY",
-    "PAPER_METHOD_KEY",
     "ScheduleSpec",
     "SolverSpec",
     "TRANSFER_SCHEDULE_KEYS",

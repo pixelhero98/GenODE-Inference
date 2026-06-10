@@ -207,8 +207,6 @@ def _filter_rows_to_contexts(
 
 def _load_student_checkpoint(
     path: str | Path,
-    *,
-    allow_noncanonical_conditioning: bool = False,
 ) -> Tuple[Any, Dict[str, int], EmbeddingNormalizer, Tuple[float, ...], Dict[str, Any]]:
     payload = torch.load(resolve_project_path(str(path)), map_location="cpu")
     if str(payload.get("protocol", "")) != GIPO_PROTOCOL:
@@ -255,7 +253,6 @@ def _load_student_checkpoint(
     validate_gipo_conditioning_style(
         student_model_config,
         require_present=True,
-        allow_noncanonical=bool(allow_noncanonical_conditioning),
     )
     validate_gipo_density_token_attention(student_model_config, require_present=True)
     validate_gipo_attention_heads(int(student_model_config.get("attention_heads", -1)))
@@ -266,7 +263,6 @@ def _load_student_checkpoint(
         context_dim=int(payload["context_dim"]),
         num_series=len(series_index_map),
         model_config=student_model_config,
-        allow_noncanonical_conditioning=bool(allow_noncanonical_conditioning),
     )
     student.load_state_dict(payload["student_state"])
     student.eval()
@@ -441,7 +437,6 @@ def _output_prefix(split_phase: str, selection_mode: str, report_label: str = ""
 def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     student, series_index_map, normalizer, reference_time_grid, checkpoint_payload = _load_student_checkpoint(
         str(args.gipo_student_checkpoint),
-        allow_noncanonical_conditioning=bool(getattr(args, "allow_noncanonical_conditioning", False)),
     )
     training_summary = json.loads(resolve_project_path(str(args.training_summary)).read_text(encoding="utf-8"))
     if str(training_summary.get("protocol", "")) != GIPO_PROTOCOL:
@@ -672,11 +667,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--split_phase", default=LOCKED_TEST_PHASE, help="Report split label: locked_test, validation_tuning, train_tuning, or context_disjoint.")
     parser.add_argument("--selection_mode", choices=(SELECTION_MODE_REPORTING, SELECTION_MODE_CALIBRATION), default=SELECTION_MODE_REPORTING)
     parser.add_argument("--require_teacher_checkpoint_selection_mode", default="")
-    parser.add_argument(
-        "--allow_noncanonical_conditioning",
-        action="store_true",
-        help="Explicitly allow noncanonical GIPO conditioning checkpoints for sidecar comparisons.",
-    )
     parser.add_argument("--report_label", default="")
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--baseline_rows", default="")

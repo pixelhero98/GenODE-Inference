@@ -11,10 +11,10 @@ requires-python = ">=3.11"
 license = {file = "LICENSE"}
 authors = [{name = "genODE contributors"}]
 dependencies = [
-  "numpy==2.4.2",
+  "numpy>=1.26",
   "scipy>=1.11",
   "matplotlib>=3.8,<4",
-  "torch==2.10.0",
+  "torch>=2.2",
   "wfdb>=4.1",
   "pyedflib>=0.1.38",
 ]
@@ -27,7 +27,6 @@ genode-train-molecule-backbone = "genode.training.train_molecule_backbone:main"
 genode-eval-molecule-backbone = "genode.evaluation.molecule_metrics:main"
 genode-train-gipo = "genode.gipo.train_gipo:main"
 genode-report-gipo-locked-test = "genode.gipo.report_locked_test:main"
-genode-report-gipo-teacher-oracle = "genode.gipo.report_teacher_oracle:main"
 genode-build-ser-ptg-reference = "genode.gipo.ser_ptg_reference:main"
 genode-evaluate-schedule-summary = "genode.gipo.evaluate_schedule_summary:main"
 genode-build-hardness-figure = "genode.visualization.build_hardness_mismatch_figure:main"

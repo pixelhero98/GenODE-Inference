@@ -63,8 +63,6 @@ MODEL_PAYLOAD_VERSION = 4
 ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1 = "density_form_transformer_v1"
 ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1 = "density_query_transformer_v1"
 CONDITIONING_STYLE_ADDITIVE_MLP_V1 = "additive_mlp_v1"
-CONDITIONING_STYLE_ADALN_ZERO_V1 = "adaln_zero_v1"
-NONCANONICAL_CONDITIONING_STYLES: Tuple[str, ...] = (CONDITIONING_STYLE_ADALN_ZERO_V1,)
 DENSITY_TOKEN_ATTENTION_ROPE_V1 = "bin_self_attention_rope_v1"
 TEACHER_OUTPUT_METRIC_VECTOR_V1 = "metric_vector_v1"
 TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1 = "weighted_metric_average_v1"
@@ -112,7 +110,6 @@ def validate_gipo_conditioning_style(
     model_config: Mapping[str, Any] | None,
     *,
     require_present: bool = False,
-    allow_noncanonical: bool = False,
 ) -> str:
     if not model_config or "conditioning_style" not in model_config:
         if require_present:
@@ -123,18 +120,10 @@ def validate_gipo_conditioning_style(
     style = str(model_config["conditioning_style"]).strip()
     if style == CONDITIONING_STYLE_ADDITIVE_MLP_V1:
         return style
-    if allow_noncanonical and style in NONCANONICAL_CONDITIONING_STYLES:
-        return style
-    if style in NONCANONICAL_CONDITIONING_STYLES:
-        raise ValueError(
-            f"GIPO density transformers require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP_V1!r} by default; "
-            f"got noncanonical style {style!r}. Pass the explicit noncanonical opt-in to use it."
-        )
-    else:
-        raise ValueError(
-            f"GIPO density transformers require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP_V1!r}; "
-            f"got {style!r}."
-        )
+    raise ValueError(
+        f"GIPO density transformers require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP_V1!r}; "
+        f"got {style!r}."
+    )
 
 
 def validate_gipo_teacher_training_metadata(metadata: Mapping[str, Any] | None) -> Dict[str, Any]:
@@ -507,10 +496,6 @@ def teacher_selection_candidate_group_key(row: MetricRow) -> Tuple[str, str, int
         logical_seed_from_row(row),
         evaluation_seed_from_row(row),
     )
-
-
-complete_candidate_group_key = teacher_selection_candidate_group_key
-
 
 def complete_candidate_group_payload(key: Tuple[str, str, int, int | None, int | None, int | None]) -> Dict[str, Any]:
     return {
@@ -1122,15 +1107,11 @@ class _DensityTokenRoPESelfAttention(nn.Module):
 
 
 class _DensityTokenTransformerBlock(nn.Module):
-    def __init__(self, *, hidden_dim: int, heads: int, dropout: float, conditioning_style: str):
+    def __init__(self, *, hidden_dim: int, heads: int, dropout: float):
         super().__init__()
         if int(hidden_dim) % int(heads) != 0:
             raise ValueError("Transformer hidden_dim must be divisible by attention heads.")
         hidden = int(hidden_dim)
-        self.conditioning_style = validate_gipo_conditioning_style(
-            {"conditioning_style": conditioning_style},
-            allow_noncanonical=True,
-        )
         self.norm1 = nn.LayerNorm(hidden)
         self.attn = _DensityTokenRoPESelfAttention(hidden_dim=hidden, heads=int(heads), dropout=float(dropout))
         self.norm2 = nn.LayerNorm(hidden)
@@ -1141,33 +1122,10 @@ class _DensityTokenTransformerBlock(nn.Module):
             nn.Linear(hidden * 4, hidden),
         )
         self.dropout = nn.Dropout(float(dropout))
-        self.adaln_modulation = None
-        if self.conditioning_style == CONDITIONING_STYLE_ADALN_ZERO_V1:
-            modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden, 6 * hidden))
-            nn.init.zeros_(modulation[-1].weight)
-            nn.init.zeros_(modulation[-1].bias)
-            self.adaln_modulation = modulation
 
-    @staticmethod
-    def _modulate(tokens: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return tokens * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-    def forward(self, tokens: torch.Tensor, condition: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         if tokens.ndim != 3:
             raise ValueError("Density token attention expects a [batch, bins, hidden] tensor.")
-        if self.conditioning_style == CONDITIONING_STYLE_ADALN_ZERO_V1:
-            if condition is None or condition.ndim != 2 or condition.shape[0] != tokens.shape[0] or condition.shape[-1] != tokens.shape[-1]:
-                raise ValueError("AdaLN conditioning expects a [batch, hidden] tensor aligned with density tokens.")
-            if self.adaln_modulation is None:
-                raise RuntimeError("AdaLN modulation layer is not initialized.")
-            shift_attn, scale_attn, gate_attn, shift_ff, scale_ff, gate_ff = self.adaln_modulation(condition).chunk(6, dim=-1)
-            tokens = tokens + gate_attn.unsqueeze(1) * self.dropout(
-                self.attn(self._modulate(self.norm1(tokens), shift_attn, scale_attn))
-            )
-            tokens = tokens + gate_ff.unsqueeze(1) * self.dropout(
-                self.ff(self._modulate(self.norm2(tokens), shift_ff, scale_ff))
-            )
-            return tokens
         tokens = tokens + self.dropout(self.attn(self.norm1(tokens)))
         tokens = tokens + self.dropout(self.ff(self.norm2(tokens)))
         return tokens
@@ -1202,15 +1160,9 @@ class _DensityConditioningMixin:
         out = tokens
         if condition.ndim != 2 or condition.shape[0] != tokens.shape[0] or condition.shape[-1] != tokens.shape[-1]:
             raise ValueError("GIPO conditioning expects a [batch, hidden] tensor aligned with density tokens.")
-        if self.conditioning_style == CONDITIONING_STYLE_ADDITIVE_MLP_V1:
-            out = out + condition.unsqueeze(1)
-            for block in self.blocks:
-                out = block(out)
-        elif self.conditioning_style == CONDITIONING_STYLE_ADALN_ZERO_V1:
-            for block in self.blocks:
-                out = block(out, condition)
-        else:
-            raise ValueError(f"Unsupported GIPO conditioning style {self.conditioning_style!r}.")
+        out = out + condition.unsqueeze(1)
+        for block in self.blocks:
+            out = block(out)
         return self.final_norm(out)
 
     def model_config(self) -> Dict[str, Any]:
@@ -1264,7 +1216,6 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
         attention_heads: int = DEFAULT_TRANSFORMER_HEADS,
         dropout: float = DEFAULT_TRANSFORMER_DROPOUT,
         conditioning_style: str = CONDITIONING_STYLE_ADDITIVE_MLP_V1,
-        allow_noncanonical_conditioning: bool = False,
         density_feature_mean: Sequence[float] | None = None,
         density_feature_std: Sequence[float] | None = None,
         teacher_metric_targets: Sequence[str] = TEACHER_METRIC_TARGET_KEYS,
@@ -1282,7 +1233,6 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
         self.dropout_probability = float(dropout)
         self.conditioning_style = validate_gipo_conditioning_style(
             {"conditioning_style": conditioning_style},
-            allow_noncanonical=bool(allow_noncanonical_conditioning),
         )
         self.teacher_metric_targets = validate_teacher_metric_target_keys(teacher_metric_targets)
         mean = np.zeros(int(density_dim), dtype=np.float32) if density_feature_mean is None else np.asarray(density_feature_mean, dtype=np.float32)
@@ -1306,7 +1256,6 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
                     hidden_dim=int(hidden_dim),
                     heads=int(self.attention_heads),
                     dropout=float(dropout),
-                    conditioning_style=self.conditioning_style,
                 )
                 for _ in range(int(hidden_layers))
             ]
@@ -1370,7 +1319,6 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
         attention_heads: int = DEFAULT_TRANSFORMER_HEADS,
         dropout: float = DEFAULT_TRANSFORMER_DROPOUT,
         conditioning_style: str = CONDITIONING_STYLE_ADDITIVE_MLP_V1,
-        allow_noncanonical_conditioning: bool = False,
     ):
         super().__init__()
         self.setting_dim = int(setting_dim)
@@ -1385,7 +1333,6 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
         self.dropout_probability = float(dropout)
         self.conditioning_style = validate_gipo_conditioning_style(
             {"conditioning_style": conditioning_style},
-            allow_noncanonical=bool(allow_noncanonical_conditioning),
         )
         condition_dim = int(setting_dim) + int(context_dim)
         self.condition_mlp = nn.Sequential(
@@ -1400,7 +1347,6 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
                     hidden_dim=int(hidden_dim),
                     heads=int(self.attention_heads),
                     dropout=float(dropout),
-                    conditioning_style=self.conditioning_style,
                 )
                 for _ in range(int(hidden_layers))
             ]
@@ -1460,13 +1406,11 @@ def build_gipo_teacher_model(
     context_dim: int,
     num_series: int,
     model_config: Mapping[str, Any] | None = None,
-    allow_noncanonical_conditioning: bool = False,
 ) -> nn.Module:
     validate_gipo_architecture(architecture, role="teacher")
     cfg = dict(model_config or {})
     conditioning_style = validate_gipo_conditioning_style(
         cfg,
-        allow_noncanonical=bool(allow_noncanonical_conditioning),
     )
     validate_series_conditioning(cfg.get("series_conditioning"))
     validate_gipo_density_token_attention(cfg)
@@ -1482,7 +1426,6 @@ def build_gipo_teacher_model(
         attention_heads=validate_gipo_attention_heads(int(cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS))),
         dropout=float(cfg.get("dropout", DEFAULT_TRANSFORMER_DROPOUT)),
         conditioning_style=conditioning_style,
-        allow_noncanonical_conditioning=bool(allow_noncanonical_conditioning),
         density_feature_mean=cfg.get("density_feature_mean"),
         density_feature_std=cfg.get("density_feature_std"),
         teacher_metric_targets=validate_teacher_metric_target_keys(cfg.get("teacher_metric_targets", TEACHER_METRIC_TARGET_KEYS)),
@@ -1497,13 +1440,11 @@ def build_gipo_student_model(
     context_dim: int,
     num_series: int,
     model_config: Mapping[str, Any] | None = None,
-    allow_noncanonical_conditioning: bool = False,
 ) -> nn.Module:
     validate_gipo_architecture(architecture, role="student")
     cfg = dict(model_config or {})
     conditioning_style = validate_gipo_conditioning_style(
         cfg,
-        allow_noncanonical=bool(allow_noncanonical_conditioning),
     )
     validate_series_conditioning(cfg.get("series_conditioning"))
     validate_gipo_density_token_attention(cfg)
@@ -1518,7 +1459,6 @@ def build_gipo_student_model(
         attention_heads=validate_gipo_attention_heads(int(cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS))),
         dropout=float(cfg.get("dropout", DEFAULT_TRANSFORMER_DROPOUT)),
         conditioning_style=conditioning_style,
-        allow_noncanonical_conditioning=bool(allow_noncanonical_conditioning),
     )
 
 

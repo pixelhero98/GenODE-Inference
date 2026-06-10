@@ -57,8 +57,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertIn("DPM++2M", solver_names)
 
     def test_gipo_docs_describe_active_density_path(self) -> None:
-        docs_path = PROJECT_ROOT / "docs" / "gipo.md"
-        text = docs_path.read_text(encoding="utf-8")
+        text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
         lower = text.lower()
 
         self.assertRegex(lower, r"continuous[- ]density")
@@ -77,8 +76,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             "ots",
             "ser",
             "context-disjoint",
-            "series-disjoint",
             "locked-test",
+            "genode-train-gipo",
+            "genode-report-gipo-locked-test",
         ):
             self.assertIn(expected, lower)
         for retired in (

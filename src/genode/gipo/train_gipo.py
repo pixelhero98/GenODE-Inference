@@ -25,7 +25,6 @@ from genode.gipo.policy import (
     DEFAULT_TRANSFORMER_HEADS,
     DEFAULT_TRANSFORMER_HIDDEN_DIM,
     DEFAULT_TRANSFORMER_LAYERS,
-    CONDITIONING_STYLE_ADALN_ZERO_V1,
     CONDITIONING_STYLE_ADDITIVE_MLP_V1,
     DensityFeatureNormalizer,
     EmbeddingNormalizer,
@@ -51,7 +50,6 @@ from genode.gipo.policy import (
     normalize_teacher_utility_weights,
     teacher_utility_weights_for_summary,
     validate_gipo_attention_heads,
-    validate_gipo_conditioning_style,
     validate_gipo_support_schedule_keys,
     validate_teacher_metric_target_keys,
     validate_teacher_objective_hyperparameters,
@@ -78,12 +76,6 @@ CANONICAL_TEACHER_SELECTION_COMPONENT_WEIGHTS: Dict[str, float] = {
 CANONICAL_TEACHER_RANK_TEMPERATURE = 0.5
 CANONICAL_TEACHER_REGRESSION_WEIGHT = 0.25
 CANONICAL_TEACHER_PAIR_MARGIN = 0.0
-
-
-class _ExplicitDefaultAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[override]
-        setattr(namespace, self.dest, values)
-        setattr(namespace, f"_{self.dest}_explicit", True)
 
 
 def _parse_csv(text: str) -> List[str]:
@@ -218,47 +210,6 @@ def _stable_hash(values: Sequence[str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _conditioning_pair_label(teacher_style: str, student_style: str) -> str:
-    if str(teacher_style) == str(student_style):
-        return str(teacher_style)
-    return f"teacher_{teacher_style}__student_{student_style}"
-
-
-def _resolve_conditioning_styles(args: argparse.Namespace) -> Tuple[str, str, str]:
-    shared_style = str(getattr(args, "gipo_conditioning_style", "") or CONDITIONING_STYLE_ADDITIVE_MLP_V1).strip()
-    teacher_override = str(getattr(args, "gipo_teacher_conditioning_style", "") or "").strip()
-    student_override = str(getattr(args, "gipo_student_conditioning_style", "") or "").strip()
-    shared_explicit = bool(getattr(args, "_gipo_conditioning_style_explicit", False))
-    if shared_explicit:
-        conflicts = []
-        if teacher_override and teacher_override != shared_style:
-            conflicts.append("--gipo_teacher_conditioning_style")
-        if student_override and student_override != shared_style:
-            conflicts.append("--gipo_student_conditioning_style")
-        if conflicts:
-            raise ValueError(
-                "--gipo_conditioning_style is a same-style shortcut and cannot be combined with "
-                f"conflicting role-specific flags: {', '.join(conflicts)}."
-            )
-    teacher_style = teacher_override or shared_style or CONDITIONING_STYLE_ADDITIVE_MLP_V1
-    student_style = student_override or shared_style or CONDITIONING_STYLE_ADDITIVE_MLP_V1
-    allow_noncanonical = bool(getattr(args, "allow_noncanonical_conditioning", False))
-    if (
-        teacher_style != CONDITIONING_STYLE_ADDITIVE_MLP_V1
-        or student_style != CONDITIONING_STYLE_ADDITIVE_MLP_V1
-    ) and not allow_noncanonical:
-        raise ValueError(
-            "Noncanonical GIPO conditioning in either teacher or student requires "
-            "--allow_noncanonical_conditioning."
-        )
-    for style in (teacher_style, student_style):
-        validate_gipo_conditioning_style(
-            {"conditioning_style": style},
-            allow_noncanonical=allow_noncanonical,
-        )
-    return teacher_style, student_style, _conditioning_pair_label(teacher_style, student_style)
-
-
 def _split_membership_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     context_ids = sorted({context_id_from_row(row) for row in rows})
     series_keys = sorted({series_key_from_row(row) for row in rows})
@@ -319,7 +270,6 @@ def _raw_split_phase(row: Mapping[str, Any]) -> str:
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train GIPO continuous-density from per-example fixed/SER rows.")
-    parser.set_defaults(_gipo_conditioning_style_explicit=False)
     parser.add_argument("--rows_csv", required=True, help="Per-example fixed/SER metric rows CSV.")
     parser.add_argument("--context_embeddings_npz", required=True, help="Frozen context embedding sidecar NPZ.")
     parser.add_argument("--schedule_summary_json", default="", help="Comma-separated schedule summaries for non-fixed references such as SER.")
@@ -361,30 +311,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--transformer_layers", type=int, default=DEFAULT_TRANSFORMER_LAYERS)
     parser.add_argument("--transformer_heads", type=int, default=DEFAULT_TRANSFORMER_HEADS)
     parser.add_argument("--transformer_dropout", type=float, default=DEFAULT_TRANSFORMER_DROPOUT)
-    parser.add_argument(
-        "--gipo_conditioning_style",
-        choices=(CONDITIONING_STYLE_ADDITIVE_MLP_V1, CONDITIONING_STYLE_ADALN_ZERO_V1),
-        default=CONDITIONING_STYLE_ADDITIVE_MLP_V1,
-        action=_ExplicitDefaultAction,
-        help="Same-style teacher/student conditioning shortcut.",
-    )
-    parser.add_argument(
-        "--gipo_teacher_conditioning_style",
-        choices=(CONDITIONING_STYLE_ADDITIVE_MLP_V1, CONDITIONING_STYLE_ADALN_ZERO_V1),
-        default="",
-        help="Teacher-only conditioning style. Defaults to --gipo_conditioning_style.",
-    )
-    parser.add_argument(
-        "--gipo_student_conditioning_style",
-        choices=(CONDITIONING_STYLE_ADDITIVE_MLP_V1, CONDITIONING_STYLE_ADALN_ZERO_V1),
-        default="",
-        help="Student-only conditioning style. Defaults to --gipo_conditioning_style.",
-    )
-    parser.add_argument(
-        "--allow_noncanonical_conditioning",
-        action="store_true",
-        help="Explicitly allow noncanonical GIPO conditioning styles for sidecar comparisons.",
-    )
     parser.add_argument("--teacher_temperature", type=float, default=DEFAULT_TEACHER_TARGET_TEMPERATURE)
     parser.add_argument("--teacher_utility_crps_weight", type=float, default=0.5)
     parser.add_argument("--teacher_utility_mase_weight", type=float, default=0.5)
@@ -411,8 +337,9 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     selection_mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
     student_selection_mode = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
     validate_gipo_attention_heads(int(args.transformer_heads))
-    allow_noncanonical_conditioning = bool(getattr(args, "allow_noncanonical_conditioning", False))
-    teacher_conditioning_style, student_conditioning_style, conditioning_pair = _resolve_conditioning_styles(args)
+    teacher_conditioning_style = CONDITIONING_STYLE_ADDITIVE_MLP_V1
+    student_conditioning_style = CONDITIONING_STYLE_ADDITIVE_MLP_V1
+    conditioning_pair = CONDITIONING_STYLE_ADDITIVE_MLP_V1
     requested_setting_mode = SETTING_ENCODER_MODE_CONTINUOUS_V3
     setting_feature_mode = validate_setting_feature_mode(requested_setting_mode)
     rows = read_metric_rows_csv(resolve_project_path(str(args.rows_csv)))
@@ -675,7 +602,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             context_dim=context_dim,
             num_series=len(series_index_map),
             model_config=teacher_transformer_model_config,
-            allow_noncanonical_conditioning=allow_noncanonical_conditioning,
         )
 
     def _build_student_instance(seed_offset: int = 0):
@@ -687,7 +613,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             context_dim=context_dim,
             num_series=len(series_index_map),
             model_config=student_transformer_model_config,
-            allow_noncanonical_conditioning=allow_noncanonical_conditioning,
         )
 
     teacher = _build_teacher_instance(0)
@@ -725,7 +650,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "teacher": teacher_conditioning_style,
             "student": student_conditioning_style,
         },
-        "noncanonical_conditioning_allowed": allow_noncanonical_conditioning,
         "student_weight_decay": float(args.student_weight_decay),
         "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "setting_feature_mode": setting_feature_mode,
