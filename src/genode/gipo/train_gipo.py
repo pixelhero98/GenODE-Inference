@@ -337,9 +337,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     selection_mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
     student_selection_mode = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
     validate_gipo_attention_heads(int(args.transformer_heads))
-    teacher_conditioning_style = CONDITIONING_STYLE_ADDITIVE_MLP_V1
-    student_conditioning_style = CONDITIONING_STYLE_ADDITIVE_MLP_V1
-    conditioning_pair = CONDITIONING_STYLE_ADDITIVE_MLP_V1
+    conditioning_style = CONDITIONING_STYLE_ADDITIVE_MLP_V1
     requested_setting_mode = SETTING_ENCODER_MODE_CONTINUOUS_V3
     setting_feature_mode = validate_setting_feature_mode(requested_setting_mode)
     rows = read_metric_rows_csv(resolve_project_path(str(args.rows_csv)))
@@ -586,12 +584,12 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     }
     teacher_transformer_model_config = {
         **transformer_model_config,
-        "conditioning_style": teacher_conditioning_style,
+        "conditioning_style": conditioning_style,
         "teacher_metric_targets": list(teacher_metric_target_keys),
     }
     student_transformer_model_config = {
         **transformer_model_config,
-        "conditioning_style": student_conditioning_style,
+        "conditioning_style": conditioning_style,
     }
     def _build_teacher_instance(seed_offset: int = 0):
         seed_all(int(args.seed) + int(seed_offset))
@@ -642,14 +640,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "student_log_every": int(args.student_log_every),
         "student_checkpoint_every": int(args.student_checkpoint_every),
         "student_selection_holdout_fraction": float(args.student_selection_holdout_fraction),
-        "gipo_conditioning_style": conditioning_pair,
-        "teacher_conditioning_style": teacher_conditioning_style,
-        "student_conditioning_style": student_conditioning_style,
-        "conditioning_pair": conditioning_pair,
-        "conditioning_styles": {
-            "teacher": teacher_conditioning_style,
-            "student": student_conditioning_style,
-        },
+        "conditioning_style": conditioning_style,
         "student_weight_decay": float(args.student_weight_decay),
         "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "setting_feature_mode": setting_feature_mode,
@@ -958,14 +949,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "support_schedule_keys": list(support_keys),
             "teacher_utility_weights": teacher_utility_weights,
             "teacher_training": teacher_training,
-            "gipo_conditioning_style": conditioning_pair,
-            "teacher_conditioning_style": teacher_conditioning_style,
-            "student_conditioning_style": student_conditioning_style,
-            "conditioning_pair": conditioning_pair,
-            "conditioning_styles": {
-                "teacher": teacher_conditioning_style,
-                "student": student_conditioning_style,
-            },
+            "conditioning_style": conditioning_style,
             "teacher_checkpoint_selection_mode": selection_mode,
             "teacher_checkpoint_selection": teacher_training.get("teacher_checkpoint_selection", {}),
             "student_checkpoint_selection_mode": student_selection_mode,
@@ -988,14 +972,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "student_model_config": student_model_config,
             "student_objective": student_training.get("student_objective", "teacher_weighted_density_mle_kl"),
             "student_state": student.state_dict(),
-            "gipo_conditioning_style": conditioning_pair,
-            "teacher_conditioning_style": teacher_conditioning_style,
-            "student_conditioning_style": student_conditioning_style,
-            "conditioning_pair": conditioning_pair,
-            "conditioning_styles": {
-                "teacher": teacher_conditioning_style,
-                "student": student_conditioning_style,
-            },
+            "conditioning_style": conditioning_style,
             "setting_dim": int(setting_dim),
             "setting_feature_mode": setting_feature_mode,
             "setting_encoder_mode": setting_encoder_config.mode,
@@ -1037,9 +1014,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
         "teacher_model_config": teacher_model_config,
         "student_model_config": student_model_config,
-        "teacher_conditioning_style": teacher_conditioning_style,
-        "student_conditioning_style": student_conditioning_style,
-        "conditioning_pair": conditioning_pair,
+        "conditioning_style": conditioning_style,
         "teacher_utility_weights": teacher_utility_weights,
         "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "teacher_checkpoint_selection_mode": selection_mode,

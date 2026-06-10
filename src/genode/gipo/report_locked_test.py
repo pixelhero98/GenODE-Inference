@@ -291,14 +291,6 @@ def _clean_metadata_string(value: Any) -> str:
     return str(value).strip() if value is not None else ""
 
 
-def _first_metadata_string(*values: Any) -> str:
-    for value in values:
-        cleaned = _clean_metadata_string(value)
-        if cleaned:
-            return cleaned
-    return ""
-
-
 def _model_conditioning_style(payload: Mapping[str, Any], config_key: str) -> str:
     config = payload.get(config_key)
     if not isinstance(config, Mapping):
@@ -306,54 +298,29 @@ def _model_conditioning_style(payload: Mapping[str, Any], config_key: str) -> st
     return _clean_metadata_string(config.get("conditioning_style"))
 
 
-def _role_conditioning_style(payload: Mapping[str, Any], role: str) -> str:
-    styles = payload.get("conditioning_styles")
-    style_from_roles = ""
-    if isinstance(styles, Mapping):
-        style_from_roles = _clean_metadata_string(styles.get(role))
-    return _first_metadata_string(style_from_roles, payload.get(f"{role}_conditioning_style"))
-
-
-def _conditioning_pair_label(teacher_style: str, student_style: str) -> str:
-    if not teacher_style or not student_style:
-        return ""
-    if str(teacher_style) == str(student_style):
-        return str(student_style)
-    return f"teacher_{teacher_style}__student_{student_style}"
-
-
 def _conditioning_metadata_for_summary(
     checkpoint_payload: Mapping[str, Any],
     training_summary: Mapping[str, Any],
 ) -> Dict[str, str]:
-    student_style = _first_metadata_string(
-        _role_conditioning_style(checkpoint_payload, "student"),
-        _model_conditioning_style(checkpoint_payload, "student_model_config"),
-        _role_conditioning_style(training_summary, "student"),
-        _model_conditioning_style(training_summary, "student_model_config"),
-    )
-    teacher_style = _first_metadata_string(
-        _role_conditioning_style(checkpoint_payload, "teacher"),
-        _model_conditioning_style(checkpoint_payload, "teacher_model_config"),
-        _role_conditioning_style(training_summary, "teacher"),
-        _model_conditioning_style(training_summary, "teacher_model_config"),
-    )
-    explicit_pair = _first_metadata_string(
-        checkpoint_payload.get("conditioning_pair"),
-        training_summary.get("conditioning_pair"),
-        checkpoint_payload.get("gipo_conditioning_style"),
-        training_summary.get("gipo_conditioning_style"),
-    )
-    derived_pair = _conditioning_pair_label(teacher_style, student_style)
-    metadata = {
-        "student_conditioning_style": student_style,
-        "conditioning_style": student_style,
+    candidates = {
+        style
+        for style in (
+            _clean_metadata_string(checkpoint_payload.get("conditioning_style")),
+            _clean_metadata_string(training_summary.get("conditioning_style")),
+            _model_conditioning_style(checkpoint_payload, "student_model_config"),
+            _model_conditioning_style(training_summary, "student_model_config"),
+            _model_conditioning_style(checkpoint_payload, "teacher_model_config"),
+            _model_conditioning_style(training_summary, "teacher_model_config"),
+        )
+        if style
     }
-    if teacher_style:
-        metadata["teacher_conditioning_style"] = teacher_style
-    if explicit_pair or derived_pair:
-        metadata["conditioning_pair"] = explicit_pair or derived_pair
-    return metadata
+    for style in candidates:
+        validate_gipo_conditioning_style({"conditioning_style": style})
+    if len(candidates) > 1:
+        raise ValueError(f"GIPO metadata contains inconsistent conditioning_style values: {sorted(candidates)}")
+    if not candidates:
+        return {}
+    return {"conditioning_style": next(iter(candidates))}
 
 
 def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str) -> List[Dict[str, Any]]:

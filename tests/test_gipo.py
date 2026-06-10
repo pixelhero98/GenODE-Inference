@@ -231,19 +231,16 @@ class GIPOCanonicalTests(unittest.TestCase):
 
         metadata = _conditioning_metadata_for_summary(
             {
+                "conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1,
                 "student_model_config": {"conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1},
-                "student_conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1,
             },
             {
+                "conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1,
                 "teacher_model_config": {"conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1},
-                "teacher_conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1,
             },
         )
 
-        self.assertEqual(metadata["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
-        self.assertEqual(metadata["student_conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
-        self.assertEqual(metadata["teacher_conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
-        self.assertEqual(metadata["conditioning_pair"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+        self.assertEqual(metadata, {"conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1})
 
     def test_teacher_model_config_contains_metric_vector_metadata(self) -> None:
         setting_dim = int(setting_features("euler", 4).numel())

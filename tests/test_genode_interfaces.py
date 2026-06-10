@@ -86,6 +86,13 @@ class GenODEInterfaceTests(unittest.TestCase):
         }
         self.assertFalse(removed_options & options)
 
+    def test_gipo_policy_public_surface_excludes_teacher_prediction_helper(self) -> None:
+        from genode.gipo import policy
+
+        helper_name = "build_teacher_weighted_density_" + "prediction_rows"
+        self.assertFalse(hasattr(policy, helper_name))
+        self.assertNotIn(helper_name, getattr(policy, "__all__", ()))
+
     def test_no_private_paths_or_upstream_namespace_in_tracked_text(self) -> None:
         blocked = (
             "/" + "scratch/",
