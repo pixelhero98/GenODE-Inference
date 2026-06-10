@@ -300,6 +300,9 @@ class GenODEInterfaceTests(unittest.TestCase):
             "b64_multiaxis_opt_" + "guarded",
             "b64_multiaxis_select_" + "ab",
             "locked_test_used_for_conditioning_" + "promotion",
+            "--density_bin_count",
+            "--teacher_checkpoint_selection_mode",
+            "--student_checkpoint_selection",
             *PRIVATE_CLUSTER_PATTERNS,
         )
         for path in _active_script_paths():
