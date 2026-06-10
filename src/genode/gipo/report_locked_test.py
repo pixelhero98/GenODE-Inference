@@ -25,7 +25,6 @@ from genode.gipo.policy import (
     validate_gipo_attention_heads,
     validate_gipo_conditioning_style,
     validate_gipo_density_token_attention,
-    validate_teacher_checkpoint_selection_mode,
     validate_gipo_teacher_training_metadata,
 )
 from genode.gipo.evaluate_schedule_summary import build_comparison_summary
@@ -451,7 +450,11 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("training_summary indicates locked_test was used for selection.")
     required_checkpoint_selection_mode = str(getattr(args, "require_teacher_checkpoint_selection_mode", "") or "").strip()
     if required_checkpoint_selection_mode:
-        required_checkpoint_selection_mode = validate_teacher_checkpoint_selection_mode(required_checkpoint_selection_mode)
+        if required_checkpoint_selection_mode != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1:
+            raise ValueError(
+                "GIPO reporter only supports "
+                f"{TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1!r} checkpoints."
+            )
         actual_selection_mode = str(
             checkpoint_payload.get("teacher_checkpoint_selection_mode")
             or training_summary.get("teacher_checkpoint_selection_mode")

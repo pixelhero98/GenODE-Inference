@@ -13,11 +13,8 @@ from genode.gipo.policy import (
     MODEL_PAYLOAD_VERSION,
     SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
     DEFAULT_SUPPORT_SCHEDULE_KEYS,
-    DEFAULT_TEACHER_MAX_TEMPERATURE,
-    DEFAULT_TEACHER_MIN_TEMPERATURE,
-    DEFAULT_TEACHER_HARD_MARGIN,
-    DEFAULT_TEACHER_TARGET_ESS,
     DEFAULT_TEACHER_TARGET_TEMPERATURE,
+    STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
     DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS,
     DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS,
     TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
@@ -30,10 +27,6 @@ from genode.gipo.policy import (
     DEFAULT_TRANSFORMER_LAYERS,
     CONDITIONING_STYLE_ADALN_ZERO_V1,
     CONDITIONING_STYLE_ADDITIVE_MLP_V1,
-    STUDENT_TARGET_MODE_MARGIN_HARD_SOFT,
-    STUDENT_TARGET_MODE_SOFT_MIXTURE,
-    TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS,
-    TEACHER_TEMPERATURE_MODE_FIXED,
     DensityFeatureNormalizer,
     EmbeddingNormalizer,
     attach_uniform_gipo_rewards,
@@ -49,7 +42,7 @@ from genode.gipo.policy import (
     read_metric_rows_csv,
     recommended_context_calibration_count,
     sample_context_ids_stratified,
-    select_gipo_teacher_checkpoint,
+    select_weighted_normalized_regret_checkpoint,
     series_key_from_row,
     split_rows_by_context_holdout,
     split_rows_by_density_family_holdout,
@@ -170,10 +163,9 @@ def _select_weighted_normalized_regret_step(
         "density_family": float(weights["density_family"]),
         "unseen_nfe_holdout": float(weights["unseen_nfe"]),
     }
-    selection = select_gipo_teacher_checkpoint(
+    selection = select_weighted_normalized_regret_checkpoint(
         combined_history,
         required_split_names=required_splits,
-        selection_mode=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
         component_weights=split_weights,
     )
     return {
@@ -338,7 +330,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher_steps", type=int, default=500)
     parser.add_argument("--teacher_checkpoint_every", type=int, default=100)
     parser.add_argument("--teacher_loss_log_every", type=int, default=0)
-    parser.add_argument("--teacher_selection_temperature", type=float, default=DEFAULT_TEACHER_TARGET_TEMPERATURE)
     parser.add_argument(
         "--teacher_density_holdout_schedule_keys",
         default=",".join(DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS),
@@ -394,21 +385,7 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly allow noncanonical GIPO conditioning styles for sidecar comparisons.",
     )
-    parser.add_argument(
-        "--teacher_temperature_mode",
-        choices=(TEACHER_TEMPERATURE_MODE_FIXED, TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS),
-        default=TEACHER_TEMPERATURE_MODE_FIXED,
-    )
     parser.add_argument("--teacher_temperature", type=float, default=DEFAULT_TEACHER_TARGET_TEMPERATURE)
-    parser.add_argument("--teacher_target_ess", type=float, default=DEFAULT_TEACHER_TARGET_ESS)
-    parser.add_argument("--teacher_min_temperature", type=float, default=DEFAULT_TEACHER_MIN_TEMPERATURE)
-    parser.add_argument("--teacher_max_temperature", type=float, default=DEFAULT_TEACHER_MAX_TEMPERATURE)
-    parser.add_argument(
-        "--student_target_mode",
-        choices=(STUDENT_TARGET_MODE_SOFT_MIXTURE, STUDENT_TARGET_MODE_MARGIN_HARD_SOFT),
-        default=STUDENT_TARGET_MODE_SOFT_MIXTURE,
-    )
-    parser.add_argument("--teacher_hard_margin", type=float, default=DEFAULT_TEACHER_HARD_MARGIN)
     parser.add_argument("--teacher_utility_crps_weight", type=float, default=0.5)
     parser.add_argument("--teacher_utility_mase_weight", type=float, default=0.5)
     parser.add_argument(
@@ -722,9 +699,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "artifact": "gipo_training_summary",
         "protocol": GIPO_PROTOCOL,
         "student_policy_type": "continuous_density",
-        "student_objective": "teacher_weighted_density_mle_kl"
-        if str(args.student_target_mode) == STUDENT_TARGET_MODE_SOFT_MIXTURE
-        else "teacher_weighted_density_margin_hard_soft_kl",
+        "student_objective": "teacher_weighted_density_mle_kl",
+        "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
         "teacher_objective": "pairwise_rank_plus_huber_regression",
         "model_payload_version": MODEL_PAYLOAD_VERSION,
         "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
@@ -735,15 +711,12 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "teacher_utility_weights": teacher_utility_weights,
         "teacher_checkpoint_selection_mode": selection_mode,
         "teacher_selection_axis_weights": selection_component_weights,
-        "teacher_selection_temperature": float(args.teacher_selection_temperature),
         "teacher_loss_log_every": int(args.teacher_loss_log_every),
         "teacher_checkpoint_every": int(args.teacher_checkpoint_every),
-        "student_target_mode": str(args.student_target_mode),
         "student_checkpoint_selection_mode": student_selection_mode,
         "student_log_every": int(args.student_log_every),
         "student_checkpoint_every": int(args.student_checkpoint_every),
         "student_selection_holdout_fraction": float(args.student_selection_holdout_fraction),
-        "teacher_hard_margin": float(args.teacher_hard_margin),
         "gipo_conditioning_style": conditioning_pair,
         "teacher_conditioning_style": teacher_conditioning_style,
         "student_conditioning_style": student_conditioning_style,
@@ -835,7 +808,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         diagnostic_splits: Mapping[str, Sequence[Mapping[str, Any]]],
         diagnostic_candidate_schedule_keys: Mapping[str, Sequence[str]] | None = None,
         steps: int,
-        checkpoint_selection_mode: str,
     ) -> Dict[str, Any]:
         if not pass_fit_rows:
             raise ValueError(f"{pass_name} teacher pass requires non-empty fit rows.")
@@ -858,8 +830,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             diagnostic_candidate_schedule_keys=diagnostic_candidate_schedule_keys,
             teacher_checkpoint_every=int(args.teacher_checkpoint_every),
             teacher_loss_log_every=int(args.teacher_loss_log_every),
-            teacher_checkpoint_selection_mode=checkpoint_selection_mode,
-            teacher_selection_temperature=float(args.teacher_selection_temperature),
             teacher_selection_axis_weights=selection_component_weights,
             seed=int(args.seed) + int(seed_offset),
             allowed_schedule_keys=support_keys,
@@ -889,7 +859,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "density_family_holdout": density_holdout_keys,
         },
         steps=int(args.teacher_steps),
-        checkpoint_selection_mode=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
     )
     unseen_nfe_training = _train_teacher_pass(
         seed_offset=102,
@@ -898,7 +867,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         diagnostic_splits={"unseen_nfe_holdout": unseen_nfe_diagnostic_rows},
         diagnostic_candidate_schedule_keys={"unseen_nfe_holdout": selection_support_schedule_keys},
         steps=int(args.teacher_steps),
-        checkpoint_selection_mode=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
     )
     checkpoint_selection = _select_weighted_normalized_regret_step(
         context_density_training=context_density_training,
@@ -923,8 +891,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         diagnostic_splits={},
         teacher_checkpoint_every=int(args.teacher_checkpoint_every),
         teacher_loss_log_every=int(args.teacher_loss_log_every),
-        teacher_checkpoint_selection_mode=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
-        teacher_selection_temperature=float(args.teacher_selection_temperature),
         final_retrain_mode=True,
         seed=int(args.seed),
         allowed_schedule_keys=support_keys,
@@ -975,13 +941,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             steps=int(steps),
             lr=float(args.student_lr),
             teacher_temperature=float(args.teacher_temperature),
-            teacher_temperature_mode=str(args.teacher_temperature_mode),
-            teacher_target_ess=float(args.teacher_target_ess),
-            teacher_min_temperature=float(args.teacher_min_temperature),
-            teacher_max_temperature=float(args.teacher_max_temperature),
             teacher_utility_weights=teacher_utility_weights,
-            student_target_mode=str(args.student_target_mode),
-            teacher_hard_margin=float(args.teacher_hard_margin),
             setting_feature_mode=setting_feature_mode,
             setting_encoder_config=setting_encoder_config,
             student_weight_decay=float(args.student_weight_decay),
@@ -993,7 +953,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             validation_context_embeddings=normalized_embeddings,
             student_log_every=int(args.student_log_every),
             student_checkpoint_every=int(args.student_checkpoint_every),
-            student_checkpoint_selection_mode=STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
             final_retrain_mode=bool(final_retrain_mode),
             device=device,
         )
@@ -1147,7 +1106,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "reference_grid_hash": reference_grid_hash(reference_time_grid),
         "support_schedule_keys": list(support_keys),
         "teacher_selected_step": teacher_training.get("teacher_checkpoint_selection", {}).get("selected_step"),
-        "student_target_mode": str(args.student_target_mode),
+        "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
         "setting_feature_mode": setting_feature_mode,
         "setting_encoder_config": setting_encoder_config.to_payload(),
         "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,

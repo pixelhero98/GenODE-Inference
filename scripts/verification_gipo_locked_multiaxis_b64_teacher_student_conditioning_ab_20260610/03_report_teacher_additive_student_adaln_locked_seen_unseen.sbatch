@@ -48,9 +48,10 @@ python scripts/verification_gipo_locked_multiaxis_b64_teacher_student_conditioni
 
 SELECTION_MODE="${SELECTION_MODE}" python - <<'PY'
 import os
-from genode.gipo.policy import validate_teacher_checkpoint_selection_mode
+from genode.gipo.policy import TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
 
-validate_teacher_checkpoint_selection_mode(os.environ["SELECTION_MODE"])
+if os.environ["SELECTION_MODE"] != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1:
+    raise SystemExit("GIPO reports require weighted_normalized_regret_v1")
 PY
 
 RUN_DIR="${GENODE_ROOT}/policy_runs/${RUN_ID}"

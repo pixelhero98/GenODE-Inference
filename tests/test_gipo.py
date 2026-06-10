@@ -352,7 +352,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         self.assertEqual(summary["sequence_multi_nfe_group_count"], 1)
         self.assertEqual(summary["physical_multi_nfe_group_count"], 1)
 
-    def test_nfe_sequence_pairs_and_smoothness_loss_are_ordered_by_budget(self) -> None:
+    def test_nfe_sequence_pairs_are_ordered_by_budget(self) -> None:
         rows: list[dict] = []
         for nfe in (4, 8, 12):
             rows.extend(
@@ -661,7 +661,6 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             lr=1e-3,
             diagnostic_splits={"context_disjoint": holdout_rows},
             teacher_checkpoint_every=1,
-            teacher_checkpoint_selection_mode=TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
             allowed_schedule_keys=("uniform", "ays"),
         )
 
@@ -736,8 +735,9 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         expected_mixture = expected_weights[0] * uniform_mass + expected_weights[1] * ser_mass
         expected_mixture /= float(np.sum(expected_mixture))
         self.assertEqual(target_summary["target_protocol"], "teacher_weighted_density_mle")
+        self.assertEqual(target_summary["student_target_protocol"], "teacher_weighted_soft_mixture_v1")
         self.assertEqual(target_summary["density_protocol"], DENSITY_PROTOCOL)
-        self.assertEqual(target_summary["teacher_temperature_mode"], "fixed")
+        self.assertEqual(target_summary["teacher_temperature"], 0.05)
         self.assertEqual(target_summary["teacher_output"], TEACHER_OUTPUT_METRIC_VECTOR_V1)
         self.assertEqual(target_summary["teacher_metric_targets"], list(TEACHER_METRIC_TARGET_KEYS))
         self.assertEqual(target_summary["teacher_scalarization"], TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1)
@@ -759,10 +759,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             "teacher_candidate_max_weight_p05",
             "teacher_candidate_max_weight_p50",
             "teacher_candidate_max_weight_p95",
-            "teacher_chosen_temperature_mean",
-            "teacher_chosen_temperature_p05",
-            "teacher_chosen_temperature_p50",
-            "teacher_chosen_temperature_p95",
+            "nfe_sequence_pair_count",
         ):
             self.assertIn(key, target_summary)
 
@@ -821,7 +818,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             mean=np.zeros(4, dtype=np.float32),
             std=np.ones(4, dtype=np.float32),
         )
-        teacher = _LastBinTeacher()
+        teacher = _ScheduleMetricTeacher()
         student = GIPODensityQueryStudentTransformer(
             setting_dim=int(setting_features("euler", 4).numel()),
             density_dim=4,
@@ -849,7 +846,6 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             validation_rows=validation_rows,
             student_log_every=1,
             student_checkpoint_every=1,
-            student_checkpoint_selection_mode=STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
         )
 
         selection = student_summary["student_checkpoint_selection"]
@@ -909,10 +905,9 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                 density_normalizer=normalizer,
                 steps=1,
                 validation_rows=locked_validation,
-                student_checkpoint_selection_mode=STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
             )
 
-    def test_student_training_reports_nfe_sequence_pairs_without_smoothness_loss(self) -> None:
+    def test_student_training_reports_nfe_sequence_pairs(self) -> None:
         torch.manual_seed(3)
         reference = uniform_reference_grid(4)
         ser_schedule_key = "ser_ptg_local_defect_eta005"
@@ -957,7 +952,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         )
 
         self.assertEqual(student_summary["student_nfe_sequence_pair_count"], 1)
-        self.assertNotIn("student_nfe_smoothness_loss", student_summary["losses"][-1])
+        self.assertEqual(student_summary["student_target_protocol"], "teacher_weighted_soft_mixture_v1")
 
     def test_student_training_can_apply_teacher_scored_pseudo_targets(self) -> None:
         torch.manual_seed(4)
@@ -1024,14 +1019,14 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         )
         self.assertEqual(student_summary["student_pseudo_target_summary"]["pseudo_target_nfes"], [6])
 
-    def test_margin_hard_soft_targets_copy_top_teacher_density(self) -> None:
+    def test_soft_mixture_targets_weight_teacher_utilities(self) -> None:
         reference = uniform_reference_grid(4)
         ser_schedule_key = "ser_ptg_local_defect_eta005"
         rows = [
             _row(schedule="uniform", context_idx=0, series_id="series_0"),
             _row(schedule=ser_schedule_key, context_idx=0, series_id="series_0"),
         ]
-        schedule_grids = {(ser_schedule_key, "euler", 4): (0.0, 0.7, 0.8, 0.9, 1.0)}
+        schedule_grids = {(ser_schedule_key, "euler", 4): (0.0, 0.1, 0.2, 0.3, 1.0)}
         context_id = context_id_from_row(rows[0])
         embeddings = {context_id: np.asarray([0.0, 0.0], dtype=np.float32)}
         series_map = build_series_index_map(rows)
@@ -1039,7 +1034,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             mean=np.zeros(4, dtype=np.float32),
             std=np.ones(4, dtype=np.float32),
         )
-        teacher = _LastBinTeacher()
+        teacher = _ScheduleMetricTeacher()
 
         _, _, _, target_mass, target_summary = build_teacher_weighted_density_targets(
             teacher,
@@ -1049,14 +1044,18 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             schedule_grids=schedule_grids,
             reference_time_grid=reference,
             density_normalizer=normalizer,
-            student_target_mode="margin_hard_soft",
-            teacher_hard_margin=0.0,
+            teacher_utility_weights={"crps": 1.0, "mase": 0.0},
         )
+        uniform_mass = np.asarray(density_mass_for_row(rows[0], schedule_grids=schedule_grids, reference_time_grid=reference))
         ser_mass = np.asarray(density_mass_for_row(rows[1], schedule_grids=schedule_grids, reference_time_grid=reference))
-        self.assertEqual(target_summary["student_target_mode"], "margin_hard_soft")
-        self.assertEqual(target_summary["hard_target_count"], 1)
-        self.assertAlmostEqual(target_summary["hard_target_fraction"], 1.0)
-        self.assertTrue(np.allclose(target_mass.detach().cpu().numpy()[0], ser_mass.astype(np.float32), atol=1e-7))
+        utilities = np.asarray([0.0, 1.0], dtype=np.float64)
+        expected_weights = np.exp((utilities - float(np.max(utilities))) / 0.05)
+        expected_weights /= float(np.sum(expected_weights))
+        expected_mass = expected_weights[0] * uniform_mass + expected_weights[1] * ser_mass
+        expected_mass /= float(np.sum(expected_mass))
+        self.assertEqual(target_summary["student_target_protocol"], "teacher_weighted_soft_mixture_v1")
+        self.assertTrue(np.allclose(target_mass.detach().cpu().numpy()[0], expected_mass.astype(np.float32), atol=1e-7))
+        self.assertGreater(expected_weights[1], expected_weights[0])
 
         prediction_rows, oracle_summary = build_teacher_weighted_density_prediction_rows(
             teacher,
@@ -1066,13 +1065,12 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             schedule_grids=schedule_grids,
             reference_time_grid=reference,
             density_normalizer=normalizer,
-            student_target_mode="margin_hard_soft",
-            teacher_hard_margin=0.0,
+            teacher_utility_weights={"crps": 1.0, "mase": 0.0},
         )
         self.assertEqual(len(prediction_rows), 1)
         self.assertEqual(prediction_rows[0]["teacher_top_schedule_key"], ser_schedule_key)
-        self.assertTrue(prediction_rows[0]["teacher_hard_target"])
-        self.assertEqual(oracle_summary["hard_target_count"], 1)
+        self.assertEqual(prediction_rows[0]["student_target_protocol"], "teacher_weighted_soft_mixture_v1")
+        self.assertEqual(oracle_summary["student_target_protocol"], "teacher_weighted_soft_mixture_v1")
         self.assertEqual(len(prediction_rows[0]["time_grid"]), 5)
 
     def test_teacher_metric_vector_scalarization_controls_oracle_top_schedule(self) -> None:
@@ -1100,8 +1098,6 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             schedule_grids=schedule_grids,
             reference_time_grid=reference,
             density_normalizer=normalizer,
-            student_target_mode="margin_hard_soft",
-            teacher_hard_margin=0.0,
             teacher_utility_weights={"crps": 1.0, "mase": 0.0},
         )
         mase_rows, mase_summary = build_teacher_weighted_density_prediction_rows(
@@ -1112,8 +1108,6 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             schedule_grids=schedule_grids,
             reference_time_grid=reference,
             density_normalizer=normalizer,
-            student_target_mode="margin_hard_soft",
-            teacher_hard_margin=0.0,
             teacher_utility_weights={"crps": 0.0, "mase": 1.0},
         )
 
@@ -1151,7 +1145,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                 density_normalizer=normalizer,
             )
 
-    def test_adaptive_teacher_temperature_hits_target_ess(self) -> None:
+    def test_teacher_temperature_controls_soft_mixture_concentration(self) -> None:
         reference = uniform_reference_grid(4)
         ser_schedule_key = "ser_ptg_local_defect_eta005"
         rows = [
@@ -1169,7 +1163,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         teacher = _LastBinTeacher()
 
         summaries = []
-        for target_ess in (1.2, 1.5, 1.8):
+        for temperature in (0.01, 0.10, 1.00):
             _, _, _, _, target_summary = build_teacher_weighted_density_targets(
                 teacher,
                 rows,
@@ -1178,17 +1172,16 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                 schedule_grids=schedule_grids,
                 reference_time_grid=reference,
                 density_normalizer=normalizer,
-                temperature_mode="adaptive_ess",
-                target_ess=target_ess,
-                min_temperature=0.001,
-                max_temperature=10.0,
+                temperature=temperature,
             )
-            self.assertEqual(target_summary["teacher_temperature_mode"], "adaptive_ess")
-            self.assertAlmostEqual(target_summary["teacher_candidate_ess_mean"], target_ess, places=3)
+            self.assertEqual(target_summary["student_target_protocol"], "teacher_weighted_soft_mixture_v1")
+            self.assertAlmostEqual(target_summary["teacher_temperature"], temperature)
             summaries.append(target_summary)
 
-        self.assertLess(summaries[0]["teacher_chosen_temperature_mean"], summaries[1]["teacher_chosen_temperature_mean"])
-        self.assertLess(summaries[1]["teacher_chosen_temperature_mean"], summaries[2]["teacher_chosen_temperature_mean"])
+        self.assertLess(summaries[0]["teacher_candidate_entropy_mean"], summaries[1]["teacher_candidate_entropy_mean"])
+        self.assertLess(summaries[1]["teacher_candidate_entropy_mean"], summaries[2]["teacher_candidate_entropy_mean"])
+        self.assertGreater(summaries[0]["teacher_candidate_max_weight_mean"], summaries[1]["teacher_candidate_max_weight_mean"])
+        self.assertGreater(summaries[1]["teacher_candidate_max_weight_mean"], summaries[2]["teacher_candidate_max_weight_mean"])
 
     def test_teacher_objective_hyperparameters_are_validated(self) -> None:
         self.assertEqual(
@@ -1377,8 +1370,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                 },
                 "student_final_retrain": {"enabled": False},
                 "student_target_summary": {
-                    "teacher_temperature_mode": "fixed",
-                    "student_target_mode": "soft_mixture",
+                    "student_target_protocol": "teacher_weighted_soft_mixture_v1",
                 },
             }
 
@@ -1654,7 +1646,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             summary = train_gipo(args)
 
             self.assertEqual(summary["status"], "dry_run")
-            self.assertEqual(summary["student_target_mode"], "soft_mixture")
+            self.assertEqual(summary["student_target_protocol"], "teacher_weighted_soft_mixture_v1")
             self.assertEqual(summary["teacher_architecture"], ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1)
             self.assertEqual(summary["student_architecture"], ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1)
             self.assertEqual(summary["gipo_conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
@@ -2133,6 +2125,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                 "conditioning_pair": pair,
                 "noncanonical_conditioning_allowed": noncanonical,
                 "density_representation": {"reference_bin_count": 64},
+                "student_target_protocol": "teacher_weighted_soft_mixture_v1",
                 "locked_test_used_for_selection": False,
                 "teacher_checkpoint_selection_mode": "weighted_normalized_regret_v1",
                 "teacher_checkpoint_selection": {
@@ -2173,6 +2166,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "locked_test_used_for_selection": False,
                 },
                 "student_training": {
+                    "student_target_protocol": "teacher_weighted_soft_mixture_v1",
                     "student_validation_used_for_selection": True,
                     "locked_test_used_for_selection": False,
                     "pseudo_distillation_used": False,

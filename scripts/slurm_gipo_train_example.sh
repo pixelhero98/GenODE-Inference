@@ -55,8 +55,4 @@ python -m genode.gipo.train_gipo \
   --teacher_checkpoint_every "${GENODE_TEACHER_CHECKPOINT_EVERY:-50}" \
   --teacher_steps "${GENODE_TEACHER_STEPS:-500}" \
   --student_steps "${GENODE_STUDENT_STEPS:-1000}" \
-  --teacher_temperature_mode "${GENODE_TEACHER_TEMPERATURE_MODE:-fixed}" \
-  --teacher_temperature "${GENODE_TEACHER_TEMPERATURE:-0.05}" \
-  --teacher_target_ess "${GENODE_TEACHER_TARGET_ESS:-2.5}" \
-  --teacher_min_temperature "${GENODE_TEACHER_MIN_TEMPERATURE:-0.01}" \
-  --teacher_max_temperature "${GENODE_TEACHER_MAX_TEMPERATURE:-1.0}"
+  --teacher_temperature "${GENODE_TEACHER_TEMPERATURE:-0.05}"

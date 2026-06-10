@@ -82,8 +82,8 @@ class GenODEInterfaceTests(unittest.TestCase):
 
         removed_options = {
             "--density_bin_count",
-            "--teacher_checkpoint_selection_mode",
-            "--student_checkpoint_selection",
+            "--teacher_checkpoint_" + "selection_mode",
+            "--student_checkpoint_" + "selection",
             "--teacher_selection_component_" + "weights",
             "--teacher_nfe_" + "proxy_anchor_values",
             "--teacher_fit_checkpoint_" + "selection",
@@ -93,8 +93,6 @@ class GenODEInterfaceTests(unittest.TestCase):
             "--setting_encoder_mode",
             "--setting_feature_mode",
             "--series_unknown_" + "dropout",
-            "--student_nfe_smoothness_" + "weight",
-            "--student_nfe_smoothness_" + "mode",
             "--student_pseudo_rows_csv",
             "--student_pseudo_target_" + "weight",
         }
@@ -127,7 +125,6 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertIn("--allow_noncanonical_conditioning", adaln_train)
         self.assertNotIn("--teacher_selection_component_" + "weights", combined)
         self.assertNotIn("--student_pseudo_target_" + "weight", combined)
-        self.assertNotIn("--student_nfe_smoothness_" + "weight", combined)
         self.assertNotIn("python -m genode.gipo.report_teacher_oracle", combined)
         self.assertIn("predeclared_additive_canonical_with_adaln_sidecar_v1", collect)
         self.assertIn('"sidecar_results_are_reporting_only": True', collect)
@@ -206,10 +203,9 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertEqual(submit.count("03_report_"), 2)
         self.assertIn("afterok:${teacher_additive_student_adaln_report_job}:${teacher_adaln_student_additive_report_job}", submit)
         self.assertNotIn("--student_pseudo_target_" + "weight", combined)
-        self.assertNotIn("--student_nfe_smoothness_" + "weight", combined)
         self.assertNotIn("python -m genode.gipo.report_teacher_oracle", combined)
         self.assertIn("pseudo target weight is nonzero", collect)
-        self.assertIn("student smoothness weight is nonzero", collect)
+        self.assertIn("student_target_protocol", collect)
         self.assertIn("teacher-oracle report exists", collect)
         for pattern in PRIVATE_CLUSTER_PATTERNS:
             self.assertNotIn(pattern, combined)
@@ -240,8 +236,8 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertIn("CONDITIONING_STYLE=additive_mlp_v1", train)
         self.assertNotIn("--allow_noncanonical_conditioning", train)
         self.assertNotIn("--density_bin_count", train)
-        self.assertNotIn("--teacher_checkpoint_selection_mode", train)
-        self.assertNotIn("--student_checkpoint_selection", train)
+        self.assertNotIn("--teacher_checkpoint_" + "selection_mode", train)
+        self.assertNotIn("--student_checkpoint_" + "selection", train)
         self.assertNotIn("--teacher_selection_component_" + "weights", train)
         self.assertNotIn("report_teacher_oracle", report)
         self.assertIn("PHYSICAL_SCHEDULES = (", collect)
@@ -292,7 +288,6 @@ class GenODEInterfaceTests(unittest.TestCase):
             "--teacher_fit_checkpoint_" + "selection",
             "--series_holdout_" + "fraction",
             "--series_unknown_" + "dropout",
-            "--student_nfe_smoothness_" + "weight",
             "--student_pseudo_target_" + "weight",
             "composite_" + "regret_" + "guarded_v1",
             "additive_locked_" + "b128",
@@ -301,8 +296,8 @@ class GenODEInterfaceTests(unittest.TestCase):
             "b64_multiaxis_select_" + "ab",
             "locked_test_used_for_conditioning_" + "promotion",
             "--density_bin_count",
-            "--teacher_checkpoint_selection_mode",
-            "--student_checkpoint_selection",
+            "--teacher_checkpoint_" + "selection_mode",
+            "--student_checkpoint_" + "selection",
             *PRIVATE_CLUSTER_PATTERNS,
         )
         for path in _active_script_paths():

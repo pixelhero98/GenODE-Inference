@@ -27,18 +27,10 @@ from genode.gipo.density_representation import DENSITY_PROTOCOL
 from genode.gipo.evaluate_schedule_summary import build_comparison_summary
 from genode.gipo.policy import (
     ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
-    DEFAULT_TEACHER_HARD_MARGIN,
-    DEFAULT_TEACHER_MAX_TEMPERATURE,
-    DEFAULT_TEACHER_MIN_TEMPERATURE,
-    DEFAULT_TEACHER_TARGET_ESS,
     DEFAULT_TEACHER_TARGET_TEMPERATURE,
     GIPO_PROTOCOL,
     MODEL_PAYLOAD_VERSION,
-    STUDENT_TARGET_MODE_MARGIN_HARD_SOFT,
-    STUDENT_TARGET_MODE_SOFT_MIXTURE,
     TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
-    TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS,
-    TEACHER_TEMPERATURE_MODE_FIXED,
     DensityFeatureNormalizer,
     EmbeddingNormalizer,
     build_gipo_teacher_model,
@@ -52,7 +44,6 @@ from genode.gipo.policy import (
     validate_gipo_density_token_attention,
     validate_gipo_teacher_output,
     validate_gipo_teacher_training_metadata,
-    validate_teacher_checkpoint_selection_mode,
     validate_teacher_metric_target_keys,
 )
 from genode.gipo.report_locked_test import (
@@ -202,7 +193,11 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("training_summary indicates locked_test was used for selection.")
     required_checkpoint_selection_mode = str(getattr(args, "require_teacher_checkpoint_selection_mode", "") or "").strip()
     if required_checkpoint_selection_mode:
-        required_checkpoint_selection_mode = validate_teacher_checkpoint_selection_mode(required_checkpoint_selection_mode)
+        if required_checkpoint_selection_mode != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1:
+            raise ValueError(
+                "GIPO teacher-oracle reporter only supports "
+                f"{TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1!r} checkpoints."
+            )
         actual_selection_mode = str(
             checkpoint_payload.get("teacher_checkpoint_selection_mode")
             or training_summary.get("teacher_checkpoint_selection_mode")
@@ -260,20 +255,6 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
             str(checkpoint_payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3))
         )
     setting_encoder_config = checkpoint_payload.get("setting_encoder_config")
-    temperature_mode = str(getattr(args, "teacher_temperature_mode", "") or training_summary.get("teacher_temperature_mode", ""))
-    if not temperature_mode:
-        temperature_mode = str(
-            dict(dict(training_summary.get("student_training", {}) or {}).get("student_target_summary", {}) or {}).get(
-                "teacher_temperature_mode", TEACHER_TEMPERATURE_MODE_FIXED
-            )
-        )
-    student_target_mode = str(
-        getattr(args, "student_target_mode", "")
-        or training_summary.get("student_target_mode")
-        or dict(dict(training_summary.get("student_training", {}) or {}).get("student_target_summary", {}) or {}).get(
-            "student_target_mode", STUDENT_TARGET_MODE_SOFT_MIXTURE
-        )
-    )
     teacher_utility_weights = dict(
         training_summary.get("teacher_utility_weights")
         or checkpoint_payload.get("teacher_utility_weights")
@@ -301,13 +282,7 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
         density_normalizer=density_normalizer,
         supervision_schedule_keys=support_keys,
         temperature=float(args.teacher_temperature),
-        temperature_mode=temperature_mode,
-        target_ess=float(args.teacher_target_ess),
-        min_temperature=float(args.teacher_min_temperature),
-        max_temperature=float(args.teacher_max_temperature),
         teacher_utility_weights=teacher_utility_weights or None,
-        student_target_mode=student_target_mode,
-        teacher_hard_margin=float(args.teacher_hard_margin),
         setting_feature_mode=setting_feature_mode,
         setting_encoder_config=setting_encoder_config,
         device=device,
@@ -392,8 +367,6 @@ def report_gipo_teacher_oracle(args: argparse.Namespace) -> Dict[str, Any]:
                 "setting_encoder_mode": prediction["setting_encoder_mode"],
                 "support_schedule_count": int(len(grouped_support.get(key, []))),
                 "teacher_top_schedule_key": prediction["teacher_top_schedule_key"],
-                "teacher_top_margin": prediction["teacher_top_margin"],
-                "teacher_hard_target": prediction["teacher_hard_target"],
                 "teacher_candidate_ess": prediction["teacher_candidate_ess"],
                 "teacher_candidate_max_weight": prediction["teacher_candidate_max_weight"],
             }
@@ -491,13 +464,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--baseline_rows", default="")
     parser.add_argument("--comparator_rows", default="")
-    parser.add_argument("--teacher_temperature_mode", default="")
     parser.add_argument("--teacher_temperature", type=float, default=DEFAULT_TEACHER_TARGET_TEMPERATURE)
-    parser.add_argument("--teacher_target_ess", type=float, default=DEFAULT_TEACHER_TARGET_ESS)
-    parser.add_argument("--teacher_min_temperature", type=float, default=DEFAULT_TEACHER_MIN_TEMPERATURE)
-    parser.add_argument("--teacher_max_temperature", type=float, default=DEFAULT_TEACHER_MAX_TEMPERATURE)
-    parser.add_argument("--student_target_mode", default="")
-    parser.add_argument("--teacher_hard_margin", type=float, default=DEFAULT_TEACHER_HARD_MARGIN)
     parser.add_argument("--setting_feature_mode", default="")
     parser.add_argument("--dataset", default="solar_energy_10m")
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))

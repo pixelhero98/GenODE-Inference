@@ -26,6 +26,7 @@ PHYSICAL_SCHEDULES = (
 SER_SCHEDULE_KEY = "ser_ptg_local_defect_eta005"
 REQUIRED_SELECTION_MODE = "weighted_normalized_regret_v1"
 REQUIRED_STUDENT_SELECTION_MODE = "validation_ce_v1"
+REQUIRED_STUDENT_TARGET_PROTOCOL = "teacher_weighted_soft_mixture_v1"
 REQUIRED_DENSITY_BIN_COUNT = 64
 
 
@@ -149,19 +150,19 @@ def _validate_training(root: Path, label: str, run_id: str, train_steps: int, is
         issues.append(f"{label}: wrong teacher selector")
     if str(training.get("student_checkpoint_selection_mode")) != REQUIRED_STUDENT_SELECTION_MODE:
         issues.append(f"{label}: wrong student selector")
+    if str(training.get("student_target_protocol")) != REQUIRED_STUDENT_TARGET_PROTOCOL:
+        issues.append(f"{label}: wrong student target protocol")
     if bool(training.get("locked_test_used_for_selection", False)):
         issues.append(f"{label}: locked test used for selection")
     if float(_nested(training, "pseudo_distillation", "pseudo_target_weight", default=0.0) or 0.0) != 0.0:
         issues.append(f"{label}: pseudo target weight nonzero")
-    if float(training.get("student_nfe_smoothness_weight", 0.0) or 0.0) != 0.0:
-        issues.append(f"{label}: student smoothness weight nonzero")
     student_training = dict(training.get("student_training", {}) or {})
     if bool(student_training.get("pseudo_distillation_used", False)):
         issues.append(f"{label}: student pseudo distillation used")
     if float(student_training.get("pseudo_target_weight", 0.0) or 0.0) != 0.0:
         issues.append(f"{label}: student pseudo target weight nonzero")
-    if float(student_training.get("student_nfe_smoothness_weight", 0.0) or 0.0) != 0.0:
-        issues.append(f"{label}: student training smoothness weight nonzero")
+    if str(student_training.get("student_target_protocol")) != REQUIRED_STUDENT_TARGET_PROTOCOL:
+        issues.append(f"{label}: wrong student training target protocol")
     if not bool(_nested(training, "student_final_retrain", "enabled", default=False)):
         issues.append(f"{label}: missing student final retrain")
     if not bool(_nested(training, "teacher_final_retrain", "enabled", default=False)):
@@ -298,6 +299,7 @@ def collect(
         "density_bin_count": REQUIRED_DENSITY_BIN_COUNT,
         "teacher_checkpoint_selection_mode": REQUIRED_SELECTION_MODE,
         "student_checkpoint_selection_mode": REQUIRED_STUDENT_SELECTION_MODE,
+        "student_target_protocol": REQUIRED_STUDENT_TARGET_PROTOCOL,
         "locked_test_used_for_backbone_maturity_selection": False,
         "maturity_interpretation": "posthoc_locked_characterization_only",
         "comparator_root": str(comparator_root),

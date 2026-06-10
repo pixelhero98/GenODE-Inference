@@ -15,6 +15,7 @@ PANELS = {
 }
 REQUIRED_SELECTION_MODE = "weighted_normalized_regret_v1"
 REQUIRED_STUDENT_SELECTION_MODE = "validation_ce_v1"
+REQUIRED_STUDENT_TARGET_PROTOCOL = "teacher_weighted_soft_mixture_v1"
 REQUIRED_DENSITY_BIN_COUNT = 64
 BASELINE_LABEL = "teacher_additive_student_additive"
 RUN_SPECS: dict[str, dict[str, Any]] = {
@@ -173,20 +174,12 @@ def _validate_training(
     )
     _issue(issues, _density_bin_count(training) == REQUIRED_DENSITY_BIN_COUNT, f"{label}: wrong density bin count")
     _issue(issues, bool(training.get("locked_test_used_for_selection", False)) is False, f"{label}: locked test used for selection")
+    _issue(issues, str(training.get("student_target_protocol")) == REQUIRED_STUDENT_TARGET_PROTOCOL, f"{label}: wrong student target protocol")
     _issue(issues, bool(pseudo.get("pseudo_distillation_requested", False)) is False, f"{label}: pseudo distillation requested")
     _issue(issues, bool(student_training.get("pseudo_distillation_used", False)) is False, f"{label}: student pseudo distillation used")
     _issue(issues, float(pseudo.get("pseudo_target_weight", 0.0) or 0.0) == 0.0, f"{label}: pseudo target weight is nonzero")
     _issue(issues, float(student_training.get("pseudo_target_weight", 0.0) or 0.0) == 0.0, f"{label}: student pseudo target weight is nonzero")
-    _issue(
-        issues,
-        _close_float(training.get("student_nfe_smoothness_weight", 0.0), 0.0),
-        f"{label}: student smoothness weight is nonzero",
-    )
-    _issue(
-        issues,
-        _close_float(student_training.get("student_nfe_smoothness_weight", 0.0), 0.0),
-        f"{label}: student training smoothness weight is nonzero",
-    )
+    _issue(issues, str(student_training.get("student_target_protocol")) == REQUIRED_STUDENT_TARGET_PROTOCOL, f"{label}: wrong student training target protocol")
 
     _issue(issues, str(training.get("teacher_checkpoint_selection_mode")) == REQUIRED_SELECTION_MODE, f"{label}: wrong teacher selection mode")
     _issue(issues, str(selection.get("selection_protocol")) == REQUIRED_SELECTION_MODE, f"{label}: wrong teacher selection protocol")
@@ -472,6 +465,7 @@ def collect(root: Path, same_style_root: Path) -> dict[str, Any]:
         "density_bin_count": REQUIRED_DENSITY_BIN_COUNT,
         "teacher_checkpoint_selection_mode": REQUIRED_SELECTION_MODE,
         "student_checkpoint_selection_mode": REQUIRED_STUDENT_SELECTION_MODE,
+        "student_target_protocol": REQUIRED_STUDENT_TARGET_PROTOCOL,
         "run_specs": RUN_SPECS,
         "reports": results,
         "training": {
@@ -480,6 +474,7 @@ def collect(root: Path, same_style_root: Path) -> dict[str, Any]:
                 "teacher_conditioning_style": _observed_role_style(training, "teacher"),
                 "student_conditioning_style": _observed_role_style(training, "student"),
                 "conditioning_pair": training.get("conditioning_pair") or training.get("gipo_conditioning_style"),
+                "student_target_protocol": training.get("student_target_protocol"),
                 "selected_teacher_step": _nested(training, "teacher_checkpoint_selection", "selected_step"),
                 "selected_student_step": _nested(training, "student_checkpoint_selection", "selected_step"),
                 "sampled_context_count": training.get("sampled_context_count"),

@@ -58,14 +58,7 @@ DEFAULT_CONTEXT_CALIBRATION_VALIDATION_FRACTION = 0.20
 MIN_CONTEXT_CALIBRATION_TOTAL = 72
 MAX_CONTEXT_CALIBRATION_TOTAL = 144
 DEFAULT_TEACHER_TARGET_TEMPERATURE = 0.05
-TEACHER_TEMPERATURE_MODE_FIXED = "fixed"
-TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS = "adaptive_ess"
-DEFAULT_TEACHER_TARGET_ESS = 2.5
-DEFAULT_TEACHER_MIN_TEMPERATURE = 0.01
-DEFAULT_TEACHER_MAX_TEMPERATURE = 1.0
-STUDENT_TARGET_MODE_SOFT_MIXTURE = "soft_mixture"
-STUDENT_TARGET_MODE_MARGIN_HARD_SOFT = "margin_hard_soft"
-DEFAULT_TEACHER_HARD_MARGIN = 0.05
+STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE = "teacher_weighted_soft_mixture_v1"
 MODEL_PAYLOAD_VERSION = 4
 ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1 = "density_form_transformer_v1"
 ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1 = "density_query_transformer_v1"
@@ -142,22 +135,6 @@ def validate_gipo_conditioning_style(
             f"GIPO density transformers require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP_V1!r}; "
             f"got {style!r}."
         )
-
-
-def validate_teacher_checkpoint_selection_mode(value: str) -> str:
-    mode = str(value).strip() or DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE
-    allowed = {TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1}
-    if mode not in allowed:
-        raise ValueError(f"Unsupported teacher checkpoint selection mode {mode!r}; expected one of {sorted(allowed)}.")
-    return mode
-
-
-def validate_student_checkpoint_selection_mode(value: str) -> str:
-    mode = str(value).strip() or DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE
-    allowed = {STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1}
-    if mode not in allowed:
-        raise ValueError(f"Unsupported student checkpoint selection mode {mode!r}; expected one of {sorted(allowed)}.")
-    return mode
 
 
 def validate_gipo_teacher_training_metadata(metadata: Mapping[str, Any] | None) -> Dict[str, Any]:
@@ -355,55 +332,6 @@ def _teacher_candidate_weights(utilities: Sequence[float], *, temperature: float
 def _teacher_candidate_ess(weights: Sequence[float]) -> float:
     arr = np.asarray(weights, dtype=np.float64)
     return float(1.0 / max(float(np.sum(np.square(arr))), 1e-12))
-
-
-def _teacher_temperature_for_target_ess(
-    utilities: Sequence[float],
-    *,
-    target_ess: float,
-    min_temperature: float,
-    max_temperature: float,
-) -> float:
-    min_temp = _finite_positive(min_temperature, label="teacher_min_temperature")
-    max_temp = _finite_positive(max_temperature, label="teacher_max_temperature")
-    if min_temp > max_temp:
-        raise ValueError("teacher_min_temperature must be <= teacher_max_temperature.")
-    util_arr = np.asarray(utilities, dtype=np.float64)
-    if util_arr.size == 0:
-        raise ValueError("Adaptive ESS temperature requires at least one teacher utility.")
-    bounded_target = min(float(util_arr.size), max(1.0, _finite_positive(target_ess, label="teacher_target_ess")))
-    low_ess = _teacher_candidate_ess(_teacher_candidate_weights(util_arr, temperature=min_temp))
-    high_ess = _teacher_candidate_ess(_teacher_candidate_weights(util_arr, temperature=max_temp))
-    if bounded_target <= low_ess:
-        return float(min_temp)
-    if bounded_target >= high_ess:
-        return float(max_temp)
-    low = float(min_temp)
-    high = float(max_temp)
-    for _ in range(64):
-        mid = 0.5 * (low + high)
-        mid_ess = _teacher_candidate_ess(_teacher_candidate_weights(util_arr, temperature=mid))
-        if mid_ess < bounded_target:
-            low = mid
-        else:
-            high = mid
-    return float(0.5 * (low + high))
-
-
-def validate_teacher_temperature_mode(mode: str) -> str:
-    value = str(mode).strip()
-    allowed = {TEACHER_TEMPERATURE_MODE_FIXED, TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS}
-    if value not in allowed:
-        raise ValueError(f"teacher_temperature_mode must be one of {sorted(allowed)}, got {mode!r}.")
-    return value
-
-
-def validate_student_target_mode(mode: str) -> str:
-    value = str(mode).strip() or STUDENT_TARGET_MODE_SOFT_MIXTURE
-    allowed = {STUDENT_TARGET_MODE_SOFT_MIXTURE, STUDENT_TARGET_MODE_MARGIN_HARD_SOFT}
-    if value not in allowed:
-        raise ValueError(f"student_target_mode must be one of {sorted(allowed)}, got {mode!r}.")
-    return value
 
 
 def _resolve_setting_encoder_config(
@@ -632,47 +560,6 @@ def student_nfe_sequence_pairs(rows: Sequence[MetricRow]) -> List[Tuple[int, int
 def student_nfe_sequence_pair_indices(rows: Sequence[MetricRow]) -> List[Tuple[int, int]]:
     """Return adjacent target row indices that share context/solver/series and differ only by ordered NFE."""
     return [(left, right) for left, right, _ in student_nfe_sequence_pairs(rows)]
-
-
-def density_sequence_roughness_summary(
-    masses: Sequence[Sequence[float]],
-    pair_indices: Sequence[Tuple[int, int] | Tuple[int, int, float]],
-) -> Dict[str, Any]:
-    if not pair_indices:
-        return {
-            "nfe_sequence_pair_count": 0,
-            "nfe_sequence_delta_mean": 0.0,
-            "nfe_sequence_js_mean": 0.0,
-            "nfe_sequence_js_p95": 0.0,
-            "nfe_sequence_l1_mean": 0.0,
-            "nfe_sequence_l1_p95": 0.0,
-        }
-    js_values: List[float] = []
-    l1_values: List[float] = []
-    delta_values: List[float] = []
-    for pair in pair_indices:
-        left_idx = int(pair[0])
-        right_idx = int(pair[1])
-        delta_values.append(float(pair[2]) if len(pair) >= 3 else 1.0)
-        left = np.asarray(masses[int(left_idx)], dtype=np.float64)
-        right = np.asarray(masses[int(right_idx)], dtype=np.float64)
-        left = left / max(float(np.sum(left)), 1e-12)
-        right = right / max(float(np.sum(right)), 1e-12)
-        mixture = 0.5 * (left + right)
-        js = 0.5 * float(np.sum(left * (np.log(np.maximum(left, 1e-12)) - np.log(np.maximum(mixture, 1e-12)))))
-        js += 0.5 * float(np.sum(right * (np.log(np.maximum(right, 1e-12)) - np.log(np.maximum(mixture, 1e-12)))))
-        js_values.append(js)
-        l1_values.append(float(np.sum(np.abs(left - right))))
-    js_stats = _summary_percentiles(js_values)
-    l1_stats = _summary_percentiles(l1_values)
-    return {
-        "nfe_sequence_pair_count": int(len(pair_indices)),
-        "nfe_sequence_delta_mean": _summary_percentiles(delta_values)["mean"],
-        "nfe_sequence_js_mean": js_stats["mean"],
-        "nfe_sequence_js_p95": js_stats["p95"],
-        "nfe_sequence_l1_mean": l1_stats["mean"],
-        "nfe_sequence_l1_p95": l1_stats["p95"],
-    }
 
 
 def _physical_nfe_sequence_key(row: MetricRow) -> Tuple[Any, ...]:
@@ -1954,7 +1841,6 @@ def gipo_teacher_diagnostics(
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     teacher_utility_weights: Mapping[str, float] | None = None,
     complete_candidate_schedule_keys: Sequence[str] | None = None,
-    teacher_selection_temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
@@ -1964,7 +1850,7 @@ def gipo_teacher_diagnostics(
         regression_weight=regression_weight,
         pair_margin=pair_margin,
     )
-    selection_temperature = _finite_positive(teacher_selection_temperature, label="teacher_selection_temperature")
+    selection_temperature = DEFAULT_TEACHER_TARGET_TEMPERATURE
     contexts = {context_id_from_row(row) for row in rows}
     series_keys = {series_key_from_row(row) for row in rows}
     schedules = {str(row["scheduler_key"]) for row in rows}
@@ -1988,7 +1874,6 @@ def gipo_teacher_diagnostics(
         "fit_series_overlap_count": int(len(series_keys & fit_series_set)),
         "setting_feature_mode": feature_mode,
         "uses_validation_labels": False,
-        "teacher_selection_temperature": float(selection_temperature),
         "complete_candidate_group_key_schema": [
             "context_id",
             "solver_key",
@@ -2208,10 +2093,9 @@ def _selected_gipo_teacher_checkpoint(
     checkpoint_states: Mapping[int, Mapping[str, torch.Tensor]],
     *,
     required_split_names: Sequence[str] = (),
-    selection_mode: str = DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE,
     component_weights: Mapping[str, float] | None = None,
 ) -> Tuple[Dict[str, Any], Mapping[str, torch.Tensor] | None]:
-    mode = validate_teacher_checkpoint_selection_mode(selection_mode)
+    mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
 
     def _component_weight(name: str, weights: Mapping[str, float]) -> float:
         split = str(name)
@@ -2396,18 +2280,16 @@ def _selected_gipo_teacher_checkpoint(
     )
 
 
-def select_gipo_teacher_checkpoint(
+def select_weighted_normalized_regret_checkpoint(
     checkpoint_history: Sequence[Dict[str, Any]],
     *,
     required_split_names: Sequence[str] = (),
-    selection_mode: str = DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE,
     component_weights: Mapping[str, float] | None = None,
 ) -> Dict[str, Any]:
     selection, _ = _selected_gipo_teacher_checkpoint(
         checkpoint_history,
         {},
         required_split_names=required_split_names,
-        selection_mode=selection_mode,
         component_weights=component_weights,
     )
     return selection
@@ -2461,8 +2343,6 @@ def train_gipo_teacher(
     diagnostic_candidate_schedule_keys: Mapping[str, Sequence[str]] | None = None,
     teacher_checkpoint_every: int = 100,
     teacher_loss_log_every: int = 0,
-    teacher_checkpoint_selection_mode: str = DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE,
-    teacher_selection_temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
     teacher_selection_axis_weights: Mapping[str, float] | None = None,
     final_retrain_mode: bool = False,
     seed: int = 0,
@@ -2483,8 +2363,8 @@ def train_gipo_teacher(
         pair_margin=pair_margin,
     )
     teacher_metric_target_keys = teacher_metric_target_keys_for_model(teacher)
-    selection_mode = validate_teacher_checkpoint_selection_mode(teacher_checkpoint_selection_mode)
-    selection_temperature = _finite_positive(teacher_selection_temperature, label="teacher_selection_temperature")
+    selection_mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
+    selection_temperature = DEFAULT_TEACHER_TARGET_TEMPERATURE
     teacher.to(device)
     sx, dx, series_idx, cx, metric_targets, pair_keys, _, _ = _teacher_training_tensors(
         rows,
@@ -2567,7 +2447,6 @@ def train_gipo_teacher(
                     setting_encoder_config=encoder_config,
                     teacher_utility_weights=teacher_utility_weights,
                     complete_candidate_schedule_keys=diagnostic_candidate_schedule_map.get(str(name)),
-                    teacher_selection_temperature=float(selection_temperature),
                     device=device,
                 )
                 for name, split_rows in diagnostic_splits.items()
@@ -2591,7 +2470,6 @@ def train_gipo_teacher(
             checkpoint_history,
             checkpoint_states,
             required_split_names=tuple(diagnostic_splits.keys()) if diagnostic_splits else (),
-            selection_mode=selection_mode,
             component_weights=teacher_selection_axis_weights,
         )
     if selected_state is not None:
@@ -2642,7 +2520,6 @@ def train_gipo_teacher(
         "teacher_checkpoint_every": int(checkpoint_every),
         "teacher_checkpoint_selection": checkpoint_selection,
         "teacher_checkpoint_selection_mode": selection_mode,
-        "teacher_selection_temperature": float(selection_temperature),
         "final_teacher_retrain": final_teacher_retrain,
         "fit_context_count": int(len(fit_context_ids)),
         "fit_series_count": int(len(fit_series_keys)),
@@ -2660,30 +2537,14 @@ def build_teacher_weighted_density_targets(
     density_normalizer: DensityFeatureNormalizer,
     supervision_schedule_keys: Sequence[str] | None = None,
     temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
-    temperature_mode: str = TEACHER_TEMPERATURE_MODE_FIXED,
-    target_ess: float = DEFAULT_TEACHER_TARGET_ESS,
-    min_temperature: float = DEFAULT_TEACHER_MIN_TEMPERATURE,
-    max_temperature: float = DEFAULT_TEACHER_MAX_TEMPERATURE,
-    student_target_mode: str = STUDENT_TARGET_MODE_SOFT_MIXTURE,
-    teacher_hard_margin: float = DEFAULT_TEACHER_HARD_MARGIN,
     teacher_utility_weights: Mapping[str, float] | None = None,
     setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     device: torch.device | str = "cpu",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    temperature_mode = validate_teacher_temperature_mode(temperature_mode)
-    target_mode = validate_student_target_mode(student_target_mode)
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     fixed_temperature = _finite_positive(temperature, label="teacher_temperature")
-    adaptive_target_ess = _finite_positive(target_ess, label="teacher_target_ess")
-    adaptive_min_temperature = _finite_positive(min_temperature, label="teacher_min_temperature")
-    adaptive_max_temperature = _finite_positive(max_temperature, label="teacher_max_temperature")
-    hard_margin = float(teacher_hard_margin)
-    if not math.isfinite(hard_margin) or hard_margin < 0.0:
-        raise ValueError(f"teacher_hard_margin must be finite and nonnegative, got {teacher_hard_margin!r}.")
-    if adaptive_min_temperature > adaptive_max_temperature:
-        raise ValueError("teacher_min_temperature must be <= teacher_max_temperature.")
     observed_keys = {str(row["scheduler_key"]) for row in rows}
     supervision_keys = validate_gipo_support_schedule_keys(
         sorted(observed_keys) if supervision_schedule_keys is None else supervision_schedule_keys
@@ -2704,10 +2565,7 @@ def build_teacher_weighted_density_targets(
     entropy_values: List[float] = []
     ess_values: List[float] = []
     max_weight_values: List[float] = []
-    chosen_temperature_values: List[float] = []
-    top_margin_values: List[float] = []
     candidate_counts: List[int] = []
-    hard_target_count = 0
     teacher.to(device)
     teacher.eval()
     score_settings: List[torch.Tensor] = []
@@ -2769,28 +2627,13 @@ def build_teacher_weighted_density_targets(
         for row in group:
             masses.append(score_masses[id(row)])
             utilities.append(float(utility_by_row_id[id(row)]))
-        if temperature_mode == TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS:
-            chosen_temperature = _teacher_temperature_for_target_ess(
-                utilities,
-                target_ess=adaptive_target_ess,
-                min_temperature=adaptive_min_temperature,
-                max_temperature=adaptive_max_temperature,
-            )
-        else:
-            chosen_temperature = fixed_temperature
+        chosen_temperature = fixed_temperature
         utility_array = np.asarray(utilities, dtype=np.float64)
         if utility_array.size > 1:
             ordered = np.argsort(-utility_array)
-            top_margin = float(utility_array[int(ordered[0])] - utility_array[int(ordered[1])])
         else:
             ordered = np.asarray([0], dtype=np.int64)
-            top_margin = float("inf")
-        if target_mode == STUDENT_TARGET_MODE_MARGIN_HARD_SOFT and top_margin >= hard_margin:
-            weights = np.zeros_like(utility_array, dtype=np.float64)
-            weights[int(ordered[0])] = 1.0
-            hard_target_count += 1
-        else:
-            weights = _teacher_candidate_weights(utilities, temperature=chosen_temperature)
+        weights = _teacher_candidate_weights(utilities, temperature=chosen_temperature)
         mixture = np.zeros(len(reference_time_grid) - 1, dtype=np.float64)
         for weight, mass in zip(weights, masses):
             mixture += float(weight) * np.asarray(mass, dtype=np.float64)
@@ -2802,20 +2645,14 @@ def build_teacher_weighted_density_targets(
         entropy_values.append(float(-np.sum(weights * np.log(np.maximum(weights, 1e-12)))))
         ess_values.append(_teacher_candidate_ess(weights))
         max_weight_values.append(float(np.max(weights)))
-        chosen_temperature_values.append(float(chosen_temperature))
-        top_margin_values.append(top_margin)
         candidate_counts.append(int(len(group)))
     entropy_stats = _summary_percentiles(entropy_values)
     ess_stats = _summary_percentiles(ess_values)
     max_weight_stats = _summary_percentiles(max_weight_values)
-    chosen_temperature_stats = _summary_percentiles(chosen_temperature_values)
-    top_margin_stats = _summary_percentiles(top_margin_values)
     sequence_pairs = student_nfe_sequence_pairs(rows)
-    sequence_summary = density_sequence_roughness_summary(target_masses, sequence_pairs)
     summary = {
         "target_protocol": "teacher_weighted_density_mle",
-        "student_target_mode": target_mode,
-        "teacher_hard_margin": float(hard_margin),
+        "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
         "teacher_output": TEACHER_OUTPUT_METRIC_VECTOR_V1,
         "teacher_metric_targets": list(teacher_metric_target_keys),
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
@@ -2823,13 +2660,7 @@ def build_teacher_weighted_density_targets(
             teacher_metric_target_keys,
             {key: float(value) for key, value in zip(teacher_metric_target_keys, score_weights[0].detach().cpu().tolist())},
         ),
-        "hard_target_count": int(hard_target_count),
-        "hard_target_fraction": float(hard_target_count / max(len(target_masses), 1)),
-        "teacher_temperature_mode": temperature_mode,
         "teacher_temperature": float(fixed_temperature),
-        "teacher_target_ess": float(adaptive_target_ess),
-        "teacher_min_temperature": float(adaptive_min_temperature),
-        "teacher_max_temperature": float(adaptive_max_temperature),
         "setting_feature_mode": feature_mode,
         "setting_encoder_mode": encoder_config.mode,
         "setting_encoder_config": encoder_config.to_payload(),
@@ -2848,18 +2679,10 @@ def build_teacher_weighted_density_targets(
         "teacher_candidate_max_weight_p05": max_weight_stats["p05"],
         "teacher_candidate_max_weight_p50": max_weight_stats["p50"],
         "teacher_candidate_max_weight_p95": max_weight_stats["p95"],
-        "teacher_chosen_temperature_mean": chosen_temperature_stats["mean"],
-        "teacher_chosen_temperature_p05": chosen_temperature_stats["p05"],
-        "teacher_chosen_temperature_p50": chosen_temperature_stats["p50"],
-        "teacher_chosen_temperature_p95": chosen_temperature_stats["p95"],
-        "teacher_top_margin_mean": top_margin_stats["mean"],
-        "teacher_top_margin_p05": top_margin_stats["p05"],
-        "teacher_top_margin_p50": top_margin_stats["p50"],
-        "teacher_top_margin_p95": top_margin_stats["p95"],
         "mean_candidate_count": float(np.mean(np.asarray(candidate_counts, dtype=np.float64))) if candidate_counts else 0.0,
+        "nfe_sequence_pair_count": int(len(sequence_pairs)),
         "supervision_schedule_keys": list(supervision_keys),
         "density_protocol": DENSITY_PROTOCOL,
-        **sequence_summary,
     }
     return (
         torch.stack(setting_rows, dim=0).to(device=device),
@@ -2881,28 +2704,14 @@ def build_teacher_weighted_density_prediction_rows(
     density_normalizer: DensityFeatureNormalizer,
     supervision_schedule_keys: Sequence[str] | None = None,
     temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
-    temperature_mode: str = TEACHER_TEMPERATURE_MODE_FIXED,
-    target_ess: float = DEFAULT_TEACHER_TARGET_ESS,
-    min_temperature: float = DEFAULT_TEACHER_MIN_TEMPERATURE,
-    max_temperature: float = DEFAULT_TEACHER_MAX_TEMPERATURE,
-    student_target_mode: str = STUDENT_TARGET_MODE_SOFT_MIXTURE,
-    teacher_hard_margin: float = DEFAULT_TEACHER_HARD_MARGIN,
     teacher_utility_weights: Mapping[str, float] | None = None,
     setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     device: torch.device | str = "cpu",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    temperature_mode = validate_teacher_temperature_mode(temperature_mode)
-    target_mode = validate_student_target_mode(student_target_mode)
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     fixed_temperature = _finite_positive(temperature, label="teacher_temperature")
-    adaptive_target_ess = _finite_positive(target_ess, label="teacher_target_ess")
-    adaptive_min_temperature = _finite_positive(min_temperature, label="teacher_min_temperature")
-    adaptive_max_temperature = _finite_positive(max_temperature, label="teacher_max_temperature")
-    hard_margin = float(teacher_hard_margin)
-    if not math.isfinite(hard_margin) or hard_margin < 0.0:
-        raise ValueError(f"teacher_hard_margin must be finite and nonnegative, got {teacher_hard_margin!r}.")
     observed_keys = {str(row["scheduler_key"]) for row in rows}
     supervision_keys = validate_gipo_support_schedule_keys(
         sorted(observed_keys) if supervision_schedule_keys is None else supervision_schedule_keys
@@ -2920,11 +2729,7 @@ def build_teacher_weighted_density_prediction_rows(
     entropy_values: List[float] = []
     ess_values: List[float] = []
     max_weight_values: List[float] = []
-    chosen_temperature_values: List[float] = []
-    top_margin_values: List[float] = []
     candidate_counts: List[int] = []
-    hard_target_count = 0
-    mixture_masses: List[np.ndarray] = []
     teacher_metric_target_keys = teacher_metric_target_keys_for_model(teacher)
     teacher.to(device)
     teacher.eval()
@@ -2995,34 +2800,17 @@ def build_teacher_weighted_density_prediction_rows(
             utilities.append(float(utility_by_row_id[id(row)]))
             metric_utilities.append(metric_utility_by_row_id[id(row)])
             schedule_keys.append(str(row["scheduler_key"]))
-        if temperature_mode == TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS:
-            chosen_temperature = _teacher_temperature_for_target_ess(
-                utilities,
-                target_ess=adaptive_target_ess,
-                min_temperature=adaptive_min_temperature,
-                max_temperature=adaptive_max_temperature,
-            )
-        else:
-            chosen_temperature = fixed_temperature
+        chosen_temperature = fixed_temperature
         utility_array = np.asarray(utilities, dtype=np.float64)
         if utility_array.size > 1:
             ordered = np.argsort(-utility_array)
-            top_margin = float(utility_array[int(ordered[0])] - utility_array[int(ordered[1])])
         else:
             ordered = np.asarray([0], dtype=np.int64)
-            top_margin = float("inf")
-        hard_target = bool(target_mode == STUDENT_TARGET_MODE_MARGIN_HARD_SOFT and top_margin >= hard_margin)
-        if hard_target:
-            weights = np.zeros_like(utility_array, dtype=np.float64)
-            weights[int(ordered[0])] = 1.0
-            hard_target_count += 1
-        else:
-            weights = _teacher_candidate_weights(utilities, temperature=chosen_temperature)
+        weights = _teacher_candidate_weights(utilities, temperature=chosen_temperature)
         mixture = np.zeros(len(reference_time_grid) - 1, dtype=np.float64)
         for weight, mass in zip(weights, masses):
             mixture += float(weight) * np.asarray(mass, dtype=np.float64)
         mixture = mixture / max(float(np.sum(mixture)), 1e-12)
-        mixture_masses.append(mixture.astype(np.float32))
         macro_steps = solver_macro_steps(solver, target_nfe)
         grid = density_mass_to_time_grid(mixture, macro_steps=macro_steps, reference_time_grid=reference_time_grid)
         entropy = float(-np.sum(weights * np.log(np.maximum(weights, 1e-12))))
@@ -3031,8 +2819,6 @@ def build_teacher_weighted_density_prediction_rows(
         entropy_values.append(entropy)
         ess_values.append(ess)
         max_weight_values.append(max_weight)
-        chosen_temperature_values.append(float(chosen_temperature))
-        top_margin_values.append(top_margin)
         candidate_counts.append(int(len(group)))
         top_idx = int(ordered[0])
         copied = dict(first)
@@ -3050,14 +2836,9 @@ def build_teacher_weighted_density_prediction_rows(
                 "reference_grid_hash": reference_grid_hash(reference_time_grid),
                 "setting_feature_mode": feature_mode,
                 "setting_encoder_mode": encoder_config.mode,
-                "teacher_temperature_mode": temperature_mode,
                 "teacher_temperature": float(fixed_temperature),
-                "teacher_target_ess": float(adaptive_target_ess),
                 "teacher_chosen_temperature": float(chosen_temperature),
-                "student_target_mode": target_mode,
-                "teacher_hard_margin": float(hard_margin),
-                "teacher_hard_target": hard_target,
-                "teacher_top_margin": top_margin,
+                "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
                 "teacher_top_schedule_key": schedule_keys[top_idx],
                 "teacher_candidate_entropy": entropy,
                 "teacher_candidate_ess": ess,
@@ -3080,14 +2861,10 @@ def build_teacher_weighted_density_prediction_rows(
     entropy_stats = _summary_percentiles(entropy_values)
     ess_stats = _summary_percentiles(ess_values)
     max_weight_stats = _summary_percentiles(max_weight_values)
-    chosen_temperature_stats = _summary_percentiles(chosen_temperature_values)
-    top_margin_stats = _summary_percentiles(top_margin_values)
     sequence_pairs = student_nfe_sequence_pairs(rows)
-    sequence_summary = density_sequence_roughness_summary(mixture_masses, sequence_pairs)
     summary = {
         "target_protocol": "teacher_weighted_density_mle",
-        "student_target_mode": target_mode,
-        "teacher_hard_margin": float(hard_margin),
+        "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
         "teacher_output": TEACHER_OUTPUT_METRIC_VECTOR_V1,
         "teacher_metric_targets": list(teacher_metric_target_keys),
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
@@ -3095,13 +2872,7 @@ def build_teacher_weighted_density_prediction_rows(
             teacher_metric_target_keys,
             {key: float(value) for key, value in zip(teacher_metric_target_keys, score_weights[0].detach().cpu().tolist())},
         ),
-        "hard_target_count": int(hard_target_count),
-        "hard_target_fraction": float(hard_target_count / max(len(records), 1)),
-        "teacher_temperature_mode": temperature_mode,
         "teacher_temperature": float(fixed_temperature),
-        "teacher_target_ess": float(adaptive_target_ess),
-        "teacher_min_temperature": float(adaptive_min_temperature),
-        "teacher_max_temperature": float(adaptive_max_temperature),
         "setting_feature_mode": feature_mode,
         "setting_encoder_mode": encoder_config.mode,
         "setting_encoder_config": encoder_config.to_payload(),
@@ -3119,18 +2890,10 @@ def build_teacher_weighted_density_prediction_rows(
         "teacher_candidate_max_weight_p05": max_weight_stats["p05"],
         "teacher_candidate_max_weight_p50": max_weight_stats["p50"],
         "teacher_candidate_max_weight_p95": max_weight_stats["p95"],
-        "teacher_chosen_temperature_mean": chosen_temperature_stats["mean"],
-        "teacher_chosen_temperature_p05": chosen_temperature_stats["p05"],
-        "teacher_chosen_temperature_p50": chosen_temperature_stats["p50"],
-        "teacher_chosen_temperature_p95": chosen_temperature_stats["p95"],
-        "teacher_top_margin_mean": top_margin_stats["mean"],
-        "teacher_top_margin_p05": top_margin_stats["p05"],
-        "teacher_top_margin_p50": top_margin_stats["p50"],
-        "teacher_top_margin_p95": top_margin_stats["p95"],
         "mean_candidate_count": float(np.mean(np.asarray(candidate_counts, dtype=np.float64))) if candidate_counts else 0.0,
+        "nfe_sequence_pair_count": int(len(sequence_pairs)),
         "supervision_schedule_keys": list(supervision_keys),
         "density_protocol": DENSITY_PROTOCOL,
-        **sequence_summary,
     }
     return records, summary
 
@@ -3148,13 +2911,7 @@ def train_gipo_student(
     steps: int = 500,
     lr: float = 1e-3,
     teacher_temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
-    teacher_temperature_mode: str = TEACHER_TEMPERATURE_MODE_FIXED,
-    teacher_target_ess: float = DEFAULT_TEACHER_TARGET_ESS,
-    teacher_min_temperature: float = DEFAULT_TEACHER_MIN_TEMPERATURE,
-    teacher_max_temperature: float = DEFAULT_TEACHER_MAX_TEMPERATURE,
     teacher_utility_weights: Mapping[str, float] | None = None,
-    student_target_mode: str = STUDENT_TARGET_MODE_SOFT_MIXTURE,
-    teacher_hard_margin: float = DEFAULT_TEACHER_HARD_MARGIN,
     setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     student_weight_decay: float = 1e-4,
@@ -3166,7 +2923,6 @@ def train_gipo_student(
     validation_context_embeddings: Mapping[str, Sequence[float]] | None = None,
     student_log_every: int = 0,
     student_checkpoint_every: int = 100,
-    student_checkpoint_selection_mode: str = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
     final_retrain_mode: bool = False,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
@@ -3180,7 +2936,7 @@ def train_gipo_student(
     pseudo_weight = float(pseudo_target_weight)
     if not math.isfinite(pseudo_weight) or pseudo_weight < 0.0:
         raise ValueError("student_pseudo_target_weight must be finite and nonnegative.")
-    selection_mode = validate_student_checkpoint_selection_mode(student_checkpoint_selection_mode)
+    selection_mode = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
     use_validation_selection = not bool(final_retrain_mode)
     checkpoint_every = max(1, int(student_checkpoint_every))
     validation_fit_rows = [dict(row) for row in (validation_rows or [])]
@@ -3206,13 +2962,7 @@ def train_gipo_student(
         density_normalizer=density_normalizer,
         supervision_schedule_keys=sorted({str(row["scheduler_key"]) for row in rows}),
         temperature=float(teacher_temperature),
-        temperature_mode=str(teacher_temperature_mode),
-        target_ess=float(teacher_target_ess),
-        min_temperature=float(teacher_min_temperature),
-        max_temperature=float(teacher_max_temperature),
         teacher_utility_weights=teacher_utility_weights,
-        student_target_mode=str(student_target_mode),
-        teacher_hard_margin=float(teacher_hard_margin),
         setting_feature_mode=feature_mode,
         setting_encoder_config=encoder_config,
         device=device,
@@ -3242,13 +2992,7 @@ def train_gipo_student(
             density_normalizer=density_normalizer,
             supervision_schedule_keys=sorted({str(row["scheduler_key"]) for row in (pseudo_rows or [])}),
             temperature=float(teacher_temperature),
-            temperature_mode=str(teacher_temperature_mode),
-            target_ess=float(teacher_target_ess),
-            min_temperature=float(teacher_min_temperature),
-            max_temperature=float(teacher_max_temperature),
             teacher_utility_weights=teacher_utility_weights,
-            student_target_mode=str(student_target_mode),
-            teacher_hard_margin=float(teacher_hard_margin),
             setting_feature_mode=feature_mode,
             setting_encoder_config=encoder_config,
             device=device,
@@ -3283,13 +3027,7 @@ def train_gipo_student(
             density_normalizer=density_normalizer,
             supervision_schedule_keys=sorted({str(row["scheduler_key"]) for row in validation_fit_rows}),
             temperature=float(teacher_temperature),
-            temperature_mode=str(teacher_temperature_mode),
-            target_ess=float(teacher_target_ess),
-            min_temperature=float(teacher_min_temperature),
-            max_temperature=float(teacher_max_temperature),
             teacher_utility_weights=teacher_utility_weights,
-            student_target_mode=str(student_target_mode),
-            teacher_hard_margin=float(teacher_hard_margin),
             setting_feature_mode=feature_mode,
             setting_encoder_config=encoder_config,
             device=device,
@@ -3465,9 +3203,8 @@ def train_gipo_student(
         }
     return {
         "student_policy_type": "continuous_density",
-        "student_objective": "teacher_weighted_density_mle_kl"
-        if validate_student_target_mode(student_target_mode) == STUDENT_TARGET_MODE_SOFT_MIXTURE
-        else "teacher_weighted_density_margin_hard_soft_kl",
+        "student_objective": "teacher_weighted_density_mle_kl",
+        "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
         "density_protocol": DENSITY_PROTOCOL,
         "student_target_summary": target_summary,
         "student_validation_target_summary": validation_target_summary,
@@ -3611,11 +3348,8 @@ __all__ = [
     "DEFAULT_SUPPORT_SCHEDULE_KEYS",
     "DEFAULT_SUPERVISION_SCHEDULE_KEYS",
     "EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS",
-    "DEFAULT_TEACHER_HARD_MARGIN",
-    "DEFAULT_TEACHER_MAX_TEMPERATURE",
-    "DEFAULT_TEACHER_MIN_TEMPERATURE",
-    "DEFAULT_TEACHER_TARGET_ESS",
     "DEFAULT_TEACHER_TARGET_TEMPERATURE",
+    "STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE",
     "DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS",
     "DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE",
     "DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE",
@@ -3633,11 +3367,7 @@ __all__ = [
     "MIN_CONTEXT_CALIBRATION_TOTAL",
     "SERIES_CONDITIONING_DIM",
     "SERIES_CONDITIONING_NONE_CONTEXT_ONLY",
-    "STUDENT_TARGET_MODE_MARGIN_HARD_SOFT",
-    "STUDENT_TARGET_MODE_SOFT_MIXTURE",
     "STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1",
-    "TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS",
-    "TEACHER_TEMPERATURE_MODE_FIXED",
     "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1",
     "GIPODensityFormTeacherTransformer",
     "GIPODensityQueryStudentTransformer",
@@ -3653,7 +3383,6 @@ __all__ = [
     "context_id_from_row",
     "context_pair_key",
     "density_family_for_schedule_key",
-    "density_sequence_roughness_summary",
     "gipo_teacher_diagnostics",
     "density_mass_for_row",
     "grid_for_schedule",
@@ -3668,7 +3397,7 @@ __all__ = [
     "sample_context_ids_stratified",
     "save_context_embedding_table",
     "schedule_grid_hash",
-    "select_gipo_teacher_checkpoint",
+    "select_weighted_normalized_regret_checkpoint",
     "series_key_from_row",
     "logical_seed_from_row",
     "evaluation_seed_from_row",
@@ -3685,11 +3414,7 @@ __all__ = [
     "validate_gipo_support_schedule_keys",
     "validate_density_family_holdout_schedule_keys",
     "validate_series_conditioning",
-    "validate_student_target_mode",
-    "validate_teacher_checkpoint_selection_mode",
-    "validate_student_checkpoint_selection_mode",
     "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1",
     "validate_teacher_objective_hyperparameters",
-    "validate_teacher_temperature_mode",
     "validate_reference_grid",
 ]
