@@ -37,6 +37,9 @@ class GenODEInterfaceTests(unittest.TestCase):
         expected_core = {
             "genode-train-backbone",
             "genode-run-schedules",
+            "genode-prepare-molecule-xyz",
+            "genode-train-molecule-backbone",
+            "genode-eval-molecule-backbone",
             "genode-train-gipo",
             "genode-report-gipo-locked-test",
             "genode-report-gipo-teacher-oracle",
@@ -325,6 +328,29 @@ class GenODEInterfaceTests(unittest.TestCase):
                 needle = "diffusion" + "_flow" + "_inference"
                 if needle in text:
                     offenders.append(str(path.relative_to(PROJECT_ROOT)))
+        self.assertEqual(offenders, [])
+
+    def test_molecule_sources_do_not_embed_local_paths_or_legacy_dataset_constants(self) -> None:
+        offenders: list[str] = []
+        blocked_patterns = (
+            "Downloads",
+            "PycharmProjects",
+            "/home/yzn",
+            "Path.home()",
+            "triangulene_2",
+            "trajectory_cleaned",
+            "ARTIFACT_EXCLUDED",
+        )
+        for path in (
+            PROJECT_ROOT / "src" / "genode" / "data" / "molecule_xyz.py",
+            PROJECT_ROOT / "src" / "genode" / "data" / "prepare_molecule_xyz.py",
+            PROJECT_ROOT / "src" / "genode" / "training" / "train_molecule_backbone.py",
+            PROJECT_ROOT / "src" / "genode" / "evaluation" / "molecule_metrics.py",
+        ):
+            text = path.read_text(encoding="utf-8")
+            for pattern in blocked_patterns:
+                if pattern in text:
+                    offenders.append(f"{path.relative_to(PROJECT_ROOT)}:{pattern}")
         self.assertEqual(offenders, [])
 
 

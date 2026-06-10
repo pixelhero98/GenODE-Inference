@@ -47,8 +47,9 @@ for context, density-family, and unseen-NFE calibration diagnostics, scores
 `J_CDN = 0.5 * J_CD + 0.5 * unseen_nfe`, and tie-breaks by minimax normalized
 regret, raw mean regret, then earlier checkpoint step. Locked-test data is not
 used for checkpoint selection.
-Series IDs are still used for row grouping, split diagnostics, and reporting,
-but no series identity feature is fed to the GIPO teacher or student.
+Series IDs are still used for row grouping, split diagnostics, series-disjoint
+diagnostics, and reporting, but no series identity feature is fed to the GIPO
+teacher or student.
 
 The canonical student is `density_query_transformer_v1`. It builds one query
 token per density bin from `(t_j, delta_t_j)`, applies the same additive

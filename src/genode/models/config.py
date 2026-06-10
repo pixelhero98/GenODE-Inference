@@ -14,6 +14,7 @@ class SequenceDataConfig:
     levels: int = 10
     token_dim: int = 4
     history_len: int = 256
+    context_feature_dim: int = 0
     standardize: bool = True
     use_cond_features: bool = False
     cond_depths: Tuple[int, ...] = (1, 3, 5, 10)
@@ -167,6 +168,7 @@ class OTFlowConfig:
 
     @property
     def context_dim(self) -> int:
+        base_dim = int(getattr(self.data, "context_feature_dim", 0) or self.snapshot_dim)
         use_elapsed = bool(getattr(self.model, "use_time_features", False))
         use_gap_only = bool(getattr(self.model, "use_time_gaps", False))
         if use_elapsed and use_gap_only:
@@ -177,7 +179,7 @@ class OTFlowConfig:
             extra_dim = 1
         else:
             extra_dim = 0
-        return int(self.snapshot_dim) + int(extra_dim)
+        return int(base_dim) + int(extra_dim)
 
     @property
     def prediction_horizon(self) -> int:

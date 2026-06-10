@@ -143,7 +143,10 @@ def _append_rollout_context_features(
 
     extra_dim = int(target_dim - block_dim)
     if future_context_seq is None:
-        extra = torch.zeros(block.shape[0], int(take), extra_dim, device=block.device, dtype=block.dtype)
+        raise ValueError(
+            "Rollout context expansion requires explicit future_context_seq. "
+            "Use a domain-specific rollout path for non-temporal augmented contexts."
+        )
     else:
         extra = future_context_seq[:, int(cursor) : int(cursor) + int(take), :].to(
             device=block.device,

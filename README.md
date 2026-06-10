@@ -149,3 +149,69 @@ PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
 For CPU-only smoke checks, set `CUDA_VISIBLE_DEVICES=''` and keep `--device auto`.
+
+## Molecule 3D Coordinate Backbones
+
+Molecule support is separate from the temporal sequence and GIPO workflows. It
+prepares fixed-order XYZ trajectory zips into per-stratum coordinate windows and
+trains standalone OTFlow backbones for continuous 3D coordinate generation.
+
+Raw zips default to project-local ignored paths:
+
+```text
+data/molecule_3d/<dataset_key>/raw/<dataset_key>.zip
+```
+
+For mixed-shape archives, inspect available categories first:
+
+```bash
+genode-prepare-molecule-xyz \
+  --dataset_key triangulene_3 \
+  --zip_path data/molecule_3d/triangulene_3/raw/triangulene_3.zip \
+  --discover_only
+```
+
+Prepare all dynamic categories into isolated fixed-shape processed datasets:
+
+```bash
+genode-prepare-molecule-xyz \
+  --dataset_key triangulene_3 \
+  --zip_path data/molecule_3d/triangulene_3/raw/triangulene_3.zip \
+  --all_strata \
+  --include_pattern 'Dynamic_*'
+```
+
+Train one autoregressive molecule backbone for a processed stratum:
+
+```bash
+genode-train-molecule-backbone \
+  --dataset_key triangulene_3 \
+  --stratum Dynamic_Anthracene \
+  --device auto \
+  --steps 20000 \
+  --future_horizon 1 \
+  --history_len 16 \
+  --ctx_encoder hybrid \
+  --ctx_local_kernel 7 \
+  --ctx_pool_scales 8 \
+  --train_context_min 8 \
+  --train_context_max 16 \
+  --budget_steps 4000,8000,12000,16000,20000
+```
+
+Evaluate a selected molecule checkpoint with the same processed data and saved
+normalization stats:
+
+```bash
+genode-eval-molecule-backbone \
+  --checkpoint outputs/molecule_3d_backbones/triangulene_3/Dynamic_Anthracene/ar_h1/20000_steps/model.pt \
+  --dataset_key triangulene_3 \
+  --stratum Dynamic_Anthracene \
+  --split test_clean \
+  --solver euler \
+  --nfe 16 \
+  --device auto
+```
+
+Processed arrays, raw zips, checkpoints, logs, and evaluation JSON are generated
+artifacts and should remain under ignored `data/` or `outputs/` paths.

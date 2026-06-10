@@ -21,7 +21,7 @@ import time
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler, WeightedRandomSampler
 from torch.optim.swa_utils import AveragedModel
 
 from genode.models.config import OTFlowConfig
@@ -70,7 +70,16 @@ def make_loader(
     """
     sampler = None
     effective_shuffle = bool(shuffle)
-    if bool(shuffle) and bool(getattr(ds, "sampler_replacement", False)):
+    if bool(shuffle) and getattr(ds, "sampler_weights", None) is not None:
+        weights = torch.as_tensor(getattr(ds, "sampler_weights"), dtype=torch.double)
+        num_samples = getattr(ds, "sampler_num_samples", None)
+        sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=int(num_samples) if num_samples is not None else int(len(weights)),
+            replacement=True,
+        )
+        effective_shuffle = False
+    elif bool(shuffle) and bool(getattr(ds, "sampler_replacement", False)):
         num_samples = getattr(ds, "sampler_num_samples", None)
         if num_samples is not None and int(num_samples) > 0:
             sampler = RandomSampler(
@@ -495,6 +504,16 @@ def generate_continuation(
 
     snapshot_dim = _model_snapshot_dim(model, context_dim=D)
     extra_dim = max(0, int(D) - int(snapshot_dim))
+    if extra_dim > 0 and future_context_seq is None:
+        uses_time_context = bool(
+            getattr(model_cfg, "use_time_features", False)
+            or getattr(model_cfg, "use_time_gaps", False)
+        )
+        if not uses_time_context:
+            raise ValueError(
+                "Continuation with context_dim > snapshot_dim requires explicit future_context_seq. "
+                "Use a domain-specific rollout path for non-temporal augmented contexts."
+            )
     if extra_dim > 0 and future_context_seq is not None:
         if future_context_seq.shape[0] != B or future_context_seq.shape[1] < int(steps) or future_context_seq.shape[2] != extra_dim:
             raise ValueError(
@@ -507,18 +526,11 @@ def generate_continuation(
         if extra_dim <= 0:
             return block
         if future_context_seq is None:
-            extra = torch.zeros(
-                block.shape[0],
-                int(take),
-                extra_dim,
-                device=block.device,
-                dtype=block.dtype,
-            )
-        else:
-            extra = future_context_seq[:, int(cursor) : int(cursor) + int(take), :].to(
-                device=block.device,
-                dtype=block.dtype,
-            )
+            raise ValueError("future_context_seq is required when context_dim exceeds snapshot_dim.")
+        extra = future_context_seq[:, int(cursor) : int(cursor) + int(take), :].to(
+            device=block.device,
+            dtype=block.dtype,
+        )
         return torch.cat([block, extra], dim=-1)
 
     prediction_horizon = _model_prediction_horizon(model)

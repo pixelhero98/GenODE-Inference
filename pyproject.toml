@@ -22,6 +22,9 @@ dependencies = [
 [project.scripts]
 genode-run-schedules = "genode.evaluation.diffusion_flow_time_reparameterization:main"
 genode-train-backbone = "genode.training.train_backbone:main"
+genode-prepare-molecule-xyz = "genode.data.prepare_molecule_xyz:main"
+genode-train-molecule-backbone = "genode.training.train_molecule_backbone:main"
+genode-eval-molecule-backbone = "genode.evaluation.molecule_metrics:main"
 genode-train-gipo = "genode.gipo.train_gipo:main"
 genode-report-gipo-locked-test = "genode.gipo.report_locked_test:main"
 genode-report-gipo-teacher-oracle = "genode.gipo.report_teacher_oracle:main"
