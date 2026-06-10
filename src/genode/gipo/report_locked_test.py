@@ -23,7 +23,7 @@ from genode.gipo.policy import (
     predict_gipo_density_many,
     read_metric_rows_csv,
     validate_gipo_attention_heads,
-    validate_gipo_conditioning_style,
+    validate_canonical_conditioning_style,
     validate_gipo_density_token_attention,
     validate_gipo_teacher_training_metadata,
 )
@@ -250,7 +250,7 @@ def _load_student_checkpoint(
             f"GIPO student checkpoints must use {ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1!r}; got {student_architecture!r}."
         )
     student_model_config = dict(payload.get("student_model_config", {}) or {})
-    validate_gipo_conditioning_style(
+    validate_canonical_conditioning_style(
         student_model_config,
         require_present=True,
     )
@@ -315,7 +315,7 @@ def _conditioning_metadata_for_summary(
         if style
     }
     for style in candidates:
-        validate_gipo_conditioning_style({"conditioning_style": style})
+        validate_canonical_conditioning_style({"conditioning_style": style})
     if len(candidates) > 1:
         raise ValueError(f"GIPO metadata contains inconsistent conditioning_style values: {sorted(candidates)}")
     if not candidates:

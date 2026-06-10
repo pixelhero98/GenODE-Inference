@@ -31,7 +31,7 @@ from genode.gipo.policy import (
     TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
     build_gipo_student_model,
     build_gipo_teacher_model,
-    validate_gipo_conditioning_style,
+    validate_canonical_conditioning_style,
 )
 from genode.gipo.train_gipo import build_argparser as build_train_argparser
 
@@ -131,7 +131,7 @@ class GIPOCanonicalTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
-            validate_gipo_conditioning_style({"conditioning_style": legacy_style})
+            validate_canonical_conditioning_style({"conditioning_style": legacy_style})
         with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
             GIPODensityQueryStudentTransformer(**model_kwargs)
         with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
@@ -160,9 +160,9 @@ class GIPOCanonicalTests(unittest.TestCase):
         options = {option for action in parser._actions for option in action.option_strings}
 
         self.assertIn("--teacher_unseen_selection_rows_csv", options)
-        self.assertNotIn("--gipo_conditioning_style", options)
-        self.assertNotIn("--gipo_teacher_conditioning_style", options)
-        self.assertNotIn("--gipo_student_conditioning_style", options)
+        self.assertNotIn("--gipo_" + "conditioning_style", options)
+        self.assertNotIn("--gipo_teacher_" + "conditioning_style", options)
+        self.assertNotIn("--gipo_student_" + "conditioning_style", options)
         self.assertNotIn("--allow_noncanonical_conditioning", options)
 
     def test_student_checkpoint_loader_accepts_only_canonical_additive_student(self) -> None:

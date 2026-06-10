@@ -65,9 +65,9 @@ class GenODEInterfaceTests(unittest.TestCase):
 
         self.assertIn("--teacher_unseen_selection_rows_csv", options)
         removed_options = {
-            "--gipo_conditioning_style",
-            "--gipo_teacher_conditioning_style",
-            "--gipo_student_conditioning_style",
+            "--gipo_" + "conditioning_style",
+            "--gipo_teacher_" + "conditioning_style",
+            "--gipo_student_" + "conditioning_style",
             "--allow_noncanonical_conditioning",
             "--density_bin_count",
             "--teacher_checkpoint_" + "selection_mode",

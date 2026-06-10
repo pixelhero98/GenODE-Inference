@@ -106,7 +106,7 @@ def validate_gipo_architecture(value: str, *, role: str | None = None) -> str:
     return arch
 
 
-def validate_gipo_conditioning_style(
+def validate_canonical_conditioning_style(
     model_config: Mapping[str, Any] | None,
     *,
     require_present: bool = False,
@@ -1231,7 +1231,7 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
         self.hidden_layers = int(hidden_layers)
         self.attention_heads = validate_gipo_attention_heads(int(attention_heads))
         self.dropout_probability = float(dropout)
-        self.conditioning_style = validate_gipo_conditioning_style(
+        self.conditioning_style = validate_canonical_conditioning_style(
             {"conditioning_style": conditioning_style},
         )
         self.teacher_metric_targets = validate_teacher_metric_target_keys(teacher_metric_targets)
@@ -1331,7 +1331,7 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
         self.hidden_layers = int(hidden_layers)
         self.attention_heads = validate_gipo_attention_heads(int(attention_heads))
         self.dropout_probability = float(dropout)
-        self.conditioning_style = validate_gipo_conditioning_style(
+        self.conditioning_style = validate_canonical_conditioning_style(
             {"conditioning_style": conditioning_style},
         )
         condition_dim = int(setting_dim) + int(context_dim)
@@ -1409,7 +1409,7 @@ def build_gipo_teacher_model(
 ) -> nn.Module:
     validate_gipo_architecture(architecture, role="teacher")
     cfg = dict(model_config or {})
-    conditioning_style = validate_gipo_conditioning_style(
+    conditioning_style = validate_canonical_conditioning_style(
         cfg,
     )
     validate_series_conditioning(cfg.get("series_conditioning"))
@@ -1443,7 +1443,7 @@ def build_gipo_student_model(
 ) -> nn.Module:
     validate_gipo_architecture(architecture, role="student")
     cfg = dict(model_config or {})
-    conditioning_style = validate_gipo_conditioning_style(
+    conditioning_style = validate_canonical_conditioning_style(
         cfg,
     )
     validate_series_conditioning(cfg.get("series_conditioning"))
