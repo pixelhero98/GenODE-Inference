@@ -55,8 +55,8 @@ class GIPOCanonicalTests(unittest.TestCase):
         reference = uniform_reference_grid(64)
         source_grid = (0.0, 0.25, 0.5, 1.0)
 
-        mass = grid_to_density_mass(source_grid, reference_grid=reference)
-        reconstructed = density_mass_to_time_grid(mass, reference_grid=reference, macro_steps=3)
+        mass = grid_to_density_mass(source_grid, reference_time_grid=reference)
+        reconstructed = density_mass_to_time_grid(mass, reference_time_grid=reference, macro_steps=3)
         metadata = density_metadata(reference)
 
         self.assertEqual(len(mass), 64)

@@ -54,10 +54,11 @@ z = additive_mlp_v1(z_inputs)
 ```
 
 The canonical teacher is `density_form_transformer_v1`. It attends over ordered
-density-bin tokens and predicts a metric utility vector. Default forecast utility
-columns are `u_crps_uniform,u_mase_uniform`, and custom tasks can provide their
-own utility columns through `--teacher_metric_target_keys` plus
-`--teacher_utility_weights`. Larger utility must mean better downstream
+density-bin tokens and predicts a metric utility vector. It is trained with a
+pairwise rank objective plus Huber regression on the selected utility targets.
+Default forecast utility columns are `u_crps_uniform,u_mase_uniform`, and custom
+tasks can provide their own utility columns through `--teacher_metric_target_keys`
+plus `--teacher_utility_weights`. Larger utility must mean better downstream
 performance.
 
 The canonical student is `density_query_transformer_v1`. It builds one query
