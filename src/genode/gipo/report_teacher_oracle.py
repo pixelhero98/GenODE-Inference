@@ -71,6 +71,7 @@ from genode.gipo.report_locked_test import (
     _source_split_phase,
     _teacher_final_retrain_metadata,
     _validate_context_rows,
+    _validate_density_bin_count,
 )
 from genode.gipo.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
 from genode.gipo.train_gipo import _load_schedule_summary_grids
@@ -119,6 +120,7 @@ def _load_teacher_checkpoint(
     density_meta = dict(payload.get("density_representation", {}))
     if str(density_meta.get("density_protocol", "")) != DENSITY_PROTOCOL:
         raise ValueError("GIPO teacher checkpoint is missing density_mass_v1 metadata.")
+    _validate_density_bin_count(payload, density_meta, role="teacher")
     reference_time_grid = tuple(float(x) for x in density_meta["reference_time_grid"])
     setting_feature_mode = validate_setting_feature_mode(str(payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3)))
     setting_encoder_config = setting_encoder_config_from_payload(

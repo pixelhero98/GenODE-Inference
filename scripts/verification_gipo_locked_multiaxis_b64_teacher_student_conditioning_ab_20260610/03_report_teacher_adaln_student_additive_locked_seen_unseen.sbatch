@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=genode_gipo_ckpt_report
+#SBATCH --job-name=genode_gipo_tada_sadd_report
 #SBATCH --partition=hopper
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -12,18 +12,18 @@
 
 set -euo pipefail
 
+RUN_ID=teacher_adaln_student_additive_locked_b64_normregret_final
+REPORT_LABEL_PREFIX=teacher_adaln_student_additive_b64_normregret_final
 SELECTION_MODE=weighted_normalized_regret_v1
 
 GENODE_REPO=${GENODE_REPO:?Set GENODE_REPO to the GenODE-Inference repository path}
 GENODE_ENV_DIR=${GENODE_ENV_DIR:?Set GENODE_ENV_DIR to the Python environment path}
-GENODE_OTFLOW_TRAIN_STEPS=${GENODE_OTFLOW_TRAIN_STEPS:?Set GENODE_OTFLOW_TRAIN_STEPS to the backbone maturity step budget}
-GENODE_BUDGET_LABEL=${GENODE_BUDGET_LABEL:-$((GENODE_OTFLOW_TRAIN_STEPS / 1000))k}
 GENODE_ROOT=${GENODE_ROOT:?Set GENODE_ROOT to this run output root}
-RUN_ID=${RUN_ID:-additive_locked_b64_normregret_ckpt${GENODE_BUDGET_LABEL}}
-REPORT_LABEL_PREFIX=${REPORT_LABEL_PREFIX:-additive_b64_normregret_ckpt${GENODE_BUDGET_LABEL}}
+GENODE_SOURCE_ROOT=${GENODE_SOURCE_ROOT:?Set GENODE_SOURCE_ROOT to the validated artifact source root}
 GENODE_DATASET_ROOT=${GENODE_DATASET_ROOT:?Set GENODE_DATASET_ROOT to the dataset root}
 GENODE_BACKBONE_MANIFEST=${GENODE_BACKBONE_MANIFEST:?Set GENODE_BACKBONE_MANIFEST to backbone_manifest.json}
 GENODE_SHARED_BACKBONE_ROOT=${GENODE_SHARED_BACKBONE_ROOT:?Set GENODE_SHARED_BACKBONE_ROOT to the backbone output root}
+GENODE_OTFLOW_TRAIN_STEPS=${GENODE_OTFLOW_TRAIN_STEPS:-20000}
 GENODE_DATASET=${GENODE_DATASET:-solar_energy_10m}
 GENODE_SOLVERS=${GENODE_SOLVERS:-euler,heun,midpoint_rk2,dpmpp2m}
 GENODE_SEEDS=${GENODE_SEEDS:-0,1,2}
@@ -33,6 +33,8 @@ GENODE_NUM_EVAL_SAMPLES=${GENODE_NUM_EVAL_SAMPLES:-5}
 GENODE_FORECAST_EVAL_BATCH_SIZE=${GENODE_FORECAST_EVAL_BATCH_SIZE:-64}
 
 mkdir -p "${GENODE_ROOT}/logs" "${GENODE_ROOT}/locked_reports"
+ln -sfn "${GENODE_SOURCE_ROOT}/artifacts" "${GENODE_ROOT}/artifacts"
+ln -sfn "${GENODE_SOURCE_ROOT}/standard_inputs" "${GENODE_ROOT}/standard_inputs"
 
 source "${GENODE_ENV_DIR}/bin/activate"
 cd "${GENODE_REPO}"
@@ -40,13 +42,21 @@ export PYTHONPATH="${GENODE_REPO}/src"
 export PYTHONDONTWRITEBYTECODE=1
 
 python -m compileall -q src tests scripts
-python scripts/verification_gipo_locked_multiaxis_b64_checkpoint_maturity_20260608/validate_locked_artifacts.py \
+python scripts/verification_gipo_locked_multiaxis_b64_teacher_student_conditioning_ab_20260610/validate_locked_artifacts.py \
   --root "${GENODE_ROOT}" \
   --validate
 
+SELECTION_MODE="${SELECTION_MODE}" python - <<'PY'
+import os
+from genode.gipo.policy import validate_teacher_checkpoint_selection_mode
+
+validate_teacher_checkpoint_selection_mode(os.environ["SELECTION_MODE"])
+PY
+
 RUN_DIR="${GENODE_ROOT}/policy_runs/${RUN_ID}"
-if [[ ! -f "${RUN_DIR}/final_retrain_metadata.json" ]]; then
-  echo "Missing final-retrain metadata under ${RUN_DIR}" >&2
+FINAL_RETRAIN_METADATA="${RUN_DIR}/final_retrain_metadata.json"
+if [[ ! -f "${FINAL_RETRAIN_METADATA}" ]]; then
+  echo "Missing final-retrain metadata: ${FINAL_RETRAIN_METADATA}" >&2
   exit 1
 fi
 
@@ -59,8 +69,25 @@ report_panel() {
   local ser_rows="${GENODE_ROOT}/standard_inputs/${panel}/ser_locked/ser_locked_context_rows.csv"
   local student_out="${GENODE_ROOT}/locked_reports/${panel}/student/${RUN_ID}"
 
+  local common_report_args=(
+    --dataset "${GENODE_DATASET}"
+    --dataset_root "${GENODE_DATASET_ROOT}"
+    --shared_backbone_root "${GENODE_SHARED_BACKBONE_ROOT}"
+    --backbone_manifest "${GENODE_BACKBONE_MANIFEST}"
+    --output_root "${GENODE_ROOT}"
+    --otflow_train_steps "${GENODE_OTFLOW_TRAIN_STEPS}"
+    --device auto
+    --seeds "${GENODE_SEEDS}"
+    --solver_names "${GENODE_SOLVERS}"
+    --target_nfe_values "${nfes}"
+    --num_eval_samples "${GENODE_NUM_EVAL_SAMPLES}"
+    --forecast_eval_batch_size "${GENODE_FORECAST_EVAL_BATCH_SIZE}"
+    --baseline_rows "${fixed_rows}"
+    --comparator_rows "${ser_rows}"
+  )
+
   if [[ -f "${student_out}/locked_test_gipo_policy_summary.json" ]]; then
-    echo "Skipping existing ${panel} locked ${RUN_ID} student report"
+    echo "Skipping existing ${panel} locked teacher-AdaLN student-additive b64 student report"
   else
     python -m genode.gipo.report_locked_test \
       --gipo_student_checkpoint "${RUN_DIR}/gipo_student.pt" \
@@ -70,22 +97,10 @@ report_panel() {
       --split_phase locked_test \
       --selection_mode reporting \
       --require_teacher_checkpoint_selection_mode "${SELECTION_MODE}" \
+      --allow_noncanonical_conditioning \
       --report_label "${panel}_locked_${REPORT_LABEL_PREFIX}" \
       --out_dir "${student_out}" \
-      --dataset "${GENODE_DATASET}" \
-      --dataset_root "${GENODE_DATASET_ROOT}" \
-      --shared_backbone_root "${GENODE_SHARED_BACKBONE_ROOT}" \
-      --backbone_manifest "${GENODE_BACKBONE_MANIFEST}" \
-      --output_root "${GENODE_ROOT}" \
-      --otflow_train_steps "${GENODE_OTFLOW_TRAIN_STEPS}" \
-      --device auto \
-      --seeds "${GENODE_SEEDS}" \
-      --solver_names "${GENODE_SOLVERS}" \
-      --target_nfe_values "${nfes}" \
-      --num_eval_samples "${GENODE_NUM_EVAL_SAMPLES}" \
-      --forecast_eval_batch_size "${GENODE_FORECAST_EVAL_BATCH_SIZE}" \
-      --baseline_rows "${fixed_rows}" \
-      --comparator_rows "${ser_rows}"
+      "${common_report_args[@]}"
   fi
 }
 

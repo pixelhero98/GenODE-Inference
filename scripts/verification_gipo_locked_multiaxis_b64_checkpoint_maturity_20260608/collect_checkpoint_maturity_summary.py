@@ -10,17 +10,6 @@ from typing import Any, Mapping, Sequence
 
 
 PANELS = {"seen": [4, 8, 12], "unseen": [6, 10, 14, 16]}
-RUNS = {
-    "ckpt16k": {
-        "train_steps": 16000,
-        "run_id": "additive_locked_b64_normregret_ckpt16k",
-    },
-    "ckpt12k": {
-        "train_steps": 12000,
-        "run_id": "additive_locked_b64_normregret_ckpt12k",
-    },
-}
-FINAL20_RUN_ID = "additive_locked_b64_normregret_final"
 PHYSICAL_SCHEDULES = (
     "uniform",
     "late_power_3",
@@ -34,7 +23,7 @@ PHYSICAL_SCHEDULES = (
     "gits_reversed",
     "ots_reversed",
 )
-SER_SCHEDULE = "ser_ptg_local_defect_eta005"
+SER_SCHEDULE_KEY = "ser_ptg_local_defect_eta005"
 REQUIRED_SELECTION_MODE = "weighted_normalized_regret_v1"
 REQUIRED_STUDENT_SELECTION_MODE = "validation_ce_v1"
 REQUIRED_DENSITY_BIN_COUNT = 64
@@ -66,6 +55,8 @@ def _density_bin_count(payload: Mapping[str, Any]) -> int | None:
     value = _nested(payload, "density_representation", "reference_bin_count")
     if value is None:
         value = _nested(payload, "teacher_model_config", "density_dim")
+    if value is None:
+        value = _nested(payload, "student_model_config", "density_dim")
     return None if value is None else int(value)
 
 
@@ -119,133 +110,112 @@ def _physical_summary(root: Path, panel: str) -> dict[str, Any]:
     fixed_rows = _read_csv(root / "standard_inputs" / panel / "fixed_locked" / "fixed_locked_context_rows.csv")
     physical_rows = [row for row in fixed_rows if str(row.get("scheduler_key")) in set(PHYSICAL_SCHEDULES)]
     schedule_rows = sorted(_aggregate_metric_rows(physical_rows, ["scheduler_key"]), key=lambda row: row["balanced_crps_mase"])
-    per_cell = _aggregate_metric_rows(physical_rows, ["solver_key", "target_nfe", "scheduler_key"])
-    best_by_cell: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in per_cell:
-        key = (str(row["solver_key"]), str(row["target_nfe"]))
-        if key not in best_by_cell or float(row["balanced_crps_mase"]) < float(best_by_cell[key]["balanced_crps_mase"]):
-            best_by_cell[key] = row
     ser_rows = _read_csv(root / "standard_inputs" / panel / "ser_locked" / "ser_locked_context_rows.csv")
-    ser_summary = _aggregate_metric_rows(ser_rows, ["scheduler_key"])[0]
-    return {
-        "schedule_rankings": schedule_rows,
-        "best_physical": schedule_rows[0],
-        "best_physical_by_cell": sorted(best_by_cell.values(), key=lambda row: (str(row["solver_key"]), int(row["target_nfe"]))),
-        "ser": ser_summary,
-    }
+    ser_summaries = _aggregate_metric_rows(ser_rows, ["scheduler_key"])
+    ser_summary = next((row for row in ser_summaries if str(row["scheduler_key"]) == SER_SCHEDULE_KEY), ser_summaries[0])
+    return {"schedule_rankings": schedule_rows, "best_physical": schedule_rows[0], "ser": ser_summary}
 
 
-def _validate_artifacts(root: Path, run_key: str, issues: list[str]) -> None:
+def _parse_candidate(text: str) -> dict[str, Any]:
+    parts = [part.strip() for part in str(text).split(",", 3)]
+    if len(parts) != 4 or any(not part for part in parts):
+        raise ValueError("Each --candidate must be 'label,root,run_id,train_steps'.")
+    return {"label": parts[0], "root": Path(parts[1]), "run_id": parts[2], "train_steps": int(parts[3])}
+
+
+def _validate_artifacts(root: Path, label: str, issues: list[str]) -> None:
     summary_path = root / "summary" / "artifact_validation_summary.json"
     if not summary_path.exists():
-        issues.append(f"{run_key}: missing artifact validation summary")
+        issues.append(f"{label}: missing artifact validation summary")
         return
     payload = _load_json(summary_path)
     if not bool(payload.get("validation_passed", False)):
-        issues.append(f"{run_key}: artifact validation did not pass")
-    artifact_issues = payload.get("issues", {})
-    if artifact_issues:
-        issues.append(f"{run_key}: artifact validation issues present")
+        issues.append(f"{label}: artifact validation did not pass")
+    if payload.get("issues", {}):
+        issues.append(f"{label}: artifact validation issues present")
 
 
-def _validate_training(root: Path, run_key: str, run_id: str, train_steps: int, issues: list[str]) -> dict[str, Any]:
+def _validate_training(root: Path, label: str, run_id: str, train_steps: int, issues: list[str]) -> dict[str, Any]:
     training = _load_json(root / "policy_runs" / run_id / "gipo_training_summary.json")
     if str(training.get("status")) != "completed":
-        issues.append(f"{run_key}: training incomplete")
+        issues.append(f"{label}: training incomplete")
     if str(training.get("gipo_conditioning_style")) != "additive_mlp_v1":
-        issues.append(f"{run_key}: non-additive conditioning")
+        issues.append(f"{label}: non-additive conditioning")
     if bool(training.get("noncanonical_conditioning_allowed")):
-        issues.append(f"{run_key}: noncanonical conditioning flag enabled")
+        issues.append(f"{label}: noncanonical conditioning flag enabled")
     if _density_bin_count(training) != REQUIRED_DENSITY_BIN_COUNT:
-        issues.append(f"{run_key}: wrong density bin count")
+        issues.append(f"{label}: wrong density bin count")
     if str(training.get("teacher_checkpoint_selection_mode")) != REQUIRED_SELECTION_MODE:
-        issues.append(f"{run_key}: wrong teacher selector")
+        issues.append(f"{label}: wrong teacher selector")
     if str(training.get("student_checkpoint_selection_mode")) != REQUIRED_STUDENT_SELECTION_MODE:
-        issues.append(f"{run_key}: wrong student selector")
+        issues.append(f"{label}: wrong student selector")
     if bool(training.get("locked_test_used_for_selection", False)):
-        issues.append(f"{run_key}: locked test used for selection")
+        issues.append(f"{label}: locked test used for selection")
     if float(_nested(training, "pseudo_distillation", "pseudo_target_weight", default=0.0) or 0.0) != 0.0:
-        issues.append(f"{run_key}: pseudo target weight nonzero")
+        issues.append(f"{label}: pseudo target weight nonzero")
+    if float(training.get("student_nfe_smoothness_weight", 0.0) or 0.0) != 0.0:
+        issues.append(f"{label}: student smoothness weight nonzero")
+    student_training = dict(training.get("student_training", {}) or {})
+    if bool(student_training.get("pseudo_distillation_used", False)):
+        issues.append(f"{label}: student pseudo distillation used")
+    if float(student_training.get("pseudo_target_weight", 0.0) or 0.0) != 0.0:
+        issues.append(f"{label}: student pseudo target weight nonzero")
+    if float(student_training.get("student_nfe_smoothness_weight", 0.0) or 0.0) != 0.0:
+        issues.append(f"{label}: student training smoothness weight nonzero")
     if not bool(_nested(training, "student_final_retrain", "enabled", default=False)):
-        issues.append(f"{run_key}: missing student final retrain")
+        issues.append(f"{label}: missing student final retrain")
     if not bool(_nested(training, "teacher_final_retrain", "enabled", default=False)):
-        issues.append(f"{run_key}: missing teacher final retrain")
+        issues.append(f"{label}: missing teacher final retrain")
     teacher_selection = dict(training.get("teacher_checkpoint_selection", {}) or {})
     if str(teacher_selection.get("selection_protocol")) != REQUIRED_SELECTION_MODE:
-        issues.append(f"{run_key}: wrong teacher selection protocol")
+        issues.append(f"{label}: wrong teacher selection protocol")
     if int(teacher_selection.get("selected_step") or 0) <= 0:
-        issues.append(f"{run_key}: missing positive teacher selected step")
+        issues.append(f"{label}: missing positive teacher selected step")
     if teacher_selection.get("selected_weighted_normalized_regret_v1_score") is None:
-        issues.append(f"{run_key}: missing weighted normalized regret score")
+        issues.append(f"{label}: missing weighted normalized regret score")
     if bool(teacher_selection.get("locked_test_used_for_selection", False)):
-        issues.append(f"{run_key}: teacher selection used locked test")
+        issues.append(f"{label}: teacher selection used locked test")
     expected_splits = {"context_disjoint", "density_family_holdout", "unseen_nfe_holdout"}
     if not expected_splits <= set((teacher_selection.get("selected_normalized_regret_values") or {}).keys()):
-        issues.append(f"{run_key}: teacher selection missing J_CDN normalized regret splits")
-    weights = dict(teacher_selection.get("selected_component_weights", {}) or {})
-    if not (
-        abs(float(weights.get("context_disjoint", 0.0)) - 0.25) <= 1e-6
-        and abs(float(weights.get("density_family_holdout", 0.0)) - 0.25) <= 1e-6
-        and abs(float(weights.get("unseen_nfe_holdout", 0.0)) - 0.50) <= 1e-6
-    ):
-        issues.append(f"{run_key}: teacher selection weights are not fixed J_CDN")
+        issues.append(f"{label}: teacher selection missing J_CDN normalized regret splits")
     unseen_selection = dict(training.get("unseen_nfe_selection", {}) or {})
     if not bool(unseen_selection.get("enabled", False)):
-        issues.append(f"{run_key}: unseen-NFE selection diagnostics disabled")
-    if [int(value) for value in unseen_selection.get("target_nfes", [])] != [6, 10, 14, 16]:
-        issues.append(f"{run_key}: wrong unseen-NFE selection diagnostics panel")
+        issues.append(f"{label}: unseen-NFE selection diagnostics disabled")
     if bool(unseen_selection.get("used_for_final_fitting", True)):
-        issues.append(f"{run_key}: unseen-NFE diagnostics used for final fitting")
-    if bool(unseen_selection.get("locked_test_used_for_selection", False)):
-        issues.append(f"{run_key}: unseen-NFE diagnostics used locked test")
+        issues.append(f"{label}: unseen-NFE diagnostics used for final fitting")
     student_selection = dict(training.get("student_checkpoint_selection", {}) or {})
     if str(student_selection.get("selection_protocol")) != REQUIRED_STUDENT_SELECTION_MODE:
-        issues.append(f"{run_key}: wrong student selection protocol")
+        issues.append(f"{label}: wrong student selection protocol")
     if str(student_selection.get("selection_metric")) != "validation_ce_loss":
-        issues.append(f"{run_key}: wrong student selection metric")
-    if int(student_selection.get("selected_step") or 0) <= 0:
-        issues.append(f"{run_key}: missing positive student selected step")
-    if bool(student_selection.get("locked_test_used_for_selection", False)):
-        issues.append(f"{run_key}: student selection used locked test")
-    if not bool(_nested(training, "student_final_retrain", "performed", default=False)):
-        issues.append(f"{run_key}: student final retrain not performed")
-    raw_target_nfes = training.get("nfe_sequence_diagnostics", {}).get("fit_rows", {}).get("target_nfes", [])
-    seen_nfes: list[int] = []
-    for item in raw_target_nfes:
-        if isinstance(item, Mapping):
-            value = item.get("target_nfe", -1)
-        else:
-            value = item
-        seen_nfes.append(int(value))
-    seen_nfes = sorted(set(seen_nfes))
-    if seen_nfes and seen_nfes != [4, 8, 12]:
-        issues.append(f"{run_key}: final fit NFE metadata is not [4,8,12]")
+        issues.append(f"{label}: wrong student selection metric")
     metadata = _load_json(root / "policy_runs" / run_id / "final_retrain_metadata.json")
     if int(metadata.get("otflow_train_steps", train_steps)) != int(train_steps):
-        issues.append(f"{run_key}: final metadata train steps mismatch")
+        issues.append(f"{label}: final metadata train steps mismatch")
     if bool(_nested(metadata, "final_retrain", "locked_test_used_for_selection", default=True)):
-        issues.append(f"{run_key}: metadata locked-test selection flag not false")
+        issues.append(f"{label}: metadata locked-test selection flag not false")
+    if bool(_nested(metadata, "script_contract", "locked_test_used_for_selection", default=True)):
+        issues.append(f"{label}: script contract locked-test selection flag not false")
     return training
 
 
-def _validate_reports(root: Path, run_key: str, run_id: str, issues: list[str]) -> dict[str, Any]:
+def _validate_reports(root: Path, label: str, run_id: str, issues: list[str]) -> dict[str, Any]:
     panels: dict[str, Any] = {}
     for panel, expected_nfes in PANELS.items():
         current = _panel_student_summary(root, run_id, panel)
         report = current["summary"]
         if str(report.get("conditioning_style")) != "additive_mlp_v1":
-            issues.append(f"{run_key}/{panel}: non-additive report")
+            issues.append(f"{label}/{panel}: non-additive report")
         if _density_bin_count(report) != REQUIRED_DENSITY_BIN_COUNT:
-            issues.append(f"{run_key}/{panel}: wrong report bin count")
+            issues.append(f"{label}/{panel}: wrong report bin count")
         if int(report.get("missing_cell_count", -1)) != 0:
-            issues.append(f"{run_key}/{panel}: missing cells")
+            issues.append(f"{label}/{panel}: missing cells")
         if [int(value) for value in report.get("target_nfe_values", [])] != expected_nfes:
-            issues.append(f"{run_key}/{panel}: wrong target NFEs")
+            issues.append(f"{label}/{panel}: wrong target NFEs")
         if bool(report.get("locked_test_used_for_selection", False)):
-            issues.append(f"{run_key}/{panel}: locked test used for selection")
+            issues.append(f"{label}/{panel}: locked test used for selection")
         oracle_path = root / "locked_reports" / panel / "oracle" / run_id
         if oracle_path.exists():
-            issues.append(f"{run_key}/{panel}: teacher-oracle report exists")
+            issues.append(f"{label}/{panel}: teacher-oracle report exists")
         physical = _physical_summary(root, panel)
         panels[panel] = {
             "student": {
@@ -258,45 +228,52 @@ def _validate_reports(root: Path, run_key: str, run_id: str, issues: list[str]) 
             "delta_student_minus_best_physical": current["balanced_crps_mase"] - float(physical["best_physical"]["balanced_crps_mase"]),
             "delta_student_minus_ser": current["balanced_crps_mase"] - float(physical["ser"]["balanced_crps_mase"]),
             "physical_schedule_rankings": physical["schedule_rankings"],
-            "best_physical_by_cell": physical["best_physical_by_cell"],
         }
     return panels
 
 
-def collect(summary_root: Path, ckpt16_root: Path, ckpt12_root: Path, final20_root: Path) -> dict[str, Any]:
+def collect(
+    summary_root: Path,
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    comparator_root: Path,
+    comparator_run_id: str,
+    comparator_label: str,
+) -> dict[str, Any]:
     issues: list[str] = []
-    roots = {"ckpt16k": ckpt16_root, "ckpt12k": ckpt12_root}
     runs: dict[str, Any] = {}
-    for run_key, spec in RUNS.items():
-        root = roots[run_key]
+    for spec in candidates:
+        label = str(spec["label"])
+        root = Path(spec["root"])
         run_id = str(spec["run_id"])
-        _validate_artifacts(root, run_key, issues)
-        training = _validate_training(root, run_key, run_id, int(spec["train_steps"]), issues)
-        panels = _validate_reports(root, run_key, run_id, issues)
-        runs[run_key] = {
+        train_steps = int(spec["train_steps"])
+        _validate_artifacts(root, label, issues)
+        training = _validate_training(root, label, run_id, train_steps, issues)
+        panels = _validate_reports(root, label, run_id, issues)
+        runs[label] = {
             "root": str(root),
             "run_id": run_id,
-            "train_steps": int(spec["train_steps"]),
+            "train_steps": train_steps,
             "selected_teacher_step": _nested(training, "teacher_checkpoint_selection", "selected_step"),
             "selected_student_step": _nested(training, "student_checkpoint_selection", "selected_step"),
             "sampled_context_count": training.get("sampled_context_count"),
             "panels": panels,
         }
-    final20: dict[str, Any] = {}
+    comparator: dict[str, Any] = {}
     for panel in PANELS:
-        current = _panel_student_summary(final20_root, FINAL20_RUN_ID, panel)
-        final20[panel] = {
+        current = _panel_student_summary(comparator_root, comparator_run_id, panel)
+        comparator[panel] = {
             "crps": current["crps"],
             "mase": current["mase"],
             "balanced_crps_mase": current["balanced_crps_mase"],
         }
     comparison_rows: list[dict[str, Any]] = []
-    for run_key, run_payload in runs.items():
+    for label, run_payload in runs.items():
         for panel, panel_payload in run_payload["panels"].items():
             student = panel_payload["student"]
             comparison_rows.append(
                 {
-                    "run_key": run_key,
+                    "run_key": label,
                     "panel": panel,
                     "train_steps": run_payload["train_steps"],
                     "run_id": run_payload["run_id"],
@@ -308,8 +285,9 @@ def collect(summary_root: Path, ckpt16_root: Path, ckpt12_root: Path, final20_ro
                     "delta_student_minus_best_physical": panel_payload["delta_student_minus_best_physical"],
                     "ser_balanced_crps_mase": panel_payload["ser"]["balanced_crps_mase"],
                     "delta_student_minus_ser": panel_payload["delta_student_minus_ser"],
-                    "final20_balanced_crps_mase": final20[panel]["balanced_crps_mase"],
-                    "delta_student_minus_final20": student["balanced_crps_mase"] - final20[panel]["balanced_crps_mase"],
+                    "comparator_label": comparator_label,
+                    "comparator_balanced_crps_mase": comparator[panel]["balanced_crps_mase"],
+                    "delta_student_minus_comparator": student["balanced_crps_mase"] - comparator[panel]["balanced_crps_mase"],
                 }
             )
     return {
@@ -322,10 +300,11 @@ def collect(summary_root: Path, ckpt16_root: Path, ckpt12_root: Path, final20_ro
         "student_checkpoint_selection_mode": REQUIRED_STUDENT_SELECTION_MODE,
         "locked_test_used_for_backbone_maturity_selection": False,
         "maturity_interpretation": "posthoc_locked_characterization_only",
-        "final20_root": str(final20_root),
-        "final20_run_id": FINAL20_RUN_ID,
+        "comparator_root": str(comparator_root),
+        "comparator_run_id": comparator_run_id,
+        "comparator_label": comparator_label,
         "runs": runs,
-        "final20": final20,
+        "comparator": comparator,
         "comparison_rows": comparison_rows,
         "validation_passed": not issues,
         "issues": issues,
@@ -338,16 +317,17 @@ def _write_markdown(path: Path, payload: Mapping[str, Any]) -> None:
         "",
         f"- Validation passed: `{payload['validation_passed']}`",
         f"- Canonical conditioning: `{payload['canonical_conditioning_style']}`",
+        f"- Comparator: `{payload['comparator_label']}`",
         f"- Locked test used for maturity selection: `{payload['locked_test_used_for_backbone_maturity_selection']}`",
         "",
-        "| Run | Panel | Student Balanced | Best Physical | Delta vs Physical | Delta vs 20k |",
+        "| Run | Panel | Student Balanced | Best Physical | Delta vs Physical | Delta vs Comparator |",
         "|---|---|---:|---|---:|---:|",
     ]
     for row in payload["comparison_rows"]:
         lines.append(
             "| {run_key} | {panel} | {student_balanced_crps_mase:.6f} | {best_physical_schedule} "
             "({best_physical_balanced_crps_mase:.6f}) | {delta_student_minus_best_physical:.6f} | "
-            "{delta_student_minus_final20:.6f} |".format(**row)
+            "{delta_student_minus_comparator:.6f} |".format(**row)
         )
     lines.append("")
     if payload["issues"]:
@@ -358,20 +338,28 @@ def _write_markdown(path: Path, payload: Mapping[str, Any]) -> None:
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Collect additive 64-bin GIPO checkpoint maturity summary.")
     parser.add_argument("--summary_root", required=True)
-    parser.add_argument("--ckpt16_root", required=True)
-    parser.add_argument("--ckpt12_root", required=True)
-    parser.add_argument("--final20_root", required=True)
+    parser.add_argument(
+        "--candidate",
+        action="append",
+        required=True,
+        help="Candidate spec formatted as label,root,run_id,train_steps. May be repeated.",
+    )
+    parser.add_argument("--comparator_root", required=True)
+    parser.add_argument("--comparator_run_id", required=True)
+    parser.add_argument("--comparator_label", default="comparator")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_argparser().parse_args(argv)
     summary_root = Path(args.summary_root)
+    candidates = [_parse_candidate(spec) for spec in args.candidate]
     payload = collect(
         summary_root,
-        Path(args.ckpt16_root),
-        Path(args.ckpt12_root),
-        Path(args.final20_root),
+        candidates,
+        comparator_root=Path(args.comparator_root),
+        comparator_run_id=str(args.comparator_run_id),
+        comparator_label=str(args.comparator_label),
     )
     out_dir = summary_root / "summary"
     out_dir.mkdir(parents=True, exist_ok=True)

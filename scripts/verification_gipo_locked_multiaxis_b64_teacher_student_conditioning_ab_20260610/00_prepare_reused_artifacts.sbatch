@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=genode_gipo_b64final_prepare
+#SBATCH --job-name=genode_gipo_tscond_prepare
 #SBATCH --partition=hopper
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -26,6 +26,6 @@ export PYTHONPATH="${GENODE_REPO}/src"
 export PYTHONDONTWRITEBYTECODE=1
 
 python -m compileall -q src tests scripts
-python scripts/verification_gipo_locked_multiaxis_b64_final_ab_20260607/validate_locked_artifacts.py \
+python scripts/verification_gipo_locked_multiaxis_b64_teacher_student_conditioning_ab_20260610/validate_locked_artifacts.py \
   --root "${GENODE_ROOT}" \
   --validate

@@ -7,8 +7,8 @@
 #SBATCH --mem=96G
 #SBATCH --gpus=1
 #SBATCH --time=24:00:00
-#SBATCH --output=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_final_ab_20260607/logs/%x.%j.out
-#SBATCH --error=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_final_ab_20260607/logs/%x.%j.err
+#SBATCH --output=slurm-%x.%j.out
+#SBATCH --error=slurm-%x.%j.err
 
 set -euo pipefail
 
@@ -20,10 +20,10 @@ CRPS_WEIGHT=0.50
 MASE_WEIGHT=0.50
 DENSITY_BIN_COUNT=64
 
-GENODE_REPO=${GENODE_REPO:-/scratch/b35z/pixelhero.b35z/genode/exec/genode_gipo_locked_multiaxis_b64_final_ab_src_20260607}
-GENODE_ENV_DIR=${GENODE_ENV_DIR:-/projects/b35z/genode/envs/genode-py311}
-GENODE_ROOT=${GENODE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_final_ab_20260607}
-GENODE_SOURCE_ROOT=${GENODE_SOURCE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_additive_locked_multiaxis_20260606}
+GENODE_REPO=${GENODE_REPO:?Set GENODE_REPO to the GenODE-Inference repository path}
+GENODE_ENV_DIR=${GENODE_ENV_DIR:?Set GENODE_ENV_DIR to the Python environment path}
+GENODE_ROOT=${GENODE_ROOT:?Set GENODE_ROOT to this run output root}
+GENODE_SOURCE_ROOT=${GENODE_SOURCE_ROOT:?Set GENODE_SOURCE_ROOT to the validated artifact source root}
 GENODE_SUPPORT_KEYS=${GENODE_SUPPORT_KEYS:-uniform,late_power_3,flowts_power_sampling,ays,gits,ots,late_power_3_reversed,flowts_power_sampling_reversed,ays_reversed,gits_reversed,ots_reversed,ser_ptg_local_defect_eta005}
 GENODE_CONTEXT_SAMPLE_COUNT=${GENODE_CONTEXT_SAMPLE_COUNT:-256}
 GENODE_TEACHER_STEPS=${GENODE_TEACHER_STEPS:-500}
@@ -57,22 +57,10 @@ require_train_capability() {
     exit 2
   fi
 }
-require_train_capability "${SELECTION_MODE}"
 require_train_capability "--teacher_loss_log_every"
 require_train_capability "--student_log_every"
 require_train_capability "--student_checkpoint_every"
 require_train_capability "--teacher_unseen_selection_rows_csv"
-if grep -q -- "--student_checkpoint_selection" <<< "${TRAIN_HELP}"; then
-  STUDENT_SELECTOR_ARGS=(--student_checkpoint_selection "${STUDENT_SELECTOR_MODE}")
-elif grep -q -- "--student_selector_mode" <<< "${TRAIN_HELP}"; then
-  STUDENT_SELECTOR_ARGS=(--student_selector_mode "${STUDENT_SELECTOR_MODE}")
-elif grep -q -- "--student_checkpoint_selection_mode" <<< "${TRAIN_HELP}"; then
-  STUDENT_SELECTOR_ARGS=(--student_checkpoint_selection_mode "${STUDENT_SELECTOR_MODE}")
-else
-  echo "genode.gipo.train_gipo does not expose a student selector mode flag." >&2
-  exit 2
-fi
-
 ROWS="${GENODE_ROOT}/artifacts/seen_train_supervision_rows.csv"
 EMBEDDINGS="${GENODE_ROOT}/artifacts/seen_train_context_embeddings.npz"
 SER_SUMMARY="${GENODE_ROOT}/standard_inputs/seen/ser_reference/ser_ptg_schedule_summary.json"
@@ -93,7 +81,6 @@ else
     --support_schedule_keys "${GENODE_SUPPORT_KEYS}" \
     --context_sample_count "${GENODE_CONTEXT_SAMPLE_COUNT}" \
     --context_holdout_fraction 0.20 \
-    --density_bin_count "${DENSITY_BIN_COUNT}" \
     --teacher_steps "${GENODE_TEACHER_STEPS}" \
     --teacher_checkpoint_every "${GENODE_TEACHER_CHECKPOINT_EVERY}" \
     --teacher_loss_log_every "${GENODE_TEACHER_LOG_EVERY}" \
@@ -101,8 +88,6 @@ else
     --student_log_every "${GENODE_STUDENT_LOG_EVERY}" \
     --student_checkpoint_every "${GENODE_STUDENT_CHECKPOINT_EVERY}" \
     --student_selection_holdout_fraction "${GENODE_STUDENT_SELECTION_HOLDOUT_FRACTION}" \
-    "${STUDENT_SELECTOR_ARGS[@]}" \
-    --teacher_checkpoint_selection_mode "${SELECTION_MODE}" \
     --teacher_selection_temperature 0.05 \
     --teacher_density_holdout_schedule_keys flowts_power_sampling,flowts_power_sampling_reversed \
     --teacher_unseen_selection_rows_csv "${UNSEEN_SELECTION_ROWS}" \

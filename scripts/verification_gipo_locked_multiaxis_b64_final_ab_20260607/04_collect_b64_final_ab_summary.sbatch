@@ -6,14 +6,14 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=16G
 #SBATCH --time=01:00:00
-#SBATCH --output=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_final_ab_20260607/logs/%x.%j.out
-#SBATCH --error=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_final_ab_20260607/logs/%x.%j.err
+#SBATCH --output=slurm-%x.%j.out
+#SBATCH --error=slurm-%x.%j.err
 
 set -euo pipefail
 
-GENODE_REPO=${GENODE_REPO:-/scratch/b35z/pixelhero.b35z/genode/exec/genode_gipo_locked_multiaxis_b64_final_ab_src_20260607}
-GENODE_ENV_DIR=${GENODE_ENV_DIR:-/projects/b35z/genode/envs/genode-py311}
-GENODE_ROOT=${GENODE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_final_ab_20260607}
+GENODE_REPO=${GENODE_REPO:?Set GENODE_REPO to the GenODE-Inference repository path}
+GENODE_ENV_DIR=${GENODE_ENV_DIR:?Set GENODE_ENV_DIR to the Python environment path}
+GENODE_ROOT=${GENODE_ROOT:?Set GENODE_ROOT to this run output root}
 
 mkdir -p "${GENODE_ROOT}/logs" "${GENODE_ROOT}/summary"
 

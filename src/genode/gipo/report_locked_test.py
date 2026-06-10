@@ -49,11 +49,11 @@ from genode.evaluation.otflow_evaluation_support import (
 from genode.runtime import ProgressBar, resolve_torch_device
 
 GIPO_SCHEDULE_KEY = "gipo"
+REQUIRED_GIPO_DENSITY_BIN_COUNT = 64
 SELECTION_MODE_REPORTING = "reporting"
 SELECTION_MODE_CALIBRATION = "calibration"
 CONTEXT_DISJOINT_PHASE = "context_disjoint"
-SERIES_DISJOINT_PHASE = "series_disjoint"
-CALIBRATION_HOLDOUT_PHASES = (CONTEXT_DISJOINT_PHASE, SERIES_DISJOINT_PHASE)
+CALIBRATION_HOLDOUT_PHASES = (CONTEXT_DISJOINT_PHASE,)
 SOURCE_SPLIT_PHASES = (TRAIN_TUNING_PHASE, VALIDATION_PHASE, LOCKED_TEST_PHASE)
 
 
@@ -89,6 +89,19 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(dict(row))
+
+
+def _validate_density_bin_count(payload: Mapping[str, Any], density_meta: Mapping[str, Any], *, role: str) -> None:
+    expected = REQUIRED_GIPO_DENSITY_BIN_COUNT
+    density_dim = int(payload.get("density_dim", -1))
+    reference_bin_count = int(density_meta.get("reference_bin_count", -1))
+    reference_grid = tuple(density_meta.get("reference_time_grid", ()))
+    if density_dim != expected or reference_bin_count != expected or len(reference_grid) != expected + 1:
+        raise ValueError(
+            f"GIPO {role} checkpoints require {expected} density bins; "
+            f"got density_dim={density_dim}, reference_bin_count={reference_bin_count}, "
+            f"reference_grid_len={len(reference_grid)}."
+        )
 
 
 def _source_split_phase(row: Mapping[str, Any]) -> str:
@@ -213,6 +226,7 @@ def _load_student_checkpoint(
     density_meta = dict(payload.get("density_representation", {}))
     if str(density_meta.get("density_protocol", "")) != "density_mass_v1":
         raise ValueError("GIPO student checkpoint is missing density_mass_v1 metadata.")
+    _validate_density_bin_count(payload, density_meta, role="student")
     teacher_training = dict(payload.get("teacher_training", {}) or {})
     teacher_training_meta = validate_gipo_teacher_training_metadata(teacher_training)
     teacher_metric_targets = teacher_training_meta["teacher_metric_targets"]
@@ -276,6 +290,75 @@ def _teacher_final_retrain_metadata(
         or training_summary.get("final_teacher_retrain")
         or {}
     )
+
+
+def _clean_metadata_string(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _first_metadata_string(*values: Any) -> str:
+    for value in values:
+        cleaned = _clean_metadata_string(value)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _model_conditioning_style(payload: Mapping[str, Any], config_key: str) -> str:
+    config = payload.get(config_key)
+    if not isinstance(config, Mapping):
+        return ""
+    return _clean_metadata_string(config.get("conditioning_style"))
+
+
+def _role_conditioning_style(payload: Mapping[str, Any], role: str) -> str:
+    styles = payload.get("conditioning_styles")
+    style_from_roles = ""
+    if isinstance(styles, Mapping):
+        style_from_roles = _clean_metadata_string(styles.get(role))
+    return _first_metadata_string(style_from_roles, payload.get(f"{role}_conditioning_style"))
+
+
+def _conditioning_pair_label(teacher_style: str, student_style: str) -> str:
+    if not teacher_style or not student_style:
+        return ""
+    if str(teacher_style) == str(student_style):
+        return str(student_style)
+    return f"teacher_{teacher_style}__student_{student_style}"
+
+
+def _conditioning_metadata_for_summary(
+    checkpoint_payload: Mapping[str, Any],
+    training_summary: Mapping[str, Any],
+) -> Dict[str, str]:
+    student_style = _first_metadata_string(
+        _role_conditioning_style(checkpoint_payload, "student"),
+        _model_conditioning_style(checkpoint_payload, "student_model_config"),
+        _role_conditioning_style(training_summary, "student"),
+        _model_conditioning_style(training_summary, "student_model_config"),
+    )
+    teacher_style = _first_metadata_string(
+        _role_conditioning_style(checkpoint_payload, "teacher"),
+        _model_conditioning_style(checkpoint_payload, "teacher_model_config"),
+        _role_conditioning_style(training_summary, "teacher"),
+        _model_conditioning_style(training_summary, "teacher_model_config"),
+    )
+    explicit_pair = _first_metadata_string(
+        checkpoint_payload.get("conditioning_pair"),
+        training_summary.get("conditioning_pair"),
+        checkpoint_payload.get("gipo_conditioning_style"),
+        training_summary.get("gipo_conditioning_style"),
+    )
+    derived_pair = _conditioning_pair_label(teacher_style, student_style)
+    metadata = {
+        "student_conditioning_style": student_style,
+        "conditioning_style": student_style,
+    }
+    if teacher_style:
+        metadata["teacher_conditioning_style"] = teacher_style
+    if explicit_pair or derived_pair:
+        metadata["conditioning_pair"] = explicit_pair or derived_pair
+    return metadata
 
 
 def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str) -> List[Dict[str, Any]]:
@@ -545,6 +628,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         else "gipo_student_calibration_report"
     )
     comparison_file = f"{output_prefix}_comparison_summary.json"
+    conditioning_metadata = _conditioning_metadata_for_summary(checkpoint_payload, training_summary)
     summary: Dict[str, Any] = {
         "artifact": artifact_name,
         "protocol": GIPO_PROTOCOL,
@@ -563,7 +647,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "mean_mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else None,
         "metric_means": _numeric_metric_means(aggregate_rows),
         "density_representation": checkpoint_payload.get("density_representation", {}),
-        "conditioning_style": dict(checkpoint_payload.get("student_model_config", {}) or {}).get("conditioning_style", ""),
+        **conditioning_metadata,
         "setting_feature_mode": checkpoint_payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3),
         "setting_encoder_mode": checkpoint_payload.get("setting_encoder_mode", ""),
         "setting_encoder_config": checkpoint_payload.get("setting_encoder_config", {}),
@@ -582,7 +666,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--training_summary", required=True)
     parser.add_argument("--context_rows", default="", help="Comma-separated context-row CSVs used to enumerate report contexts.")
     parser.add_argument("--context_embeddings_npz", default="", help="Context embedding table for --context_rows.")
-    parser.add_argument("--split_phase", default=LOCKED_TEST_PHASE, help="Report split label: locked_test, validation_tuning, train_tuning, context_disjoint, or series_disjoint.")
+    parser.add_argument("--split_phase", default=LOCKED_TEST_PHASE, help="Report split label: locked_test, validation_tuning, train_tuning, or context_disjoint.")
     parser.add_argument("--selection_mode", choices=(SELECTION_MODE_REPORTING, SELECTION_MODE_CALIBRATION), default=SELECTION_MODE_REPORTING)
     parser.add_argument("--require_teacher_checkpoint_selection_mode", default="")
     parser.add_argument(

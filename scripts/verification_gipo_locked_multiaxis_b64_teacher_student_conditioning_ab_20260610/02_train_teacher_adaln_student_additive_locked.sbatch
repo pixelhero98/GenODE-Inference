@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=genode_gipo_ckpt_train
+#SBATCH --job-name=genode_gipo_tada_sadd_train
 #SBATCH --partition=hopper
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -12,7 +12,9 @@
 
 set -euo pipefail
 
-CONDITIONING_STYLE=additive_mlp_v1
+RUN_ID=teacher_adaln_student_additive_locked_b64_normregret_final
+TEACHER_CONDITIONING_STYLE=adaln_zero_v1
+STUDENT_CONDITIONING_STYLE=additive_mlp_v1
 SELECTION_MODE=weighted_normalized_regret_v1
 STUDENT_SELECTOR_MODE=validation_ce_v1
 CRPS_WEIGHT=0.50
@@ -21,10 +23,8 @@ DENSITY_BIN_COUNT=64
 
 GENODE_REPO=${GENODE_REPO:?Set GENODE_REPO to the GenODE-Inference repository path}
 GENODE_ENV_DIR=${GENODE_ENV_DIR:?Set GENODE_ENV_DIR to the Python environment path}
-GENODE_OTFLOW_TRAIN_STEPS=${GENODE_OTFLOW_TRAIN_STEPS:?Set GENODE_OTFLOW_TRAIN_STEPS to the backbone maturity step budget}
-GENODE_BUDGET_LABEL=${GENODE_BUDGET_LABEL:-$((GENODE_OTFLOW_TRAIN_STEPS / 1000))k}
 GENODE_ROOT=${GENODE_ROOT:?Set GENODE_ROOT to this run output root}
-RUN_ID=${RUN_ID:-additive_locked_b64_normregret_ckpt${GENODE_BUDGET_LABEL}}
+GENODE_SOURCE_ROOT=${GENODE_SOURCE_ROOT:?Set GENODE_SOURCE_ROOT to the validated artifact source root}
 GENODE_SUPPORT_KEYS=${GENODE_SUPPORT_KEYS:-uniform,late_power_3,flowts_power_sampling,ays,gits,ots,late_power_3_reversed,flowts_power_sampling_reversed,ays_reversed,gits_reversed,ots_reversed,ser_ptg_local_defect_eta005}
 GENODE_CONTEXT_SAMPLE_COUNT=${GENODE_CONTEXT_SAMPLE_COUNT:-256}
 GENODE_TEACHER_STEPS=${GENODE_TEACHER_STEPS:-500}
@@ -36,6 +36,8 @@ GENODE_STUDENT_CHECKPOINT_EVERY=${GENODE_STUDENT_CHECKPOINT_EVERY:-50}
 GENODE_STUDENT_SELECTION_HOLDOUT_FRACTION=${GENODE_STUDENT_SELECTION_HOLDOUT_FRACTION:-0.10}
 
 mkdir -p "${GENODE_ROOT}/logs" "${GENODE_ROOT}/policy_runs" "${GENODE_ROOT}/summary"
+ln -sfn "${GENODE_SOURCE_ROOT}/artifacts" "${GENODE_ROOT}/artifacts"
+ln -sfn "${GENODE_SOURCE_ROOT}/standard_inputs" "${GENODE_ROOT}/standard_inputs"
 
 source "${GENODE_ENV_DIR}/bin/activate"
 cd "${GENODE_REPO}"
@@ -44,10 +46,25 @@ export PYTHONDONTWRITEBYTECODE=1
 
 python -m compileall -q src tests scripts
 python -m unittest tests.test_gipo tests.test_genode_interfaces
-python scripts/verification_gipo_locked_multiaxis_b64_checkpoint_maturity_20260608/validate_locked_artifacts.py \
+python scripts/verification_gipo_locked_multiaxis_b64_teacher_student_conditioning_ab_20260610/validate_locked_artifacts.py \
   --root "${GENODE_ROOT}" \
   --validate
 
+TRAIN_HELP="$(python -m genode.gipo.train_gipo --help)"
+require_train_capability() {
+  local needle=$1
+  if ! grep -q -- "${needle}" <<< "${TRAIN_HELP}"; then
+    echo "genode.gipo.train_gipo does not expose required teacher/student conditioning capability: ${needle}" >&2
+    exit 2
+  fi
+}
+require_train_capability "--teacher_loss_log_every"
+require_train_capability "--student_log_every"
+require_train_capability "--student_checkpoint_every"
+require_train_capability "--teacher_unseen_selection_rows_csv"
+require_train_capability "--gipo_teacher_conditioning_style"
+require_train_capability "--gipo_student_conditioning_style"
+require_train_capability "--allow_noncanonical_conditioning"
 ROWS="${GENODE_ROOT}/artifacts/seen_train_supervision_rows.csv"
 EMBEDDINGS="${GENODE_ROOT}/artifacts/seen_train_context_embeddings.npz"
 SER_SUMMARY="${GENODE_ROOT}/standard_inputs/seen/ser_reference/ser_ptg_schedule_summary.json"
@@ -83,7 +100,9 @@ else
     --teacher_unseen_selection_target_nfe_values 6,10,14,16 \
     --teacher_temperature_mode fixed \
     --teacher_temperature 0.05 \
-    --gipo_conditioning_style "${CONDITIONING_STYLE}" \
+    --gipo_teacher_conditioning_style "${TEACHER_CONDITIONING_STYLE}" \
+    --gipo_student_conditioning_style "${STUDENT_CONDITIONING_STYLE}" \
+    --allow_noncanonical_conditioning \
     --transformer_heads 4 \
     --transformer_dropout 0.05 \
     --teacher_utility_crps_weight "${CRPS_WEIGHT}" \
@@ -94,10 +113,10 @@ fi
 
 RUN_ID="${RUN_ID}" \
 SELECTION_MODE="${SELECTION_MODE}" \
-CONDITIONING_STYLE="${CONDITIONING_STYLE}" \
+TEACHER_CONDITIONING_STYLE="${TEACHER_CONDITIONING_STYLE}" \
+STUDENT_CONDITIONING_STYLE="${STUDENT_CONDITIONING_STYLE}" \
 STUDENT_SELECTOR_MODE="${STUDENT_SELECTOR_MODE}" \
 DENSITY_BIN_COUNT="${DENSITY_BIN_COUNT}" \
-GENODE_OTFLOW_TRAIN_STEPS="${GENODE_OTFLOW_TRAIN_STEPS}" \
 GENODE_STUDENT_BUDGET="${GENODE_STUDENT_BUDGET}" \
 GENODE_TEACHER_CHECKPOINT_EVERY="${GENODE_TEACHER_CHECKPOINT_EVERY}" \
 GENODE_TEACHER_LOG_EVERY="${GENODE_TEACHER_LOG_EVERY}" \
@@ -124,15 +143,27 @@ root = Path(os.environ["GENODE_ROOT"])
 run_id = os.environ["RUN_ID"]
 run_dir = root / "policy_runs" / run_id
 summary_path = run_dir / "gipo_training_summary.json"
+if not summary_path.exists():
+    raise FileNotFoundError(f"Training summary is required before final-retrain metadata: {summary_path}")
 summary = json.loads(summary_path.read_text(encoding="utf-8"))
+teacher_style = os.environ["TEACHER_CONDITIONING_STYLE"]
+student_style = os.environ["STUDENT_CONDITIONING_STYLE"]
+conditioning_pair = summary.get("conditioning_pair") or f"teacher_{teacher_style}__student_{student_style}"
 
 metadata = {
-    "artifact": "gipo_locked_multiaxis_b64_checkpoint_maturity_final_retrain_metadata",
+    "artifact": "gipo_locked_multiaxis_b64_teacher_student_conditioning_ab_final_retrain_metadata",
     "created_at_utc": datetime.now(timezone.utc).isoformat(),
     "run_id": run_id,
-    "run_role": "canonical_additive_checkpoint_maturity",
+    "run_role": "mixed_conditioning",
     "selection_mode": os.environ["SELECTION_MODE"],
-    "otflow_train_steps": int(os.environ["GENODE_OTFLOW_TRAIN_STEPS"]),
+    "selection_policy": os.environ["SELECTION_MODE"],
+    "selection": {
+        "mode": os.environ["SELECTION_MODE"],
+        "candidate_run_ids": [run_id],
+        "selected_run_id": run_id,
+        "selected_before_locked_reporting": True,
+        "locked_test_used_for_selection": False,
+    },
     "final_retrain": {
         "enabled": True,
         "completed": summary.get("status") == "completed",
@@ -149,9 +180,13 @@ metadata = {
         "locked_test_used_for_selection": False,
     },
     "script_contract": {
-        "conditioning_style": os.environ["CONDITIONING_STYLE"],
+        "teacher_conditioning_style": teacher_style,
+        "student_conditioning_style": student_style,
+        "conditioning_pair": conditioning_pair,
+        "same_style_shortcut_used": False,
         "density_bin_count": int(os.environ["DENSITY_BIN_COUNT"]),
         "teacher_checkpoint_every": int(os.environ["GENODE_TEACHER_CHECKPOINT_EVERY"]),
+        "teacher_log_every": int(os.environ["GENODE_TEACHER_LOG_EVERY"]),
         "teacher_loss_log_every": int(os.environ["GENODE_TEACHER_LOG_EVERY"]),
         "student_selector_mode": os.environ["STUDENT_SELECTOR_MODE"],
         "student_budget": int(os.environ["GENODE_STUDENT_BUDGET"]),
@@ -165,5 +200,5 @@ metadata = {
 }
 metadata_path = run_dir / "final_retrain_metadata.json"
 metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
-print(json.dumps({"final_retrain_metadata": str(metadata_path), "run_id": run_id}, sort_keys=True))
+print(json.dumps({"final_retrain_metadata": str(metadata_path), "selection_mode": metadata["selection_mode"]}, sort_keys=True))
 PY

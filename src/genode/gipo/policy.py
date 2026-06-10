@@ -79,7 +79,6 @@ DEFAULT_TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = ("u_crps_uniform", "u_mase
 TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = DEFAULT_TEACHER_METRIC_TARGET_KEYS
 TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1 = "weighted_normalized_regret_v1"
 DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
-STUDENT_CHECKPOINT_SELECTION_FINAL_STEP = "final_step"
 STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1 = "validation_ce_v1"
 DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
 DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS: Dict[str, float] = {
@@ -155,10 +154,7 @@ def validate_teacher_checkpoint_selection_mode(value: str) -> str:
 
 def validate_student_checkpoint_selection_mode(value: str) -> str:
     mode = str(value).strip() or DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE
-    allowed = {
-        STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
-        STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
-    }
+    allowed = {STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1}
     if mode not in allowed:
         raise ValueError(f"Unsupported student checkpoint selection mode {mode!r}; expected one of {sorted(allowed)}.")
     return mode
@@ -638,37 +634,6 @@ def student_nfe_sequence_pair_indices(rows: Sequence[MetricRow]) -> List[Tuple[i
     return [(left, right) for left, right, _ in student_nfe_sequence_pairs(rows)]
 
 
-def density_sequence_smoothness_loss(
-    logits: torch.Tensor,
-    pair_indices: Sequence[Tuple[int, int] | Tuple[int, int, float]],
-    *,
-    mode: str = "js",
-) -> torch.Tensor:
-    if not pair_indices:
-        return logits.new_zeros(())
-    left = torch.tensor([int(pair[0]) for pair in pair_indices], dtype=torch.long, device=logits.device)
-    right = torch.tensor([int(pair[1]) for pair in pair_indices], dtype=torch.long, device=logits.device)
-    weights = torch.tensor(
-        [1.0 / max(float(pair[2]), 1.0) if len(pair) >= 3 else 1.0 for pair in pair_indices],
-        dtype=torch.float32,
-        device=logits.device,
-    )
-    weights = weights / torch.clamp(torch.sum(weights), min=1e-12)
-    value = str(mode).strip() or "js"
-    if value == "logit_l2":
-        per_pair = torch.mean(torch.square(logits[left] - logits[right]), dim=-1)
-        return torch.sum(weights * per_pair)
-    if value != "js":
-        raise ValueError("student_nfe_smoothness_mode must be 'js' or 'logit_l2'.")
-    left_probs = torch.softmax(logits[left], dim=-1)
-    right_probs = torch.softmax(logits[right], dim=-1)
-    mixture = 0.5 * (left_probs + right_probs)
-    eps = 1e-8
-    left_kl = torch.sum(left_probs * (torch.log(left_probs + eps) - torch.log(mixture + eps)), dim=-1)
-    right_kl = torch.sum(right_probs * (torch.log(right_probs + eps) - torch.log(mixture + eps)), dim=-1)
-    return torch.sum(weights * (0.5 * (left_kl + right_kl)))
-
-
 def density_sequence_roughness_summary(
     masses: Sequence[Sequence[float]],
     pair_indices: Sequence[Tuple[int, int] | Tuple[int, int, float]],
@@ -950,39 +915,6 @@ def split_rows_by_context_holdout(
         copied = dict(row)
         copied["context_id"] = context_id_from_row(copied)
         if copied["context_id"] in holdout_ids:
-            holdout_rows.append(copied)
-        else:
-            fit_rows.append(copied)
-    return fit_rows, holdout_rows
-
-
-def split_rows_by_series_holdout(
-    rows: Sequence[MetricRow],
-    *,
-    holdout_fraction: float,
-    seed: int,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    frac = float(holdout_fraction)
-    if frac <= 0.0:
-        return [dict(row) for row in rows], []
-    if frac >= 1.0:
-        raise ValueError("holdout_fraction must be smaller than 1.0.")
-    series_keys = sorted({series_key_from_row(row) for row in rows})
-    if len(series_keys) <= 1:
-        return [dict(row) for row in rows], []
-    rng = np.random.default_rng(int(seed))
-    shuffled = list(series_keys)
-    rng.shuffle(shuffled)
-    holdout_count = max(1, int(round(float(len(shuffled)) * frac)))
-    holdout_count = min(holdout_count, len(shuffled) - 1)
-    holdout_series = set(shuffled[:holdout_count])
-    fit_rows: List[Dict[str, Any]] = []
-    holdout_rows: List[Dict[str, Any]] = []
-    for row in rows:
-        copied = dict(row)
-        copied["context_id"] = context_id_from_row(copied)
-        copied["series_key"] = series_key_from_row(copied)
-        if copied["series_key"] in holdout_series:
             holdout_rows.append(copied)
         else:
             fit_rows.append(copied)
@@ -1965,7 +1897,6 @@ def _teacher_training_tensors(
     setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     teacher_metric_target_keys: Sequence[str] = TEACHER_METRIC_TARGET_KEYS,
-    series_unknown_probability: float = 0.0,
     seed: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[ContextPairKey], List[str], List[Tuple[float, ...]]]:
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
@@ -2295,18 +2226,7 @@ def _selected_gipo_teacher_checkpoint(
         return float(weights.get(split, 0.0))
 
     if not checkpoint_history:
-        return (
-            {
-                "selection_protocol": "final_checkpoint_no_diagnostics",
-                "selection_mode": mode,
-                "selection_metric": "final_step",
-                "selected_step": None,
-                "history": [],
-                "uses_validation_labels": False,
-                "locked_test_used_for_selection": False,
-            },
-            None,
-        )
+        raise ValueError("Weighted normalized regret selection requires checkpoint diagnostics.")
 
     required = tuple(str(name) for name in required_split_names)
     scored: List[Dict[str, Any]] = []
@@ -2544,7 +2464,7 @@ def train_gipo_teacher(
     teacher_checkpoint_selection_mode: str = DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE,
     teacher_selection_temperature: float = DEFAULT_TEACHER_TARGET_TEMPERATURE,
     teacher_selection_axis_weights: Mapping[str, float] | None = None,
-    series_unknown_probability: float = 0.0,
+    final_retrain_mode: bool = False,
     seed: int = 0,
     allowed_schedule_keys: Sequence[str] = DEFAULT_SUPERVISION_SCHEDULE_KEYS,
     setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
@@ -2577,7 +2497,6 @@ def train_gipo_teacher(
         setting_feature_mode=feature_mode,
         setting_encoder_config=encoder_config,
         teacher_metric_target_keys=teacher_metric_target_keys,
-        series_unknown_probability=0.0,
         seed=int(seed),
     )
     target_weights = _teacher_metric_weights(
@@ -2656,13 +2575,25 @@ def train_gipo_teacher(
             step_value = int(step + 1)
             checkpoint_history.append({"step": step_value, "diagnostics": diagnostics})
             checkpoint_states[step_value] = copy.deepcopy(teacher.state_dict())
-    checkpoint_selection, selected_state = _selected_gipo_teacher_checkpoint(
-        checkpoint_history,
-        checkpoint_states,
-        required_split_names=tuple(diagnostic_splits.keys()) if diagnostic_splits else (),
-        selection_mode=selection_mode,
-        component_weights=teacher_selection_axis_weights,
-    )
+    if bool(final_retrain_mode):
+        checkpoint_selection = {
+            "selection_protocol": "gipo_teacher_final_retrain_v1",
+            "selection_mode": selection_mode,
+            "selection_metric": "configured_selected_step",
+            "selected_step": int(steps),
+            "history": checkpoint_history,
+            "uses_validation_labels": False,
+            "locked_test_used_for_selection": False,
+        }
+        selected_state = None
+    else:
+        checkpoint_selection, selected_state = _selected_gipo_teacher_checkpoint(
+            checkpoint_history,
+            checkpoint_states,
+            required_split_names=tuple(diagnostic_splits.keys()) if diagnostic_splits else (),
+            selection_mode=selection_mode,
+            component_weights=teacher_selection_axis_weights,
+        )
     if selected_state is not None:
         teacher.load_state_dict(selected_state)
     final_teacher_retrain = {
@@ -2690,8 +2621,6 @@ def train_gipo_teacher(
         ),
         "teacher_density_feature": "train_normalized_log_density",
         "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
-        "series_unknown_probability": 0.0,
-        "series_unknown_probability_mode": "disabled_no_series_conditioning",
         "setting_feature_mode": feature_mode,
         "setting_encoder_mode": encoder_config.mode,
         "setting_encoder_config": encoder_config.to_payload(),
@@ -3228,10 +3157,7 @@ def train_gipo_student(
     teacher_hard_margin: float = DEFAULT_TEACHER_HARD_MARGIN,
     setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
-    series_unknown_dropout: float = 0.0,
     student_weight_decay: float = 1e-4,
-    student_nfe_smoothness_weight: float = 0.0,
-    student_nfe_smoothness_mode: str = "js",
     pseudo_rows: Sequence[MetricRow] | None = None,
     pseudo_context_embeddings: Mapping[str, Sequence[float]] | None = None,
     pseudo_schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None = None,
@@ -3240,29 +3166,25 @@ def train_gipo_student(
     validation_context_embeddings: Mapping[str, Sequence[float]] | None = None,
     student_log_every: int = 0,
     student_checkpoint_every: int = 100,
-    student_checkpoint_selection_mode: str = STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
+    student_checkpoint_selection_mode: str = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+    final_retrain_mode: bool = False,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
     if not rows:
         raise ValueError("Student density training requires at least one fit row.")
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
-    smoothness_weight = float(student_nfe_smoothness_weight)
-    if not math.isfinite(smoothness_weight) or smoothness_weight < 0.0:
-        raise ValueError("student_nfe_smoothness_weight must be finite and nonnegative.")
     weight_decay = float(student_weight_decay)
     if not math.isfinite(weight_decay) or weight_decay < 0.0:
         raise ValueError("student_weight_decay must be finite and nonnegative.")
-    smoothness_mode = str(student_nfe_smoothness_mode).strip() or "js"
-    if smoothness_mode not in {"js", "logit_l2"}:
-        raise ValueError("student_nfe_smoothness_mode must be 'js' or 'logit_l2'.")
     pseudo_weight = float(pseudo_target_weight)
     if not math.isfinite(pseudo_weight) or pseudo_weight < 0.0:
         raise ValueError("student_pseudo_target_weight must be finite and nonnegative.")
     selection_mode = validate_student_checkpoint_selection_mode(student_checkpoint_selection_mode)
+    use_validation_selection = not bool(final_retrain_mode)
     checkpoint_every = max(1, int(student_checkpoint_every))
     validation_fit_rows = [dict(row) for row in (validation_rows or [])]
-    if selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1 and not validation_fit_rows:
+    if use_validation_selection and not validation_fit_rows:
         raise ValueError("student validation CE checkpoint selection requires non-empty validation_rows.")
     locked_validation_rows = [
         row
@@ -3441,16 +3363,12 @@ def train_gipo_student(
             )
             pseudo_log_probs = torch.log_softmax(pseudo_logits, dim=-1)
             pseudo_ce_loss = -(pseudo_target_mass * pseudo_log_probs).sum(dim=-1).mean()
-        smoothness_loss = density_sequence_smoothness_loss(logits, sequence_pairs, mode=smoothness_mode)
-        loss = ce_loss + float(pseudo_weight) * pseudo_ce_loss + float(smoothness_weight) * smoothness_loss
+        loss = ce_loss + float(pseudo_weight) * pseudo_ce_loss
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
         should_log = _should_log_step(step, int(steps), int(student_log_every))
-        should_checkpoint = (
-            selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
-            and _should_log_step(step, int(steps), checkpoint_every)
-        )
+        should_checkpoint = use_validation_selection and _should_log_step(step, int(steps), checkpoint_every)
         train_ce_for_checkpoint: float | None = None
         train_entropy_for_checkpoint: float | None = None
         if should_log or should_checkpoint:
@@ -3470,7 +3388,6 @@ def train_gipo_student(
                     "student_eval_kl_ce_loss": float(train_ce_for_checkpoint),
                     "student_pseudo_kl_ce_loss": float(pseudo_ce_loss.detach().cpu().item()),
                     "student_pseudo_weighted_loss": float((float(pseudo_weight) * pseudo_ce_loss).detach().cpu().item()),
-                    "student_nfe_smoothness_loss": float(smoothness_loss.detach().cpu().item()),
                     "student_entropy": float(train_entropy_for_checkpoint),
                 }
             )
@@ -3500,7 +3417,7 @@ def train_gipo_student(
                 }
             )
             checkpoint_states[step_value] = copy.deepcopy(student.state_dict())
-    if selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1:
+    if use_validation_selection:
         if not checkpoint_history:
             raise ValueError("Student validation CE checkpoint selection found no checkpoints.")
         selected_checkpoint = min(
@@ -3535,9 +3452,10 @@ def train_gipo_student(
         }
     else:
         student_checkpoint_selection = {
-            "selection_protocol": STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
-            "selection_mode": STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
-            "selection_metric": "final_step",
+            "selection_protocol": "gipo_student_final_retrain_v1",
+            "selection_mode": "final_retrain",
+            "selection_metric": "configured_selected_step",
+            "canonical_checkpoint_selection_mode": selection_mode,
             "selected_step": int(steps),
             "history": [],
             "student_checkpoint_every": int(checkpoint_every),
@@ -3558,14 +3476,10 @@ def train_gipo_student(
         "pseudo_distillation_used": bool(pseudo_enabled),
         "pseudo_target_weight": float(pseudo_weight),
         "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
-        "series_unknown_dropout": 0.0,
-        "series_unknown_dropout_mode": "disabled_no_series_conditioning",
         "student_weight_decay": float(weight_decay),
         "setting_feature_mode": feature_mode,
         "setting_encoder_mode": encoder_config.mode,
         "setting_encoder_config": encoder_config.to_payload(),
-        "student_nfe_smoothness_weight": float(smoothness_weight),
-        "student_nfe_smoothness_mode": smoothness_mode,
         "student_nfe_sequence_pair_count": int(len(sequence_pairs)),
         "losses": losses,
         "student_loss_tail_slope": _loss_tail_slope(losses, "student_kl_ce_loss"),
@@ -3589,13 +3503,13 @@ def train_gipo_student(
             "validation_context_count": int(len({context_id_from_row(row) for row in validation_fit_rows})) if validation_fit_rows else 0,
             "locked_test_used_for_selection": False,
         },
-        "student_validation_used_for_selection": bool(selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1),
+        "student_validation_used_for_selection": bool(use_validation_selection),
         "locked_test_used_for_selection": False,
         "student_final_retrain": {
-            "enabled": False,
-            "performed": False,
+            "enabled": bool(final_retrain_mode),
+            "performed": bool(final_retrain_mode),
             "selected_step": int(student_checkpoint_selection.get("selected_step") or int(steps)),
-            "selection_protocol": selection_mode,
+            "selection_protocol": str(student_checkpoint_selection.get("selection_protocol", selection_mode)),
             "locked_test_used_for_selection": False,
         },
     }
@@ -3721,7 +3635,6 @@ __all__ = [
     "SERIES_CONDITIONING_NONE_CONTEXT_ONLY",
     "STUDENT_TARGET_MODE_MARGIN_HARD_SOFT",
     "STUDENT_TARGET_MODE_SOFT_MIXTURE",
-    "STUDENT_CHECKPOINT_SELECTION_FINAL_STEP",
     "STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1",
     "TEACHER_TEMPERATURE_MODE_ADAPTIVE_ESS",
     "TEACHER_TEMPERATURE_MODE_FIXED",
@@ -3741,7 +3654,6 @@ __all__ = [
     "context_pair_key",
     "density_family_for_schedule_key",
     "density_sequence_roughness_summary",
-    "density_sequence_smoothness_loss",
     "gipo_teacher_diagnostics",
     "density_mass_for_row",
     "grid_for_schedule",
@@ -3764,7 +3676,6 @@ __all__ = [
     "teacher_selection_candidate_group_key",
     "split_rows_by_context_holdout",
     "split_rows_by_density_family_holdout",
-    "split_rows_by_series_holdout",
     "student_nfe_sequence_pair_indices",
     "student_nfe_sequence_pairs",
     "train_gipo_student",

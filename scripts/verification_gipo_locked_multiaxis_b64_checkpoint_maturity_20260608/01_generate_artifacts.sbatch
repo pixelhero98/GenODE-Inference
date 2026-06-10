@@ -7,19 +7,19 @@
 #SBATCH --mem=96G
 #SBATCH --gpus=1
 #SBATCH --time=24:00:00
-#SBATCH --output=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_checkpoint_maturity_20260608/logs/%x.%j.out
-#SBATCH --error=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_checkpoint_maturity_20260608/logs/%x.%j.err
+#SBATCH --output=slurm-%x.%j.out
+#SBATCH --error=slurm-%x.%j.err
 
 set -euo pipefail
 
-GENODE_REPO=${GENODE_REPO:-/scratch/b35z/pixelhero.b35z/genode/exec/genode_gipo_locked_multiaxis_b64_checkpoint_maturity_src_20260608}
-GENODE_ENV_DIR=${GENODE_ENV_DIR:-/projects/b35z/genode/envs/genode-py311}
-GENODE_DATASET_ROOT=${GENODE_DATASET_ROOT:-/projects/b35z/genode/paper_datasets}
-GENODE_BACKBONE_MANIFEST=${GENODE_BACKBONE_MANIFEST:-/scratch/b35z/pixelhero.b35z/genode/outputs/backbone_matrix/backbone_manifest.json}
-GENODE_SHARED_BACKBONE_ROOT=${GENODE_SHARED_BACKBONE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/backbone_matrix}
-GENODE_OTFLOW_TRAIN_STEPS=${GENODE_OTFLOW_TRAIN_STEPS:?Set GENODE_OTFLOW_TRAIN_STEPS to 16000 or 12000}
+GENODE_REPO=${GENODE_REPO:?Set GENODE_REPO to the GenODE-Inference repository path}
+GENODE_ENV_DIR=${GENODE_ENV_DIR:?Set GENODE_ENV_DIR to the Python environment path}
+GENODE_DATASET_ROOT=${GENODE_DATASET_ROOT:?Set GENODE_DATASET_ROOT to the dataset root}
+GENODE_BACKBONE_MANIFEST=${GENODE_BACKBONE_MANIFEST:?Set GENODE_BACKBONE_MANIFEST to backbone_manifest.json}
+GENODE_SHARED_BACKBONE_ROOT=${GENODE_SHARED_BACKBONE_ROOT:?Set GENODE_SHARED_BACKBONE_ROOT to the backbone output root}
+GENODE_OTFLOW_TRAIN_STEPS=${GENODE_OTFLOW_TRAIN_STEPS:?Set GENODE_OTFLOW_TRAIN_STEPS to the backbone maturity step budget}
 GENODE_BUDGET_LABEL=${GENODE_BUDGET_LABEL:-$((GENODE_OTFLOW_TRAIN_STEPS / 1000))k}
-GENODE_ROOT=${GENODE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_ckpt${GENODE_BUDGET_LABEL}_20260608}
+GENODE_ROOT=${GENODE_ROOT:?Set GENODE_ROOT to this run output root}
 GENODE_DATASET=${GENODE_DATASET:-solar_energy_10m}
 GENODE_SOLVERS=${GENODE_SOLVERS:-euler,heun,midpoint_rk2,dpmpp2m}
 GENODE_SEEN_NFES=${GENODE_SEEN_NFES:-4,8,12}
@@ -34,7 +34,6 @@ GENODE_TRAIN_TUNING_SAMPLING_MODE=${GENODE_TRAIN_TUNING_SAMPLING_MODE:-train_win
 GENODE_LOCKED_EVAL_WINDOWS=${GENODE_LOCKED_EVAL_WINDOWS:-32}
 
 mkdir -p "${GENODE_ROOT}/logs" "${GENODE_ROOT}/summary" "${GENODE_ROOT}/artifacts" "${GENODE_ROOT}/standard_inputs"
-mkdir -p /scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_checkpoint_maturity_20260608/logs
 
 source "${GENODE_ENV_DIR}/bin/activate"
 cd "${GENODE_REPO}"

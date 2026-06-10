@@ -7,8 +7,8 @@
 #SBATCH --mem=96G
 #SBATCH --gpus=1
 #SBATCH --time=24:00:00
-#SBATCH --output=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_final_ab_20260607/logs/%x.%j.out
-#SBATCH --error=/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_final_ab_20260607/logs/%x.%j.err
+#SBATCH --output=slurm-%x.%j.out
+#SBATCH --error=slurm-%x.%j.err
 
 set -euo pipefail
 
@@ -16,13 +16,13 @@ RUN_ID=adaln_locked_b64_normregret_final
 REPORT_LABEL_PREFIX=adaln_b64_normregret_final
 SELECTION_MODE=weighted_normalized_regret_v1
 
-GENODE_REPO=${GENODE_REPO:-/scratch/b35z/pixelhero.b35z/genode/exec/genode_gipo_locked_multiaxis_b64_final_ab_src_20260607}
-GENODE_ENV_DIR=${GENODE_ENV_DIR:-/projects/b35z/genode/envs/genode-py311}
-GENODE_ROOT=${GENODE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_final_ab_20260607}
-GENODE_SOURCE_ROOT=${GENODE_SOURCE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_additive_locked_multiaxis_20260606}
-GENODE_DATASET_ROOT=${GENODE_DATASET_ROOT:-/projects/b35z/genode/paper_datasets}
-GENODE_BACKBONE_MANIFEST=${GENODE_BACKBONE_MANIFEST:-/scratch/b35z/pixelhero.b35z/genode/outputs/backbone_matrix/backbone_manifest.json}
-GENODE_SHARED_BACKBONE_ROOT=${GENODE_SHARED_BACKBONE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/backbone_matrix}
+GENODE_REPO=${GENODE_REPO:?Set GENODE_REPO to the GenODE-Inference repository path}
+GENODE_ENV_DIR=${GENODE_ENV_DIR:?Set GENODE_ENV_DIR to the Python environment path}
+GENODE_ROOT=${GENODE_ROOT:?Set GENODE_ROOT to this run output root}
+GENODE_SOURCE_ROOT=${GENODE_SOURCE_ROOT:?Set GENODE_SOURCE_ROOT to the validated artifact source root}
+GENODE_DATASET_ROOT=${GENODE_DATASET_ROOT:?Set GENODE_DATASET_ROOT to the dataset root}
+GENODE_BACKBONE_MANIFEST=${GENODE_BACKBONE_MANIFEST:?Set GENODE_BACKBONE_MANIFEST to backbone_manifest.json}
+GENODE_SHARED_BACKBONE_ROOT=${GENODE_SHARED_BACKBONE_ROOT:?Set GENODE_SHARED_BACKBONE_ROOT to the backbone output root}
 GENODE_OTFLOW_TRAIN_STEPS=${GENODE_OTFLOW_TRAIN_STEPS:-20000}
 GENODE_DATASET=${GENODE_DATASET:-solar_energy_10m}
 GENODE_SOLVERS=${GENODE_SOLVERS:-euler,heun,midpoint_rk2,dpmpp2m}

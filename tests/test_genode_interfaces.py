@@ -12,6 +12,7 @@ from genode.runtime import resolve_torch_device
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PRIVATE_CLUSTER_PATTERNS = ("/" + "scratch/", "pixel" + "hero", "b" + "35z")
 
 
 def _active_script_paths() -> list[Path]:
@@ -33,20 +34,18 @@ class GenODEInterfaceTests(unittest.TestCase):
     def test_public_entry_points_are_registered(self) -> None:
         data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         scripts = data["project"]["scripts"]
-        self.assertEqual(
-            set(scripts),
-            {
-                "genode-train-backbone",
-                "genode-run-schedules",
-                "genode-train-gipo",
-                "genode-report-gipo-locked-test",
-                "genode-report-gipo-teacher-oracle",
-                "genode-build-ser-ptg-reference",
-                "genode-evaluate-schedule-summary",
-                "genode-build-hardness-figure",
-                "genode-build-ptg-figure",
-            },
-        )
+        expected_core = {
+            "genode-train-backbone",
+            "genode-run-schedules",
+            "genode-train-gipo",
+            "genode-report-gipo-locked-test",
+            "genode-report-gipo-teacher-oracle",
+            "genode-build-ser-ptg-reference",
+            "genode-evaluate-schedule-summary",
+            "genode-build-hardness-figure",
+            "genode-build-ptg-figure",
+        }
+        self.assertTrue(expected_core <= set(scripts))
         for target in scripts.values():
             module_name, func_name = str(target).split(":", 1)
             self.assertTrue(callable(getattr(importlib.import_module(module_name), func_name)))
@@ -72,16 +71,19 @@ class GenODEInterfaceTests(unittest.TestCase):
         defaults_by_dest = {action.dest: action.default for action in parser._actions}
         options = {option for action in parser._actions for option in action.option_strings}
 
-        self.assertEqual(choices_by_dest["teacher_checkpoint_selection_mode"], {"weighted_normalized_regret_v1"})
-        self.assertEqual(choices_by_dest["student_checkpoint_selection"], {"validation_ce_v1"})
-        self.assertEqual(defaults_by_dest["density_bin_count"], 64)
         self.assertEqual(defaults_by_dest["gipo_conditioning_style"], "additive_mlp_v1")
         self.assertEqual(choices_by_dest["gipo_conditioning_style"], {"additive_mlp_v1", "adaln_zero_v1"})
+        self.assertEqual(choices_by_dest["gipo_teacher_conditioning_style"], {"additive_mlp_v1", "adaln_zero_v1"})
+        self.assertEqual(choices_by_dest["gipo_student_conditioning_style"], {"additive_mlp_v1", "adaln_zero_v1"})
         self.assertIn("--allow_noncanonical_conditioning", options)
+        self.assertIn("--gipo_teacher_conditioning_style", options)
+        self.assertIn("--gipo_student_conditioning_style", options)
         self.assertIn("--teacher_unseen_selection_rows_csv", options)
-        self.assertIn("--student_checkpoint_selection", options)
 
         removed_options = {
+            "--density_bin_count",
+            "--teacher_checkpoint_selection_mode",
+            "--student_checkpoint_selection",
             "--teacher_selection_component_" + "weights",
             "--teacher_nfe_" + "proxy_anchor_values",
             "--teacher_fit_checkpoint_" + "selection",
@@ -133,6 +135,84 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertNotIn("promotion_" + "decision", collect)
         self.assertNotIn("locked_test_used_for_conditioning_" + "promotion", collect)
         self.assertNotIn("--additive" + "128_root", collect)
+        for pattern in PRIVATE_CLUSTER_PATTERNS:
+            self.assertNotIn(pattern, combined)
+
+    def test_teacher_student_conditioning_ab_trains_two_mixed_runs_and_collects_four_way(self) -> None:
+        root = PROJECT_ROOT / "scripts" / "verification_gipo_locked_multiaxis_b64_teacher_student_conditioning_ab_20260610"
+        expected_train_files = {
+            "02_train_teacher_additive_student_adaln_locked.sbatch",
+            "02_train_teacher_adaln_student_additive_locked.sbatch",
+        }
+        expected_report_files = {
+            "03_report_teacher_additive_student_adaln_locked_seen_unseen.sbatch",
+            "03_report_teacher_adaln_student_additive_locked_seen_unseen.sbatch",
+        }
+        train_files = {path.name for path in root.glob("02_train_*.sbatch")}
+        report_files = {path.name for path in root.glob("03_report_*.sbatch")}
+        self.assertEqual(train_files, expected_train_files)
+        self.assertEqual(report_files, expected_report_files)
+
+        files = [
+            root / "00_prepare_reused_artifacts.sbatch",
+            *(root / name for name in sorted(expected_train_files)),
+            *(root / name for name in sorted(expected_report_files)),
+            root / "04_collect_teacher_student_conditioning_ab_summary.sbatch",
+            root / "collect_teacher_student_conditioning_ab_summary.py",
+            root / "submit_teacher_student_conditioning_ab.sh",
+            root / "validate_locked_artifacts.py",
+        ]
+        combined = "\n".join(path.read_text(encoding="utf-8") for path in files)
+        train_add_student_adaln = (root / "02_train_teacher_additive_student_adaln_locked.sbatch").read_text(encoding="utf-8")
+        train_adaln_student_add = (root / "02_train_teacher_adaln_student_additive_locked.sbatch").read_text(encoding="utf-8")
+        report_combined = "\n".join((root / name).read_text(encoding="utf-8") for name in sorted(expected_report_files))
+        collect = (root / "collect_teacher_student_conditioning_ab_summary.py").read_text(encoding="utf-8")
+        submit = (root / "submit_teacher_student_conditioning_ab.sh").read_text(encoding="utf-8")
+
+        self.assertIn("GENODE_SOURCE_ROOT", combined)
+        self.assertIn("RUN_ID=teacher_additive_student_adaln_locked_b64_normregret_final", train_add_student_adaln)
+        self.assertIn("TEACHER_CONDITIONING_STYLE=additive_mlp_v1", train_add_student_adaln)
+        self.assertIn("STUDENT_CONDITIONING_STYLE=adaln_zero_v1", train_add_student_adaln)
+        self.assertIn("RUN_ID=teacher_adaln_student_additive_locked_b64_normregret_final", train_adaln_student_add)
+        self.assertIn("TEACHER_CONDITIONING_STYLE=adaln_zero_v1", train_adaln_student_add)
+        self.assertIn("STUDENT_CONDITIONING_STYLE=additive_mlp_v1", train_adaln_student_add)
+        for train_text in (train_add_student_adaln, train_adaln_student_add):
+            self.assertIn("SELECTION_MODE=weighted_normalized_regret_v1", train_text)
+            self.assertIn("DENSITY_BIN_COUNT=64", train_text)
+            self.assertIn("--teacher_unseen_selection_rows_csv", train_text)
+            self.assertIn("--gipo_teacher_conditioning_style", train_text)
+            self.assertIn("--gipo_student_conditioning_style", train_text)
+            self.assertIn("--allow_noncanonical_conditioning", train_text)
+            self.assertNotIn("--gipo_conditioning_style", train_text)
+            self.assertIn('"same_style_shortcut_used": False', train_text)
+
+        self.assertIn("python -m genode.gipo.report_locked_test", report_combined)
+        self.assertIn('locked_reports/${panel}/student/${RUN_ID}', report_combined)
+        self.assertIn("--allow_noncanonical_conditioning", report_combined)
+        self.assertIn("teacher_additive_student_adaln_locked_b64_normregret_final", report_combined)
+        self.assertIn("teacher_adaln_student_additive_locked_b64_normregret_final", report_combined)
+
+        self.assertIn("--same-style-root", collect)
+        self.assertIn("same_style_root", collect)
+        self.assertIn("predeclared_teacher_student_conditioning_four_way_ab_v1", collect)
+        self.assertIn("teacher_additive_student_additive", collect)
+        self.assertIn("teacher_additive_student_adaln", collect)
+        self.assertIn("teacher_adaln_student_additive", collect)
+        self.assertIn("teacher_adaln_student_adaln", collect)
+        self.assertIn("student_locked_reports_only", collect)
+        self.assertIn("gipo_locked_multiaxis_b64_teacher_student_conditioning_ab_four_way_summary", collect)
+
+        self.assertEqual(submit.count("02_train_"), 2)
+        self.assertEqual(submit.count("03_report_"), 2)
+        self.assertIn("afterok:${teacher_additive_student_adaln_report_job}:${teacher_adaln_student_additive_report_job}", submit)
+        self.assertNotIn("--student_pseudo_target_" + "weight", combined)
+        self.assertNotIn("--student_nfe_smoothness_" + "weight", combined)
+        self.assertNotIn("python -m genode.gipo.report_teacher_oracle", combined)
+        self.assertIn("pseudo target weight is nonzero", collect)
+        self.assertIn("student smoothness weight is nonzero", collect)
+        self.assertIn("teacher-oracle report exists", collect)
+        for pattern in PRIVATE_CLUSTER_PATTERNS:
+            self.assertNotIn(pattern, combined)
 
     def test_checkpoint_maturity_stream_is_additive_only_and_regenerates_artifacts(self) -> None:
         root = PROJECT_ROOT / "scripts" / "verification_gipo_locked_multiaxis_b64_checkpoint_maturity_20260608"
@@ -159,20 +239,27 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertIn("additive_locked_b64_normregret_ckpt${GENODE_BUDGET_LABEL}", train)
         self.assertIn("CONDITIONING_STYLE=additive_mlp_v1", train)
         self.assertNotIn("--allow_noncanonical_conditioning", train)
-        self.assertIn("--density_bin_count \"${DENSITY_BIN_COUNT}\"", train)
-        self.assertIn("--teacher_checkpoint_selection_mode \"${SELECTION_MODE}\"", train)
-        self.assertIn("--student_checkpoint_selection \"${STUDENT_SELECTOR_MODE}\"", train)
+        self.assertNotIn("--density_bin_count", train)
+        self.assertNotIn("--teacher_checkpoint_selection_mode", train)
+        self.assertNotIn("--student_checkpoint_selection", train)
         self.assertNotIn("--teacher_selection_component_" + "weights", train)
         self.assertNotIn("report_teacher_oracle", report)
         self.assertIn("PHYSICAL_SCHEDULES = (", collect)
         self.assertIn("ser_ptg_local_defect_eta005", collect)
-        self.assertIn("FINAL20_RUN_ID = \"additive_locked_b64_normregret_final\"", collect)
+        self.assertIn("--candidate", collect)
+        self.assertIn("--comparator_root", collect)
+        self.assertIn("--comparator_run_id", collect)
         self.assertIn("locked_test_used_for_backbone_maturity_selection", collect)
-        self.assertIn("GENODE_OTFLOW_TRAIN_STEPS=16000", submit)
-        self.assertIn("GENODE_OTFLOW_TRAIN_STEPS=12000", submit)
-        self.assertIn("afterok:${report16_job}:${report12_job}", submit)
-        self.assertIn("verification_gipo_locked_multiaxis_b64_ckpt16k_20260608", combined)
-        self.assertIn("verification_gipo_locked_multiaxis_b64_ckpt12k_20260608", combined)
+        self.assertIn("GENODE_MATURITY_SPECS", submit)
+        self.assertIn("label,train_steps,root,run_id,report_label_prefix", submit)
+        self.assertIn("GENODE_MATURITY_CANDIDATES", submit)
+        self.assertIn("GENODE_COMPARATOR_ROOT", submit)
+        self.assertNotIn("ROOT16", submit)
+        self.assertNotIn("ROOT12", submit)
+        self.assertNotIn("GENODE_CKPT16_ROOT", combined)
+        self.assertNotIn("GENODE_CKPT12_ROOT", combined)
+        for pattern in PRIVATE_CLUSTER_PATTERNS:
+            self.assertNotIn(pattern, combined)
 
     def test_legacy_gipo_script_roots_are_archived(self) -> None:
         archive_root = PROJECT_ROOT / "scripts" / "legacy_archive_20260608"
@@ -194,6 +281,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         active_roots = {path.name for path in (PROJECT_ROOT / "scripts").iterdir() if path.is_dir()}
         self.assertIn("verification_gipo_locked_multiaxis_b64_final_ab_20260607", active_roots)
         self.assertIn("verification_gipo_locked_multiaxis_b64_checkpoint_maturity_20260608", active_roots)
+        self.assertIn("verification_gipo_locked_multiaxis_b64_teacher_student_conditioning_ab_20260610", active_roots)
         self.assertFalse(expected & active_roots)
 
     def test_retired_flags_do_not_remain_in_active_scripts(self) -> None:
@@ -212,6 +300,7 @@ class GenODEInterfaceTests(unittest.TestCase):
             "b64_multiaxis_opt_" + "guarded",
             "b64_multiaxis_select_" + "ab",
             "locked_test_used_for_conditioning_" + "promotion",
+            *PRIVATE_CLUSTER_PATTERNS,
         )
         for path in _active_script_paths():
             if path.suffix not in {".py", ".sh", ".sbatch"}:

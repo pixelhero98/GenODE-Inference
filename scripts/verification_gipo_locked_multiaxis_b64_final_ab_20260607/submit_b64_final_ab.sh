@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GENODE_ROOT=${GENODE_ROOT:-/scratch/b35z/pixelhero.b35z/genode/outputs/verification_gipo_locked_multiaxis_b64_final_ab_20260607}
+GENODE_ROOT=${GENODE_ROOT:?Set GENODE_ROOT to this run output root}
 
 mkdir -p "${GENODE_ROOT}/logs"
 

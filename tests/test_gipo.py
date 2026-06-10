@@ -22,7 +22,6 @@ from genode.gipo.policy import (
     MODEL_PAYLOAD_VERSION,
     SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
     STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
-    STUDENT_CHECKPOINT_SELECTION_FINAL_STEP,
     TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
     TEACHER_METRIC_TARGET_KEYS,
     TEACHER_OUTPUT_METRIC_VECTOR_V1,
@@ -36,7 +35,6 @@ from genode.gipo.policy import (
     build_teacher_weighted_density_targets,
     context_id_from_row,
     density_family_for_schedule_key,
-    density_sequence_smoothness_loss,
     gipo_teacher_diagnostics,
     density_mass_for_row,
     nfe_sequence_diagnostic_summary,
@@ -473,11 +471,6 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
         self.assertEqual(teacher.model_config()["teacher_output"], TEACHER_OUTPUT_METRIC_VECTOR_V1)
         self.assertEqual(teacher.model_config()["teacher_metric_targets"], list(TEACHER_METRIC_TARGET_KEYS))
         self.assertEqual(teacher.model_config()["teacher_scalarization"], TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1)
-        identical_logits = torch.zeros(3, 4)
-        rough_logits = torch.tensor([[4.0, 0.0, 0.0, 0.0], [0.0, 4.0, 0.0, 0.0], [0.0, 0.0, 4.0, 0.0]])
-        self.assertAlmostEqual(float(density_sequence_smoothness_loss(identical_logits, [(0, 1), (1, 2)])), 0.0, places=6)
-        self.assertGreater(float(density_sequence_smoothness_loss(rough_logits, [(0, 1), (1, 2)])), 0.0)
-
     def test_additive_conditioning_changes_student_logits_immediately(self) -> None:
         torch.manual_seed(18)
         rows = [
@@ -795,8 +788,8 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             steps=2,
             lr=1e-3,
             teacher_temperature=0.05,
-            series_unknown_dropout=0.0,
             student_weight_decay=0.0,
+            final_retrain_mode=True,
         )
         self.assertEqual(student_summary["student_policy_type"], "continuous_density")
         self.assertEqual(student_summary["student_objective"], "teacher_weighted_density_mle_kl")
@@ -852,7 +845,6 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             steps=3,
             lr=1e-3,
             teacher_temperature=0.05,
-            series_unknown_dropout=0.0,
             student_weight_decay=0.0,
             validation_rows=validation_rows,
             student_log_every=1,
@@ -920,7 +912,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                 student_checkpoint_selection_mode=STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
             )
 
-    def test_student_training_can_apply_nfe_sequence_smoothness(self) -> None:
+    def test_student_training_reports_nfe_sequence_pairs_without_smoothness_loss(self) -> None:
         torch.manual_seed(3)
         reference = uniform_reference_grid(4)
         ser_schedule_key = "ser_ptg_local_defect_eta005"
@@ -961,13 +953,11 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             steps=2,
             lr=1e-3,
             teacher_temperature=0.05,
-            series_unknown_dropout=0.0,
-            student_nfe_smoothness_weight=0.1,
+            final_retrain_mode=True,
         )
 
         self.assertEqual(student_summary["student_nfe_sequence_pair_count"], 1)
-        self.assertEqual(student_summary["student_nfe_smoothness_weight"], 0.1)
-        self.assertIn("student_nfe_smoothness_loss", student_summary["losses"][-1])
+        self.assertNotIn("student_nfe_smoothness_loss", student_summary["losses"][-1])
 
     def test_student_training_can_apply_teacher_scored_pseudo_targets(self) -> None:
         torch.manual_seed(4)
@@ -1016,11 +1006,11 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             steps=2,
             lr=1e-3,
             teacher_temperature=0.05,
-            series_unknown_dropout=0.0,
             pseudo_rows=pseudo_rows,
             pseudo_context_embeddings=embeddings,
             pseudo_schedule_grids=schedule_grids,
             pseudo_target_weight=0.25,
+            final_retrain_mode=True,
         )
 
         last_loss = student_summary["losses"][-1]
@@ -1362,24 +1352,25 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
 
         def _fake_student_training(*args, **kwargs) -> dict:
             del args
-            mode = str(kwargs.get("student_checkpoint_selection_mode", STUDENT_CHECKPOINT_SELECTION_FINAL_STEP))
+            final_retrain = bool(kwargs.get("final_retrain_mode", False))
+            mode = str(kwargs.get("student_checkpoint_selection_mode", STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1))
             steps = int(kwargs.get("steps", 1))
-            selected_step = 2 if mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1 else steps
+            selected_step = steps if final_retrain else 2
             return {
                 "student_objective": "teacher_weighted_density_mle_kl",
                 "student_checkpoint_selection_mode": mode,
                 "student_checkpoint_selection": {
-                    "selection_protocol": mode,
-                    "selection_mode": mode,
+                    "selection_protocol": "gipo_student_final_retrain_v1" if final_retrain else mode,
+                    "selection_mode": "final_retrain" if final_retrain else mode,
                     "selection_metric": "validation_ce_loss"
-                    if mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
-                    else "final_step",
+                    if not final_retrain
+                    else "configured_selected_step",
                     "selected_step": selected_step,
                     "history": [
                         {"step": 1, "validation_ce_loss": 1.0, "train_ce_loss": 1.0},
                         {"step": 2, "validation_ce_loss": 0.5, "train_ce_loss": 0.4},
                     ]
-                    if mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
+                    if not final_retrain
                     else [],
                     "uses_validation_labels": False,
                     "locked_test_used_for_selection": False,
@@ -1458,8 +1449,6 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "1",
                     "--student_steps",
                     "3",
-                    "--student_checkpoint_selection",
-                    "validation_ce_v1",
                     "--student_selection_holdout_fraction",
                     "0.25",
                     "--student_log_every",
@@ -1474,6 +1463,11 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "4",
                     "--transformer_dropout",
                     "0",
+                    "--gipo_teacher_conditioning_style",
+                    CONDITIONING_STYLE_ADALN_ZERO_V1,
+                    "--gipo_student_conditioning_style",
+                    CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+                    "--allow_noncanonical_conditioning",
                     "--student_weight_decay",
                     "0",
                     "--device",
@@ -1501,6 +1495,14 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             self.assertIn("student_selector_training", summary["student_training"])
             self.assertTrue(summary["student_training"]["student_validation_used_for_selection"])
             self.assertEqual(summary["teacher_final_retrain"]["selected_step"], 2)
+            self.assertEqual(summary["teacher_conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(summary["student_conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(
+                summary["conditioning_pair"],
+                f"teacher_{CONDITIONING_STYLE_ADALN_ZERO_V1}__student_{CONDITIONING_STYLE_ADDITIVE_MLP_V1}",
+            )
+            self.assertEqual(summary["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(summary["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
             self.assertEqual(
                 summary["teacher_checkpoint_selection"]["selection_protocol"],
                 TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
@@ -1512,6 +1514,12 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                 self.assertEqual(payload["student_final_retrain"]["selected_step"], 2)
                 self.assertTrue(payload["teacher_training"]["teacher_final_retrain"]["enabled"])
                 self.assertTrue(payload["teacher_training"]["final_teacher_retrain"]["enabled"])
+                self.assertEqual(payload["teacher_conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+                self.assertEqual(payload["student_conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+                self.assertEqual(
+                    payload["conditioning_pair"],
+                    f"teacher_{CONDITIONING_STYLE_ADALN_ZERO_V1}__student_{CONDITIONING_STYLE_ADDITIVE_MLP_V1}",
+                )
                 self.assertEqual(
                     payload["teacher_checkpoint_selection"]["selection_protocol"],
                     TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
@@ -1650,22 +1658,23 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             self.assertEqual(summary["teacher_architecture"], ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1)
             self.assertEqual(summary["student_architecture"], ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1)
             self.assertEqual(summary["gipo_conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(summary["teacher_conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(summary["student_conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(summary["conditioning_pair"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
             self.assertEqual(summary["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
             self.assertEqual(summary["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
             self.assertEqual(summary["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
             self.assertEqual(summary["teacher_model_config"]["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
             self.assertEqual(summary["student_model_config"]["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
-            self.assertEqual(summary["series_unknown_dropout"], 0.0)
             self.assertEqual(summary["student_weight_decay"], 0.0)
             self.assertEqual(summary["setting_feature_mode"], SETTING_ENCODER_MODE_CONTINUOUS_V3)
             self.assertEqual(summary["setting_encoder_mode"], SETTING_ENCODER_MODE_CONTINUOUS_V3)
             self.assertIn("fit_rows", summary["nfe_sequence_diagnostics"])
             membership = summary["split_membership"]
-            self.assertTrue({"fit", "context_disjoint", "series_disjoint"}.issubset(set(membership)))
+            self.assertTrue({"fit", "context_disjoint", "density_family_holdout"}.issubset(set(membership)))
             self.assertIn("density_family_holdout", membership)
             self.assertGreater(membership["fit"]["context_count"], 0)
             self.assertGreater(membership["context_disjoint"]["context_count"], 0)
-            self.assertGreater(membership["series_disjoint"]["series_count"], 0)
             self.assertEqual(len(membership["fit"]["context_id_hash"]), 64)
             self.assertIn("context_ids", membership["context_disjoint"])
 
@@ -1714,9 +1723,88 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             adaln_summary = train_gipo(adaln_args)
             self.assertEqual(adaln_summary["status"], "dry_run")
             self.assertEqual(adaln_summary["gipo_conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(adaln_summary["teacher_conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(adaln_summary["student_conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(adaln_summary["conditioning_pair"], CONDITIONING_STYLE_ADALN_ZERO_V1)
             self.assertTrue(adaln_summary["noncanonical_conditioning_allowed"])
             self.assertEqual(adaln_summary["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
             self.assertEqual(adaln_summary["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+
+            role_adaln_without_opt_in = build_train_argparser().parse_args(
+                [
+                    "--rows_csv",
+                    str(rows_path),
+                    "--context_embeddings_npz",
+                    str(embeddings_path),
+                    "--out_dir",
+                    str(root / "policy_role_adaln_rejected"),
+                    "--support_schedule_keys",
+                    "uniform,ays",
+                    "--teacher_unseen_selection_rows_csv",
+                    str(unseen_rows_path),
+                    "--gipo_teacher_conditioning_style",
+                    CONDITIONING_STYLE_ADALN_ZERO_V1,
+                    "--dry_run",
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "allow_noncanonical_conditioning"):
+                train_gipo(role_adaln_without_opt_in)
+
+            conflicting_args = build_train_argparser().parse_args(
+                [
+                    "--rows_csv",
+                    str(rows_path),
+                    "--context_embeddings_npz",
+                    str(embeddings_path),
+                    "--out_dir",
+                    str(root / "policy_conflicting_conditioning"),
+                    "--support_schedule_keys",
+                    "uniform,ays",
+                    "--teacher_unseen_selection_rows_csv",
+                    str(unseen_rows_path),
+                    "--gipo_conditioning_style",
+                    CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+                    "--gipo_teacher_conditioning_style",
+                    CONDITIONING_STYLE_ADALN_ZERO_V1,
+                    "--allow_noncanonical_conditioning",
+                    "--dry_run",
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "same-style shortcut|conflicting role-specific"):
+                train_gipo(conflicting_args)
+
+            role_specific_args = build_train_argparser().parse_args(
+                [
+                    "--rows_csv",
+                    str(rows_path),
+                    "--context_embeddings_npz",
+                    str(embeddings_path),
+                    "--out_dir",
+                    str(root / "policy_role_specific"),
+                    "--support_schedule_keys",
+                    "uniform,ays",
+                    "--context_sample_count",
+                    "24",
+                    "--teacher_unseen_selection_rows_csv",
+                    str(unseen_rows_path),
+                    "--gipo_teacher_conditioning_style",
+                    CONDITIONING_STYLE_ADALN_ZERO_V1,
+                    "--gipo_student_conditioning_style",
+                    CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+                    "--allow_noncanonical_conditioning",
+                    "--dry_run",
+                ]
+            )
+            role_specific_summary = train_gipo(role_specific_args)
+            self.assertEqual(role_specific_summary["status"], "dry_run")
+            self.assertEqual(role_specific_summary["teacher_conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(role_specific_summary["student_conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(
+                role_specific_summary["conditioning_pair"],
+                f"teacher_{CONDITIONING_STYLE_ADALN_ZERO_V1}__student_{CONDITIONING_STYLE_ADDITIVE_MLP_V1}",
+            )
+            self.assertEqual(role_specific_summary["teacher_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+            self.assertEqual(role_specific_summary["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
 
     def test_gipo_trainer_accepts_custom_utility_metric_columns_without_forecast_rewards(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1835,7 +1923,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            reference = uniform_reference_grid(4)
+            reference = uniform_reference_grid(64)
             config = build_setting_encoder_config(
                 SETTING_ENCODER_MODE_CONTINUOUS_V3,
                 observed_target_nfes=(4, 8, 12),
@@ -1845,7 +1933,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             setting_dim = setting_feature_dim(SETTING_ENCODER_MODE_CONTINUOUS_V3, config=config)
             student = GIPODensityQueryStudentTransformer(
                 setting_dim=setting_dim,
-                density_dim=4,
+                density_dim=64,
                 context_dim=2,
                 num_series=1,
                 hidden_dim=16,
@@ -1866,7 +1954,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "setting_dim": setting_dim,
                     "setting_feature_mode": SETTING_ENCODER_MODE_CONTINUOUS_V3,
                     "setting_encoder_config": config.to_payload(),
-                    "density_dim": 4,
+                    "density_dim": 64,
                     "context_dim": 2,
                     "series_index_map": {"series_0": 0},
                     "embedding_normalizer": {"mean": [0.0, 0.0], "std": [1.0, 1.0]},
@@ -1895,11 +1983,19 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "setting_dim"):
                 _load_student_checkpoint(bad_path)
 
+            noncanonical_bins_path = root / "noncanonical_bins_gipo_student.pt"
+            noncanonical_bins_payload = torch.load(checkpoint_path, map_location="cpu")
+            noncanonical_bins_payload["density_dim"] = 4
+            noncanonical_bins_payload["density_representation"] = density_metadata(uniform_reference_grid(4))
+            torch.save(noncanonical_bins_payload, noncanonical_bins_path)
+            with self.assertRaisesRegex(ValueError, "64 density bins"):
+                _load_student_checkpoint(noncanonical_bins_path)
+
             additive_path = root / "additive_gipo_student.pt"
             additive_payload = torch.load(checkpoint_path, map_location="cpu")
             additive_student = GIPODensityQueryStudentTransformer(
                 setting_dim=setting_dim,
-                density_dim=4,
+                density_dim=64,
                 context_dim=2,
                 num_series=1,
                 hidden_dim=16,
@@ -1925,7 +2021,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             adaln_payload = torch.load(checkpoint_path, map_location="cpu")
             adaln_student = GIPODensityQueryStudentTransformer(
                 setting_dim=setting_dim,
-                density_dim=4,
+                density_dim=64,
                 context_dim=2,
                 num_series=1,
                 hidden_dim=16,
@@ -1990,18 +2086,183 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "weighted_normalized_regret_v1"):
                 _load_student_checkpoint(legacy_selection_path)
 
+    def test_locked_report_conditioning_metadata_preserves_student_compatibility_field(self) -> None:
+        from genode.gipo.report_locked_test import _conditioning_metadata_for_summary
+
+        metadata = _conditioning_metadata_for_summary(
+            {
+                "student_model_config": {"conditioning_style": CONDITIONING_STYLE_ADALN_ZERO_V1},
+                "student_conditioning_style": CONDITIONING_STYLE_ADALN_ZERO_V1,
+                "conditioning_pair": "teacher_additive_mlp_v1__student_adaln_zero_v1",
+            },
+            {
+                "teacher_model_config": {"conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1},
+                "teacher_conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+            },
+        )
+
+        self.assertEqual(metadata["conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+        self.assertEqual(metadata["student_conditioning_style"], CONDITIONING_STYLE_ADALN_ZERO_V1)
+        self.assertEqual(metadata["teacher_conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+        self.assertEqual(metadata["conditioning_pair"], "teacher_additive_mlp_v1__student_adaln_zero_v1")
+
+    def test_teacher_student_conditioning_collector_validates_four_local_runs(self) -> None:
+        import importlib.util
+
+        script_path = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "verification_gipo_locked_multiaxis_b64_teacher_student_conditioning_ab_20260610"
+            / "collect_teacher_student_conditioning_ab_summary.py"
+        )
+        spec = importlib.util.spec_from_file_location("collect_teacher_student_conditioning_ab_summary", script_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        collector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(collector)
+
+        def write_json(path: Path, payload: dict[str, object]) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+        def training_payload(teacher_style: str, student_style: str, pair: str, noncanonical: bool) -> dict[str, object]:
+            return {
+                "status": "completed",
+                "teacher_conditioning_style": teacher_style,
+                "student_conditioning_style": student_style,
+                "conditioning_pair": pair,
+                "noncanonical_conditioning_allowed": noncanonical,
+                "density_representation": {"reference_bin_count": 64},
+                "locked_test_used_for_selection": False,
+                "teacher_checkpoint_selection_mode": "weighted_normalized_regret_v1",
+                "teacher_checkpoint_selection": {
+                    "selection_protocol": "weighted_normalized_regret_v1",
+                    "selected_step": 1,
+                    "selected_weighted_normalized_regret_v1_score": 0.1,
+                    "uses_unseen_nfe_selection_diagnostics": True,
+                    "uses_validation_labels": False,
+                    "locked_test_used_for_selection": False,
+                    "selected_normalized_regret_values": {
+                        "context_disjoint": 0.1,
+                        "density_family_holdout": 0.2,
+                        "unseen_nfe_holdout": 0.3,
+                    },
+                    "selected_component_weights": {
+                        "context_disjoint": 0.25,
+                        "density_family_holdout": 0.25,
+                        "unseen_nfe_holdout": 0.50,
+                    },
+                },
+                "teacher_final_retrain": {
+                    "enabled": True,
+                    "unseen_selection_diagnostics_used": True,
+                    "locked_test_used_for_selection": False,
+                },
+                "unseen_nfe_selection": {
+                    "enabled": True,
+                    "target_nfes": [6, 10, 14, 16],
+                    "raw_csv": "root/artifacts/unseen_train_supervision_rows.csv",
+                    "used_for_final_fitting": False,
+                    "locked_test_used_for_selection": False,
+                },
+                "student_checkpoint_selection_mode": "validation_ce_v1",
+                "student_checkpoint_selection": {
+                    "selection_protocol": "validation_ce_v1",
+                    "selection_metric": "validation_ce_loss",
+                    "selected_step": 1,
+                    "locked_test_used_for_selection": False,
+                },
+                "student_training": {
+                    "student_validation_used_for_selection": True,
+                    "locked_test_used_for_selection": False,
+                    "pseudo_distillation_used": False,
+                    "pseudo_target_weight": 0.0,
+                },
+                "student_final_retrain": {
+                    "enabled": True,
+                    "performed": True,
+                    "locked_test_used_for_selection": False,
+                },
+                "pseudo_distillation": {
+                    "pseudo_distillation_requested": False,
+                    "pseudo_target_weight": 0.0,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mixed_root = root / "mixed"
+            same_root = root / "same"
+            for label, run_spec in collector.RUN_SPECS.items():
+                run_root = mixed_root if run_spec["root_key"] == "mixed" else same_root
+                run_id = str(run_spec["run_id"])
+                teacher_style = str(run_spec["teacher"])
+                student_style = str(run_spec["student"])
+                pair = collector._conditioning_pair(teacher_style, student_style)
+                write_json(
+                    run_root / "policy_runs" / run_id / "gipo_training_summary.json",
+                    training_payload(teacher_style, student_style, pair, bool(run_spec["noncanonical_allowed"])),
+                )
+                write_json(
+                    run_root / "policy_runs" / run_id / "final_retrain_metadata.json",
+                    {
+                        "selection_mode": "weighted_normalized_regret_v1",
+                        "selection_policy": "weighted_normalized_regret_v1",
+                        "selection": {"locked_test_used_for_selection": False},
+                        "final_retrain": {"locked_test_used_for_selection": False},
+                        "script_contract": {
+                            "density_bin_count": 64,
+                            "student_selector_mode": "validation_ce_v1",
+                            "locked_test_used_for_selection": False,
+                            "teacher_conditioning_style": teacher_style,
+                            "student_conditioning_style": student_style,
+                            "conditioning_pair": pair,
+                        },
+                    },
+                )
+                for panel, nfes in collector.PANELS.items():
+                    write_json(
+                        run_root
+                        / "locked_reports"
+                        / panel
+                        / "student"
+                        / run_id
+                        / "locked_test_gipo_policy_summary.json",
+                        {
+                            "status": "completed",
+                            "conditioning_style": student_style,
+                            "student_conditioning_style": student_style,
+                            "teacher_conditioning_style": teacher_style,
+                            "conditioning_pair": pair,
+                            "density_representation": {"reference_bin_count": 64},
+                            "selection_mode": "reporting",
+                            "teacher_checkpoint_selection_mode": "weighted_normalized_regret_v1",
+                            "locked_test_used_for_selection": False,
+                            "missing_cell_count": 0,
+                            "target_nfe_values": nfes,
+                            "mean_crps": 1.0 + 0.01 * len(label),
+                            "mean_mase": 2.0 + 0.01 * len(panel),
+                        },
+                    )
+
+            payload = collector.collect(mixed_root, same_root)
+
+        self.assertTrue(payload["validation_passed"], payload["issues"])
+        self.assertEqual(len(payload["four_way_rows"]), 8)
+        self.assertEqual(len(payload["comparison_rows"]), 6)
+
     def test_nondefault_transformer_architecture_roundtrips_from_checkpoint_config(self) -> None:
         from genode.gipo.report_locked_test import _load_student_checkpoint
         from genode.gipo.report_teacher_oracle import _load_teacher_checkpoint
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            reference = uniform_reference_grid(4)
+            reference = uniform_reference_grid(64)
             setting_dim = int(setting_features("euler", 4).numel())
             student = build_gipo_student_model(
                 architecture=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
                 setting_dim=setting_dim,
-                density_dim=4,
+                density_dim=64,
                 context_dim=2,
                 num_series=1,
                 model_config={"hidden_dim": 24, "hidden_layers": 1, "attention_heads": 4, "dropout": 0.0},
@@ -2009,7 +2270,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             teacher = build_gipo_teacher_model(
                 architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
                 setting_dim=setting_dim,
-                density_dim=4,
+                density_dim=64,
                 context_dim=2,
                 num_series=1,
                 model_config={"hidden_dim": 28, "hidden_layers": 1, "attention_heads": 4, "dropout": 0.0},
@@ -2018,7 +2279,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                 "protocol": GIPO_PROTOCOL,
                 "model_payload_version": MODEL_PAYLOAD_VERSION,
                 "setting_dim": setting_dim,
-                "density_dim": 4,
+                "density_dim": 64,
                 "context_dim": 2,
                 "series_index_map": {"series_0": 0},
                 "embedding_normalizer": {"mean": [0.0, 0.0], "std": [1.0, 1.0]},
@@ -2047,8 +2308,8 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "teacher_model_config": teacher.model_config(),
                     "teacher_state": teacher.state_dict(),
                     "density_feature_normalizer": DensityFeatureNormalizer(
-                        mean=np.zeros(4, dtype=np.float32),
-                        std=np.ones(4, dtype=np.float32),
+                        mean=np.zeros(64, dtype=np.float32),
+                        std=np.ones(64, dtype=np.float32),
                     ).to_payload(),
                 },
                 teacher_path,
@@ -2085,7 +2346,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            reference = uniform_reference_grid(4)
+            reference = uniform_reference_grid(64)
             config = build_setting_encoder_config(
                 SETTING_ENCODER_MODE_CONTINUOUS_V3,
                 observed_target_nfes=(4, 8, 12),
@@ -2095,7 +2356,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             setting_dim = setting_feature_dim(SETTING_ENCODER_MODE_CONTINUOUS_V3, config=config)
             teacher = GIPODensityFormTeacherTransformer(
                 setting_dim=setting_dim,
-                density_dim=4,
+                density_dim=64,
                 context_dim=2,
                 num_series=1,
                 hidden_dim=16,
@@ -2114,13 +2375,13 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "setting_dim": setting_dim,
                     "setting_feature_mode": SETTING_ENCODER_MODE_CONTINUOUS_V3,
                     "setting_encoder_config": config.to_payload(),
-                    "density_dim": 4,
+                    "density_dim": 64,
                     "context_dim": 2,
                     "series_index_map": {"series_0": 0},
                     "embedding_normalizer": {"mean": [0.0, 0.0], "std": [1.0, 1.0]},
                     "density_feature_normalizer": DensityFeatureNormalizer(
-                        mean=np.zeros(4, dtype=np.float32),
-                        std=np.ones(4, dtype=np.float32),
+                        mean=np.zeros(64, dtype=np.float32),
+                        std=np.ones(64, dtype=np.float32),
                     ).to_payload(),
                     "density_representation": density_metadata(reference),
                     "teacher_training": _teacher_training_payload(),
@@ -2147,11 +2408,19 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "setting_dim"):
                 _load_teacher_checkpoint(bad_path)
 
+            noncanonical_bins_path = root / "noncanonical_bins_gipo_teacher.pt"
+            noncanonical_bins_payload = torch.load(checkpoint_path, map_location="cpu")
+            noncanonical_bins_payload["density_dim"] = 4
+            noncanonical_bins_payload["density_representation"] = density_metadata(uniform_reference_grid(4))
+            torch.save(noncanonical_bins_payload, noncanonical_bins_path)
+            with self.assertRaisesRegex(ValueError, "64 density bins"):
+                _load_teacher_checkpoint(noncanonical_bins_path)
+
             additive_path = root / "additive_gipo_teacher.pt"
             additive_payload = torch.load(checkpoint_path, map_location="cpu")
             additive_teacher = GIPODensityFormTeacherTransformer(
                 setting_dim=setting_dim,
-                density_dim=4,
+                density_dim=64,
                 context_dim=2,
                 num_series=1,
                 hidden_dim=16,
@@ -2177,7 +2446,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             adaln_payload = torch.load(checkpoint_path, map_location="cpu")
             adaln_teacher = GIPODensityFormTeacherTransformer(
                 setting_dim=setting_dim,
-                density_dim=4,
+                density_dim=64,
                 context_dim=2,
                 num_series=1,
                 hidden_dim=16,
@@ -2335,7 +2604,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            reference = uniform_reference_grid(4)
+            reference = uniform_reference_grid(64)
             locked_row = _row(schedule="uniform", split_phase="locked_test", series_id="series_0")
             rows_path = root / "locked_rows.csv"
             embeddings_path = root / "embeddings.npz"
@@ -2348,7 +2617,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             )
             student = GIPODensityQueryStudentTransformer(
                 setting_dim=int(setting_features("euler", 4).numel()),
-                density_dim=4,
+                density_dim=64,
                 context_dim=2,
                 num_series=1,
                 hidden_dim=16,
@@ -2366,7 +2635,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "student_objective": "teacher_weighted_density_mle_kl",
                     "student_state": student.state_dict(),
                     "setting_dim": int(setting_features("euler", 4).numel()),
-                    "density_dim": 4,
+                    "density_dim": 64,
                     "context_dim": 2,
                     "series_index_map": {"series_0": 0},
                     "embedding_normalizer": {"mean": [0.0, 0.0], "std": [1.0, 1.0]},
@@ -2423,7 +2692,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            reference = uniform_reference_grid(4)
+            reference = uniform_reference_grid(64)
             row = _row(schedule="uniform", split_phase="validation_tuning", series_id="series_0")
             row["evaluation_seed"] = 0
             rows_path = root / "validation_rows.csv"
@@ -2437,7 +2706,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
             )
             student = GIPODensityQueryStudentTransformer(
                 setting_dim=int(setting_features("euler", 4).numel()),
-                density_dim=4,
+                density_dim=64,
                 context_dim=2,
                 num_series=1,
                 hidden_dim=16,
@@ -2455,7 +2724,7 @@ class ContextDensityGIPOContractTests(unittest.TestCase):
                     "student_objective": "teacher_weighted_density_mle_kl",
                     "student_state": student.state_dict(),
                     "setting_dim": int(setting_features("euler", 4).numel()),
-                    "density_dim": 4,
+                    "density_dim": 64,
                     "context_dim": 2,
                     "series_index_map": {"series_0": 0},
                     "embedding_normalizer": {"mean": [0.0, 0.0], "std": [1.0, 1.0]},

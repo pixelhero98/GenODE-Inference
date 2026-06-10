@@ -67,6 +67,10 @@ def _script_contract(summary_root: Path, run_id: str) -> dict[str, Any]:
     return _load_json(summary_root / "policy_runs" / run_id / "final_retrain_metadata.json").get("script_contract", {})
 
 
+def _final_retrain_metadata(summary_root: Path, run_id: str) -> dict[str, Any]:
+    return _load_json(summary_root / "policy_runs" / run_id / "final_retrain_metadata.json")
+
+
 def _training_summary(root: Path, run_id: str) -> dict[str, Any]:
     return _load_json(root / "policy_runs" / run_id / "gipo_training_summary.json")
 
@@ -148,6 +152,10 @@ def _validate_training(
     student_selection = dict(training.get("student_checkpoint_selection", {}) or {})
     student_training = dict(training.get("student_training", {}) or {})
     student_retrain = dict(training.get("student_final_retrain", {}) or {})
+    _issue(issues, bool(student_training.get("pseudo_distillation_used", False)) is False, f"{label}: student pseudo distillation used")
+    _issue(issues, float(student_training.get("pseudo_target_weight", 0.0) or 0.0) == 0.0, f"{label}: student pseudo target weight is nonzero")
+    _issue(issues, float(training.get("student_nfe_smoothness_weight", 0.0) or 0.0) == 0.0, f"{label}: student smoothness weight is nonzero")
+    _issue(issues, float(student_training.get("student_nfe_smoothness_weight", 0.0) or 0.0) == 0.0, f"{label}: student training smoothness weight is nonzero")
     _issue(issues, str(training.get("student_checkpoint_selection_mode")) == REQUIRED_STUDENT_SELECTION_MODE, f"{label}: wrong student selection mode")
     _issue(issues, str(student_selection.get("selection_protocol")) == REQUIRED_STUDENT_SELECTION_MODE, f"{label}: wrong student selection protocol")
     _issue(issues, str(student_selection.get("selection_metric")) == "validation_ce_loss", f"{label}: wrong student selection metric")
@@ -165,6 +173,11 @@ def _validate_training(
     _issue(issues, int(contract.get("density_bin_count", -1)) == REQUIRED_DENSITY_BIN_COUNT, f"{label}: script contract wrong density bin count")
     _issue(issues, str(contract.get("student_selector_mode")) == REQUIRED_STUDENT_SELECTION_MODE, f"{label}: script contract wrong student selector")
     _issue(issues, bool(contract.get("locked_test_used_for_selection", False)) is False, f"{label}: script contract locked test selection")
+    final_metadata = _final_retrain_metadata(root, run_id)
+    final_retrain = dict(final_metadata.get("final_retrain", {}) or {})
+    final_selection = dict(final_metadata.get("selection", {}) or {})
+    _issue(issues, bool(final_retrain.get("locked_test_used_for_selection", False)) is False, f"{label}: final metadata retrain used locked test")
+    _issue(issues, bool(final_selection.get("locked_test_used_for_selection", False)) is False, f"{label}: final metadata selection used locked test")
 
 
 def _validate_report(
