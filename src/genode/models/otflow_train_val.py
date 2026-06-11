@@ -28,7 +28,7 @@ from genode.models.config import OTFlowConfig
 from genode.models.modules import EMAModel
 from genode.models.otflow_model import OTFlow
 from genode.data.otflow_datasets import L2FeatureMap, WindowedParamSequenceDataset, compute_basic_l2_metrics
-from genode.data.otflow_medical_datasets import SLEEP_EDF_DATASET_KEY, SLEEP_EDF_STAGE_NAMES
+from genode.data.otflow_medical_datasets import LONG_TERM_ST_DATASET_KEY, SLEEP_EDF_DATASET_KEY, SLEEP_EDF_STAGE_NAMES
 from genode.models.otflow_utils import flatten_dict, unflatten_to_nested, microstructure_series
 
 
@@ -1188,6 +1188,86 @@ def _collect_sleep_feature_examples(
     }
 
 
+def _collect_signal_feature_examples(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    sampling_rate_hz: float,
+    channel_names: Sequence[str],
+) -> Dict[str, Any]:
+    real_features: List[np.ndarray] = []
+    gen_features: List[np.ndarray] = []
+    feature_names: Optional[List[str]] = None
+    for row in rows:
+        seq = row.get("seq", {})
+        gen_signal = seq.get("gen_signal_raw")
+        true_signal = seq.get("true_signal_raw")
+        if gen_signal is None or true_signal is None:
+            continue
+        gen_vec, names = _sleep_feature_vector(
+            np.asarray(gen_signal, dtype=np.float32),
+            sampling_rate_hz=float(sampling_rate_hz),
+            channel_names=channel_names,
+        )
+        true_vec, _ = _sleep_feature_vector(
+            np.asarray(true_signal, dtype=np.float32),
+            sampling_rate_hz=float(sampling_rate_hz),
+            channel_names=channel_names,
+        )
+        if feature_names is None:
+            feature_names = list(names)
+        gen_features.append(gen_vec)
+        real_features.append(true_vec)
+    if not real_features:
+        empty = np.zeros((0, 1), dtype=np.float32)
+        return {"real_x": empty, "gen_x": empty, "feature_names": ["empty"]}
+    return {
+        "real_x": np.stack(real_features, axis=0).astype(np.float32),
+        "gen_x": np.stack(gen_features, axis=0).astype(np.float32),
+        "feature_names": list(feature_names or []),
+    }
+
+
+def _aggregate_signal_feature_distances(
+    *,
+    real_x: np.ndarray,
+    gen_x: np.ndarray,
+    feature_names: Sequence[str],
+) -> Dict[str, Any]:
+    real_x = np.asarray(real_x, dtype=np.float64)
+    gen_x = np.asarray(gen_x, dtype=np.float64)
+    if real_x.shape != gen_x.shape:
+        raise ValueError("Signal real_x and gen_x must share shape.")
+    if real_x.ndim != 2:
+        raise ValueError("Signal feature arrays must be 2D.")
+
+    unconditional_by_stat: Dict[str, float] = {}
+    unconditional_l1_by_stat: Dict[str, float] = {}
+    stat_scales: Dict[str, float] = {}
+    for feature_idx, feature_name in enumerate(feature_names):
+        real_col = real_x[:, int(feature_idx)]
+        gen_col = gen_x[:, int(feature_idx)]
+        scale = float(np.std(real_col) + 1e-6)
+        stat_scales[str(feature_name)] = scale
+        unconditional_by_stat[str(feature_name)] = _wasserstein_1d(real_col, gen_col) / scale
+        unconditional_l1_by_stat[str(feature_name)] = _hist_l1(
+            (gen_col - float(np.mean(real_col))) / scale,
+            (real_col - float(np.mean(real_col))) / scale,
+        )
+    unconditional = float(np.nanmean(np.asarray(list(unconditional_by_stat.values()), dtype=np.float64)))
+    u_l1 = float(np.nanmean(np.asarray(list(unconditional_l1_by_stat.values()), dtype=np.float64)))
+    return {
+        "unconditional_w1": unconditional,
+        "conditional_w1": unconditional,
+        "u_l1": u_l1,
+        "c_l1": u_l1,
+        "unconditional_w1_by_stat": unconditional_by_stat,
+        "conditional_w1_by_stat": dict(unconditional_by_stat),
+        "unconditional_l1_by_stat": unconditional_l1_by_stat,
+        "conditional_l1_by_stat": dict(unconditional_l1_by_stat),
+        "stat_scales": stat_scales,
+    }
+
+
 def _aggregate_sleep_feature_distances(
     *,
     real_x: np.ndarray,
@@ -1331,6 +1411,61 @@ def _evaluate_generation_main_metrics(
 ) -> Dict[str, Any]:
     dataset_kind = str(dataset_kind)
     dataset_metadata = dict(dataset_metadata or {})
+    if dataset_kind == LONG_TERM_ST_DATASET_KEY:
+        device = _downstream_device(cfg)
+        channel_names = list(dataset_metadata.get("channel_names", [])) or ["ECG"]
+        sampling_rate_hz = float(dataset_metadata.get("sampling_rate_hz", 100.0))
+        downstream = _collect_signal_feature_examples(
+            rows,
+            sampling_rate_hz=sampling_rate_hz,
+            channel_names=channel_names,
+        )
+        real_x = downstream["real_x"]
+        gen_x = downstream["gen_x"]
+        disc_auc = float("nan")
+        if len(gen_x) > 1 and len(real_x) > 1:
+            train_x, train_y, test_x, test_y = _pairwise_split(real_x, gen_x, seed=seed + 17)
+            if len(train_x) > 0 and len(test_x) > 0:
+                train_x, test_x = _standardize_pair(train_x, test_x)
+                disc_auc = _train_small_discriminator_auc(
+                    train_x,
+                    train_y.astype(np.float32),
+                    test_x,
+                    test_y,
+                    device=device,
+                    seed=seed + 47,
+                )
+        disc_auc_gap = float(abs(disc_auc - 0.5)) if np.isfinite(disc_auc) else float("nan")
+        w1_metrics = _aggregate_signal_feature_distances(
+            real_x=real_x,
+            gen_x=gen_x,
+            feature_names=downstream["feature_names"],
+        )
+        score_terms = [
+            disc_auc_gap,
+            np.log1p(w1_metrics["unconditional_w1"]) if np.isfinite(w1_metrics["unconditional_w1"]) else np.nan,
+        ]
+        finite_terms = np.asarray([term for term in score_terms if np.isfinite(term)], dtype=np.float64)
+        score_main = float(finite_terms.mean()) if finite_terms.size > 0 else float("nan")
+        return {
+            "tstr_macro_f1": float("nan"),
+            "disc_auc": float(disc_auc),
+            "disc_auc_gap": float(disc_auc_gap),
+            "unconditional_w1": float(w1_metrics["unconditional_w1"]),
+            "conditional_w1": float(w1_metrics["conditional_w1"]),
+            "u_l1": float(w1_metrics["u_l1"]),
+            "c_l1": float(w1_metrics["c_l1"]),
+            "unconditional_w1_by_stat": w1_metrics["unconditional_w1_by_stat"],
+            "conditional_w1_by_stat": w1_metrics["conditional_w1_by_stat"],
+            "unconditional_l1_by_stat": w1_metrics["unconditional_l1_by_stat"],
+            "conditional_l1_by_stat": w1_metrics["conditional_l1_by_stat"],
+            "stat_scales": w1_metrics["stat_scales"],
+            "score_main": float(score_main),
+            "label_horizon": int(max(1, horizon)),
+            "n_examples_real": int(len(real_x)),
+            "n_examples_gen": int(len(gen_x)),
+            "threshold_abs_move": float("nan"),
+        }
     if dataset_kind == SLEEP_EDF_DATASET_KEY:
         device = _downstream_device(cfg)
         channel_names = list(dataset_metadata.get("channel_names", []))
@@ -1796,10 +1931,10 @@ def eval_one_window(
     gen_raw_params = _denorm_params_seq(ds, gen_norm)
     true_raw_params = _denorm_params_seq(ds, true_norm)
 
-    if dataset_kind == SLEEP_EDF_DATASET_KEY:
+    if dataset_kind in {SLEEP_EDF_DATASET_KEY, LONG_TERM_ST_DATASET_KEY}:
         stage_index = -1
         cond_target = None
-        if ds.cond is not None and int(t0) < int(len(ds.cond)):
+        if dataset_kind == SLEEP_EDF_DATASET_KEY and ds.cond is not None and int(t0) < int(len(ds.cond)):
             cond_target = ds.cond[int(t0)].astype(np.float32, copy=False)
             if cond_target.ndim == 1 and cond_target.size > 0:
                 stage_index = int(np.argmax(cond_target))
@@ -2051,7 +2186,7 @@ def eval_many_windows(
     ret_acf = cmp.get("temporal", {}).get("ret", {}).get("acf_l1", {}).get("mean")
     vol_acf = cmp.get("temporal", {}).get("volatility", {}).get("acf_l1", {}).get("mean")
     ret_vol_terms = [v for v in (ret_acf, vol_acf) if isinstance(v, (int, float)) and np.isfinite(v)]
-    if dataset_kind == SLEEP_EDF_DATASET_KEY:
+    if dataset_kind in {SLEEP_EDF_DATASET_KEY, LONG_TERM_ST_DATASET_KEY}:
         temporal_entries = []
         for channel_payload in cmp.get("temporal", {}).values():
             if isinstance(channel_payload, dict):
@@ -2066,7 +2201,7 @@ def eval_many_windows(
             "ret_vol_acf_error": _wrap_scalar_as_mean_std(
                 float(np.mean(temporal_entries)) if temporal_entries else float("nan")
             ),
-            "impact_response_error": _wrap_scalar_as_mean_std(main_metrics["stage_mismatch_rate"]),
+            "impact_response_error": _wrap_scalar_as_mean_std(main_metrics.get("stage_mismatch_rate", float("nan"))),
             "efficiency_ms_per_sample": timing.get("latency_ms_per_sample", _wrap_scalar_as_mean_std(float("nan"))),
         }
     else:

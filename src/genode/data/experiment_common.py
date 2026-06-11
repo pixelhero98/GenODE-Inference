@@ -20,12 +20,18 @@ from genode.data.otflow_datasets import (
     default_optiver_npz_path,
 )
 from genode.data.otflow_medical_datasets import (
+    LONG_TERM_ST_DATASET_KEY,
+    LONG_TERM_ST_DEFAULT_STRIDE,
+    LONG_TERM_ST_HISTORY_LEN,
+    LONG_TERM_ST_HORIZON_LEN,
     SLEEP_EDF_DATASET_KEY,
+    build_dataset_splits_from_long_term_st,
     build_dataset_splits_from_sleep_edf,
+    default_long_term_st_data_path,
     default_sleep_edf_data_path,
 )
 
-DATASET_CHOICES = ("synthetic", "npz_l2", "optiver", "cryptos", "es_mbp_10", SLEEP_EDF_DATASET_KEY)
+DATASET_CHOICES = ("synthetic", "npz_l2", "optiver", "cryptos", "es_mbp_10", SLEEP_EDF_DATASET_KEY, LONG_TERM_ST_DATASET_KEY)
 OTFLOW_PAPER_DATASET_CHOICES = ("cryptos", "es_mbp_10", SLEEP_EDF_DATASET_KEY)
 OTFLOW_PAPER_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
     "cryptos": {
@@ -64,6 +70,21 @@ OTFLOW_PAPER_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
         "cond_standardize": False,
         "rollout_mode": "non_ar",
         "future_block_len": 3_000,
+    },
+    LONG_TERM_ST_DATASET_KEY: {
+        "levels": 1,
+        "token_dim": 1,
+        "history_len": LONG_TERM_ST_HISTORY_LEN,
+        "ctx_encoder": "hybrid",
+        "ctx_causal": True,
+        "ctx_local_kernel": 7,
+        "ctx_pool_scales": "8,32",
+        "use_time_features": False,
+        "use_time_gaps": False,
+        "use_cond_features": False,
+        "cond_standardize": False,
+        "rollout_mode": "non_ar",
+        "future_block_len": LONG_TERM_ST_HORIZON_LEN,
     },
 }
 OTFLOW_PAPER_BACKBONE_PRESET: Mapping[str, object] = OTFLOW_PAPER_BACKBONE_PRESETS["cryptos"]
@@ -127,6 +148,23 @@ OTFLOW_QUALITY_PRESETS: Mapping[str, Dict[str, object]] = {
         "use_time_gaps": False,
         "rollout_mode": "non_ar",
         "future_block_len": 3_000,
+    },
+    LONG_TERM_ST_DATASET_KEY: {
+        "levels": 1,
+        "token_dim": 1,
+        "history_len": LONG_TERM_ST_HISTORY_LEN,
+        "eval_nfe": 1,
+        "solver": "euler",
+        "ctx_encoder": "hybrid",
+        "ctx_causal": True,
+        "ctx_local_kernel": 7,
+        "ctx_pool_scales": "8,32",
+        "use_cond_features": False,
+        "cond_standardize": False,
+        "use_time_features": False,
+        "use_time_gaps": False,
+        "rollout_mode": "non_ar",
+        "future_block_len": LONG_TERM_ST_HORIZON_LEN,
     },
 }
 
@@ -207,6 +245,22 @@ DATASET_PLANS: Mapping[str, DatasetPlan] = {
         stride_eval=3000,
         batch_size=2,
     ),
+    LONG_TERM_ST_DATASET_KEY: DatasetPlan(
+        name=LONG_TERM_ST_DATASET_KEY,
+        dataset=LONG_TERM_ST_DATASET_KEY,
+        levels=1,
+        horizons=(LONG_TERM_ST_HORIZON_LEN, LONG_TERM_ST_HORIZON_LEN, LONG_TERM_ST_HORIZON_LEN),
+        history_options=(LONG_TERM_ST_HISTORY_LEN,),
+        nfe_options=(1,),
+        train_steps_tune=4000,
+        train_steps_final=12000,
+        eval_windows_tune=4,
+        eval_windows_final=8,
+        data_path=default_long_term_st_data_path(),
+        stride_train=LONG_TERM_ST_DEFAULT_STRIDE,
+        stride_eval=LONG_TERM_ST_DEFAULT_STRIDE,
+        batch_size=2,
+    ),
 }
 
 _OPTIONAL_CFG_OVERRIDES = (
@@ -256,7 +310,7 @@ def parse_float_list(text: str) -> List[float]:
 
 def get_otflow_paper_backbone_preset(dataset: str) -> Dict[str, object]:
     dataset_key = str(dataset).strip()
-    if dataset_key not in OTFLOW_PAPER_DATASET_CHOICES:
+    if dataset_key not in OTFLOW_PAPER_BACKBONE_PRESETS:
         raise ValueError(f"No OTFlow paper preset defined for dataset={dataset!r}")
     return copy.deepcopy(dict(OTFLOW_PAPER_BACKBONE_PRESETS[dataset_key]))
 
@@ -386,6 +440,16 @@ def build_dataset_splits(args, cfg: OTFlowConfig):
     if dataset == SLEEP_EDF_DATASET_KEY:
         return build_dataset_splits_from_sleep_edf(
             path=args.data_path or default_sleep_edf_data_path(),
+            cfg=cfg,
+            stride_train=args.stride_train,
+            stride_eval=args.stride_eval,
+            train_frac=args.train_frac,
+            val_frac=args.val_frac,
+            test_frac=args.test_frac,
+        )
+    if dataset == LONG_TERM_ST_DATASET_KEY:
+        return build_dataset_splits_from_long_term_st(
+            path=args.data_path or default_long_term_st_data_path(),
             cfg=cfg,
             stride_train=args.stride_train,
             stride_eval=args.stride_eval,

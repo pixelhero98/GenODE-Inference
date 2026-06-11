@@ -4,14 +4,18 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
 
+import genode.evaluation.otflow_evaluation_support as eval_support
 from genode.models.config import OTFlowConfig
 from genode.evaluation.fm_backbone_registry import (
     BACKBONE_NAME_OTFLOW,
     CONDITIONAL_GENERATION_FAMILY,
+    FORECAST_FAMILY,
     materialize_backbone_manifest,
 )
 from genode.data.otflow_datasets import build_dataset_splits_from_arrays
@@ -43,6 +47,53 @@ def _tiny_cfg(*, cond_dim: int = 0) -> OTFlowConfig:
 
 
 class ConditionalGenerationFixesTest(unittest.TestCase):
+    def test_forecast_manifest_checkpoint_branch_returns_manifest_train_steps(self) -> None:
+        cfg = _tiny_cfg(cond_dim=0)
+        cfg.apply_overrides(steps=8000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ckpt_path = root / "model.pt"
+            ckpt_path.write_bytes(b"placeholder")
+            (root / "checkpoint_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "dataset_key": "electricity",
+                        "benchmark_family": FORECAST_FAMILY,
+                        "train_steps": 8000,
+                        "history_len": int(cfg.history_len),
+                        "future_block_len": int(cfg.prediction_horizon),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            artifact = {
+                "checkpoint_path": str(ckpt_path),
+                "checkpoint_id": "otflow_forecast_electricity_8k",
+                "train_steps": 8000,
+                "train_budget_label": "8k",
+                "backbone_name": BACKBONE_NAME_OTFLOW,
+            }
+
+            with (
+                mock.patch.object(eval_support, "_resolved_manifest_artifact", return_value=artifact),
+                mock.patch.object(eval_support, "_resolve_checkpoint_path", return_value=ckpt_path),
+                mock.patch.object(eval_support, "load_checkpoint_model", return_value=(object(), cfg)),
+                mock.patch.object(eval_support, "_validate_forecast_checkpoint_task"),
+                mock.patch.object(eval_support, "_forecast_time_feature_mode", return_value="none"),
+                mock.patch.object(eval_support, "build_monash_forecast_splits", return_value={"stats": {}}),
+            ):
+                result = eval_support.load_forecast_checkpoint_splits(
+                    cli_args=SimpleNamespace(otflow_train_steps=8000),
+                    dataset_root=root,
+                    shared_backbone_root=root,
+                    dataset="electricity",
+                    device=torch.device("cpu"),
+                )
+
+        self.assertEqual(result["train_steps"], 8000)
+        self.assertEqual(result["train_budget_label"], "8k")
+        self.assertEqual(result["checkpoint_id"], "otflow_forecast_electricity_8k")
+
     def test_dataset_builder_updates_model_cond_dim_without_shadow_field(self) -> None:
         rng = np.random.default_rng(0)
         params = rng.normal(size=(80, 4)).astype(np.float32)

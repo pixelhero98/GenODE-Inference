@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping
 
-from genode.data.otflow_medical_constants import SLEEP_EDF_DATASET_KEY
+from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY, SLEEP_EDF_DATASET_KEY
 
 FORECAST_FAMILY = "forecast_extrapolation"
 CONDITIONAL_GENERATION_FAMILY = "conditional_generation"
@@ -109,6 +109,23 @@ PAPER_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
     ),
 )
 
+EXPERIMENTAL_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
+    DatasetExperimentSpec(
+        dataset_key=LONG_TERM_ST_DATASET_KEY,
+        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
+        display_name="long_term_st",
+        experiment_horizon=3000,
+        future_block_len=3000,
+        history_len=12000,
+        reasoning_axis="physical_time",
+        rationale="Long-Term ST uses a context-only ECG continuation task after strict WFDB validation and downsampling from 250 Hz to 100 Hz, matching the Sleep-EDF 120-second context and 30-second non-AR continuation while avoiding native-rate memory pressure.",
+    ),
+)
+
+SUPPORTED_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
+    PAPER_EXPERIMENT_SPECS + EXPERIMENTAL_EXPERIMENT_SPECS
+)
+
 CANONICAL_FORECAST_PAPER_DATASETS: tuple[str, ...] = tuple(
     spec.dataset_key for spec in PAPER_EXPERIMENT_SPECS if spec.benchmark_family == FORECAST_FAMILY
 )
@@ -119,6 +136,9 @@ CHECKPOINT_READY_FORECAST_DATASETS: tuple[str, ...] = tuple(CANONICAL_FORECAST_P
 CHECKPOINT_READY_CONDITIONAL_GENERATION_DATASETS: tuple[str, ...] = tuple(
     CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS
 )
+SUPPORTED_CONDITIONAL_GENERATION_DATASETS: tuple[str, ...] = tuple(
+    spec.dataset_key for spec in SUPPORTED_EXPERIMENT_SPECS if spec.benchmark_family == CONDITIONAL_GENERATION_FAMILY
+)
 
 
 def experiment_plan_specs() -> List[DatasetExperimentSpec]:
@@ -126,7 +146,7 @@ def experiment_plan_specs() -> List[DatasetExperimentSpec]:
 
 
 def experiment_plan_by_key() -> Dict[str, DatasetExperimentSpec]:
-    return {spec.dataset_key: spec for spec in PAPER_EXPERIMENT_SPECS}
+    return {spec.dataset_key: spec for spec in SUPPORTED_EXPERIMENT_SPECS}
 
 
 def canonical_forecast_paper_dataset_keys() -> tuple[str, ...]:
@@ -143,6 +163,10 @@ def checkpoint_ready_forecast_dataset_keys() -> tuple[str, ...]:
 
 def checkpoint_ready_conditional_generation_dataset_keys() -> tuple[str, ...]:
     return tuple(CHECKPOINT_READY_CONDITIONAL_GENERATION_DATASETS)
+
+
+def supported_conditional_generation_dataset_keys() -> tuple[str, ...]:
+    return tuple(SUPPORTED_CONDITIONAL_GENERATION_DATASETS)
 
 
 def validate_experiment_plan(specs: Iterable[DatasetExperimentSpec] | None = None) -> List[Dict[str, object]]:
@@ -185,6 +209,9 @@ __all__ = [
     "CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS",
     "CHECKPOINT_READY_FORECAST_DATASETS",
     "CHECKPOINT_READY_CONDITIONAL_GENERATION_DATASETS",
+    "EXPERIMENTAL_EXPERIMENT_SPECS",
+    "SUPPORTED_CONDITIONAL_GENERATION_DATASETS",
+    "SUPPORTED_EXPERIMENT_SPECS",
     "DatasetExperimentSpec",
     "FORECAST_FAMILY",
     "PAPER_EXPERIMENT_SPECS",
@@ -194,6 +221,7 @@ __all__ = [
     "checkpoint_ready_conditional_generation_dataset_keys",
     "experiment_plan_by_key",
     "experiment_plan_specs",
+    "supported_conditional_generation_dataset_keys",
     "validate_experiment_plan",
     "write_experiment_plan",
 ]

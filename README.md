@@ -93,6 +93,36 @@ Training requires:
 Rows are paired inside exact `(dataset, solver, NFE, context_id, seed)` cells.
 They must not cross solver, NFE, seed, series, target time, or context identity.
 
+## Long-Term ST Conditional Generation
+
+`long_term_st` is an opt-in conditional-generation ECG dataset. It is not part
+of the default canonical paper dataset list and is not checkpoint-ready until a
+prepared dataset and backbone checkpoint are explicitly produced.
+
+Place the three raw `long_term_st-*.zip` archives outside git, for example:
+
+```bash
+export OTFLOW_MEDICAL_STAGING_ROOT=../genode-medical-staging
+mkdir -p "$OTFLOW_MEDICAL_STAGING_ROOT/raw/long_term_st"
+```
+
+Prepare the context-only 100 Hz dataset:
+
+```bash
+python - <<'PY'
+from genode.data.otflow_medical_datasets import prepare_long_term_st_dataset
+prepare_long_term_st_dataset()
+PY
+```
+
+The preparer treats the archives as one WFDB source, extracts only `RECORDS`,
+`.hea`, and header-referenced `.dat` files, validates readable declared tails,
+skips suspect records, ignores sparse `.atr` annotations, omits header comments,
+and writes sanitized prepared arrays plus
+`data/long_term_st_100hz_context_only/manifest.json`. The locked task is
+`history_len=12000` and `future_block_len=3000`, i.e. a 120-second ECG context
+and 30-second continuation at 100 Hz with no external condition labels.
+
 ## Train GIPO
 
 Generate reusable fixed/SER rows and context embeddings with the schedule

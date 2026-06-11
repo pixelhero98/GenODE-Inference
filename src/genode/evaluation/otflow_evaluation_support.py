@@ -24,14 +24,16 @@ from genode.evaluation.fm_backbone_registry import (
 from genode.data.otflow_experiment_plan import (
     CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS,
     CANONICAL_FORECAST_PAPER_DATASETS,
+    SUPPORTED_CONDITIONAL_GENERATION_DATASETS as ALL_SUPPORTED_CONDITIONAL_GENERATION_DATASETS,
     experiment_plan_by_key,
 )
 from genode.data.otflow_forecast_data import build_monash_forecast_splits
-from genode.data.otflow_medical_datasets import SLEEP_EDF_DATASET_KEY
+from genode.data.otflow_medical_datasets import LONG_TERM_ST_DATASET_KEY, SLEEP_EDF_DATASET_KEY
 from genode.models.otflow_model import OTFlow
 from genode.data.otflow_paths import (
     default_cryptos_data_path,
     default_es_mbp_10_data_path,
+    default_long_term_st_data_path,
     default_sleep_edf_data_path,
     project_results_root,
     resolve_project_path,
@@ -73,6 +75,7 @@ CONDITIONAL_GENERATION_PHYSICAL_BATCH_SIZE_BY_DATASET: Dict[str, int] = {
     "cryptos": 8,
     "es_mbp_10": 8,
     SLEEP_EDF_DATASET_KEY: 2,
+    LONG_TERM_ST_DATASET_KEY: 2,
 }
 IGNORED_BASELINE_MODEL_CONFIG_KEYS = {
     "baseline_latent_dim",
@@ -88,6 +91,7 @@ IGNORED_BASELINE_MODEL_CONFIG_KEYS = {
 DEFAULT_FORECAST_DATASETS = tuple(CANONICAL_FORECAST_PAPER_DATASETS)
 SUPPORTED_FORECAST_DATASETS = tuple(CANONICAL_FORECAST_PAPER_DATASETS)
 DEFAULT_CONDITIONAL_GENERATION_DATASETS = tuple(CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS)
+SUPPORTED_CONDITIONAL_GENERATION_DATASETS = tuple(ALL_SUPPORTED_CONDITIONAL_GENERATION_DATASETS)
 ALL_SOLVER_ORDER: Tuple[str, ...] = ("euler", "heun", "midpoint_rk2", "dpmpp2m")
 SOLVER_RUNTIME_NAMES: Dict[str, str] = {
     "euler": "euler",
@@ -134,7 +138,7 @@ def parse_forecast_datasets(text: str) -> List[str]:
 
 def parse_conditional_generation_datasets(text: str) -> List[str]:
     names = parse_csv(text)
-    unknown = [name for name in names if name not in DEFAULT_CONDITIONAL_GENERATION_DATASETS]
+    unknown = [name for name in names if name not in SUPPORTED_CONDITIONAL_GENERATION_DATASETS]
     if unknown:
         raise ValueError(f"Unknown conditional-generation datasets: {unknown}")
     return names
@@ -455,6 +459,7 @@ def _resolved_manifest_artifact(
     *,
     benchmark_family: str,
     dataset_key: str,
+    train_steps: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     manifest_payload = _load_ready_backbone_manifest(cli_args)
     if manifest_payload is None:
@@ -464,7 +469,7 @@ def _resolved_manifest_artifact(
         backbone_name=BACKBONE_NAME_OTFLOW,
         benchmark_family=str(benchmark_family),
         dataset_key=str(dataset_key),
-        train_steps=int(getattr(cli_args, "otflow_train_steps", 20000)),
+        train_steps=int(train_steps if train_steps is not None else getattr(cli_args, "otflow_train_steps", 20000)),
         status="ready",
     )
 
@@ -530,13 +535,14 @@ def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
             except KeyError:
                 missing_artifacts.append(f"{FORECAST_FAMILY}:{dataset}")
         for dataset in conditional_generation_datasets:
+            expected_steps = int(resolved_train_steps(cli_args, str(dataset)))
             try:
                 artifact = find_backbone_artifact(
                     manifest_payload,
                     backbone_name=BACKBONE_NAME_OTFLOW,
                     benchmark_family=CONDITIONAL_GENERATION_FAMILY,
                     dataset_key=str(dataset),
-                    train_steps=int(getattr(cli_args, "otflow_train_steps", 20000)),
+                    train_steps=int(expected_steps),
                     status="ready",
                 )
                 ckpt_path = _resolve_checkpoint_path(str(artifact["checkpoint_path"]))
@@ -546,8 +552,8 @@ def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
                 missing_artifacts.append(f"{CONDITIONAL_GENERATION_FAMILY}:{dataset}")
         if missing_artifacts:
             errors.append(
-                "Backbone manifest is missing ready OTFlow checkpoints for the selected datasets and train_steps="
-                f"{int(getattr(cli_args, 'otflow_train_steps', 20000))}: {', '.join(missing_artifacts)}"
+                "Backbone manifest is missing ready OTFlow checkpoints for the selected datasets: "
+                f"{', '.join(missing_artifacts)}"
             )
         if missing_manifest_checkpoints:
             missing_lines = ", ".join(str(path) for path in missing_manifest_checkpoints)
@@ -603,9 +609,14 @@ def safe_spearman(x: Sequence[float], y: Sequence[float]) -> float:
 def _resolved_conditional_generation_physical_batch_size(dataset: str) -> int:
     dataset_key = str(dataset)
     default_value = int(CONDITIONAL_GENERATION_PHYSICAL_BATCH_SIZE_BY_DATASET[dataset_key])
-    if dataset_key != SLEEP_EDF_DATASET_KEY:
+    env_name = ""
+    if dataset_key == SLEEP_EDF_DATASET_KEY:
+        env_name = "OTFLOW_SLEEP_EDF_PHYSICAL_BATCH_SIZE"
+    elif dataset_key == LONG_TERM_ST_DATASET_KEY:
+        env_name = "OTFLOW_LONG_TERM_ST_PHYSICAL_BATCH_SIZE"
+    if not env_name:
         return default_value
-    raw = str(os.environ.get("OTFLOW_SLEEP_EDF_PHYSICAL_BATCH_SIZE", "") or "").strip()
+    raw = str(os.environ.get(env_name, "") or "").strip()
     if not raw:
         return default_value
     try:
@@ -622,12 +633,18 @@ def _dataset_data_path(cli_args: argparse.Namespace, dataset: str) -> str:
         return str(getattr(cli_args, "es_path", "") or default_es_mbp_10_data_path())
     if str(dataset) == SLEEP_EDF_DATASET_KEY:
         return str(getattr(cli_args, "sleep_edf_path", "") or default_sleep_edf_data_path())
+    if str(dataset) == LONG_TERM_ST_DATASET_KEY:
+        return str(getattr(cli_args, "long_term_st_path", "") or default_long_term_st_data_path())
     raise ValueError(f"Unknown conditional-generation dataset: {dataset}")
 
 
 def resolved_train_steps(cli_args: argparse.Namespace, dataset: str) -> int:
-    del dataset
-    return int(cli_args.steps) if int(cli_args.steps) > 0 else int(DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS)
+    if int(getattr(cli_args, "steps", 0)) > 0:
+        return int(cli_args.steps)
+    dataset_key = str(dataset)
+    if dataset_key == LONG_TERM_ST_DATASET_KEY:
+        return int(DATASET_PLANS[dataset_key].train_steps_final)
+    return int(DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS)
 
 
 def resolved_eval_horizon(cli_args: argparse.Namespace, dataset: str) -> int:
@@ -959,21 +976,21 @@ def load_forecast_checkpoint_splits(
     if manifest_artifact is not None:
         ckpt_path = _resolve_checkpoint_path(str(manifest_artifact["checkpoint_path"]))
         checkpoint_id = str(manifest_artifact["checkpoint_id"])
-        resolved_train_steps = int(manifest_artifact["train_steps"])
+        resolved_checkpoint_steps = int(manifest_artifact["train_steps"])
         resolved_budget_label = str(manifest_artifact["train_budget_label"])
         backbone_name = str(manifest_artifact.get("backbone_name", BACKBONE_NAME_OTFLOW))
     else:
         ckpt_path = shared_backbone_root / "forecast" / str(dataset) / "model.pt"
         metadata = _safe_json(shared_backbone_root / "forecast" / str(dataset) / "checkpoint_metadata.json") or {}
-        resolved_train_steps = int(metadata.get("train_steps", int(getattr(cli_args, "otflow_train_steps", 20000))))
-        resolved_budget_label = str(metadata.get("train_budget_label", train_budget_label(resolved_train_steps)))
+        resolved_checkpoint_steps = int(metadata.get("train_steps", int(getattr(cli_args, "otflow_train_steps", 20000))))
+        resolved_budget_label = str(metadata.get("train_budget_label", train_budget_label(resolved_checkpoint_steps)))
         checkpoint_id = str(
             metadata.get("checkpoint_id")
             or build_backbone_checkpoint_id(
                 backbone_name=BACKBONE_NAME_OTFLOW,
                 benchmark_family=FORECAST_FAMILY,
                 dataset_key=str(dataset),
-                train_steps=resolved_train_steps,
+                train_steps=resolved_checkpoint_steps,
             )
         )
         backbone_name = BACKBONE_NAME_OTFLOW
@@ -1009,7 +1026,7 @@ def load_forecast_checkpoint_splits(
         "checkpoint_path": ckpt_path,
         "checkpoint_id": str(checkpoint_id),
         "backbone_name": str(backbone_name),
-        "train_steps": int(resolved_train_steps),
+        "train_steps": int(resolved_checkpoint_steps),
         "train_budget_label": str(resolved_budget_label),
     }
 
@@ -1021,7 +1038,7 @@ def load_conditional_generation_checkpoint_splits(
     dataset: str,
     device: torch.device,
 ) -> Dict[str, Any]:
-    expected_train_steps = int(getattr(cli_args, "otflow_train_steps", 20000))
+    expected_train_steps = int(resolved_train_steps(cli_args, str(dataset)))
     experiment_spec = experiment_plan_by_key()[str(dataset)]
     expected_history_len = int(experiment_spec.history_len)
     expected_future_block_len = (
@@ -1033,11 +1050,12 @@ def load_conditional_generation_checkpoint_splits(
         cli_args,
         benchmark_family=CONDITIONAL_GENERATION_FAMILY,
         dataset_key=str(dataset),
+        train_steps=int(expected_train_steps),
     )
     if manifest_artifact is not None:
         ckpt_path = _resolve_checkpoint_path(str(manifest_artifact["checkpoint_path"]))
         checkpoint_id = str(manifest_artifact["checkpoint_id"])
-        resolved_train_steps = int(manifest_artifact["train_steps"])
+        resolved_checkpoint_steps = int(manifest_artifact["train_steps"])
         resolved_budget_label = str(manifest_artifact["train_budget_label"])
         backbone_name = str(manifest_artifact.get("backbone_name", BACKBONE_NAME_OTFLOW))
     else:
@@ -1058,15 +1076,15 @@ def load_conditional_generation_checkpoint_splits(
             )
             or {}
         )
-        resolved_train_steps = int(metadata.get("train_steps", int(getattr(cli_args, "otflow_train_steps", 20000))))
-        resolved_budget_label = str(metadata.get("train_budget_label", train_budget_label(resolved_train_steps)))
+        resolved_checkpoint_steps = int(metadata.get("train_steps", int(expected_train_steps)))
+        resolved_budget_label = str(metadata.get("train_budget_label", train_budget_label(resolved_checkpoint_steps)))
         checkpoint_id = str(
             metadata.get("checkpoint_id")
             or build_backbone_checkpoint_id(
                 backbone_name=BACKBONE_NAME_OTFLOW,
                 benchmark_family=CONDITIONAL_GENERATION_FAMILY,
                 dataset_key=str(dataset),
-                train_steps=resolved_train_steps,
+                train_steps=resolved_checkpoint_steps,
                 field_network_type=DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE,
             )
         )
@@ -1119,7 +1137,7 @@ def load_conditional_generation_checkpoint_splits(
         "checkpoint_path": ckpt_path,
         "checkpoint_id": str(checkpoint_id),
         "backbone_name": str(backbone_name),
-        "train_steps": int(resolved_train_steps),
+        "train_steps": int(resolved_checkpoint_steps),
         "train_budget_label": str(resolved_budget_label),
     }
 
@@ -1403,6 +1421,7 @@ __all__ = [
     "FORECAST_FAMILY",
     "LOCKED_TEST_PHASE",
     "SOLVER_RUNTIME_NAMES",
+    "SUPPORTED_CONDITIONAL_GENERATION_DATASETS",
     "SUPPORTED_FORECAST_DATASETS",
     "TRAIN_TUNING_PHASE",
     "TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED",

@@ -61,6 +61,7 @@ from genode.data.otflow_paths import (
     default_backbone_manifest_path,
     default_cryptos_data_path,
     default_es_mbp_10_data_path,
+    default_long_term_st_data_path,
     default_sleep_edf_data_path,
     project_outputs_root,
     project_paper_dataset_root,
@@ -271,10 +272,12 @@ def _data_path_fingerprints(cli_args: argparse.Namespace) -> Dict[str, Any]:
     cryptos_path = str(cli_args.cryptos_path).strip() or default_cryptos_data_path()
     es_path = str(cli_args.es_path).strip() or default_es_mbp_10_data_path()
     sleep_path = str(cli_args.sleep_edf_path).strip() or default_sleep_edf_data_path()
+    long_term_st_path = str(getattr(cli_args, "long_term_st_path", "")).strip() or default_long_term_st_data_path()
     return {
         "cryptos": _path_fingerprint(cryptos_path),
         "es_mbp_10": _path_fingerprint(es_path),
         "sleep_edf": _path_fingerprint(sleep_path),
+        "long_term_st": _path_fingerprint(long_term_st_path),
         "dataset_root": _path_fingerprint(str(cli_args.dataset_root)),
         "shared_backbone_root": _path_fingerprint(str(cli_args.shared_backbone_root)),
     }
@@ -289,6 +292,7 @@ def _sanitized_cli_args(cli_args: argparse.Namespace) -> Dict[str, Any]:
         "cryptos_path",
         "es_path",
         "sleep_edf_path",
+        "long_term_st_path",
     }
     payload: Dict[str, Any] = {}
     for key, value in vars(cli_args).items():
@@ -960,6 +964,7 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--cryptos_path", type=str, default="")
     ap.add_argument("--es_path", type=str, default="")
     ap.add_argument("--sleep_edf_path", type=str, default="")
+    ap.add_argument("--long_term_st_path", type=str, default="")
     ap.add_argument("--solver_names", type=str, default=",".join(ALL_SOLVER_ORDER))
     ap.add_argument("--target_nfe_values", type=str, default=",".join(str(x) for x in DEFAULT_TARGET_NFE_VALUES))
     ap.add_argument("--baseline_scheduler_names", type=str, default=",".join(DEFAULT_SCHEDULES))
