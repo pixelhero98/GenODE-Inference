@@ -108,8 +108,8 @@ class NineDatasetMatrixTests(unittest.TestCase):
             "solar_energy_10m": (1008, 1008),
             "traffic_hourly": (336, 168),
             "weather_daily": (120, 30),
-            "cryptos": (256, 200),
-            "lobster_synthetic": (256, 200),
+            "cryptos": (256, 128),
+            "lobster_synthetic": (256, 128),
             "long_term_st": (12000, 3000),
         }
         plans = experiment_plan_by_key()
@@ -122,16 +122,16 @@ class NineDatasetMatrixTests(unittest.TestCase):
         for dataset_key in ("cryptos", LOBSTER_SYNTHETIC_DATASET_KEY):
             preset = OTFLOW_PAPER_BACKBONE_PRESETS[dataset_key]
             self.assertEqual(preset["rollout_mode"], "non_ar")
-            self.assertEqual(preset["future_block_len"], 200)
+            self.assertEqual(preset["future_block_len"], 128)
             self.assertEqual(preset["history_len"], 256)
-            self.assertEqual(DATASET_PLANS[dataset_key].horizons, (200, 200, 200))
+            self.assertEqual(DATASET_PLANS[dataset_key].horizons, (128, 128, 128))
 
     def test_strict_temporal_overrides_reject_noncanonical_lengths_and_rollout(self) -> None:
         args = SimpleNamespace(eval_horizon=167, future_block_len=0, rollout_mode="non_ar")
         with self.assertRaisesRegex(ValueError, "Non-canonical --eval_horizon"):
             eval_support.resolved_eval_horizon(args, "traffic_hourly")
 
-        args = SimpleNamespace(eval_horizon=0, future_block_len=199, rollout_mode="non_ar")
+        args = SimpleNamespace(eval_horizon=0, future_block_len=127, rollout_mode="non_ar")
         with self.assertRaisesRegex(ValueError, "Non-canonical --future_block_len"):
             eval_support.resolved_future_block_len(args, "cryptos")
 
