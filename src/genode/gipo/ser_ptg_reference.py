@@ -388,7 +388,7 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build local-defect SER-PTG reference schedules for genODE.")
-    parser.add_argument("--dataset", default="san_francisco_traffic")
+    parser.add_argument("--dataset", default="traffic_hourly")
     parser.add_argument("--trace_variant", default="local_defect", choices=("local_defect",))
     parser.add_argument("--density_floor_eta", type=float, default=0.05)
     parser.add_argument("--seeds", default="0,1,2")

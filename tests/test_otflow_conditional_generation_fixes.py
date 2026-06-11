@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import tempfile
@@ -57,7 +57,7 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
             (root / "checkpoint_metadata.json").write_text(
                 json.dumps(
                     {
-                        "dataset_key": "electricity",
+                        "dataset_key": "traffic_hourly",
                         "benchmark_family": FORECAST_FAMILY,
                         "train_steps": 8000,
                         "history_len": int(cfg.history_len),
@@ -68,7 +68,7 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
             )
             artifact = {
                 "checkpoint_path": str(ckpt_path),
-                "checkpoint_id": "otflow_forecast_electricity_8k",
+                "checkpoint_id": "otflow_forecast_traffic_hourly_8k",
                 "train_steps": 8000,
                 "train_budget_label": "8k",
                 "backbone_name": BACKBONE_NAME_OTFLOW,
@@ -86,13 +86,13 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
                     cli_args=SimpleNamespace(otflow_train_steps=8000),
                     dataset_root=root,
                     shared_backbone_root=root,
-                    dataset="electricity",
+                    dataset="traffic_hourly",
                     device=torch.device("cpu"),
                 )
 
         self.assertEqual(result["train_steps"], 8000)
         self.assertEqual(result["train_budget_label"], "8k")
-        self.assertEqual(result["checkpoint_id"], "otflow_forecast_electricity_8k")
+        self.assertEqual(result["checkpoint_id"], "otflow_forecast_traffic_hourly_8k")
 
     def test_dataset_builder_updates_model_cond_dim_without_shadow_field(self) -> None:
         rng = np.random.default_rng(0)
@@ -147,13 +147,13 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
         model = OTFlow(cfg)
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            artifact_dir = root / "conditional_generation" / "sleep_edf" / "transformer"
+            artifact_dir = root / "conditional_generation" / "long_term_st" / "transformer"
             artifact_dir.mkdir(parents=True, exist_ok=True)
             torch.save({"cfg": cfg.to_dict(), "model_state": model.state_dict()}, artifact_dir / "model.pt")
             (artifact_dir / "checkpoint_metadata.json").write_text(
                 json.dumps(
                     {
-                        "dataset_key": "sleep_edf",
+                        "dataset_key": "long_term_st",
                         "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
                         "train_steps": 20000,
                         "history_len": 12000,
@@ -169,7 +169,7 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
                 load_conditional_generation_checkpoint_splits(
                     cli_args=args,
                     shared_backbone_root=root,
-                    dataset="sleep_edf",
+                    dataset="long_term_st",
                     device=torch.device("cpu"),
                 )
 
@@ -198,14 +198,14 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
         model = OTFlow(cfg)
         with tempfile.TemporaryDirectory() as tmpdir:
             matrix_root = Path(tmpdir) / "matrix"
-            artifact_dir = matrix_root / "otflow" / "conditional_generation" / "20k" / "sleep_edf" / "transformer"
+            artifact_dir = matrix_root / "otflow" / "conditional_generation" / "20k" / "long_term_st" / "transformer"
             artifact_dir.mkdir(parents=True, exist_ok=True)
             torch.save({"cfg": cfg.to_dict(), "model_state": model.state_dict()}, artifact_dir / "model.pt")
             (artifact_dir / "checkpoint_metadata.json").write_text(
                 json.dumps(
                     {
-                        "checkpoint_id": "sleep_bad",
-                        "dataset_key": "sleep_edf",
+                        "checkpoint_id": "long_term_bad",
+                        "dataset_key": "long_term_st",
                         "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
                         "train_steps": 20000,
                         "history_len": 12000,
@@ -225,15 +225,15 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
                 write_path=Path(tmpdir) / "manifest.json",
             )
 
-        sleep_rows = [
+        long_term_rows = [
             row
             for row in payload["artifacts"]
             if row["backbone_name"] == BACKBONE_NAME_OTFLOW
             and row["benchmark_family"] == CONDITIONAL_GENERATION_FAMILY
-            and row["dataset_key"] == "sleep_edf"
+            and row["dataset_key"] == "long_term_st"
         ]
-        self.assertEqual(sleep_rows[0]["status"], "invalid")
-        self.assertIn("metadata cond_dim=5", sleep_rows[0]["compatibility_error"])
+        self.assertEqual(long_term_rows[0]["status"], "invalid")
+        self.assertIn("metadata cond_dim=5", long_term_rows[0]["compatibility_error"])
 
     def test_sleep_window_selection_is_stage_stratified(self) -> None:
         rng = np.random.default_rng(2)

@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping
 
-from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY, SLEEP_EDF_DATASET_KEY
+from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 
 FORECAST_FAMILY = "forecast_extrapolation"
 CONDITIONAL_GENERATION_FAMILY = "conditional_generation"
@@ -28,46 +28,6 @@ class DatasetExperimentSpec:
 
 PAPER_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
     DatasetExperimentSpec(
-        dataset_key="wind_farms_wo_missing",
-        benchmark_family=FORECAST_FAMILY,
-        display_name="Wind Farms (Monash, W/O Missing)",
-        experiment_horizon=1440,
-        future_block_len=1440,
-        history_len=1440,
-        reasoning_axis="physical_time",
-        rationale="Minute-level extrapolation uses a one-day long horizon, and the rollout is horizon-wise so the scheduler is applied to one full non-AR conditional solve.",
-    ),
-    DatasetExperimentSpec(
-        dataset_key="san_francisco_traffic",
-        benchmark_family=FORECAST_FAMILY,
-        display_name="San Francisco Traffic (Monash)",
-        experiment_horizon=168,
-        future_block_len=168,
-        history_len=336,
-        reasoning_axis="physical_time",
-        rationale="Hourly traffic uses a one-week horizon, and the rollout is horizon-wise to avoid chunk-to-chunk distribution shift in the main schedule comparison.",
-    ),
-    DatasetExperimentSpec(
-        dataset_key="london_smart_meters_wo_missing",
-        benchmark_family=FORECAST_FAMILY,
-        display_name="London Smart Meters (Monash, W/O Missing)",
-        experiment_horizon=336,
-        future_block_len=336,
-        history_len=672,
-        reasoning_axis="physical_time",
-        rationale="Half-hourly smart meters use a one-week horizon, with a horizon-wise non-AR rollout so later steps are not influenced by an extra chunking policy.",
-    ),
-    DatasetExperimentSpec(
-        dataset_key="electricity",
-        benchmark_family=FORECAST_FAMILY,
-        display_name="Electricity (Monash)",
-        experiment_horizon=168,
-        future_block_len=168,
-        history_len=336,
-        reasoning_axis="physical_time",
-        rationale="Hourly electricity uses a one-week horizon, and the rollout is horizon-wise for a cleaner one-schedule-per-horizon comparison.",
-    ),
-    DatasetExperimentSpec(
         dataset_key="solar_energy_10m",
         benchmark_family=FORECAST_FAMILY,
         display_name="Solar Energy (Monash, 10m)",
@@ -76,6 +36,26 @@ PAPER_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
         history_len=1008,
         reasoning_axis="physical_time",
         rationale="10-minute solar uses a one-week horizon, and the rollout is horizon-wise so the non-AR comparison is not confounded by intermediate block stitching.",
+    ),
+    DatasetExperimentSpec(
+        dataset_key="traffic_hourly",
+        benchmark_family=FORECAST_FAMILY,
+        display_name="Traffic Hourly (Monash)",
+        experiment_horizon=168,
+        future_block_len=168,
+        history_len=336,
+        reasoning_axis="physical_time",
+        rationale="Hourly traffic uses a one-week horizon, and the rollout is horizon-wise to avoid chunk-to-chunk distribution shift in the main schedule comparison.",
+    ),
+    DatasetExperimentSpec(
+        dataset_key="weather_daily",
+        benchmark_family=FORECAST_FAMILY,
+        display_name="Weather Daily (Monash)",
+        experiment_horizon=30,
+        future_block_len=30,
+        history_len=120,
+        reasoning_axis="physical_time",
+        rationale="Daily weather uses the official 30-day horizon with a 120-day context, keeping the schedule comparison horizon-wise.",
     ),
     DatasetExperimentSpec(
         dataset_key="cryptos",
@@ -88,28 +68,15 @@ PAPER_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
         rationale="Conditional generation uses a 200-event horizon with a horizon-wise rollout so the scheduler is evaluated on the full event trajectory rather than on repeated sub-blocks.",
     ),
     DatasetExperimentSpec(
-        dataset_key="es_mbp_10",
+        dataset_key="lobster_synthetic",
         benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-        display_name="es_mbp_10",
+        display_name="lobster_synthetic",
         experiment_horizon=200,
         future_block_len=200,
         history_len=256,
         reasoning_axis="event_count",
-        rationale="The more irregular ES benchmark keeps the same 200-event horizon, but the main fairness criterion is horizon-wise rollout so schedule comparisons are made on a single full-horizon solve.",
+        rationale="LOBSTER-calibrated synthetic order-book continuation uses the same event-count context and horizon as cryptos, generated from the public lobiflow profile.",
     ),
-    DatasetExperimentSpec(
-        dataset_key=SLEEP_EDF_DATASET_KEY,
-        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-        display_name="sleep_edf",
-        experiment_horizon=3000,
-        future_block_len=3000,
-        history_len=12000,
-        reasoning_axis="physical_time",
-        rationale="Sleep-EDF uses a 120-second context and a 30-second stage-conditioned continuation at 100 Hz, keeping the main comparison on a single full-horizon non-AR solve while preserving the locked medical benchmark horizon.",
-    ),
-)
-
-EXPERIMENTAL_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
     DatasetExperimentSpec(
         dataset_key=LONG_TERM_ST_DATASET_KEY,
         benchmark_family=CONDITIONAL_GENERATION_FAMILY,
@@ -118,9 +85,11 @@ EXPERIMENTAL_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
         future_block_len=3000,
         history_len=12000,
         reasoning_axis="physical_time",
-        rationale="Long-Term ST uses a context-only ECG continuation task after strict WFDB validation and downsampling from 250 Hz to 100 Hz, matching the Sleep-EDF 120-second context and 30-second non-AR continuation while avoiding native-rate memory pressure.",
+        rationale="Long-Term ST uses a context-only ECG continuation task after strict WFDB validation and downsampling from 250 Hz to 100 Hz.",
     ),
 )
+
+EXPERIMENTAL_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = ()
 
 SUPPORTED_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
     PAPER_EXPERIMENT_SPECS + EXPERIMENTAL_EXPERIMENT_SPECS

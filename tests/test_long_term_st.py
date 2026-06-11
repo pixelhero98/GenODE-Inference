@@ -64,9 +64,9 @@ class LongTermSTTests(unittest.TestCase):
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         return manifest_path
 
-    def test_long_term_st_is_supported_but_not_default_conditional_generation(self) -> None:
-        self.assertNotIn(LONG_TERM_ST_DATASET_KEY, DEFAULT_CONDITIONAL_GENERATION_DATASETS)
-        self.assertNotIn(LONG_TERM_ST_DATASET_KEY, OTFLOW_PAPER_DATASET_CHOICES)
+    def test_long_term_st_is_default_conditional_generation(self) -> None:
+        self.assertIn(LONG_TERM_ST_DATASET_KEY, DEFAULT_CONDITIONAL_GENERATION_DATASETS)
+        self.assertIn(LONG_TERM_ST_DATASET_KEY, OTFLOW_PAPER_DATASET_CHOICES)
         self.assertEqual(parse_conditional_generation_datasets(LONG_TERM_ST_DATASET_KEY), [LONG_TERM_ST_DATASET_KEY])
         self.assertEqual(get_otflow_paper_backbone_preset(LONG_TERM_ST_DATASET_KEY)["future_block_len"], 3000)
 

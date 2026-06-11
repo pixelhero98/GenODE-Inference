@@ -6,11 +6,15 @@ import json
 from genode.data.molecule_xyz import (
     DEFAULT_MOLECULE_DATASET_KEY,
     DEFAULT_MOLECULE_SPLIT_SEED,
+    MOLECULE_GROUP_DATASET_KEYS,
+    build_balanced_molecule_stratum_groups,
     discover_molecule_xyz_strata,
     default_molecule_processed_dir,
     default_molecule_raw_zip,
+    prepare_molecule_xyz_group_datasets,
     prepare_molecule_xyz_all_strata,
     prepare_molecule_xyz_zip,
+    write_molecule_group_manifests,
 )
 
 
@@ -19,8 +23,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset_key", default=DEFAULT_MOLECULE_DATASET_KEY)
     parser.add_argument("--stratum", default="")
     parser.add_argument("--all_strata", action="store_true", default=False)
+    parser.add_argument("--balanced_groups", action="store_true", default=False)
+    parser.add_argument("--prepare_group_data", action="store_true", default=False)
     parser.add_argument("--discover_only", action="store_true", default=False)
     parser.add_argument("--zip_path", default=None)
+    parser.add_argument("--zip_paths", default="")
+    parser.add_argument("--group_root", default=None)
+    parser.add_argument("--group_dataset_keys", default=",".join(MOLECULE_GROUP_DATASET_KEYS))
     parser.add_argument("--processed_dir", default=None)
     parser.add_argument("--include_pattern", default="*")
     parser.add_argument("--exclude_pattern", default="")
@@ -30,6 +39,25 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argparser().parse_args()
+    if bool(args.balanced_groups):
+        zip_paths = [part.strip() for part in str(args.zip_paths or "").split(",") if part.strip()]
+        if not zip_paths:
+            zip_paths = [default_molecule_raw_zip(args.dataset_key, args.stratum) if args.zip_path is None else args.zip_path]
+        dataset_keys = tuple(part.strip() for part in str(args.group_dataset_keys).split(",") if part.strip())
+        if bool(args.discover_only):
+            print(json.dumps(build_balanced_molecule_stratum_groups(zip_paths, dataset_keys=dataset_keys), indent=2))
+            return
+        if bool(args.prepare_group_data):
+            metadata = prepare_molecule_xyz_group_datasets(
+                zip_paths,
+                args.group_root,
+                dataset_keys=dataset_keys,
+                split_seed=int(args.split_seed),
+            )
+        else:
+            metadata = write_molecule_group_manifests(zip_paths, args.group_root, dataset_keys=dataset_keys)
+        print(json.dumps(metadata, indent=2))
+        return
     zip_path = default_molecule_raw_zip(args.dataset_key, args.stratum) if args.zip_path is None else args.zip_path
     if bool(args.discover_only):
         print(json.dumps(discover_molecule_xyz_strata(zip_path), indent=2))

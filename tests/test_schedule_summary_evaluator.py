@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import contextlib
@@ -52,7 +52,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             fraction=0.20,
             seed=7,
             strata=20,
-            dataset="san_francisco_traffic",
+            dataset="traffic_hourly",
             sampling_mode=TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED,
             reference_examples=862,
             train_split_fraction=0.70,
@@ -63,7 +63,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             fraction=0.20,
             seed=7,
             strata=20,
-            dataset="san_francisco_traffic",
+            dataset="traffic_hourly",
             sampling_mode=TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED,
             reference_examples=862,
             train_split_fraction=0.70,
@@ -76,7 +76,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
     def test_schedule_evaluator_protocol_tracks_train_tuning_sampling_mode(self) -> None:
         base = [
             "--dataset",
-            "san_francisco_traffic",
+            "traffic_hourly",
             "--schedule_summary",
             "dummy.json",
             "--split_phase",
@@ -104,7 +104,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "dataset": "san_francisco_traffic",
+                        "dataset": "traffic_hourly",
                         "schedules": [
                             {
                                 "scheduler_key": SER_PTG_SCHEDULE_KEY,
@@ -125,7 +125,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             )
             predictions = load_schedule_predictions(
                 path,
-                dataset="san_francisco_traffic",
+                dataset="traffic_hourly",
                 solver_names=("heun",),
                 target_nfe_values=(4,),
             )
@@ -139,7 +139,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "dataset": "san_francisco_traffic",
+                        "dataset": "traffic_hourly",
                         "schedules": [
                             {
                                 "scheduler_key": "gipo_candidate_steps20",
@@ -160,7 +160,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing predictions"):
                 load_schedule_predictions(
                     path,
-                    dataset="san_francisco_traffic",
+                    dataset="traffic_hourly",
                     solver_names=("heun",),
                     target_nfe_values=(4,),
                     require_complete=True,
@@ -186,7 +186,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             baseline_rows=baseline_rows,
             comparator_rows=ser_rows,
             student_rows=student_rows,
-            dataset="san_francisco_traffic",
+            dataset="traffic_hourly",
             split_phase="locked_test",
             seeds=(0,),
             solver_names=("euler",),
@@ -220,7 +220,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             baseline_rows=baseline_rows,
             comparator_rows=[],
             student_rows=student_rows,
-            dataset="san_francisco_traffic",
+            dataset="traffic_hourly",
             split_phase="validation_tuning",
             seeds=(0,),
             solver_names=("euler",),
@@ -371,7 +371,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             build_argparser().parse_args(
                 [
                     "--dataset",
-                    "san_francisco_traffic",
+                    "traffic_hourly",
                     "--schedule_summary",
                     "summary.json",
                     "--split_phase",
@@ -387,7 +387,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             schedule_path.write_text(
                 json.dumps(
                     {
-                        "dataset": "san_francisco_traffic",
+                        "dataset": "traffic_hourly",
                         "schedules": [
                             {
                                 "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
@@ -425,7 +425,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             args = build_argparser().parse_args(
                 [
                     "--dataset",
-                    "san_francisco_traffic",
+                    "traffic_hourly",
                     "--schedule_summary",
                     str(schedule_path),
                     "--split_phase",
@@ -479,7 +479,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             schedule_path.write_text(
                 json.dumps(
                     {
-                        "dataset": "san_francisco_traffic",
+                        "dataset": "traffic_hourly",
                         "schedules": [
                             {
                                 "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
@@ -515,7 +515,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             args = build_argparser().parse_args(
                 [
                     "--dataset",
-                    "san_francisco_traffic",
+                    "traffic_hourly",
                     "--schedule_summary",
                     str(schedule_path),
                     "--split_phase",

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import tempfile
@@ -69,9 +69,9 @@ class ExtrapolationFixesTest(unittest.TestCase):
 
     def test_parse_forecast_datasets_rejects_high_level_ecg_until_checkpoint_is_supported(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unknown forecast datasets"):
-            parse_forecast_datasets(f"electricity,{LONG_TERM_HEADERED_ECG_DATASET_KEY}")
+            parse_forecast_datasets(f"traffic_hourly,{LONG_TERM_HEADERED_ECG_DATASET_KEY}")
         with self.assertRaisesRegex(ValueError, "Unknown forecast datasets"):
-            parse_forecast_datasets("electricity,not_a_dataset")
+            parse_forecast_datasets("traffic_hourly,not_a_dataset")
 
     def test_stale_ecg_manifest_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -262,7 +262,7 @@ class ExtrapolationFixesTest(unittest.TestCase):
         )
 
         class DummyDataset:
-            dataset_key = "electricity"
+            dataset_key = "traffic_hourly"
             split_name = "validation_tuning"
             horizon = 1
 
@@ -313,7 +313,7 @@ class ExtrapolationFixesTest(unittest.TestCase):
                 seed=evaluation_seed,
                 logical_seed=3,
                 scheduler_key="uniform",
-                dataset_key="electricity",
+                dataset_key="traffic_hourly",
                 split_phase="validation_tuning",
                 checkpoint_id="ck",
                 example_indices=np.asarray([0], dtype=np.int64),
@@ -341,7 +341,7 @@ class ExtrapolationFixesTest(unittest.TestCase):
             seed=9999,
             logical_seed=3,
             scheduler_key="uniform",
-            dataset_key="electricity",
+            dataset_key="traffic_hourly",
             split_phase="validation_tuning",
             checkpoint_id="ck",
             example_indices=np.asarray([0], dtype=np.int64),

@@ -10,13 +10,16 @@ import torch
 from genode.models.config import OTFlowConfig
 from genode.data.otflow_datasets import (
     DEFAULT_SYNTHETIC_LENGTH,
+    LOBSTER_SYNTHETIC_DATASET_KEY,
     build_dataset_splits_from_cryptos,
     build_dataset_splits_from_es_mbp_10,
+    build_dataset_splits_from_lobster_synthetic,
     build_dataset_splits_from_npz_l2,
     build_dataset_splits_from_optiver,
     build_dataset_splits_synthetic,
     default_cryptos_npz_path,
     default_es_mbp_10_npz_path,
+    default_lobster_synth_profile_path,
     default_optiver_npz_path,
 )
 from genode.data.otflow_medical_datasets import (
@@ -31,8 +34,8 @@ from genode.data.otflow_medical_datasets import (
     default_sleep_edf_data_path,
 )
 
-DATASET_CHOICES = ("synthetic", "npz_l2", "optiver", "cryptos", "es_mbp_10", SLEEP_EDF_DATASET_KEY, LONG_TERM_ST_DATASET_KEY)
-OTFLOW_PAPER_DATASET_CHOICES = ("cryptos", "es_mbp_10", SLEEP_EDF_DATASET_KEY)
+DATASET_CHOICES = ("synthetic", "npz_l2", "optiver", "cryptos", LOBSTER_SYNTHETIC_DATASET_KEY, LONG_TERM_ST_DATASET_KEY)
+OTFLOW_PAPER_DATASET_CHOICES = ("cryptos", LOBSTER_SYNTHETIC_DATASET_KEY, LONG_TERM_ST_DATASET_KEY)
 OTFLOW_PAPER_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
     "cryptos": {
         "levels": 10,
@@ -45,7 +48,7 @@ OTFLOW_PAPER_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
         "use_time_features": True,
         "use_time_gaps": False,
     },
-    "es_mbp_10": {
+    LOBSTER_SYNTHETIC_DATASET_KEY: {
         "levels": 10,
         "token_dim": 4,
         "history_len": 256,
@@ -55,21 +58,6 @@ OTFLOW_PAPER_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
         "ctx_pool_scales": "8,32",
         "use_time_features": True,
         "use_time_gaps": False,
-    },
-    SLEEP_EDF_DATASET_KEY: {
-        "levels": 1,
-        "token_dim": 3,
-        "history_len": 12_000,
-        "ctx_encoder": "hybrid",
-        "ctx_causal": True,
-        "ctx_local_kernel": 7,
-        "ctx_pool_scales": "8,32",
-        "use_time_features": False,
-        "use_time_gaps": False,
-        "use_cond_features": True,
-        "cond_standardize": False,
-        "rollout_mode": "non_ar",
-        "future_block_len": 3_000,
     },
     LONG_TERM_ST_DATASET_KEY: {
         "levels": 1,
@@ -121,7 +109,7 @@ OTFLOW_QUALITY_PRESETS: Mapping[str, Dict[str, object]] = {
         "ctx_local_kernel": 7,
         "ctx_pool_scales": "8,32",
     },
-    "es_mbp_10": {
+    LOBSTER_SYNTHETIC_DATASET_KEY: {
         "levels": 10,
         "token_dim": 4,
         "history_len": 256,
@@ -131,23 +119,6 @@ OTFLOW_QUALITY_PRESETS: Mapping[str, Dict[str, object]] = {
         "ctx_causal": True,
         "ctx_local_kernel": 7,
         "ctx_pool_scales": "8,32",
-    },
-    SLEEP_EDF_DATASET_KEY: {
-        "levels": 1,
-        "token_dim": 3,
-        "history_len": 12_000,
-        "eval_nfe": 1,
-        "solver": "euler",
-        "ctx_encoder": "hybrid",
-        "ctx_causal": True,
-        "ctx_local_kernel": 7,
-        "ctx_pool_scales": "8,32",
-        "use_cond_features": True,
-        "cond_standardize": False,
-        "use_time_features": False,
-        "use_time_gaps": False,
-        "rollout_mode": "non_ar",
-        "future_block_len": 3_000,
     },
     LONG_TERM_ST_DATASET_KEY: {
         "levels": 1,
@@ -217,33 +188,18 @@ DATASET_PLANS: Mapping[str, DatasetPlan] = {
         eval_windows_tune=10,
         eval_windows_final=20,
     ),
-    "es_mbp_10": DatasetPlan(
-        name="es_mbp_10",
-        dataset="es_mbp_10",
+    LOBSTER_SYNTHETIC_DATASET_KEY: DatasetPlan(
+        name=LOBSTER_SYNTHETIC_DATASET_KEY,
+        dataset=LOBSTER_SYNTHETIC_DATASET_KEY,
         levels=10,
-        horizons=(60, 300, 900),
+        horizons=(200, 200, 200),
         history_options=(256,),
         nfe_options=(1,),
         train_steps_tune=6000,
         train_steps_final=12000,
         eval_windows_tune=10,
         eval_windows_final=20,
-    ),
-    SLEEP_EDF_DATASET_KEY: DatasetPlan(
-        name=SLEEP_EDF_DATASET_KEY,
-        dataset=SLEEP_EDF_DATASET_KEY,
-        levels=1,
-        horizons=(3000, 3000, 3000),
-        history_options=(12000,),
-        nfe_options=(1,),
-        train_steps_tune=4000,
-        train_steps_final=12000,
-        eval_windows_tune=6,
-        eval_windows_final=12,
-        data_path=default_sleep_edf_data_path(),
-        stride_train=3000,
-        stride_eval=3000,
-        batch_size=2,
+        data_path=default_lobster_synth_profile_path(),
     ),
     LONG_TERM_ST_DATASET_KEY: DatasetPlan(
         name=LONG_TERM_ST_DATASET_KEY,
@@ -410,6 +366,18 @@ def build_dataset_splits(args, cfg: OTFlowConfig):
         return build_dataset_splits_from_optiver(
             path=args.data_path or default_optiver_npz_path(),
             cfg=cfg,
+            stride_train=args.stride_train,
+            stride_eval=args.stride_eval,
+            train_frac=args.train_frac,
+            val_frac=args.val_frac,
+            test_frac=args.test_frac,
+        )
+    if dataset == LOBSTER_SYNTHETIC_DATASET_KEY:
+        return build_dataset_splits_from_lobster_synthetic(
+            profile_path=args.data_path or default_lobster_synth_profile_path(),
+            cfg=cfg,
+            length=args.synthetic_length,
+            seed=args.seed,
             stride_train=args.stride_train,
             stride_eval=args.stride_eval,
             train_frac=args.train_frac,

@@ -47,18 +47,14 @@ PTG_X_LABELS: Dict[str, str] = {
 }
 
 DATASET_ORDER: Tuple[str, ...] = (
-    "electricity",
-    "london_smart_meters_wo_missing",
-    "san_francisco_traffic",
     "solar_energy_10m",
-    "wind_farms_wo_missing",
+    "traffic_hourly",
+    "weather_daily",
 )
 DATASET_LABELS: Dict[str, str] = {
-    "electricity": "Electricity",
-    "london_smart_meters_wo_missing": "London SM",
-    "san_francisco_traffic": "SF traffic",
     "solar_energy_10m": "Solar",
-    "wind_farms_wo_missing": "Wind",
+    "traffic_hourly": "Traffic",
+    "weather_daily": "Weather",
 }
 SOLVER_ORDER: Tuple[str, ...] = ("euler", "heun", "midpoint_rk2", "dpmpp2m")
 SOLVER_LABELS: Dict[str, str] = {
@@ -1252,11 +1248,9 @@ def build_figure(points: Sequence[Mapping[str, Any]], *, x_key: str = DEFAULT_MA
     y = np.asarray([float(point["observed_integration_gain_percent"]) for point in points], dtype=np.float64)
     fig, ax = plt.subplots(figsize=(8.2, 5.65))
     dataset_markers = {
-        "electricity": "o",
-        "london_smart_meters_wo_missing": "s",
-        "san_francisco_traffic": "^",
         "solar_energy_10m": "D",
-        "wind_farms_wo_missing": "P",
+        "traffic_hourly": "^",
+        "weather_daily": "o",
     }
     schedule_colors = {
         "ays": "#0072B2",

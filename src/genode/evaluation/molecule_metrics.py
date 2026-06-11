@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -15,6 +15,7 @@ from genode.data.molecule_xyz import (
     build_molecule_dataset_splits,
     default_molecule_processed_dir,
     kabsch_aligned_rmsd,
+    load_molecule_group_manifest,
     molecule_stats_from_mapping,
 )
 from genode.data.otflow_paths import project_root, resolve_project_path
@@ -195,6 +196,65 @@ def _aggregate(rows: Sequence[Mapping[str, float]]) -> Dict[str, Dict[str, float
             "max": float(np.max(values)),
         }
     return out
+
+
+def _numeric_leaves(value: Any, prefix: Tuple[str, ...] = ()) -> List[Tuple[Tuple[str, ...], float]]:
+    if isinstance(value, Mapping):
+        rows: List[Tuple[Tuple[str, ...], float]] = []
+        for key, child in value.items():
+            rows.extend(_numeric_leaves(child, (*prefix, str(key))))
+        return rows
+    if isinstance(value, (int, float, np.floating)) and np.isfinite(float(value)):
+        return [(prefix, float(value))]
+    return []
+
+
+def _set_nested_metric(payload: Dict[str, Any], path: Sequence[str], value: float) -> None:
+    cursor = payload
+    for part in path[:-1]:
+        cursor = cursor.setdefault(str(part), {})
+    cursor[str(path[-1])] = float(value)
+
+
+def aggregate_molecule_group_evaluation(
+    *,
+    dataset_key: str,
+    stratum_summaries: Sequence[Mapping[str, Any]],
+    group_root: str | Path | None = None,
+) -> Dict[str, Any]:
+    manifest = load_molecule_group_manifest(str(dataset_key), group_root)
+    allowed_strata = {str(row["stratum"]) for row in manifest.get("strata", [])}
+    weighted: Dict[Tuple[str, ...], List[Tuple[float, float]]] = {}
+    per_stratum: List[Dict[str, Any]] = []
+    for summary in stratum_summaries:
+        stratum = str(summary.get("stratum", ""))
+        if stratum not in allowed_strata:
+            raise ValueError(f"Stratum {stratum!r} is not part of molecule group {dataset_key!r}.")
+        weight = float(max(1, int(summary.get("examples", 1))))
+        per_stratum.append(
+            {
+                "stratum": stratum,
+                "examples": int(weight),
+                "metrics": dict(summary.get("metrics", {}) or {}),
+            }
+        )
+        for path, value in _numeric_leaves(summary.get("metrics", {})):
+            weighted.setdefault(path, []).append((float(value), weight))
+    metrics: Dict[str, Any] = {}
+    for path, values in sorted(weighted.items()):
+        total_weight = float(sum(weight for _, weight in values))
+        if total_weight <= 0.0:
+            continue
+        mean = float(sum(value * weight for value, weight in values) / total_weight)
+        _set_nested_metric(metrics, path, mean)
+    return {
+        "dataset_key": str(dataset_key),
+        "benchmark_family": str(manifest.get("benchmark_family", "molecule_3d")),
+        "stratum_count": int(len(per_stratum)),
+        "examples": int(sum(row["examples"] for row in per_stratum)),
+        "metrics": metrics,
+        "per_stratum": per_stratum,
+    }
 
 
 @torch.no_grad()

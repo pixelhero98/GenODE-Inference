@@ -33,6 +33,7 @@ from genode.models.otflow_model import OTFlow
 from genode.data.otflow_paths import (
     default_cryptos_data_path,
     default_es_mbp_10_data_path,
+    default_lobster_synthetic_profile_path,
     default_long_term_st_data_path,
     default_sleep_edf_data_path,
     project_results_root,
@@ -73,8 +74,7 @@ DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE = "transformer"
 DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS = 20_000
 CONDITIONAL_GENERATION_PHYSICAL_BATCH_SIZE_BY_DATASET: Dict[str, int] = {
     "cryptos": 8,
-    "es_mbp_10": 8,
-    SLEEP_EDF_DATASET_KEY: 2,
+    "lobster_synthetic": 8,
     LONG_TERM_ST_DATASET_KEY: 2,
 }
 IGNORED_BASELINE_MODEL_CONFIG_KEYS = {
@@ -610,9 +610,7 @@ def _resolved_conditional_generation_physical_batch_size(dataset: str) -> int:
     dataset_key = str(dataset)
     default_value = int(CONDITIONAL_GENERATION_PHYSICAL_BATCH_SIZE_BY_DATASET[dataset_key])
     env_name = ""
-    if dataset_key == SLEEP_EDF_DATASET_KEY:
-        env_name = "OTFLOW_SLEEP_EDF_PHYSICAL_BATCH_SIZE"
-    elif dataset_key == LONG_TERM_ST_DATASET_KEY:
+    if dataset_key == LONG_TERM_ST_DATASET_KEY:
         env_name = "OTFLOW_LONG_TERM_ST_PHYSICAL_BATCH_SIZE"
     if not env_name:
         return default_value
@@ -629,6 +627,8 @@ def _resolved_conditional_generation_physical_batch_size(dataset: str) -> int:
 def _dataset_data_path(cli_args: argparse.Namespace, dataset: str) -> str:
     if str(dataset) == "cryptos":
         return str(getattr(cli_args, "cryptos_path", "") or default_cryptos_data_path())
+    if str(dataset) == "lobster_synthetic":
+        return str(getattr(cli_args, "lobster_synthetic_profile_path", "") or default_lobster_synthetic_profile_path())
     if str(dataset) == "es_mbp_10":
         return str(getattr(cli_args, "es_path", "") or default_es_mbp_10_data_path())
     if str(dataset) == SLEEP_EDF_DATASET_KEY:
@@ -641,9 +641,6 @@ def _dataset_data_path(cli_args: argparse.Namespace, dataset: str) -> str:
 def resolved_train_steps(cli_args: argparse.Namespace, dataset: str) -> int:
     if int(getattr(cli_args, "steps", 0)) > 0:
         return int(cli_args.steps)
-    dataset_key = str(dataset)
-    if dataset_key == LONG_TERM_ST_DATASET_KEY:
-        return int(DATASET_PLANS[dataset_key].train_steps_final)
     return int(DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS)
 
 

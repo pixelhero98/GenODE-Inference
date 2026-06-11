@@ -22,26 +22,32 @@ import math
 import os
 from functools import lru_cache
 from typing import Dict, Optional, Tuple, Union
+import urllib.request
 
 import numpy as np
 import torch
 
 from genode.models.config import OTFlowConfig
-from genode.data.otflow_paths import project_data_root
+from genode.data.otflow_paths import default_lobster_synthetic_profile_path, project_data_root
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
 DEFAULT_SYNTHETIC_LENGTH = 2_000_000
 DEFAULT_CRYPTOS_NPZ = str(project_data_root() / "cryptos_binance_spot_monthly_1s_l10.npz")
 DEFAULT_ES_MBP_10_NPZ = str(project_data_root() / "es_mbp_10.npz")
+LOBIFLOW_CRYPTOS_NPZ_URL = (
+    "https://huggingface.co/datasets/mpstoryfans/lobiflow/resolve/main/"
+    "data/cryptos/cryptos_binance_spot_monthly_1s_l10.npz?download=1"
+)
 DEFAULT_OPTIVER_NPZ = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "data_optiver",
     "optiver_train_8stocks_l2.npz",
 )
-DEFAULT_LOBSTER_SYNTH_PROFILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "data_synthetic",
-    "lobster_free_sample_profile_10.json",
+DEFAULT_LOBSTER_SYNTH_PROFILE = default_lobster_synthetic_profile_path()
+LOBSTER_SYNTHETIC_DATASET_KEY = "lobster_synthetic"
+LOBIFLOW_SYNTHETIC_PROFILE_URL = (
+    "https://huggingface.co/datasets/mpstoryfans/lobiflow/resolve/main/"
+    "data/synthetic/lobster_free_sample_profile_10.json"
 )
 
 
@@ -669,25 +675,83 @@ def default_lobster_synth_profile_path() -> str:
     return DEFAULT_LOBSTER_SYNTH_PROFILE
 
 
+def default_lobster_synthetic_profile_path_alias() -> str:
+    return default_lobster_synth_profile_path()
+
+
+def validate_lobster_synth_profile(profile: Dict[str, object], *, source: str = "") -> Dict[str, object]:
+    profiles = profile.get("profiles", [])
+    if not isinstance(profiles, list) or not profiles:
+        raise ValueError(f"LOBSTER synthetic profile at {source or '<memory>'} contains no regimes.")
+    required = (
+        "rows",
+        "tick_size",
+        "log_spread_mean",
+        "log_spread_std",
+        "spread_phi",
+        "imb_mean",
+        "imb_std",
+        "imb_phi",
+        "ret_scale_ticks",
+        "jump_prob_5ticks",
+        "jump_prob_2ticks",
+        "seasonality_abs_ret",
+        "log_ask_gap_mean",
+        "log_ask_gap_std",
+        "log_bid_gap_mean",
+        "log_bid_gap_std",
+        "log_ask_vol_mean",
+        "log_ask_vol_std",
+        "log_bid_vol_mean",
+        "log_bid_vol_std",
+    )
+    for idx, regime in enumerate(profiles):
+        if not isinstance(regime, dict):
+            raise ValueError(f"LOBSTER profile regime {idx} must be an object.")
+        missing = [key for key in required if key not in regime]
+        if missing:
+            raise ValueError(f"LOBSTER profile regime {idx} is missing {missing}.")
+        if float(regime["tick_size"]) <= 0.0:
+            raise ValueError(f"LOBSTER profile regime {idx} has non-positive tick_size.")
+    return profile
+
+
 @lru_cache(maxsize=None)
 def load_lobster_synth_profile(path: Optional[str] = None) -> Dict[str, object]:
     resolved = path or default_lobster_synth_profile_path()
     with open(resolved, "r", encoding="utf-8") as f:
         profile = json.load(f)
-    profiles = profile.get("profiles", [])
-    if not profiles:
-        raise ValueError(f"LOBSTER synthetic profile at {resolved} contains no regimes.")
-    return profile
+    return validate_lobster_synth_profile(profile, source=str(resolved))
+
+
+def download_lobster_synthetic_profile(
+    path: str | os.PathLike[str] | None = None,
+    *,
+    url: str = LOBIFLOW_SYNTHETIC_PROFILE_URL,
+    force: bool = False,
+) -> Dict[str, object]:
+    resolved = os.fspath(path or default_lobster_synth_profile_path())
+    if force or not os.path.exists(resolved):
+        os.makedirs(os.path.dirname(os.path.abspath(resolved)), exist_ok=True)
+        with urllib.request.urlopen(str(url)) as response, open(resolved, "wb") as out_fh:
+            out_fh.write(response.read())
+        load_lobster_synth_profile.cache_clear()
+    return load_lobster_synth_profile(resolved)
 
 
 def _generate_synthetic_l2(
-    levels: int, length: int, seed: int, eps: float = 1e-8,
+    levels: int,
+    length: int,
+    seed: int,
+    eps: float = 1e-8,
+    *,
+    profile_path: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Generate LOBSTER-calibrated synthetic L2 data with persistent liquidity regimes."""
     rng = np.random.default_rng(seed)
     L = levels
     T = int(length)
-    profile = load_lobster_synth_profile()
+    profile = load_lobster_synth_profile(profile_path)
     regimes = [
         regime for regime in profile["profiles"]
         if len(regime["log_ask_vol_mean"]) >= L and len(regime["log_bid_vol_mean"]) >= L
@@ -1308,6 +1372,30 @@ def default_cryptos_npz_path() -> str:
     return DEFAULT_CRYPTOS_NPZ
 
 
+def _download_url_to_path(url: str, destination: str | os.PathLike[str]) -> str:
+    resolved = os.fspath(destination)
+    os.makedirs(os.path.dirname(os.path.abspath(resolved)), exist_ok=True)
+    with urllib.request.urlopen(str(url)) as response, open(resolved, "wb") as out_fh:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            out_fh.write(chunk)
+    return resolved
+
+
+def download_cryptos_npz(
+    path: str | os.PathLike[str] | None = None,
+    *,
+    url: str = LOBIFLOW_CRYPTOS_NPZ_URL,
+    force: bool = False,
+) -> str:
+    resolved = os.fspath(path or default_cryptos_npz_path())
+    if force or not os.path.exists(resolved):
+        _download_url_to_path(str(url), resolved)
+    return resolved
+
+
 def default_es_mbp_10_npz_path() -> str:
     return DEFAULT_ES_MBP_10_NPZ
 
@@ -1330,6 +1418,8 @@ def build_dataset_splits_from_cryptos(
 ) -> Dict[str, object]:
     """Named dataset helper for the prepared Tardis crypto L2 archive."""
     resolved_path = path or default_cryptos_npz_path()
+    if not os.path.exists(resolved_path):
+        download_cryptos_npz(resolved_path)
     return build_dataset_splits_from_npz_l2(
         path=resolved_path,
         cfg=cfg,
@@ -1431,6 +1521,56 @@ def build_dataset_splits_synthetic(
     )
 
 
+def build_dataset_splits_from_lobster_synthetic(
+    profile_path: str,
+    cfg: OTFlowConfig,
+    *,
+    length: int = DEFAULT_SYNTHETIC_LENGTH,
+    seed: int = 0,
+    stride_train: int = 1,
+    stride_eval: int = 1,
+    train_frac: float = 0.7,
+    val_frac: float = 0.1,
+    test_frac: Optional[float] = None,
+    train_end: Optional[int] = None,
+    val_end: Optional[int] = None,
+) -> Dict[str, object]:
+    resolved_profile = profile_path or default_lobster_synth_profile_path()
+    if not os.path.exists(resolved_profile):
+        download_lobster_synthetic_profile(resolved_profile)
+    validate_lobster_synth_profile(load_lobster_synth_profile(resolved_profile), source=resolved_profile)
+    ask_p, ask_v, bid_p, bid_v = _generate_synthetic_l2(
+        cfg.levels,
+        length,
+        seed,
+        cfg.eps,
+        profile_path=resolved_profile,
+    )
+    fm = L2FeatureMap(cfg.levels, cfg.eps)
+    params_raw, mids = fm.encode_sequence(ask_p, ask_v, bid_p, bid_v)
+    return build_dataset_splits_from_arrays(
+        params_raw=params_raw,
+        mids=mids,
+        cfg=cfg,
+        timestamps=None,
+        stride_train=stride_train,
+        stride_eval=stride_eval,
+        train_frac=train_frac,
+        val_frac=val_frac,
+        test_frac=test_frac,
+        train_end=train_end,
+        val_end=val_end,
+        dataset_kind=LOBSTER_SYNTHETIC_DATASET_KEY,
+        dataset_metadata={
+            "dataset_key": LOBSTER_SYNTHETIC_DATASET_KEY,
+            "source": "mpstoryfans/lobiflow data/synthetic/lobster_free_sample_profile_10.json",
+            "profile_name": os.path.basename(os.fspath(resolved_profile)),
+            "length": int(length),
+            "seed": int(seed),
+        },
+    )
+
+
 # -----------------------------
 # Basic metrics (raw space) for quick checks
 # -----------------------------
@@ -1452,15 +1592,20 @@ __all__ = [
     "WindowedParamSequenceDataset",
     "build_dataset_synthetic",
     "build_dataset_splits_from_arrays",
+    "build_dataset_splits_from_lobster_synthetic",
     "build_dataset_splits_from_npz_l2",
     "build_dataset_splits_from_es_mbp_10",
     "build_dataset_splits_from_optiver",
     "build_dataset_splits_synthetic",
     "default_cryptos_npz_path",
+    "download_cryptos_npz",
     "default_es_mbp_10_npz_path",
     "default_optiver_npz_path",
     "default_lobster_synth_profile_path",
+    "default_lobster_synthetic_profile_path",
+    "download_lobster_synthetic_profile",
     "load_lobster_synth_profile",
+    "validate_lobster_synth_profile",
     "standardize_params",
     "standardize_cond",
     "load_l2_npz",
@@ -1469,4 +1614,7 @@ __all__ = [
     "build_cond_features",
     "compute_basic_l2_metrics",
     "DEFAULT_SYNTHETIC_LENGTH",
+    "LOBIFLOW_CRYPTOS_NPZ_URL",
+    "LOBIFLOW_SYNTHETIC_PROFILE_URL",
+    "LOBSTER_SYNTHETIC_DATASET_KEY",
 ]

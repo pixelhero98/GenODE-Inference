@@ -19,11 +19,9 @@ DEFAULT_PNG = DEFAULT_FIGURE_DIR / "native_info_growth_schedule_trace.png"
 DEFAULT_PDF = DEFAULT_FIGURE_DIR / "native_info_growth_schedule_trace.pdf"
 
 DATASET_ORDER = (
-    "electricity",
-    "london_smart_meters_wo_missing",
-    "san_francisco_traffic",
     "solar_energy_10m",
-    "wind_farms_wo_missing",
+    "traffic_hourly",
+    "weather_daily",
 )
 SCHEDULE_ORDER = BASELINE_SCHEDULE_KEYS
 NATIVE_HARDNESS_TRACE_KEY = NATIVE_INFO_GROWTH_TRACE_KEY

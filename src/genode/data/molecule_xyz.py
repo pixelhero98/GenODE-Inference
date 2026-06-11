@@ -4,6 +4,7 @@ import fnmatch
 import json
 import math
 import re
+import copy
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -19,6 +20,7 @@ from genode.models.config import OTFlowConfig
 
 MOLECULE_BENCHMARK_FAMILY = "molecule_3d"
 DEFAULT_MOLECULE_DATASET_KEY = "molecule_3d"
+MOLECULE_GROUP_DATASET_KEYS = ("molecule_3d_set1", "molecule_3d_set2", "molecule_3d_set3")
 MOLECULE_TOKEN_DIM = 3
 MOLECULE_CONTEXT_ATOM_FEATURE_DIM = 11
 DEFAULT_MOLECULE_SPLIT_SEED = 20260610
@@ -192,8 +194,12 @@ def _category_from_name(name: str) -> str:
     parts = PurePosixPath(name).parts
     if len(parts) > 1 and parts[0] not in {"", "."}:
         return str(parts[0])
-    match = re.search(r"(Dynamic_[A-Za-z0-9_.-]+|Direct_[A-Za-z0-9_.-]+)", name)
-    return str(match.group(1)) if match else ""
+    stem = str(PurePosixPath(name).stem)
+    match = re.search(r"(Dynamic|Direct)_([A-Za-z0-9_.-]+?)_Iso\d+(?:\b|[_.-])", stem)
+    if match:
+        return f"{match.group(1)}_{match.group(2).rstrip('_.-')}"
+    match = re.search(r"(Dynamic|Direct)_([A-Za-z0-9_.-]+)", stem)
+    return f"{match.group(1)}_{match.group(2).rstrip('_.-')}" if match else ""
 
 
 def _iso_id_from_name(name: str) -> Optional[int]:
@@ -329,6 +335,195 @@ def discover_molecule_xyz_strata(zip_path: str | Path) -> Dict[str, Dict[str, An
                 "trainable": bool(not category.startswith("Direct_")),
             }
     return summaries
+
+
+def default_molecule_group_root() -> Path:
+    return resolve_project_path(Path("data") / MOLECULE_BENCHMARK_FAMILY)
+
+
+def default_molecule_group_manifest_path(dataset_key: str, group_root: str | Path | None = None) -> Path:
+    key = _clean_path_token(dataset_key, label="dataset_key")
+    root = default_molecule_group_root() if group_root is None else resolve_project_path(group_root)
+    return root / key / "group_manifest.json"
+
+
+def _source_zip_display_name(zip_path: str | Path) -> str:
+    return Path(zip_path).expanduser().resolve().name
+
+
+def _member_key(source_zip_name: str, stratum: str) -> str:
+    stem = Path(str(source_zip_name)).stem
+    return _clean_path_token(f"{stem}__{str(stratum)}", label="member_key")
+
+
+def discover_trainable_molecule_strata(zip_paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str]] = set()
+    for raw_path in zip_paths:
+        zip_path = Path(raw_path).expanduser().resolve()
+        if not zip_path.exists():
+            raise FileNotFoundError(f"Missing molecule trajectory zip: {zip_path}")
+        source_zip_name = _source_zip_display_name(zip_path)
+        for stratum_key, summary in discover_molecule_xyz_strata(zip_path).items():
+            stratum_name = str(summary.get("stratum") or stratum_key)
+            if not stratum_name or stratum_name.startswith("Direct_"):
+                continue
+            if not bool(summary.get("trainable", True)) or bool(summary.get("mixed_shape", False)):
+                continue
+            row_key = (source_zip_name, stratum_name)
+            if row_key in seen:
+                raise ValueError(f"Duplicate molecule stratum {source_zip_name}/{stratum_name}.")
+            seen.add(row_key)
+            member_key = _member_key(source_zip_name, stratum_name)
+            rows.append(
+                {
+                    "member_key": member_key,
+                    "stratum": stratum_name,
+                    "source_zip_name": source_zip_name,
+                    "source_zip_path": str(zip_path),
+                    "xyz_count": int(summary.get("xyz_count", 0)),
+                    "trajectory_count": int(summary.get("xyz_count", 0)),
+                    "atom_count": int(summary["atom_count"]),
+                    "formula": str(summary["formula"]),
+                    "fixed_atom_order": bool(summary.get("fixed_atom_order", True)),
+                    "mixed_shape": bool(summary.get("mixed_shape", False)),
+                    "trainable": True,
+                }
+            )
+    return sorted(rows, key=lambda row: (str(row["source_zip_name"]), str(row["stratum"])))
+
+
+def build_balanced_molecule_stratum_groups(
+    zip_paths: Sequence[str | Path],
+    *,
+    dataset_keys: Sequence[str] = MOLECULE_GROUP_DATASET_KEYS,
+) -> Dict[str, Any]:
+    keys = tuple(_clean_path_token(key, label="dataset_key") for key in dataset_keys)
+    if len(keys) <= 0:
+        raise ValueError("At least one molecule group dataset key is required.")
+    strata = discover_trainable_molecule_strata(zip_paths)
+    groups = [
+        {
+            "dataset_key": key,
+            "trajectory_count": 0,
+            "strata": [],
+        }
+        for key in keys
+    ]
+    for row in sorted(strata, key=lambda item: (-int(item["trajectory_count"]), str(item["source_zip_name"]), str(item["stratum"]))):
+        target_idx = min(range(len(groups)), key=lambda idx: (int(groups[idx]["trajectory_count"]), idx))
+        member = {
+            key: value
+            for key, value in row.items()
+            if key != "source_zip_path"
+        }
+        member["processed_dir"] = f"processed/{member['member_key']}"
+        groups[target_idx]["strata"].append(member)
+        groups[target_idx]["trajectory_count"] = int(groups[target_idx]["trajectory_count"]) + int(row["trajectory_count"])
+    group_counts = [int(group["trajectory_count"]) for group in groups]
+    total = int(sum(group_counts))
+    balance = {
+        "group_count": int(len(groups)),
+        "total_trajectory_count": total,
+        "group_trajectory_counts": group_counts,
+        "max_group_trajectory_count": int(max(group_counts, default=0)),
+        "min_group_trajectory_count": int(min(group_counts, default=0)),
+        "max_min_delta": int(max(group_counts, default=0) - min(group_counts, default=0)),
+        "group_trajectory_fractions": [float(count / max(1, total)) for count in group_counts],
+    }
+    return {
+        "dataset_keys": list(keys),
+        "source_zip_names": sorted({_source_zip_display_name(path) for path in zip_paths}),
+        "trainable_stratum_count": int(len(strata)),
+        "groups": groups,
+        "balance": balance,
+    }
+
+
+def write_molecule_group_manifests(
+    zip_paths: Sequence[str | Path],
+    group_root: str | Path | None = None,
+    *,
+    dataset_keys: Sequence[str] = MOLECULE_GROUP_DATASET_KEYS,
+) -> Dict[str, Any]:
+    grouping = build_balanced_molecule_stratum_groups(zip_paths, dataset_keys=dataset_keys)
+    root = default_molecule_group_root() if group_root is None else resolve_project_path(group_root)
+    manifest_paths: Dict[str, str] = {}
+    for group in grouping["groups"]:
+        dataset_key = str(group["dataset_key"])
+        manifest_path = root / dataset_key / "group_manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "manifest_version": "molecule_3d_group_manifest_v1",
+            "dataset_key": dataset_key,
+            "benchmark_family": MOLECULE_BENCHMARK_FAMILY,
+            "source": "local molecule trajectory zip files",
+            "source_zip_names": sorted({str(row["source_zip_name"]) for row in group["strata"]}),
+            "strata": group["strata"],
+            "balance": {
+                **dict(grouping["balance"]),
+                "dataset_key": dataset_key,
+                "trajectory_count": int(group["trajectory_count"]),
+                "stratum_count": int(len(group["strata"])),
+            },
+        }
+        manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        manifest_paths[dataset_key] = _project_display_path(manifest_path)
+    return {
+        "manifest_paths": manifest_paths,
+        "grouping": grouping,
+    }
+
+
+def load_molecule_group_manifest(dataset_key: str, group_root: str | Path | None = None) -> Dict[str, Any]:
+    manifest_path = default_molecule_group_manifest_path(dataset_key, group_root)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_key = _clean_path_token(dataset_key, label="dataset_key")
+    if str(payload.get("dataset_key")) != expected_key:
+        raise ValueError(f"Molecule group manifest {manifest_path} is for {payload.get('dataset_key')}, not {expected_key}.")
+    for row in payload.get("strata", []):
+        processed_dir = PurePosixPath(str(row.get("processed_dir", "")))
+        if processed_dir.is_absolute() or ".." in processed_dir.parts:
+            raise ValueError(f"Molecule group manifest has unsafe processed_dir={processed_dir}.")
+        if Path(str(row.get("source_zip_name", ""))).name != str(row.get("source_zip_name", "")):
+            raise ValueError("Molecule group manifest source_zip_name must be a file name, not a path.")
+    return payload
+
+
+def prepare_molecule_xyz_group_datasets(
+    zip_paths: Sequence[str | Path],
+    group_root: str | Path | None = None,
+    *,
+    dataset_keys: Sequence[str] = MOLECULE_GROUP_DATASET_KEYS,
+    split_seed: int = DEFAULT_MOLECULE_SPLIT_SEED,
+) -> Dict[str, Any]:
+    zip_by_name = {_source_zip_display_name(path): Path(path).expanduser().resolve() for path in zip_paths}
+    manifest_summary = write_molecule_group_manifests(zip_paths, group_root, dataset_keys=dataset_keys)
+    root = default_molecule_group_root() if group_root is None else resolve_project_path(group_root)
+    prepared: Dict[str, Any] = {}
+    for dataset_key in manifest_summary["grouping"]["dataset_keys"]:
+        manifest = load_molecule_group_manifest(str(dataset_key), root)
+        rows: Dict[str, Any] = {}
+        for member_idx, member in enumerate(manifest["strata"]):
+            source_zip = zip_by_name[str(member["source_zip_name"])]
+            processed_dir = root / str(dataset_key) / str(member["processed_dir"])
+            rows[str(member["member_key"])] = prepare_molecule_xyz_zip(
+                source_zip,
+                processed_dir,
+                dataset_key=str(dataset_key),
+                stratum=str(member["stratum"]),
+                split_seed=int(split_seed) + int(member_idx) + sum(ord(ch) for ch in str(dataset_key)),
+                trainable=True,
+            )
+        prepared[str(dataset_key)] = {
+            "dataset_key": str(dataset_key),
+            "manifest_path": _project_display_path(default_molecule_group_manifest_path(str(dataset_key), root)),
+            "prepared_strata": rows,
+        }
+    return {
+        "manifests": manifest_summary["manifest_paths"],
+        "prepared": prepared,
+    }
 
 
 def kabsch_rotation(moving: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -1373,9 +1568,71 @@ def configure_molecule_otflow(
     return cfg
 
 
+def build_molecule_group_dataset_splits(
+    *,
+    dataset_key: str,
+    group_root: str | Path | None = None,
+    cfg: OTFlowConfig | None = None,
+    history_len: int = 2,
+    future_horizon: int = 1,
+    rollout_mode: str = "autoregressive",
+    stride_train: int = 1,
+    stride_eval: int = 1,
+) -> Dict[str, Any]:
+    manifest = load_molecule_group_manifest(dataset_key, group_root)
+    root = default_molecule_group_root() if group_root is None else resolve_project_path(group_root)
+    base_cfg = OTFlowConfig() if cfg is None else cfg
+    strata: Dict[str, Any] = {}
+    aggregate: Dict[str, Any] = {
+        "dataset_key": str(dataset_key),
+        "benchmark_family": MOLECULE_BENCHMARK_FAMILY,
+        "stratum_count": 0,
+        "trajectory_count": 0,
+        "atom_counts": {},
+        "formulas": {},
+    }
+    for member in manifest.get("strata", []):
+        member_key = str(member["member_key"])
+        processed_dir = root / str(dataset_key) / str(member["processed_dir"])
+        atom_count = int(member["atom_count"])
+        member_cfg = configure_molecule_otflow(
+            copy.deepcopy(base_cfg),
+            history_len=int(history_len),
+            future_horizon=int(future_horizon),
+            rollout_mode=str(rollout_mode),
+            atom_count=atom_count,
+        )
+        splits = build_molecule_dataset_splits(
+            processed_dir=processed_dir,
+            cfg=member_cfg,
+            history_len=int(history_len),
+            future_horizon=int(future_horizon),
+            stride_train=int(stride_train),
+            stride_eval=int(stride_eval),
+            dataset_key=str(dataset_key),
+            stratum=str(member["stratum"]),
+        )
+        strata[member_key] = {
+            "member": dict(member),
+            "cfg": member_cfg,
+            "splits": splits,
+        }
+        aggregate["stratum_count"] = int(aggregate["stratum_count"]) + 1
+        aggregate["trajectory_count"] = int(aggregate["trajectory_count"]) + int(member.get("trajectory_count", member.get("xyz_count", 0)))
+        aggregate["atom_counts"][member_key] = atom_count
+        aggregate["formulas"][member_key] = str(member.get("formula", ""))
+    return {
+        "dataset_key": str(dataset_key),
+        "manifest": manifest,
+        "strata": strata,
+        "stats": aggregate,
+    }
+
+
 __all__ = [
     "ATOM_COVALENT_RADIUS",
     "DEFAULT_MOLECULE_DATASET_KEY",
+    "MOLECULE_GROUP_DATASET_KEYS",
     "DEFAULT_MOLECULE_SPLIT_SEED",
     "MOLECULE_BENCHMARK_FAMILY",
     "MOLECULE_CONTEXT_ATOM_FEATURE_DIM",
@@ -1384,19 +1641,27 @@ __all__ = [
     "MoleculeStats",
     "MoleculeWindowDataset",
     "align_window_to_reference",
+    "build_balanced_molecule_stratum_groups",
     "build_molecule_dataset_splits",
+    "build_molecule_group_dataset_splits",
     "configure_molecule_otflow",
+    "default_molecule_group_manifest_path",
+    "default_molecule_group_root",
     "default_molecule_processed_dir",
     "default_molecule_raw_zip",
+    "discover_trainable_molecule_strata",
     "discover_molecule_xyz_strata",
     "ensure_molecule_processed",
     "invert_aligned_coords",
     "kabsch_aligned_rmsd",
     "kabsch_rotation",
+    "load_molecule_group_manifest",
     "load_molecule_processed",
     "molecule_processed_metadata_path",
     "molecule_processed_npz_path",
     "molecule_stats_from_mapping",
     "prepare_molecule_xyz_all_strata",
+    "prepare_molecule_xyz_group_datasets",
     "prepare_molecule_xyz_zip",
+    "write_molecule_group_manifests",
 ]

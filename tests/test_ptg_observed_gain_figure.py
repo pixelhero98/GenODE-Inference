@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import tempfile
 import unittest
@@ -82,7 +82,7 @@ class PtgObservedGainFigureTests(unittest.TestCase):
     def test_observed_gain_calculation(self) -> None:
         rows = [
             {
-                "dataset": "electricity",
+                "dataset": "traffic_hourly",
                 "split_phase": "locked_test",
                 "checkpoint_id": "ckpt",
                 "backbone_name": "otflow",
@@ -110,19 +110,19 @@ class PtgObservedGainFigureTests(unittest.TestCase):
         expected = 0.5 * (20.0 + 25.0)
         self.assertAlmostEqual(stats[0]["integration_gain_percent_mean"], expected)
 
-    def test_20k_filter_has_180_points_and_excludes_late_power(self) -> None:
+    def test_20k_filter_has_108_points_and_excludes_late_power(self) -> None:
         zip_path = ptg_fig.DEFAULT_ZIP_PATH
         if not zip_path.exists():
             self.skipTest(f"Missing local 20k.zip at {zip_path}")
         rows = ptg_fig.load_observed_gain_rows(zip_path)
-        self.assertEqual(len(rows), 180)
+        self.assertEqual(len(rows), 108)
         self.assertFalse(any(key[3] == "late_power_3" for key in rows))
         self.assertEqual({key[3] for key in rows}, set(ptg_fig.TRANSFER_SCHEDULES))
 
     def test_synthetic_points_are_exact_scope(self) -> None:
         with mock.patch.object(ptg_fig, "build_fixed_schedule_grid", side_effect=_lightweight_grid):
             points = ptg_fig.build_points(ptg_fig.synthetic_payload(), ptg_fig.synthetic_observed_rows())
-        self.assertEqual(len(points), 180)
+        self.assertEqual(len(points), 108)
         self.assertEqual({point["schedule_key"] for point in points}, set(ptg_fig.TRANSFER_SCHEDULES))
         self.assertTrue(all("observed_integration_gain_percent" in point for point in points))
         for key in (
@@ -177,11 +177,11 @@ class PtgObservedGainFigureTests(unittest.TestCase):
             points = ptg_fig.build_points(ptg_fig.synthetic_payload(), ptg_fig.synthetic_observed_rows())
         summary = ptg_fig.summarize_ptg_points(points)
         self.assertEqual(summary["main_ptg_key"], "ptg_info_growth_raw")
-        self.assertEqual(summary["n_points"], 180)
+        self.assertEqual(summary["n_points"], 108)
         self.assertEqual(summary["observed_y_key"], "observed_integration_gain_percent")
         self.assertIn("ptg_info_growth_raw", summary["variants"])
 
-    def test_integration_gain_loader_has_180_points_and_excludes_nontransferred(self) -> None:
+    def test_integration_gain_loader_has_108_points_and_excludes_nontransferred(self) -> None:
         stats_rows = []
         for dataset in ptg_fig.DATASET_ORDER:
             for solver_key in ptg_fig.SOLVER_ORDER:
@@ -220,7 +220,7 @@ class PtgObservedGainFigureTests(unittest.TestCase):
             path = Path(tmpdir) / "stats.csv"
             ptg_fig.write_csv_rows(stats_rows, path)
             rows = ptg_fig.load_integration_gain_rows(path)
-        self.assertEqual(len(rows), 180)
+        self.assertEqual(len(rows), 108)
         self.assertEqual({key[3] for key in rows}, set(ptg_fig.TRANSFER_SCHEDULES))
         self.assertFalse(any(key[3] == "late_power_3" for key in rows))
 

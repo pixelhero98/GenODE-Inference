@@ -93,13 +93,43 @@ Training requires:
 Rows are paired inside exact `(dataset, solver, NFE, context_id, seed)` cells.
 They must not cross solver, NFE, seed, series, target time, or context identity.
 
-## Long-Term ST Conditional Generation
+## Evaluation Datasets
 
-`long_term_st` is an opt-in conditional-generation ECG dataset. It is not part
-of the default canonical paper dataset list and is not checkpoint-ready until a
-prepared dataset and backbone checkpoint are explicitly produced.
+The active experiment matrix has exactly nine public dataset keys:
 
-Place the three raw `long_term_st-*.zip` archives outside git, for example:
+- Forecast extrapolation: `solar_energy_10m`, `traffic_hourly`,
+  `weather_daily`.
+- Temporal conditional generation: `cryptos`, `lobster_synthetic`,
+  `long_term_st`.
+- Molecule 3D coordinate generation: `molecule_3d_set1`,
+  `molecule_3d_set2`, `molecule_3d_set3`.
+
+Retired keys are not accepted by active forecast or conditional-generation
+dataset parsers.
+
+Forecast datasets are downloaded from ForecastingData/Monash into
+`paper_datasets/`:
+
+```bash
+python - <<'PY'
+from genode.data.otflow_monash_datasets import download_monash_paper_datasets
+download_monash_paper_datasets("paper_datasets")
+PY
+```
+
+`cryptos` and `lobster_synthetic` use the public lobiflow data layout. Download
+the prepared crypto NPZ and synthetic profile into `data/`:
+
+```bash
+python - <<'PY'
+from genode.data.otflow_datasets import download_cryptos_npz, download_lobster_synthetic_profile
+download_cryptos_npz()
+download_lobster_synthetic_profile()
+PY
+```
+
+`long_term_st` is the canonical context-only ECG continuation dataset. Place the
+three raw `long_term_st-*.zip` archives outside git, for example:
 
 ```bash
 export OTFLOW_MEDICAL_STAGING_ROOT=../genode-medical-staging
@@ -122,6 +152,17 @@ and writes sanitized prepared arrays plus
 `data/long_term_st_100hz_context_only/manifest.json`. The locked task is
 `history_len=12000` and `future_block_len=3000`, i.e. a 120-second ECG context
 and 30-second continuation at 100 Hz with no external condition labels.
+
+Molecule group datasets are built from local molecule trajectory zip files. Each
+group contains whole fixed-shape strata; mixed atom counts are evaluated through
+per-stratum subdatasets rather than padded into one tensor.
+
+```bash
+genode-prepare-molecule-xyz \
+  --balanced_groups \
+  --zip_paths trajectory.zip,triangulene_3.zip \
+  --group_root data/molecule_3d
+```
 
 ## Train GIPO
 

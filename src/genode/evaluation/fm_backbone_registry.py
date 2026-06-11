@@ -15,12 +15,10 @@ from genode.data.otflow_experiment_plan import (
 from genode.data.otflow_medical_constants import (
     LONG_TERM_HEADERED_ECG_DATASET_KEY,
     LONG_TERM_ST_DATASET_KEY,
-    SLEEP_EDF_DATASET_KEY,
     default_long_term_headered_ecg_manifest_path,
     default_long_term_st_manifest_path,
-    default_sleep_edf_data_path,
 )
-from genode.data.otflow_paths import project_backbone_matrix_root as default_project_backbone_matrix_root, project_data_root, project_outputs_root, project_paper_dataset_root
+from genode.data.otflow_paths import default_lobster_synthetic_profile_path, project_backbone_matrix_root as default_project_backbone_matrix_root, project_data_root, project_outputs_root, project_paper_dataset_root
 
 FORECAST_FAMILY = "forecast_extrapolation"
 CONDITIONAL_GENERATION_FAMILY = "conditional_generation"
@@ -34,16 +32,14 @@ AUDIT_VERSION = "fm_backbone_manifest_check_v1"
 IMPORTED_EXTERNAL_SOURCE_KIND = "imported_external"
 
 ACTIVE_FORECAST_BACKBONE_BUDGETS: Mapping[str, Tuple[int, ...]] = {
-    "san_francisco_traffic": (4000, 8000, 12000, 16000, 20000),
-    "london_smart_meters_wo_missing": (4000, 8000, 12000, 16000, 20000),
-    "electricity": (4000, 8000, 12000, 16000, 20000),
     "solar_energy_10m": (4000, 8000, 12000, 16000, 20000),
-    "wind_farms_wo_missing": (4000, 8000, 12000, 16000, 20000),
+    "traffic_hourly": (4000, 8000, 12000, 16000, 20000),
+    "weather_daily": (4000, 8000, 12000, 16000, 20000),
 }
 ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS: Mapping[str, Tuple[int, ...]] = {
     "cryptos": (4000, 8000, 12000, 16000, 20000),
-    "es_mbp_10": (4000, 8000, 12000, 16000, 20000),
-    SLEEP_EDF_DATASET_KEY: (4000, 8000, 12000, 16000, 20000),
+    "lobster_synthetic": (4000, 8000, 12000, 16000, 20000),
+    LONG_TERM_ST_DATASET_KEY: (4000, 8000, 12000, 16000, 20000),
 }
 
 
@@ -785,11 +781,11 @@ def find_backbone_artifact(
 def build_runtime_probe(
     *,
     dataset_root: str | Path | None = None,
-    sleep_edf_path: str | Path | None = None,
+    lobster_synthetic_profile_path: str | Path | None = None,
     long_term_st_path: str | Path | None = None,
 ) -> Dict[str, Any]:
     resolved_dataset_root = Path(dataset_root or project_paper_dataset_root()).resolve()
-    resolved_sleep_path = Path(sleep_edf_path or default_sleep_edf_data_path()).resolve()
+    resolved_lobster_profile_path = Path(lobster_synthetic_profile_path or default_lobster_synthetic_profile_path()).resolve()
     resolved_long_term_st_path = Path(long_term_st_path or default_long_term_st_manifest_path().parent).resolve()
     monash_root = resolved_dataset_root / "monash"
     import_names = ("numpy", "torch", "wfdb", "pyedflib")
@@ -806,13 +802,12 @@ def build_runtime_probe(
         "monash_manifests": forecast_dataset_presence,
         LONG_TERM_HEADERED_ECG_DATASET_KEY: bool(default_long_term_headered_ecg_manifest_path(resolved_dataset_root).exists()),
         LONG_TERM_ST_DATASET_KEY: bool(default_long_term_st_manifest_path(resolved_long_term_st_path).exists()),
-        SLEEP_EDF_DATASET_KEY: bool(resolved_sleep_path.exists()),
         "cryptos_npz": bool((project_data_root() / "cryptos_binance_spot_monthly_1s_l10.npz").exists()),
-        "es_mbp_10_npz": bool((project_data_root() / "es_mbp_10.npz").exists()),
+        "lobster_synthetic_profile": bool(resolved_lobster_profile_path.exists()),
     }
     return {
         "dataset_root": str(resolved_dataset_root),
-        "sleep_edf_path": str(resolved_sleep_path),
+        "lobster_synthetic_profile_name": str(resolved_lobster_profile_path.name),
         "long_term_st_prepared_dir": str(resolved_long_term_st_path.name),
         "imports": imports,
         "dataset_presence": dataset_presence,
@@ -825,7 +820,7 @@ def build_backbone_readiness_audit(
     otflow_reuse_root: str | Path | None = None,
     imported_backbone_root: str | Path | None = None,
     dataset_root: str | Path | None = None,
-    sleep_edf_path: str | Path | None = None,
+    lobster_synthetic_profile_path: str | Path | None = None,
     long_term_st_path: str | Path | None = None,
     budget_steps: Sequence[int] = TRAIN_BUDGET_STEPS,
     seed: int = DEFAULT_SEED,
@@ -851,7 +846,7 @@ def build_backbone_readiness_audit(
         "normalization": normalization,
         "runtime_probe": build_runtime_probe(
             dataset_root=dataset_root,
-            sleep_edf_path=sleep_edf_path,
+            lobster_synthetic_profile_path=lobster_synthetic_profile_path,
             long_term_st_path=long_term_st_path,
         ),
     }

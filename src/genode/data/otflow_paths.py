@@ -59,6 +59,10 @@ def default_cryptos_data_path() -> str:
     return str(project_data_root() / "cryptos_binance_spot_monthly_1s_l10.npz")
 
 
+def default_lobster_synthetic_profile_path() -> str:
+    return str(project_data_root() / "lobster_synthetic" / "lobster_free_sample_profile_10.json")
+
+
 def default_es_mbp_10_data_path() -> str:
     return str(project_data_root() / "es_mbp_10.npz")
 

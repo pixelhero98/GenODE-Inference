@@ -25,7 +25,7 @@ from genode.models.config import OTFlowConfig
 from genode.models.otflow_train_val import evaluate_average_loss, save_json, seed_all, train_loop
 from genode.runtime import resolve_torch_device
 
-DEFAULT_DATASET = "san_francisco_traffic"
+DEFAULT_DATASET = "traffic_hourly"
 DEFAULT_HIDDEN_DIM = 160
 
 

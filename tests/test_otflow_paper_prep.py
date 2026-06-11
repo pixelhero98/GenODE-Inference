@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
@@ -110,13 +110,13 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
 
     def test_scheduler_cases_evaluate_uniform_first(self) -> None:
         args = runner.build_argparser().parse_args(["--baseline_scheduler_names", "ays,uniform"])
-        cases = runner._scheduler_cases_for_datasets(args, ["electricity"])
-        self.assertEqual([case["scheduler_key"] for case in cases["electricity"]], ["uniform", "ays"])
+        cases = runner._scheduler_cases_for_datasets(args, ["traffic_hourly"])
+        self.assertEqual([case["scheduler_key"] for case in cases["traffic_hourly"]], ["uniform", "ays"])
 
     def test_scheduler_cases_accept_explicit_experimental_reversed_keys(self) -> None:
         args = runner.build_argparser().parse_args(["--baseline_scheduler_names", "ays_reversed,uniform"])
-        cases = runner._scheduler_cases_for_datasets(args, ["electricity"])
-        self.assertEqual([case["scheduler_key"] for case in cases["electricity"]], ["uniform", "ays_reversed"])
+        cases = runner._scheduler_cases_for_datasets(args, ["traffic_hourly"])
+        self.assertEqual([case["scheduler_key"] for case in cases["traffic_hourly"]], ["uniform", "ays_reversed"])
         default_args = runner.build_argparser().parse_args([])
         self.assertNotIn("ays_reversed", runner._parse_schedule_names(default_args.baseline_scheduler_names))
 
@@ -126,7 +126,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 "benchmark_family": "forecast_extrapolation",
                 "split_phase": "locked_test",
                 "seed": 0,
-                "dataset": "electricity",
+                "dataset": "traffic_hourly",
                 "checkpoint_id": "ck",
                 "backbone_name": "otflow",
                 "train_steps": 20000,
@@ -142,7 +142,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 "benchmark_family": "forecast_extrapolation",
                 "split_phase": "locked_test",
                 "seed": 0,
-                "dataset": "electricity",
+                "dataset": "traffic_hourly",
                 "checkpoint_id": "ck",
                 "backbone_name": "otflow",
                 "train_steps": 20000,
@@ -337,13 +337,13 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as tmpdir:
             root = Path(tmpdir)
             rel_root = root.relative_to(PROJECT_ROOT).as_posix()
-            ckpt_path = root / "forecast" / "electricity" / "model.pt"
+            ckpt_path = root / "forecast" / "traffic_hourly" / "model.pt"
             ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             ckpt_path.write_bytes(b"checkpoint")
             args = runner.build_argparser().parse_args(
                 [
                     "--forecast_datasets",
-                    "electricity",
+                    "traffic_hourly",
                     "--conditional_generation_datasets",
                     "",
                     "--shared_backbone_root",
@@ -367,10 +367,10 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                             {
                                 "backbone_name": "otflow",
                                 "benchmark_family": "forecast_extrapolation",
-                                "dataset_key": "electricity",
+                                "dataset_key": "traffic_hourly",
                                 "train_steps": 20000,
                                 "train_budget_label": "20k",
-                                "checkpoint_id": "electricity_otflow_forecast_20k_seed0",
+                                "checkpoint_id": "traffic_hourly_otflow_forecast_20k_seed0",
                                 "checkpoint_path": "outputs/missing_preflight_checkpoint/model.pt",
                                 "summary_path": "",
                                 "status": "ready",
@@ -384,7 +384,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             args = runner.build_argparser().parse_args(
                 [
                     "--forecast_datasets",
-                    "electricity",
+                    "traffic_hourly",
                     "--conditional_generation_datasets",
                     "",
                     "--backbone_manifest",
@@ -502,7 +502,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "--out_root",
                     tmpdir,
                     "--forecast_datasets",
-                    "electricity",
+                    "traffic_hourly",
                     "--conditional_generation_datasets",
                     "",
                     "--baseline_scheduler_names",
@@ -582,7 +582,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                         "--out_root",
                         tmpdir,
                         "--forecast_datasets",
-                        "electricity",
+                        "traffic_hourly",
                         "--conditional_generation_datasets",
                         "",
                         "--baseline_scheduler_names",
@@ -622,7 +622,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                             row_recorder=recorder,
                             split_phase=split_phase,
                             seeds=[0],
-                            scheduler_cases_by_dataset={"electricity": [{"scheduler_key": "uniform"}]},
+                            scheduler_cases_by_dataset={"traffic_hourly": [{"scheduler_key": "uniform"}]},
                         )
                 finally:
                     recorder["fh"].close()
@@ -652,7 +652,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "--out_root",
                     tmpdir,
                     "--forecast_datasets",
-                    "electricity",
+                    "traffic_hourly",
                     "--conditional_generation_datasets",
                     "",
                     "--baseline_scheduler_names",
@@ -697,7 +697,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                         row_recorder=recorder,
                         split_phase="validation_tuning",
                         seeds=[5],
-                        scheduler_cases_by_dataset={"electricity": [{"scheduler_key": "uniform"}]},
+                        scheduler_cases_by_dataset={"traffic_hourly": [{"scheduler_key": "uniform"}]},
                     )
             finally:
                 recorder["fh"].close()
@@ -776,9 +776,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 imported_backbone_root=root / "imported",
                 write_path=root / "manifest.json",
             )
-        self.assertEqual(int(payload.get("artifact_count", 0)), 40)
+        self.assertEqual(int(payload.get("artifact_count", 0)), 30)
         self.assertEqual(int(payload.get("ready_count", -1)), 0)
-        self.assertEqual(int(payload.get("missing_count", 0)), 40)
+        self.assertEqual(int(payload.get("missing_count", 0)), 30)
 
 
 if __name__ == "__main__":

@@ -1248,7 +1248,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate generated schedule-summary grids on train-tuning, validation, or locked test splits.")
-    parser.add_argument("--dataset", default="san_francisco_traffic")
+    parser.add_argument("--dataset", default="traffic_hourly")
     parser.add_argument("--schedule_summary", required=True)
     parser.add_argument("--split_phase", choices=(TRAIN_TUNING_PHASE, VALIDATION_PHASE, LOCKED_TEST_PHASE), required=True)
     parser.add_argument("--out_dir", default=str(project_outputs_root() / "schedule_summary_evaluation"))
