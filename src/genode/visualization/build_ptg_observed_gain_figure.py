@@ -15,6 +15,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
 from genode.data.otflow_paths import project_root
 
 PROJECT_ROOT = project_root()
@@ -63,7 +64,7 @@ SOLVER_LABELS: Dict[str, str] = {
     "midpoint_rk2": "Midpoint RK2",
     "dpmpp2m": "DPM++2M",
 }
-TARGET_NFES: Tuple[int, ...] = (4, 8, 12)
+TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 TRANSFER_SCHEDULES: Tuple[str, ...] = ("ays", "gits", "ots")
 INTEGRATION_SCHEDULES: Tuple[str, ...] = ("uniform", *TRANSFER_SCHEDULES)
 SCHEDULE_LABELS: Dict[str, str] = {

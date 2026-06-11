@@ -83,6 +83,33 @@ def density_mass_hash(density_mass: Sequence[float], *, reference_time_grid: Seq
     )
 
 
+def reverse_density_mass(
+    density_mass: Sequence[float],
+    *,
+    eps: float = DEFAULT_DENSITY_EPS,
+) -> Tuple[float, ...]:
+    return sanitize_density_mass(tuple(reversed(tuple(float(x) for x in density_mass))), eps=float(eps))
+
+
+def average_density_masses(
+    left_density_mass: Sequence[float],
+    right_density_mass: Sequence[float],
+    *,
+    left_weight: float = 0.5,
+    right_weight: float = 0.5,
+    eps: float = DEFAULT_DENSITY_EPS,
+) -> Tuple[float, ...]:
+    left = np.asarray(sanitize_density_mass(left_density_mass, eps=0.0), dtype=np.float64)
+    right = np.asarray(sanitize_density_mass(right_density_mass, eps=0.0), dtype=np.float64)
+    if left.shape != right.shape:
+        raise ValueError("Cannot average density masses with different shapes.")
+    lw = float(left_weight)
+    rw = float(right_weight)
+    if not np.isfinite(lw) or not np.isfinite(rw) or lw < 0.0 or rw < 0.0 or lw + rw <= 0.0:
+        raise ValueError("Density average weights must be finite, nonnegative, and have positive sum.")
+    return sanitize_density_mass(lw * left + rw * right, eps=float(eps))
+
+
 def grid_to_density_mass(
     time_grid: Sequence[float],
     *,
@@ -197,6 +224,7 @@ def density_metadata(reference_time_grid: Sequence[float] | None = None) -> Dict
 
 
 __all__ = [
+    "average_density_masses",
     "DEFAULT_DENSITY_BIN_COUNT",
     "DEFAULT_DENSITY_EPS",
     "DEFAULT_LOG_DENSITY_EPS",
@@ -208,6 +236,7 @@ __all__ = [
     "density_metadata",
     "grid_to_density_mass",
     "reference_grid_hash",
+    "reverse_density_mass",
     "sanitize_density_mass",
     "uniform_reference_grid",
     "validate_reference_grid",

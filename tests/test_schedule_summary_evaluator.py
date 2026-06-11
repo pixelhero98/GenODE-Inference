@@ -18,7 +18,11 @@ from genode.gipo.evaluate_schedule_summary import (
     load_schedule_predictions,
     select_best_validation_schedule,
 )
-from genode.gipo.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
+from genode.gipo.ser_ptg_reference import (
+    SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
+    SER_PTG_REVERSED_SCHEDULE_KEY,
+    SER_PTG_SCHEDULE_KEY,
+)
 from genode.evaluation.otflow_evaluation_support import (
     TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED,
     choose_forecast_train_tuning_indices,
@@ -130,6 +134,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 target_nfe_values=(4,),
             )
         self.assertIn((SER_PTG_SCHEDULE_KEY, "heun", 4), predictions)
+        self.assertIn((SER_PTG_REVERSED_SCHEDULE_KEY, "heun", 4), predictions)
+        self.assertIn((SER_PTG_AVG_REVERSED_SCHEDULE_KEY, "heun", 4), predictions)
         self.assertEqual(predictions[(SER_PTG_SCHEDULE_KEY, "heun", 4)]["realized_nfe"], 4)
         self.assertNotIn(SER_PTG_SCHEDULE_KEY, BASELINE_SCHEDULE_KEYS)
 

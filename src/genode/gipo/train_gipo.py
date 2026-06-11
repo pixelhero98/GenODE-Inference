@@ -8,6 +8,14 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import torch
 
+from genode.canonical_experiment_layout import (
+    CANONICAL_CONTEXT_SAMPLE_COUNT,
+    CANONICAL_PSEUDO_TARGET_WEIGHT,
+    CANONICAL_SEEN_NFES,
+    CANONICAL_UNSEEN_NFES,
+    STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
+    STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO,
+)
 from genode.gipo.policy import (
     GIPO_PROTOCOL,
     MODEL_PAYLOAD_VERSION,
@@ -55,6 +63,7 @@ from genode.gipo.policy import (
     validate_teacher_objective_hyperparameters,
 )
 from genode.gipo.density_representation import density_metadata, reference_grid_hash, uniform_reference_grid
+from genode.gipo.density_representation import average_density_masses, density_mass_to_time_grid, grid_to_density_mass
 from genode.gipo.models import (
     SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config_for_rows,
@@ -171,6 +180,42 @@ def _select_weighted_normalized_regret_step(
     }
 
 
+def _select_context_density_regret_step(
+    *,
+    context_density_training: Mapping[str, Any],
+    component_weights: Mapping[str, float],
+) -> Dict[str, Any]:
+    context_history = _history_by_step(context_density_training)
+    if not context_history:
+        raise ValueError("Context/density checkpoint selection found no eligible checkpoint steps.")
+    required_splits = ("context_disjoint", "density_family_holdout")
+    adjusted_weights = {
+        "context": float(component_weights.get("context", 0.0)),
+        "density_family": float(component_weights.get("density_family", 0.0)),
+    }
+    total = sum(adjusted_weights.values())
+    if total <= 0.0:
+        raise ValueError("Context/density checkpoint selection requires positive context or density weights.")
+    split_weights = {
+        "context": adjusted_weights["context"] / total,
+        "density_family": adjusted_weights["density_family"] / total,
+    }
+    selection = select_weighted_normalized_regret_checkpoint(
+        [{"step": int(step), "diagnostics": dict(entry.get("diagnostics", {}) or {})} for step, entry in sorted(context_history.items())],
+        required_split_names=required_splits,
+        component_weights=split_weights,
+    )
+    return {
+        **selection,
+        "selection_component_axis_weights": dict(split_weights),
+        "uses_unseen_nfe_selection_diagnostics": False,
+        "component_histories": {
+            "context_density": context_density_training.get("teacher_checkpoint_selection", {}).get("history", []),
+            "unseen_nfe": [],
+        },
+    }
+
+
 def _load_schedule_summary_grids(paths: Sequence[str]) -> Dict[Tuple[str, str, int], Tuple[float, ...]]:
     grids: Dict[Tuple[str, str, int], Tuple[float, ...]] = {}
     for path_text in paths:
@@ -194,7 +239,23 @@ def _load_schedule_summary_grids(paths: Sequence[str]) -> Dict[Tuple[str, str, i
                 solver = str(item["solver_key"])
                 target_nfe = int(item["target_nfe"])
                 macro_steps = solver_macro_steps(solver, target_nfe)
-                grids[(schedule_key, solver, target_nfe)] = validate_time_grid(item["time_grid"], macro_steps=macro_steps)
+                base_grid = validate_time_grid(item["time_grid"], macro_steps=macro_steps)
+                grids[(schedule_key, solver, target_nfe)] = base_grid
+                if schedule_key == "ser_ptg_local_defect_eta005":
+                    reversed_grid = validate_time_grid(
+                        [1.0 - float(value) for value in reversed(base_grid)],
+                        macro_steps=macro_steps,
+                    )
+                    grids[("ser_ptg_local_defect_eta005_reversed", solver, target_nfe)] = reversed_grid
+                    reference = uniform_reference_grid(CANONICAL_DENSITY_BIN_COUNT)
+                    base_mass = grid_to_density_mass(base_grid, reference_time_grid=reference, macro_steps=macro_steps)
+                    reversed_mass = grid_to_density_mass(reversed_grid, reference_time_grid=reference, macro_steps=macro_steps)
+                    averaged_mass = average_density_masses(base_mass, reversed_mass)
+                    grids[("ser_ptg_local_defect_eta005_avg_reversed", solver, target_nfe)] = density_mass_to_time_grid(
+                        averaged_mass,
+                        reference_time_grid=reference,
+                        macro_steps=macro_steps,
+                    )
     return grids
 
 
@@ -268,6 +329,25 @@ def _raw_split_phase(row: Mapping[str, Any]) -> str:
     return str(row.get("split_phase", row.get("split", ""))).strip()
 
 
+def _validate_train_tuning_rows(rows: Sequence[Mapping[str, Any]], *, label: str) -> None:
+    locked_rows = [
+        row
+        for row in rows
+        if _source_split_phase(row) == "locked_test" or _raw_split_phase(row) == "locked_test"
+    ]
+    if locked_rows:
+        raise ValueError(f"{label} refuses locked_test rows; found {len(locked_rows)} locked-test rows.")
+    bad_source_phases = sorted(
+        {
+            _source_split_phase(row)
+            for row in rows
+            if _source_split_phase(row) and _source_split_phase(row) != "train_tuning"
+        }
+    )
+    if bad_source_phases:
+        raise ValueError(f"{label} requires train_tuning source rows; found {bad_source_phases}.")
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train GIPO continuous-density from per-example fixed/SER rows.")
     parser.add_argument("--rows_csv", required=True, help="Per-example fixed/SER metric rows CSV.")
@@ -275,7 +355,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--schedule_summary_json", default="", help="Comma-separated schedule summaries for non-fixed references such as SER.")
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--support_schedule_keys", default="", help="Comma-separated fixed/SER supervision keys. Defaults to observed row keys.")
-    parser.add_argument("--context_sample_count", type=int, default=0)
+    parser.add_argument("--context_sample_count", type=int, default=CANONICAL_CONTEXT_SAMPLE_COUNT)
     parser.add_argument("--context_holdout_fraction", type=float, default=0.20)
     parser.add_argument("--teacher_steps", type=int, default=500)
     parser.add_argument("--teacher_checkpoint_every", type=int, default=100)
@@ -300,7 +380,26 @@ def build_argparser() -> argparse.ArgumentParser:
         default="",
         help="Schedule summaries for unseen selection rows, such as unseen SER references.",
     )
-    parser.add_argument("--teacher_unseen_selection_target_nfe_values", default="6,10,14,16")
+    parser.add_argument(
+        "--teacher_unseen_selection_target_nfe_values",
+        default=",".join(str(value) for value in CANONICAL_UNSEEN_NFES),
+    )
+    parser.add_argument(
+        "--student_pseudo_rows_csv",
+        default="",
+        help="Optional unseen-NFE train_tuning rows for down-weighted teacher pseudo-target distillation.",
+    )
+    parser.add_argument(
+        "--student_pseudo_context_embeddings_npz",
+        default="",
+        help="Context embeddings for --student_pseudo_rows_csv; defaults to --context_embeddings_npz.",
+    )
+    parser.add_argument(
+        "--student_pseudo_schedule_summary_json",
+        default="",
+        help="Schedule summaries for pseudo rows, such as unseen SER-derived references.",
+    )
+    parser.add_argument("--student_pseudo_target_weight", type=float, default=CANONICAL_PSEUDO_TARGET_WEIGHT)
     parser.add_argument("--student_steps", type=int, default=500)
     parser.add_argument("--student_log_every", type=int, default=0)
     parser.add_argument("--student_checkpoint_every", type=int, default=100)
@@ -417,15 +516,15 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "context=0.25,density_family=0.25,unseen_nfe=0.50."
         )
     sampled_target_nfes = sorted({int(row["target_nfe"]) for row in sampled_rows})
-    if sampled_target_nfes != [4, 8, 12]:
+    canonical_seen_nfes = list(CANONICAL_SEEN_NFES)
+    if sampled_target_nfes != canonical_seen_nfes:
         raise ValueError(
-            "weighted_normalized_regret final teacher/student fitting expects seen calibration NFEs [4, 8, 12]; "
+            "weighted_normalized_regret final teacher/student fitting expects seen calibration NFEs "
+            f"{canonical_seen_nfes}; "
             f"found {sampled_target_nfes}."
         )
     unseen_selection_rows: List[Dict[str, Any]] = []
     unseen_selection_target_nfes = _parse_int_csv(str(args.teacher_unseen_selection_target_nfe_values))
-    if not str(args.teacher_unseen_selection_rows_csv).strip():
-        raise ValueError("weighted_normalized_regret requires --teacher_unseen_selection_rows_csv for unseen-NFE selection diagnostics.")
     if str(args.teacher_unseen_selection_rows_csv).strip():
         unseen_raw_rows = read_metric_rows_csv(resolve_project_path(str(args.teacher_unseen_selection_rows_csv)))
         if not unseen_raw_rows:
@@ -560,7 +659,59 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     pseudo_rows: List[Dict[str, Any]] = []
     pseudo_embeddings: Dict[str, Any] | None = None
     pseudo_schedule_grids: Dict[Tuple[str, str, int], Tuple[float, ...]] | None = None
-    pseudo_target_weight = 0.0
+    pseudo_target_weight = float(args.student_pseudo_target_weight)
+    if not torch.isfinite(torch.tensor(pseudo_target_weight, dtype=torch.float64)) or pseudo_target_weight < 0.0:
+        raise ValueError("student_pseudo_target_weight must be finite and nonnegative.")
+    pseudo_source_rows: List[Dict[str, Any]] = []
+    pseudo_support_keys: Tuple[str, ...] = ()
+    if str(args.student_pseudo_rows_csv).strip():
+        raw_pseudo_rows = read_metric_rows_csv(resolve_project_path(str(args.student_pseudo_rows_csv)))
+        if not raw_pseudo_rows:
+            raise ValueError("student_pseudo_rows_csv contains no rows.")
+        _validate_train_tuning_rows(raw_pseudo_rows, label="Student pseudo distillation")
+        pseudo_filtered_rows = _rows_for_target_nfes(raw_pseudo_rows, CANONICAL_UNSEEN_NFES)
+        if not pseudo_filtered_rows:
+            raise ValueError(
+                "student_pseudo_rows_csv has no rows after filtering to canonical unseen NFEs "
+                f"{list(CANONICAL_UNSEEN_NFES)}."
+            )
+        pseudo_source_rows = [dict(row) for row in pseudo_filtered_rows]
+        for row in pseudo_source_rows:
+            row["context_id"] = context_id_from_row(row)
+        pseudo_support_keys = _observed_support(pseudo_source_rows)
+        _validate_support_group_counts(pseudo_source_rows, pseudo_support_keys)
+        pseudo_context_ids = set(
+            sample_context_ids_stratified(
+                pseudo_source_rows,
+                sample_count=min(sample_count, len({context_id_from_row(row) for row in pseudo_source_rows})),
+                seed=int(args.seed) + 808,
+            )
+        )
+        pseudo_rows = [row for row in pseudo_source_rows if context_id_from_row(row) in pseudo_context_ids]
+        pseudo_embeddings_path = str(args.student_pseudo_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
+        raw_pseudo_embeddings = load_context_embedding_table(resolve_project_path(pseudo_embeddings_path))
+        missing_pseudo_embeddings = sorted({context_id_from_row(row) for row in pseudo_rows} - set(raw_pseudo_embeddings))
+        if missing_pseudo_embeddings:
+            raise KeyError(f"Pseudo distillation context embeddings are missing contexts: {missing_pseudo_embeddings[:8]}")
+        pseudo_embeddings = embedding_normalizer.transform_table(raw_pseudo_embeddings)
+        normalized_embeddings.update(pseudo_embeddings)
+        pseudo_schedule_grids = dict(schedule_grids)
+        pseudo_schedule_summary_paths = _parse_csv(str(args.student_pseudo_schedule_summary_json))
+        if pseudo_schedule_summary_paths:
+            pseudo_schedule_grids.update(_load_schedule_summary_grids(pseudo_schedule_summary_paths))
+        missing_pseudo_grid_rows: List[str] = []
+        for row in pseudo_rows:
+            try:
+                density_mass_for_row(row, schedule_grids=pseudo_schedule_grids, reference_time_grid=reference_time_grid)
+            except (KeyError, ValueError):
+                missing_pseudo_grid_rows.append(str((row["scheduler_key"], row["solver_key"], int(row["target_nfe"]))))
+        if missing_pseudo_grid_rows:
+            raise ValueError(f"Pseudo distillation rows are missing schedule grids: {missing_pseudo_grid_rows[:8]}")
+    student_training_mode = (
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO
+        if pseudo_rows and pseudo_target_weight > 0.0
+        else STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT
+    )
     student_selector_fit_rows = [dict(row) for row in fit_rows]
     student_selector_validation_rows: List[Dict[str, Any]] = []
     if student_selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE:
@@ -648,7 +799,26 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "setting_encoder_config": setting_encoder_config.to_payload(),
         "density_representation": density_meta,
         "support_schedule_keys": list(support_keys),
+        "canonical_seen_nfes": [int(value) for value in CANONICAL_SEEN_NFES],
+        "canonical_unseen_nfes": [int(value) for value in CANONICAL_UNSEEN_NFES],
+        "context_sample_count": int(sample_count),
         "sampled_context_count": int(len(selected_context_ids)),
+        "student_training_mode": student_training_mode,
+        "student_pseudo_distillation": {
+            "enabled": bool(pseudo_rows) and pseudo_target_weight > 0.0,
+            "pseudo_target_weight": float(pseudo_target_weight),
+            "target_nfes": [int(value) for value in CANONICAL_UNSEEN_NFES],
+            "raw_csv": str(args.student_pseudo_rows_csv),
+            "context_embeddings_npz": str(args.student_pseudo_context_embeddings_npz or args.context_embeddings_npz),
+            "schedule_summary_json": str(args.student_pseudo_schedule_summary_json),
+            "source_row_count": int(len(pseudo_source_rows)),
+            "selected_row_count": int(len(pseudo_rows)),
+            "selected_context_count": int(len({context_id_from_row(row) for row in pseudo_rows})),
+            "support_schedule_keys": list(pseudo_support_keys),
+            "used_for_teacher_fitting": False,
+            "used_for_teacher_selection": False,
+            "locked_test_used_for_pseudo": False,
+        },
         "density_family_holdout": {
             **density_holdout_metadata,
             "density_family_holdout_requested_schedule_keys": list(density_holdout_requested),
@@ -679,6 +849,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "density_family_diagnostic": _split_counts(density_family_diagnostic_rows),
             "unseen_nfe_selection": _split_counts(unseen_selection_rows),
             "unseen_nfe_diagnostic": _split_counts(unseen_nfe_diagnostic_rows),
+            "student_pseudo": _split_counts(pseudo_rows),
             "student_selector_fit": _split_counts(student_selector_fit_rows),
             "student_selector_validation": _split_counts(student_selector_validation_rows),
         },
@@ -692,6 +863,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "density_family_diagnostic": _split_membership_summary(density_family_diagnostic_rows),
             "unseen_nfe_selection": _split_membership_summary(unseen_selection_rows),
             "unseen_nfe_diagnostic": _split_membership_summary(unseen_nfe_diagnostic_rows),
+            "student_pseudo": _split_membership_summary(pseudo_rows),
             "student_selector_fit": _split_membership_summary(student_selector_fit_rows),
             "student_selector_validation": _split_membership_summary(student_selector_validation_rows),
         },
@@ -702,6 +874,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "selector_fit_rows": nfe_sequence_diagnostic_summary(selector_fit_rows),
             "unseen_nfe_selection_rows": nfe_sequence_diagnostic_summary(unseen_selection_rows),
             "unseen_nfe_diagnostic_rows": nfe_sequence_diagnostic_summary(unseen_nfe_diagnostic_rows),
+            "student_pseudo_rows": nfe_sequence_diagnostic_summary(pseudo_rows),
             "student_selector_fit_rows": nfe_sequence_diagnostic_summary(student_selector_fit_rows),
             "student_selector_validation_rows": nfe_sequence_diagnostic_summary(student_selector_validation_rows),
         },
@@ -762,8 +935,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("weighted_normalized_regret selection requires non-empty context_disjoint diagnostic rows.")
     if not density_family_diagnostic_rows:
         raise ValueError("weighted_normalized_regret selection requires non-empty density_family_holdout diagnostic rows.")
-    if not unseen_nfe_diagnostic_rows:
-        raise ValueError("weighted_normalized_regret requires non-empty unseen-NFE diagnostic rows.")
     context_density_training = _train_teacher_pass(
         seed_offset=101,
         pass_name="context_density_selector",
@@ -775,19 +946,26 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         },
         steps=int(args.teacher_steps),
     )
-    unseen_nfe_training = _train_teacher_pass(
-        seed_offset=102,
-        pass_name="unseen_nfe_selector",
-        pass_fit_rows=selector_fit_rows,
-        diagnostic_splits={"unseen_nfe_holdout": unseen_nfe_diagnostic_rows},
-        diagnostic_candidate_schedule_keys={"unseen_nfe_holdout": selection_support_schedule_keys},
-        steps=int(args.teacher_steps),
-    )
-    checkpoint_selection = _select_weighted_normalized_regret_step(
-        context_density_training=context_density_training,
-        component_weights=selection_component_weights,
-        unseen_nfe_training=unseen_nfe_training,
-    )
+    unseen_nfe_training: Dict[str, Any] = {}
+    if unseen_nfe_diagnostic_rows:
+        unseen_nfe_training = _train_teacher_pass(
+            seed_offset=102,
+            pass_name="unseen_nfe_selector",
+            pass_fit_rows=selector_fit_rows,
+            diagnostic_splits={"unseen_nfe_holdout": unseen_nfe_diagnostic_rows},
+            diagnostic_candidate_schedule_keys={"unseen_nfe_holdout": selection_support_schedule_keys},
+            steps=int(args.teacher_steps),
+        )
+        checkpoint_selection = _select_weighted_normalized_regret_step(
+            context_density_training=context_density_training,
+            component_weights=selection_component_weights,
+            unseen_nfe_training=unseen_nfe_training,
+        )
+    else:
+        checkpoint_selection = _select_context_density_regret_step(
+            context_density_training=context_density_training,
+            component_weights=selection_component_weights,
+        )
     selected_step = int(checkpoint_selection["selected_step"])
     teacher = _build_teacher_instance(0)
     final_teacher_training = train_gipo_teacher(
@@ -954,6 +1132,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "teacher_checkpoint_selection": teacher_training.get("teacher_checkpoint_selection", {}),
             "student_checkpoint_selection_mode": student_selection_mode,
             "student_checkpoint_selection": student_training.get("student_checkpoint_selection", {}),
+            "student_training_mode": student_training_mode,
+            "student_pseudo_distillation": summary_base["student_pseudo_distillation"],
             "student_final_retrain": student_training.get("student_final_retrain", {}),
             "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
             "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
@@ -992,6 +1172,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "teacher_checkpoint_selection": teacher_training.get("teacher_checkpoint_selection", {}),
             "student_checkpoint_selection_mode": student_selection_mode,
             "student_checkpoint_selection": student_training.get("student_checkpoint_selection", {}),
+            "student_training_mode": student_training_mode,
+            "student_pseudo_distillation": summary_base["student_pseudo_distillation"],
             "student_final_retrain": student_training.get("student_final_retrain", {}),
             "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
             "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
@@ -1020,6 +1202,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "teacher_checkpoint_selection_mode": selection_mode,
         "student_checkpoint_selection_mode": student_selection_mode,
         "student_checkpoint_selection": student_training.get("student_checkpoint_selection", {}),
+        "student_training_mode": student_training_mode,
+        "student_pseudo_distillation": summary_base["student_pseudo_distillation"],
         "student_final_retrain": student_training.get("student_final_retrain", {}),
         "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
         "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),

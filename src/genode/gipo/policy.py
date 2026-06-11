@@ -15,9 +15,17 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from genode.canonical_experiment_layout import (
+    AVERAGED_SCHEDULE_COMPONENTS,
+    CANONICAL_CONTEXT_SAMPLE_COUNT,
+    CANONICAL_SUPERVISION_SCHEDULE_KEYS,
+    REVERSED_SCHEDULE_BASE,
+    schedule_family_for_key,
+)
 from genode.gipo.density_representation import (
     DEFAULT_DENSITY_BIN_COUNT,
     DENSITY_PROTOCOL,
+    average_density_masses,
     density_log_features,
     density_mass_hash,
     density_mass_to_time_grid,
@@ -49,14 +57,14 @@ ContextPairKey = Tuple[str, str, int, str, int | None]
 ScheduleGridKey = Tuple[str, str, int]
 
 GIPO_PROTOCOL = "gipo_density"
-DEFAULT_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = tuple(BASELINE_SCHEDULE_KEYS) + (SER_PTG_SCHEDULE_KEY,)
+DEFAULT_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = CANONICAL_SUPERVISION_SCHEDULE_KEYS
 DEFAULT_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
 GIPO_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
-EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = tuple(EXPERIMENTAL_FIXED_SCHEDULE_KEYS) + (SER_PTG_SCHEDULE_KEY,)
-DEFAULT_CONTEXT_CALIBRATION_TOTAL = 120
+EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
+DEFAULT_CONTEXT_CALIBRATION_TOTAL = CANONICAL_CONTEXT_SAMPLE_COUNT
 DEFAULT_CONTEXT_CALIBRATION_VALIDATION_FRACTION = 0.20
 MIN_CONTEXT_CALIBRATION_TOTAL = 72
-MAX_CONTEXT_CALIBRATION_TOTAL = 144
+MAX_CONTEXT_CALIBRATION_TOTAL = CANONICAL_CONTEXT_SAMPLE_COUNT
 DEFAULT_TEACHER_TARGET_TEMPERATURE = 0.05
 STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE = "teacher_weighted_soft_mixture"
 MODEL_PAYLOAD_VERSION = 4
@@ -80,6 +88,7 @@ DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS: Dict[str, float] = {
 DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS: Tuple[str, ...] = (
     "flowts_power_sampling",
     "flowts_power_sampling_reversed",
+    "flowts_power_sampling_avg_reversed",
 )
 DEFAULT_TRANSFORMER_HIDDEN_DIM = 64
 DEFAULT_TRANSFORMER_LAYERS = 2
@@ -363,9 +372,11 @@ def stable_context_id(
     target_t: int,
     history_start: int | None = None,
     history_stop: int | None = None,
+    context_schema: str = "forecast_window",
 ) -> str:
     return _json_hash(
         {
+            "context_schema": str(context_schema),
             "dataset": str(dataset),
             "split_phase": str(split_phase),
             "example_idx": int(example_idx),
@@ -397,6 +408,26 @@ def context_id_from_row(row: MetricRow) -> str:
     example_idx_raw = row.get("example_idx", row.get("example_index", None))
     target_t_raw = row.get("target_t", None)
     has_series_identity = str(row.get("series_id", "")).strip() != "" or str(row.get("series_idx", "")).strip() != ""
+    context_schema = str(row.get("context_schema", "") or "").strip()
+    if context_schema and str(row.get("axis_dataset", "") or row.get("dataset", row.get("dataset_key", ""))).strip():
+        payload = {
+            "context_schema": context_schema,
+            "dataset": str(row.get("axis_dataset", row.get("dataset", row.get("dataset_key", "")))),
+            "split_phase": split_phase,
+            "axis_series": str(row.get("axis_series", row.get("series_id", row.get("series_idx", "")))),
+            "axis_time_bin": str(row.get("axis_time_bin", "")),
+            "axis_stratum": str(row.get("axis_stratum", row.get("stratum", ""))),
+            "axis_member": str(row.get("axis_member", row.get("member_key", ""))),
+            "axis_formula": str(row.get("axis_formula", row.get("formula", ""))),
+            "axis_atom_count": str(row.get("axis_atom_count", row.get("atom_count", ""))),
+            "axis_trajectory": str(row.get("axis_trajectory", row.get("trajectory_key", row.get("trajectory_id", "")))),
+            "axis_flags": str(row.get("axis_flags", "")),
+            "example_idx": str(row.get("example_idx", row.get("example_index", ""))),
+            "target_t": str(row.get("target_t", "")),
+            "history_start": str(row.get("history_start", "")),
+            "history_stop": str(row.get("history_stop", "")),
+        }
+        return _json_hash(payload, prefix="ctx")
     missing = []
     if not dataset:
         missing.append("dataset")
@@ -419,6 +450,7 @@ def context_id_from_row(row: MetricRow) -> str:
         target_t=int(target_t_raw),
         history_start=_optional_int(row.get("history_start")),
         history_stop=_optional_int(row.get("history_stop")),
+        context_schema=context_schema or "forecast_window",
     )
 
 
@@ -473,7 +505,15 @@ def series_key_from_row(row: MetricRow) -> str:
     series_idx = str(row.get("series_idx", "") or "").strip()
     if series_idx:
         return f"series_idx:{series_idx}"
-    raise ValueError("Rows require series_id or series_idx for series-disjoint diagnostics.")
+    axis_series = str(row.get("axis_series", "") or "").strip()
+    if axis_series:
+        return f"axis_series:{axis_series}"
+    axis_member = str(row.get("axis_member", row.get("member_key", "")) or "").strip()
+    axis_stratum = str(row.get("axis_stratum", row.get("stratum", "")) or "").strip()
+    axis_trajectory = str(row.get("axis_trajectory", row.get("trajectory_key", row.get("trajectory_id", ""))) or "").strip()
+    if axis_member or axis_stratum or axis_trajectory:
+        return "axis:" + "|".join(part for part in (axis_member, axis_stratum, axis_trajectory) if part)
+    raise ValueError("Rows require series_id, series_idx, or generalized axis series fields for series-disjoint diagnostics.")
 
 
 def context_pair_key(row: MetricRow, *, pair_on_seed: bool = True) -> ContextPairKey:
@@ -619,6 +659,8 @@ def density_family_for_schedule_key(schedule_key: str) -> str:
         return "uniform_anchor"
     if key == SER_PTG_SCHEDULE_KEY:
         return "ser_oracle"
+    if key in AVERAGED_SCHEDULE_COMPONENTS:
+        return f"avg_{AVERAGED_SCHEDULE_COMPONENTS[key][0]}"
     suffix = "_reversed"
     return key[: -len(suffix)] if key.endswith(suffix) else key
 
@@ -805,7 +847,7 @@ def recommended_context_calibration_count(
     available = int(available_contexts)
     if available <= 0:
         raise ValueError("available_contexts must be positive.")
-    cap = min(int(max_total), max(int(min_total), 12 * int(cells)))
+    cap = int(max_total)
     requested = int(default_total) if normalized_combined_reference is None else int(round(0.20 * float(normalized_combined_reference)))
     target = min(cap, max(int(min_total), requested))
     return int(min(available, target))
@@ -848,14 +890,20 @@ def sample_context_ids_stratified(
     target = int(min(len(by_context), max(1, target)))
     if target >= len(by_context):
         return sorted(by_context)
-    strata: Dict[Tuple[str, int], List[str]] = defaultdict(list)
+    strata: Dict[Tuple[str, str, str, str, str, str], List[str]] = defaultdict(list)
     for context_id, row in by_context.items():
-        series = str(row.get("series_id", row.get("series_idx", "")))
+        dataset = str(row.get("axis_dataset", row.get("dataset", row.get("dataset_key", ""))))
+        series = str(row.get("axis_series", row.get("series_id", row.get("series_idx", ""))))
+        stratum = str(row.get("axis_stratum", row.get("stratum", "")))
+        formula = str(row.get("axis_formula", row.get("formula", "")))
+        trajectory = str(row.get("axis_trajectory", row.get("trajectory_key", row.get("trajectory_id", ""))))
+        explicit_time_bin = str(row.get("axis_time_bin", "") or "")
         try:
             target_t = int(row.get("target_t", 0))
         except (TypeError, ValueError):
             target_t = 0
-        strata[(series, int(math.floor(float(target_t) / 24.0)))].append(context_id)
+        time_bin = explicit_time_bin or str(int(math.floor(float(target_t) / 24.0)))
+        strata[(dataset, series, stratum, formula, trajectory, time_bin)].append(context_id)
     rng = np.random.default_rng(int(seed))
     selected: List[str] = []
     stratum_items = sorted(strata.items(), key=lambda item: item[0])
@@ -1013,6 +1061,23 @@ def grid_for_schedule(
 ) -> Tuple[float, ...]:
     key = str(schedule_key)
     macro_steps = solver_macro_steps(str(solver_key), int(target_nfe))
+    if key in AVERAGED_SCHEDULE_COMPONENTS:
+        left_key, right_key = AVERAGED_SCHEDULE_COMPONENTS[key]
+        left_grid = grid_for_schedule(left_key, solver_key, target_nfe, schedule_grids=schedule_grids)
+        right_grid = grid_for_schedule(right_key, solver_key, target_nfe, schedule_grids=schedule_grids)
+        reference = uniform_reference_grid()
+        left_mass = grid_to_density_mass(left_grid, reference_time_grid=reference, macro_steps=macro_steps)
+        right_mass = grid_to_density_mass(right_grid, reference_time_grid=reference, macro_steps=macro_steps)
+        avg_mass = average_density_masses(left_mass, right_mass)
+        return density_mass_to_time_grid(
+            avg_mass,
+            reference_time_grid=reference,
+            macro_steps=macro_steps,
+        )
+    if key in REVERSED_SCHEDULE_BASE and key not in EXPERIMENTAL_FIXED_SCHEDULE_KEYS:
+        base_grid = grid_for_schedule(REVERSED_SCHEDULE_BASE[key], solver_key, target_nfe, schedule_grids=schedule_grids)
+        reversed_grid = [1.0 - float(value) for value in reversed(tuple(base_grid))]
+        return validate_time_grid(reversed_grid, macro_steps=macro_steps)
     if schedule_grids is not None and (key, str(solver_key), int(target_nfe)) in schedule_grids:
         return validate_time_grid(schedule_grids[(key, str(solver_key), int(target_nfe))], macro_steps=macro_steps)
     if key in EXPERIMENTAL_FIXED_SCHEDULE_KEYS:

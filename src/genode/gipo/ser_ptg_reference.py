@@ -9,6 +9,15 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
+from genode.gipo.density_representation import (
+    average_density_masses,
+    density_mass_hash,
+    density_mass_to_time_grid,
+    grid_to_density_mass,
+    reference_grid_hash,
+    uniform_reference_grid,
+)
 from genode.gipo.models import validate_time_grid
 from genode.data.otflow_paths import (
     default_backbone_manifest_path,
@@ -38,8 +47,10 @@ from genode.runtime import resolve_torch_device
 
 SER_PTG_SCHEDULE_KEY = "ser_ptg_local_defect_eta005"
 SER_PTG_SCHEDULE_NAME = "SER-PTG local defect eta=0.05"
+SER_PTG_REVERSED_SCHEDULE_KEY = "ser_ptg_local_defect_eta005_reversed"
+SER_PTG_AVG_REVERSED_SCHEDULE_KEY = "ser_ptg_local_defect_eta005_avg_reversed"
 DEFAULT_SOLVERS: Tuple[str, ...] = ("euler", "heun", "midpoint_rk2", "dpmpp2m")
-DEFAULT_TARGET_NFES: Tuple[int, ...] = (4, 8, 12)
+DEFAULT_TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 
 
 def _parse_csv(text: str) -> List[str]:
@@ -72,6 +83,73 @@ def grid_geometry(time_grid: Sequence[float]) -> Dict[str, float]:
         "internal_count": int(internal.size),
         "min_interval": float(np.min(intervals)) if intervals.size else 0.0,
         "max_interval": float(np.max(intervals)) if intervals.size else 0.0,
+    }
+
+
+def _prediction_with_density_metadata(prediction: Mapping[str, Any], *, scheduler_key: str, schedule_name: str, time_grid: Sequence[float]) -> Dict[str, Any]:
+    macro_steps = int(prediction["macro_steps"])
+    grid = validate_time_grid(time_grid, macro_steps=macro_steps)
+    density_reference = uniform_reference_grid()
+    mass = grid_to_density_mass(grid, reference_time_grid=density_reference, macro_steps=macro_steps)
+    copied = dict(prediction)
+    copied.update(
+        {
+            "scheduler_key": str(scheduler_key),
+            "schedule_name": str(schedule_name),
+            "time_grid": list(grid),
+            "schedule_grid_hash": _hash_grid(grid),
+            "density_protocol": "density_mass",
+            "density_reference_grid_hash": reference_grid_hash(density_reference),
+            "density_mass": [float(x) for x in mass],
+            "density_mass_hash": density_mass_hash(mass, reference_time_grid=density_reference),
+            "grid_geometry": grid_geometry(grid),
+        }
+    )
+    return copied
+
+
+def _derive_ser_reference_predictions(predictions: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    physical: List[Dict[str, Any]] = []
+    reversed_rows: List[Dict[str, Any]] = []
+    averaged_rows: List[Dict[str, Any]] = []
+    density_reference = uniform_reference_grid()
+    for prediction in predictions:
+        macro_steps = int(prediction["macro_steps"])
+        base_grid = validate_time_grid(prediction["time_grid"], macro_steps=macro_steps)
+        physical_prediction = _prediction_with_density_metadata(
+            prediction,
+            scheduler_key=SER_PTG_SCHEDULE_KEY,
+            schedule_name=SER_PTG_SCHEDULE_NAME,
+            time_grid=base_grid,
+        )
+        reversed_grid = validate_time_grid([1.0 - float(value) for value in reversed(base_grid)], macro_steps=macro_steps)
+        reversed_prediction = _prediction_with_density_metadata(
+            {**prediction, "schedule_derivation": "reverse_physical_clock"},
+            scheduler_key=SER_PTG_REVERSED_SCHEDULE_KEY,
+            schedule_name=f"{SER_PTG_SCHEDULE_NAME} reversed",
+            time_grid=reversed_grid,
+        )
+        base_mass = grid_to_density_mass(base_grid, reference_time_grid=density_reference, macro_steps=macro_steps)
+        reversed_mass = grid_to_density_mass(reversed_grid, reference_time_grid=density_reference, macro_steps=macro_steps)
+        averaged_mass = average_density_masses(base_mass, reversed_mass)
+        averaged_grid = density_mass_to_time_grid(
+            averaged_mass,
+            reference_time_grid=density_reference,
+            macro_steps=macro_steps,
+        )
+        averaged_prediction = _prediction_with_density_metadata(
+            {**prediction, "schedule_derivation": "average_physical_and_reversed_density_mass"},
+            scheduler_key=SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
+            schedule_name=f"{SER_PTG_SCHEDULE_NAME} density average",
+            time_grid=averaged_grid,
+        )
+        physical.append(physical_prediction)
+        reversed_rows.append(reversed_prediction)
+        averaged_rows.append(averaged_prediction)
+    return {
+        SER_PTG_SCHEDULE_KEY: physical,
+        SER_PTG_REVERSED_SCHEDULE_KEY: reversed_rows,
+        SER_PTG_AVG_REVERSED_SCHEDULE_KEY: averaged_rows,
     }
 
 
@@ -341,20 +419,43 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             )
     out_dir = resolve_project_path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
+    derived_predictions = _derive_ser_reference_predictions(predictions)
     schedule = {
         "scheduler_key": SER_PTG_SCHEDULE_KEY,
         "schedule_name": SER_PTG_SCHEDULE_NAME,
         "comparison_role": "reference_comparator",
         "trace_variant": str(args.trace_variant),
         "density_floor_eta": float(args.density_floor_eta),
-        "predictions": predictions,
+        "predictions": derived_predictions[SER_PTG_SCHEDULE_KEY],
     }
+    schedules = [
+        schedule,
+        {
+            "scheduler_key": SER_PTG_REVERSED_SCHEDULE_KEY,
+            "schedule_name": f"{SER_PTG_SCHEDULE_NAME} reversed",
+            "comparison_role": "reference_comparator",
+            "trace_variant": str(args.trace_variant),
+            "density_floor_eta": float(args.density_floor_eta),
+            "schedule_derivation": "reverse_physical_clock",
+            "predictions": derived_predictions[SER_PTG_REVERSED_SCHEDULE_KEY],
+        },
+        {
+            "scheduler_key": SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
+            "schedule_name": f"{SER_PTG_SCHEDULE_NAME} density average",
+            "comparison_role": "reference_comparator",
+            "trace_variant": str(args.trace_variant),
+            "density_floor_eta": float(args.density_floor_eta),
+            "schedule_derivation": "average_physical_and_reversed_density_mass",
+            "predictions": derived_predictions[SER_PTG_AVG_REVERSED_SCHEDULE_KEY],
+        },
+    ]
     summary = {
         "status": "ready",
         "artifact": "ser_ptg_schedule_summary",
         "dataset": dataset,
         "schedule_key": SER_PTG_SCHEDULE_KEY,
         "schedule_name": SER_PTG_SCHEDULE_NAME,
+        "schedules": schedules,
         "baseline_schedule": False,
         "seeds": [int(seed) for seed in seeds],
         "solver_names": solvers,

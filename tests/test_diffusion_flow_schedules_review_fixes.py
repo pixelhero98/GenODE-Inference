@@ -5,8 +5,10 @@ import unittest
 
 import torch
 
+from genode.gipo.density_representation import average_density_masses, grid_to_density_mass, uniform_reference_grid
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
+    EXPERIMENTAL_AVERAGED_FIXED_SCHEDULE_KEYS,
     EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
     EXPERIMENTAL_REVERSED_SCHEDULE_KEYS,
     build_schedule_grid,
@@ -68,6 +70,29 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
                     self.assertAlmostEqual(observed, target)
                 self.assertIn("reversed", schedule_display_name(schedule_key).lower())
                 self.assertIn("reversed", schedule_time_alignment(schedule_key))
+
+    def test_averaged_fixed_schedule_grids_average_density_mass(self) -> None:
+        reference = uniform_reference_grid()
+        for schedule_key in EXPERIMENTAL_AVERAGED_FIXED_SCHEDULE_KEYS:
+            base_key = schedule_key.removesuffix("_avg_reversed")
+            reversed_key = f"{base_key}_reversed"
+            with self.subTest(schedule_key=schedule_key):
+                base_grid = build_schedule_grid(base_key, 8)
+                reversed_grid = build_schedule_grid(reversed_key, 8)
+                averaged_grid = build_schedule_grid(schedule_key, 8)
+                self.assertIsNotNone(base_grid)
+                self.assertIsNotNone(reversed_grid)
+                self.assertIsNotNone(averaged_grid)
+                assert base_grid is not None
+                assert reversed_grid is not None
+                assert averaged_grid is not None
+                expected_mass = average_density_masses(
+                    grid_to_density_mass(base_grid, reference_time_grid=reference, macro_steps=8),
+                    grid_to_density_mass(reversed_grid, reference_time_grid=reference, macro_steps=8),
+                )
+                observed_mass = grid_to_density_mass(averaged_grid, reference_time_grid=reference, macro_steps=8)
+                self.assertAlmostEqual(sum(observed_mass), 1.0, places=6)
+                self.assertEqual(len(observed_mass), len(expected_mass))
 
     def test_seed_paired_relative_mase_gain_is_preserved_in_summary_rows(self) -> None:
         rows = [

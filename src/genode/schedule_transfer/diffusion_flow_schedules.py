@@ -10,6 +10,19 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.canonical_experiment_layout import (
+    AVERAGED_REVERSED_SCHEDULE_KEYS,
+    AVERAGED_SCHEDULE_COMPONENTS,
+    REVERSED_SCHEDULE_BASE,
+    density_source_key_for_schedule,
+    schedule_family_for_key,
+)
+from genode.gipo.density_representation import (
+    average_density_masses,
+    density_mass_to_time_grid,
+    grid_to_density_mass,
+    uniform_reference_grid,
+)
 from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _metric_bundle, _restore_sample_overrides
 from genode.schedule_transfer.otflow_schedule_diagnostics import _collect_rollout_diagnostics
 from genode.models.otflow_train_val import eval_many_windows
@@ -23,7 +36,16 @@ EXPERIMENTAL_REVERSED_SCHEDULE_KEYS: Tuple[str, ...] = (
     "gits_reversed",
     "ots_reversed",
 )
-EXPERIMENTAL_FIXED_SCHEDULE_KEYS: Tuple[str, ...] = BASELINE_SCHEDULE_KEYS + EXPERIMENTAL_REVERSED_SCHEDULE_KEYS
+EXPERIMENTAL_AVERAGED_FIXED_SCHEDULE_KEYS: Tuple[str, ...] = tuple(
+    key
+    for key in AVERAGED_REVERSED_SCHEDULE_KEYS
+    if "ser_ptg_local_defect" not in key
+)
+EXPERIMENTAL_FIXED_SCHEDULE_KEYS: Tuple[str, ...] = (
+    BASELINE_SCHEDULE_KEYS
+    + EXPERIMENTAL_REVERSED_SCHEDULE_KEYS
+    + EXPERIMENTAL_AVERAGED_FIXED_SCHEDULE_KEYS
+)
 _REVERSED_SCHEDULE_BASES: Dict[str, str] = {
     "late_power_3_reversed": "late_power_3",
     "flowts_power_sampling_reversed": "flowts_power_sampling",
@@ -48,6 +70,12 @@ _SCHEDULE_TIME_ALIGNMENT: Dict[str, str] = {
 }
 for _reversed_key, _base_key in _REVERSED_SCHEDULE_BASES.items():
     _SCHEDULE_TIME_ALIGNMENT[_reversed_key] = f"{_SCHEDULE_TIME_ALIGNMENT[_base_key]}_reversed"
+for _averaged_key, (_physical_key, _reversed_key) in AVERAGED_SCHEDULE_COMPONENTS.items():
+    if _averaged_key in EXPERIMENTAL_AVERAGED_FIXED_SCHEDULE_KEYS:
+        _SCHEDULE_TIME_ALIGNMENT[_averaged_key] = (
+            f"{_SCHEDULE_TIME_ALIGNMENT.get(_physical_key, 'runtime_' + _physical_key)}_avg_"
+            f"{_SCHEDULE_TIME_ALIGNMENT.get(_reversed_key, 'runtime_' + _reversed_key)}"
+        )
 
 
 def _uniform_grid(n_steps: int) -> Tuple[float, ...]:
@@ -83,6 +111,29 @@ def _ensure_monotone(grid: Sequence[float]) -> Tuple[float, ...]:
 
 def _reverse_schedule_grid(grid: Sequence[float]) -> Tuple[float, ...]:
     return _ensure_monotone([1.0 - float(value) for value in reversed(tuple(grid))])
+
+
+def _average_schedule_grid_by_density(
+    physical_grid: Sequence[float],
+    reversed_grid: Sequence[float],
+    *,
+    n_steps: int,
+) -> Tuple[float, ...]:
+    reference = uniform_reference_grid()
+    physical_mass = np.asarray(
+        grid_to_density_mass(physical_grid, reference_time_grid=reference, macro_steps=int(n_steps)),
+        dtype=np.float64,
+    )
+    reversed_mass = np.asarray(
+        grid_to_density_mass(reversed_grid, reference_time_grid=reference, macro_steps=int(n_steps)),
+        dtype=np.float64,
+    )
+    averaged_mass = average_density_masses(physical_mass, reversed_mass)
+    return density_mass_to_time_grid(
+        averaged_mass,
+        reference_time_grid=reference,
+        macro_steps=int(n_steps),
+    )
 
 
 def _resample_reference_progression(progression: Sequence[float], n_steps: int) -> Tuple[float, ...]:
@@ -333,6 +384,15 @@ def _validate_positive_n_steps(n_steps: int) -> int:
 def build_schedule_grid(schedule_key: str, n_steps: int) -> Optional[Tuple[float, ...]]:
     key = str(schedule_key).strip().lower()
     n_steps = _validate_positive_n_steps(int(n_steps))
+    if key in AVERAGED_SCHEDULE_COMPONENTS:
+        if key not in EXPERIMENTAL_AVERAGED_FIXED_SCHEDULE_KEYS:
+            return None
+        physical_key, reversed_key = AVERAGED_SCHEDULE_COMPONENTS[key]
+        physical_grid = build_schedule_grid(physical_key, n_steps)
+        reversed_grid = build_schedule_grid(reversed_key, n_steps)
+        if physical_grid is None or reversed_grid is None:
+            return None
+        return _ensure_monotone(_average_schedule_grid_by_density(physical_grid, reversed_grid, n_steps=n_steps))
     if key in _REVERSED_SCHEDULE_BASES:
         base_grid = build_schedule_grid(_REVERSED_SCHEDULE_BASES[key], n_steps)
         if base_grid is None:
@@ -354,6 +414,11 @@ def build_schedule_grid(schedule_key: str, n_steps: int) -> Optional[Tuple[float
 
 def schedule_display_name(schedule_key: str) -> str:
     key = str(schedule_key).strip().lower()
+    if key in AVERAGED_SCHEDULE_COMPONENTS:
+        source = density_source_key_for_schedule(key)
+        return f"{source.replace('_', ' ')} density average"
+    if key == "ser_ptg_local_defect_eta005_reversed":
+        return "SER-PTG local defect eta=0.05 reversed"
     if key in _REVERSED_SCHEDULE_BASES:
         return f"{schedule_display_name(_REVERSED_SCHEDULE_BASES[key])} reversed"
     names = {
@@ -370,6 +435,10 @@ def schedule_display_name(schedule_key: str) -> str:
 def schedule_time_alignment(schedule_key: str) -> str:
     key = str(schedule_key).strip().lower()
     return _SCHEDULE_TIME_ALIGNMENT.get(key, f"runtime_{key}")
+
+
+def schedule_density_family(schedule_key: str) -> str:
+    return schedule_family_for_key(str(schedule_key))
 
 
 def fixed_schedule_shape_statistics(time_grid: Sequence[float]) -> Dict[str, Optional[float]]:
@@ -470,6 +539,7 @@ def run_fixed_schedule_variant(
 
 __all__ = [
     "BASELINE_SCHEDULE_KEYS",
+    "EXPERIMENTAL_AVERAGED_FIXED_SCHEDULE_KEYS",
     "EXPERIMENTAL_FIXED_SCHEDULE_KEYS",
     "EXPERIMENTAL_REVERSED_SCHEDULE_KEYS",
     "TRANSFER_SCHEDULE_KEYS",
@@ -477,6 +547,7 @@ __all__ = [
     "fixed_schedule_shape_statistics",
     "load_external_schedule_catalog",
     "run_fixed_schedule_variant",
+    "schedule_density_family",
     "schedule_display_name",
     "schedule_time_alignment",
 ]

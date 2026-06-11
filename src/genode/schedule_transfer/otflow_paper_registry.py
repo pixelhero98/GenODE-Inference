@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from genode.canonical_experiment_layout import (
+    CANONICAL_SEEN_NFES,
+    CANONICAL_UNSEEN_NFES,
+    PHYSICAL_SCHEDULE_KEYS,
+    REVERSED_SCHEDULE_KEYS,
+)
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
     TRANSFER_SCHEDULE_KEYS,
@@ -12,8 +18,8 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
     schedule_time_alignment,
 )
 
-MAIN_NFE_VALUES: Tuple[int, ...] = (4, 8, 12)
-APPENDIX_NFE_VALUES: Tuple[int, ...] = (6, 8, 20, 24)
+MAIN_NFE_VALUES: Tuple[int, ...] = CANONICAL_SEEN_NFES
+APPENDIX_NFE_VALUES: Tuple[int, ...] = CANONICAL_UNSEEN_NFES
 METHOD_KEY = "diffusion_flow_time_reparameterization"
 PAPER_MAIN_SIGNAL_FAMILY = "native_info_growth"
 
@@ -126,6 +132,8 @@ def paper_registry_snapshot() -> Dict[str, Any]:
         "appendix_nfe_values": list(APPENDIX_NFE_VALUES),
         "paper_main_signal_family": PAPER_MAIN_SIGNAL_FAMILY,
         "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
+        "physical_schedule_keys": list(PHYSICAL_SCHEDULE_KEYS),
+        "canonical_reversed_schedule_keys": list(REVERSED_SCHEDULE_KEYS),
         "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS),
         "schedules": [asdict(spec) for spec in paper_schedule_specs()],
         "solvers": [asdict(spec) for spec in paper_solver_specs()],

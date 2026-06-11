@@ -122,7 +122,8 @@ class PtgObservedGainFigureTests(unittest.TestCase):
     def test_synthetic_points_are_exact_scope(self) -> None:
         with mock.patch.object(ptg_fig, "build_fixed_schedule_grid", side_effect=_lightweight_grid):
             points = ptg_fig.build_points(ptg_fig.synthetic_payload(), ptg_fig.synthetic_observed_rows())
-        self.assertEqual(len(points), 108)
+        expected_points = len(ptg_fig.DATASET_ORDER) * len(ptg_fig.SOLVER_ORDER) * len(ptg_fig.TARGET_NFES) * len(ptg_fig.TRANSFER_SCHEDULES)
+        self.assertEqual(len(points), expected_points)
         self.assertEqual({point["schedule_key"] for point in points}, set(ptg_fig.TRANSFER_SCHEDULES))
         self.assertTrue(all("observed_integration_gain_percent" in point for point in points))
         for key in (
@@ -177,7 +178,8 @@ class PtgObservedGainFigureTests(unittest.TestCase):
             points = ptg_fig.build_points(ptg_fig.synthetic_payload(), ptg_fig.synthetic_observed_rows())
         summary = ptg_fig.summarize_ptg_points(points)
         self.assertEqual(summary["main_ptg_key"], "ptg_info_growth_raw")
-        self.assertEqual(summary["n_points"], 108)
+        expected_points = len(ptg_fig.DATASET_ORDER) * len(ptg_fig.SOLVER_ORDER) * len(ptg_fig.TARGET_NFES) * len(ptg_fig.TRANSFER_SCHEDULES)
+        self.assertEqual(summary["n_points"], expected_points)
         self.assertEqual(summary["observed_y_key"], "observed_integration_gain_percent")
         self.assertIn("ptg_info_growth_raw", summary["variants"])
 
@@ -220,7 +222,8 @@ class PtgObservedGainFigureTests(unittest.TestCase):
             path = Path(tmpdir) / "stats.csv"
             ptg_fig.write_csv_rows(stats_rows, path)
             rows = ptg_fig.load_integration_gain_rows(path)
-        self.assertEqual(len(rows), 108)
+        expected_points = len(ptg_fig.DATASET_ORDER) * len(ptg_fig.SOLVER_ORDER) * len(ptg_fig.TARGET_NFES) * len(ptg_fig.TRANSFER_SCHEDULES)
+        self.assertEqual(len(rows), expected_points)
         self.assertEqual({key[3] for key in rows}, set(ptg_fig.TRANSFER_SCHEDULES))
         self.assertFalse(any(key[3] == "late_power_3" for key in rows))
 

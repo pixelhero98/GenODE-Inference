@@ -45,9 +45,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
 
     def test_registry_exposes_active_baseline_matrix(self) -> None:
         snapshot = paper_registry_snapshot()
-        self.assertEqual(MAIN_NFE_VALUES, (4, 8, 12))
-        self.assertEqual(snapshot["main_nfe_values"], [4, 8, 12])
-        self.assertEqual(runner.DEFAULT_TARGET_NFE_VALUES, (4, 8, 12))
+        self.assertEqual(MAIN_NFE_VALUES, (4, 8, 12, 16))
+        self.assertEqual(snapshot["main_nfe_values"], [4, 8, 12, 16])
+        self.assertEqual(runner.DEFAULT_TARGET_NFE_VALUES, (4, 8, 12, 16))
         self.assertEqual(snapshot["baseline_schedule_keys"], ["uniform", "late_power_3", "flowts_power_sampling", "ays", "gits", "ots"])
 
         solver_names = {spec.display_name for spec in paper_solver_specs()}
@@ -131,6 +131,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 "backbone_name": "otflow",
                 "train_steps": 20000,
                 "train_budget_label": "20k",
+                "checkpoint_step": 20000,
                 "target_nfe": 10,
                 "solver_key": "euler",
                 "scheduler_key": "ays",
@@ -147,6 +148,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 "backbone_name": "otflow",
                 "train_steps": 20000,
                 "train_budget_label": "20k",
+                "checkpoint_step": 20000,
                 "target_nfe": 10,
                 "solver_key": "euler",
                 "scheduler_key": "uniform",
@@ -205,6 +207,8 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 "train_steps": 20000,
                 "train_budget_label": "20k",
             },
+            checkpoint_step=20000,
+            nfe_role="seen",
             target_nfe=10,
             runtime_nfe=10,
             solver_key="euler",
@@ -266,7 +270,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "--backbone_manifest",
                     str(manifest),
                     "--target_nfe_values",
-                    "10",
+                    "4",
                 ]
             )
             recorder = runner._init_row_recorder(Path(tmpdir), args)
@@ -285,7 +289,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "--backbone_manifest",
                     str(manifest),
                     "--target_nfe_values",
-                    "12",
+                    "8",
                 ]
             )
             recorder_changed = runner._init_row_recorder(Path(tmpdir), args_changed)
@@ -342,6 +346,8 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     rel_root,
                     "--backbone_manifest",
                     "",
+                    "--checkpoint_steps",
+                    "20000",
                     "--allow_execute",
                 ]
             )
@@ -381,6 +387,8 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "",
                     "--backbone_manifest",
                     str(manifest_path),
+                    "--checkpoint_steps",
+                    "20000",
                     "--allow_execute",
                 ]
             )
@@ -589,6 +597,8 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                         split_phase,
                         "--backbone_manifest",
                         str(PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"),
+                        "--checkpoint_steps",
+                        "20000",
                     ]
                 )
                 recorder = runner._init_row_recorder(Path(tmpdir), args)
@@ -661,6 +671,8 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "1",
                     "--backbone_manifest",
                     str(PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"),
+                    "--checkpoint_steps",
+                    "20000",
                 ]
             )
             recorder = runner._init_row_recorder(Path(tmpdir), args)

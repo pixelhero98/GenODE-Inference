@@ -73,10 +73,11 @@ loss = KL(target_density || student_density)
 ```
 
 Teacher checkpoint selection uses `weighted_normalized_regret` over
-context-disjoint, density-family, and unseen-NFE calibration diagnostics.
-Student checkpoint selection uses `validation_ce` on a context-disjoint
-calibration validation split. Locked-test rows are reporting-only and are never
-used for teacher or student selection.
+context-disjoint and density-family calibration diagnostics. Optional unseen-NFE
+diagnostic rows can be supplied for audits, but strict zero-shot fitting does
+not require measured unseen-NFE rows. Student checkpoint selection uses
+`validation_ce` on a context-disjoint calibration validation split. Locked-test
+rows are reporting-only and are never used for teacher or student selection.
 
 ## Required Inputs
 
@@ -87,11 +88,16 @@ Training requires:
   `scheduler_key`, and metric/utility columns.
 - A context embedding NPZ sidecar created from the frozen backbone under
   eval/no-grad mode.
-- Optional schedule-summary JSON files for non-fixed references such as SER.
-- Optional unseen-NFE train-tuning rows for teacher selection diagnostics.
+- Optional schedule-summary JSON files for non-fixed references such as SER,
+  including SER reversed and SER density-averaged references.
+- Optional unseen-NFE train-tuning rows for down-weighted student pseudo-target
+  distillation. These rows are never used for teacher fitting or checkpoint
+  selection.
 
 Rows are paired inside exact `(dataset, solver, NFE, context_id, seed)` cells.
 They must not cross solver, NFE, seed, series, target time, or context identity.
+Default context calibration samples are capped at 256 unique contexts per
+scenario, checkpoint maturity, and split.
 
 ## Evaluation Datasets
 
@@ -205,12 +211,16 @@ genode-prepare-molecule-xyz \
 ## Train GIPO
 
 Generate reusable fixed/SER rows and context embeddings with the schedule
-runner:
+runner. Defaults are seen NFEs `4,8,12,16`, checkpoint maturities
+`4000,8000,12000,16000,20000`, and the canonical fixed schedule set.
+Use `--nfe_role unseen` for zero-shot evaluation at `6,10,14,20`.
 
 ```bash
 genode-run-schedules \
   --forecast_datasets <dataset-key> \
   --split_phase train_tuning \
+  --nfe_role seen \
+  --checkpoint_steps 4000,8000,12000,16000,20000 \
   --baseline_scheduler_names uniform,late_power_3,flowts_power_sampling,ays,gits,ots \
   --write_forecast_context_rows \
   --device auto
@@ -233,10 +243,22 @@ genode-train-gipo \
   --rows_csv <context-rows.csv> \
   --context_embeddings_npz <context-embeddings.npz> \
   --schedule_summary_json <ser-schedule-summary.json> \
-  --teacher_unseen_selection_rows_csv <unseen-nfe-rows.csv> \
-  --teacher_unseen_selection_context_embeddings_npz <unseen-context-embeddings.npz> \
   --out_dir <output-dir> \
-  --support_schedule_keys uniform,late_power_3,flowts_power_sampling,ays,gits,ots,ser_ptg_local_defect_eta005
+  --support_schedule_keys uniform,late_power_3,flowts_power_sampling,ays,gits,ots,ser_ptg_local_defect_eta005,late_power_3_reversed,flowts_power_sampling_reversed,ays_reversed,gits_reversed,ots_reversed,ser_ptg_local_defect_eta005_reversed,late_power_3_avg_reversed,flowts_power_sampling_avg_reversed,ays_avg_reversed,gits_avg_reversed,ots_avg_reversed,ser_ptg_local_defect_eta005_avg_reversed
+```
+
+To train the pseudo-distilled student variant, add unseen-NFE pseudo rows. The
+default pseudo target weight is `0.25`:
+
+```bash
+genode-train-gipo \
+  --rows_csv <seen-context-rows.csv> \
+  --context_embeddings_npz <seen-context-embeddings.npz> \
+  --schedule_summary_json <seen-ser-summary.json> \
+  --student_pseudo_rows_csv <unseen-pseudo-rows.csv> \
+  --student_pseudo_context_embeddings_npz <unseen-context-embeddings.npz> \
+  --student_pseudo_schedule_summary_json <unseen-ser-summary.json> \
+  --out_dir <output-dir>
 ```
 
 For non-forecast tasks, provide utility columns and weights:

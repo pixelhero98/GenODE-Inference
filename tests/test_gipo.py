@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
 from genode.gipo.density_representation import (
     DENSITY_PROTOCOL,
     density_mass_to_time_grid,
@@ -172,7 +173,7 @@ class GIPOCanonicalTests(unittest.TestCase):
             root = Path(tmpdir)
             config = build_setting_encoder_config(
                 SETTING_ENCODER_MODE_CONTINUOUS_V3,
-                observed_target_nfes=(4, 8, 12),
+                observed_target_nfes=CANONICAL_SEEN_NFES,
                 nfe_reference=16,
                 rope_frequencies=(1.0, 2.0),
             )

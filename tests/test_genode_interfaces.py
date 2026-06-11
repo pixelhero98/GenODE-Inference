@@ -64,6 +64,8 @@ class GenODEInterfaceTests(unittest.TestCase):
         options = {option for action in parser._actions for option in action.option_strings}
 
         self.assertIn("--teacher_unseen_selection_rows_csv", options)
+        self.assertIn("--student_pseudo_rows_csv", options)
+        self.assertIn("--student_pseudo_target_" + "weight", options)
         removed_options = {
             "--gipo_" + "conditioning_style",
             "--gipo_teacher_" + "conditioning_style",
@@ -81,8 +83,6 @@ class GenODEInterfaceTests(unittest.TestCase):
             "--setting_encoder_mode",
             "--setting_feature_mode",
             "--series_unknown_" + "dropout",
-            "--student_pseudo_rows_csv",
-            "--student_pseudo_target_" + "weight",
         }
         self.assertFalse(removed_options & options)
 

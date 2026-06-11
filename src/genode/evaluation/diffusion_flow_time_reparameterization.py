@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import json
@@ -10,6 +11,16 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.canonical_experiment_layout import (
+    CANONICAL_CHECKPOINT_STEPS,
+    CANONICAL_LAYOUT_VERSION,
+    CANONICAL_SEEN_NFES,
+    NFE_ROLE_SEEN,
+    NFE_ROLES,
+    canonical_nfes_for_role,
+    density_source_key_for_schedule,
+    schedule_family_for_key,
+)
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
     EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
@@ -71,15 +82,22 @@ from genode.models.otflow_train_val import save_json
 from genode.runtime import resolve_torch_device
 from genode.gipo.policy import load_context_embedding_table, save_context_embedding_table
 
-RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_v4"
+RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen"
 DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
-DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = (4, 8, 12)
+DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
 DEFAULT_SCHEDULES: Tuple[str, ...] = BASELINE_SCHEDULE_KEYS
 SUPPORTED_SPLIT_PHASES: Tuple[str, ...] = (LOCKED_TEST_PHASE, VALIDATION_PHASE, TRAIN_TUNING_PHASE)
 
 ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "benchmark_family",
+    "canonical_layout_version",
+    "scenario_key",
+    "scenario_family",
+    "nfe_role",
+    "checkpoint_step",
+    "checkpoint_maturity_label",
+    "checkpoint_maturity_index",
     "split_phase",
     "seed",
     "dataset",
@@ -96,6 +114,9 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "scheduler_variant_key",
     "scheduler_variant_name",
     "schedule_name",
+    "schedule_family",
+    "density_source_key",
+    "student_training_mode",
     "row_signature",
     "signal_trace_key",
     "signal_validation_spearman",
@@ -156,6 +177,13 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
 
 FORECAST_CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "benchmark_family",
+    "canonical_layout_version",
+    "scenario_key",
+    "scenario_family",
+    "nfe_role",
+    "checkpoint_step",
+    "checkpoint_maturity_label",
+    "checkpoint_maturity_index",
     "parent_row_signature",
     "protocol_hash",
     "dataset",
@@ -168,6 +196,18 @@ FORECAST_CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "runtime_nfe",
     "realized_nfe",
     "scheduler_key",
+    "schedule_family",
+    "density_source_key",
+    "context_schema",
+    "axis_dataset",
+    "axis_series",
+    "axis_time_bin",
+    "axis_stratum",
+    "axis_member",
+    "axis_formula",
+    "axis_atom_count",
+    "axis_trajectory",
+    "axis_flags",
     "schedule_grid_hash",
     "example_idx",
     "series_id",
@@ -241,6 +281,58 @@ def _parse_schedule_names(text: str) -> List[str]:
     return names
 
 
+def _target_nfe_values_for_args(cli_args: argparse.Namespace) -> List[int]:
+    role = str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN) or NFE_ROLE_SEEN)
+    canonical = tuple(int(value) for value in canonical_nfes_for_role(role))
+    raw = str(getattr(cli_args, "target_nfe_values", "") or "").strip()
+    values = parse_int_csv(raw) if raw else list(canonical)
+    unknown = [int(value) for value in values if int(value) not in set(canonical)]
+    if unknown:
+        raise ValueError(
+            f"target_nfe_values {unknown} are not canonical for nfe_role={role!r}; "
+            f"allowed values are {list(canonical)}."
+        )
+    if not values:
+        raise ValueError("At least one target NFE is required.")
+    return [int(value) for value in values]
+
+
+def _checkpoint_steps_for_args(cli_args: argparse.Namespace) -> List[int]:
+    raw = str(getattr(cli_args, "checkpoint_steps", "") or "").strip()
+    if raw:
+        values = parse_int_csv(raw)
+    else:
+        fallback = int(getattr(cli_args, "otflow_train_steps", 0) or 0)
+        values = [fallback] if fallback > 0 else list(CANONICAL_CHECKPOINT_STEPS)
+    allowed = set(int(value) for value in CANONICAL_CHECKPOINT_STEPS)
+    unknown = [int(value) for value in values if int(value) not in allowed]
+    if unknown:
+        raise ValueError(
+            f"checkpoint_steps {unknown} are not canonical; allowed values are {list(CANONICAL_CHECKPOINT_STEPS)}."
+        )
+    if not values:
+        raise ValueError("At least one checkpoint step is required.")
+    return [int(value) for value in values]
+
+
+def _checkpoint_maturity_label(step: int) -> str:
+    return f"{int(step)}_steps"
+
+
+def _checkpoint_maturity_index(step: int) -> int:
+    steps = tuple(int(value) for value in CANONICAL_CHECKPOINT_STEPS)
+    if int(step) not in steps:
+        raise ValueError(f"Unknown canonical checkpoint step: {step}")
+    return int(steps.index(int(step)))
+
+
+def _args_for_checkpoint_step(cli_args: argparse.Namespace, checkpoint_step: int) -> argparse.Namespace:
+    copied = copy.copy(cli_args)
+    copied.otflow_train_steps = int(checkpoint_step)
+    copied.steps = int(checkpoint_step)
+    return copied
+
+
 def _path_fingerprint(path: str | Path) -> Dict[str, Any]:
     resolved = resolve_project_path(str(path))
     path_hash = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()
@@ -306,11 +398,13 @@ def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
             str(cli_args.conditional_generation_datasets)
         ),
         "seeds": parse_int_csv(str(cli_args.seeds)),
-        "target_nfe_values": parse_int_csv(str(cli_args.target_nfe_values)),
+        "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
+        "nfe_role": str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN)),
+        "target_nfe_values": _target_nfe_values_for_args(cli_args),
+        "checkpoint_steps": _checkpoint_steps_for_args(cli_args),
         "solver_names": parse_csv(str(cli_args.solver_names)),
         "baseline_scheduler_names": _parse_schedule_names(str(cli_args.baseline_scheduler_names)),
         "split_phase": str(cli_args.split_phase),
-        "otflow_train_steps": int(cli_args.otflow_train_steps),
         "dataset_seed": int(cli_args.dataset_seed),
         "num_eval_samples": int(cli_args.num_eval_samples),
         "forecast_eval_batch_size": int(cli_args.forecast_eval_batch_size),
@@ -534,13 +628,20 @@ def _evaluation_protocol_fields(result_row: Mapping[str, Any], *, eval_horizon: 
     }
 
 
-def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: str, checkpoint: Mapping[str, Any], target_nfe: int, runtime_nfe: int, solver_key: str, scheduler_key: str, details: Mapping[str, Any], metrics: Mapping[str, Any], row_signature: str, protocol_hash: str) -> Dict[str, Any]:
+def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: str, checkpoint: Mapping[str, Any], checkpoint_step: int, nfe_role: str, target_nfe: int, runtime_nfe: int, solver_key: str, scheduler_key: str, details: Mapping[str, Any], metrics: Mapping[str, Any], row_signature: str, protocol_hash: str) -> Dict[str, Any]:
     selection_metric = selection_metric_for_family(str(benchmark_family))
     realized_nfe = metrics.get("realized_nfe")
     if realized_nfe is None:
         realized_nfe = _realized_nfe_for_solver(str(solver_key), int(runtime_nfe))
     return {
         "benchmark_family": str(benchmark_family),
+        "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
+        "scenario_key": str(dataset),
+        "scenario_family": str(benchmark_family),
+        "nfe_role": str(nfe_role),
+        "checkpoint_step": int(checkpoint_step),
+        "checkpoint_maturity_label": _checkpoint_maturity_label(int(checkpoint_step)),
+        "checkpoint_maturity_index": _checkpoint_maturity_index(int(checkpoint_step)),
         "split_phase": str(split_phase),
         "seed": int(seed),
         "dataset": str(dataset),
@@ -557,6 +658,9 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "scheduler_variant_key": str(scheduler_key),
         "scheduler_variant_name": schedule_display_name(str(scheduler_key)),
         "schedule_name": schedule_display_name(str(scheduler_key)),
+        "schedule_family": schedule_family_for_key(str(scheduler_key)),
+        "density_source_key": density_source_key_for_schedule(str(scheduler_key)),
+        "student_training_mode": "",
         "row_signature": str(row_signature),
         "signal_trace_key": None,
         "signal_validation_spearman": None,
@@ -622,146 +726,196 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
     dataset_root = resolve_project_path(str(cli_args.dataset_root))
     shared_backbone_root = resolve_project_path(str(cli_args.shared_backbone_root))
     device = resolve_torch_device(str(cli_args.device))
-    dataset_cache: Dict[str, Dict[str, Any]] = {}
+    dataset_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
     rows: List[Dict[str, Any]] = []
     datasets = parse_forecast_datasets(str(cli_args.forecast_datasets))
+    target_nfes = _target_nfe_values_for_args(cli_args)
+    checkpoint_steps = _checkpoint_steps_for_args(cli_args)
+    nfe_role = str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN) or NFE_ROLE_SEEN)
     for dataset_idx, dataset in enumerate(datasets):
-        if dataset not in dataset_cache:
-            dataset_cache[dataset] = load_forecast_checkpoint_splits(cli_args=cli_args, dataset_root=dataset_root, shared_backbone_root=shared_backbone_root, dataset=dataset, device=device)
-        checkpoint = dataset_cache[dataset]
-        model = checkpoint["model"]
-        cfg = checkpoint["cfg"]
-        splits = checkpoint["splits"]
-        train_tuning_reference_examples = int(len(splits.get("val", [])))
-        if str(split_phase) == TRAIN_TUNING_PHASE:
-            eval_ds = splits["train"]
-            eval_window_count = 0
-        elif str(split_phase) == VALIDATION_PHASE:
-            eval_ds = splits["val"]
-            eval_window_count = int(cli_args.eval_windows_val)
-        else:
-            eval_ds = splits["test"]
-            eval_window_count = int(cli_args.eval_windows_test)
-        for seed in seeds:
+        for checkpoint_step in checkpoint_steps:
+            step_args = _args_for_checkpoint_step(cli_args, int(checkpoint_step))
+            cache_key = (str(dataset), int(checkpoint_step))
+            if cache_key not in dataset_cache:
+                dataset_cache[cache_key] = load_forecast_checkpoint_splits(
+                    cli_args=step_args,
+                    dataset_root=dataset_root,
+                    shared_backbone_root=shared_backbone_root,
+                    dataset=dataset,
+                    device=device,
+                )
+            checkpoint = dataset_cache[cache_key]
+            model = checkpoint["model"]
+            cfg = checkpoint["cfg"]
+            splits = checkpoint["splits"]
+            train_tuning_reference_examples = int(len(splits.get("val", [])))
             if str(split_phase) == TRAIN_TUNING_PHASE:
-                chosen_examples = choose_forecast_train_tuning_indices(
-                    eval_ds,
-                    fraction=float(cli_args.eval_train_fraction),
-                    seed=int(cli_args.train_tuning_seed) + int(seed) + 1_000 * dataset_idx,
-                    strata=int(cli_args.train_tuning_strata),
-                    dataset=str(dataset),
-                    sampling_mode=str(cli_args.train_tuning_sampling_mode),
-                    reference_examples=int(train_tuning_reference_examples),
-                    train_split_fraction=float(cli_args.train_tuning_train_split_fraction),
-                    val_split_fraction=float(cli_args.train_tuning_val_split_fraction),
-                )
+                eval_ds = splits["train"]
+                eval_window_count = 0
+            elif str(split_phase) == VALIDATION_PHASE:
+                eval_ds = splits["val"]
+                eval_window_count = int(cli_args.eval_windows_val)
             else:
-                chosen_examples = choose_forecast_example_indices(
-                    eval_ds,
-                    n_examples=int(eval_window_count),
-                    seed=int(seed) + 1_000 * dataset_idx,
-                )
-            for target_idx, target_nfe in enumerate(parse_int_csv(str(cli_args.target_nfe_values))):
-                for solver_idx, solver_key in enumerate(parse_csv(str(cli_args.solver_names))):
-                    runtime_nfe = solver_macro_steps(str(solver_key), int(target_nfe))
-                    scheduler_cases = list(scheduler_cases_by_dataset[str(dataset)])
-                    existing_rows, pending_cases = _pending_scheduler_cases(row_recorder, benchmark_family=FORECAST_FAMILY, split_phase=str(split_phase), seed=int(seed), dataset=str(dataset), checkpoint_id=str(checkpoint["checkpoint_id"]), target_nfe=int(target_nfe), solver_key=str(solver_key), scheduler_cases=scheduler_cases)
-                    rows.extend(existing_rows)
-                    cell_uniform_metrics: Optional[Mapping[str, Any]] = None
-                    for existing_row in existing_rows:
-                        if str(existing_row.get("scheduler_key")) == UNIFORM_SCHEDULER_KEY:
-                            cell_uniform_metrics = existing_row
-                    for case in pending_cases:
-                        scheduler_key = str(case["scheduler_key"])
-                        details = _fixed_schedule_details(scheduler_key, int(runtime_nfe))
-                        eval_seed = int(seed) + 100_000 * dataset_idx + 1_000 * target_idx + solver_idx
-                        metrics = evaluate_forecast_schedule(
-                            model,
-                            eval_ds,
-                            cfg,
-                            solver_name=str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
-                            runtime_nfe=int(runtime_nfe),
-                            target_nfe=int(target_nfe),
-                            time_grid=details["time_grid"],
-                            num_eval_samples=int(cli_args.num_eval_samples),
-                            seed=int(eval_seed),
-                            logical_seed=int(seed),
-                            scheduler_key=str(scheduler_key),
-                            dataset_key=str(dataset),
+                eval_ds = splits["test"]
+                eval_window_count = int(cli_args.eval_windows_test)
+            for seed in seeds:
+                if str(split_phase) == TRAIN_TUNING_PHASE:
+                    tuning_seed = int(cli_args.train_tuning_seed) + int(seed) + 1_000 * dataset_idx
+                    chosen_examples = choose_forecast_train_tuning_indices(
+                        eval_ds,
+                        fraction=float(cli_args.eval_train_fraction),
+                        seed=tuning_seed,
+                        strata=int(cli_args.train_tuning_strata),
+                        dataset=str(dataset),
+                        sampling_mode=str(cli_args.train_tuning_sampling_mode),
+                        reference_examples=int(train_tuning_reference_examples),
+                        train_split_fraction=float(cli_args.train_tuning_train_split_fraction),
+                        val_split_fraction=float(cli_args.train_tuning_val_split_fraction),
+                    )
+                else:
+                    tuning_seed = int(seed) + 1_000 * dataset_idx
+                    chosen_examples = choose_forecast_example_indices(
+                        eval_ds,
+                        n_examples=int(eval_window_count),
+                        seed=tuning_seed,
+                    )
+                for target_idx, target_nfe in enumerate(target_nfes):
+                    for solver_idx, solver_key in enumerate(parse_csv(str(cli_args.solver_names))):
+                        runtime_nfe = solver_macro_steps(str(solver_key), int(target_nfe))
+                        scheduler_cases = list(scheduler_cases_by_dataset[str(dataset)])
+                        existing_rows, pending_cases = _pending_scheduler_cases(
+                            row_recorder,
+                            benchmark_family=FORECAST_FAMILY,
                             split_phase=str(split_phase),
+                            seed=int(seed),
+                            dataset=str(dataset),
                             checkpoint_id=str(checkpoint["checkpoint_id"]),
-                            example_indices=chosen_examples,
-                            batch_size=int(cli_args.forecast_eval_batch_size),
-                            progress_label=f"{split_phase} {dataset} {scheduler_key} seed={seed} {solver_key}/{target_nfe}",
-                            return_per_example_rows=bool(getattr(cli_args, "write_forecast_context_rows", False)),
-                            return_context_embeddings=bool(getattr(cli_args, "write_forecast_context_rows", False)),
-                            context_embedding_kind=str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
+                            target_nfe=int(target_nfe),
+                            solver_key=str(solver_key),
+                            scheduler_cases=scheduler_cases,
                         )
-                        if scheduler_key != UNIFORM_SCHEDULER_KEY and cell_uniform_metrics is not None:
-                            metrics = dict(metrics)
-                            metrics["forecast_relative_crps_gain_vs_uniform"] = _safe_relative_gain(
-                                metrics.get("forecast_crps"),
-                                cell_uniform_metrics.get("forecast_crps"),
+                        rows.extend(existing_rows)
+                        cell_uniform_metrics: Optional[Mapping[str, Any]] = None
+                        for existing_row in existing_rows:
+                            if str(existing_row.get("scheduler_key")) == UNIFORM_SCHEDULER_KEY:
+                                cell_uniform_metrics = existing_row
+                        for case in pending_cases:
+                            scheduler_key = str(case["scheduler_key"])
+                            details = _fixed_schedule_details(scheduler_key, int(runtime_nfe))
+                            eval_seed = int(seed) + 100_000 * dataset_idx + 1_000 * target_idx + solver_idx
+                            metrics = evaluate_forecast_schedule(
+                                model,
+                                eval_ds,
+                                cfg,
+                                solver_name=str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
+                                runtime_nfe=int(runtime_nfe),
+                                target_nfe=int(target_nfe),
+                                time_grid=details["time_grid"],
+                                num_eval_samples=int(cli_args.num_eval_samples),
+                                seed=int(eval_seed),
+                                logical_seed=int(seed),
+                                scheduler_key=str(scheduler_key),
+                                dataset_key=str(dataset),
+                                split_phase=str(split_phase),
+                                checkpoint_id=str(checkpoint["checkpoint_id"]),
+                                example_indices=chosen_examples,
+                                batch_size=int(cli_args.forecast_eval_batch_size),
+                                progress_label=f"{split_phase} {dataset} {scheduler_key} step={checkpoint_step} seed={seed} {solver_key}/{target_nfe}",
+                                return_per_example_rows=bool(getattr(cli_args, "write_forecast_context_rows", False)),
+                                return_context_embeddings=bool(getattr(cli_args, "write_forecast_context_rows", False)),
+                                context_embedding_kind=str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
                             )
-                            metrics["forecast_relative_mase_gain_vs_uniform"] = _safe_relative_gain(
-                                metrics.get("forecast_mase"),
-                                cell_uniform_metrics.get("forecast_mase"),
+                            if scheduler_key != UNIFORM_SCHEDULER_KEY and cell_uniform_metrics is not None:
+                                metrics = dict(metrics)
+                                metrics["forecast_relative_crps_gain_vs_uniform"] = _safe_relative_gain(
+                                    metrics.get("forecast_crps"),
+                                    cell_uniform_metrics.get("forecast_crps"),
+                                )
+                                metrics["forecast_relative_mase_gain_vs_uniform"] = _safe_relative_gain(
+                                    metrics.get("forecast_mase"),
+                                    cell_uniform_metrics.get("forecast_mase"),
+                                )
+                            row = _build_row(
+                                benchmark_family=FORECAST_FAMILY,
+                                split_phase=str(split_phase),
+                                seed=int(seed),
+                                dataset=str(dataset),
+                                checkpoint=checkpoint,
+                                checkpoint_step=int(checkpoint_step),
+                                nfe_role=nfe_role,
+                                target_nfe=int(target_nfe),
+                                runtime_nfe=int(runtime_nfe),
+                                solver_key=str(solver_key),
+                                scheduler_key=scheduler_key,
+                                details=details,
+                                metrics=metrics,
+                                row_signature=str(case["row_signature"]),
+                                protocol_hash=str(row_recorder["protocol_hash"]),
                             )
-                        row = _build_row(benchmark_family=FORECAST_FAMILY, split_phase=str(split_phase), seed=int(seed), dataset=str(dataset), checkpoint=checkpoint, target_nfe=int(target_nfe), runtime_nfe=int(runtime_nfe), solver_key=str(solver_key), scheduler_key=scheduler_key, details=details, metrics=metrics, row_signature=str(case["row_signature"]), protocol_hash=str(row_recorder["protocol_hash"]))
-                        if str(split_phase) == TRAIN_TUNING_PHASE:
-                            row.update(
-                                {
-                                    "train_tuning_fraction": float(cli_args.eval_train_fraction),
-                                    "train_tuning_seed": int(cli_args.train_tuning_seed) + int(seed) + 1_000 * dataset_idx,
-                                    "train_tuning_strata": int(cli_args.train_tuning_strata),
-                                    "train_tuning_sampler": train_tuning_sampler_key(str(cli_args.train_tuning_sampling_mode)),
-                                    "train_tuning_sampling_mode": str(cli_args.train_tuning_sampling_mode),
-                                    "train_tuning_reference_examples": int(train_tuning_reference_examples),
-                                    "train_tuning_target_examples": int(len(chosen_examples)),
-                                    "train_tuning_train_split_fraction": float(cli_args.train_tuning_train_split_fraction),
-                                    "train_tuning_val_split_fraction": float(cli_args.train_tuning_val_split_fraction),
-                                }
-                            )
-                        _append_row_record(row_recorder, row)
-                        if bool(getattr(cli_args, "write_forecast_context_rows", False)):
-                            context_rows = []
-                            for detail_row in list(metrics.get("per_example_rows", []) or []):
-                                copied_detail = dict(detail_row)
-                                copied_detail.update(
+                            if str(split_phase) == TRAIN_TUNING_PHASE:
+                                row.update(
                                     {
-                                        "benchmark_family": FORECAST_FAMILY,
-                                        "parent_row_signature": str(case["row_signature"]),
-                                        "protocol_hash": str(row_recorder["protocol_hash"]),
+                                        "train_tuning_fraction": float(cli_args.eval_train_fraction),
+                                        "train_tuning_seed": int(tuning_seed),
+                                        "train_tuning_strata": int(cli_args.train_tuning_strata),
+                                        "train_tuning_sampler": train_tuning_sampler_key(str(cli_args.train_tuning_sampling_mode)),
+                                        "train_tuning_sampling_mode": str(cli_args.train_tuning_sampling_mode),
+                                        "train_tuning_reference_examples": int(train_tuning_reference_examples),
+                                        "train_tuning_target_examples": int(len(chosen_examples)),
+                                        "train_tuning_train_split_fraction": float(cli_args.train_tuning_train_split_fraction),
+                                        "train_tuning_val_split_fraction": float(cli_args.train_tuning_val_split_fraction),
                                     }
                                 )
-                                if str(split_phase) == TRAIN_TUNING_PHASE:
+                            _append_row_record(row_recorder, row)
+                            if bool(getattr(cli_args, "write_forecast_context_rows", False)):
+                                context_rows = []
+                                for detail_row in list(metrics.get("per_example_rows", []) or []):
+                                    copied_detail = dict(detail_row)
                                     copied_detail.update(
                                         {
-                                            "train_tuning_fraction": float(cli_args.eval_train_fraction),
-                                            "train_tuning_seed": int(cli_args.train_tuning_seed) + int(seed) + 1_000 * dataset_idx,
-                                            "train_tuning_strata": int(cli_args.train_tuning_strata),
-                                            "train_tuning_sampler": train_tuning_sampler_key(str(cli_args.train_tuning_sampling_mode)),
+                                            "benchmark_family": FORECAST_FAMILY,
+                                            "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
+                                            "scenario_key": str(dataset),
+                                            "scenario_family": FORECAST_FAMILY,
+                                            "nfe_role": nfe_role,
+                                            "checkpoint_step": int(checkpoint_step),
+                                            "checkpoint_maturity_label": _checkpoint_maturity_label(int(checkpoint_step)),
+                                            "checkpoint_maturity_index": _checkpoint_maturity_index(int(checkpoint_step)),
+                                            "parent_row_signature": str(case["row_signature"]),
+                                            "protocol_hash": str(row_recorder["protocol_hash"]),
+                                            "schedule_family": schedule_family_for_key(str(scheduler_key)),
+                                            "density_source_key": density_source_key_for_schedule(str(scheduler_key)),
                                         }
                                     )
-                                context_rows.append(copied_detail)
-                            _append_forecast_context_records(
-                                row_recorder,
-                                context_rows,
-                                context_embeddings=dict(metrics.get("context_embeddings", {}) or {}),
-                                metadata={
-                                    "checkpoint_id": str(checkpoint["checkpoint_id"]),
-                                    "dataset": str(dataset),
-                                    "split_phase": str(split_phase),
-                                    "context_embedding_kind": str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
-                                    "history_len": int(getattr(cfg, "history_len", 0)),
-                                    "horizon": int(getattr(eval_ds, "horizon", 1)),
-                                    "chosen_examples_hash": str(metrics.get("chosen_examples_hash", "")),
-                                    "evaluation_protocol_hash": str(metrics.get("evaluation_protocol_hash", "")),
-                                },
-                            )
-                        rows.append(row)
-                        if scheduler_key == UNIFORM_SCHEDULER_KEY:
-                            cell_uniform_metrics = row
+                                    if str(split_phase) == TRAIN_TUNING_PHASE:
+                                        copied_detail.update(
+                                            {
+                                                "train_tuning_fraction": float(cli_args.eval_train_fraction),
+                                                "train_tuning_seed": int(tuning_seed),
+                                                "train_tuning_strata": int(cli_args.train_tuning_strata),
+                                                "train_tuning_sampler": train_tuning_sampler_key(str(cli_args.train_tuning_sampling_mode)),
+                                            }
+                                        )
+                                    context_rows.append(copied_detail)
+                                _append_forecast_context_records(
+                                    row_recorder,
+                                    context_rows,
+                                    context_embeddings=dict(metrics.get("context_embeddings", {}) or {}),
+                                    metadata={
+                                        "checkpoint_id": str(checkpoint["checkpoint_id"]),
+                                        "checkpoint_step": int(checkpoint_step),
+                                        "dataset": str(dataset),
+                                        "split_phase": str(split_phase),
+                                        "context_embedding_kind": str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
+                                        "history_len": int(getattr(cfg, "history_len", 0)),
+                                        "horizon": int(getattr(eval_ds, "horizon", 1)),
+                                        "chosen_examples_hash": str(metrics.get("chosen_examples_hash", "")),
+                                        "evaluation_protocol_hash": str(metrics.get("evaluation_protocol_hash", "")),
+                                    },
+                                )
+                            rows.append(row)
+                            if scheduler_key == UNIFORM_SCHEDULER_KEY:
+                                cell_uniform_metrics = row
     return rows
 
 
@@ -770,62 +924,126 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
         raise ValueError("train_tuning split is only supported for forecast schedule evaluation.")
     shared_backbone_root = resolve_project_path(str(cli_args.shared_backbone_root))
     device = resolve_torch_device(str(cli_args.device))
-    dataset_cache: Dict[str, Dict[str, Any]] = {}
+    dataset_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
     rows: List[Dict[str, Any]] = []
     datasets = parse_conditional_generation_datasets(str(cli_args.conditional_generation_datasets))
+    target_nfes = _target_nfe_values_for_args(cli_args)
+    checkpoint_steps = _checkpoint_steps_for_args(cli_args)
+    nfe_role = str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN) or NFE_ROLE_SEEN)
     for dataset_idx, dataset in enumerate(datasets):
-        if dataset not in dataset_cache:
-            dataset_cache[dataset] = load_conditional_generation_checkpoint_splits(cli_args=cli_args, shared_backbone_root=shared_backbone_root, dataset=dataset, device=device)
-        checkpoint = dataset_cache[dataset]
-        model = checkpoint["model"]
-        cfg = checkpoint["cfg"]
-        splits = checkpoint["splits"]
-        eval_ds = splits["val"] if str(split_phase) == VALIDATION_PHASE else splits["test"]
-        eval_horizon = resolved_eval_horizon(cli_args, str(dataset))
-        eval_windows = resolved_eval_windows(cli_args, str(dataset), "val" if str(split_phase) == VALIDATION_PHASE else "test")
-        for seed in seeds:
-            chosen_eval_t0s = np.asarray(_choose_valid_windows(eval_ds, horizon=int(eval_horizon), n_windows=int(eval_windows), seed=int(seed) + 1_000 * dataset_idx), dtype=np.int64)
-            for target_idx, target_nfe in enumerate(parse_int_csv(str(cli_args.target_nfe_values))):
-                for solver_idx, solver_key in enumerate(parse_csv(str(cli_args.solver_names))):
-                    runtime_nfe = solver_macro_steps(str(solver_key), int(target_nfe))
-                    existing_rows, pending_cases = _pending_scheduler_cases(row_recorder, benchmark_family=CONDITIONAL_GENERATION_FAMILY, split_phase=str(split_phase), seed=int(seed), dataset=str(dataset), checkpoint_id=str(checkpoint["checkpoint_id"]), target_nfe=int(target_nfe), solver_key=str(solver_key), scheduler_cases=list(scheduler_cases_by_dataset[str(dataset)]))
-                    rows.extend(existing_rows)
-                    cell_uniform_metrics: Optional[Mapping[str, Any]] = None
-                    for existing_row in existing_rows:
-                        if str(existing_row.get("scheduler_key")) == UNIFORM_SCHEDULER_KEY:
-                            cell_uniform_metrics = existing_row
-                    for case in pending_cases:
-                        scheduler_key = str(case["scheduler_key"])
-                        details = _fixed_schedule_details(scheduler_key, int(runtime_nfe))
-                        grid_spec = {"grid_name": scheduler_key, "grid_kind": "fixed_diffusion_flow_time_grid", "selection_group": scheduler_key, "comparison_role": "transferred" if scheduler_key in TRANSFER_SCHEDULE_KEYS else "baseline", "solver_name": str(SOLVER_RUNTIME_NAMES[str(solver_key)]), "nfe": int(runtime_nfe), "time_grid": details["time_grid"]}
-                        metrics_seed = int(seed) + 1_000_000 * dataset_idx + 10_000 * target_idx + solver_idx
-                        result_row = run_fixed_schedule_variant(model=model, ds=eval_ds, cfg=cfg, eval_horizon=int(eval_horizon), eval_windows=int(len(chosen_eval_t0s)), grid_spec=grid_spec, chosen_t0s=chosen_eval_t0s, generation_seed_base=int(metrics_seed), metrics_seed=int(metrics_seed), score_main_only=False)
-                        metrics = {
-                            "score_main": result_row.get("score_main"),
-                            "temporal_tstr_f1": result_row.get("temporal_tstr_f1"),
-                            "temporal_tstr_f1_applicable": result_row.get("temporal_tstr_f1_applicable"),
-                            "disc_auc": result_row.get("disc_auc"),
-                            "disc_auc_gap": result_row.get("disc_auc_gap"),
-                            "temporal_uw1": result_row.get("temporal_uw1"),
-                            "temporal_cw1": result_row.get("temporal_cw1"),
-                            "u_l1": result_row.get("u_l1"),
-                            "c_l1": result_row.get("c_l1"),
-                            "spread_specific_error": result_row.get("spread_specific_error"),
-                            "imbalance_specific_error": result_row.get("imbalance_specific_error"),
-                            "ret_vol_acf_error": result_row.get("ret_vol_acf_error"),
-                            "impact_response_error": result_row.get("impact_response_error"),
-                            "efficiency_ms_per_sample": result_row.get("efficiency_ms_per_sample"),
-                            "eval_windows": int(len(chosen_eval_t0s)),
-                            "realized_nfe": _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)),
-                            **_evaluation_protocol_fields(result_row, eval_horizon=int(eval_horizon)),
-                        }
-                        if scheduler_key != UNIFORM_SCHEDULER_KEY and cell_uniform_metrics is not None:
-                            metrics["relative_score_gain_vs_uniform"] = _safe_relative_gain(metrics.get("score_main"), cell_uniform_metrics.get("score_main"))
-                        row = _build_row(benchmark_family=CONDITIONAL_GENERATION_FAMILY, split_phase=str(split_phase), seed=int(seed), dataset=str(dataset), checkpoint=checkpoint, target_nfe=int(target_nfe), runtime_nfe=int(runtime_nfe), solver_key=str(solver_key), scheduler_key=scheduler_key, details=details, metrics=metrics, row_signature=str(case["row_signature"]), protocol_hash=str(row_recorder["protocol_hash"]))
-                        _append_row_record(row_recorder, row)
-                        rows.append(row)
-                        if scheduler_key == UNIFORM_SCHEDULER_KEY:
-                            cell_uniform_metrics = row
+        for checkpoint_step in checkpoint_steps:
+            step_args = _args_for_checkpoint_step(cli_args, int(checkpoint_step))
+            cache_key = (str(dataset), int(checkpoint_step))
+            if cache_key not in dataset_cache:
+                dataset_cache[cache_key] = load_conditional_generation_checkpoint_splits(
+                    cli_args=step_args,
+                    shared_backbone_root=shared_backbone_root,
+                    dataset=dataset,
+                    device=device,
+                )
+            checkpoint = dataset_cache[cache_key]
+            model = checkpoint["model"]
+            cfg = checkpoint["cfg"]
+            splits = checkpoint["splits"]
+            eval_ds = splits["val"] if str(split_phase) == VALIDATION_PHASE else splits["test"]
+            eval_horizon = resolved_eval_horizon(step_args, str(dataset))
+            eval_windows = resolved_eval_windows(step_args, str(dataset), "val" if str(split_phase) == VALIDATION_PHASE else "test")
+            for seed in seeds:
+                chosen_eval_t0s = np.asarray(
+                    _choose_valid_windows(
+                        eval_ds,
+                        horizon=int(eval_horizon),
+                        n_windows=int(eval_windows),
+                        seed=int(seed) + 1_000 * dataset_idx,
+                    ),
+                    dtype=np.int64,
+                )
+                for target_idx, target_nfe in enumerate(target_nfes):
+                    for solver_idx, solver_key in enumerate(parse_csv(str(cli_args.solver_names))):
+                        runtime_nfe = solver_macro_steps(str(solver_key), int(target_nfe))
+                        existing_rows, pending_cases = _pending_scheduler_cases(
+                            row_recorder,
+                            benchmark_family=CONDITIONAL_GENERATION_FAMILY,
+                            split_phase=str(split_phase),
+                            seed=int(seed),
+                            dataset=str(dataset),
+                            checkpoint_id=str(checkpoint["checkpoint_id"]),
+                            target_nfe=int(target_nfe),
+                            solver_key=str(solver_key),
+                            scheduler_cases=list(scheduler_cases_by_dataset[str(dataset)]),
+                        )
+                        rows.extend(existing_rows)
+                        cell_uniform_metrics: Optional[Mapping[str, Any]] = None
+                        for existing_row in existing_rows:
+                            if str(existing_row.get("scheduler_key")) == UNIFORM_SCHEDULER_KEY:
+                                cell_uniform_metrics = existing_row
+                        for case in pending_cases:
+                            scheduler_key = str(case["scheduler_key"])
+                            details = _fixed_schedule_details(scheduler_key, int(runtime_nfe))
+                            grid_spec = {
+                                "grid_name": scheduler_key,
+                                "grid_kind": "fixed_diffusion_flow_time_grid",
+                                "selection_group": scheduler_key,
+                                "comparison_role": "transferred" if scheduler_key in TRANSFER_SCHEDULE_KEYS else "baseline",
+                                "solver_name": str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
+                                "nfe": int(runtime_nfe),
+                                "time_grid": details["time_grid"],
+                            }
+                            metrics_seed = int(seed) + 1_000_000 * dataset_idx + 10_000 * target_idx + solver_idx
+                            result_row = run_fixed_schedule_variant(
+                                model=model,
+                                ds=eval_ds,
+                                cfg=cfg,
+                                eval_horizon=int(eval_horizon),
+                                eval_windows=int(len(chosen_eval_t0s)),
+                                grid_spec=grid_spec,
+                                chosen_t0s=chosen_eval_t0s,
+                                generation_seed_base=int(metrics_seed),
+                                metrics_seed=int(metrics_seed),
+                                score_main_only=False,
+                            )
+                            metrics = {
+                                "score_main": result_row.get("score_main"),
+                                "temporal_tstr_f1": result_row.get("temporal_tstr_f1"),
+                                "temporal_tstr_f1_applicable": result_row.get("temporal_tstr_f1_applicable"),
+                                "disc_auc": result_row.get("disc_auc"),
+                                "disc_auc_gap": result_row.get("disc_auc_gap"),
+                                "temporal_uw1": result_row.get("temporal_uw1"),
+                                "temporal_cw1": result_row.get("temporal_cw1"),
+                                "u_l1": result_row.get("u_l1"),
+                                "c_l1": result_row.get("c_l1"),
+                                "spread_specific_error": result_row.get("spread_specific_error"),
+                                "imbalance_specific_error": result_row.get("imbalance_specific_error"),
+                                "ret_vol_acf_error": result_row.get("ret_vol_acf_error"),
+                                "impact_response_error": result_row.get("impact_response_error"),
+                                "efficiency_ms_per_sample": result_row.get("efficiency_ms_per_sample"),
+                                "eval_windows": int(len(chosen_eval_t0s)),
+                                "realized_nfe": _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)),
+                                **_evaluation_protocol_fields(result_row, eval_horizon=int(eval_horizon)),
+                            }
+                            if scheduler_key != UNIFORM_SCHEDULER_KEY and cell_uniform_metrics is not None:
+                                metrics["relative_score_gain_vs_uniform"] = _safe_relative_gain(metrics.get("score_main"), cell_uniform_metrics.get("score_main"))
+                            row = _build_row(
+                                benchmark_family=CONDITIONAL_GENERATION_FAMILY,
+                                split_phase=str(split_phase),
+                                seed=int(seed),
+                                dataset=str(dataset),
+                                checkpoint=checkpoint,
+                                checkpoint_step=int(checkpoint_step),
+                                nfe_role=nfe_role,
+                                target_nfe=int(target_nfe),
+                                runtime_nfe=int(runtime_nfe),
+                                solver_key=str(solver_key),
+                                scheduler_key=scheduler_key,
+                                details=details,
+                                metrics=metrics,
+                                row_signature=str(case["row_signature"]),
+                                protocol_hash=str(row_recorder["protocol_hash"]),
+                            )
+                            _append_row_record(row_recorder, row)
+                            rows.append(row)
+                            if scheduler_key == UNIFORM_SCHEDULER_KEY:
+                                cell_uniform_metrics = row
     return rows
 
 
@@ -846,7 +1064,16 @@ def _candidate_rows_by_phase(rows: Sequence[Mapping[str, Any]], split_phase: str
 def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     groups: Dict[Tuple[Any, ...], List[Mapping[str, Any]]] = {}
     for row in rows:
-        key = (row.get("benchmark_family"), row.get("dataset"), row.get("target_nfe"), row.get("solver_key"), row.get("scheduler_key"), row.get("train_budget_label"))
+        key = (
+            row.get("benchmark_family"),
+            row.get("scenario_key", row.get("dataset")),
+            row.get("nfe_role"),
+            row.get("checkpoint_step"),
+            row.get("target_nfe"),
+            row.get("solver_key"),
+            row.get("scheduler_key"),
+            row.get("train_budget_label"),
+        )
         groups.setdefault(key, []).append(row)
     summaries: List[Dict[str, Any]] = []
     metric_names = (
@@ -873,8 +1100,27 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
         "latency_ms_per_sample",
     )
     for key, group in sorted(groups.items(), key=lambda item: tuple(str(x) for x in item[0])):
-        family, dataset, target_nfe, solver_key, scheduler_key, budget = key
-        summary: Dict[str, Any] = {"benchmark_family": family, "dataset": dataset, "target_nfe": int(target_nfe), "solver_key": solver_key, "scheduler_key": scheduler_key, "schedule_name": schedule_display_name(str(scheduler_key)), "train_budget_label": budget, "n_seeds": int(len(group)), "seed_values": sorted(int(row.get("seed", 0)) for row in group)}
+        family, dataset, nfe_role, checkpoint_step, target_nfe, solver_key, scheduler_key, budget = key
+        summary: Dict[str, Any] = {
+            "benchmark_family": family,
+            "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
+            "scenario_key": dataset,
+            "scenario_family": family,
+            "nfe_role": nfe_role,
+            "checkpoint_step": int(checkpoint_step),
+            "checkpoint_maturity_label": _checkpoint_maturity_label(int(checkpoint_step)),
+            "checkpoint_maturity_index": _checkpoint_maturity_index(int(checkpoint_step)),
+            "dataset": dataset,
+            "target_nfe": int(target_nfe),
+            "solver_key": solver_key,
+            "scheduler_key": scheduler_key,
+            "schedule_name": schedule_display_name(str(scheduler_key)),
+            "schedule_family": schedule_family_for_key(str(scheduler_key)),
+            "density_source_key": density_source_key_for_schedule(str(scheduler_key)),
+            "train_budget_label": budget,
+            "n_seeds": int(len(group)),
+            "seed_values": sorted(int(row.get("seed", 0)) for row in group),
+        }
         for metric in metric_names:
             vals = [_optional_float(row.get(metric)) for row in group]
             vals = [float(v) for v in vals if v is not None]
@@ -912,7 +1158,8 @@ def _aggregate_main_table(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
 def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
     schedules = _parse_schedule_names(str(cli_args.baseline_scheduler_names))
     solvers = parse_csv(str(cli_args.solver_names))
-    nfes = parse_int_csv(str(cli_args.target_nfe_values))
+    nfes = _target_nfe_values_for_args(cli_args)
+    checkpoint_steps = _checkpoint_steps_for_args(cli_args)
     manifest_path = resolve_project_path(str(cli_args.backbone_manifest)) if str(cli_args.backbone_manifest).strip() else None
     manifest_summary: Dict[str, Any] = {"path": None, "ready_count": None, "missing_count": None}
     if manifest_path is not None:
@@ -925,13 +1172,16 @@ def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
     return {
         "runner_mode": "diffusion_flow_time_reparameterization",
         "runner_signature": RUNNER_SIGNATURE_VERSION,
+        "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
         "method_key": METHOD_KEY,
         "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
         "experimental_fixed_schedule_keys": list(EXPERIMENTAL_FIXED_SCHEDULE_KEYS),
         "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS),
         "scheduled_evaluation_keys": schedules,
         "solver_names": solvers,
+        "nfe_role": str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN)),
         "target_nfe_values": nfes,
+        "checkpoint_steps": checkpoint_steps,
         "forecast_datasets": parse_forecast_datasets(str(cli_args.forecast_datasets)),
         "conditional_generation_datasets": parse_conditional_generation_datasets(
             str(cli_args.conditional_generation_datasets)
@@ -948,7 +1198,8 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--dataset_root", type=str, default=str(project_paper_dataset_root()))
     ap.add_argument("--shared_backbone_root", type=str, default=str(DEFAULT_SHARED_BACKBONE_ROOT))
     ap.add_argument("--backbone_manifest", type=str, default=str(default_backbone_manifest_path()))
-    ap.add_argument("--otflow_train_steps", type=int, default=20000)
+    ap.add_argument("--checkpoint_steps", type=str, default=",".join(str(x) for x in CANONICAL_CHECKPOINT_STEPS))
+    ap.add_argument("--otflow_train_steps", type=int, default=0)
     ap.add_argument("--steps", type=int, default=0)
     ap.add_argument("--forecast_datasets", type=str, default=",".join(DEFAULT_FORECAST_DATASETS))
     ap.add_argument(
@@ -960,7 +1211,8 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--lobster_synthetic_profile_path", type=str, default="")
     ap.add_argument("--long_term_st_path", type=str, default="")
     ap.add_argument("--solver_names", type=str, default=",".join(ALL_SOLVER_ORDER))
-    ap.add_argument("--target_nfe_values", type=str, default=",".join(str(x) for x in DEFAULT_TARGET_NFE_VALUES))
+    ap.add_argument("--nfe_role", type=str, choices=NFE_ROLES, default=NFE_ROLE_SEEN)
+    ap.add_argument("--target_nfe_values", type=str, default="")
     ap.add_argument("--baseline_scheduler_names", type=str, default=",".join(DEFAULT_SCHEDULES))
     ap.add_argument("--seeds", type=str, default=",".join(str(x) for x in DEFAULT_SEEDS))
     ap.add_argument("--split_phase", type=str, choices=SUPPORTED_SPLIT_PHASES, default=LOCKED_TEST_PHASE)
@@ -1070,6 +1322,10 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
     save_json(dict(main_table_summary), str(out_root / "main_table_summary.json"))
     schedule_selection = {
         "method_key": METHOD_KEY,
+        "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
+        "nfe_role": str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN)),
+        "target_nfe_values": _target_nfe_values_for_args(cli_args),
+        "checkpoint_steps": _checkpoint_steps_for_args(cli_args),
         "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
         "experimental_fixed_schedule_keys": list(EXPERIMENTAL_FIXED_SCHEDULE_KEYS),
         "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS),

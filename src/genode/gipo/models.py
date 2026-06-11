@@ -7,8 +7,10 @@ from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import torch
 
+from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
+
 SOLVER_TO_ID: Dict[str, int] = {"euler": 0, "heun": 1, "midpoint_rk2": 2, "dpmpp2m": 3}
-TARGET_NFES: Tuple[int, ...] = (4, 8, 12)
+TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 DEFAULT_NFE_REFERENCE = 16
 SETTING_ENCODER_MODE_CONTINUOUS_V3 = "continuous_v3"
 SERIES_ENCODING_NONE_CONTEXT_ONLY = "none_context_only"

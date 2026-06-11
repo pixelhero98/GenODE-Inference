@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
 from genode.gipo.policy import (
     ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
     GIPO_PROTOCOL,
@@ -647,7 +648,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--solver_names", default="euler,heun,midpoint_rk2,dpmpp2m")
-    parser.add_argument("--target_nfe_values", default="4,8,12")
+    parser.add_argument("--target_nfe_values", default=",".join(str(value) for value in CANONICAL_SEEN_NFES))
     parser.add_argument("--num_eval_samples", type=int, default=5)
     parser.add_argument("--forecast_eval_batch_size", type=int, default=1)
     return parser

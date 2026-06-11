@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.canonical_experiment_layout import CANONICAL_CHECKPOINT_STEPS
 from genode.data.experiment_common import DATASET_PLANS, build_dataset_splits, get_otflow_paper_backbone_preset
 from genode.evaluation.fm_backbone_registry import (
     BACKBONE_NAME_OTFLOW,
@@ -507,12 +508,23 @@ def _missing_shared_checkpoint_paths(
     return missing
 
 
+def _requested_checkpoint_steps(cli_args: argparse.Namespace) -> List[int]:
+    raw = str(getattr(cli_args, "checkpoint_steps", "") or "").strip()
+    if raw:
+        return parse_int_csv(raw)
+    legacy_steps = int(getattr(cli_args, "otflow_train_steps", 0) or 0)
+    if legacy_steps > 0:
+        return [int(legacy_steps)]
+    return [int(step) for step in CANONICAL_CHECKPOINT_STEPS]
+
+
 def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
     forecast_datasets = parse_forecast_datasets(str(cli_args.forecast_datasets))
     conditional_generation_datasets = parse_conditional_generation_datasets(
         str(cli_args.conditional_generation_datasets)
     )
     shared_backbone_root = resolve_project_path(str(cli_args.shared_backbone_root))
+    checkpoint_steps = _requested_checkpoint_steps(cli_args)
     errors: List[str] = []
     for dataset in list(forecast_datasets) + list(conditional_generation_datasets):
         try:
@@ -526,36 +538,37 @@ def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
         missing_artifacts: List[str] = []
         missing_manifest_checkpoints: List[Path] = []
         for dataset in forecast_datasets:
-            try:
-                artifact = find_backbone_artifact(
-                    manifest_payload,
-                    backbone_name=BACKBONE_NAME_OTFLOW,
-                    benchmark_family=FORECAST_FAMILY,
-                    dataset_key=str(dataset),
-                    train_steps=int(getattr(cli_args, "otflow_train_steps", 20000)),
-                    status="ready",
-                )
-                ckpt_path = _resolve_checkpoint_path(str(artifact["checkpoint_path"]))
-                if not ckpt_path.exists():
-                    missing_manifest_checkpoints.append(ckpt_path)
-            except KeyError:
-                missing_artifacts.append(f"{FORECAST_FAMILY}:{dataset}")
+            for expected_steps in checkpoint_steps:
+                try:
+                    artifact = find_backbone_artifact(
+                        manifest_payload,
+                        backbone_name=BACKBONE_NAME_OTFLOW,
+                        benchmark_family=FORECAST_FAMILY,
+                        dataset_key=str(dataset),
+                        train_steps=int(expected_steps),
+                        status="ready",
+                    )
+                    ckpt_path = _resolve_checkpoint_path(str(artifact["checkpoint_path"]))
+                    if not ckpt_path.exists():
+                        missing_manifest_checkpoints.append(ckpt_path)
+                except KeyError:
+                    missing_artifacts.append(f"{FORECAST_FAMILY}:{dataset}:{int(expected_steps)}")
         for dataset in conditional_generation_datasets:
-            expected_steps = int(resolved_train_steps(cli_args, str(dataset)))
-            try:
-                artifact = find_backbone_artifact(
-                    manifest_payload,
-                    backbone_name=BACKBONE_NAME_OTFLOW,
-                    benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-                    dataset_key=str(dataset),
-                    train_steps=int(expected_steps),
-                    status="ready",
-                )
-                ckpt_path = _resolve_checkpoint_path(str(artifact["checkpoint_path"]))
-                if not ckpt_path.exists():
-                    missing_manifest_checkpoints.append(ckpt_path)
-            except KeyError:
-                missing_artifacts.append(f"{CONDITIONAL_GENERATION_FAMILY}:{dataset}")
+            for expected_steps in checkpoint_steps:
+                try:
+                    artifact = find_backbone_artifact(
+                        manifest_payload,
+                        backbone_name=BACKBONE_NAME_OTFLOW,
+                        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
+                        dataset_key=str(dataset),
+                        train_steps=int(expected_steps),
+                        status="ready",
+                    )
+                    ckpt_path = _resolve_checkpoint_path(str(artifact["checkpoint_path"]))
+                    if not ckpt_path.exists():
+                        missing_manifest_checkpoints.append(ckpt_path)
+                except KeyError:
+                    missing_artifacts.append(f"{CONDITIONAL_GENERATION_FAMILY}:{dataset}:{int(expected_steps)}")
         if missing_artifacts:
             errors.append(
                 "Backbone manifest is missing ready OTFlow checkpoints for the selected datasets: "
@@ -1349,7 +1362,8 @@ def evaluate_forecast_schedule(
                         )
                     if chunk_context_embeddings is not None:
                         for context_idx, context_id in enumerate(chunk_context_ids):
-                            context_embeddings[context_id] = [
+                            context_embedding_id = f"{checkpoint_id}:{context_id}"
+                            context_embeddings[context_embedding_id] = [
                                 float(value) for value in chunk_context_embeddings[context_idx].astype(np.float32).tolist()
                             ]
                 chunk_draws: List[np.ndarray] = []
@@ -1390,6 +1404,7 @@ def evaluate_forecast_schedule(
                         ]
                         row_signature_payload = {
                             "context_id": str(context_id),
+                            "checkpoint_id": str(checkpoint_id),
                             "logical_seed": int(logical_panel_seed),
                             "scheduler_key": str(scheduler_key),
                             "solver_key": str(solver_name),
@@ -1410,6 +1425,16 @@ def evaluate_forecast_schedule(
                                 "runtime_nfe": int(runtime_nfe),
                                 "realized_nfe": int(realized_nfe),
                                 "scheduler_key": str(scheduler_key),
+                                "context_schema": "forecast_window",
+                                "axis_dataset": str(metadata["dataset"]),
+                                "axis_series": str(metadata["series_id"] or f"series_idx:{metadata['series_idx']}"),
+                                "axis_time_bin": str(metadata["target_t"]),
+                                "axis_stratum": "",
+                                "axis_member": "",
+                                "axis_formula": "",
+                                "axis_atom_count": "",
+                                "axis_trajectory": "",
+                                "axis_flags": "",
                                 "schedule_grid_hash": schedule_grid_hash(time_grid),
                                 "example_idx": int(metadata["example_idx"]),
                                 "series_id": str(metadata["series_id"]),
@@ -1419,7 +1444,7 @@ def evaluate_forecast_schedule(
                                 "history_stop": metadata.get("history_stop", ""),
                                 "target_stop": metadata.get("target_stop", ""),
                                 "context_id": str(context_id),
-                                "context_embedding_id": str(context_id) if return_context_embeddings else "",
+                                "context_embedding_id": f"{checkpoint_id}:{context_id}" if return_context_embeddings else "",
                                 "checkpoint_id": str(checkpoint_id),
                                 "forecast_crps": float(crps),
                                 "forecast_mase": float(mase),

@@ -11,10 +11,22 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
+from genode.gipo.density_representation import (
+    average_density_masses,
+    density_mass_to_time_grid,
+    grid_to_density_mass,
+    uniform_reference_grid,
+)
 from genode.gipo.models import validate_time_grid
 from genode.gipo.policy import load_context_embedding_table, save_context_embedding_table
 from genode.gipo.objectives import attach_reward_columns, crps_mase_reward, rewards_by_setting, seed_mean_metric_rows
-from genode.gipo.ser_ptg_reference import SER_PTG_SCHEDULE_KEY, grid_geometry
+from genode.gipo.ser_ptg_reference import (
+    SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
+    SER_PTG_REVERSED_SCHEDULE_KEY,
+    SER_PTG_SCHEDULE_KEY,
+    grid_geometry,
+)
 from genode.data.otflow_paths import (
     default_backbone_manifest_path,
     project_outputs_root,
@@ -50,10 +62,15 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
 )
 
 DEFAULT_SOLVERS: Tuple[str, ...] = ("euler", "heun", "midpoint_rk2", "dpmpp2m")
-DEFAULT_TARGET_NFES: Tuple[int, ...] = (4, 8, 12)
+DEFAULT_TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 SELECTED_STUDENT_SCHEDULE_KEY = "gipo"
 SELECTED_STUDENT_SCHEDULE_NAME = "GIPO"
-EVALUATOR_SIGNATURE_VERSION = "schedule_summary_evaluator_v3"
+EVALUATOR_SIGNATURE_VERSION = "schedule_summary_evaluator_seen_unseen"
+SER_REFERENCE_SCHEDULE_KEYS: Tuple[str, ...] = (
+    SER_PTG_SCHEDULE_KEY,
+    SER_PTG_REVERSED_SCHEDULE_KEY,
+    SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
+)
 
 SCHEDULE_ROW_FIELDS: Tuple[str, ...] = (
     "benchmark_family",
@@ -281,9 +298,63 @@ def schedule_display_name_for_key(schedule_key: str) -> str:
     key = str(schedule_key)
     if key == SER_PTG_SCHEDULE_KEY:
         return "SER-PTG local defect eta=0.05"
+    if key == SER_PTG_REVERSED_SCHEDULE_KEY:
+        return "SER-PTG local defect eta=0.05 reversed"
+    if key == SER_PTG_AVG_REVERSED_SCHEDULE_KEY:
+        return "SER-PTG local defect eta=0.05 density average"
     if key == SELECTED_STUDENT_SCHEDULE_KEY:
         return SELECTED_STUDENT_SCHEDULE_NAME
     return schedule_display_name(key)
+
+
+def _derived_ser_time_grid(schedule_key: str, base_grid: Sequence[float], *, macro_steps: int) -> Tuple[float, ...]:
+    base = validate_time_grid(base_grid, macro_steps=int(macro_steps))
+    if str(schedule_key) == SER_PTG_REVERSED_SCHEDULE_KEY:
+        return validate_time_grid([1.0 - float(value) for value in reversed(base)], macro_steps=int(macro_steps))
+    if str(schedule_key) == SER_PTG_AVG_REVERSED_SCHEDULE_KEY:
+        reference = uniform_reference_grid()
+        reversed_grid = validate_time_grid([1.0 - float(value) for value in reversed(base)], macro_steps=int(macro_steps))
+        base_mass = grid_to_density_mass(base, reference_time_grid=reference, macro_steps=int(macro_steps))
+        reversed_mass = grid_to_density_mass(reversed_grid, reference_time_grid=reference, macro_steps=int(macro_steps))
+        averaged_mass = average_density_masses(base_mass, reversed_mass)
+        return density_mass_to_time_grid(averaged_mass, reference_time_grid=reference, macro_steps=int(macro_steps))
+    return base
+
+
+def _register_prediction(
+    predictions: Dict[Tuple[str, str, int], Dict[str, Any]],
+    *,
+    scheduler_key: str,
+    schedule_name: str,
+    budget: Any,
+    item: Mapping[str, Any],
+    time_grid: Sequence[float],
+    solver_key: str,
+    target_nfe: int,
+    macro_steps: int,
+    realized_nfe: int,
+) -> None:
+    key = (str(scheduler_key), str(solver_key), int(target_nfe))
+    if key in predictions:
+        return
+    prediction = dict(item)
+    intervals = [float(x) for x in np.diff(np.asarray(time_grid, dtype=np.float64)).tolist()]
+    prediction.update(
+        {
+            "scheduler_key": str(scheduler_key),
+            "schedule_name": str(schedule_name),
+            "gipo_step_budget": None if budget in (None, "") else int(budget),
+            "solver_key": str(solver_key),
+            "target_nfe": int(target_nfe),
+            "runtime_nfe": int(macro_steps),
+            "macro_steps": int(macro_steps),
+            "realized_nfe": int(realized_nfe),
+            "time_grid": list(time_grid),
+            "schedule_grid_hash": _schedule_grid_hash(time_grid),
+            "intervals_json": prediction.get("intervals_json", json.dumps(intervals, separators=(",", ":"))),
+        }
+    )
+    predictions[key] = prediction
 
 
 def load_schedule_predictions(
@@ -336,9 +407,6 @@ def load_schedule_predictions(
             realized_nfe = expected_realized_nfe(solver_key, target_nfe)
             if realized_nfe != int(target_nfe):
                 raise ValueError(f"Realized NFE {realized_nfe} does not match target NFE {target_nfe} for {solver_key}.")
-            key = (scheduler_key, solver_key, target_nfe)
-            if key in predictions:
-                raise ValueError(f"Duplicate schedule prediction for {key}.")
             prediction = dict(item)
             for meta_key in (
                 "candidate_source",
@@ -352,23 +420,38 @@ def load_schedule_predictions(
             ):
                 if meta_key not in prediction and meta_key in schedule:
                     prediction[meta_key] = schedule.get(meta_key)
-            intervals = [float(x) for x in np.diff(np.asarray(time_grid, dtype=np.float64)).tolist()]
-            prediction.update(
-                {
-                    "scheduler_key": scheduler_key,
-                    "schedule_name": schedule_name,
-                    "gipo_step_budget": None if budget in (None, "") else int(budget),
-                    "solver_key": solver_key,
-                    "target_nfe": int(target_nfe),
-                    "runtime_nfe": int(macro_steps),
-                    "macro_steps": int(macro_steps),
-                    "realized_nfe": int(realized_nfe),
-                    "time_grid": list(time_grid),
-                    "schedule_grid_hash": _schedule_grid_hash(time_grid),
-                    "intervals_json": prediction.get("intervals_json", json.dumps(intervals, separators=(",", ":"))),
-                }
+            key = (scheduler_key, solver_key, target_nfe)
+            if key in predictions:
+                if scheduler_key in SER_REFERENCE_SCHEDULE_KEYS:
+                    continue
+                raise ValueError(f"Duplicate schedule prediction for {key}.")
+            _register_prediction(
+                predictions,
+                scheduler_key=scheduler_key,
+                schedule_name=schedule_name,
+                budget=budget,
+                item=prediction,
+                time_grid=time_grid,
+                solver_key=solver_key,
+                target_nfe=int(target_nfe),
+                macro_steps=int(macro_steps),
+                realized_nfe=int(realized_nfe),
             )
-            predictions[key] = prediction
+            if scheduler_key == SER_PTG_SCHEDULE_KEY:
+                for derived_key in (SER_PTG_REVERSED_SCHEDULE_KEY, SER_PTG_AVG_REVERSED_SCHEDULE_KEY):
+                    derived_grid = _derived_ser_time_grid(derived_key, time_grid, macro_steps=int(macro_steps))
+                    _register_prediction(
+                        predictions,
+                        scheduler_key=derived_key,
+                        schedule_name=schedule_display_name_for_key(derived_key),
+                        budget=budget,
+                        item={**prediction, "schedule_derivation": "ser_reference_density_transform"},
+                        time_grid=derived_grid,
+                        solver_key=solver_key,
+                        target_nfe=int(target_nfe),
+                        macro_steps=int(macro_steps),
+                        realized_nfe=int(realized_nfe),
+                    )
     if require_complete:
         schedule_keys = sorted(set(expected_schedule_keys))
         expected = {
@@ -696,7 +779,7 @@ def select_best_validation_schedule(
     candidate_rows = [
         dict(row)
         for row in rows
-        if str(row.get("scheduler_key", "")) not in set(BASELINE_SCHEDULE_KEYS).union({SER_PTG_SCHEDULE_KEY})
+        if str(row.get("scheduler_key", "")) not in set(BASELINE_SCHEDULE_KEYS).union(SER_REFERENCE_SCHEDULE_KEYS)
     ]
     if not candidate_rows:
         raise ValueError("No generated candidate rows were available for validation selection.")
@@ -938,7 +1021,7 @@ def build_comparison_summary(
         seeds=seeds,
         solver_names=solver_names,
         target_nfe_values=target_nfe_values,
-        schedule_keys=(SER_PTG_SCHEDULE_KEY,),
+        schedule_keys=SER_REFERENCE_SCHEDULE_KEYS,
     ) if comparator_rows else []
     return {
         "evaluator_signature": EVALUATOR_SIGNATURE_VERSION,
@@ -946,6 +1029,7 @@ def build_comparison_summary(
         "split_phase": str(split_phase),
         "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
         "ser_ptg_schedule_key": SER_PTG_SCHEDULE_KEY,
+        "ser_reference_schedule_keys": list(SER_REFERENCE_SCHEDULE_KEYS),
         "ser_ptg_is_baseline": SER_PTG_SCHEDULE_KEY in BASELINE_SCHEDULE_KEYS,
         "student_schedule_key": student_schedule_keys[0] if len(student_schedule_keys) == 1 else None,
         "student_schedule_keys": student_schedule_keys,
@@ -957,7 +1041,7 @@ def build_comparison_summary(
         "expected_baseline_rows": int(len(seeds) * len(solver_names) * len(target_nfe_values) * len(BASELINE_SCHEDULE_KEYS)),
         "observed_baseline_rows": int(len(baseline_rows)),
         "missing_baseline_cells": baseline_missing,
-        "expected_ser_ptg_rows": int(len(seeds) * len(solver_names) * len(target_nfe_values)) if comparator_rows else 0,
+        "expected_ser_ptg_rows": int(len(seeds) * len(solver_names) * len(target_nfe_values) * len(SER_REFERENCE_SCHEDULE_KEYS)) if comparator_rows else 0,
         "observed_ser_ptg_rows": int(len(comparator_rows)),
         "missing_ser_ptg_cells": ser_missing,
         "expected_student_rows": int(len(seeds) * len(solver_names) * len(target_nfe_values) * len(student_schedule_keys)),
