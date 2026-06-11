@@ -47,6 +47,8 @@ OTFLOW_PAPER_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
         "ctx_pool_scales": "8,32",
         "use_time_features": True,
         "use_time_gaps": False,
+        "rollout_mode": "non_ar",
+        "future_block_len": 200,
     },
     LOBSTER_SYNTHETIC_DATASET_KEY: {
         "levels": 10,
@@ -58,6 +60,8 @@ OTFLOW_PAPER_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
         "ctx_pool_scales": "8,32",
         "use_time_features": True,
         "use_time_gaps": False,
+        "rollout_mode": "non_ar",
+        "future_block_len": 200,
     },
     LONG_TERM_ST_DATASET_KEY: {
         "levels": 1,
@@ -180,7 +184,7 @@ DATASET_PLANS: Mapping[str, DatasetPlan] = {
         name="cryptos",
         dataset="cryptos",
         levels=10,
-        horizons=(60, 300, 900),
+        horizons=(200, 200, 200),
         history_options=(256,),
         nfe_options=(1, 2),
         train_steps_tune=6000,

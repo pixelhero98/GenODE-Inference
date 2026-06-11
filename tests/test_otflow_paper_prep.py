@@ -767,7 +767,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         for pattern in retired_patterns:
             self.assertIsNone(re.search(pattern, source_text), pattern)
 
-    def test_backbone_manifest_tracks_40_active_artifacts_without_private_outputs(self) -> None:
+    def test_backbone_manifest_tracks_30_active_artifacts_without_private_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             payload = materialize_backbone_manifest(

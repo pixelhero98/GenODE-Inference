@@ -4,12 +4,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZipFile
 
 import numpy as np
 import torch
 
-from genode.data.experiment_common import OTFLOW_PAPER_DATASET_CHOICES
+from genode.data.experiment_common import DATASET_PLANS, OTFLOW_PAPER_BACKBONE_PRESETS, OTFLOW_PAPER_DATASET_CHOICES
 from genode.data.molecule_xyz import (
     MOLECULE_GROUP_DATASET_KEYS,
     build_balanced_molecule_stratum_groups,
@@ -25,12 +26,16 @@ from genode.data.otflow_datasets import (
 from genode.data.otflow_experiment_plan import (
     canonical_conditional_generation_paper_dataset_keys,
     canonical_forecast_paper_dataset_keys,
+    experiment_plan_by_key,
 )
 from genode.data.otflow_medical_datasets import LONG_TERM_ST_DATASET_KEY
 from genode.data.otflow_monash_datasets import get_monash_dataset_spec, monash_paper_dataset_keys
+from genode.evaluation import otflow_evaluation_support as eval_support
+from genode.evaluation.fm_backbone_registry import CONDITIONAL_GENERATION_FAMILY
 from genode.evaluation.otflow_evaluation_support import parse_conditional_generation_datasets, parse_forecast_datasets
 from genode.evaluation.molecule_metrics import aggregate_molecule_group_evaluation
 from genode.models.config import OTFlowConfig
+from genode.training import train_molecule_backbone as train_molecule_module
 
 
 def _profile(levels: int = 2) -> dict:
@@ -97,6 +102,78 @@ class NineDatasetMatrixTests(unittest.TestCase):
         for retired in ("es_mbp_10", "sleep_edf"):
             with self.assertRaisesRegex(ValueError, "Unknown conditional-generation datasets"):
                 parse_conditional_generation_datasets(retired)
+
+    def test_canonical_temporal_context_horizon_table_is_locked(self) -> None:
+        expected = {
+            "solar_energy_10m": (1008, 1008),
+            "traffic_hourly": (336, 168),
+            "weather_daily": (120, 30),
+            "cryptos": (256, 200),
+            "lobster_synthetic": (256, 200),
+            "long_term_st": (12000, 3000),
+        }
+        plans = experiment_plan_by_key()
+        for dataset_key, (history_len, future_block_len) in expected.items():
+            spec = plans[dataset_key]
+            self.assertEqual((spec.history_len, spec.future_block_len), (history_len, future_block_len))
+            self.assertEqual(spec.experiment_horizon, future_block_len)
+
+    def test_conditional_presets_and_plans_use_canonical_non_ar_horizons(self) -> None:
+        for dataset_key in ("cryptos", LOBSTER_SYNTHETIC_DATASET_KEY):
+            preset = OTFLOW_PAPER_BACKBONE_PRESETS[dataset_key]
+            self.assertEqual(preset["rollout_mode"], "non_ar")
+            self.assertEqual(preset["future_block_len"], 200)
+            self.assertEqual(preset["history_len"], 256)
+            self.assertEqual(DATASET_PLANS[dataset_key].horizons, (200, 200, 200))
+
+    def test_strict_temporal_overrides_reject_noncanonical_lengths_and_rollout(self) -> None:
+        args = SimpleNamespace(eval_horizon=167, future_block_len=0, rollout_mode="non_ar")
+        with self.assertRaisesRegex(ValueError, "Non-canonical --eval_horizon"):
+            eval_support.resolved_eval_horizon(args, "traffic_hourly")
+
+        args = SimpleNamespace(eval_horizon=0, future_block_len=199, rollout_mode="non_ar")
+        with self.assertRaisesRegex(ValueError, "Non-canonical --future_block_len"):
+            eval_support.resolved_future_block_len(args, "cryptos")
+
+        args = SimpleNamespace(eval_horizon=0, future_block_len=0, rollout_mode="autoregressive")
+        with self.assertRaisesRegex(ValueError, "Non-canonical --rollout_mode"):
+            eval_support.resolved_rollout_mode(args, "weather_daily")
+
+    def test_conditional_checkpoint_validation_rejects_ar_rollout_even_when_lengths_match(self) -> None:
+        spec = experiment_plan_by_key()["cryptos"]
+        metadata = {
+            "dataset_key": "cryptos",
+            "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+            "train_steps": 20000,
+            "history_len": int(spec.history_len),
+            "future_block_len": int(spec.future_block_len),
+            "field_network_type": "transformer",
+            "cond_dim": 0,
+            "split_stats": {"cond_dim": 0, "history_len": int(spec.history_len)},
+        }
+        with self.assertRaisesRegex(RuntimeError, "rollout_mode mismatch"):
+            eval_support._validate_conditional_generation_checkpoint_task(
+                dataset="cryptos",
+                ckpt_path=Path("model.pt"),
+                metadata=metadata,
+                checkpoint_model_cond_dim=0,
+                checkpoint_train_steps=20000,
+                checkpoint_history_len=int(spec.history_len),
+                checkpoint_future_block_len=int(spec.future_block_len),
+                checkpoint_rollout_mode="autoregressive",
+                expected_train_steps=20000,
+                expected_history_len=int(spec.history_len),
+                expected_future_block_len=int(spec.future_block_len),
+            )
+
+    def test_molecule_3d_defaults_remain_variable_16_context_ar(self) -> None:
+        parser = train_molecule_module.build_argparser()
+        args = parser.parse_args(["--processed_dir", "data/molecule_xyz", "--stratum", "Dynamic_Test"])
+        self.assertEqual(train_molecule_module.DEFAULT_HISTORY_LEN, 16)
+        self.assertEqual(args.history_len, 16)
+        self.assertEqual(args.future_horizon, 1)
+        self.assertTrue(args.train_variable_context)
+        self.assertEqual(args.train_context_max, 16)
 
     def test_monash_weather_and_traffic_specs_are_public_keys(self) -> None:
         traffic = get_monash_dataset_spec("traffic_hourly")

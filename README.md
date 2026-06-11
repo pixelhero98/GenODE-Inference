@@ -107,6 +107,20 @@ The active experiment matrix has exactly nine public dataset keys:
 Retired keys are not accepted by active forecast or conditional-generation
 dataset parsers.
 
+Canonical temporal experiment lengths are locked by `PAPER_EXPERIMENT_SPECS`:
+
+| Dataset | Task | `history_len` | `future_block_len` | Rollout |
+| --- | --- | ---: | ---: | --- |
+| `solar_energy_10m` | forecast | 1008 | 1008 | `non_ar` |
+| `traffic_hourly` | forecast | 336 | 168 | `non_ar` |
+| `weather_daily` | forecast | 120 | 30 | `non_ar` |
+| `cryptos` | conditional generation | 256 | 200 | `non_ar` |
+| `lobster_synthetic` | conditional generation | 256 | 200 | `non_ar` |
+| `long_term_st` | conditional generation | 12000 | 3000 | `non_ar` |
+
+Monash prepared manifests also include a `context_length` field used during
+data preparation; the experiment context is the `history_len` above.
+
 Forecast datasets are downloaded from ForecastingData/Monash into
 `paper_datasets/`:
 

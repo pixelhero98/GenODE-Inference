@@ -166,6 +166,7 @@ def _save_backbone_artifact(
         "seed": int(seed),
         "history_len": int(spec.history_len),
         "future_block_len": int(spec.future_block_len),
+        "rollout_mode": "non_ar",
         "cond_dim": 0,
         "checkpoint_path": str(checkpoint_path),
         "metadata_path": str(artifact_root / "checkpoint_metadata.json"),

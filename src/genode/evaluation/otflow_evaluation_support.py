@@ -72,6 +72,7 @@ DEFAULT_SHARED_BACKBONE_ROOT = (
 )
 DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE = "transformer"
 DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS = 20_000
+CANONICAL_TEMPORAL_ROLLOUT_MODE = "non_ar"
 CONDITIONAL_GENERATION_PHYSICAL_BATCH_SIZE_BY_DATASET: Dict[str, int] = {
     "cryptos": 8,
     "lobster_synthetic": 8,
@@ -515,6 +516,13 @@ def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
     )
     shared_backbone_root = resolve_project_path(str(cli_args.shared_backbone_root))
     errors: List[str] = []
+    for dataset in list(forecast_datasets) + list(conditional_generation_datasets):
+        try:
+            resolved_eval_horizon(cli_args, str(dataset))
+            resolved_future_block_len(cli_args, str(dataset))
+            resolved_rollout_mode(cli_args, str(dataset))
+        except ValueError as exc:
+            errors.append(str(exc))
     manifest_payload = _load_ready_backbone_manifest(cli_args)
     if manifest_payload is not None:
         missing_artifacts: List[str] = []
@@ -646,7 +654,41 @@ def resolved_train_steps(cli_args: argparse.Namespace, dataset: str) -> int:
 
 def resolved_eval_horizon(cli_args: argparse.Namespace, dataset: str) -> int:
     spec = experiment_plan_by_key()[str(dataset)]
-    return int(cli_args.eval_horizon) if int(cli_args.eval_horizon) > 0 else int(spec.experiment_horizon)
+    override = int(getattr(cli_args, "eval_horizon", 0) or 0)
+    expected = int(spec.experiment_horizon)
+    if override == 0:
+        return int(expected)
+    if override != expected:
+        raise ValueError(
+            f"Non-canonical --eval_horizon={override} for {dataset}; use 0 or the locked "
+            f"experiment horizon {expected}."
+        )
+    return int(expected)
+
+
+def resolved_future_block_len(cli_args: argparse.Namespace, dataset: str) -> int:
+    spec = experiment_plan_by_key()[str(dataset)]
+    override = int(getattr(cli_args, "future_block_len", 0) or 0)
+    expected = int(spec.future_block_len)
+    if override == 0:
+        return int(expected)
+    if override != expected:
+        raise ValueError(
+            f"Non-canonical --future_block_len={override} for {dataset}; use 0 or the locked "
+            f"future_block_len {expected}."
+        )
+    return int(expected)
+
+
+def resolved_rollout_mode(cli_args: argparse.Namespace, dataset: str) -> str:
+    raw = str(getattr(cli_args, "rollout_mode", CANONICAL_TEMPORAL_ROLLOUT_MODE) or CANONICAL_TEMPORAL_ROLLOUT_MODE)
+    value = raw.strip().lower()
+    if value != CANONICAL_TEMPORAL_ROLLOUT_MODE:
+        raise ValueError(
+            f"Non-canonical --rollout_mode={raw!r} for {dataset}; active temporal paper-matrix "
+            f"datasets require {CANONICAL_TEMPORAL_ROLLOUT_MODE!r}."
+        )
+    return CANONICAL_TEMPORAL_ROLLOUT_MODE
 
 
 def resolved_eval_windows(cli_args: argparse.Namespace, dataset: str, split: str) -> int:
@@ -669,12 +711,9 @@ def build_conditional_generation_dataset_args_from_cfg(
     preset = get_otflow_paper_backbone_preset(str(dataset))
     batch_size = int(_resolved_conditional_generation_physical_batch_size(str(dataset)))
     grad_accum_steps = max(1, int(math.ceil(32.0 / float(max(1, batch_size)))))
-    locked_future_block_len = (
-        int(cli_args.future_block_len)
-        if int(getattr(cli_args, "future_block_len", 0)) > 0
-        else int(experiment_spec.future_block_len)
-    )
+    locked_future_block_len = int(resolved_future_block_len(cli_args, str(dataset)))
     locked_history_len = int(experiment_spec.history_len)
+    locked_rollout_mode = str(resolved_rollout_mode(cli_args, str(dataset)))
     args = argparse.Namespace(
         dataset=str(dataset),
         data_path=_dataset_data_path(cli_args, str(dataset)),
@@ -707,7 +746,7 @@ def build_conditional_generation_dataset_args_from_cfg(
         fu_net_type=str(field_network_type),
         fu_net_layers=int(cli_args.fu_net_layers),
         fu_net_heads=int(cli_args.fu_net_heads),
-        rollout_mode=str(cli_args.rollout_mode),
+        rollout_mode=str(locked_rollout_mode),
         future_block_len=int(locked_future_block_len),
         adaptive_context=False,
         adaptive_context_ratio=None,
@@ -744,6 +783,11 @@ def build_conditional_generation_dataset_args_from_cfg(
     args.fu_net_layers = int(getattr(cfg.model, "fu_net_layers", args.fu_net_layers))
     args.fu_net_heads = int(getattr(cfg.model, "fu_net_heads", args.fu_net_heads))
     args.rollout_mode = str(getattr(cfg.model, "rollout_mode", args.rollout_mode))
+    if args.rollout_mode.strip().lower() != CANONICAL_TEMPORAL_ROLLOUT_MODE:
+        raise RuntimeError(
+            f"Conditional-generation checkpoint config rollout_mode={args.rollout_mode!r} does not match locked "
+            f"{dataset} rollout_mode={CANONICAL_TEMPORAL_ROLLOUT_MODE!r}."
+        )
     checkpoint_future_block_len = int(getattr(cfg.model, "future_block_len", args.future_block_len))
     if checkpoint_future_block_len != int(locked_future_block_len):
         raise RuntimeError(
@@ -863,6 +907,7 @@ def _validate_forecast_checkpoint_task(
     checkpoint_train_steps: int,
     checkpoint_history_len: int,
     checkpoint_future_block_len: int,
+    checkpoint_rollout_mode: str,
     expected_train_steps: int,
 ) -> None:
     experiment_spec = experiment_plan_by_key()[str(dataset)]
@@ -896,6 +941,11 @@ def _validate_forecast_checkpoint_task(
             f"Forecast checkpoint {ckpt_path} future_block_len mismatch for {dataset}: "
             f"checkpoint={int(checkpoint_future_block_len)}, expected={int(experiment_spec.future_block_len)}."
         )
+    if str(checkpoint_rollout_mode).strip().lower() != CANONICAL_TEMPORAL_ROLLOUT_MODE:
+        raise RuntimeError(
+            f"Forecast checkpoint {ckpt_path} rollout_mode mismatch for {dataset}: "
+            f"checkpoint={str(checkpoint_rollout_mode)!r}, expected {CANONICAL_TEMPORAL_ROLLOUT_MODE!r}."
+        )
 
 
 def _validate_conditional_generation_checkpoint_task(
@@ -907,6 +957,7 @@ def _validate_conditional_generation_checkpoint_task(
     checkpoint_train_steps: int,
     checkpoint_history_len: int,
     checkpoint_future_block_len: int,
+    checkpoint_rollout_mode: str,
     expected_train_steps: int,
     expected_history_len: int,
     expected_future_block_len: int,
@@ -943,6 +994,11 @@ def _validate_conditional_generation_checkpoint_task(
             f"Conditional-generation checkpoint {ckpt_path} future_block_len mismatch: "
             f"checkpoint={int(checkpoint_future_block_len)}, expected={int(expected_future_block_len)}."
         )
+    if str(checkpoint_rollout_mode).strip().lower() != CANONICAL_TEMPORAL_ROLLOUT_MODE:
+        raise RuntimeError(
+            f"Conditional-generation checkpoint {ckpt_path} rollout_mode mismatch: "
+            f"checkpoint={str(checkpoint_rollout_mode)!r}, expected {CANONICAL_TEMPORAL_ROLLOUT_MODE!r}."
+        )
     if splits is None:
         return
     stats = dict(splits.get("stats", {}) or {})
@@ -969,6 +1025,9 @@ def load_forecast_checkpoint_splits(
     device: torch.device,
 ) -> Dict[str, Any]:
     expected_train_steps = int(getattr(cli_args, "otflow_train_steps", 20000))
+    resolved_eval_horizon(cli_args, str(dataset))
+    resolved_future_block_len(cli_args, str(dataset))
+    resolved_rollout_mode(cli_args, str(dataset))
     manifest_artifact = _resolved_manifest_artifact(cli_args, benchmark_family=FORECAST_FAMILY, dataset_key=str(dataset))
     if manifest_artifact is not None:
         ckpt_path = _resolve_checkpoint_path(str(manifest_artifact["checkpoint_path"]))
@@ -1004,6 +1063,7 @@ def load_forecast_checkpoint_splits(
         checkpoint_train_steps=int(getattr(cfg.train, "steps", 0)),
         checkpoint_history_len=int(cfg.history_len),
         checkpoint_future_block_len=int(getattr(cfg.model, "future_block_len", 1)),
+        checkpoint_rollout_mode=str(getattr(cfg.model, "rollout_mode", "")),
         expected_train_steps=int(expected_train_steps),
     )
     time_feature_mode = _forecast_time_feature_mode(cfg)
@@ -1038,11 +1098,8 @@ def load_conditional_generation_checkpoint_splits(
     expected_train_steps = int(resolved_train_steps(cli_args, str(dataset)))
     experiment_spec = experiment_plan_by_key()[str(dataset)]
     expected_history_len = int(experiment_spec.history_len)
-    expected_future_block_len = (
-        int(getattr(cli_args, "future_block_len", 0))
-        if int(getattr(cli_args, "future_block_len", 0)) > 0
-        else int(experiment_spec.future_block_len)
-    )
+    expected_future_block_len = int(resolved_future_block_len(cli_args, str(dataset)))
+    resolved_rollout_mode(cli_args, str(dataset))
     manifest_artifact = _resolved_manifest_artifact(
         cli_args,
         benchmark_family=CONDITIONAL_GENERATION_FAMILY,
@@ -1095,6 +1152,7 @@ def load_conditional_generation_checkpoint_splits(
     checkpoint_train_steps = int(getattr(cfg.train, "steps", 0))
     checkpoint_history_len = int(cfg.history_len)
     checkpoint_future_block_len = int(getattr(cfg.model, "future_block_len", 1))
+    checkpoint_rollout_mode = str(getattr(cfg.model, "rollout_mode", ""))
     _validate_conditional_generation_checkpoint_task(
         dataset=str(dataset),
         ckpt_path=ckpt_path,
@@ -1103,6 +1161,7 @@ def load_conditional_generation_checkpoint_splits(
         checkpoint_train_steps=int(checkpoint_train_steps),
         checkpoint_history_len=int(checkpoint_history_len),
         checkpoint_future_block_len=int(checkpoint_future_block_len),
+        checkpoint_rollout_mode=str(checkpoint_rollout_mode),
         expected_train_steps=int(expected_train_steps),
         expected_history_len=int(expected_history_len),
         expected_future_block_len=int(expected_future_block_len),
@@ -1122,6 +1181,7 @@ def load_conditional_generation_checkpoint_splits(
         checkpoint_train_steps=int(checkpoint_train_steps),
         checkpoint_history_len=int(checkpoint_history_len),
         checkpoint_future_block_len=int(checkpoint_future_block_len),
+        checkpoint_rollout_mode=str(checkpoint_rollout_mode),
         expected_train_steps=int(expected_train_steps),
         expected_history_len=int(expected_history_len),
         expected_future_block_len=int(expected_future_block_len),
@@ -1443,6 +1503,8 @@ __all__ = [
     "parse_int_csv",
     "resolve_reference_macro_steps",
     "resolved_eval_horizon",
+    "resolved_future_block_len",
+    "resolved_rollout_mode",
     "resolved_eval_windows",
     "resolved_train_steps",
     "safe_spearman",

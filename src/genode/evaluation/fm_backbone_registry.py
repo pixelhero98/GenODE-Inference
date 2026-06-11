@@ -25,6 +25,7 @@ CONDITIONAL_GENERATION_FAMILY = "conditional_generation"
 BACKBONE_NAME_OTFLOW = "otflow"
 DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE = "transformer"
 DEFAULT_SEED = 0
+CANONICAL_TEMPORAL_ROLLOUT_MODE = "non_ar"
 TRAIN_BUDGET_STEPS: Tuple[int, ...] = (4000, 8000, 12000, 16000, 20000)
 STANDARD_ARTIFACT_SUMMARY_NAME = "artifact_summary.json"
 MANIFEST_VERSION = "fm_backbone_manifest_v1"
@@ -223,6 +224,7 @@ def _checkpoint_signature(checkpoint_path: Path) -> Tuple[Optional[Dict[str, int
         "history_len": int(getattr(cfg, "history_len")),
         "future_block_len": int(getattr(cfg.model, "future_block_len", 1)),
         "prediction_horizon": int(getattr(cfg, "prediction_horizon", 1)),
+        "rollout_mode": str(getattr(cfg.model, "rollout_mode", "")),
         "train_steps": int(getattr(cfg.train, "steps", 0) or 0),
         "field_network_type": str(getattr(cfg.model, "fu_net_type", "")),
     }
@@ -292,6 +294,10 @@ def _otflow_artifact_compatibility(
     if int(signature["future_block_len"]) != int(spec.future_block_len):
         errors.append(
             f"checkpoint future_block_len={int(signature['future_block_len'])} != expected {int(spec.future_block_len)}"
+        )
+    if str(signature.get("rollout_mode", "")).strip().lower() != CANONICAL_TEMPORAL_ROLLOUT_MODE:
+        errors.append(
+            f"checkpoint rollout_mode={str(signature.get('rollout_mode', ''))!r} != expected {CANONICAL_TEMPORAL_ROLLOUT_MODE!r}"
         )
     if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY and str(signature["field_network_type"]) != str(
         field_network_type or DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE

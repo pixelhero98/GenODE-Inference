@@ -39,6 +39,7 @@ def _checkpoint_metadata(benchmark_family: str, dataset_key: str, train_steps: i
         "train_budget_label": f"{train_steps // 1000}k",
         "history_len": int(spec.history_len),
         "future_block_len": int(spec.future_block_len),
+        "rollout_mode": "non_ar",
         "cond_dim": 0,
         "split_stats": {
             "cond_dim": 0,
@@ -59,6 +60,7 @@ def _fake_checkpoint_signature(checkpoint_path: Path):
             "history_len": int(spec.history_len),
             "future_block_len": int(spec.future_block_len),
             "prediction_horizon": int(spec.future_block_len),
+            "rollout_mode": "non_ar",
             "train_steps": int(metadata["train_steps"]),
             "field_network_type": str(metadata.get("field_network_type", "transformer")),
         },
@@ -118,6 +120,44 @@ class BackboneMatrixTests(unittest.TestCase):
         )
         self.assertEqual(artifact["source_kind"], "reused_shared_20k")
         self.assertEqual(artifact["train_budget_label"], "20k")
+
+    def test_manifest_rejects_matching_length_autoregressive_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            imported_root = Path(tmpdir) / "imported"
+            artifact_dir = imported_root / CONDITIONAL_GENERATION_FAMILY / "cryptos" / "20k"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "model.pt").write_bytes(b"ckpt")
+            (artifact_dir / "checkpoint_metadata.json").write_text(
+                json.dumps(_checkpoint_metadata(CONDITIONAL_GENERATION_FAMILY, "cryptos", 20000)),
+                encoding="utf-8",
+            )
+
+            def _ar_signature(checkpoint_path: Path):
+                signature, _ = _fake_checkpoint_signature(checkpoint_path)
+                signature["rollout_mode"] = "autoregressive"
+                return signature, None
+
+            with patch(
+                "genode.evaluation.fm_backbone_registry._checkpoint_signature",
+                side_effect=_ar_signature,
+            ):
+                readiness = build_backbone_readiness_audit(
+                    matrix_root=Path(tmpdir) / "matrix",
+                    otflow_reuse_root=Path(tmpdir) / "reuse",
+                    imported_backbone_root=imported_root,
+                    dataset_root=Path(tmpdir) / "datasets",
+                    budget_steps=(20000,),
+                    write_path=Path(tmpdir) / "backbone_manifest.json",
+                )
+                payload = readiness["manifest"]
+
+        rows = [
+            row
+            for row in payload["artifacts"]
+            if row["benchmark_family"] == CONDITIONAL_GENERATION_FAMILY and row["dataset_key"] == "cryptos"
+        ]
+        self.assertEqual(rows[0]["status"], "invalid")
+        self.assertIn("checkpoint rollout_mode='autoregressive'", rows[0]["compatibility_error"])
 
     def test_readiness_audit_normalizes_imported_backbones_and_reports_strict_30_grid_gaps(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
