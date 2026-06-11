@@ -37,10 +37,13 @@ def molecule_artifact_root(
     variant: str,
     train_steps: int,
     dataset_key: str = DEFAULT_MOLECULE_DATASET_KEY,
+    member_key: str = "",
     stratum: str = "",
 ) -> Path:
     root = project_outputs_root() / "molecule_3d_backbones" if out_dir is None else resolve_project_path(out_dir)
     parts = [root, Path(str(dataset_key))]
+    if str(member_key):
+        parts.append(Path(str(member_key)))
     if str(stratum):
         parts.append(Path(str(stratum)))
     parts.extend([Path(str(variant)), Path(f"{int(train_steps)}_steps")])
@@ -184,10 +187,14 @@ def _save_molecule_artifact(
     checkpoint_cfg = _checkpoint_cfg_for_budget(cfg, int(budget_steps))
     dataset_key = str(split_stats.get("dataset_key", DEFAULT_MOLECULE_DATASET_KEY))
     stratum = str(split_stats.get("stratum", ""))
+    member_key = str(split_stats.get("member_key", ""))
+    source_zip_name = str(split_stats.get("source_zip_name", ""))
+    atom_count = int(split_stats.get("atom_count", 0) or 0)
+    formula = str(split_stats.get("formula", ""))
     snapshot_dim = int(split_stats["snapshot_dim"])
     context_feature_dim = int(split_stats["context_feature_dim"])
     checkpoint_id = (
-        f"otflow_{MOLECULE_BENCHMARK_FAMILY}_{dataset_key}_{stratum}_"
+        f"otflow_{MOLECULE_BENCHMARK_FAMILY}_{dataset_key}_{member_key or stratum}_"
         f"{variant}_{int(budget_steps)}_steps_seed{int(seed)}"
     )
     torch.save(
@@ -204,6 +211,7 @@ def _save_molecule_artifact(
         "checkpoint_id": checkpoint_id,
         "dataset_key": dataset_key,
         "stratum": stratum,
+        "member_key": member_key,
         "benchmark_family": MOLECULE_BENCHMARK_FAMILY,
         "backbone_name": "otflow_molecule_3d",
         "variant": str(variant),
@@ -211,6 +219,10 @@ def _save_molecule_artifact(
         "seed": int(seed),
         "history_len": int(cfg.history_len),
         "future_block_len": int(cfg.prediction_horizon),
+        "rollout_mode": str(cfg.model.rollout_mode),
+        "atom_count": atom_count,
+        "formula": formula,
+        "source_zip_name": source_zip_name,
         "snapshot_dim": snapshot_dim,
         "context_feature_dim": context_feature_dim,
         "checkpoint_path": _project_display_path(checkpoint_path),
@@ -358,6 +370,7 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         raise RuntimeError(f"No validation-selected molecule checkpoints are available for budgets {missing_budgets}.")
 
     variant = str(args.variant or "ar_h1")
+    member_key = str(splits["stats"].get("member_key", ""))
     budget_artifacts: Dict[str, Any] = {}
     final_budget = int(max(budget_steps))
     for budget in budget_steps:
@@ -367,6 +380,7 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
             variant=variant,
             train_steps=int(budget),
             dataset_key=dataset_key,
+            member_key=member_key,
             stratum=stratum,
         )
         selection = {
@@ -390,6 +404,7 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         budget_summary = {
             "status": "ready",
             "dataset": dataset_key,
+            "member_key": member_key,
             "stratum": stratum,
             "variant": variant,
             "train_steps": int(args.steps),
@@ -424,11 +439,13 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         variant=variant,
         train_steps=final_budget,
         dataset_key=dataset_key,
+        member_key=member_key,
         stratum=stratum,
     )
     summary = {
         "status": "ready",
         "dataset": dataset_key,
+        "member_key": member_key,
         "stratum": stratum,
         "variant": variant,
         "train_steps": int(args.steps),

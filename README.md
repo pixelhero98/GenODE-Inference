@@ -35,9 +35,9 @@ and reports should stay in ignored project-local directories such as `data/`,
 
 ## GIPO Protocol
 
-The active protocol is `gipo_density_v1`. Measured fixed/SER schedules are
+The active protocol is `gipo_density`. Measured fixed/SER schedules are
 supervision candidates only. Each schedule grid is converted to canonical
-64-bin `density_mass_v1` on normalized model time `[0, 1]`:
+64-bin `density_mass` on normalized model time `[0, 1]`:
 
 ```text
 reference edges: linspace(0, 1, 65)
@@ -50,10 +50,10 @@ solver/NFE features plus a frozen context embedding:
 
 ```text
 z_inputs = concat(setting_features(solver, NFE), frozen_context_embedding)
-z = additive_mlp_v1(z_inputs)
+z = additive_mlp(z_inputs)
 ```
 
-The canonical teacher is `density_form_transformer_v1`. It attends over ordered
+The canonical teacher is `density_form_transformer`. It attends over ordered
 density-bin tokens and predicts a metric utility vector. It is trained with a
 pairwise rank objective plus Huber regression on the selected utility targets.
 Default forecast utility columns are `u_crps_uniform,u_mase_uniform`, and custom
@@ -61,7 +61,7 @@ tasks can provide their own utility columns through `--teacher_metric_target_key
 plus `--teacher_utility_weights`. Larger utility must mean better downstream
 performance.
 
-The canonical student is `density_query_transformer_v1`. It builds one query
+The canonical student is `density_query_transformer`. It builds one query
 token per density bin, applies the same additive context-only conditioning, and
 normalizes one logit per bin with softmax. Student targets are teacher-weighted
 mixtures of measured candidate densities:
@@ -72,9 +72,9 @@ target_density = sum_i w_i * density_mass_i
 loss = KL(target_density || student_density)
 ```
 
-Teacher checkpoint selection uses `weighted_normalized_regret_v1` over
+Teacher checkpoint selection uses `weighted_normalized_regret` over
 context-disjoint, density-family, and unseen-NFE calibration diagnostics.
-Student checkpoint selection uses `validation_ce_v1` on a context-disjoint
+Student checkpoint selection uses `validation_ce` on a context-disjoint
 calibration validation split. Locked-test rows are reporting-only and are never
 used for teacher or student selection.
 
@@ -106,6 +106,27 @@ The active experiment matrix has exactly nine public dataset keys:
 
 Retired keys are not accepted by active forecast or conditional-generation
 dataset parsers.
+
+Backbone readiness uses three formal benchmark families:
+`temporal_extrapolation`, `temporal_conditional_generation`, and
+`molecule_3d_coordinate_generation`. The temporal matrix is fixed at
+`(3 forecast + 3 conditional generation) x 5` maturity levels, i.e. 30 OTFlow
+artifacts for 4000, 8000, 12000, 16000, and 20000 training steps. Molecule
+backbones are counted per trainable fixed-shape stratum, so the full matrix is
+`30 + 5N`, where `N` is the number of trainable molecule strata discovered from
+the molecule group manifests. `Direct_*`, mixed-shape, unsafe-path, and
+non-trainable molecule strata are excluded.
+
+Canonical metrics are family-specific. Forecast extrapolation reports
+`forecast_crps` and `forecast_mase`; all active forecast datasets use seasonal
+MASE with scale periods 144, 24, and 7 for solar, traffic, and weather. Temporal
+conditional generation reports `temporal_cw1`, `temporal_uw1`, and
+`temporal_tstr_f1`; `long_term_st` has no labels, so
+`temporal_tstr_f1_applicable=false` and `temporal_tstr_f1=null`. Molecule 3D
+coordinate generation reports `molecule_kabsch_rmsd_3d`,
+`molecule_ensemble_velocity_norm_w1`,
+`molecule_ensemble_acceleration_norm_w1`, and 16-step autoregressive rollout
+stability errors for velocity and acceleration.
 
 Canonical temporal experiment lengths are locked by `PAPER_EXPERIMENT_SPECS`:
 
@@ -170,6 +191,9 @@ and 30-second continuation at 100 Hz with no external condition labels.
 Molecule group datasets are built from local molecule trajectory zip files. Each
 group contains whole fixed-shape strata; mixed atom counts are evaluated through
 per-stratum subdatasets rather than padded into one tensor.
+The canonical molecule setting uses variable context up to 16 frames,
+`future_horizon=1`, autoregressive rollout, and `--rollout_steps 16` for
+evaluation.
 
 ```bash
 genode-prepare-molecule-xyz \

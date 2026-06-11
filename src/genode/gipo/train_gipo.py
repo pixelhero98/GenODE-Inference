@@ -17,15 +17,15 @@ from genode.gipo.policy import (
     STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
     DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS,
     DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS,
-    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
-    STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
-    ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
-    ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
+    STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE,
+    ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
+    ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
     DEFAULT_TRANSFORMER_DROPOUT,
     DEFAULT_TRANSFORMER_HEADS,
     DEFAULT_TRANSFORMER_HIDDEN_DIM,
     DEFAULT_TRANSFORMER_LAYERS,
-    CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+    CONDITIONING_STYLE_ADDITIVE_MLP,
     DensityFeatureNormalizer,
     EmbeddingNormalizer,
     attach_uniform_gipo_rewards,
@@ -334,10 +334,10 @@ def build_argparser() -> argparse.ArgumentParser:
 def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     seed_all(int(args.seed))
     density_bin_count = CANONICAL_DENSITY_BIN_COUNT
-    selection_mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
-    student_selection_mode = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
+    selection_mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
+    student_selection_mode = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE
     validate_gipo_attention_heads(int(args.transformer_heads))
-    conditioning_style = CONDITIONING_STYLE_ADDITIVE_MLP_V1
+    conditioning_style = CONDITIONING_STYLE_ADDITIVE_MLP
     requested_setting_mode = SETTING_ENCODER_MODE_CONTINUOUS_V3
     setting_feature_mode = validate_setting_feature_mode(requested_setting_mode)
     rows = read_metric_rows_csv(resolve_project_path(str(args.rows_csv)))
@@ -413,19 +413,19 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     }
     if bad_weights:
         raise ValueError(
-            "weighted_normalized_regret_v1 requires J_CDN weights "
+            "weighted_normalized_regret requires J_CDN weights "
             "context=0.25,density_family=0.25,unseen_nfe=0.50."
         )
     sampled_target_nfes = sorted({int(row["target_nfe"]) for row in sampled_rows})
     if sampled_target_nfes != [4, 8, 12]:
         raise ValueError(
-            "weighted_normalized_regret_v1 final teacher/student fitting expects seen calibration NFEs [4, 8, 12]; "
+            "weighted_normalized_regret final teacher/student fitting expects seen calibration NFEs [4, 8, 12]; "
             f"found {sampled_target_nfes}."
         )
     unseen_selection_rows: List[Dict[str, Any]] = []
     unseen_selection_target_nfes = _parse_int_csv(str(args.teacher_unseen_selection_target_nfe_values))
     if not str(args.teacher_unseen_selection_rows_csv).strip():
-        raise ValueError("weighted_normalized_regret_v1 requires --teacher_unseen_selection_rows_csv for unseen-NFE selection diagnostics.")
+        raise ValueError("weighted_normalized_regret requires --teacher_unseen_selection_rows_csv for unseen-NFE selection diagnostics.")
     if str(args.teacher_unseen_selection_rows_csv).strip():
         unseen_raw_rows = read_metric_rows_csv(resolve_project_path(str(args.teacher_unseen_selection_rows_csv)))
         if not unseen_raw_rows:
@@ -514,7 +514,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     selection_support_schedule_keys = tuple(key for key in support_keys if key not in set(density_holdout_keys))
     context_holdout_diagnostic_rows = _rows_without_schedule_keys(context_holdout_rows, density_holdout_keys)
     if not density_holdout_rows and not bool(args.dry_run):
-        raise ValueError("weighted_normalized_regret_v1 selection requires non-empty density-family holdout rows.")
+        raise ValueError("weighted_normalized_regret selection requires non-empty density-family holdout rows.")
     selector_fit_rows = density_selection_fit_rows
     final_fit_rows = [dict(row) for row in sampled_rows]
     if not selector_fit_rows:
@@ -563,7 +563,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     pseudo_target_weight = 0.0
     student_selector_fit_rows = [dict(row) for row in fit_rows]
     student_selector_validation_rows: List[Dict[str, Any]] = []
-    if student_selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1:
+    if student_selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE:
         student_selector_fit_rows, student_selector_validation_rows = split_rows_by_context_holdout(
             fit_rows,
             holdout_fraction=float(args.student_selection_holdout_fraction),
@@ -594,7 +594,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     def _build_teacher_instance(seed_offset: int = 0):
         seed_all(int(args.seed) + int(seed_offset))
         return build_gipo_teacher_model(
-            architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+            architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
             setting_dim=setting_dim,
             density_dim=int(len(reference_time_grid) - 1),
             context_dim=context_dim,
@@ -605,7 +605,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     def _build_student_instance(seed_offset: int = 0):
         seed_all(int(args.seed) + int(seed_offset))
         return build_gipo_student_model(
-            architecture=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+            architecture=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
             setting_dim=setting_dim,
             density_dim=int(len(reference_time_grid) - 1),
             context_dim=context_dim,
@@ -626,8 +626,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
         "teacher_objective": "pairwise_rank_plus_huber_regression",
         "model_payload_version": MODEL_PAYLOAD_VERSION,
-        "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
-        "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+        "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
+        "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
         "teacher_model_config": teacher_model_config,
         "student_model_config": student_model_config,
         "teacher_metric_targets": list(teacher_metric_target_keys),
@@ -657,7 +657,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "density_family_diagnostic_row_count": int(len(density_family_diagnostic_rows)),
         },
         "unseen_nfe_selection": {
-            "protocol": "unseen_train_tuning_selection_diagnostic_v1",
+            "protocol": "unseen_train_tuning_selection_diagnostic",
             "enabled": bool(unseen_selection_rows),
             "target_nfes": [int(value) for value in unseen_selection_target_nfes],
             "raw_csv": str(args.teacher_unseen_selection_rows_csv),
@@ -759,11 +759,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "density_family_holdout": density_family_diagnostic_rows,
     }
     if not context_holdout_diagnostic_rows:
-        raise ValueError("weighted_normalized_regret_v1 selection requires non-empty context_disjoint diagnostic rows.")
+        raise ValueError("weighted_normalized_regret selection requires non-empty context_disjoint diagnostic rows.")
     if not density_family_diagnostic_rows:
-        raise ValueError("weighted_normalized_regret_v1 selection requires non-empty density_family_holdout diagnostic rows.")
+        raise ValueError("weighted_normalized_regret selection requires non-empty density_family_holdout diagnostic rows.")
     if not unseen_nfe_diagnostic_rows:
-        raise ValueError("weighted_normalized_regret_v1 requires non-empty unseen-NFE diagnostic rows.")
+        raise ValueError("weighted_normalized_regret requires non-empty unseen-NFE diagnostic rows.")
     context_density_training = _train_teacher_pass(
         seed_offset=101,
         pass_name="context_density_selector",
@@ -893,8 +893,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     student_final_retrain = {
         "enabled": True,
         "performed": True,
-        "protocol": "gipo_student_final_retrain_v1",
-        "selection_protocol": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+        "protocol": "gipo_student_final_retrain",
+        "selection_protocol": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE,
         "selected_step": int(selected_student_step),
         "selector_max_steps": int(args.student_steps),
         "selector_fit_row_count": int(len(student_selector_fit_rows)),
@@ -909,12 +909,12 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     }
     student_training = {
         **student_training,
-        "student_checkpoint_selection_mode": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+        "student_checkpoint_selection_mode": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE,
         "student_checkpoint_selection": student_checkpoint_selection,
         "student_selection_pass": student_selection_training,
         "student_selector_training": student_selection_training,
         "student_validation_split": {
-            "protocol": "context_disjoint_student_validation_v1",
+            "protocol": "context_disjoint_student_validation",
             "fit_row_count": int(len(student_selector_fit_rows)),
             "fit_context_count": int(len({context_id_from_row(row) for row in student_selector_fit_rows})),
             "validation_row_count": int(len(student_selector_validation_rows)),
@@ -933,7 +933,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         {
             "protocol": GIPO_PROTOCOL,
             "model_payload_version": MODEL_PAYLOAD_VERSION,
-            "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+            "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
             "teacher_model_config": teacher_model_config,
             "teacher_state": teacher.state_dict(),
             "setting_dim": int(setting_dim),
@@ -968,7 +968,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "protocol": GIPO_PROTOCOL,
             "model_payload_version": MODEL_PAYLOAD_VERSION,
             "student_policy_type": "continuous_density",
-            "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+            "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
             "student_model_config": student_model_config,
             "student_objective": student_training.get("student_objective", "teacher_weighted_density_mle_kl"),
             "student_state": student.state_dict(),
@@ -1010,8 +1010,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
         "setting_feature_mode": setting_feature_mode,
         "setting_encoder_config": setting_encoder_config.to_payload(),
-        "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
-        "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+        "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
+        "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
         "teacher_model_config": teacher_model_config,
         "student_model_config": student_model_config,
         "conditioning_style": conditioning_style,

@@ -18,7 +18,8 @@ from genode.data.otflow_paths import project_root, resolve_project_path
 from genode.models.config import OTFlowConfig
 
 
-MOLECULE_BENCHMARK_FAMILY = "molecule_3d"
+MOLECULE_BENCHMARK_FAMILY = "molecule_3d_coordinate_generation"
+MOLECULE_GROUP_ROOT_NAME = "molecule_3d"
 DEFAULT_MOLECULE_DATASET_KEY = "molecule_3d"
 MOLECULE_GROUP_DATASET_KEYS = ("molecule_3d_set1", "molecule_3d_set2", "molecule_3d_set3")
 MOLECULE_TOKEN_DIM = 3
@@ -338,7 +339,7 @@ def discover_molecule_xyz_strata(zip_path: str | Path) -> Dict[str, Dict[str, An
 
 
 def default_molecule_group_root() -> Path:
-    return resolve_project_path(Path("data") / MOLECULE_BENCHMARK_FAMILY)
+    return resolve_project_path(Path("data") / MOLECULE_GROUP_ROOT_NAME)
 
 
 def default_molecule_group_manifest_path(dataset_key: str, group_root: str | Path | None = None) -> Path:
@@ -380,7 +381,6 @@ def discover_trainable_molecule_strata(zip_paths: Sequence[str | Path]) -> List[
                     "member_key": member_key,
                     "stratum": stratum_name,
                     "source_zip_name": source_zip_name,
-                    "source_zip_path": str(zip_path),
                     "xyz_count": int(summary.get("xyz_count", 0)),
                     "trajectory_count": int(summary.get("xyz_count", 0)),
                     "atom_count": int(summary["atom_count"]),
@@ -412,11 +412,7 @@ def build_balanced_molecule_stratum_groups(
     ]
     for row in sorted(strata, key=lambda item: (-int(item["trajectory_count"]), str(item["source_zip_name"]), str(item["stratum"]))):
         target_idx = min(range(len(groups)), key=lambda idx: (int(groups[idx]["trajectory_count"]), idx))
-        member = {
-            key: value
-            for key, value in row.items()
-            if key != "source_zip_path"
-        }
+        member = dict(row)
         member["processed_dir"] = f"processed/{member['member_key']}"
         groups[target_idx]["strata"].append(member)
         groups[target_idx]["trajectory_count"] = int(groups[target_idx]["trajectory_count"]) + int(row["trajectory_count"])
@@ -454,7 +450,7 @@ def write_molecule_group_manifests(
         manifest_path = root / dataset_key / "group_manifest.json"
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "manifest_version": "molecule_3d_group_manifest_v1",
+            "manifest_version": "molecule_3d_group_manifest",
             "dataset_key": dataset_key,
             "benchmark_family": MOLECULE_BENCHMARK_FAMILY,
             "source": "local molecule trajectory zip files",
@@ -786,9 +782,9 @@ def prepare_molecule_xyz_zip(
     metadata: Dict[str, Any] = {
         "dataset_key": key,
         "stratum": stratum_name,
+        "member_key": _member_key(zip_path.name, stratum_name or category or key),
         "trainable": trainable_value,
         "benchmark_family": MOLECULE_BENCHMARK_FAMILY,
-        "source_zip": _project_display_path(zip_path),
         "source_zip_name": zip_path.name,
         "source_xyz_count": int(len(source_names_out)),
         "source_total_frames": int(total),
@@ -1325,6 +1321,17 @@ class MoleculeWindowDataset(torch.utils.data.Dataset):
             "rotation": rotation.astype(np.float32),
         }
 
+    def context_features_from_history_coords(self, history_coords: np.ndarray) -> np.ndarray:
+        history = np.asarray(history_coords, dtype=np.float32)
+        if history.ndim != 3 or history.shape[1:] != (self.data.atom_count, 3):
+            raise ValueError(
+                "history_coords must have shape [history_len, atom_count, 3], "
+                f"got {history.shape}."
+            )
+        if history.shape[0] < self.H:
+            raise ValueError(f"Need at least {self.H} molecule history frames, got {history.shape[0]}.")
+        return _context_features_from_local(history[-self.H :], self.atom_static)
+
     def eval_item(self, idx: int) -> Dict[str, Any]:
         target_idx = int(self.start_indices[int(idx)])
         arrays = self._raw_eval_arrays(target_idx)
@@ -1517,7 +1524,10 @@ def build_molecule_dataset_splits(
             "future_horizon": int(future_horizon),
             "dataset_key": data.dataset_key,
             "stratum": data.stratum,
+            "member_key": str(data.metadata.get("member_key", "")),
+            "source_zip_name": str(data.metadata.get("source_zip_name", "")),
             "atom_count": int(data.atom_count),
+            "formula": str(data.metadata.get("formula", "")),
             "context_feature_dim": int(data.context_feature_dim),
             "snapshot_dim": int(data.coord_dim),
             "normalization_source": stats_source,
@@ -1633,6 +1643,7 @@ __all__ = [
     "ATOM_COVALENT_RADIUS",
     "DEFAULT_MOLECULE_DATASET_KEY",
     "MOLECULE_GROUP_DATASET_KEYS",
+    "MOLECULE_GROUP_ROOT_NAME",
     "DEFAULT_MOLECULE_SPLIT_SEED",
     "MOLECULE_BENCHMARK_FAMILY",
     "MOLECULE_CONTEXT_ATOM_FEATURE_DIM",

@@ -10,8 +10,8 @@ from typing import Dict, Iterable, List, Mapping
 
 from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 
-FORECAST_FAMILY = "forecast_extrapolation"
-CONDITIONAL_GENERATION_FAMILY = "conditional_generation"
+FORECAST_FAMILY = "temporal_extrapolation"
+CONDITIONAL_GENERATION_FAMILY = "temporal_conditional_generation"
 
 
 @dataclass(frozen=True)

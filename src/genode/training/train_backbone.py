@@ -88,10 +88,6 @@ def build_forecast_cfg(args: argparse.Namespace) -> OTFlowConfig:
     return cfg
 
 
-def build_sf_traffic_cfg(args: argparse.Namespace) -> OTFlowConfig:
-    return build_forecast_cfg(args)
-
-
 def ensure_forecast_dataset(dataset_root: Path, dataset: str, *, prepare: bool) -> None:
     manifest = default_manifest_path(dataset_root, dataset)
     if manifest.exists():

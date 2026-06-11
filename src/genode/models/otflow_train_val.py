@@ -28,7 +28,7 @@ from genode.models.config import OTFlowConfig
 from genode.models.modules import EMAModel
 from genode.models.otflow_model import OTFlow
 from genode.data.otflow_datasets import L2FeatureMap, WindowedParamSequenceDataset, compute_basic_l2_metrics
-from genode.data.otflow_medical_datasets import LONG_TERM_ST_DATASET_KEY, SLEEP_EDF_DATASET_KEY, SLEEP_EDF_STAGE_NAMES
+from genode.data.otflow_medical_datasets import LONG_TERM_ST_DATASET_KEY
 from genode.models.otflow_utils import flatten_dict, unflatten_to_nested, microstructure_series
 
 
@@ -1054,7 +1054,7 @@ def _aggregate_core_l2_distribution_metrics(rows: Sequence[Dict[str, Any]]) -> D
     }
 
 
-def _sleep_bandpower(values: np.ndarray, fs_hz: float, low_hz: float, high_hz: float) -> float:
+def _signal_bandpower(values: np.ndarray, fs_hz: float, low_hz: float, high_hz: float) -> float:
     arr = np.asarray(values, dtype=np.float64).ravel()
     arr = arr[np.isfinite(arr)]
     if arr.size < 8:
@@ -1071,7 +1071,7 @@ def _sleep_bandpower(values: np.ndarray, fs_hz: float, low_hz: float, high_hz: f
     return float(np.sum(power[mask]))
 
 
-def _sleep_feature_vector(
+def _signal_feature_vector(
     signal: np.ndarray,
     *,
     sampling_rate_hz: float,
@@ -1079,7 +1079,7 @@ def _sleep_feature_vector(
 ) -> Tuple[np.ndarray, List[str]]:
     arr = np.asarray(signal, dtype=np.float64)
     if arr.ndim != 2:
-        raise ValueError(f"Expected 2D sleep signal array [T, C], got shape {arr.shape}.")
+        raise ValueError(f"Expected 2D signal array [T, C], got shape {arr.shape}.")
 
     features: List[float] = []
     names: List[str] = []
@@ -1113,79 +1113,8 @@ def _sleep_feature_vector(
                 ("beta", 12.0, 30.0),
             ):
                 names.append(f"{channel_name}:{band_name}_bandpower")
-                features.append(_sleep_bandpower(channel, float(sampling_rate_hz), float(low_hz), float(high_hz)))
+                features.append(_signal_bandpower(channel, float(sampling_rate_hz), float(low_hz), float(high_hz)))
     return np.asarray(features, dtype=np.float32), names
-
-
-def _sleep_stage_index_from_row(row: Mapping[str, Any]) -> int:
-    seq = row.get("seq", {})
-    if "stage_index" in seq:
-        return int(seq["stage_index"])
-    cond = seq.get("cond_target")
-    if cond is None:
-        return -1
-    cond_arr = np.asarray(cond, dtype=np.float32).reshape(-1)
-    if cond_arr.size <= 0:
-        return -1
-    return int(np.argmax(cond_arr))
-
-
-def _collect_sleep_feature_examples(
-    rows: Sequence[Dict[str, Any]],
-    *,
-    sampling_rate_hz: float,
-    channel_names: Sequence[str],
-) -> Dict[str, Any]:
-    real_features: List[np.ndarray] = []
-    gen_features: List[np.ndarray] = []
-    stage_indices: List[int] = []
-    feature_names: Optional[List[str]] = None
-
-    for row in rows:
-        seq = row.get("seq", {})
-        gen_signal = seq.get("gen_signal_raw")
-        true_signal = seq.get("true_signal_raw")
-        if gen_signal is None or true_signal is None:
-            continue
-        gen_vec, names = _sleep_feature_vector(
-            np.asarray(gen_signal, dtype=np.float32),
-            sampling_rate_hz=float(sampling_rate_hz),
-            channel_names=channel_names,
-        )
-        true_vec, _ = _sleep_feature_vector(
-            np.asarray(true_signal, dtype=np.float32),
-            sampling_rate_hz=float(sampling_rate_hz),
-            channel_names=channel_names,
-        )
-        if feature_names is None:
-            feature_names = list(names)
-        stage_index = _sleep_stage_index_from_row(row)
-        if stage_index < 0:
-            continue
-        gen_features.append(gen_vec)
-        real_features.append(true_vec)
-        stage_indices.append(int(stage_index))
-
-    if not real_features:
-        empty = np.zeros((0, 1), dtype=np.float32)
-        return {
-            "real_x": empty,
-            "gen_x": empty,
-            "real_y": np.zeros(0, dtype=np.int64),
-            "gen_y": np.zeros(0, dtype=np.int64),
-            "feature_names": ["empty"],
-        }
-
-    real_x = np.stack(real_features, axis=0).astype(np.float32)
-    gen_x = np.stack(gen_features, axis=0).astype(np.float32)
-    labels = np.asarray(stage_indices, dtype=np.int64)
-    return {
-        "real_x": real_x,
-        "gen_x": gen_x,
-        "real_y": labels,
-        "gen_y": labels.copy(),
-        "feature_names": list(feature_names or []),
-    }
 
 
 def _collect_signal_feature_examples(
@@ -1196,6 +1125,7 @@ def _collect_signal_feature_examples(
 ) -> Dict[str, Any]:
     real_features: List[np.ndarray] = []
     gen_features: List[np.ndarray] = []
+    history_scores: List[float] = []
     feature_names: Optional[List[str]] = None
     for row in rows:
         seq = row.get("seq", {})
@@ -1203,12 +1133,12 @@ def _collect_signal_feature_examples(
         true_signal = seq.get("true_signal_raw")
         if gen_signal is None or true_signal is None:
             continue
-        gen_vec, names = _sleep_feature_vector(
+        gen_vec, names = _signal_feature_vector(
             np.asarray(gen_signal, dtype=np.float32),
             sampling_rate_hz=float(sampling_rate_hz),
             channel_names=channel_names,
         )
-        true_vec, _ = _sleep_feature_vector(
+        true_vec, _ = _signal_feature_vector(
             np.asarray(true_signal, dtype=np.float32),
             sampling_rate_hz=float(sampling_rate_hz),
             channel_names=channel_names,
@@ -1217,13 +1147,30 @@ def _collect_signal_feature_examples(
             feature_names = list(names)
         gen_features.append(gen_vec)
         real_features.append(true_vec)
+        history_signal = seq.get("history_signal_raw")
+        if history_signal is None:
+            history_scores.append(float(np.mean(np.abs(true_vec))))
+        else:
+            history_vec, _ = _signal_feature_vector(
+                np.asarray(history_signal, dtype=np.float32),
+                sampling_rate_hz=float(sampling_rate_hz),
+                channel_names=channel_names,
+            )
+            history_scores.append(float(np.nanmean(np.abs(history_vec))))
     if not real_features:
         empty = np.zeros((0, 1), dtype=np.float32)
-        return {"real_x": empty, "gen_x": empty, "feature_names": ["empty"]}
+        return {"real_x": empty, "gen_x": empty, "feature_names": ["empty"], "condition_labels": np.zeros(0, dtype=np.int64)}
+    score_arr = np.asarray(history_scores, dtype=np.float64)
+    if score_arr.size >= 3 and np.isfinite(score_arr).any():
+        q1, q2 = np.nanquantile(score_arr, [1.0 / 3.0, 2.0 / 3.0])
+        condition_labels = np.digitize(score_arr, [float(q1), float(q2)], right=False).astype(np.int64)
+    else:
+        condition_labels = np.zeros(score_arr.shape[0], dtype=np.int64)
     return {
         "real_x": np.stack(real_features, axis=0).astype(np.float32),
         "gen_x": np.stack(gen_features, axis=0).astype(np.float32),
         "feature_names": list(feature_names or []),
+        "condition_labels": condition_labels,
     }
 
 
@@ -1232,6 +1179,7 @@ def _aggregate_signal_feature_distances(
     real_x: np.ndarray,
     gen_x: np.ndarray,
     feature_names: Sequence[str],
+    condition_labels: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     real_x = np.asarray(real_x, dtype=np.float64)
     gen_x = np.asarray(gen_x, dtype=np.float64)
@@ -1241,55 +1189,13 @@ def _aggregate_signal_feature_distances(
         raise ValueError("Signal feature arrays must be 2D.")
 
     unconditional_by_stat: Dict[str, float] = {}
-    unconditional_l1_by_stat: Dict[str, float] = {}
-    stat_scales: Dict[str, float] = {}
-    for feature_idx, feature_name in enumerate(feature_names):
-        real_col = real_x[:, int(feature_idx)]
-        gen_col = gen_x[:, int(feature_idx)]
-        scale = float(np.std(real_col) + 1e-6)
-        stat_scales[str(feature_name)] = scale
-        unconditional_by_stat[str(feature_name)] = _wasserstein_1d(real_col, gen_col) / scale
-        unconditional_l1_by_stat[str(feature_name)] = _hist_l1(
-            (gen_col - float(np.mean(real_col))) / scale,
-            (real_col - float(np.mean(real_col))) / scale,
-        )
-    unconditional = float(np.nanmean(np.asarray(list(unconditional_by_stat.values()), dtype=np.float64)))
-    u_l1 = float(np.nanmean(np.asarray(list(unconditional_l1_by_stat.values()), dtype=np.float64)))
-    return {
-        "unconditional_w1": unconditional,
-        "conditional_w1": unconditional,
-        "u_l1": u_l1,
-        "c_l1": u_l1,
-        "unconditional_w1_by_stat": unconditional_by_stat,
-        "conditional_w1_by_stat": dict(unconditional_by_stat),
-        "unconditional_l1_by_stat": unconditional_l1_by_stat,
-        "conditional_l1_by_stat": dict(unconditional_l1_by_stat),
-        "stat_scales": stat_scales,
-    }
-
-
-def _aggregate_sleep_feature_distances(
-    *,
-    real_x: np.ndarray,
-    gen_x: np.ndarray,
-    labels: np.ndarray,
-    feature_names: Sequence[str],
-    stage_names: Sequence[str],
-) -> Dict[str, Any]:
-    real_x = np.asarray(real_x, dtype=np.float64)
-    gen_x = np.asarray(gen_x, dtype=np.float64)
-    labels = np.asarray(labels, dtype=np.int64)
-    if real_x.shape != gen_x.shape:
-        raise ValueError("Sleep real_x and gen_x must share shape.")
-    if real_x.ndim != 2:
-        raise ValueError("Sleep feature arrays must be 2D.")
-
-    unconditional_by_stat: Dict[str, float] = {}
     conditional_by_stat: Dict[str, float] = {}
     unconditional_l1_by_stat: Dict[str, float] = {}
     conditional_l1_by_stat: Dict[str, float] = {}
     stat_scales: Dict[str, float] = {}
-
+    labels = None if condition_labels is None else np.asarray(condition_labels, dtype=np.int64).reshape(-1)
+    if labels is not None and labels.shape[0] != real_x.shape[0]:
+        raise ValueError("Signal condition_labels must match the number of examples.")
     for feature_idx, feature_name in enumerate(feature_names):
         real_col = real_x[:, int(feature_idx)]
         gen_col = gen_x[:, int(feature_idx)]
@@ -1300,21 +1206,23 @@ def _aggregate_sleep_feature_distances(
             (gen_col - float(np.mean(real_col))) / scale,
             (real_col - float(np.mean(real_col))) / scale,
         )
-
-        per_stage = []
-        per_stage_l1 = []
-        for stage_index, _ in enumerate(stage_names):
-            mask = labels == int(stage_index)
-            if int(np.count_nonzero(mask)) < 2:
-                continue
-            per_stage.append(_wasserstein_1d(real_col[mask], gen_col[mask]) / scale)
-            per_stage_l1.append(_hist_l1(
-                (gen_col[mask] - float(np.mean(real_col[mask]))) / max(float(np.std(real_col[mask])), 1e-6),
-                (real_col[mask] - float(np.mean(real_col[mask]))) / max(float(np.std(real_col[mask])), 1e-6),
-            ))
-        conditional_by_stat[str(feature_name)] = float(np.mean(per_stage)) if per_stage else float("nan")
-        conditional_l1_by_stat[str(feature_name)] = float(np.mean(per_stage_l1)) if per_stage_l1 else float("nan")
-
+        per_condition = []
+        per_condition_l1 = []
+        if labels is not None:
+            for label in sorted(set(int(value) for value in labels.tolist())):
+                mask = labels == int(label)
+                if int(np.count_nonzero(mask)) < 2:
+                    continue
+                local_scale = max(float(np.std(real_col[mask])), 1e-6)
+                per_condition.append(_wasserstein_1d(real_col[mask], gen_col[mask]) / local_scale)
+                per_condition_l1.append(
+                    _hist_l1(
+                        (gen_col[mask] - float(np.mean(real_col[mask]))) / local_scale,
+                        (real_col[mask] - float(np.mean(real_col[mask]))) / local_scale,
+                    )
+                )
+        conditional_by_stat[str(feature_name)] = float(np.mean(per_condition)) if per_condition else float("nan")
+        conditional_l1_by_stat[str(feature_name)] = float(np.mean(per_condition_l1)) if per_condition_l1 else float("nan")
     unconditional = float(np.nanmean(np.asarray(list(unconditional_by_stat.values()), dtype=np.float64)))
     conditional = float(np.nanmean(np.asarray(list(conditional_by_stat.values()), dtype=np.float64)))
     u_l1 = float(np.nanmean(np.asarray(list(unconditional_l1_by_stat.values()), dtype=np.float64)))
@@ -1332,14 +1240,12 @@ def _aggregate_sleep_feature_distances(
     }
 
 
-def _compare_sleep_sequences(
+def _compare_signal_sequences(
     gen_signal: np.ndarray,
     true_signal: np.ndarray,
     *,
     sampling_rate_hz: float,
     channel_names: Sequence[str],
-    stage_index: int,
-    stage_names: Sequence[str],
     max_acf_lag: int = 20,
 ) -> Dict[str, Any]:
     gen_arr = np.asarray(gen_signal, dtype=np.float64)
@@ -1367,12 +1273,12 @@ def _compare_sleep_sequences(
             "acf_l1": float(np.mean(np.abs(_acf(gen_col, max_lag=max_acf_lag) - _acf(true_col, max_lag=max_acf_lag)))),
             "acf_l2": float(np.sqrt(np.mean((_acf(gen_col, max_lag=max_acf_lag) - _acf(true_col, max_lag=max_acf_lag)) ** 2))),
         }
-        gen_feat, feat_names = _sleep_feature_vector(
+        gen_feat, feat_names = _signal_feature_vector(
             gen_arr[:, [int(channel_index)]],
             sampling_rate_hz=float(sampling_rate_hz),
             channel_names=[str(channel_name)],
         )
-        true_feat, _ = _sleep_feature_vector(
+        true_feat, _ = _signal_feature_vector(
             true_arr[:, [int(channel_index)]],
             sampling_rate_hz=float(sampling_rate_hz),
             channel_names=[str(channel_name)],
@@ -1380,7 +1286,6 @@ def _compare_sleep_sequences(
         if gen_feat.size > 0:
             spectral_errors.append(float(np.mean(np.abs(gen_feat - true_feat))))
 
-    valid_stage = 0 <= int(stage_index) < len(stage_names)
     score_terms = np.asarray(signal_errors + spectral_errors, dtype=np.float64)
     finite_terms = score_terms[np.isfinite(score_terms)]
     return {
@@ -1390,10 +1295,6 @@ def _compare_sleep_sequences(
             "spectral_mae": float(np.mean(spectral_errors)) if spectral_errors else float("nan"),
             "signal_mae_by_channel": mae_by_channel,
             "signal_rmse_by_channel": rmse_by_channel,
-        },
-        "stage": {
-            "stage_index": int(stage_index),
-            "valid_stage_label": float(1.0 if valid_stage else 0.0),
         },
         "score_main": float(np.mean(finite_terms)) if finite_terms.size > 0 else float("nan"),
     }
@@ -1440,6 +1341,7 @@ def _evaluate_generation_main_metrics(
             real_x=real_x,
             gen_x=gen_x,
             feature_names=downstream["feature_names"],
+            condition_labels=downstream["condition_labels"],
         )
         score_terms = [
             disc_auc_gap,
@@ -1448,15 +1350,16 @@ def _evaluate_generation_main_metrics(
         finite_terms = np.asarray([term for term in score_terms if np.isfinite(term)], dtype=np.float64)
         score_main = float(finite_terms.mean()) if finite_terms.size > 0 else float("nan")
         return {
-            "tstr_macro_f1": float("nan"),
+            "temporal_tstr_f1": None,
+            "temporal_tstr_f1_applicable": False,
             "disc_auc": float(disc_auc),
             "disc_auc_gap": float(disc_auc_gap),
-            "unconditional_w1": float(w1_metrics["unconditional_w1"]),
-            "conditional_w1": float(w1_metrics["conditional_w1"]),
+            "temporal_uw1": float(w1_metrics["unconditional_w1"]),
+            "temporal_cw1": float(w1_metrics["conditional_w1"]),
             "u_l1": float(w1_metrics["u_l1"]),
             "c_l1": float(w1_metrics["c_l1"]),
-            "unconditional_w1_by_stat": w1_metrics["unconditional_w1_by_stat"],
-            "conditional_w1_by_stat": w1_metrics["conditional_w1_by_stat"],
+            "temporal_uw1_by_stat": w1_metrics["unconditional_w1_by_stat"],
+            "temporal_cw1_by_stat": w1_metrics["conditional_w1_by_stat"],
             "unconditional_l1_by_stat": w1_metrics["unconditional_l1_by_stat"],
             "conditional_l1_by_stat": w1_metrics["conditional_l1_by_stat"],
             "stat_scales": w1_metrics["stat_scales"],
@@ -1466,116 +1369,6 @@ def _evaluate_generation_main_metrics(
             "n_examples_gen": int(len(gen_x)),
             "threshold_abs_move": float("nan"),
         }
-    if dataset_kind == SLEEP_EDF_DATASET_KEY:
-        device = _downstream_device(cfg)
-        channel_names = list(dataset_metadata.get("channel_names", []))
-        if not channel_names:
-            channel_names = [f"channel_{idx}" for idx in range(rows[0]["seq"]["true_signal_raw"].shape[1])]
-        stage_names = list(dataset_metadata.get("stage_names", list(SLEEP_EDF_STAGE_NAMES)))
-        sampling_rate_hz = float(dataset_metadata.get("sampling_rate_hz", 100.0))
-        downstream = _collect_sleep_feature_examples(
-            rows,
-            sampling_rate_hz=sampling_rate_hz,
-            channel_names=channel_names,
-        )
-        real_x = downstream["real_x"]
-        gen_x = downstream["gen_x"]
-        real_y = downstream["real_y"]
-        gen_y = downstream["gen_y"]
-
-        tstr_macro_f1 = float("nan")
-        class_count = int(len(stage_names))
-        if len(gen_x) > 0 and len(real_x) > 0 and np.unique(gen_y).size >= 2 and np.unique(real_y).size >= 2:
-            x_train, x_test = _standardize_pair(gen_x, real_x)
-            tstr_macro_f1 = _train_small_multiclass_mlp_f1(
-                x_train,
-                gen_y,
-                x_test,
-                real_y,
-                device=device,
-                seed=seed + 31,
-                num_classes=class_count,
-            )
-
-        stage_mismatch_rate = float("nan")
-        stage_classifier_real_macro_f1 = float("nan")
-        if len(real_x) > 0 and len(gen_x) > 0 and np.unique(real_y).size >= 2:
-            real_train_x, gen_test_x = _standardize_pair(real_x, gen_x)
-            try:
-                stage_classifier, stage_class_count = _train_small_multiclass_mlp(
-                    real_train_x,
-                    real_y,
-                    device=device,
-                    seed=seed + 71,
-                    num_classes=class_count,
-                )
-                pred_gen_y = _predict_small_multiclass_mlp(stage_classifier, gen_test_x, device=device)
-                pred_real_y = _predict_small_multiclass_mlp(stage_classifier, real_train_x, device=device)
-                stage_mismatch_rate = float(np.mean(pred_gen_y != gen_y)) if len(pred_gen_y) else float("nan")
-                stage_classifier_real_macro_f1 = _macro_f1_score(
-                    real_y,
-                    pred_real_y,
-                    num_classes=stage_class_count,
-                )
-            except ValueError:
-                stage_mismatch_rate = float("nan")
-
-        disc_auc = float("nan")
-        if len(gen_x) > 1 and len(real_x) > 1:
-            train_x, train_y, test_x, test_y = _pairwise_split(real_x, gen_x, seed=seed + 17)
-            if len(train_x) > 0 and len(test_x) > 0:
-                train_x, test_x = _standardize_pair(train_x, test_x)
-                disc_auc = _train_small_discriminator_auc(
-                    train_x,
-                    train_y.astype(np.float32),
-                    test_x,
-                    test_y,
-                    device=device,
-                    seed=seed + 47,
-                )
-        disc_auc_gap = float(abs(disc_auc - 0.5)) if np.isfinite(disc_auc) else float("nan")
-        w1_metrics = _aggregate_sleep_feature_distances(
-            real_x=real_x,
-            gen_x=gen_x,
-            labels=real_y,
-            feature_names=downstream["feature_names"],
-            stage_names=stage_names,
-        )
-        score_terms = [
-            1.0 - tstr_macro_f1 if np.isfinite(tstr_macro_f1) else np.nan,
-            disc_auc_gap,
-            np.log1p(w1_metrics["unconditional_w1"]) if np.isfinite(w1_metrics["unconditional_w1"]) else np.nan,
-            np.log1p(w1_metrics["conditional_w1"]) if np.isfinite(w1_metrics["conditional_w1"]) else np.nan,
-        ]
-        finite_terms = np.asarray([term for term in score_terms if np.isfinite(term)], dtype=np.float64)
-        score_main = float(finite_terms.mean()) if finite_terms.size > 0 else float("nan")
-        stage_counts = {
-            str(stage_names[int(stage_idx)]): int(np.sum(real_y == int(stage_idx)))
-            for stage_idx in range(len(stage_names))
-        }
-        return {
-            "tstr_macro_f1": float(tstr_macro_f1),
-            "disc_auc": float(disc_auc),
-            "disc_auc_gap": float(disc_auc_gap),
-            "unconditional_w1": float(w1_metrics["unconditional_w1"]),
-            "conditional_w1": float(w1_metrics["conditional_w1"]),
-            "u_l1": float(w1_metrics["u_l1"]),
-            "c_l1": float(w1_metrics["c_l1"]),
-            "unconditional_w1_by_stat": w1_metrics["unconditional_w1_by_stat"],
-            "conditional_w1_by_stat": w1_metrics["conditional_w1_by_stat"],
-            "unconditional_l1_by_stat": w1_metrics["unconditional_l1_by_stat"],
-            "conditional_l1_by_stat": w1_metrics["conditional_l1_by_stat"],
-            "stat_scales": w1_metrics["stat_scales"],
-            "score_main": float(score_main),
-            "label_horizon": int(max(1, horizon)),
-            "n_examples_real": int(len(real_x)),
-            "n_examples_gen": int(len(gen_x)),
-            "threshold_abs_move": float("nan"),
-            "stage_mismatch_rate": float(stage_mismatch_rate),
-            "stage_classifier_real_macro_f1": float(stage_classifier_real_macro_f1),
-            "stage_counts": stage_counts,
-        }
-
     label_horizon = int(max(1, min(10, max(1, horizon // 10))))
     downstream = _collect_downstream_examples(
         rows,
@@ -1633,15 +1426,16 @@ def _evaluate_generation_main_metrics(
     score_main = float(finite_terms.mean()) if finite_terms.size > 0 else float("nan")
 
     return {
-        "tstr_macro_f1": float(tstr_macro_f1),
+        "temporal_tstr_f1": float(tstr_macro_f1) if np.isfinite(tstr_macro_f1) else None,
+        "temporal_tstr_f1_applicable": True,
         "disc_auc": float(disc_auc),
         "disc_auc_gap": float(disc_auc_gap),
-        "unconditional_w1": float(w1_metrics["unconditional_w1"]),
-        "conditional_w1": float(w1_metrics["conditional_w1"]),
+        "temporal_uw1": float(w1_metrics["unconditional_w1"]),
+        "temporal_cw1": float(w1_metrics["conditional_w1"]),
         "u_l1": float(w1_metrics["u_l1"]),
         "c_l1": float(w1_metrics["c_l1"]),
-        "unconditional_w1_by_stat": w1_metrics["unconditional_w1_by_stat"],
-        "conditional_w1_by_stat": w1_metrics["conditional_w1_by_stat"],
+        "temporal_uw1_by_stat": w1_metrics["unconditional_w1_by_stat"],
+        "temporal_cw1_by_stat": w1_metrics["conditional_w1_by_stat"],
         "unconditional_l1_by_stat": w1_metrics["unconditional_l1_by_stat"],
         "conditional_l1_by_stat": w1_metrics["conditional_l1_by_stat"],
         "stat_scales": w1_metrics["stat_scales"],
@@ -1795,64 +1589,10 @@ def _valid_eval_indices(ds: WindowedParamSequenceDataset, horizon: int) -> np.nd
     return starts[starts + int(horizon) <= segment_ends]
 
 
-def _sleep_stage_index_for_t0(ds: WindowedParamSequenceDataset, t0: int) -> int:
-    if ds.cond is None or int(t0) < 0 or int(t0) >= int(len(ds.cond)):
-        return -1
-    cond = np.asarray(ds.cond[int(t0)], dtype=np.float32).reshape(-1)
-    if cond.size <= 0:
-        return -1
-    return int(np.argmax(cond))
-
-
-def _stage_counts_for_t0s(ds: WindowedParamSequenceDataset, t0s: Sequence[int]) -> Dict[str, int]:
-    metadata = dict(getattr(ds, "dataset_metadata", {}) or {})
-    stage_names = list(metadata.get("stage_names", list(SLEEP_EDF_STAGE_NAMES)))
-    counts = {str(name): 0 for name in stage_names}
-    for t0 in t0s:
-        stage_idx = _sleep_stage_index_for_t0(ds, int(t0))
-        if 0 <= stage_idx < len(stage_names):
-            counts[str(stage_names[stage_idx])] += 1
-    return counts
-
-
-def _choose_sleep_stage_stratified_windows(
-    ds: WindowedParamSequenceDataset,
-    valid_ts: np.ndarray,
-    *,
-    n_windows: int,
-    seed: int,
-) -> np.ndarray:
-    by_stage: Dict[int, List[int]] = {}
-    for t0 in np.asarray(valid_ts, dtype=np.int64).tolist():
-        stage_idx = _sleep_stage_index_for_t0(ds, int(t0))
-        if stage_idx >= 0:
-            by_stage.setdefault(int(stage_idx), []).append(int(t0))
-    if not by_stage:
-        raise ValueError("Sleep-EDF stratified evaluation requires valid stage labels.")
-
-    rng = np.random.default_rng(seed)
-    stages = sorted(by_stage)
-    target_count = max(int(n_windows), len(stages))
-    pools = {stage: rng.permutation(np.asarray(values, dtype=np.int64)).astype(np.int64).tolist() for stage, values in by_stage.items()}
-    chosen: List[int] = []
-    while len(chosen) < target_count:
-        for stage in stages:
-            if len(chosen) >= target_count:
-                break
-            if pools[stage]:
-                chosen.append(int(pools[stage].pop()))
-            else:
-                chosen.append(int(rng.choice(np.asarray(by_stage[stage], dtype=np.int64))))
-    return np.asarray(chosen, dtype=np.int64)
-
-
 def select_eval_window_starts(ds: WindowedParamSequenceDataset, horizon: int, n_windows: int, seed: int) -> np.ndarray:
     valid_ts = _valid_eval_indices(ds, int(horizon))
     if len(valid_ts) == 0:
         raise ValueError(f"No valid windows for horizon={horizon}.")
-    dataset_kind = str(getattr(ds, "dataset_kind", "l2"))
-    if dataset_kind == SLEEP_EDF_DATASET_KEY:
-        return _choose_sleep_stage_stratified_windows(ds, valid_ts, n_windows=int(n_windows), seed=int(seed))
     rng = np.random.default_rng(seed)
     if int(n_windows) <= len(valid_ts):
         return np.asarray(rng.choice(valid_ts, size=int(n_windows), replace=False), dtype=np.int64)
@@ -1930,29 +1670,23 @@ def eval_one_window(
     true_norm = ds.params[t0 : t0 + horizon].astype(np.float32)
     gen_raw_params = _denorm_params_seq(ds, gen_norm)
     true_raw_params = _denorm_params_seq(ds, true_norm)
+    history_start = max(0, int(t0) - int(context_len))
+    history_norm = ds.params[history_start:int(t0)].astype(np.float32)
+    history_raw_params = _denorm_params_seq(ds, history_norm) if history_norm.size > 0 else np.zeros((0, gen_raw_params.shape[1]), dtype=np.float32)
 
-    if dataset_kind in {SLEEP_EDF_DATASET_KEY, LONG_TERM_ST_DATASET_KEY}:
-        stage_index = -1
-        cond_target = None
-        if dataset_kind == SLEEP_EDF_DATASET_KEY and ds.cond is not None and int(t0) < int(len(ds.cond)):
-            cond_target = ds.cond[int(t0)].astype(np.float32, copy=False)
-            if cond_target.ndim == 1 and cond_target.size > 0:
-                stage_index = int(np.argmax(cond_target))
+    if dataset_kind == LONG_TERM_ST_DATASET_KEY:
         channel_names = list(dataset_metadata.get("channel_names", []))
         if not channel_names:
             channel_names = [f"channel_{idx}" for idx in range(int(gen_raw_params.shape[1]))]
-        stage_names = list(dataset_metadata.get("stage_names", list(SLEEP_EDF_STAGE_NAMES)))
         sampling_rate_hz = float(dataset_metadata.get("sampling_rate_hz", 100.0))
         cmp_metrics = (
             {}
             if main_metrics_only
-            else _compare_sleep_sequences(
+            else _compare_signal_sequences(
                 gen_raw_params,
                 true_raw_params,
                 sampling_rate_hz=sampling_rate_hz,
                 channel_names=channel_names,
-                stage_index=stage_index,
-                stage_names=stage_names,
             )
         )
         horizon_metrics = {}
@@ -1988,7 +1722,6 @@ def eval_one_window(
                 "context_len": int(context_len),
                 "main_metrics_only": bool(main_metrics_only),
                 "dataset_kind": dataset_kind,
-                "stage_index": int(stage_index),
             },
         }
         if return_sequences:
@@ -1997,8 +1730,7 @@ def eval_one_window(
                 "true_params_raw": true_raw_params,
                 "gen_signal_raw": gen_raw_params,
                 "true_signal_raw": true_raw_params,
-                "cond_target": cond_target,
-                "stage_index": int(stage_index),
+                "history_signal_raw": history_raw_params,
             }
         return out
 
@@ -2085,6 +1817,12 @@ def _wrap_scalar_as_mean_std(value: float) -> Dict[str, float]:
     return {"mean": float(value), "std": 0.0}
 
 
+def _wrap_optional_scalar_as_mean_std(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {"mean": None, "std": None}
+    return _wrap_scalar_as_mean_std(float(value))
+
+
 @torch.no_grad()
 def eval_many_windows(
     ds: WindowedParamSequenceDataset,
@@ -2151,42 +1889,33 @@ def eval_many_windows(
             dataset_metadata=dataset_metadata,
         )
     cmp["main"] = {
-        "tstr_macro_f1": _wrap_scalar_as_mean_std(main_metrics["tstr_macro_f1"]),
+        "temporal_tstr_f1": _wrap_optional_scalar_as_mean_std(main_metrics["temporal_tstr_f1"]),
+        "temporal_tstr_f1_applicable": bool(main_metrics["temporal_tstr_f1_applicable"]),
         "disc_auc": _wrap_scalar_as_mean_std(main_metrics["disc_auc"]),
         "disc_auc_gap": _wrap_scalar_as_mean_std(main_metrics["disc_auc_gap"]),
-        "unconditional_w1": _wrap_scalar_as_mean_std(main_metrics["unconditional_w1"]),
-        "conditional_w1": _wrap_scalar_as_mean_std(main_metrics["conditional_w1"]),
+        "temporal_uw1": _wrap_scalar_as_mean_std(main_metrics["temporal_uw1"]),
+        "temporal_cw1": _wrap_scalar_as_mean_std(main_metrics["temporal_cw1"]),
         "label_horizon": int(main_metrics["label_horizon"]),
         "n_examples_real": int(main_metrics["n_examples_real"]),
         "n_examples_gen": int(main_metrics["n_examples_gen"]),
         "threshold_abs_move": _wrap_scalar_as_mean_std(main_metrics["threshold_abs_move"]),
-        "unconditional_w1_by_stat": {
+        "temporal_uw1_by_stat": {
             key: _wrap_scalar_as_mean_std(val)
-            for key, val in main_metrics["unconditional_w1_by_stat"].items()
+            for key, val in main_metrics["temporal_uw1_by_stat"].items()
         },
-        "conditional_w1_by_stat": {
+        "temporal_cw1_by_stat": {
             key: _wrap_scalar_as_mean_std(val)
-            for key, val in main_metrics["conditional_w1_by_stat"].items()
+            for key, val in main_metrics["temporal_cw1_by_stat"].items()
         },
         "stat_scales": {
             key: _wrap_scalar_as_mean_std(val)
             for key, val in main_metrics["stat_scales"].items()
         },
     }
-    if "stage_counts" in main_metrics:
-        cmp["main"]["stage_counts"] = {
-            key: _wrap_scalar_as_mean_std(val)
-            for key, val in main_metrics["stage_counts"].items()
-        }
-    if "stage_mismatch_rate" in main_metrics:
-        cmp["main"]["stage_mismatch_rate"] = _wrap_scalar_as_mean_std(main_metrics["stage_mismatch_rate"])
-        cmp["main"]["stage_classifier_real_macro_f1"] = _wrap_scalar_as_mean_std(
-            main_metrics.get("stage_classifier_real_macro_f1", float("nan"))
-        )
     ret_acf = cmp.get("temporal", {}).get("ret", {}).get("acf_l1", {}).get("mean")
     vol_acf = cmp.get("temporal", {}).get("volatility", {}).get("acf_l1", {}).get("mean")
     ret_vol_terms = [v for v in (ret_acf, vol_acf) if isinstance(v, (int, float)) and np.isfinite(v)]
-    if dataset_kind in {SLEEP_EDF_DATASET_KEY, LONG_TERM_ST_DATASET_KEY}:
+    if dataset_kind == LONG_TERM_ST_DATASET_KEY:
         temporal_entries = []
         for channel_payload in cmp.get("temporal", {}).values():
             if isinstance(channel_payload, dict):
@@ -2201,7 +1930,7 @@ def eval_many_windows(
             "ret_vol_acf_error": _wrap_scalar_as_mean_std(
                 float(np.mean(temporal_entries)) if temporal_entries else float("nan")
             ),
-            "impact_response_error": _wrap_scalar_as_mean_std(main_metrics.get("stage_mismatch_rate", float("nan"))),
+            "impact_response_error": _wrap_scalar_as_mean_std(float("nan")),
             "efficiency_ms_per_sample": timing.get("latency_ms_per_sample", _wrap_scalar_as_mean_std(float("nan"))),
         }
     else:
@@ -2230,7 +1959,6 @@ def eval_many_windows(
             "chosen_t0s_hash": hashlib.sha256(
                 json.dumps([int(t0) for t0 in chosen.tolist()], separators=(",", ":")).encode("utf-8")
             ).hexdigest(),
-            "stage_counts": _stage_counts_for_t0s(ds, chosen.tolist()) if dataset_kind == SLEEP_EDF_DATASET_KEY else {},
             "generation_seed_base": None if generation_seed_base is None else int(generation_seed_base),
             "metrics_seed": int(metrics_seed_value),
             "main_metrics_only": bool(main_metrics_only),
@@ -2385,10 +2113,10 @@ def summarize_ablation_for_table(
     ablation_results: Dict[str, Any],
     keys: Sequence[str] = (
         "eval.cmp.score_main.mean",
-        "eval.cmp.main.tstr_macro_f1.mean",
+        "eval.cmp.main.temporal_tstr_f1.mean",
         "eval.cmp.main.disc_auc_gap.mean",
-        "eval.cmp.main.unconditional_w1.mean",
-        "eval.cmp.main.conditional_w1.mean",
+        "eval.cmp.main.temporal_uw1.mean",
+        "eval.cmp.main.temporal_cw1.mean",
         "eval.cmp.extra.u_l1.mean",
         "eval.cmp.extra.c_l1.mean",
         "eval.cmp.extra.spread_specific_error.mean",

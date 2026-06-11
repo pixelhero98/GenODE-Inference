@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import csv
 import contextlib
@@ -563,7 +563,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 rows = list(csv.DictReader(fh))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["split_phase"], "train_tuning")
-            self.assertEqual(rows[0]["train_tuning_sampler"], "temporal_stratified_hash_v1")
+            self.assertEqual(rows[0]["train_tuning_sampler"], "temporal_stratified_hash")
             self.assertEqual(rows[0]["train_tuning_sampling_mode"], "train_window_fraction")
 
 

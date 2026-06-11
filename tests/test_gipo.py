@@ -16,19 +16,19 @@ from genode.gipo.density_representation import (
 )
 from genode.gipo.models import SETTING_ENCODER_MODE_CONTINUOUS_V3, build_setting_encoder_config, setting_feature_dim, setting_features
 from genode.gipo.policy import (
-    ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
-    ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
-    CONDITIONING_STYLE_ADDITIVE_MLP_V1,
-    DENSITY_TOKEN_ATTENTION_ROPE_V1,
+    ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
+    ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
+    CONDITIONING_STYLE_ADDITIVE_MLP,
+    DENSITY_TOKEN_ATTENTION_ROPE,
     GIPO_PROTOCOL,
     GIPODensityFormTeacherTransformer,
     GIPODensityQueryStudentTransformer,
     MODEL_PAYLOAD_VERSION,
     SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
-    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
     TEACHER_METRIC_TARGET_KEYS,
-    TEACHER_OUTPUT_METRIC_VECTOR_V1,
-    TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
+    TEACHER_OUTPUT_METRIC_VECTOR,
+    TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
     build_gipo_student_model,
     build_gipo_teacher_model,
     validate_canonical_conditioning_style,
@@ -40,9 +40,9 @@ def _teacher_training_payload() -> dict:
     return {
         "teacher_target": "metric_vector",
         "teacher_metric_targets": list(TEACHER_METRIC_TARGET_KEYS),
-        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
+        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_checkpoint_selection": {
-            "selection_protocol": TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+            "selection_protocol": TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
             "selected_step": 1,
             "uses_validation_labels": False,
             "locked_test_used_for_selection": False,
@@ -109,15 +109,15 @@ class GIPOCanonicalTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(student_logits[0], student_logits[1], atol=1e-6))
         self.assertTrue(torch.allclose(teacher_scores[0], teacher_scores[1], atol=1e-6))
-        self.assertEqual(student.model_config()["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
-        self.assertEqual(teacher.model_config()["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+        self.assertEqual(student.model_config()["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP)
+        self.assertEqual(teacher.model_config()["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP)
         self.assertEqual(student.model_config()["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
         self.assertEqual(teacher.model_config()["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
-        self.assertEqual(student.model_config()["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE_V1)
-        self.assertEqual(teacher.model_config()["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE_V1)
+        self.assertEqual(student.model_config()["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE)
+        self.assertEqual(teacher.model_config()["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE)
 
     def test_non_additive_conditioning_style_is_rejected(self) -> None:
-        legacy_style = "ada" + "ln_zero_v1"
+        legacy_style = "ada" + "adaptive_layer_norm_zero"
         model_kwargs = {
             "setting_dim": 2,
             "density_dim": 64,
@@ -130,24 +130,24 @@ class GIPOCanonicalTests(unittest.TestCase):
             "conditioning_style": legacy_style,
         }
 
-        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp"):
             validate_canonical_conditioning_style({"conditioning_style": legacy_style})
-        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp"):
             GIPODensityQueryStudentTransformer(**model_kwargs)
-        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp"):
             GIPODensityFormTeacherTransformer(**model_kwargs)
-        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp"):
             build_gipo_student_model(
-                architecture=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+                architecture=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
                 setting_dim=2,
                 density_dim=64,
                 context_dim=2,
                 num_series=1,
                 model_config={"conditioning_style": legacy_style},
             )
-        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+        with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp"):
             build_gipo_teacher_model(
-                architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+                architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
                 setting_dim=2,
                 density_dim=64,
                 context_dim=2,
@@ -178,7 +178,7 @@ class GIPOCanonicalTests(unittest.TestCase):
             )
             setting_dim = setting_feature_dim(SETTING_ENCODER_MODE_CONTINUOUS_V3, config=config)
             student = build_gipo_student_model(
-                architecture=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+                architecture=ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
                 setting_dim=setting_dim,
                 density_dim=64,
                 context_dim=2,
@@ -190,7 +190,7 @@ class GIPOCanonicalTests(unittest.TestCase):
                 "protocol": GIPO_PROTOCOL,
                 "model_payload_version": MODEL_PAYLOAD_VERSION,
                 "student_policy_type": "continuous_density",
-                "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+                "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
                 "student_model_config": student.model_config(),
                 "student_state": student.state_dict(),
                 "setting_dim": setting_dim,
@@ -209,14 +209,14 @@ class GIPOCanonicalTests(unittest.TestCase):
 
             loaded_student, _, _, _, loaded_payload = _load_student_checkpoint(checkpoint_path)
             self.assertEqual(loaded_student.setting_dim, setting_dim)
-            self.assertEqual(loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP_V1)
+            self.assertEqual(loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP)
 
             legacy_path = root / "legacy_student.pt"
             legacy_payload = dict(payload)
             legacy_payload["student_model_config"] = dict(payload["student_model_config"])
-            legacy_payload["student_model_config"]["conditioning_style"] = "ada" + "ln_zero_v1"
+            legacy_payload["student_model_config"]["conditioning_style"] = "ada" + "adaptive_layer_norm_zero"
             torch.save(legacy_payload, legacy_path)
-            with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp_v1"):
+            with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp"):
                 _load_student_checkpoint(legacy_path)
 
             scalar_policy_path = root / "categorical_student.pt"
@@ -231,21 +231,21 @@ class GIPOCanonicalTests(unittest.TestCase):
 
         metadata = _conditioning_metadata_for_summary(
             {
-                "conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1,
-                "student_model_config": {"conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1},
+                "conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP,
+                "student_model_config": {"conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP},
             },
             {
-                "conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1,
-                "teacher_model_config": {"conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1},
+                "conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP,
+                "teacher_model_config": {"conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP},
             },
         )
 
-        self.assertEqual(metadata, {"conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP_V1})
+        self.assertEqual(metadata, {"conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP})
 
     def test_teacher_model_config_contains_metric_vector_metadata(self) -> None:
         setting_dim = int(setting_features("euler", 4).numel())
         teacher = build_gipo_teacher_model(
-            architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+            architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
             setting_dim=setting_dim,
             density_dim=64,
             context_dim=2,
@@ -254,9 +254,9 @@ class GIPOCanonicalTests(unittest.TestCase):
         )
 
         config = teacher.model_config()
-        self.assertEqual(config["teacher_output"], TEACHER_OUTPUT_METRIC_VECTOR_V1)
+        self.assertEqual(config["teacher_output"], TEACHER_OUTPUT_METRIC_VECTOR)
         self.assertEqual(config["teacher_metric_targets"], list(TEACHER_METRIC_TARGET_KEYS))
-        self.assertEqual(config["teacher_scalarization"], TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1)
+        self.assertEqual(config["teacher_scalarization"], TEACHER_SCALARIZATION_WEIGHTED_AVERAGE)
 
 
 if __name__ == "__main__":

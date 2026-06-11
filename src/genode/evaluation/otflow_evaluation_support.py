@@ -24,18 +24,18 @@ from genode.evaluation.fm_backbone_registry import (
 from genode.data.otflow_experiment_plan import (
     CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS,
     CANONICAL_FORECAST_PAPER_DATASETS,
+    CONDITIONAL_GENERATION_FAMILY,
+    FORECAST_FAMILY,
     SUPPORTED_CONDITIONAL_GENERATION_DATASETS as ALL_SUPPORTED_CONDITIONAL_GENERATION_DATASETS,
     experiment_plan_by_key,
 )
 from genode.data.otflow_forecast_data import build_monash_forecast_splits
-from genode.data.otflow_medical_datasets import LONG_TERM_ST_DATASET_KEY, SLEEP_EDF_DATASET_KEY
+from genode.data.otflow_medical_datasets import LONG_TERM_ST_DATASET_KEY
 from genode.models.otflow_model import OTFlow
 from genode.data.otflow_paths import (
     default_cryptos_data_path,
-    default_es_mbp_10_data_path,
     default_lobster_synthetic_profile_path,
     default_long_term_st_data_path,
-    default_sleep_edf_data_path,
     project_results_root,
     resolve_project_path,
 )
@@ -49,8 +49,6 @@ from genode.schedule_transfer.otflow_signal_traces import (
 )
 from genode.models.otflow_train_val import save_json, seed_all
 
-FORECAST_FAMILY = "forecast_extrapolation"
-CONDITIONAL_GENERATION_FAMILY = "conditional_generation"
 VALIDATION_PHASE = "validation_tuning"
 LOCKED_TEST_PHASE = "locked_test"
 TRAIN_TUNING_PHASE = "train_tuning"
@@ -61,8 +59,8 @@ TRAIN_TUNING_SAMPLING_MODES = (
     TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
     TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED,
 )
-TRAIN_TUNING_SAMPLER_WINDOW_FRACTION_V1 = "temporal_stratified_hash_v1"
-TRAIN_TUNING_SAMPLER_VALIDATION_NORMALIZED_V2 = "temporal_stratified_validation_normalized_v2"
+TRAIN_TUNING_SAMPLER_WINDOW_FRACTION = "temporal_stratified_hash"
+TRAIN_TUNING_SAMPLER_VALIDATION_NORMALIZED = "temporal_stratified_validation_normalized"
 DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION = 0.70
 DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION = 0.10
 
@@ -178,8 +176,8 @@ def normalize_train_tuning_sampling_mode(mode: str) -> str:
 def train_tuning_sampler_key(mode: str) -> str:
     normalized = normalize_train_tuning_sampling_mode(str(mode))
     if normalized == TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED:
-        return TRAIN_TUNING_SAMPLER_VALIDATION_NORMALIZED_V2
-    return TRAIN_TUNING_SAMPLER_WINDOW_FRACTION_V1
+        return TRAIN_TUNING_SAMPLER_VALIDATION_NORMALIZED
+    return TRAIN_TUNING_SAMPLER_WINDOW_FRACTION
 
 
 def train_tuning_target_example_count(
@@ -261,7 +259,7 @@ def choose_forecast_train_tuning_indices(
     seed: int = 0,
     strata: int = 20,
     dataset: str = "",
-    salt: str = "train_tuning_v1",
+    salt: str = "train_tuning",
     sampling_mode: str = TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
     reference_examples: Optional[int] = None,
     train_split_fraction: float = DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION,
@@ -384,7 +382,7 @@ def _forecast_example_detail_metadata(
 
 def selection_metric_for_family(benchmark_family: str) -> str:
     if str(benchmark_family) == FORECAST_FAMILY:
-        return "crps"
+        return "forecast_crps"
     if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
         return "score_main"
     raise ValueError(f"Unsupported benchmark_family={benchmark_family}")
@@ -493,13 +491,13 @@ def _missing_shared_checkpoint_paths(
 ) -> List[Path]:
     missing: List[Path] = []
     for dataset in forecast_datasets:
-        ckpt_path = shared_backbone_root / "forecast" / str(dataset) / "model.pt"
+        ckpt_path = shared_backbone_root / FORECAST_FAMILY / str(dataset) / "model.pt"
         if not ckpt_path.exists():
             missing.append(ckpt_path)
     for dataset in conditional_generation_datasets:
         ckpt_path = (
             shared_backbone_root
-            / "conditional_generation"
+            / CONDITIONAL_GENERATION_FAMILY
             / str(dataset)
             / DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE
             / "model.pt"
@@ -637,10 +635,6 @@ def _dataset_data_path(cli_args: argparse.Namespace, dataset: str) -> str:
         return str(getattr(cli_args, "cryptos_path", "") or default_cryptos_data_path())
     if str(dataset) == "lobster_synthetic":
         return str(getattr(cli_args, "lobster_synthetic_profile_path", "") or default_lobster_synthetic_profile_path())
-    if str(dataset) == "es_mbp_10":
-        return str(getattr(cli_args, "es_path", "") or default_es_mbp_10_data_path())
-    if str(dataset) == SLEEP_EDF_DATASET_KEY:
-        return str(getattr(cli_args, "sleep_edf_path", "") or default_sleep_edf_data_path())
     if str(dataset) == LONG_TERM_ST_DATASET_KEY:
         return str(getattr(cli_args, "long_term_st_path", "") or default_long_term_st_data_path())
     raise ValueError(f"Unknown conditional-generation dataset: {dataset}")
@@ -1036,8 +1030,8 @@ def load_forecast_checkpoint_splits(
         resolved_budget_label = str(manifest_artifact["train_budget_label"])
         backbone_name = str(manifest_artifact.get("backbone_name", BACKBONE_NAME_OTFLOW))
     else:
-        ckpt_path = shared_backbone_root / "forecast" / str(dataset) / "model.pt"
-        metadata = _safe_json(shared_backbone_root / "forecast" / str(dataset) / "checkpoint_metadata.json") or {}
+        ckpt_path = shared_backbone_root / FORECAST_FAMILY / str(dataset) / "model.pt"
+        metadata = _safe_json(shared_backbone_root / FORECAST_FAMILY / str(dataset) / "checkpoint_metadata.json") or {}
         resolved_checkpoint_steps = int(metadata.get("train_steps", int(getattr(cli_args, "otflow_train_steps", 20000))))
         resolved_budget_label = str(metadata.get("train_budget_label", train_budget_label(resolved_checkpoint_steps)))
         checkpoint_id = str(
@@ -1115,7 +1109,7 @@ def load_conditional_generation_checkpoint_splits(
     else:
         ckpt_path = (
             shared_backbone_root
-            / "conditional_generation"
+            / CONDITIONAL_GENERATION_FAMILY
             / str(dataset)
             / DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE
             / "model.pt"
@@ -1123,7 +1117,7 @@ def load_conditional_generation_checkpoint_splits(
         metadata = (
             _safe_json(
                 shared_backbone_root
-                / "conditional_generation"
+                / CONDITIONAL_GENERATION_FAMILY
                 / str(dataset)
                 / DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE
                 / "checkpoint_metadata.json"
@@ -1427,9 +1421,13 @@ def evaluate_forecast_schedule(
                                 "context_id": str(context_id),
                                 "context_embedding_id": str(context_id) if return_context_embeddings else "",
                                 "checkpoint_id": str(checkpoint_id),
-                                "crps": float(crps),
-                                "mase": float(mase),
-                                "mse": float(mse),
+                                "forecast_crps": float(crps),
+                                "forecast_mase": float(mase),
+                                "forecast_mse": float(mse),
+                                "forecast_mase_scale_kind": "seasonal"
+                                if int(getattr(ds, "mase_seasonal_period", 1) or 1) > 1
+                                else "nonseasonal",
+                                "forecast_mase_scale_period": int(max(1, int(getattr(ds, "mase_seasonal_period", 1) or 1))),
                                 "num_eval_samples": int(num_eval_samples),
                                 "eval_horizon": int(getattr(ds, "horizon", 1)),
                                 "batch_size": int(effective_batch_size),
@@ -1444,10 +1442,14 @@ def evaluate_forecast_schedule(
     finally:
         _restore_sample_overrides(model, cfg, backup)
     latency_arr = np.asarray(latencies, dtype=np.float64)
+    mase_scale_period = int(max(1, int(getattr(ds, "mase_seasonal_period", 1) or 1)))
+    mase_scale_kind = "seasonal" if mase_scale_period > 1 else "nonseasonal"
     result = {
-        "crps": float(np.mean(np.asarray(crps_values, dtype=np.float64))) if crps_values else float("nan"),
-        "mse": float(np.mean(np.asarray(mse_values, dtype=np.float64))) if mse_values else float("nan"),
-        "mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else float("nan"),
+        "forecast_crps": float(np.mean(np.asarray(crps_values, dtype=np.float64))) if crps_values else float("nan"),
+        "forecast_mse": float(np.mean(np.asarray(mse_values, dtype=np.float64))) if mse_values else float("nan"),
+        "forecast_mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else float("nan"),
+        "forecast_mase_scale_kind": mase_scale_kind,
+        "forecast_mase_scale_period": mase_scale_period,
         "latency_ms_per_sample": float(1000.0 * latency_arr.mean()) if latency_arr.size > 0 else float("nan"),
         "eval_examples": int(len(example_payload)),
         "eval_horizon": int(getattr(ds, "horizon", 1)),

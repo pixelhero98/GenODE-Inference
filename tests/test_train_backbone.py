@@ -105,7 +105,7 @@ class TrainBackboneTests(unittest.TestCase):
 
             self.assertEqual(summary["checkpoint_steps"], [1, 2])
             for steps, selected_step in ((1, 1), (2, 2)):
-                artifact_root = matrix_root / "otflow" / "forecast" / f"{steps}_steps" / "solar_energy_10m"
+                artifact_root = matrix_root / "otflow" / "temporal_extrapolation" / f"{steps}_steps" / "solar_energy_10m"
                 metadata = json.loads((artifact_root / "checkpoint_metadata.json").read_text(encoding="utf-8"))
                 self.assertEqual(metadata["dataset_key"], "solar_energy_10m")
                 self.assertEqual(metadata["train_steps"], steps)

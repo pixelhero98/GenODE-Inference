@@ -58,17 +58,17 @@ def _coordinate_cw1(pred_rows: np.ndarray, true_rows: np.ndarray) -> Dict[str, f
     true = np.asarray(true_rows, dtype=np.float64)
     if pred.size == 0 or true.size == 0:
         return {
-            "coord_cw1_mean": float("nan"),
-            "coord_cw1_median": float("nan"),
-            "coord_cw1_max": float("nan"),
+            "molecule_coordinate_w1_mean": float("nan"),
+            "molecule_coordinate_w1_median": float("nan"),
+            "molecule_coordinate_w1_max": float("nan"),
         }
     if pred.shape != true.shape or pred.ndim != 2:
         raise ValueError(f"Expected matching [samples, dims] coordinate arrays, got {pred.shape} and {true.shape}.")
     values = np.mean(np.abs(np.sort(pred, axis=0) - np.sort(true, axis=0)), axis=0)
     return {
-        "coord_cw1_mean": float(np.mean(values)),
-        "coord_cw1_median": float(np.median(values)),
-        "coord_cw1_max": float(np.max(values)),
+        "molecule_coordinate_w1_mean": float(np.mean(values)),
+        "molecule_coordinate_w1_median": float(np.median(values)),
+        "molecule_coordinate_w1_max": float(np.max(values)),
     }
 
 
@@ -130,7 +130,7 @@ def molecule_coordinate_metrics(
     pair_diff = pred_pair - true_pair
     validity = _validity_metrics(pred, true, atom_symbols, bond_pairs)
     return {
-        "kabsch_rmsd": kabsch_aligned_rmsd(pred, true),
+        "molecule_kabsch_rmsd_3d": kabsch_aligned_rmsd(pred, true),
         "raw_coord_mae": float(np.mean(np.abs(diff))),
         "raw_coord_rmse": float(np.sqrt(np.mean(diff * diff))),
         "pairwise_distance_mae": float(np.mean(np.abs(pair_diff))),
@@ -176,9 +176,117 @@ def molecule_distributional_metrics(
         acceleration_norm_w1 = _wasserstein_1d(pred_acceleration_norm, true_acceleration_norm)
     return {
         **_coordinate_cw1(pred.reshape(pred.shape[0], -1), true.reshape(true.shape[0], -1)),
-        "pairdist_w1": _wasserstein_1d(pred_pair, true_pair),
-        "velocity_norm_w1": _wasserstein_1d(pred_velocity_norm, true_velocity_norm),
-        "acceleration_norm_w1": acceleration_norm_w1,
+        "molecule_pair_distance_w1": _wasserstein_1d(pred_pair, true_pair),
+        "molecule_ensemble_velocity_norm_w1": _wasserstein_1d(pred_velocity_norm, true_velocity_norm),
+        "molecule_ensemble_acceleration_norm_w1": acceleration_norm_w1,
+    }
+
+
+@torch.no_grad()
+def _sample_molecule_ar_rollout(
+    *,
+    model: torch.nn.Module,
+    ds,
+    history_coords: np.ndarray,
+    rollout_steps: int,
+    nfe: int,
+    solver: str,
+    device: torch.device,
+) -> np.ndarray:
+    history = np.asarray(history_coords, dtype=np.float32).copy()
+    generated: List[np.ndarray] = []
+    for _ in range(int(rollout_steps)):
+        context = ds.context_features_from_history_coords(history)
+        hist = (context - ds.stats.context_mean[None, :]) / ds.stats.context_std[None, :]
+        hist_t = torch.from_numpy(hist[None].astype(np.float32)).to(device)
+        pred_norm = model.sample_future(
+            hist_t,
+            steps=int(nfe),
+            solver=str(solver),
+        )
+        residual = ds.denormalize_target(pred_norm.detach().cpu().numpy()[0])[0]
+        next_coords = history[-1] + residual.reshape(ds.data.atom_count, 3)
+        generated.append(next_coords.astype(np.float32))
+        history = np.concatenate([history, next_coords[None, :, :].astype(np.float32)], axis=0)
+    return np.stack(generated, axis=0).astype(np.float32)
+
+
+def _motion_norms_from_paths(paths: np.ndarray, previous_frame: Optional[np.ndarray]) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    arr = np.asarray(paths, dtype=np.float32)
+    if arr.ndim != 4:
+        raise ValueError(f"Expected coordinate paths [samples, frames, atoms, 3], got {arr.shape}.")
+    velocity = arr[:, 1:] - arr[:, :-1]
+    velocity_norm = np.linalg.norm(velocity, axis=3)
+    if previous_frame is None:
+        return velocity_norm, None
+    previous = np.asarray(previous_frame, dtype=np.float32)
+    if previous.shape != arr.shape[2:]:
+        raise ValueError(f"previous_frame shape {previous.shape} does not match atom frame shape {arr.shape[2:]}.")
+    context_velocity = arr[:, 0] - previous[None, :, :]
+    previous_velocity = np.concatenate([context_velocity[:, None, :, :], velocity[:, :-1]], axis=1)
+    acceleration = velocity - previous_velocity
+    acceleration_norm = np.linalg.norm(acceleration, axis=3)
+    return velocity_norm, acceleration_norm
+
+
+def molecule_rollout_motion_metrics(
+    pred_rollouts: np.ndarray,
+    true_future: np.ndarray,
+    history_coords: np.ndarray,
+) -> Dict[str, Any]:
+    pred = np.asarray(pred_rollouts, dtype=np.float32)
+    true = np.asarray(true_future, dtype=np.float32)
+    history = np.asarray(history_coords, dtype=np.float32)
+    if pred.ndim != 4 or pred.shape[-1] != 3:
+        raise ValueError(f"Expected pred_rollouts [samples, steps, atoms, 3], got {pred.shape}.")
+    if true.ndim != 3 or true.shape[-1] != 3:
+        raise ValueError(f"Expected true_future [steps, atoms, 3], got {true.shape}.")
+    steps = min(int(pred.shape[1]), int(true.shape[0]))
+    if steps <= 0:
+        return {
+            "molecule_ensemble_velocity_norm_w1": float("nan"),
+            "molecule_ensemble_acceleration_norm_w1": float("nan"),
+            "molecule_rollout_velocity_norm_w1": float("nan"),
+            "molecule_rollout_acceleration_norm_w1": float("nan"),
+            "molecule_rollout_velocity_norm_w1_by_horizon": {},
+            "molecule_rollout_acceleration_norm_w1_by_horizon": {},
+        }
+    pred = pred[:, :steps]
+    true = true[:steps]
+    current = history[-1]
+    previous = history[-2] if history.ndim == 3 and history.shape[0] >= 2 else None
+    pred_paths = np.concatenate(
+        [np.broadcast_to(current[None, None, :, :], (pred.shape[0], 1, pred.shape[2], 3)), pred],
+        axis=1,
+    )
+    true_paths = np.concatenate(
+        [np.broadcast_to(current[None, None, :, :], (pred.shape[0], 1, true.shape[1], 3)), np.broadcast_to(true[None], pred.shape)],
+        axis=1,
+    )
+    pred_velocity, pred_acceleration = _motion_norms_from_paths(pred_paths, previous)
+    true_velocity, true_acceleration = _motion_norms_from_paths(true_paths, previous)
+    velocity_by_horizon = {
+        str(h + 1): _wasserstein_1d(pred_velocity[:, h, :], true_velocity[:, h, :])
+        for h in range(steps)
+    }
+    if pred_acceleration is None or true_acceleration is None:
+        acceleration_by_horizon: Dict[str, float] = {str(h + 1): float("nan") for h in range(steps)}
+        acceleration_ensemble = float("nan")
+    else:
+        acceleration_by_horizon = {
+            str(h + 1): _wasserstein_1d(pred_acceleration[:, h, :], true_acceleration[:, h, :])
+            for h in range(steps)
+        }
+        acceleration_ensemble = _wasserstein_1d(pred_acceleration, true_acceleration)
+    velocity_values = np.asarray([value for value in velocity_by_horizon.values() if np.isfinite(value)], dtype=np.float64)
+    acceleration_values = np.asarray([value for value in acceleration_by_horizon.values() if np.isfinite(value)], dtype=np.float64)
+    return {
+        "molecule_ensemble_velocity_norm_w1": _wasserstein_1d(pred_velocity, true_velocity),
+        "molecule_ensemble_acceleration_norm_w1": acceleration_ensemble,
+        "molecule_rollout_velocity_norm_w1": float(np.mean(velocity_values)) if velocity_values.size else float("nan"),
+        "molecule_rollout_acceleration_norm_w1": float(np.mean(acceleration_values)) if acceleration_values.size else float("nan"),
+        "molecule_rollout_velocity_norm_w1_by_horizon": velocity_by_horizon,
+        "molecule_rollout_acceleration_norm_w1_by_horizon": acceleration_by_horizon,
     }
 
 
@@ -277,7 +385,7 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
         else resolve_project_path(str(args.processed_dir))
     )
     model, cfg = load_checkpoint_model(checkpoint_path, device)
-    splits = build_molecule_dataset_splits(
+    loss_splits = build_molecule_dataset_splits(
         processed_dir=processed_dir,
         cfg=cfg,
         history_len=int(cfg.history_len),
@@ -288,10 +396,22 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
         dataset_key=dataset_key,
         stratum=stratum,
     )
+    rollout_steps = max(1, int(getattr(args, "rollout_steps", 16)))
+    splits = build_molecule_dataset_splits(
+        processed_dir=processed_dir,
+        cfg=cfg,
+        history_len=int(cfg.history_len),
+        future_horizon=rollout_steps,
+        stride_train=1,
+        stride_eval=int(args.stride_eval),
+        stats=checkpoint_stats,
+        dataset_key=dataset_key,
+        stratum=stratum,
+    )
     split = str(args.split)
     ds = splits[split]
     avg_loss = evaluate_average_loss(
-        ds,
+        loss_splits[split],
         model,
         cfg,
         model_name="otflow",
@@ -314,6 +434,9 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
     transition_rows: List[Dict[str, float]] = []
     horizon_rows: Dict[int, List[Dict[str, float]]] = {}
     distribution_rows: List[Dict[str, float]] = []
+    motion_rows: List[Dict[str, float]] = []
+    rollout_velocity_horizon_rows: Dict[int, List[Dict[str, float]]] = {}
+    rollout_acceleration_horizon_rows: Dict[int, List[Dict[str, float]]] = {}
     dist_inputs: Dict[str, Dict[str, List[np.ndarray]]] = {
         scope: {"pred": [], "true": [], "current": [], "previous": []}
         for scope in ("all_first_horizon", "clean_first_horizon", "transition_first_horizon")
@@ -321,22 +444,24 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
 
     for dataset_idx in indices:
         item = ds.eval_item(int(dataset_idx))
-        hist = (item["context"] - ds.stats.context_mean[None, :]) / ds.stats.context_std[None, :]
-        hist_t = torch.from_numpy(hist[None].astype(np.float32)).to(device)
         true_future = np.asarray(item["future_coords"], dtype=np.float32)
         current = np.asarray(item["current_coords"], dtype=np.float32)
         history_coords = np.asarray(item.get("history_coords", []), dtype=np.float32)
         previous = history_coords[-2] if history_coords.ndim == 3 and history_coords.shape[0] >= 2 else None
         sample_metrics: List[Dict[str, float]] = []
         sample_kabsch: List[float] = []
+        sample_rollouts: List[np.ndarray] = []
         for _ in range(int(args.sample_count)):
-            pred_norm = model.sample_future(
-                hist_t,
-                steps=int(args.nfe),
+            pred_future = _sample_molecule_ar_rollout(
+                model=model,
+                ds=ds,
+                history_coords=history_coords,
+                rollout_steps=rollout_steps,
+                nfe=int(args.nfe),
                 solver=str(args.solver),
+                device=device,
             )
-            pred_residual = ds.denormalize_target(pred_norm.detach().cpu().numpy()[0])
-            pred_future = current[None, :, :] + pred_residual.reshape(pred_residual.shape[0], ds.data.atom_count, 3)
+            sample_rollouts.append(pred_future)
             horizon_limit = min(pred_future.shape[0], true_future.shape[0])
             for h in range(horizon_limit):
                 metrics = molecule_coordinate_metrics(
@@ -348,7 +473,7 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
                 metrics["horizon"] = float(h + 1)
                 sample_metrics.append(metrics)
                 horizon_rows.setdefault(h + 1, []).append(metrics)
-                sample_kabsch.append(float(metrics["kabsch_rmsd"]))
+                sample_kabsch.append(float(metrics["molecule_kabsch_rmsd_3d"]))
                 if h == 0:
                     is_transition = bool(item.get("transition_window", item["transition"]))
                     scopes = ["all_first_horizon", "transition_first_horizon" if is_transition else "clean_first_horizon"]
@@ -358,6 +483,27 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
                         dist_inputs[scope]["current"].append(current.astype(np.float32))
                         if previous is not None:
                             dist_inputs[scope]["previous"].append(previous.astype(np.float32))
+        if sample_rollouts:
+            motion = molecule_rollout_motion_metrics(
+                np.stack(sample_rollouts, axis=0),
+                true_future,
+                history_coords,
+            )
+            motion_rows.append(
+                {
+                    key: float(value)
+                    for key, value in motion.items()
+                    if isinstance(value, (int, float, np.floating))
+                }
+            )
+            for horizon_key, value in dict(motion["molecule_rollout_velocity_norm_w1_by_horizon"]).items():
+                rollout_velocity_horizon_rows.setdefault(int(horizon_key), []).append(
+                    {"molecule_rollout_velocity_norm_w1": float(value)}
+                )
+            for horizon_key, value in dict(motion["molecule_rollout_acceleration_norm_w1_by_horizon"]).items():
+                rollout_acceleration_horizon_rows.setdefault(int(horizon_key), []).append(
+                    {"molecule_rollout_acceleration_norm_w1": float(value)}
+                )
         if sample_metrics:
             first_sample = sample_metrics[0]
             all_rows.append(first_sample)
@@ -367,9 +513,9 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
                 clean_rows.append(first_sample)
             distribution_rows.append(
                 {
-                    "kabsch_rmsd_sample_mean": float(np.mean(sample_kabsch)),
-                    "kabsch_rmsd_sample_std": float(np.std(sample_kabsch)),
-                    "kabsch_rmsd_sample_min": float(np.min(sample_kabsch)),
+                    "molecule_kabsch_rmsd_3d_sample_mean": float(np.mean(sample_kabsch)),
+                    "molecule_kabsch_rmsd_3d_sample_std": float(np.std(sample_kabsch)),
+                    "molecule_kabsch_rmsd_3d_sample_min": float(np.min(sample_kabsch)),
                 }
             )
 
@@ -392,6 +538,7 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
         "split": split,
         "examples": int(len(indices)),
         "sample_count": int(args.sample_count),
+        "rollout_steps": int(rollout_steps),
         "nfe": int(args.nfe),
         "solver": str(args.solver),
         "validation_vector_loss": avg_loss,
@@ -402,6 +549,11 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
             "horizon": horizon_summary,
             "generative_distribution": _aggregate(distribution_rows),
             "distributional": distributional_summary,
+            "motion_distribution": _aggregate(motion_rows),
+            "rollout_stability_by_horizon": {
+                "velocity": {str(h): _aggregate(rows) for h, rows in sorted(rollout_velocity_horizon_rows.items())},
+                "acceleration": {str(h): _aggregate(rows) for h, rows in sorted(rollout_acceleration_horizon_rows.items())},
+            },
         },
     }
     if args.out_json:
@@ -421,6 +573,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max_windows", type=int, default=256)
     parser.add_argument("--sample_count", type=int, default=1)
+    parser.add_argument("--rollout_steps", type=int, default=16)
     parser.add_argument("--nfe", type=int, default=16)
     parser.add_argument("--solver", default="euler")
     parser.add_argument("--stride_eval", type=int, default=1)

@@ -33,7 +33,6 @@ from genode.data.otflow_paths import default_lobster_synthetic_profile_path, pro
 ArrayLike = Union[np.ndarray, torch.Tensor]
 DEFAULT_SYNTHETIC_LENGTH = 2_000_000
 DEFAULT_CRYPTOS_NPZ = str(project_data_root() / "cryptos_binance_spot_monthly_1s_l10.npz")
-DEFAULT_ES_MBP_10_NPZ = str(project_data_root() / "es_mbp_10.npz")
 LOBIFLOW_CRYPTOS_NPZ_URL = (
     "https://huggingface.co/datasets/mpstoryfans/lobiflow/resolve/main/"
     "data/cryptos/cryptos_binance_spot_monthly_1s_l10.npz?download=1"
@@ -673,10 +672,6 @@ def _build_windowed_dataset(
 
 def default_lobster_synth_profile_path() -> str:
     return DEFAULT_LOBSTER_SYNTH_PROFILE
-
-
-def default_lobster_synthetic_profile_path_alias() -> str:
-    return default_lobster_synth_profile_path()
 
 
 def validate_lobster_synth_profile(profile: Dict[str, object], *, source: str = "") -> Dict[str, object]:
@@ -1396,10 +1391,6 @@ def download_cryptos_npz(
     return resolved
 
 
-def default_es_mbp_10_npz_path() -> str:
-    return DEFAULT_ES_MBP_10_NPZ
-
-
 def default_optiver_npz_path() -> str:
     return DEFAULT_OPTIVER_NPZ
 
@@ -1420,33 +1411,6 @@ def build_dataset_splits_from_cryptos(
     resolved_path = path or default_cryptos_npz_path()
     if not os.path.exists(resolved_path):
         download_cryptos_npz(resolved_path)
-    return build_dataset_splits_from_npz_l2(
-        path=resolved_path,
-        cfg=cfg,
-        stride_train=stride_train,
-        stride_eval=stride_eval,
-        train_frac=train_frac,
-        val_frac=val_frac,
-        test_frac=test_frac,
-        train_end=train_end,
-        val_end=val_end,
-    )
-
-
-def build_dataset_splits_from_es_mbp_10(
-    path: str,
-    cfg: OTFlowConfig,
-    *,
-    stride_train: int = 1,
-    stride_eval: int = 1,
-    train_frac: float = 0.7,
-    val_frac: float = 0.1,
-    test_frac: Optional[float] = None,
-    train_end: Optional[int] = None,
-    val_end: Optional[int] = None,
-) -> Dict[str, object]:
-    """Named dataset helper for the prepared Databento ES MBP-10 archive."""
-    resolved_path = path or default_es_mbp_10_npz_path()
     return build_dataset_splits_from_npz_l2(
         path=resolved_path,
         cfg=cfg,
@@ -1594,12 +1558,10 @@ __all__ = [
     "build_dataset_splits_from_arrays",
     "build_dataset_splits_from_lobster_synthetic",
     "build_dataset_splits_from_npz_l2",
-    "build_dataset_splits_from_es_mbp_10",
     "build_dataset_splits_from_optiver",
     "build_dataset_splits_synthetic",
     "default_cryptos_npz_path",
     "download_cryptos_npz",
-    "default_es_mbp_10_npz_path",
     "default_optiver_npz_path",
     "default_lobster_synth_profile_path",
     "default_lobster_synthetic_profile_path",

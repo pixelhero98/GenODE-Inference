@@ -10,11 +10,12 @@ from genode.models.otflow_train_val import select_eval_window_starts
 
 PRIMARY_METRICS = (
     "score_main",
-    "tstr_macro_f1",
+    "temporal_tstr_f1",
+    "temporal_tstr_f1_applicable",
     "disc_auc",
     "disc_auc_gap",
-    "unconditional_w1",
-    "conditional_w1",
+    "temporal_uw1",
+    "temporal_cw1",
 )
 
 EXTRA_METRICS = (
@@ -30,16 +31,19 @@ EXTRA_METRICS = (
 ALL_METRICS = PRIMARY_METRICS + EXTRA_METRICS
 
 
-def _metric_value(result: Mapping[str, Any], metric: str) -> float:
+def _metric_value(result: Mapping[str, Any], metric: str) -> Any:
     if metric == "score_main":
         return float(result["cmp"]["score_main"]["mean"])
+    if metric == "temporal_tstr_f1_applicable":
+        return bool(result["cmp"]["main"][metric])
     if metric in PRIMARY_METRICS:
-        return float(result["cmp"]["main"][metric]["mean"])
+        value = result["cmp"]["main"][metric]["mean"]
+        return None if value is None else float(value)
     return float(result["cmp"]["extra"][metric]["mean"])
 
 
-def _metric_bundle(result: Mapping[str, Any]) -> Dict[str, float]:
-    return {metric: float(_metric_value(result, metric)) for metric in ALL_METRICS}
+def _metric_bundle(result: Mapping[str, Any]) -> Dict[str, Any]:
+    return {metric: _metric_value(result, metric) for metric in ALL_METRICS}
 
 
 def _choose_valid_windows(ds, horizon: int, n_windows: int, seed: int) -> np.ndarray:

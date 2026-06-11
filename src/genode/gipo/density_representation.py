@@ -8,7 +8,7 @@ import numpy as np
 
 from genode.gipo.models import validate_time_grid
 
-DENSITY_PROTOCOL = "density_mass_v1"
+DENSITY_PROTOCOL = "density_mass"
 DENSITY_DOMAIN = "normalized_model_time_0_1"
 DEFAULT_DENSITY_BIN_COUNT = 64
 DEFAULT_DENSITY_EPS = 1e-12
@@ -190,8 +190,8 @@ def density_metadata(reference_time_grid: Sequence[float] | None = None) -> Dict
         "reference_bin_count": int(len(grid) - 1),
         "reference_time_grid": [float(x) for x in grid],
         "reference_grid_hash": reference_grid_hash(grid),
-        "grid_to_density_method": "equal_step_mass_overlap_v1",
-        "density_to_grid_method": "piecewise_constant_inverse_cdf_v1",
+        "grid_to_density_method": "equal_step_mass_overlap",
+        "density_to_grid_method": "piecewise_constant_inverse_cdf",
         "log_density_floor": float(DEFAULT_LOG_DENSITY_EPS),
     }
 

@@ -88,7 +88,8 @@ class MoleculeBackboneTests(unittest.TestCase):
             self.assertEqual(metadata["atom_count"], 6)
             self.assertEqual(metadata["formula"], "C4H2")
             self.assertEqual(data.coords.shape, (8 * 8, 6, 3))
-            self.assertFalse(Path(str(metadata["source_zip"])).is_absolute())
+            self.assertEqual(metadata["source_zip_name"], "demo.zip")
+            self.assertNotIn("source_zip", metadata)
             self.assertNotIn(str(root), json.dumps(metadata))
             split_ids = metadata["split_trajectory_ids"]
             self.assertTrue(split_ids["train"])
@@ -461,12 +462,12 @@ class MoleculeBackboneTests(unittest.TestCase):
         metrics = molecule_metrics.molecule_distributional_metrics(coords, coords, coords, previous)
 
         expected_keys = {
-            "coord_cw1_mean",
-            "coord_cw1_median",
-            "coord_cw1_max",
-            "pairdist_w1",
-            "velocity_norm_w1",
-            "acceleration_norm_w1",
+            "molecule_coordinate_w1_mean",
+            "molecule_coordinate_w1_median",
+            "molecule_coordinate_w1_max",
+            "molecule_pair_distance_w1",
+            "molecule_ensemble_velocity_norm_w1",
+            "molecule_ensemble_acceleration_norm_w1",
         }
         self.assertEqual(set(metrics), expected_keys)
         for value in metrics.values():
@@ -481,9 +482,9 @@ class MoleculeBackboneTests(unittest.TestCase):
 
         metrics = molecule_metrics.molecule_distributional_metrics(pred, true, current, previous)
 
-        self.assertAlmostEqual(metrics["pairdist_w1"], 1.0, places=6)
-        self.assertAlmostEqual(metrics["coord_cw1_max"], 1.0, places=6)
-        self.assertTrue(np.isnan(molecule_metrics.molecule_distributional_metrics(pred, true, current, None)["acceleration_norm_w1"]))
+        self.assertAlmostEqual(metrics["molecule_pair_distance_w1"], 1.0, places=6)
+        self.assertAlmostEqual(metrics["molecule_coordinate_w1_max"], 1.0, places=6)
+        self.assertTrue(np.isnan(molecule_metrics.molecule_distributional_metrics(pred, true, current, None)["molecule_ensemble_acceleration_norm_w1"]))
         with self.assertRaisesRegex(ValueError, "pred/true"):
             molecule_metrics.molecule_distributional_metrics(pred[:, :1], true, current, previous)
         with self.assertRaisesRegex(ValueError, "current coordinate"):
@@ -538,6 +539,10 @@ class MoleculeBackboneTests(unittest.TestCase):
             def denormalize_target(self, values):
                 return np.asarray(values, dtype=np.float32)
 
+            def context_features_from_history_coords(self, history_coords):
+                history = np.asarray(history_coords, dtype=np.float32)
+                return context_from_positions(history[-2], history[-1])
+
         class FakeModel:
             def sample_future(self, hist_t, *, steps: int, solver: str):
                 del hist_t, steps, solver
@@ -548,12 +553,12 @@ class MoleculeBackboneTests(unittest.TestCase):
         def fake_distributional(pred, true, current, previous):
             calls.append((pred.copy(), true.copy(), current.copy(), previous.copy()))
             return {
-                "coord_cw1_mean": 1.0,
-                "coord_cw1_median": 2.0,
-                "coord_cw1_max": 3.0,
-                "pairdist_w1": 4.0,
-                "velocity_norm_w1": 5.0,
-                "acceleration_norm_w1": 6.0,
+                "molecule_coordinate_w1_mean": 1.0,
+                "molecule_coordinate_w1_median": 2.0,
+                "molecule_coordinate_w1_max": 3.0,
+                "molecule_pair_distance_w1": 4.0,
+                "molecule_ensemble_velocity_norm_w1": 5.0,
+                "molecule_ensemble_acceleration_norm_w1": 6.0,
             }
 
         args = SimpleNamespace(
@@ -565,6 +570,7 @@ class MoleculeBackboneTests(unittest.TestCase):
             device="cpu",
             max_windows=2,
             sample_count=1,
+            rollout_steps=1,
             nfe=1,
             solver="euler",
             stride_eval=1,
@@ -598,12 +604,12 @@ class MoleculeBackboneTests(unittest.TestCase):
 
         dist = summary["metrics"]["distributional"]
         expected = {
-            "coord_cw1_mean",
-            "coord_cw1_median",
-            "coord_cw1_max",
-            "pairdist_w1",
-            "velocity_norm_w1",
-            "acceleration_norm_w1",
+            "molecule_coordinate_w1_mean",
+            "molecule_coordinate_w1_median",
+            "molecule_coordinate_w1_max",
+            "molecule_pair_distance_w1",
+            "molecule_ensemble_velocity_norm_w1",
+            "molecule_ensemble_acceleration_norm_w1",
         }
         self.assertEqual(set(dist["all_first_horizon"]), expected)
         self.assertEqual(set(dist["clean_first_horizon"]), expected)
@@ -612,6 +618,8 @@ class MoleculeBackboneTests(unittest.TestCase):
         self.assertEqual(calls[0][0].shape, (2, 2, 3))
         self.assertEqual(calls[1][0].shape, (1, 2, 3))
         self.assertEqual(calls[2][0].shape, (1, 2, 3))
+        self.assertIn("motion_distribution", summary["metrics"])
+        self.assertIn("rollout_stability_by_horizon", summary["metrics"])
 
 
 if __name__ == "__main__":

@@ -1,9 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import tempfile
 import unittest
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -17,8 +16,6 @@ from genode.evaluation.otflow_evaluation_support import (
     parse_forecast_datasets,
 )
 from genode.data.otflow_forecast_data import ForecastExampleRef, ForecastSeriesRecord, MonashForecastWindowDataset, _regular_time_features
-from genode.data.otflow_medical_constants import LONG_TERM_HEADERED_ECG_DATASET_KEY, default_long_term_headered_ecg_manifest_path
-from genode.data.otflow_medical_datasets import prepare_long_term_headered_ecg_dataset
 
 
 class ExtrapolationFixesTest(unittest.TestCase):
@@ -68,28 +65,11 @@ class ExtrapolationFixesTest(unittest.TestCase):
         self.assertEqual(ds_two_step.start_indices[-1], 8)
 
     def test_parse_forecast_datasets_rejects_high_level_ecg_until_checkpoint_is_supported(self) -> None:
+        retired_ecg_key = "long_term_headered_" + "ECG_records"
         with self.assertRaisesRegex(ValueError, "Unknown forecast datasets"):
-            parse_forecast_datasets(f"traffic_hourly,{LONG_TERM_HEADERED_ECG_DATASET_KEY}")
+            parse_forecast_datasets(f"traffic_hourly,{retired_ecg_key}")
         with self.assertRaisesRegex(ValueError, "Unknown forecast datasets"):
             parse_forecast_datasets("traffic_hourly,not_a_dataset")
-
-    def test_stale_ecg_manifest_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manifest_path = default_long_term_headered_ecg_manifest_path(Path(tmpdir))
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "dataset_key": LONG_TERM_HEADERED_ECG_DATASET_KEY,
-                        "context_length": 2000,
-                        "official_horizon": 1000,
-                        "series_specs": [],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(ValueError, "Existing ECG manifest does not match"):
-                prepare_long_term_headered_ecg_dataset(Path(tmpdir), history_len=4, horizon=2)
 
     def test_horizon_one_forecast_schedule_uses_target_without_future_tuple(self) -> None:
         cfg = OTFlowConfig(
@@ -141,7 +121,7 @@ class ExtrapolationFixesTest(unittest.TestCase):
             seed=0,
         )
         self.assertEqual(metrics["eval_examples"], 1)
-        self.assertTrue(np.isfinite(metrics["mse"]))
+        self.assertTrue(np.isfinite(metrics["forecast_mse"]))
 
     def test_forecast_schedule_uses_deterministic_example_subset(self) -> None:
         cfg = OTFlowConfig(

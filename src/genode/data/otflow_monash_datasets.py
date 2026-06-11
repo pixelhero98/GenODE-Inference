@@ -10,6 +10,8 @@ import shutil
 import urllib.request
 import zipfile
 
+from genode.data.otflow_experiment_plan import FORECAST_FAMILY
+
 
 MONASH_ARCHIVE_URL = "https://forecastingdata.org/"
 
@@ -26,7 +28,7 @@ class MonashDatasetSpec:
     official_horizon: int
     horizon_source: str
     source_url: str = MONASH_ARCHIVE_URL
-    benchmark_family: str = "forecast_extrapolation"
+    benchmark_family: str = FORECAST_FAMILY
 
 
 @dataclass(frozen=True)

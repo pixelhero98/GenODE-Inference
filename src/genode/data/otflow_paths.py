@@ -63,13 +63,5 @@ def default_lobster_synthetic_profile_path() -> str:
     return str(project_data_root() / "lobster_synthetic" / "lobster_free_sample_profile_10.json")
 
 
-def default_es_mbp_10_data_path() -> str:
-    return str(project_data_root() / "es_mbp_10.npz")
-
-
-def default_sleep_edf_data_path() -> str:
-    return str(project_data_root() / "sleep_edf_3ch_100hz_stage_conditioned.npz")
-
-
 def default_long_term_st_data_path() -> str:
     return str(project_data_root() / "long_term_st_100hz_context_only")

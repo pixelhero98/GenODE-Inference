@@ -11,10 +11,10 @@ import numpy as np
 import torch
 
 from genode.gipo.policy import (
-    ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+    ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
     GIPO_PROTOCOL,
     MODEL_PAYLOAD_VERSION,
-    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1,
+    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
     EmbeddingNormalizer,
     build_gipo_student_model,
     context_id_from_row,
@@ -221,8 +221,8 @@ def _load_student_checkpoint(
     if bool(payload.get("locked_test_used_for_selection", False)):
         raise ValueError("GIPO student checkpoint indicates locked_test was used for selection.")
     density_meta = dict(payload.get("density_representation", {}))
-    if str(density_meta.get("density_protocol", "")) != "density_mass_v1":
-        raise ValueError("GIPO student checkpoint is missing density_mass_v1 metadata.")
+    if str(density_meta.get("density_protocol", "")) != "density_mass":
+        raise ValueError("GIPO student checkpoint is missing density_mass metadata.")
     _validate_density_bin_count(payload, density_meta, role="student")
     teacher_training = dict(payload.get("teacher_training", {}) or {})
     teacher_training_meta = validate_gipo_teacher_training_metadata(teacher_training)
@@ -245,9 +245,9 @@ def _load_student_checkpoint(
     series_index_map = {str(key): int(value) for key, value in dict(payload["series_index_map"]).items()}
     normalizer = EmbeddingNormalizer.from_payload(payload["embedding_normalizer"])
     student_architecture = str(payload.get("student_architecture", ""))
-    if student_architecture != ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1:
+    if student_architecture != ARCHITECTURE_DENSITY_QUERY_TRANSFORMER:
         raise ValueError(
-            f"GIPO student checkpoints must use {ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1!r}; got {student_architecture!r}."
+            f"GIPO student checkpoints must use {ARCHITECTURE_DENSITY_QUERY_TRANSFORMER!r}; got {student_architecture!r}."
         )
     student_model_config = dict(payload.get("student_model_config", {}) or {})
     validate_canonical_conditioning_style(
@@ -412,10 +412,10 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("training_summary indicates locked_test was used for selection.")
     required_checkpoint_selection_mode = str(getattr(args, "require_teacher_checkpoint_selection_mode", "") or "").strip()
     if required_checkpoint_selection_mode:
-        if required_checkpoint_selection_mode != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1:
+        if required_checkpoint_selection_mode != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET:
             raise ValueError(
                 "GIPO reporter only supports "
-                f"{TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1!r} checkpoints."
+                f"{TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET!r} checkpoints."
             )
         actual_selection_mode = str(
             checkpoint_payload.get("teacher_checkpoint_selection_mode")
@@ -427,7 +427,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 f"GIPO reporter requires teacher_checkpoint_selection_mode={required_checkpoint_selection_mode!r}; "
                 f"got {actual_selection_mode!r}."
             )
-        if required_checkpoint_selection_mode == TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1:
+        if required_checkpoint_selection_mode == TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET:
             final_retrain = _teacher_final_retrain_metadata(checkpoint_payload, training_summary)
             if final_retrain.get("enabled") is not True:
                 raise ValueError("GIPO reporter requires final teacher retrain metadata for weighted-normalized-regret checkpoints.")
@@ -534,9 +534,9 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 "series_id": row.get("series_id", ""),
                 "series_idx": row.get("series_idx", ""),
                 "target_t": row.get("target_t", ""),
-                "crps": float(metrics["crps"]),
-                "mase": float(metrics["mase"]),
-                "mse": metrics.get("mse", ""),
+                "crps": float(metrics["forecast_crps"]),
+                "mase": float(metrics["forecast_mase"]),
+                "mse": metrics.get("forecast_mse", ""),
                 "time_grid_json": json.dumps(prediction["time_grid"], separators=(",", ":")),
                 "density_mass_hash": prediction["density_mass_hash"],
                 "schedule_grid_hash": prediction["schedule_grid_hash"],

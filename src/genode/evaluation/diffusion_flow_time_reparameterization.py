@@ -110,29 +110,26 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "runtime_grid_q25",
     "runtime_grid_q50",
     "runtime_grid_q75",
-    "crps",
-    "mse",
-    "mase",
+    "forecast_crps",
+    "forecast_mse",
+    "forecast_mase",
+    "forecast_mase_scale_kind",
+    "forecast_mase_scale_period",
     "score_main",
     "disc_auc",
     "disc_auc_gap",
-    "unconditional_w1",
-    "conditional_w1",
-    "tstr_macro_f1",
+    "temporal_uw1",
+    "temporal_cw1",
+    "temporal_tstr_f1",
+    "temporal_tstr_f1_applicable",
     "u_l1",
     "c_l1",
     "spread_specific_error",
     "imbalance_specific_error",
     "ret_vol_acf_error",
     "impact_response_error",
-    "stage_mismatch_rate",
-    "stage_classifier_real_macro_f1",
-    "sleep_signal_mae",
-    "sleep_spectral_mae",
-    "sleep_stage_mismatch_rate",
-    "sleep_stage_classifier_real_macro_f1",
-    "relative_crps_gain_vs_uniform",
-    "relative_mase_gain_vs_uniform",
+    "forecast_relative_crps_gain_vs_uniform",
+    "forecast_relative_mase_gain_vs_uniform",
     "relative_score_gain_vs_uniform",
     "realized_nfe",
     "latency_ms_per_sample",
@@ -143,7 +140,6 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "evaluation_protocol_hash",
     "chosen_t0s_hash",
     "chosen_examples_hash",
-    "stage_counts_json",
     "schedule_grid_hash",
     "protocol_hash",
     "row_status",
@@ -183,9 +179,11 @@ FORECAST_CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "context_id",
     "context_embedding_id",
     "checkpoint_id",
-    "crps",
-    "mase",
-    "mse",
+    "forecast_crps",
+    "forecast_mase",
+    "forecast_mse",
+    "forecast_mase_scale_kind",
+    "forecast_mase_scale_period",
     "num_eval_samples",
     "eval_horizon",
     "batch_size",
@@ -533,7 +531,6 @@ def _evaluation_protocol_fields(result_row: Mapping[str, Any], *, eval_horizon: 
         "eval_horizon": int(eval_horizon),
         "evaluation_protocol_hash": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
         "chosen_t0s_hash": str(protocol.get("chosen_t0s_hash", "")),
-        "stage_counts_json": json.dumps(dict(protocol.get("stage_counts", {}) or {}), sort_keys=True, separators=(",", ":")),
     }
 
 
@@ -574,29 +571,26 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "runtime_grid_q25": details.get("runtime_grid_q25"),
         "runtime_grid_q50": details.get("runtime_grid_q50"),
         "runtime_grid_q75": details.get("runtime_grid_q75"),
-        "crps": metrics.get("crps"),
-        "mse": metrics.get("mse"),
-        "mase": metrics.get("mase"),
+        "forecast_crps": metrics.get("forecast_crps"),
+        "forecast_mse": metrics.get("forecast_mse"),
+        "forecast_mase": metrics.get("forecast_mase"),
+        "forecast_mase_scale_kind": metrics.get("forecast_mase_scale_kind"),
+        "forecast_mase_scale_period": metrics.get("forecast_mase_scale_period"),
         "score_main": metrics.get("score_main"),
         "disc_auc": metrics.get("disc_auc"),
         "disc_auc_gap": metrics.get("disc_auc_gap"),
-        "unconditional_w1": metrics.get("unconditional_w1"),
-        "conditional_w1": metrics.get("conditional_w1"),
-        "tstr_macro_f1": metrics.get("tstr_macro_f1"),
+        "temporal_uw1": metrics.get("temporal_uw1"),
+        "temporal_cw1": metrics.get("temporal_cw1"),
+        "temporal_tstr_f1": metrics.get("temporal_tstr_f1"),
+        "temporal_tstr_f1_applicable": metrics.get("temporal_tstr_f1_applicable"),
         "u_l1": metrics.get("u_l1"),
         "c_l1": metrics.get("c_l1"),
         "spread_specific_error": metrics.get("spread_specific_error"),
         "imbalance_specific_error": metrics.get("imbalance_specific_error"),
         "ret_vol_acf_error": metrics.get("ret_vol_acf_error"),
         "impact_response_error": metrics.get("impact_response_error"),
-        "stage_mismatch_rate": metrics.get("stage_mismatch_rate"),
-        "stage_classifier_real_macro_f1": metrics.get("stage_classifier_real_macro_f1"),
-        "sleep_signal_mae": metrics.get("sleep_signal_mae"),
-        "sleep_spectral_mae": metrics.get("sleep_spectral_mae"),
-        "sleep_stage_mismatch_rate": metrics.get("sleep_stage_mismatch_rate"),
-        "sleep_stage_classifier_real_macro_f1": metrics.get("sleep_stage_classifier_real_macro_f1"),
-        "relative_crps_gain_vs_uniform": metrics.get("relative_crps_gain_vs_uniform"),
-        "relative_mase_gain_vs_uniform": metrics.get("relative_mase_gain_vs_uniform"),
+        "forecast_relative_crps_gain_vs_uniform": metrics.get("forecast_relative_crps_gain_vs_uniform"),
+        "forecast_relative_mase_gain_vs_uniform": metrics.get("forecast_relative_mase_gain_vs_uniform"),
         "relative_score_gain_vs_uniform": metrics.get("relative_score_gain_vs_uniform"),
         "realized_nfe": int(realized_nfe),
         "latency_ms_per_sample": metrics.get("latency_ms_per_sample", metrics.get("efficiency_ms_per_sample")),
@@ -607,7 +601,6 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "evaluation_protocol_hash": metrics.get("evaluation_protocol_hash"),
         "chosen_t0s_hash": metrics.get("chosen_t0s_hash"),
         "chosen_examples_hash": metrics.get("chosen_examples_hash"),
-        "stage_counts_json": metrics.get("stage_counts_json"),
         "schedule_grid_hash": details.get("schedule_grid_hash"),
         "protocol_hash": str(protocol_hash),
         "row_status": "complete",
@@ -706,8 +699,14 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                         )
                         if scheduler_key != UNIFORM_SCHEDULER_KEY and cell_uniform_metrics is not None:
                             metrics = dict(metrics)
-                            metrics["relative_crps_gain_vs_uniform"] = _safe_relative_gain(metrics.get("crps"), cell_uniform_metrics.get("crps"))
-                            metrics["relative_mase_gain_vs_uniform"] = _safe_relative_gain(metrics.get("mase"), cell_uniform_metrics.get("mase"))
+                            metrics["forecast_relative_crps_gain_vs_uniform"] = _safe_relative_gain(
+                                metrics.get("forecast_crps"),
+                                cell_uniform_metrics.get("forecast_crps"),
+                            )
+                            metrics["forecast_relative_mase_gain_vs_uniform"] = _safe_relative_gain(
+                                metrics.get("forecast_mase"),
+                                cell_uniform_metrics.get("forecast_mase"),
+                            )
                         row = _build_row(benchmark_family=FORECAST_FAMILY, split_phase=str(split_phase), seed=int(seed), dataset=str(dataset), checkpoint=checkpoint, target_nfe=int(target_nfe), runtime_nfe=int(runtime_nfe), solver_key=str(solver_key), scheduler_key=scheduler_key, details=details, metrics=metrics, row_signature=str(case["row_signature"]), protocol_hash=str(row_recorder["protocol_hash"]))
                         if str(split_phase) == TRAIN_TUNING_PHASE:
                             row.update(
@@ -803,23 +802,18 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                         result_row = run_fixed_schedule_variant(model=model, ds=eval_ds, cfg=cfg, eval_horizon=int(eval_horizon), eval_windows=int(len(chosen_eval_t0s)), grid_spec=grid_spec, chosen_t0s=chosen_eval_t0s, generation_seed_base=int(metrics_seed), metrics_seed=int(metrics_seed), score_main_only=False)
                         metrics = {
                             "score_main": result_row.get("score_main"),
-                            "tstr_macro_f1": result_row.get("tstr_macro_f1"),
+                            "temporal_tstr_f1": result_row.get("temporal_tstr_f1"),
+                            "temporal_tstr_f1_applicable": result_row.get("temporal_tstr_f1_applicable"),
                             "disc_auc": result_row.get("disc_auc"),
                             "disc_auc_gap": result_row.get("disc_auc_gap"),
-                            "unconditional_w1": result_row.get("unconditional_w1"),
-                            "conditional_w1": result_row.get("conditional_w1"),
+                            "temporal_uw1": result_row.get("temporal_uw1"),
+                            "temporal_cw1": result_row.get("temporal_cw1"),
                             "u_l1": result_row.get("u_l1"),
                             "c_l1": result_row.get("c_l1"),
                             "spread_specific_error": result_row.get("spread_specific_error"),
                             "imbalance_specific_error": result_row.get("imbalance_specific_error"),
                             "ret_vol_acf_error": result_row.get("ret_vol_acf_error"),
                             "impact_response_error": result_row.get("impact_response_error"),
-                            "stage_mismatch_rate": result_row.get("stage_mismatch_rate"),
-                            "stage_classifier_real_macro_f1": result_row.get("stage_classifier_real_macro_f1"),
-                            "sleep_signal_mae": result_row.get("spread_specific_error") if str(dataset) == "sleep_edf" else None,
-                            "sleep_spectral_mae": result_row.get("imbalance_specific_error") if str(dataset) == "sleep_edf" else None,
-                            "sleep_stage_mismatch_rate": result_row.get("stage_mismatch_rate") if str(dataset) == "sleep_edf" else None,
-                            "sleep_stage_classifier_real_macro_f1": result_row.get("stage_classifier_real_macro_f1") if str(dataset) == "sleep_edf" else None,
                             "efficiency_ms_per_sample": result_row.get("efficiency_ms_per_sample"),
                             "eval_windows": int(len(chosen_eval_t0s)),
                             "realized_nfe": _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)),
@@ -856,29 +850,24 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
         groups.setdefault(key, []).append(row)
     summaries: List[Dict[str, Any]] = []
     metric_names = (
-        "crps",
-        "mse",
-        "mase",
+        "forecast_crps",
+        "forecast_mse",
+        "forecast_mase",
+        "forecast_mase_scale_period",
         "score_main",
-        "tstr_macro_f1",
+        "temporal_tstr_f1",
         "disc_auc",
         "disc_auc_gap",
-        "unconditional_w1",
-        "conditional_w1",
+        "temporal_uw1",
+        "temporal_cw1",
         "u_l1",
         "c_l1",
         "spread_specific_error",
         "imbalance_specific_error",
         "ret_vol_acf_error",
         "impact_response_error",
-        "stage_mismatch_rate",
-        "stage_classifier_real_macro_f1",
-        "sleep_signal_mae",
-        "sleep_spectral_mae",
-        "sleep_stage_mismatch_rate",
-        "sleep_stage_classifier_real_macro_f1",
-        "relative_crps_gain_vs_uniform",
-        "relative_mase_gain_vs_uniform",
+        "forecast_relative_crps_gain_vs_uniform",
+        "forecast_relative_mase_gain_vs_uniform",
         "relative_score_gain_vs_uniform",
         "realized_nfe",
         "latency_ms_per_sample",
@@ -891,6 +880,16 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
             vals = [float(v) for v in vals if v is not None]
             summary[f"{metric}_mean"] = _mean(vals)
             summary[f"{metric}_std"] = _std(vals)
+        scale_kinds = sorted({str(row.get("forecast_mase_scale_kind")) for row in group if row.get("forecast_mase_scale_kind") not in (None, "")})
+        summary["forecast_mase_scale_kind"] = scale_kinds[0] if len(scale_kinds) == 1 else (",".join(scale_kinds) if scale_kinds else "")
+        applicability_values = {
+            bool(row.get("temporal_tstr_f1_applicable"))
+            for row in group
+            if row.get("temporal_tstr_f1_applicable") is not None
+        }
+        summary["temporal_tstr_f1_applicable"] = (
+            next(iter(applicability_values)) if len(applicability_values) == 1 else (None if not applicability_values else True)
+        )
         summaries.append(summary)
     return summaries
 

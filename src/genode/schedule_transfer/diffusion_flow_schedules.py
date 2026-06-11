@@ -454,7 +454,6 @@ def run_fixed_schedule_variant(
         "evaluation_protocol": {
             "chosen_t0s": [int(t0) for t0 in result["meta"]["chosen_t0s"]],
             "chosen_t0s_hash": str(result["meta"].get("chosen_t0s_hash", "")),
-            "stage_counts": dict(result["meta"].get("stage_counts", {}) or {}),
             "eval_horizon": int(result["meta"].get("horizon", eval_horizon)),
             "dataset_kind": str(result["meta"].get("dataset_kind", "")),
             "generation_seed_base": None
@@ -466,11 +465,6 @@ def run_fixed_schedule_variant(
         "score_main_only": bool(result["meta"].get("main_metrics_only", False)),
     }
     row.update(_metric_bundle(result))
-    main_metrics = dict(result.get("cmp", {}).get("main", {}) or {})
-    for metric_name in ("stage_mismatch_rate", "stage_classifier_real_macro_f1"):
-        metric_payload = main_metrics.get(metric_name, {})
-        if isinstance(metric_payload, Mapping) and "mean" in metric_payload:
-            row[metric_name] = float(metric_payload["mean"])
     return row
 
 

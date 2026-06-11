@@ -13,7 +13,7 @@ DEFAULT_NFE_REFERENCE = 16
 SETTING_ENCODER_MODE_CONTINUOUS_V3 = "continuous_v3"
 SERIES_ENCODING_NONE_CONTEXT_ONLY = "none_context_only"
 DEFAULT_SERIES_ENCODING = SERIES_ENCODING_NONE_CONTEXT_ONLY
-SOLVER_METADATA_VERSION = "solver_metadata_v1"
+SOLVER_METADATA_VERSION = "solver_metadata"
 
 
 def solver_macro_steps(solver_key: str, target_nfe: int) -> int:

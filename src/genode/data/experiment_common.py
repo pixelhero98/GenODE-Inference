@@ -12,13 +12,11 @@ from genode.data.otflow_datasets import (
     DEFAULT_SYNTHETIC_LENGTH,
     LOBSTER_SYNTHETIC_DATASET_KEY,
     build_dataset_splits_from_cryptos,
-    build_dataset_splits_from_es_mbp_10,
     build_dataset_splits_from_lobster_synthetic,
     build_dataset_splits_from_npz_l2,
     build_dataset_splits_from_optiver,
     build_dataset_splits_synthetic,
     default_cryptos_npz_path,
-    default_es_mbp_10_npz_path,
     default_lobster_synth_profile_path,
     default_optiver_npz_path,
 )
@@ -27,11 +25,8 @@ from genode.data.otflow_medical_datasets import (
     LONG_TERM_ST_DEFAULT_STRIDE,
     LONG_TERM_ST_HISTORY_LEN,
     LONG_TERM_ST_HORIZON_LEN,
-    SLEEP_EDF_DATASET_KEY,
     build_dataset_splits_from_long_term_st,
-    build_dataset_splits_from_sleep_edf,
     default_long_term_st_data_path,
-    default_sleep_edf_data_path,
 )
 
 DATASET_CHOICES = ("synthetic", "npz_l2", "optiver", "cryptos", LOBSTER_SYNTHETIC_DATASET_KEY, LONG_TERM_ST_DATASET_KEY)
@@ -388,31 +383,11 @@ def build_dataset_splits(args, cfg: OTFlowConfig):
             val_frac=args.val_frac,
             test_frac=args.test_frac,
         )
-    if dataset == "es_mbp_10":
-        return build_dataset_splits_from_es_mbp_10(
-            path=args.data_path or default_es_mbp_10_npz_path(),
-            cfg=cfg,
-            stride_train=args.stride_train,
-            stride_eval=args.stride_eval,
-            train_frac=args.train_frac,
-            val_frac=args.val_frac,
-            test_frac=args.test_frac,
-        )
     if dataset == "synthetic":
         return build_dataset_splits_synthetic(
             cfg=cfg,
             length=args.synthetic_length,
             seed=args.seed,
-            stride_train=args.stride_train,
-            stride_eval=args.stride_eval,
-            train_frac=args.train_frac,
-            val_frac=args.val_frac,
-            test_frac=args.test_frac,
-        )
-    if dataset == SLEEP_EDF_DATASET_KEY:
-        return build_dataset_splits_from_sleep_edf(
-            path=args.data_path or default_sleep_edf_data_path(),
-            cfg=cfg,
             stride_train=args.stride_train,
             stride_eval=args.stride_eval,
             train_frac=args.train_frac,

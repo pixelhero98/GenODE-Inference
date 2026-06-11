@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import re
@@ -64,7 +64,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertRegex(lower, r"teacher[- ]weighted")
         for expected in (
             "gipo",
-            "gipo_density_v1",
+            "gipo_density",
             "density_mass",
             "rank",
             "huber",
@@ -123,7 +123,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
     def test_aggregate_relative_gain_uses_fraction_units(self) -> None:
         rows = [
             {
-                "benchmark_family": "forecast_extrapolation",
+                "benchmark_family": "temporal_extrapolation",
                 "split_phase": "locked_test",
                 "seed": 0,
                 "dataset": "traffic_hourly",
@@ -136,10 +136,10 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 "scheduler_key": "ays",
                 "experiment_scope": "main",
                 "row_status": "complete",
-                "crps": 3.0,
+                "forecast_crps": 3.0,
             },
             {
-                "benchmark_family": "forecast_extrapolation",
+                "benchmark_family": "temporal_extrapolation",
                 "split_phase": "locked_test",
                 "seed": 0,
                 "dataset": "traffic_hourly",
@@ -152,7 +152,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 "scheduler_key": "uniform",
                 "experiment_scope": "main",
                 "row_status": "complete",
-                "crps": 4.0,
+                "forecast_crps": 4.0,
             },
         ]
 
@@ -160,8 +160,8 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         by_schedule = {row["scheduler_key"]: row for row in summary}
 
         self.assertAlmostEqual(runner._safe_relative_gain(3.0, 4.0), 0.25)
-        self.assertAlmostEqual(by_schedule["ays"]["relative_crps_gain_vs_uniform"], 0.25)
-        self.assertAlmostEqual(by_schedule["uniform"]["relative_crps_gain_vs_uniform"], 0.0)
+        self.assertAlmostEqual(by_schedule["ays"]["forecast_relative_crps_gain_vs_uniform"], 0.25)
+        self.assertAlmostEqual(by_schedule["uniform"]["forecast_relative_crps_gain_vs_uniform"], 0.0)
 
     def test_native_hardness_trace_is_info_growth(self) -> None:
         self.assertEqual(NATIVE_INFO_GROWTH_TRACE_KEY, "info_growth_hardness_by_step")
@@ -194,10 +194,10 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
 
     def test_conditional_generation_build_row_preserves_full_metrics(self) -> None:
         row = runner._build_row(
-            benchmark_family="conditional_generation",
+            benchmark_family="temporal_conditional_generation",
             split_phase="locked_test",
             seed=0,
-            dataset="sleep_edf",
+            dataset="cryptos",
             checkpoint={
                 "checkpoint_id": "ck",
                 "checkpoint_path": "outputs/example/model.pt",
@@ -212,28 +212,22 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             details={"reference_macro_steps": 10, "schedule_grid_hash": "grid"},
             metrics={
                 "score_main": 0.4,
-                "tstr_macro_f1": 0.5,
+                "temporal_tstr_f1": 0.5,
+                "temporal_tstr_f1_applicable": True,
                 "disc_auc": 0.6,
                 "disc_auc_gap": 0.1,
-                "unconditional_w1": 0.2,
-                "conditional_w1": 0.3,
+                "temporal_uw1": 0.2,
+                "temporal_cw1": 0.3,
                 "u_l1": 0.7,
                 "c_l1": 0.8,
                 "spread_specific_error": 0.9,
                 "imbalance_specific_error": 1.1,
                 "ret_vol_acf_error": 1.2,
                 "impact_response_error": 0.25,
-                "stage_mismatch_rate": 0.2,
-                "stage_classifier_real_macro_f1": 0.75,
-                "sleep_signal_mae": 0.9,
-                "sleep_spectral_mae": 1.1,
-                "sleep_stage_mismatch_rate": 0.2,
-                "sleep_stage_classifier_real_macro_f1": 0.75,
                 "eval_horizon": 3000,
                 "evaluation_protocol_hash": "protocol",
                 "chosen_t0s_hash": "windows",
                 "chosen_examples_hash": "examples",
-                "stage_counts_json": '{"N2":2}',
             },
             row_signature="sig",
             protocol_hash="hash",
@@ -242,18 +236,16 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         for key in (
             "disc_auc",
             "disc_auc_gap",
-            "unconditional_w1",
+            "temporal_tstr_f1",
+            "temporal_tstr_f1_applicable",
+            "temporal_uw1",
+            "temporal_cw1",
             "u_l1",
             "c_l1",
             "spread_specific_error",
             "imbalance_specific_error",
             "ret_vol_acf_error",
             "impact_response_error",
-            "stage_mismatch_rate",
-            "stage_classifier_real_macro_f1",
-            "sleep_signal_mae",
-            "sleep_spectral_mae",
-            "sleep_stage_mismatch_rate",
         ):
             self.assertIn(key, row)
         self.assertEqual(row["eval_horizon"], 3000)
@@ -337,7 +329,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as tmpdir:
             root = Path(tmpdir)
             rel_root = root.relative_to(PROJECT_ROOT).as_posix()
-            ckpt_path = root / "forecast" / "traffic_hourly" / "model.pt"
+            ckpt_path = root / "temporal_extrapolation" / "traffic_hourly" / "model.pt"
             ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             ckpt_path.write_bytes(b"checkpoint")
             args = runner.build_argparser().parse_args(
@@ -366,7 +358,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                         "artifacts": [
                             {
                                 "backbone_name": "otflow",
-                                "benchmark_family": "forecast_extrapolation",
+                                "benchmark_family": "temporal_extrapolation",
                                 "dataset_key": "traffic_hourly",
                                 "train_steps": 20000,
                                 "train_budget_label": "20k",
@@ -604,9 +596,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     def fake_eval(model, ds, cfg, **kwargs):
                         seen.append(ds.name)
                         return {
-                            "crps": 1.0,
+                            "forecast_crps": 1.0,
                             "mse": 1.0,
-                            "mase": 1.0,
+                            "forecast_mase": 1.0,
                             "latency_ms_per_sample": 0.0,
                             "num_eval_samples": 1,
                             "eval_examples": 3,
@@ -678,9 +670,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 del model, ds, cfg
                 calls.append(dict(kwargs))
                 return {
-                    "crps": 1.0,
+                    "forecast_crps": 1.0,
                     "mse": 1.0,
-                    "mase": 1.0,
+                    "forecast_mase": 1.0,
                     "latency_ms_per_sample": 0.0,
                     "num_eval_samples": 1,
                     "eval_examples": 1,

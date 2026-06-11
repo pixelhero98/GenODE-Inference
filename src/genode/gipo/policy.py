@@ -48,7 +48,7 @@ MetricRow = Mapping[str, Any]
 ContextPairKey = Tuple[str, str, int, str, int | None]
 ScheduleGridKey = Tuple[str, str, int]
 
-GIPO_PROTOCOL = "gipo_density_v1"
+GIPO_PROTOCOL = "gipo_density"
 DEFAULT_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = tuple(BASELINE_SCHEDULE_KEYS) + (SER_PTG_SCHEDULE_KEY,)
 DEFAULT_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
 GIPO_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
@@ -58,20 +58,20 @@ DEFAULT_CONTEXT_CALIBRATION_VALIDATION_FRACTION = 0.20
 MIN_CONTEXT_CALIBRATION_TOTAL = 72
 MAX_CONTEXT_CALIBRATION_TOTAL = 144
 DEFAULT_TEACHER_TARGET_TEMPERATURE = 0.05
-STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE = "teacher_weighted_soft_mixture_v1"
+STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE = "teacher_weighted_soft_mixture"
 MODEL_PAYLOAD_VERSION = 4
-ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1 = "density_form_transformer_v1"
-ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1 = "density_query_transformer_v1"
-CONDITIONING_STYLE_ADDITIVE_MLP_V1 = "additive_mlp_v1"
-DENSITY_TOKEN_ATTENTION_ROPE_V1 = "bin_self_attention_rope_v1"
-TEACHER_OUTPUT_METRIC_VECTOR_V1 = "metric_vector_v1"
-TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1 = "weighted_metric_average_v1"
+ARCHITECTURE_DENSITY_FORM_TRANSFORMER = "density_form_transformer"
+ARCHITECTURE_DENSITY_QUERY_TRANSFORMER = "density_query_transformer"
+CONDITIONING_STYLE_ADDITIVE_MLP = "additive_mlp"
+DENSITY_TOKEN_ATTENTION_ROPE = "bin_self_attention_rope"
+TEACHER_OUTPUT_METRIC_VECTOR = "metric_vector"
+TEACHER_SCALARIZATION_WEIGHTED_AVERAGE = "weighted_metric_average"
 DEFAULT_TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = ("u_crps_uniform", "u_mase_uniform")
 TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = DEFAULT_TEACHER_METRIC_TARGET_KEYS
-TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1 = "weighted_normalized_regret_v1"
-DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
-STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1 = "validation_ce_v1"
-DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
+TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET = "weighted_normalized_regret"
+DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
+STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE = "validation_ce"
+DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE
 DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS: Dict[str, float] = {
     "context": 0.25,
     "density_family": 0.25,
@@ -90,17 +90,17 @@ SERIES_CONDITIONING_DIM = 0
 
 
 def validate_gipo_architecture(value: str, *, role: str | None = None) -> str:
-    default = ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1 if role == "teacher" else ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1
+    default = ARCHITECTURE_DENSITY_FORM_TRANSFORMER if role == "teacher" else ARCHITECTURE_DENSITY_QUERY_TRANSFORMER
     arch = str(value).strip() or default
     expected = {
-        "teacher": ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
-        "student": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+        "teacher": ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
+        "student": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
     }.get(str(role or ""), "")
     if expected:
         if arch != expected:
             raise ValueError(f"GIPO {role} architecture must be {expected!r}, got {value!r}.")
         return arch
-    allowed = {ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1, ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1}
+    allowed = {ARCHITECTURE_DENSITY_FORM_TRANSFORMER, ARCHITECTURE_DENSITY_QUERY_TRANSFORMER}
     if arch not in allowed:
         raise ValueError(f"GIPO architecture must be one of {sorted(allowed)}, got {value!r}.")
     return arch
@@ -114,14 +114,14 @@ def validate_canonical_conditioning_style(
     if not model_config or "conditioning_style" not in model_config:
         if require_present:
             raise ValueError(
-                f"GIPO density transformer checkpoints require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP_V1!r}."
+                f"GIPO density transformer checkpoints require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP!r}."
             )
-        return CONDITIONING_STYLE_ADDITIVE_MLP_V1
+        return CONDITIONING_STYLE_ADDITIVE_MLP
     style = str(model_config["conditioning_style"]).strip()
-    if style == CONDITIONING_STYLE_ADDITIVE_MLP_V1:
+    if style == CONDITIONING_STYLE_ADDITIVE_MLP:
         return style
     raise ValueError(
-        f"GIPO density transformers require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP_V1!r}; "
+        f"GIPO density transformers require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP!r}; "
         f"got {style!r}."
     )
 
@@ -132,22 +132,22 @@ def validate_gipo_teacher_training_metadata(metadata: Mapping[str, Any] | None) 
     if teacher_target not in {"metric_vector", "metric_vector_uniform"}:
         raise ValueError("GIPO checkpoint must come from a metric-vector teacher.")
     teacher_metric_targets = validate_teacher_metric_target_keys(teacher_training.get("teacher_metric_targets", ()))
-    if str(teacher_training.get("teacher_scalarization", "")) != TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1:
+    if str(teacher_training.get("teacher_scalarization", "")) != TEACHER_SCALARIZATION_WEIGHTED_AVERAGE:
         raise ValueError(
-            f"GIPO checkpoint teacher_scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1!r}."
+            f"GIPO checkpoint teacher_scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE!r}."
         )
     selection = dict(teacher_training.get("teacher_checkpoint_selection", {}) or {})
-    if str(selection.get("selection_protocol", "")) != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1:
+    if str(selection.get("selection_protocol", "")) != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET:
         raise ValueError(
             f"GIPO checkpoints must use teacher checkpoint selection "
-            f"{TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1!r}."
+            f"{TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET!r}."
         )
     if bool(selection.get("uses_validation_labels", False)):
         raise ValueError("GIPO teacher checkpoint selection metadata must not use validation labels.")
     return {
         "teacher_target": teacher_target,
         "teacher_metric_targets": teacher_metric_targets,
-        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
+        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_checkpoint_selection": selection,
     }
 
@@ -155,12 +155,12 @@ def validate_gipo_teacher_training_metadata(metadata: Mapping[str, Any] | None) 
 def validate_gipo_density_token_attention(model_config: Mapping[str, Any] | None, *, require_present: bool = False) -> str:
     if not model_config or "density_token_attention" not in model_config:
         if require_present:
-            raise ValueError(f"GIPO density transformer checkpoints require density_token_attention={DENSITY_TOKEN_ATTENTION_ROPE_V1!r}.")
-        return DENSITY_TOKEN_ATTENTION_ROPE_V1
+            raise ValueError(f"GIPO density transformer checkpoints require density_token_attention={DENSITY_TOKEN_ATTENTION_ROPE!r}.")
+        return DENSITY_TOKEN_ATTENTION_ROPE
     attention = str(model_config["density_token_attention"]).strip()
-    if attention != DENSITY_TOKEN_ATTENTION_ROPE_V1:
+    if attention != DENSITY_TOKEN_ATTENTION_ROPE:
         raise ValueError(
-            f"GIPO density transformers require density_token_attention={DENSITY_TOKEN_ATTENTION_ROPE_V1!r}; "
+            f"GIPO density transformers require density_token_attention={DENSITY_TOKEN_ATTENTION_ROPE!r}; "
             f"got {attention!r}."
         )
     return attention
@@ -169,18 +169,18 @@ def validate_gipo_density_token_attention(model_config: Mapping[str, Any] | None
 def validate_gipo_teacher_output(model_config: Mapping[str, Any] | None, *, require_present: bool = False) -> str:
     if not model_config or "teacher_output" not in model_config:
         if require_present:
-            raise ValueError(f"GIPO teacher checkpoints require teacher_output={TEACHER_OUTPUT_METRIC_VECTOR_V1!r}.")
-        return TEACHER_OUTPUT_METRIC_VECTOR_V1
+            raise ValueError(f"GIPO teacher checkpoints require teacher_output={TEACHER_OUTPUT_METRIC_VECTOR!r}.")
+        return TEACHER_OUTPUT_METRIC_VECTOR
     output = str(model_config["teacher_output"]).strip()
-    if output != TEACHER_OUTPUT_METRIC_VECTOR_V1:
-        raise ValueError(f"GIPO teacher output must be {TEACHER_OUTPUT_METRIC_VECTOR_V1!r}; got {output!r}.")
+    if output != TEACHER_OUTPUT_METRIC_VECTOR:
+        raise ValueError(f"GIPO teacher output must be {TEACHER_OUTPUT_METRIC_VECTOR!r}; got {output!r}.")
     if require_present and "teacher_metric_targets" not in model_config:
         raise ValueError("GIPO teacher checkpoints require explicit teacher_metric_targets.")
     validate_teacher_metric_target_keys(model_config.get("teacher_metric_targets", TEACHER_METRIC_TARGET_KEYS))
-    scalarization = str(model_config.get("teacher_scalarization", TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1))
-    if scalarization != TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1:
+    scalarization = str(model_config.get("teacher_scalarization", TEACHER_SCALARIZATION_WEIGHTED_AVERAGE))
+    if scalarization != TEACHER_SCALARIZATION_WEIGHTED_AVERAGE:
         raise ValueError(
-            f"GIPO teacher scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1!r}; got {scalarization!r}."
+            f"GIPO teacher scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE!r}; got {scalarization!r}."
         )
     return output
 
@@ -1179,7 +1179,7 @@ class _DensityConditioningMixin:
             "attention_heads": int(self.attention_heads),
             "dropout": float(self.dropout_probability),
             "conditioning_style": self.conditioning_style,
-            "density_token_attention": DENSITY_TOKEN_ATTENTION_ROPE_V1,
+            "density_token_attention": DENSITY_TOKEN_ATTENTION_ROPE,
             "density_feature_mean": self.density_feature_mean.detach().cpu().numpy().astype(float).tolist()
             if hasattr(self, "density_feature_mean")
             else None,
@@ -1187,12 +1187,12 @@ class _DensityConditioningMixin:
             if hasattr(self, "density_feature_std")
             else None,
         }
-        if self.architecture == ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1:
+        if self.architecture == ARCHITECTURE_DENSITY_FORM_TRANSFORMER:
             config.update(
                 {
-                    "teacher_output": TEACHER_OUTPUT_METRIC_VECTOR_V1,
+                    "teacher_output": TEACHER_OUTPUT_METRIC_VECTOR,
                     "teacher_metric_targets": list(self.teacher_metric_targets),
-                    "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
+                    "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
                 }
             )
         return config
@@ -1201,7 +1201,7 @@ class _DensityConditioningMixin:
 class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
     """Teacher that scores an observed density form after bin-token self-attention."""
 
-    architecture = ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1
+    architecture = ARCHITECTURE_DENSITY_FORM_TRANSFORMER
 
     def __init__(
         self,
@@ -1215,7 +1215,7 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
         hidden_layers: int = DEFAULT_TRANSFORMER_LAYERS,
         attention_heads: int = DEFAULT_TRANSFORMER_HEADS,
         dropout: float = DEFAULT_TRANSFORMER_DROPOUT,
-        conditioning_style: str = CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+        conditioning_style: str = CONDITIONING_STYLE_ADDITIVE_MLP,
         density_feature_mean: Sequence[float] | None = None,
         density_feature_std: Sequence[float] | None = None,
         teacher_metric_targets: Sequence[str] = TEACHER_METRIC_TARGET_KEYS,
@@ -1304,7 +1304,7 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
 class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
     """Student that decodes one density logit per bin query under conditioning z."""
 
-    architecture = ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1
+    architecture = ARCHITECTURE_DENSITY_QUERY_TRANSFORMER
 
     def __init__(
         self,
@@ -1318,7 +1318,7 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
         hidden_layers: int = DEFAULT_TRANSFORMER_LAYERS,
         attention_heads: int = DEFAULT_TRANSFORMER_HEADS,
         dropout: float = DEFAULT_TRANSFORMER_DROPOUT,
-        conditioning_style: str = CONDITIONING_STYLE_ADDITIVE_MLP_V1,
+        conditioning_style: str = CONDITIONING_STYLE_ADDITIVE_MLP,
     ):
         super().__init__()
         self.setting_dim = int(setting_dim)
@@ -1400,7 +1400,7 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
 
 def build_gipo_teacher_model(
     *,
-    architecture: str = ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1,
+    architecture: str = ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
     setting_dim: int,
     density_dim: int,
     context_dim: int,
@@ -1434,7 +1434,7 @@ def build_gipo_teacher_model(
 
 def build_gipo_student_model(
     *,
-    architecture: str = ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1,
+    architecture: str = ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
     setting_dim: int,
     density_dim: int,
     context_dim: int,
@@ -2035,7 +2035,7 @@ def _selected_gipo_teacher_checkpoint(
     required_split_names: Sequence[str] = (),
     component_weights: Mapping[str, float] | None = None,
 ) -> Tuple[Dict[str, Any], Mapping[str, torch.Tensor] | None]:
-    mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
+    mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
 
     def _component_weight(name: str, weights: Mapping[str, float]) -> float:
         split = str(name)
@@ -2173,7 +2173,7 @@ def _selected_gipo_teacher_checkpoint(
         entry["selection_component_values"] = dict(normalized_values)
         entry["selection_component_ranges"] = dict(ranges)
         entry["selection_component_weights"] = dict(normalized_weights)
-        entry["weighted_normalized_regret_v1_score"] = weighted_score
+        entry["weighted_normalized_regret_score"] = weighted_score
         entry["checkpoint_selection_score"] = weighted_score
         entry["minimax_normalized_regret"] = minimax_score
         entry["raw_mean_validation_soft_regret"] = raw_mean
@@ -2181,7 +2181,7 @@ def _selected_gipo_teacher_checkpoint(
     best_entry = min(
         valid_entries,
         key=lambda entry: (
-            float(entry["weighted_normalized_regret_v1_score"]),
+            float(entry["weighted_normalized_regret_score"]),
             float(entry["minimax_normalized_regret"]),
             float(entry["raw_mean_validation_soft_regret"]),
             int(entry["step"]),
@@ -2192,7 +2192,7 @@ def _selected_gipo_teacher_checkpoint(
         {
             "selection_protocol": mode,
             "selection_split": "teacher_holdouts",
-            "selection_metric": "weighted_normalized_regret_v1_score",
+            "selection_metric": "weighted_normalized_regret_score",
             "selection_mode": mode,
             "selected_step": selected_step,
             "selected_mean_diagnostic_total_loss": best_entry.get("mean_diagnostic_total_loss"),
@@ -2202,7 +2202,7 @@ def _selected_gipo_teacher_checkpoint(
             "selected_mean_spearman_rank_correlation": best_entry.get("mean_spearman_rank_correlation"),
             "selected_mean_rank_loss": best_entry.get("mean_rank_loss"),
             "selected_mean_huber_loss": best_entry.get("mean_huber_loss"),
-            "selected_weighted_normalized_regret_v1_score": best_entry.get("weighted_normalized_regret_v1_score"),
+            "selected_weighted_normalized_regret_score": best_entry.get("weighted_normalized_regret_score"),
             "selected_normalized_regret_values": best_entry.get("selection_normalized_regret_values", {}),
             "selected_raw_regret_values": best_entry.get("selection_raw_regret_values", {}),
             "selected_regret_normalization_ranges": best_entry.get("selection_component_ranges", {}),
@@ -2303,7 +2303,7 @@ def train_gipo_teacher(
         pair_margin=pair_margin,
     )
     teacher_metric_target_keys = teacher_metric_target_keys_for_model(teacher)
-    selection_mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1
+    selection_mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
     selection_temperature = DEFAULT_TEACHER_TARGET_TEMPERATURE
     teacher.to(device)
     sx, dx, series_idx, cx, metric_targets, pair_keys, _, _ = _teacher_training_tensors(
@@ -2396,7 +2396,7 @@ def train_gipo_teacher(
             checkpoint_states[step_value] = copy.deepcopy(teacher.state_dict())
     if bool(final_retrain_mode):
         checkpoint_selection = {
-            "selection_protocol": "gipo_teacher_final_retrain_v1",
+            "selection_protocol": "gipo_teacher_final_retrain",
             "selection_mode": selection_mode,
             "selection_metric": "configured_selected_step",
             "selected_step": int(steps),
@@ -2415,7 +2415,7 @@ def train_gipo_teacher(
     if selected_state is not None:
         teacher.load_state_dict(selected_state)
     final_teacher_retrain = {
-        "protocol": "gipo_teacher_finalization_v1",
+        "protocol": "gipo_teacher_finalization",
         "performed": False,
         "reason": "selected_checkpoint_state_restored" if selected_state is not None else "final_checkpoint_state_retained",
         "selected_checkpoint_step": checkpoint_selection.get("selected_step"),
@@ -2432,7 +2432,7 @@ def train_gipo_teacher(
         "teacher_target": "metric_vector",
         "teacher_metric_targets": list(teacher_metric_target_keys),
         "teacher_scalar_target": "weighted_metric_utility",
-        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
+        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_utility_weights": teacher_utility_weights_for_summary(
             teacher_metric_target_keys,
             {key: float(value) for key, value in zip(teacher_metric_target_keys, target_weights[0].detach().cpu().tolist())},
@@ -2593,9 +2593,9 @@ def build_teacher_weighted_density_targets(
     summary = {
         "target_protocol": "teacher_weighted_density_mle",
         "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
-        "teacher_output": TEACHER_OUTPUT_METRIC_VECTOR_V1,
+        "teacher_output": TEACHER_OUTPUT_METRIC_VECTOR,
         "teacher_metric_targets": list(teacher_metric_target_keys),
-        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE_V1,
+        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_utility_weights": teacher_utility_weights_for_summary(
             teacher_metric_target_keys,
             {key: float(value) for key, value in zip(teacher_metric_target_keys, score_weights[0].detach().cpu().tolist())},
@@ -2671,7 +2671,7 @@ def train_gipo_student(
     pseudo_weight = float(pseudo_target_weight)
     if not math.isfinite(pseudo_weight) or pseudo_weight < 0.0:
         raise ValueError("student_pseudo_target_weight must be finite and nonnegative.")
-    selection_mode = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1
+    selection_mode = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE
     use_validation_selection = not bool(final_retrain_mode)
     checkpoint_every = max(1, int(student_checkpoint_every))
     validation_fit_rows = [dict(row) for row in (validation_rows or [])]
@@ -2906,8 +2906,8 @@ def train_gipo_student(
         if selected_state is not None:
             student.load_state_dict(selected_state)
         student_checkpoint_selection = {
-            "selection_protocol": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
-            "selection_mode": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1,
+            "selection_protocol": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE,
+            "selection_mode": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE,
             "selection_metric": "validation_ce_loss",
             "selected_step": int(selected_step),
             "selected_validation_ce_loss": float(selected_checkpoint["validation_ce_loss"]),
@@ -2925,7 +2925,7 @@ def train_gipo_student(
         }
     else:
         student_checkpoint_selection = {
-            "selection_protocol": "gipo_student_final_retrain_v1",
+            "selection_protocol": "gipo_student_final_retrain",
             "selection_mode": "final_retrain",
             "selection_metric": "configured_selected_step",
             "canonical_checkpoint_selection_mode": selection_mode,
@@ -2970,7 +2970,7 @@ def train_gipo_student(
         "student_checkpoint_selection_mode": selection_mode,
         "student_checkpoint_selection": student_checkpoint_selection,
         "student_validation_split": {
-            "protocol": "context_disjoint_student_validation_v1",
+            "protocol": "context_disjoint_student_validation",
             "validation_row_count": int(len(validation_fit_rows)),
             "validation_context_count": int(len({context_id_from_row(row) for row in validation_fit_rows})) if validation_fit_rows else 0,
             "locked_test_used_for_selection": False,
@@ -3089,10 +3089,10 @@ __all__ = [
     "DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE",
     "DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE",
     "DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS",
-    "ARCHITECTURE_DENSITY_FORM_TRANSFORMER_V1",
-    "ARCHITECTURE_DENSITY_QUERY_TRANSFORMER_V1",
-    "CONDITIONING_STYLE_ADDITIVE_MLP_V1",
-    "DENSITY_TOKEN_ATTENTION_ROPE_V1",
+    "ARCHITECTURE_DENSITY_FORM_TRANSFORMER",
+    "ARCHITECTURE_DENSITY_QUERY_TRANSFORMER",
+    "CONDITIONING_STYLE_ADDITIVE_MLP",
+    "DENSITY_TOKEN_ATTENTION_ROPE",
     "DEFAULT_TRANSFORMER_DROPOUT",
     "DEFAULT_TRANSFORMER_HEADS",
     "DEFAULT_TRANSFORMER_HIDDEN_DIM",
@@ -3102,8 +3102,8 @@ __all__ = [
     "MIN_CONTEXT_CALIBRATION_TOTAL",
     "SERIES_CONDITIONING_DIM",
     "SERIES_CONDITIONING_NONE_CONTEXT_ONLY",
-    "STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE_V1",
-    "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1",
+    "STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE",
+    "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET",
     "GIPODensityFormTeacherTransformer",
     "GIPODensityQueryStudentTransformer",
     "DensityFeatureNormalizer",
@@ -3148,7 +3148,7 @@ __all__ = [
     "validate_gipo_support_schedule_keys",
     "validate_density_family_holdout_schedule_keys",
     "validate_series_conditioning",
-    "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET_V1",
+    "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET",
     "validate_teacher_objective_hyperparameters",
     "validate_reference_grid",
 ]

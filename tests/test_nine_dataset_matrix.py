@@ -270,13 +270,13 @@ class NineDatasetMatrixTests(unittest.TestCase):
                     {
                         "stratum": str(member["member"]["stratum"]),
                         "examples": 2,
-                        "metrics": {"all_first_horizon": {"kabsch_rmsd": {"mean": 1.0}}},
+                        "metrics": {"all_first_horizon": {"molecule_kabsch_rmsd_3d": {"mean": 1.0}}},
                     }
                     for member in first_group["strata"].values()
                 ],
             )
             self.assertEqual(group_summary["dataset_key"], MOLECULE_GROUP_DATASET_KEYS[0])
-            self.assertEqual(group_summary["metrics"]["all_first_horizon"]["kabsch_rmsd"]["mean"], 1.0)
+            self.assertEqual(group_summary["metrics"]["all_first_horizon"]["molecule_kabsch_rmsd_3d"]["mean"], 1.0)
             encoded = json.dumps(prepared)
             self.assertNotIn(str(root), encoded)
 

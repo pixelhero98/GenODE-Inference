@@ -72,32 +72,32 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
     def test_seed_paired_relative_mase_gain_is_preserved_in_summary_rows(self) -> None:
         rows = [
             {
-                "benchmark_family": "forecast_extrapolation",
+                "benchmark_family": "temporal_extrapolation",
                 "dataset": "demo",
                 "target_nfe": 10,
                 "solver_key": "euler",
                 "scheduler_key": "uniform",
                 "train_budget_label": "20k",
-                "crps_mean": 10.0,
-                "mase_mean": 5.0,
+                "forecast_crps_mean": 10.0,
+                "forecast_mase_mean": 5.0,
             },
             {
-                "benchmark_family": "forecast_extrapolation",
+                "benchmark_family": "temporal_extrapolation",
                 "dataset": "demo",
                 "target_nfe": 10,
                 "solver_key": "euler",
                 "scheduler_key": "gits",
                 "train_budget_label": "20k",
-                "crps_mean": 9.0,
-                "mase_mean": 4.0,
-                "relative_crps_gain_vs_uniform_mean": 0.11,
-                "relative_mase_gain_vs_uniform_mean": 0.25,
+                "forecast_crps_mean": 9.0,
+                "forecast_mase_mean": 4.0,
+                "forecast_relative_crps_gain_vs_uniform_mean": 0.11,
+                "forecast_relative_mase_gain_vs_uniform_mean": 0.25,
             },
         ]
         augmented = augment_rows_with_relative_metrics(rows)
         gits = next(row for row in augmented if row["scheduler_key"] == "gits")
-        self.assertAlmostEqual(gits["relative_crps_gain_vs_uniform"], 0.11)
-        self.assertAlmostEqual(gits["relative_mase_gain_vs_uniform"], 0.25)
+        self.assertAlmostEqual(gits["forecast_relative_crps_gain_vs_uniform"], 0.11)
+        self.assertAlmostEqual(gits["forecast_relative_mase_gain_vs_uniform"], 0.25)
 
     def test_rollout_diagnostics_rejects_empty_chosen_t0s(self) -> None:
         cfg = SimpleNamespace(device=torch.device("cpu"))

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import tempfile
@@ -20,9 +20,8 @@ from genode.evaluation.fm_backbone_registry import (
 )
 from genode.data.otflow_datasets import build_dataset_splits_from_arrays
 from genode.evaluation.otflow_evaluation_support import load_conditional_generation_checkpoint_splits
-from genode.data.otflow_medical_datasets import prepare_sleep_edf_dataset
 from genode.models.otflow_model import OTFlow
-from genode.models.otflow_train_val import _parse_batch, select_eval_window_starts, train_loop
+from genode.models.otflow_train_val import _parse_batch, train_loop
 
 
 def _tiny_cfg(*, cond_dim: int = 0) -> OTFlowConfig:
@@ -68,7 +67,7 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
             )
             artifact = {
                 "checkpoint_path": str(ckpt_path),
-                "checkpoint_id": "otflow_forecast_traffic_hourly_8k",
+                "checkpoint_id": "otflow_temporal_extrapolation_traffic_hourly_8k",
                 "train_steps": 8000,
                 "train_budget_label": "8k",
                 "backbone_name": BACKBONE_NAME_OTFLOW,
@@ -92,7 +91,7 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
 
         self.assertEqual(result["train_steps"], 8000)
         self.assertEqual(result["train_budget_label"], "8k")
-        self.assertEqual(result["checkpoint_id"], "otflow_forecast_traffic_hourly_8k")
+        self.assertEqual(result["checkpoint_id"], "otflow_temporal_extrapolation_traffic_hourly_8k")
 
     def test_dataset_builder_updates_model_cond_dim_without_shadow_field(self) -> None:
         rng = np.random.default_rng(0)
@@ -147,7 +146,7 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
         model = OTFlow(cfg)
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            artifact_dir = root / "conditional_generation" / "long_term_st" / "transformer"
+            artifact_dir = root / CONDITIONAL_GENERATION_FAMILY / "long_term_st" / "transformer"
             artifact_dir.mkdir(parents=True, exist_ok=True)
             torch.save({"cfg": cfg.to_dict(), "model_state": model.state_dict()}, artifact_dir / "model.pt")
             (artifact_dir / "checkpoint_metadata.json").write_text(
@@ -173,32 +172,12 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
                     device=torch.device("cpu"),
                 )
 
-    def test_sleep_metadata_is_bound_to_requested_npz_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            requested = root / "custom_sleep_edf.npz"
-            requested.write_bytes(b"placeholder")
-            requested.with_suffix(".json").write_text(
-                json.dumps(
-                    {
-                        "dataset_key": "sleep_edf",
-                        "history_len": 12000,
-                        "official_horizon": 3000,
-                        "prepared_npz_path": str(root / "other_sleep_edf.npz"),
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "does not match requested NPZ path"):
-                prepare_sleep_edf_dataset(requested)
-
     def test_readiness_manifest_marks_conditional_checkpoint_without_conditional_state_invalid(self) -> None:
         cfg = _tiny_cfg(cond_dim=0)
         model = OTFlow(cfg)
         with tempfile.TemporaryDirectory() as tmpdir:
             matrix_root = Path(tmpdir) / "matrix"
-            artifact_dir = matrix_root / "otflow" / "conditional_generation" / "20k" / "long_term_st" / "transformer"
+            artifact_dir = matrix_root / "otflow" / CONDITIONAL_GENERATION_FAMILY / "20k" / "long_term_st" / "transformer"
             artifact_dir.mkdir(parents=True, exist_ok=True)
             torch.save({"cfg": cfg.to_dict(), "model_state": model.state_dict()}, artifact_dir / "model.pt")
             (artifact_dir / "checkpoint_metadata.json").write_text(
@@ -234,27 +213,6 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
         ]
         self.assertEqual(long_term_rows[0]["status"], "invalid")
         self.assertIn("metadata cond_dim=5", long_term_rows[0]["compatibility_error"])
-
-    def test_sleep_window_selection_is_stage_stratified(self) -> None:
-        rng = np.random.default_rng(2)
-        params = rng.normal(size=(80, 4)).astype(np.float32)
-        mids = np.linspace(100.0, 101.0, 80, dtype=np.float32)
-        cond = np.eye(5, dtype=np.float32)[np.arange(80) % 5]
-        cfg = _tiny_cfg(cond_dim=5)
-        splits = build_dataset_splits_from_arrays(
-            params,
-            mids,
-            cfg,
-            cond_raw_full=cond,
-            train_frac=0.6,
-            val_frac=0.2,
-            dataset_kind="sleep_edf",
-            dataset_metadata={"stage_names": ["W", "N1", "N2", "N3", "REM"]},
-        )
-
-        chosen = select_eval_window_starts(splits["test"], horizon=2, n_windows=3, seed=5)
-        stages = {int(np.argmax(splits["test"].cond[int(t0)])) for t0 in chosen.tolist()}
-        self.assertEqual(stages, {0, 1, 2, 3, 4})
 
     def test_legacy_model_names_are_rejected(self) -> None:
         rng = np.random.default_rng(3)

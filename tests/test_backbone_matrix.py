@@ -15,8 +15,10 @@ from genode.evaluation.fm_backbone_registry import (
     ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS,
     ACTIVE_FORECAST_BACKBONE_BUDGETS,
     BACKBONE_NAME_OTFLOW,
+    BACKBONE_NAME_OTFLOW_MOLECULE,
     CONDITIONAL_GENERATION_FAMILY,
     FORECAST_FAMILY,
+    MOLECULE_FAMILY,
     build_backbone_readiness_audit,
     find_backbone_artifact,
     materialize_backbone_manifest,
@@ -30,7 +32,7 @@ CONDITIONAL_KEYS = ("cryptos", "lobster_synthetic", "long_term_st")
 
 def _checkpoint_metadata(benchmark_family: str, dataset_key: str, train_steps: int) -> dict:
     spec = experiment_plan_by_key()[str(dataset_key)]
-    family_token = "forecast" if benchmark_family == FORECAST_FAMILY else "conditional_generation_transformer"
+    family_token = "temporal_extrapolation" if benchmark_family == FORECAST_FAMILY else "temporal_conditional_generation_transformer"
     metadata = {
         "checkpoint_id": f"{dataset_key}_otflow_{family_token}_{train_steps // 1000}k_seed0",
         "dataset_key": str(dataset_key),
@@ -81,6 +83,7 @@ class BackboneMatrixTests(unittest.TestCase):
                 matrix_root=Path(tmpdir) / "matrix",
                 otflow_reuse_root=Path(tmpdir) / "reuse",
                 imported_backbone_root=Path(tmpdir) / "imported",
+                molecule_group_root=Path(tmpdir) / "empty_molecule_groups",
                 write_path=Path(tmpdir) / "backbone_manifest.json",
             )
         self.assertEqual(payload["artifact_count"], 30)
@@ -90,10 +93,110 @@ class BackboneMatrixTests(unittest.TestCase):
         active = {(row["benchmark_family"], row["dataset_key"]) for row in payload["artifacts"]}
         self.assertEqual(active, {(FORECAST_FAMILY, key) for key in FORECAST_KEYS} | {(CONDITIONAL_GENERATION_FAMILY, key) for key in CONDITIONAL_KEYS})
 
+    def test_manifest_extends_temporal_grid_with_trainable_molecule_strata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            group_root = Path(tmpdir) / "groups"
+            manifest_dir = group_root / "molecule_3d_set1"
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            (manifest_dir / "group_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "manifest_version": "molecule_3d_group_manifest",
+                        "dataset_key": "molecule_3d_set1",
+                        "benchmark_family": MOLECULE_FAMILY,
+                        "source_zip_names": ["trajectory.zip", "triangulene_3.zip"],
+                        "strata": [
+                            {
+                                "member_key": "trajectory_Dynamic_A",
+                                "stratum": "Dynamic_A",
+                                "source_zip_name": "trajectory.zip",
+                                "trajectory_count": 7,
+                                "atom_count": 6,
+                                "formula": "C4H2",
+                                "processed_dir": "Dynamic_A",
+                                "trainable": True,
+                                "mixed_shape": False,
+                            },
+                            {
+                                "member_key": "triangulene_3_Dynamic_A",
+                                "stratum": "Dynamic_A",
+                                "source_zip_name": "triangulene_3.zip",
+                                "trajectory_count": 5,
+                                "atom_count": 8,
+                                "formula": "C6H2",
+                                "processed_dir": "triangulene_3_Dynamic_A",
+                                "trainable": True,
+                                "mixed_shape": False,
+                            },
+                            {
+                                "member_key": "trajectory_Direct_A",
+                                "stratum": "Direct_A",
+                                "source_zip_name": "trajectory.zip",
+                                "trajectory_count": 99,
+                                "atom_count": 8,
+                                "formula": "C6H2",
+                                "processed_dir": "Direct_A",
+                                "trainable": True,
+                                "mixed_shape": False,
+                            },
+                            {
+                                "member_key": "trajectory_Dynamic_Mixed",
+                                "stratum": "Dynamic_Mixed",
+                                "source_zip_name": "trajectory.zip",
+                                "trajectory_count": 99,
+                                "atom_count": 10,
+                                "formula": "C8H2",
+                                "processed_dir": "Dynamic_Mixed",
+                                "trainable": True,
+                                "mixed_shape": True,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = materialize_backbone_manifest(
+                matrix_root=Path(tmpdir) / "matrix",
+                otflow_reuse_root=Path(tmpdir) / "reuse",
+                imported_backbone_root=Path(tmpdir) / "imported",
+                molecule_group_root=group_root,
+                molecule_backbone_root=Path(tmpdir) / "molecule_backbones",
+                write_path=Path(tmpdir) / "backbone_manifest.json",
+            )
+
+        self.assertEqual(payload["temporal_artifact_count"], 30)
+        self.assertEqual(payload["molecule_stratum_count"], 2)
+        self.assertEqual(payload["molecule_artifact_count"], 10)
+        self.assertEqual(payload["artifact_count"], 40)
+        artifact = find_backbone_artifact(
+            payload,
+            backbone_name=BACKBONE_NAME_OTFLOW_MOLECULE,
+            benchmark_family=MOLECULE_FAMILY,
+            dataset_key="molecule_3d_set1",
+            member_key="trajectory_Dynamic_A",
+            stratum="Dynamic_A",
+            train_steps=4000,
+            status="missing",
+        )
+        self.assertEqual(artifact["atom_count"], 6)
+        self.assertEqual(artifact["formula"], "C4H2")
+        self.assertEqual(artifact["trajectory_count"], 7)
+        self.assertIn("trajectory_Dynamic_A", artifact["checkpoint_path"])
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            find_backbone_artifact(
+                payload,
+                backbone_name=BACKBONE_NAME_OTFLOW_MOLECULE,
+                benchmark_family=MOLECULE_FAMILY,
+                dataset_key="molecule_3d_set1",
+                stratum="Dynamic_A",
+                train_steps=4000,
+                status="missing",
+            )
+
     def test_manifest_reuses_existing_otflow_20k_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             reuse_root = Path(tmpdir) / "reuse"
-            artifact_dir = reuse_root / "forecast" / "traffic_hourly"
+            artifact_dir = reuse_root / FORECAST_FAMILY / "traffic_hourly"
             artifact_dir.mkdir(parents=True, exist_ok=True)
             (artifact_dir / "model.pt").write_bytes(b"ckpt")
             (artifact_dir / "checkpoint_metadata.json").write_text(
@@ -108,6 +211,7 @@ class BackboneMatrixTests(unittest.TestCase):
                     matrix_root=Path(tmpdir) / "matrix",
                     otflow_reuse_root=reuse_root,
                     imported_backbone_root=Path(tmpdir) / "imported",
+                    molecule_group_root=Path(tmpdir) / "empty_molecule_groups",
                     write_path=Path(tmpdir) / "backbone_manifest.json",
                 )
         artifact = find_backbone_artifact(
@@ -145,6 +249,7 @@ class BackboneMatrixTests(unittest.TestCase):
                     matrix_root=Path(tmpdir) / "matrix",
                     otflow_reuse_root=Path(tmpdir) / "reuse",
                     imported_backbone_root=imported_root,
+                    molecule_group_root=Path(tmpdir) / "empty_molecule_groups",
                     dataset_root=Path(tmpdir) / "datasets",
                     budget_steps=(20000,),
                     write_path=Path(tmpdir) / "backbone_manifest.json",
@@ -195,6 +300,7 @@ class BackboneMatrixTests(unittest.TestCase):
                     matrix_root=matrix_root,
                     otflow_reuse_root=Path(tmpdir) / "reuse",
                     imported_backbone_root=imported_root,
+                    molecule_group_root=Path(tmpdir) / "empty_molecule_groups",
                     dataset_root=Path(tmpdir) / "datasets",
                     lobster_synthetic_profile_path=Path(tmpdir) / "lobster_profile.json",
                     write_path=Path(tmpdir) / "backbone_manifest.json",
@@ -224,7 +330,7 @@ class BackboneMatrixTests(unittest.TestCase):
                 "target_nfe": 10,
                 "solver_key": "euler",
                 "schedule_name": "uniform",
-                "crps": 5.0,
+                "forecast_crps": 5.0,
                 "experiment_scope": "main",
             },
             {
@@ -238,7 +344,7 @@ class BackboneMatrixTests(unittest.TestCase):
                 "target_nfe": 10,
                 "solver_key": "euler",
                 "schedule_name": "flowts_power_sampling",
-                "crps": 3.0,
+                "forecast_crps": 3.0,
                 "experiment_scope": "main",
             },
             {
@@ -252,14 +358,14 @@ class BackboneMatrixTests(unittest.TestCase):
                 "target_nfe": 10,
                 "solver_key": "euler",
                 "schedule_name": "uniform",
-                "crps": 4.0,
+                "forecast_crps": 4.0,
                 "experiment_scope": "main",
             },
         ]
         enriched = augment_rows_with_relative_metrics(rows)
         by_schedule = {(row["train_steps"], row["schedule_name"]): row for row in enriched}
         self.assertIsNone(by_schedule[(4000, "flowts_power_sampling")]["relative_score_gain_vs_uniform"])
-        self.assertAlmostEqual(by_schedule[(4000, "flowts_power_sampling")]["relative_crps_gain_vs_uniform"], 0.25)
+        self.assertAlmostEqual(by_schedule[(4000, "flowts_power_sampling")]["forecast_relative_crps_gain_vs_uniform"], 0.25)
 
     def test_conditional_generation_relative_metrics_preserve_seed_paired_gain(self) -> None:
         rows = [
