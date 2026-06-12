@@ -7,6 +7,12 @@ from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 
+from genode.canonical_experiment_layout import (
+    SCENARIO_FAMILY_CONDITIONAL_GENERATION,
+    SCENARIO_FAMILY_FORECAST,
+    SCENARIO_FAMILY_MOLECULE,
+)
+
 MetricRow = Mapping[str, object]
 SettingKey = Tuple[str, int]
 ScheduleKey = Tuple[str, int, str]
@@ -54,6 +60,31 @@ MOLECULE_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec("molecule_rollout_velocity_norm_w1", "u_molecule_rollout_velocity_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15),
     MetricObjectiveSpec("molecule_rollout_acceleration_norm_w1", "u_molecule_rollout_acceleration_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15),
 )
+OBJECTIVE_SPECS_BY_FAMILY: Dict[str, Tuple[MetricObjectiveSpec, ...]] = {
+    SCENARIO_FAMILY_FORECAST: FORECAST_METRIC_SPECS,
+    SCENARIO_FAMILY_CONDITIONAL_GENERATION: CONDITIONAL_METRIC_SPECS,
+    SCENARIO_FAMILY_MOLECULE: MOLECULE_METRIC_SPECS,
+}
+
+
+def objective_specs_for_family(benchmark_family: str) -> Tuple[MetricObjectiveSpec, ...]:
+    family = str(benchmark_family).strip()
+    if family not in OBJECTIVE_SPECS_BY_FAMILY:
+        raise ValueError(f"Unsupported benchmark_family for GIPO teacher targets: {benchmark_family!r}")
+    return OBJECTIVE_SPECS_BY_FAMILY[family]
+
+
+def objective_utility_keys_for_family(benchmark_family: str) -> Tuple[str, ...]:
+    return tuple(spec.utility_key for spec in objective_specs_for_family(benchmark_family))
+
+
+def objective_weight_map_for_keys(target_keys: Sequence[str]) -> Dict[str, float]:
+    spec_by_utility = {
+        spec.utility_key: spec
+        for specs in OBJECTIVE_SPECS_BY_FAMILY.values()
+        for spec in specs
+    }
+    return {str(key): float(spec_by_utility[str(key)].weight) for key in target_keys if str(key) in spec_by_utility}
 
 
 def _finite_positive(value: object) -> float:

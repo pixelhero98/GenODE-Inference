@@ -44,9 +44,13 @@ from genode.gipo.models import (
     validate_time_grid,
 )
 from genode.gipo.objectives import (
+    CONDITIONAL_METRIC_SPECS,
     DEFAULT_REWARD_EPS,
     FORECAST_METRIC_SPECS,
+    MOLECULE_METRIC_SPECS,
+    MetricObjectiveSpec,
     UNIFORM_SCHEDULE_KEY,
+    objective_weight_map_for_keys,
     uniform_anchored_objective_columns,
 )
 from genode.gipo.schedule_hash import json_hash as _canonical_json_hash
@@ -81,6 +85,8 @@ CONDITIONING_STYLE_ADDITIVE_MLP = "additive_mlp"
 DENSITY_TOKEN_ATTENTION_ROPE = "bin_self_attention_rope"
 TEACHER_OUTPUT_METRIC_VECTOR = "metric_vector"
 TEACHER_SCALARIZATION_WEIGHTED_AVERAGE = "weighted_metric_average"
+TEACHER_METRIC_TARGET_PROTOCOL_VECTOR = "family_metric_utility_vector"
+TEACHER_METRIC_MASK_PROTOCOL = "row_valid_component_mask"
 DEFAULT_TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = ("u_comp_uniform",)
 TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = DEFAULT_TEACHER_METRIC_TARGET_KEYS
 TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET = "weighted_normalized_regret"
@@ -163,6 +169,12 @@ def validate_gipo_teacher_training_metadata(metadata: Mapping[str, Any] | None) 
     return {
         "teacher_target": teacher_target,
         "teacher_metric_targets": teacher_metric_targets,
+        "teacher_metric_target_protocol": str(
+            teacher_training.get("teacher_metric_target_protocol", TEACHER_METRIC_TARGET_PROTOCOL_VECTOR)
+        ),
+        "teacher_metric_mask_protocol": str(
+            teacher_training.get("teacher_metric_mask_protocol", TEACHER_METRIC_MASK_PROTOCOL)
+        ),
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_checkpoint_selection": selection,
     }
@@ -197,6 +209,16 @@ def validate_gipo_teacher_output(model_config: Mapping[str, Any] | None, *, requ
     if scalarization != TEACHER_SCALARIZATION_WEIGHTED_AVERAGE:
         raise ValueError(
             f"GIPO teacher scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE!r}; got {scalarization!r}."
+        )
+    target_protocol = str(model_config.get("teacher_metric_target_protocol", TEACHER_METRIC_TARGET_PROTOCOL_VECTOR))
+    if target_protocol != TEACHER_METRIC_TARGET_PROTOCOL_VECTOR:
+        raise ValueError(
+            f"GIPO teacher metric target protocol must be {TEACHER_METRIC_TARGET_PROTOCOL_VECTOR!r}; got {target_protocol!r}."
+        )
+    mask_protocol = str(model_config.get("teacher_metric_mask_protocol", TEACHER_METRIC_MASK_PROTOCOL))
+    if mask_protocol != TEACHER_METRIC_MASK_PROTOCOL:
+        raise ValueError(
+            f"GIPO teacher metric mask protocol must be {TEACHER_METRIC_MASK_PROTOCOL!r}; got {mask_protocol!r}."
         )
     return output
 
@@ -260,6 +282,7 @@ def normalize_teacher_utility_weights(
 ) -> Dict[str, float]:
     keys = validate_teacher_metric_target_keys(target_keys)
     raw = dict(weights or {})
+    default_weights = objective_weight_map_for_keys(keys)
     values: List[float] = []
     for key in keys:
         alias = _metric_weight_alias(key)
@@ -272,7 +295,7 @@ def normalize_teacher_utility_weights(
         elif f"{alias}_weight" in raw:
             value = float(raw[f"{alias}_weight"])
         else:
-            value = 1.0
+            value = float(default_weights.get(key, 1.0))
         if not math.isfinite(value) or value < 0.0:
             raise ValueError("teacher utility weights must be finite and nonnegative.")
         values.append(value)
@@ -815,6 +838,14 @@ def attach_uniform_gipo_rewards(
                     **reward_columns,
                     "u_comp_crps_weight": float(crps_weight),
                     "u_comp_mase_weight": float(mase_weight),
+                    "reward_metric_weights_json": json.dumps(
+                        {
+                            "u_crps_uniform": float(crps_weight),
+                            "u_mase_uniform": float(mase_weight),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                     "u_comp_uniform": float(crps_weight * u_crps + mase_weight * u_mase),
                 }
             )
@@ -1324,6 +1355,8 @@ class _DensityConditioningMixin:
                 {
                     "teacher_output": TEACHER_OUTPUT_METRIC_VECTOR,
                     "teacher_metric_targets": list(self.teacher_metric_targets),
+                    "teacher_metric_target_protocol": TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
+                    "teacher_metric_mask_protocol": TEACHER_METRIC_MASK_PROTOCOL,
                     "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
                 }
             )
@@ -1608,6 +1641,77 @@ def _student_architecture(model: nn.Module) -> str:
     return validate_gipo_architecture(str(getattr(model, "architecture", "")), role="student")
 
 
+def _teacher_target_spec_by_utility() -> Dict[str, MetricObjectiveSpec]:
+    return {
+        spec.utility_key: spec
+        for specs in (FORECAST_METRIC_SPECS, CONDITIONAL_METRIC_SPECS, MOLECULE_METRIC_SPECS)
+        for spec in specs
+    }
+
+
+def _truthy_row_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _finite_target_value(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    return val if math.isfinite(val) else None
+
+
+def _target_component_applicable(row: MetricRow, target_key: str) -> bool:
+    spec = _teacher_target_spec_by_utility().get(str(target_key))
+    if spec is None or not spec.applicable_key:
+        return True
+    value = row.get(spec.applicable_key)
+    if value in (None, ""):
+        return False
+    return _truthy_row_value(value)
+
+
+def _row_reward_metric_weights(row: MetricRow, target_keys: Sequence[str]) -> Dict[str, float]:
+    raw = row.get("reward_metric_weights_json", "")
+    if raw in (None, ""):
+        return {}
+    try:
+        payload = json.loads(str(raw))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid reward_metric_weights_json for context {context_id_from_row(row)!r}.") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("reward_metric_weights_json must decode to an object.")
+    out: Dict[str, float] = {}
+    for key in validate_teacher_metric_target_keys(target_keys):
+        alias = _metric_weight_alias(key)
+        if key in payload:
+            value = float(payload[key])
+        elif alias in payload:
+            value = float(payload[alias])
+        else:
+            continue
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("reward_metric_weights_json values must be finite and nonnegative.")
+        out[key] = value
+    return out
+
+
+def _masked_normalize_teacher_weights(raw_weights: torch.Tensor, target_mask: torch.Tensor | None) -> torch.Tensor:
+    weights = raw_weights
+    if target_mask is not None:
+        if target_mask.shape != raw_weights.shape:
+            raise ValueError("Teacher target mask must match metric weight shape.")
+        weights = raw_weights * target_mask.to(device=raw_weights.device, dtype=raw_weights.dtype)
+    denom = torch.sum(weights, dim=-1, keepdim=True)
+    if bool(torch.any(denom <= 0.0).detach().cpu().item()):
+        raise ValueError("Each teacher target row must have at least one positive-weight valid metric component.")
+    return weights / denom
+
+
 def _teacher_metric_weights(
     rows: Sequence[MetricRow] | None,
     *,
@@ -1616,52 +1720,83 @@ def _teacher_metric_weights(
     device: torch.device,
     dtype: torch.dtype,
     teacher_utility_weights: Mapping[str, float] | None = None,
+    target_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     keys = validate_teacher_metric_target_keys(target_keys)
-    if teacher_utility_weights is not None:
-        normalized = normalize_teacher_utility_weights(keys, teacher_utility_weights)
-        weights = np.tile(np.asarray([normalized[key] for key in keys], dtype=np.float32), (int(batch), 1))
-    elif rows is None:
-        normalized = normalize_teacher_utility_weights(keys)
-        weights = np.tile(np.asarray([normalized[key] for key in keys], dtype=np.float32), (int(batch), 1))
-    else:
+    if rows is not None:
         if len(rows) != int(batch):
             raise ValueError("Teacher scalarization rows must match the score batch length.")
         values: List[List[float]] = []
+        default_weights = objective_weight_map_for_keys(keys)
+        explicit_weights = normalize_teacher_utility_weights(keys, teacher_utility_weights) if teacher_utility_weights is not None else {}
         for row in rows:
-            row_weights: Dict[str, float] = {}
-            for key in keys:
-                alias = _metric_weight_alias(key)
-                row_weights[key] = float(
-                    row.get(
-                        f"{key}_weight",
+            reward_weights = _row_reward_metric_weights(row, keys)
+            if reward_weights:
+                row_weights = {key: float(reward_weights.get(key, 0.0)) for key in keys}
+            elif explicit_weights:
+                row_weights = {key: float(explicit_weights[key]) for key in keys}
+            else:
+                row_weights = {}
+                for key in keys:
+                    alias = _metric_weight_alias(key)
+                    row_weights[key] = float(
                         row.get(
-                            f"{alias}_weight",
-                            row.get(f"u_comp_{alias}_weight", 1.0),
-                        ),
+                            f"{key}_weight",
+                            row.get(
+                                f"{alias}_weight",
+                                row.get(f"u_comp_{alias}_weight", default_weights.get(key, 1.0)),
+                            ),
+                        )
                     )
-                )
-            normalized = normalize_teacher_utility_weights(
-                keys,
-                row_weights,
-            )
-            values.append([normalized[key] for key in keys])
-        weights = np.asarray(values, dtype=np.float32)
-    return torch.tensor(weights, dtype=dtype, device=device)
+            values.append([float(row_weights[key]) for key in keys])
+        raw_weights = np.asarray(values, dtype=np.float32)
+    elif teacher_utility_weights is not None:
+        normalized = normalize_teacher_utility_weights(keys, teacher_utility_weights)
+        raw_weights = np.tile(np.asarray([normalized[key] for key in keys], dtype=np.float32), (int(batch), 1))
+    else:
+        normalized = normalize_teacher_utility_weights(keys)
+        raw_weights = np.tile(np.asarray([normalized[key] for key in keys], dtype=np.float32), (int(batch), 1))
+    weights_tensor = torch.tensor(raw_weights, dtype=dtype, device=device)
+    return _masked_normalize_teacher_weights(weights_tensor, target_mask)
 
 
-def _teacher_metric_targets(rows: Sequence[MetricRow], *, target_keys: Sequence[str], device: torch.device | str) -> torch.Tensor:
+def _teacher_metric_targets(
+    rows: Sequence[MetricRow],
+    *,
+    target_keys: Sequence[str],
+    device: torch.device | str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     keys = validate_teacher_metric_target_keys(target_keys)
     values: List[Tuple[float, ...]] = []
+    masks: List[Tuple[float, ...]] = []
     for row in rows:
-        missing = [key for key in keys if key not in row]
-        if missing:
-            raise ValueError(f"Teacher metric target row is missing utility columns: {missing}")
-        values.append(tuple(float(row[key]) for key in keys))  # type: ignore[arg-type]
-    return torch.tensor(np.asarray(values, dtype=np.float32), dtype=torch.float32, device=device)
+        row_values: List[float] = []
+        row_mask: List[float] = []
+        for key in keys:
+            value = _finite_target_value(row.get(key))
+            valid = value is not None and _target_component_applicable(row, key)
+            row_values.append(float(value) if valid else 0.0)
+            row_mask.append(1.0 if valid else 0.0)
+        if not any(mask > 0.0 for mask in row_mask):
+            raise ValueError(
+                "Teacher metric target row has no valid utility components "
+                f"for context={context_id_from_row(row)!r}, scheduler={row.get('scheduler_key')!r}."
+            )
+        values.append(tuple(row_values))
+        masks.append(tuple(row_mask))
+    return (
+        torch.tensor(np.asarray(values, dtype=np.float32), dtype=torch.float32, device=device),
+        torch.tensor(np.asarray(masks, dtype=np.float32), dtype=torch.float32, device=device),
+    )
 
 
-def _scalarize_teacher_metric_values(values: torch.Tensor, weights: torch.Tensor, *, target_keys: Sequence[str]) -> torch.Tensor:
+def _scalarize_teacher_metric_values(
+    values: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    target_keys: Sequence[str],
+    target_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     expected = len(validate_teacher_metric_target_keys(target_keys))
     if values.ndim != 2 or values.shape[-1] != expected:
         raise ValueError(
@@ -1669,7 +1804,30 @@ def _scalarize_teacher_metric_values(values: torch.Tensor, weights: torch.Tensor
         )
     if weights.shape != values.shape:
         raise ValueError("Teacher metric scalarization weights must match metric score shape.")
-    return torch.sum(values * weights.to(device=values.device, dtype=values.dtype), dim=-1)
+    normalized = _masked_normalize_teacher_weights(weights.to(device=values.device, dtype=values.dtype), target_mask)
+    return torch.sum(values * normalized, dim=-1)
+
+
+def _masked_smooth_l1_loss(pred: torch.Tensor, target: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
+    if pred.shape != target.shape or target_mask.shape != target.shape:
+        raise ValueError("Masked teacher regression tensors must have matching shapes.")
+    loss = F.smooth_l1_loss(pred, target, reduction="none") * target_mask.to(device=pred.device, dtype=pred.dtype)
+    denom = torch.sum(target_mask.to(device=pred.device, dtype=pred.dtype))
+    if bool((denom <= 0.0).detach().cpu().item()):
+        raise ValueError("Teacher regression mask has no valid components.")
+    return torch.sum(loss) / denom
+
+
+def _masked_metric_huber_values(pred: torch.Tensor, target: torch.Tensor, target_mask: torch.Tensor) -> List[float | None]:
+    if pred.shape != target.shape or target_mask.shape != target.shape:
+        raise ValueError("Masked teacher regression tensors must have matching shapes.")
+    loss = F.smooth_l1_loss(pred, target, reduction="none") * target_mask.to(device=pred.device, dtype=pred.dtype)
+    counts = torch.sum(target_mask.to(device=pred.device, dtype=pred.dtype), dim=0)
+    totals = torch.sum(loss, dim=0)
+    out: List[float | None] = []
+    for total, count in zip(totals.detach().cpu().tolist(), counts.detach().cpu().tolist()):
+        out.append(None if float(count) <= 0.0 else float(total) / float(count))
+    return out
 
 
 def teacher_metric_target_keys_for_model(teacher: nn.Module) -> Tuple[str, ...]:
@@ -1724,6 +1882,9 @@ def _teacher_scores(
         context_embedding_batch,
         rows=rows,
     )
+    target_mask = None
+    if rows is not None:
+        _, target_mask = _teacher_metric_targets(rows, target_keys=target_keys, device=metric_scores.device)
     weights = _teacher_metric_weights(
         rows,
         target_keys=target_keys,
@@ -1731,8 +1892,9 @@ def _teacher_scores(
         device=metric_scores.device,
         dtype=metric_scores.dtype,
         teacher_utility_weights=teacher_utility_weights,
+        target_mask=target_mask,
     )
-    return _scalarize_teacher_metric_values(metric_scores, weights, target_keys=target_keys)
+    return _scalarize_teacher_metric_values(metric_scores, weights, target_keys=target_keys, target_mask=target_mask)
 
 
 def _student_logits(
@@ -1857,7 +2019,7 @@ def _teacher_training_tensors(
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     teacher_metric_target_keys: Sequence[str] = TEACHER_METRIC_TARGET_KEYS,
     seed: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[ContextPairKey], List[str], List[Tuple[float, ...]]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[ContextPairKey], List[str], List[Tuple[float, ...]]]:
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     setting_rows: List[torch.Tensor] = []
@@ -1881,12 +2043,14 @@ def _teacher_training_tensors(
         pair_keys.append(context_pair_key(row, pair_on_seed=True))
         schedule_keys.append(str(row["scheduler_key"]))
         density_masses.append(mass)
+    metric_targets, metric_target_mask = _teacher_metric_targets(rows, target_keys=teacher_metric_target_keys, device=device)
     return (
         torch.stack(setting_rows, dim=0).to(device=device),
         torch.tensor(np.stack(density_rows, axis=0), dtype=torch.float32, device=device),
         torch.tensor(series_rows, dtype=torch.long, device=device),
         torch.tensor(np.stack(context_rows, axis=0), dtype=torch.float32, device=device),
-        _teacher_metric_targets(rows, target_keys=teacher_metric_target_keys, device=device),
+        metric_targets,
+        metric_target_mask,
         pair_keys,
         schedule_keys,
         density_masses,
@@ -1979,7 +2143,7 @@ def gipo_teacher_diagnostics(
     was_training = bool(teacher.training)
     teacher.eval()
     with torch.no_grad():
-        sx, dx, series_idx, cx, metric_targets, pair_keys, schedule_keys, _ = _teacher_training_tensors(
+        sx, dx, series_idx, cx, metric_targets, metric_target_mask, pair_keys, schedule_keys, _ = _teacher_training_tensors(
             rows,
             context_embeddings=context_embeddings,
             series_index_map=series_index_map,
@@ -1998,15 +2162,26 @@ def gipo_teacher_diagnostics(
             device=sx.device,
             dtype=metric_targets.dtype,
             teacher_utility_weights=teacher_utility_weights,
+            target_mask=metric_target_mask,
         )
-        targets = _scalarize_teacher_metric_values(metric_targets, target_weights, target_keys=teacher_metric_target_keys)
+        targets = _scalarize_teacher_metric_values(
+            metric_targets,
+            target_weights,
+            target_keys=teacher_metric_target_keys,
+            target_mask=metric_target_mask,
+        )
         if not pair_on_seed:
             pair_keys = [key[:4] + (None,) for key in pair_keys]
         rank_left, rank_right, rank_sign = _pair_indices(targets, pair_keys, margin=float(pair_margin), device=sx.device)
         metric_pred = _teacher_metric_scores(teacher, sx, dx, series_idx, cx, rows=rows)
-        pred = _scalarize_teacher_metric_values(metric_pred, target_weights, target_keys=teacher_metric_target_keys)
+        pred = _scalarize_teacher_metric_values(
+            metric_pred,
+            target_weights,
+            target_keys=teacher_metric_target_keys,
+            target_mask=metric_target_mask,
+        )
         rank = pairwise_rank_loss(pred, rank_left, rank_right, rank_sign, temperature=float(rank_temperature))
-        huber = F.smooth_l1_loss(metric_pred, metric_targets)
+        huber = _masked_smooth_l1_loss(metric_pred, metric_targets, metric_target_mask)
         total = rank + float(regression_weight) * huber
         if rank_left.numel() > 0:
             predicted_sign = torch.sign(pred[rank_left] - pred[rank_right])
@@ -2015,7 +2190,7 @@ def gipo_teacher_diagnostics(
             pairwise_accuracy = None
         pred_values = [float(value) for value in pred.detach().cpu().tolist()]
         target_values = [float(value) for value in targets.detach().cpu().tolist()]
-        metric_huber_values = F.smooth_l1_loss(metric_pred, metric_targets, reduction="none").mean(dim=0).detach().cpu().tolist()
+        metric_huber_values = _masked_metric_huber_values(metric_pred, metric_targets, metric_target_mask)
     if was_training:
         teacher.train()
 
@@ -2119,7 +2294,7 @@ def gipo_teacher_diagnostics(
             "rank_loss": float(rank.detach().cpu().item()),
             "huber_loss": float(huber.detach().cpu().item()),
             **{
-                f"metric_huber_loss_{_metric_weight_alias(key)}": float(value)
+                f"metric_huber_loss_{_metric_weight_alias(key)}": (None if value is None else float(value))
                 for key, value in zip(teacher_metric_target_keys, metric_huber_values)
             },
             "total_loss": float(total.detach().cpu().item()),
@@ -2438,7 +2613,7 @@ def train_gipo_teacher(
     selection_mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
     selection_temperature = DEFAULT_TEACHER_TARGET_TEMPERATURE
     teacher.to(device)
-    sx, dx, series_idx, cx, metric_targets, pair_keys, _, _ = _teacher_training_tensors(
+    sx, dx, series_idx, cx, metric_targets, metric_target_mask, pair_keys, _, _ = _teacher_training_tensors(
         rows,
         context_embeddings=context_embeddings,
         series_index_map=series_index_map,
@@ -2458,8 +2633,14 @@ def train_gipo_teacher(
         device=sx.device,
         dtype=metric_targets.dtype,
         teacher_utility_weights=teacher_utility_weights,
+        target_mask=metric_target_mask,
     )
-    targets = _scalarize_teacher_metric_values(metric_targets, target_weights, target_keys=teacher_metric_target_keys)
+    targets = _scalarize_teacher_metric_values(
+        metric_targets,
+        target_weights,
+        target_keys=teacher_metric_target_keys,
+        target_mask=metric_target_mask,
+    )
     if not pair_on_seed:
         pair_keys = [key[:4] + (None,) for key in pair_keys]
     left, right, sign = _pair_indices(targets, pair_keys, margin=float(pair_margin), device=sx.device)
@@ -2478,9 +2659,14 @@ def train_gipo_teacher(
     checkpoint_every = max(1, int(teacher_checkpoint_every))
     for step in range(int(steps)):
         metric_pred = _teacher_metric_scores(teacher, sx, dx, series_idx, cx, rows=rows)
-        pred = _scalarize_teacher_metric_values(metric_pred, target_weights, target_keys=teacher_metric_target_keys)
+        pred = _scalarize_teacher_metric_values(
+            metric_pred,
+            target_weights,
+            target_keys=teacher_metric_target_keys,
+            target_mask=metric_target_mask,
+        )
         rank = pairwise_rank_loss(pred, left, right, sign, temperature=float(rank_temperature))
-        huber = F.smooth_l1_loss(metric_pred, metric_targets)
+        huber = _masked_smooth_l1_loss(metric_pred, metric_targets, metric_target_mask)
         loss = rank + float(regression_weight) * huber
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -2563,6 +2749,8 @@ def train_gipo_teacher(
         "teacher_objective": "pairwise_rank_plus_huber_regression",
         "teacher_target": "metric_vector",
         "teacher_metric_targets": list(teacher_metric_target_keys),
+        "teacher_metric_target_protocol": TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
+        "teacher_metric_mask_protocol": TEACHER_METRIC_MASK_PROTOCOL,
         "teacher_scalar_target": "weighted_metric_utility",
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_utility_weights": teacher_utility_weights_for_summary(
@@ -2658,6 +2846,7 @@ def build_teacher_weighted_density_targets(
         score_series.append(0)
         score_context.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
     with torch.no_grad():
+        _, metric_score_mask = _teacher_metric_targets(rows, target_keys=teacher_metric_target_keys, device=device)
         metric_score_values = _teacher_metric_scores(
             teacher,
             torch.stack(score_settings, dim=0).to(device=device),
@@ -2673,8 +2862,14 @@ def build_teacher_weighted_density_targets(
             device=metric_score_values.device,
             dtype=metric_score_values.dtype,
             teacher_utility_weights=teacher_utility_weights,
+            target_mask=metric_score_mask,
         )
-        score_values = _scalarize_teacher_metric_values(metric_score_values, score_weights, target_keys=teacher_metric_target_keys)
+        score_values = _scalarize_teacher_metric_values(
+            metric_score_values,
+            score_weights,
+            target_keys=teacher_metric_target_keys,
+            target_mask=metric_score_mask,
+        )
     utility_by_row_id = {
         id(row): float(value)
         for row, value in zip(rows, score_values.detach().cpu().tolist())
@@ -2727,6 +2922,8 @@ def build_teacher_weighted_density_targets(
         "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
         "teacher_output": TEACHER_OUTPUT_METRIC_VECTOR,
         "teacher_metric_targets": list(teacher_metric_target_keys),
+        "teacher_metric_target_protocol": TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
+        "teacher_metric_mask_protocol": TEACHER_METRIC_MASK_PROTOCOL,
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_utility_weights": teacher_utility_weights_for_summary(
             teacher_metric_target_keys,
@@ -3240,6 +3437,8 @@ __all__ = [
     "SERIES_CONDITIONING_NONE_CONTEXT_ONLY",
     "STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE",
     "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET",
+    "TEACHER_METRIC_MASK_PROTOCOL",
+    "TEACHER_METRIC_TARGET_PROTOCOL_VECTOR",
     "GIPODensityFormTeacherTransformer",
     "GIPODensityQueryStudentTransformer",
     "DensityFeatureNormalizer",

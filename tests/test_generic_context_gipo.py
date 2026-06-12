@@ -5,14 +5,36 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import torch
+
 from genode.evaluation import diffusion_flow_time_reparameterization as runner
 from genode.evaluation.otflow_evaluation_support import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
+from genode.gipo import evaluate_schedule_summary
 from genode.gipo.evaluate_schedule_summary import build_comparison_summary
-from genode.gipo.objectives import CONDITIONAL_METRIC_SPECS, MOLECULE_METRIC_SPECS, uniform_anchored_objective_columns
-from genode.gipo.policy import GIPO_PROTOCOL, context_embedding_id_from_row, read_metric_rows_csv, stable_context_id
+from genode.gipo.objectives import (
+    CONDITIONAL_METRIC_SPECS,
+    FORECAST_METRIC_SPECS,
+    MOLECULE_METRIC_SPECS,
+    uniform_anchored_objective_columns,
+)
+from genode.gipo.policy import (
+    GIPO_PROTOCOL,
+    _scalarize_teacher_metric_values,
+    _teacher_metric_targets,
+    _teacher_metric_weights,
+    context_embedding_id_from_row,
+    read_metric_rows_csv,
+    stable_context_id,
+)
 from genode.gipo import report_locked_test
 from genode.pipeline import full_pipeline
-from genode.gipo.train_gipo import _merge_embedding_tables_guarded, _resolve_teacher_metric_target_keys, _validate_support_group_counts
+from genode.gipo.train_gipo import (
+    _merge_embedding_tables_guarded,
+    _resolve_teacher_metric_target_keys,
+    _validate_context_embedding_checkpoint_scope,
+    _validate_support_group_counts,
+    _validate_unique_schedule_rows,
+)
 
 
 class GenericContextGipoTests(unittest.TestCase):
@@ -261,7 +283,97 @@ class GenericContextGipoTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _validate_support_group_counts([row], ["late_power_3"])
 
-    def test_nonforecast_rows_default_to_composite_utility_target(self) -> None:
+    def test_duplicate_exact_schedule_rows_are_rejected(self) -> None:
+        row = {
+            "dataset": "lobster_synthetic",
+            "split_phase": "train_tuning",
+            "seed": 0,
+            "solver_key": "euler",
+            "target_nfe": 4,
+            "context_id": "ctx",
+            "series_id": "series",
+            "scheduler_key": "uniform",
+        }
+        with self.assertRaisesRegex(ValueError, "duplicate schedule rows"):
+            _validate_unique_schedule_rows([row, dict(row)], label="test")
+
+        other_checkpoint = dict(row, checkpoint_id="ckpt_b")
+        base_checkpoint = dict(row, checkpoint_id="ckpt_a")
+        _validate_unique_schedule_rows([base_checkpoint, other_checkpoint], label="test")
+
+    def test_checkpoint_scoped_embedding_id_is_required_when_checkpoint_id_present(self) -> None:
+        good = {"checkpoint_id": "ckpt_a", "context_id": "ctx", "context_embedding_id": "ckpt_a:ctx"}
+        _validate_context_embedding_checkpoint_scope([good], label="test")
+        bad = {"checkpoint_id": "ckpt_b", "context_id": "ctx", "context_embedding_id": "ckpt_a:ctx"}
+        with self.assertRaisesRegex(ValueError, "checkpoint-scoped"):
+            _validate_context_embedding_checkpoint_scope([bad], label="test")
+
+    def test_duplicate_context_row_signatures_are_rejected_on_load(self) -> None:
+        row = {field: "" for field in runner.CONTEXT_ROW_FIELDS}
+        row.update({"row_signature": "sig", "context_id": "ctx", "context_embedding_id": "ckpt:ctx"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "context_rows.csv"
+            runner._write_context_row_csv(path, [row, dict(row)])
+            with self.assertRaisesRegex(ValueError, "Duplicate context row signature"):
+                runner._load_context_rows(path)
+            with self.assertRaisesRegex(ValueError, "Duplicate context row signature"):
+                evaluate_schedule_summary._load_context_rows(path)
+
+    def test_masked_teacher_targets_and_scalarization_match_composite(self) -> None:
+        row = {
+            "context_id": "ctx",
+            "scheduler_key": "late_power_3",
+            "u_temporal_cw1_uniform": 0.2,
+            "u_temporal_uw1_uniform": 0.6,
+            "u_temporal_tstr_f1_uniform": "",
+            "temporal_tstr_f1_applicable": "false",
+            "reward_metric_weights_json": '{"u_temporal_cw1_uniform":0.5,"u_temporal_uw1_uniform":0.5}',
+            "u_comp_uniform": 0.4,
+        }
+        target_keys = tuple(spec.utility_key for spec in CONDITIONAL_METRIC_SPECS[:3])
+        values, mask = _teacher_metric_targets([row], target_keys=target_keys, device="cpu")
+        self.assertEqual(mask.tolist(), [[1.0, 1.0, 0.0]])
+        weights = _teacher_metric_weights([row], target_keys=target_keys, batch=1, device=torch.device("cpu"), dtype=torch.float32, target_mask=mask)
+        scalar = _scalarize_teacher_metric_values(values, weights, target_keys=target_keys, target_mask=mask)
+        self.assertAlmostEqual(float(scalar.item()), float(row["u_comp_uniform"]))
+
+    def test_masked_teacher_scalarization_renormalizes_available_components(self) -> None:
+        target_keys = ("u_temporal_cw1_uniform", "u_temporal_uw1_uniform")
+        values = torch.tensor([[2.0, 10.0]], dtype=torch.float32)
+        mask = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+        raw_weights = torch.tensor([[0.8, 0.2]], dtype=torch.float32)
+        scalar = _scalarize_teacher_metric_values(values, raw_weights, target_keys=target_keys, target_mask=mask)
+        self.assertAlmostEqual(float(scalar.item()), 2.0)
+
+    def test_row_reward_weights_override_explicit_teacher_weights(self) -> None:
+        row = {
+            "context_id": "ctx",
+            "scheduler_key": "late_power_3",
+            "u_temporal_cw1_uniform": 1.0,
+            "u_temporal_uw1_uniform": 3.0,
+            "reward_metric_weights_json": '{"u_temporal_cw1_uniform":0.25,"u_temporal_uw1_uniform":0.75}',
+        }
+        target_keys = ("u_temporal_cw1_uniform", "u_temporal_uw1_uniform")
+        values, mask = _teacher_metric_targets([row], target_keys=target_keys, device="cpu")
+        weights = _teacher_metric_weights(
+            [row],
+            target_keys=target_keys,
+            batch=1,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            teacher_utility_weights={"u_temporal_cw1_uniform": 1.0, "u_temporal_uw1_uniform": 0.0},
+            target_mask=mask,
+        )
+        scalar = _scalarize_teacher_metric_values(values, weights, target_keys=target_keys, target_mask=mask)
+        self.assertAlmostEqual(float(scalar.item()), 2.5)
+
+    def test_schedule_summary_context_embedding_collisions_are_rejected(self) -> None:
+        embeddings = {"ckpt:ctx": [0.0, 1.0]}
+        evaluate_schedule_summary._merge_context_embeddings_checked(embeddings, {"ckpt:ctx": [0.0, 1.0]})
+        with self.assertRaisesRegex(ValueError, "Context embedding collision"):
+            evaluate_schedule_summary._merge_context_embeddings_checked(embeddings, {"ckpt:ctx": [1.0, 0.0]})
+
+    def test_explicit_teacher_target_keys_are_preserved(self) -> None:
         args = argparse.Namespace(teacher_metric_target_keys="u_crps_uniform,u_mase_uniform")
         rows = [
             {
@@ -272,10 +384,10 @@ class GenericContextGipoTests(unittest.TestCase):
                 "u_comp_uniform": "0.0",
             }
         ]
-        self.assertEqual(_resolve_teacher_metric_target_keys(args, rows), ("u_comp_uniform",))
+        self.assertEqual(_resolve_teacher_metric_target_keys(args, rows), ("u_crps_uniform", "u_mase_uniform"))
 
-    def test_csv_roundtrip_blank_forecast_columns_still_uses_composite_target(self) -> None:
-        args = argparse.Namespace(teacher_metric_target_keys="u_crps_uniform,u_mase_uniform")
+    def test_auto_teacher_target_keys_are_family_vectors_after_csv_roundtrip(self) -> None:
+        args = argparse.Namespace(teacher_metric_target_keys="auto")
         row = {field: "" for field in runner.CONTEXT_ROW_FIELDS}
         row.update(
             {
@@ -294,7 +406,22 @@ class GenericContextGipoTests(unittest.TestCase):
             path = Path(tmpdir) / "context_rows.csv"
             runner._write_context_row_csv(path, [row])
             loaded = read_metric_rows_csv(path)
-        self.assertEqual(_resolve_teacher_metric_target_keys(args, loaded), ("u_comp_uniform",))
+        self.assertEqual(_resolve_teacher_metric_target_keys(args, loaded), tuple(spec.utility_key for spec in CONDITIONAL_METRIC_SPECS))
+
+    def test_auto_teacher_target_keys_cover_all_families(self) -> None:
+        args = argparse.Namespace(teacher_metric_target_keys="auto")
+        self.assertEqual(
+            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": FORECAST_FAMILY, "dataset": "solar_energy_10m"}]),
+            tuple(spec.utility_key for spec in FORECAST_METRIC_SPECS),
+        )
+        self.assertEqual(
+            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": CONDITIONAL_GENERATION_FAMILY, "dataset": "lobster_synthetic"}]),
+            tuple(spec.utility_key for spec in CONDITIONAL_METRIC_SPECS),
+        )
+        self.assertEqual(
+            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": "molecule_3d_coordinate_generation", "dataset": "molecule_3d_set1"}]),
+            tuple(spec.utility_key for spec in MOLECULE_METRIC_SPECS),
+        )
 
     def test_reporter_family_detection_and_conditional_aggregation(self) -> None:
         rows = [
@@ -445,9 +572,45 @@ class GenericContextGipoTests(unittest.TestCase):
         pseudo = " ".join(by_stage["gipo_student_seen_plus_unseen_pseudo"])
         self.assertNotIn("--teacher_unseen_selection_rows_csv", zero_shot)
         self.assertNotIn("--teacher_unseen_selection_context_embeddings_npz", zero_shot)
-        self.assertIn("--teacher_metric_target_keys u_comp_uniform", zero_shot)
+        self.assertIn("--teacher_metric_target_keys u_temporal_cw1_uniform,u_temporal_uw1_uniform,u_temporal_tstr_f1_uniform", zero_shot)
         self.assertIn("--student_pseudo_rows_csv", pseudo)
-        self.assertIn("--teacher_metric_target_keys u_comp_uniform", pseudo)
+        self.assertIn("--teacher_metric_target_keys u_temporal_cw1_uniform,u_temporal_uw1_uniform,u_temporal_tstr_f1_uniform", pseudo)
+        self.assertIn("--teacher_utility_weights", pseudo)
+
+    def _dry_run_gipo_commands_for_scenario(self, scenario_key: str) -> str:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    scenario_key,
+                    "--run_root",
+                    str(Path(tmpdir) / "run"),
+                    "--stages",
+                    "gipo_student_seen_only_zero_shot,gipo_student_seen_plus_unseen_pseudo",
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+        return " ".join(" ".join(command) for stage in summary["stages"] for command in stage["commands"])
+
+    def test_full_pipeline_forecast_uses_forecast_teacher_target_vector(self) -> None:
+        commands = self._dry_run_gipo_commands_for_scenario("solar_energy_10m")
+        self.assertIn("--teacher_metric_target_keys u_crps_uniform,u_mase_uniform", commands)
+        self.assertNotIn("--teacher_metric_target_keys u_comp_uniform", commands)
+
+    def test_full_pipeline_conditional_uses_conditional_teacher_target_vector(self) -> None:
+        commands = self._dry_run_gipo_commands_for_scenario("lobster_synthetic")
+        expected = ",".join(spec.utility_key for spec in CONDITIONAL_METRIC_SPECS)
+        self.assertIn(f"--teacher_metric_target_keys {expected}", commands)
+        self.assertIn("u_temporal_cw1_uniform=0.4", commands)
+        self.assertNotIn("--teacher_metric_target_keys u_comp_uniform", commands)
+
+    def test_full_pipeline_molecule_uses_molecule_teacher_target_vector(self) -> None:
+        commands = self._dry_run_gipo_commands_for_scenario("molecule_3d_set1")
+        expected = ",".join(spec.utility_key for spec in MOLECULE_METRIC_SPECS)
+        self.assertIn(f"--teacher_metric_target_keys {expected}", commands)
+        self.assertIn("u_molecule_kabsch_rmsd_3d_uniform=0.4", commands)
+        self.assertNotIn("--teacher_metric_target_keys u_comp_uniform", commands)
 
 
 if __name__ == "__main__":

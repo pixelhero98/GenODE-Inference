@@ -35,6 +35,7 @@ from genode.data.otflow_paths import (
     project_root,
     resolve_project_path,
 )
+from genode.gipo.objectives import objective_specs_for_family
 
 PIPELINE_VERSION = "canonical_multi_family_gipo_pipeline"
 DEFAULT_STAGES = (
@@ -109,6 +110,18 @@ def _display_stage(entry: StageCommand) -> Dict[str, Any]:
         "manifest_name": entry.manifest_name,
         "commands": [_display_command(command) for command in entry.commands],
     }
+
+
+def _teacher_target_args_for_family(dataset: str) -> List[str]:
+    specs = objective_specs_for_family(scenario_family_for_key(str(dataset)))
+    target_keys = [str(spec.utility_key) for spec in specs]
+    weights = [f"{spec.utility_key}={float(spec.weight):g}" for spec in specs]
+    return [
+        "--teacher_metric_target_keys",
+        ",".join(target_keys),
+        "--teacher_utility_weights",
+        ",".join(weights),
+    ]
 
 
 def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
@@ -512,8 +525,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                         _ser_summary_list("seen"),
                         "--support_schedule_keys",
                         support_schedules,
-                        "--teacher_metric_target_keys",
-                        "u_comp_uniform",
+                        *_teacher_target_args_for_family(dataset),
                         "--context_sample_count",
                         int(args.context_sample_count),
                         "--out_dir",
@@ -537,8 +549,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                         _ser_summary_list("seen"),
                         "--support_schedule_keys",
                         support_schedules,
-                        "--teacher_metric_target_keys",
-                        "u_comp_uniform",
+                        *_teacher_target_args_for_family(dataset),
                         "--student_pseudo_rows_csv",
                         _csv_list("unseen", "train_tuning", "context_rows.csv"),
                         "--student_pseudo_context_embeddings_npz",

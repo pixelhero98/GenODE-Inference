@@ -14,9 +14,14 @@ from genode.canonical_experiment_layout import (
     CANONICAL_PSEUDO_TARGET_WEIGHT,
     CANONICAL_SEEN_NFES,
     CANONICAL_UNSEEN_NFES,
+    SCENARIO_FAMILY_CONDITIONAL_GENERATION,
+    SCENARIO_FAMILY_FORECAST,
+    SCENARIO_FAMILY_MOLECULE,
     STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
     STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO,
+    scenario_family_for_key,
 )
+from genode.gipo.objectives import objective_utility_keys_for_family
 from genode.gipo.policy import (
     GIPO_PROTOCOL,
     MODEL_PAYLOAD_VERSION,
@@ -24,6 +29,9 @@ from genode.gipo.policy import (
     DEFAULT_SUPPORT_SCHEDULE_KEYS,
     DEFAULT_TEACHER_TARGET_TEMPERATURE,
     STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
+    TEACHER_METRIC_MASK_PROTOCOL,
+    TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
+    TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
     DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS,
     DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS,
     TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
@@ -154,21 +162,40 @@ def _has_nonempty_value(row: Mapping[str, Any], key: str) -> bool:
     return True
 
 
+def _infer_single_benchmark_family(rows: Sequence[Mapping[str, Any]]) -> str:
+    families = {str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()}
+    if not families:
+        dataset_families = set()
+        for row in rows:
+            dataset = str(row.get("dataset", row.get("dataset_key", ""))).strip()
+            if not dataset:
+                continue
+            try:
+                dataset_families.add(scenario_family_for_key(dataset))
+            except ValueError:
+                pass
+        families = dataset_families
+    if not families:
+        if _rows_have_forecast_metrics(rows):
+            return SCENARIO_FAMILY_FORECAST
+        if any(_has_nonempty_value(row, key) for row in rows for key in objective_utility_keys_for_family(SCENARIO_FAMILY_CONDITIONAL_GENERATION)):
+            return SCENARIO_FAMILY_CONDITIONAL_GENERATION
+        if any(_has_nonempty_value(row, key) for row in rows for key in objective_utility_keys_for_family(SCENARIO_FAMILY_MOLECULE)):
+            return SCENARIO_FAMILY_MOLECULE
+        raise ValueError("Cannot infer benchmark_family for automatic GIPO teacher target selection.")
+    if len(families) != 1:
+        raise ValueError(f"GIPO training rows must contain exactly one benchmark_family; found {sorted(families)}.")
+    family = next(iter(families))
+    if family not in {SCENARIO_FAMILY_FORECAST, SCENARIO_FAMILY_CONDITIONAL_GENERATION, SCENARIO_FAMILY_MOLECULE}:
+        raise ValueError(f"Unsupported benchmark_family for GIPO teacher target selection: {family!r}.")
+    return family
+
+
 def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
-    requested = validate_teacher_metric_target_keys(str(args.teacher_metric_target_keys))
-    if requested == ("u_comp_uniform",):
-        return requested
-    has_forecast_utility = any(
-        _has_nonempty_value(row, "u_crps_uniform")
-        or _has_nonempty_value(row, "u_mase_uniform")
-        or _has_nonempty_value(row, "forecast_crps")
-        or _has_nonempty_value(row, "forecast_mase")
-        for row in rows
-    )
-    has_canonical_composite = any(_has_nonempty_value(row, "u_comp_uniform") for row in rows)
-    if has_canonical_composite and not has_forecast_utility:
-        return ("u_comp_uniform",)
-    return requested
+    raw = str(args.teacher_metric_target_keys).strip()
+    if not raw or raw.lower() == "auto":
+        return objective_utility_keys_for_family(_infer_single_benchmark_family(rows))
+    return validate_teacher_metric_target_keys(raw)
 
 
 def _rows_are_forecast_family(rows: Sequence[Mapping[str, Any]]) -> bool:
@@ -187,7 +214,7 @@ def _rows_have_forecast_metrics(rows: Sequence[Mapping[str, Any]]) -> bool:
 
 
 def _missing_target_value_keys(rows: Sequence[Mapping[str, Any]], target_keys: Sequence[str]) -> List[str]:
-    return sorted({key for key in target_keys if any(not _has_nonempty_value(row, key) for row in rows)})
+    return sorted({key for key in target_keys if all(not _has_nonempty_value(row, key) for row in rows)})
 
 
 def _needs_forecast_uniform_rewards(rows: Sequence[Mapping[str, Any]], target_keys: Sequence[str]) -> bool:
@@ -431,6 +458,37 @@ def _validate_support_group_counts(rows: Sequence[Mapping[str, Any]], support_sc
         )
 
 
+def _validate_unique_schedule_rows(rows: Sequence[Mapping[str, Any]], *, label: str) -> None:
+    counts: Dict[Tuple[Any, ...], int] = {}
+    for row in rows:
+        key = (*context_pair_key(row, pair_on_seed=True), str(row.get("checkpoint_id", "") or ""), str(row["scheduler_key"]))
+        counts[key] = int(counts.get(key, 0)) + 1
+    duplicates = {key: count for key, count in counts.items() if count != 1}
+    if duplicates:
+        first_key = next(iter(duplicates))
+        raise ValueError(
+            f"{label} contains duplicate schedule rows for exact "
+            "(dataset,solver_key,target_nfe,context_id,seed,checkpoint_id,scheduler_key) cells; "
+            f"first duplicate={first_key}, count={duplicates[first_key]}."
+        )
+
+
+def _validate_context_embedding_checkpoint_scope(rows: Sequence[Mapping[str, Any]], *, label: str) -> None:
+    mismatches: List[str] = []
+    for row in rows:
+        checkpoint_id = str(row.get("checkpoint_id", "") or "").strip()
+        if not checkpoint_id:
+            continue
+        embedding_id = context_embedding_id_from_row(row)
+        if not str(embedding_id).startswith(f"{checkpoint_id}:"):
+            mismatches.append(f"{checkpoint_id}->{embedding_id}")
+    if mismatches:
+        raise ValueError(
+            f"{label} requires checkpoint-scoped context_embedding_id values; "
+            f"first mismatches: {mismatches[:8]}."
+        )
+
+
 def _embedding_ids(rows: Sequence[Mapping[str, Any]]) -> set[str]:
     return {context_embedding_id_from_row(row) for row in rows}
 
@@ -561,8 +619,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher_utility_mase_weight", type=float, default=0.5)
     parser.add_argument(
         "--teacher_metric_target_keys",
-        default="u_comp_uniform",
-        help="Comma-separated utility columns predicted by the metric-vector teacher.",
+        default="auto",
+        help="Comma-separated utility columns predicted by the metric-vector teacher, or auto for family defaults.",
     )
     parser.add_argument(
         "--teacher_utility_weights",
@@ -598,6 +656,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     observed_source_phases = sorted({_source_split_phase(row) for row in rows if _source_split_phase(row)})
     if observed_source_phases and observed_source_phases != ["train_tuning"]:
         raise ValueError(f"GIPO training rows_csv must contain only train_tuning source rows; found {observed_source_phases}.")
+    _validate_unique_schedule_rows(rows, label="GIPO training rows_csv")
+    _validate_context_embedding_checkpoint_scope(rows, label="GIPO training rows_csv")
     validate_teacher_objective_hyperparameters(
         rank_temperature=CANONICAL_TEACHER_RANK_TEMPERATURE,
         regression_weight=CANONICAL_TEACHER_REGRESSION_WEIGHT,
@@ -638,8 +698,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             row["context_id"] = context_id_from_row(row)
     _validate_support_group_counts(rewarded_rows, support_keys)
     missing_metric_columns = _missing_target_value_keys(rewarded_rows, teacher_metric_target_keys)
-    if missing_metric_columns:
-        raise ValueError(f"GIPO rows are missing teacher metric target columns: {missing_metric_columns}")
+    if len(missing_metric_columns) == len(teacher_metric_target_keys):
+        raise ValueError(f"GIPO rows are missing all teacher metric target columns: {missing_metric_columns}")
     available_context_ids = sorted({context_id_from_row(row) for row in rewarded_rows})
     sample_count = int(args.context_sample_count)
     if sample_count <= 0:
@@ -673,6 +733,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         unseen_raw_rows = _read_metric_rows_csvs(str(args.teacher_unseen_selection_rows_csv))
         if not unseen_raw_rows:
             raise ValueError("teacher_unseen_selection_rows_csv contains no rows.")
+        _validate_unique_schedule_rows(unseen_raw_rows, label="Teacher unseen selection rows")
+        _validate_context_embedding_checkpoint_scope(unseen_raw_rows, label="Teacher unseen selection rows")
         unseen_locked_rows = [
             row
             for row in unseen_raw_rows
@@ -715,8 +777,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
                 row["context_id"] = context_id_from_row(row)
         _validate_support_group_counts(unseen_rewarded_rows, support_keys)
         missing_unseen_columns = _missing_target_value_keys(unseen_rewarded_rows, teacher_metric_target_keys)
-        if missing_unseen_columns:
-            raise ValueError(f"Teacher unseen selection rows are missing metric target columns: {missing_unseen_columns}")
+        if len(missing_unseen_columns) == len(teacher_metric_target_keys):
+            raise ValueError(f"Teacher unseen selection rows are missing all metric target columns: {missing_unseen_columns}")
         unseen_context_ids = set(
             sample_context_ids_stratified(
                 unseen_rewarded_rows,
@@ -810,6 +872,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         raw_pseudo_rows = _read_metric_rows_csvs(str(args.student_pseudo_rows_csv))
         if not raw_pseudo_rows:
             raise ValueError("student_pseudo_rows_csv contains no rows.")
+        _validate_unique_schedule_rows(raw_pseudo_rows, label="Student pseudo distillation rows")
+        _validate_context_embedding_checkpoint_scope(raw_pseudo_rows, label="Student pseudo distillation rows")
         _validate_train_tuning_rows(raw_pseudo_rows, label="Student pseudo distillation")
         pseudo_filtered_rows = _rows_for_target_nfes(raw_pseudo_rows, CANONICAL_UNSEEN_NFES)
         if not pseudo_filtered_rows:
@@ -879,6 +943,9 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         **transformer_model_config,
         "conditioning_style": conditioning_style,
         "teacher_metric_targets": list(teacher_metric_target_keys),
+        "teacher_metric_target_protocol": TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
+        "teacher_metric_mask_protocol": TEACHER_METRIC_MASK_PROTOCOL,
+        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
     }
     student_transformer_model_config = {
         **transformer_model_config,
@@ -924,6 +991,9 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "teacher_model_config": teacher_model_config,
         "student_model_config": student_model_config,
         "teacher_metric_targets": list(teacher_metric_target_keys),
+        "teacher_metric_target_protocol": TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
+        "teacher_metric_mask_protocol": TEACHER_METRIC_MASK_PROTOCOL,
+        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_utility_weights": teacher_utility_weights,
         "teacher_checkpoint_selection_mode": selection_mode,
         "teacher_selection_axis_weights": selection_component_weights,

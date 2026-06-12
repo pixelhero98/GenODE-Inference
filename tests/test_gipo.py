@@ -28,6 +28,8 @@ from genode.gipo.policy import (
     SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
     TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
     TEACHER_METRIC_TARGET_KEYS,
+    TEACHER_METRIC_MASK_PROTOCOL,
+    TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
     TEACHER_OUTPUT_METRIC_VECTOR,
     TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
     build_gipo_student_model,
@@ -41,6 +43,8 @@ def _teacher_training_payload() -> dict:
     return {
         "teacher_target": "metric_vector",
         "teacher_metric_targets": list(TEACHER_METRIC_TARGET_KEYS),
+        "teacher_metric_target_protocol": TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
+        "teacher_metric_mask_protocol": TEACHER_METRIC_MASK_PROTOCOL,
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_checkpoint_selection": {
             "selection_protocol": TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
@@ -257,6 +261,8 @@ class GIPOCanonicalTests(unittest.TestCase):
         config = teacher.model_config()
         self.assertEqual(config["teacher_output"], TEACHER_OUTPUT_METRIC_VECTOR)
         self.assertEqual(config["teacher_metric_targets"], list(TEACHER_METRIC_TARGET_KEYS))
+        self.assertEqual(config["teacher_metric_target_protocol"], TEACHER_METRIC_TARGET_PROTOCOL_VECTOR)
+        self.assertEqual(config["teacher_metric_mask_protocol"], TEACHER_METRIC_MASK_PROTOCOL)
         self.assertEqual(config["teacher_scalarization"], TEACHER_SCALARIZATION_WEIGHTED_AVERAGE)
 
 

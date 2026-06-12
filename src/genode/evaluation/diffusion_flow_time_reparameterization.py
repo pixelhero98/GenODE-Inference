@@ -676,6 +676,8 @@ def _load_context_rows(csv_path: Path) -> Dict[str, Dict[str, Any]]:
         for row in csv.DictReader(fh):
             signature = str(row.get("row_signature", "")).strip()
             if signature:
+                if signature in rows:
+                    raise ValueError(f"Duplicate context row signature in {csv_path}: {signature}")
                 rows[signature] = dict(row)
     return rows
 
@@ -763,6 +765,8 @@ def _append_context_records(
         signature = str(row.get("row_signature", "")).strip()
         if not signature:
             continue
+        if signature in rows_by_signature:
+            raise ValueError(f"Duplicate context row signature while appending context artifacts: {signature}")
         rows_by_signature[signature] = dict(row)
     existing_embeddings = row_recorder["context_embeddings"]
     for key, value in context_embeddings.items():

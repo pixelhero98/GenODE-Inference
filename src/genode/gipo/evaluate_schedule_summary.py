@@ -528,8 +528,25 @@ def _load_context_rows(path: Path) -> Dict[str, Dict[str, Any]]:
         for row in csv.DictReader(fh):
             signature = str(row.get("row_signature", "")).strip()
             if signature:
+                if signature in rows:
+                    raise ValueError(f"Duplicate context row signature in {path}: {signature}")
                 rows[signature] = dict(row)
     return rows
+
+
+def _merge_context_embeddings_checked(
+    existing: Dict[str, Sequence[float]],
+    extra: Mapping[str, Sequence[float]],
+) -> None:
+    for key, value in extra.items():
+        key_text = str(key)
+        new_vec = np.asarray(value, dtype=np.float32)
+        if key_text in existing:
+            old_vec = np.asarray(existing[key_text], dtype=np.float32)
+            if old_vec.shape != new_vec.shape or not np.allclose(old_vec, new_vec, rtol=1e-5, atol=1e-6):
+                raise ValueError(f"Context embedding collision for {key_text!r} with different vector/protocol.")
+            continue
+        existing[key_text] = new_vec.astype(float).tolist()
 
 
 def _schedule_row(
@@ -1342,8 +1359,14 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                                             "train_tuning_sampler": train_tuning_sampler_key(str(args.train_tuning_sampling_mode)),
                                         }
                                     )
-                                context_rows_by_signature[str(copied_detail["row_signature"])] = copied_detail
-                            context_embeddings.update(dict(metrics.get("context_embeddings", {}) or {}))
+                                signature = str(copied_detail["row_signature"])
+                                if signature in context_rows_by_signature:
+                                    raise ValueError(f"Duplicate context row signature while appending context artifacts: {signature}")
+                                context_rows_by_signature[signature] = copied_detail
+                            _merge_context_embeddings_checked(
+                                context_embeddings,
+                                dict(metrics.get("context_embeddings", {}) or {}),
+                            )
                             _write_context_csv(context_csv_path, list(context_rows_by_signature.values()))
                             if context_embeddings:
                                 save_context_embedding_table(
