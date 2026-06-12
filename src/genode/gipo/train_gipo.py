@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -53,7 +52,6 @@ from genode.gipo.policy import (
     context_id_from_row,
     context_pair_key,
     density_mass_for_row,
-    density_family_for_schedule_key,
     load_context_embedding_table,
     nfe_sequence_diagnostic_summary,
     read_metric_rows_csv,
@@ -881,11 +879,23 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
                 "student_pseudo_rows_csv has no rows after filtering to canonical unseen NFEs "
                 f"{list(CANONICAL_UNSEEN_NFES)}."
             )
-        pseudo_source_rows = [dict(row) for row in pseudo_filtered_rows]
-        for row in pseudo_source_rows:
-            row["context_id"] = context_id_from_row(row)
-        pseudo_support_keys = _observed_support(pseudo_source_rows)
+        pseudo_support_keys = _observed_support(pseudo_filtered_rows)
+        if _needs_forecast_uniform_rewards(pseudo_filtered_rows, teacher_metric_target_keys):
+            pseudo_source_rows = attach_uniform_gipo_rewards(
+                pseudo_filtered_rows,
+                support_schedule_keys=pseudo_support_keys,
+                utility_crps_weight=float(args.teacher_utility_crps_weight),
+                utility_mase_weight=float(args.teacher_utility_mase_weight),
+                pair_on_seed=True,
+            )
+        else:
+            pseudo_source_rows = [dict(row) for row in pseudo_filtered_rows]
+            for row in pseudo_source_rows:
+                row["context_id"] = context_id_from_row(row)
         _validate_support_group_counts(pseudo_source_rows, pseudo_support_keys)
+        missing_pseudo_columns = _missing_target_value_keys(pseudo_source_rows, teacher_metric_target_keys)
+        if len(missing_pseudo_columns) == len(teacher_metric_target_keys):
+            raise ValueError(f"Student pseudo distillation rows are missing all metric target columns: {missing_pseudo_columns}")
         pseudo_context_ids = set(
             sample_context_ids_stratified(
                 pseudo_source_rows,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -11,6 +12,42 @@ from genode.runtime import resolve_torch_device
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+GENERATED_ROOTS = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "data",
+    "dist",
+    "outputs",
+    "paper_datasets",
+    "reports",
+}
+
+
+def _is_generated_path(path: Path) -> bool:
+    parts = path.relative_to(PROJECT_ROOT).parts
+    return bool(GENERATED_ROOTS & set(parts)) or any(part.endswith(".egg-info") for part in parts)
+
+
+def _source_release_files() -> list[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "ls-files"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return [
+            path
+            for path in PROJECT_ROOT.rglob("*")
+            if path.is_file() and not _is_generated_path(path)
+        ]
+    return [PROJECT_ROOT / line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 class GenODEInterfaceTests(unittest.TestCase):
@@ -43,7 +80,11 @@ class GenODEInterfaceTests(unittest.TestCase):
             self.assertTrue(callable(getattr(importlib.import_module(module_name), func_name)))
 
     def test_single_markdown_file_is_readme(self) -> None:
-        markdown_files = sorted(path.relative_to(PROJECT_ROOT).as_posix() for path in PROJECT_ROOT.rglob("*.md") if ".git" not in path.parts)
+        markdown_files = sorted(
+            path.relative_to(PROJECT_ROOT).as_posix()
+            for path in _source_release_files()
+            if path.suffix == ".md"
+        )
         self.assertEqual(markdown_files, ["README.md"])
         text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("gipo_density", text)
@@ -106,9 +147,7 @@ class GenODEInterfaceTests(unittest.TestCase):
             "diffusion" + "_flow" + "_inference",
         )
         offenders: list[str] = []
-        for path in PROJECT_ROOT.rglob("*"):
-            if not path.is_file() or ".git" in path.parts:
-                continue
+        for path in _source_release_files():
             if path == Path(__file__):
                 continue
             if path.suffix not in {".py", ".toml", ".md", ".json", ".txt", ".yml", ".yaml"}:

@@ -19,7 +19,6 @@ from genode.canonical_experiment_layout import (
     CANONICAL_CONTEXT_SAMPLE_COUNT,
     CANONICAL_SUPERVISION_SCHEDULE_KEYS,
     REVERSED_SCHEDULE_BASE,
-    schedule_family_for_key,
 )
 from genode.gipo.density_representation import (
     DEFAULT_DENSITY_BIN_COUNT,
@@ -30,7 +29,6 @@ from genode.gipo.density_representation import (
     density_mass_to_time_grid,
     density_metadata,
     grid_to_density_mass,
-    reference_grid_hash,
     uniform_reference_grid,
     validate_reference_grid,
 )
@@ -58,7 +56,6 @@ from genode.gipo.schedule_hash import schedule_grid_hash
 from genode.solver_protocol import normalize_solver_key
 from genode.gipo.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
 from genode.schedule_transfer.diffusion_flow_schedules import (
-    BASELINE_SCHEDULE_KEYS,
     EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
     build_schedule_grid,
 )
@@ -164,8 +161,8 @@ def validate_gipo_teacher_training_metadata(metadata: Mapping[str, Any] | None) 
             f"GIPO checkpoints must use teacher checkpoint selection "
             f"{TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET!r}."
         )
-    if bool(selection.get("uses_validation_labels", False)):
-        raise ValueError("GIPO teacher checkpoint selection metadata must not use validation labels.")
+    if bool(selection.get("locked_test_used_for_selection", False)):
+        raise ValueError("GIPO teacher checkpoint selection metadata must not use locked-test labels.")
     return {
         "teacher_target": teacher_target,
         "teacher_metric_targets": teacher_metric_targets,
@@ -2110,6 +2107,8 @@ def gipo_teacher_diagnostics(
         "fit_series_overlap_count": int(len(series_keys & fit_series_set)),
         "setting_feature_mode": feature_mode,
         "uses_validation_labels": False,
+        "uses_calibration_labels": True,
+        "locked_test_used_for_selection": False,
         "complete_candidate_group_key_schema": [
             "context_id",
             "solver_key",
@@ -2520,6 +2519,7 @@ def _selected_gipo_teacher_checkpoint(
             "selected_component_weights": best_entry.get("selection_component_weights", {}),
             "tie_breaker": "weighted_score_then_minimax_normalized_regret_then_raw_mean_regret_then_earlier_step",
             "uses_validation_labels": False,
+            "uses_calibration_labels": True,
             "locked_test_used_for_selection": False,
             "history": scored,
         },
@@ -2720,6 +2720,7 @@ def train_gipo_teacher(
             "selected_step": int(steps),
             "history": checkpoint_history,
             "uses_validation_labels": False,
+            "uses_calibration_labels": True,
             "locked_test_used_for_selection": False,
         }
         selected_state = None
@@ -2740,6 +2741,7 @@ def train_gipo_teacher(
         "selection_protocol": checkpoint_selection.get("selection_protocol"),
         "selection_metric": checkpoint_selection.get("selection_metric"),
         "uses_validation_labels": False,
+        "uses_calibration_labels": True,
         "locked_test_used_for_selection": False,
         "fit_row_count": int(len(rows)),
         "fit_context_count": int(len(fit_context_ids)),
@@ -3249,6 +3251,7 @@ def train_gipo_student(
             "validation_row_count": int(len(validation_fit_rows)),
             "validation_context_count": int(len({context_id_from_row(row) for row in validation_fit_rows})),
             "uses_validation_labels": False,
+            "uses_calibration_labels": True,
             "uses_student_validation_targets": True,
             "locked_test_used_for_selection": False,
         }
@@ -3262,6 +3265,7 @@ def train_gipo_student(
             "history": [],
             "student_checkpoint_every": int(checkpoint_every),
             "uses_validation_labels": False,
+            "uses_calibration_labels": False,
             "uses_student_validation_targets": False,
             "locked_test_used_for_selection": False,
         }

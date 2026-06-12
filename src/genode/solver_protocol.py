@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, Sequence, Tuple
 
 CANONICAL_SOLVER_KEYS: Tuple[str, ...] = ("euler", "dpmpp2m", "heun", "midpoint_rk2")
 CANONICAL_SOLVER_DISPLAY_NAMES: Dict[str, str] = {

@@ -13,7 +13,6 @@ import torch
 from genode.canonical_experiment_layout import (
     AVERAGED_REVERSED_SCHEDULE_KEYS,
     AVERAGED_SCHEDULE_COMPONENTS,
-    REVERSED_SCHEDULE_BASE,
     density_source_key_for_schedule,
     schedule_family_for_key,
 )

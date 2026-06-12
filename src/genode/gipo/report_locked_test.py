@@ -40,7 +40,11 @@ from genode.gipo.policy import (
     validate_gipo_density_token_attention,
     validate_gipo_teacher_training_metadata,
 )
-from genode.gipo.evaluate_schedule_summary import build_comparison_summary
+from genode.gipo.evaluate_schedule_summary import (
+    SER_REFERENCE_SCHEDULE_KEYS,
+    _filter_rows_to_schedule_keys,
+    build_comparison_summary,
+)
 from genode.gipo.models import solver_macro_steps
 from genode.gipo.models import SETTING_ENCODER_MODE_CONTINUOUS_V3, setting_encoder_config_from_payload, setting_feature_dim, validate_setting_feature_mode
 from genode.data.otflow_paths import (
@@ -61,7 +65,7 @@ from genode.evaluation.otflow_evaluation_support import (
     load_conditional_generation_checkpoint_splits,
     load_forecast_checkpoint_splits,
 )
-from genode.schedule_transfer.diffusion_flow_schedules import run_fixed_schedule_variant
+from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, run_fixed_schedule_variant
 from genode.runtime import ProgressBar, resolve_torch_device
 
 GIPO_SCHEDULE_KEY = "gipo"
@@ -651,6 +655,8 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
 
     baseline_rows = _read_csvs(str(args.baseline_rows)) if str(args.baseline_rows).strip() else []
     comparator_rows = _read_csvs(str(args.comparator_rows)) if str(args.comparator_rows).strip() else []
+    baseline_rows = _filter_rows_to_schedule_keys(baseline_rows, BASELINE_SCHEDULE_KEYS)
+    comparator_rows = _filter_rows_to_schedule_keys(comparator_rows, SER_REFERENCE_SCHEDULE_KEYS)
     if baseline_rows:
         _benchmark_family_from_rows(baseline_rows, benchmark_family)
     if comparator_rows:

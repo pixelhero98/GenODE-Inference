@@ -39,6 +39,9 @@ def _checkpoint_metadata(benchmark_family: str, dataset_key: str, train_steps: i
         "benchmark_family": str(benchmark_family),
         "train_steps": int(train_steps),
         "train_budget_label": f"{train_steps // 1000}k",
+        "checkpoint_budget_steps": int(train_steps),
+        "effective_train_steps": int(train_steps) - 100,
+        "checkpoint_export_protocol": "best_validation_state_within_budget",
         "history_len": int(spec.history_len),
         "future_block_len": int(spec.future_block_len),
         "rollout_mode": "non_ar",
@@ -224,6 +227,9 @@ class BackboneMatrixTests(unittest.TestCase):
         )
         self.assertEqual(artifact["source_kind"], "reused_shared_20k")
         self.assertEqual(artifact["train_budget_label"], "20k")
+        self.assertEqual(artifact["checkpoint_budget_steps"], 20000)
+        self.assertEqual(artifact["effective_train_steps"], 19900)
+        self.assertEqual(artifact["checkpoint_export_protocol"], "best_validation_state_within_budget")
 
     def test_manifest_rejects_matching_length_autoregressive_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -310,6 +316,18 @@ class BackboneMatrixTests(unittest.TestCase):
             self.assertEqual(readiness["manifest"]["ready_count"], 26)
             self.assertEqual(readiness["manifest"]["missing_count"], 4)
             self.assertEqual(readiness["normalization"]["normalized_count"], 26)
+            artifact = find_backbone_artifact(
+                readiness["manifest"],
+                backbone_name=BACKBONE_NAME_OTFLOW,
+                benchmark_family=FORECAST_FAMILY,
+                dataset_key="solar_energy_10m",
+                train_steps=8000,
+                status="ready",
+            )
+            self.assertEqual(artifact["source_kind"], "matrix_output")
+            self.assertEqual(artifact["checkpoint_budget_steps"], 8000)
+            self.assertEqual(artifact["effective_train_steps"], 7900)
+            self.assertEqual(artifact["checkpoint_export_protocol"], "best_validation_state_within_budget")
             missing_keys = {
                 (row["benchmark_family"], row["dataset_key"], int(row["train_steps"]))
                 for row in readiness["manifest"]["artifacts"]

@@ -240,6 +240,110 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         self.assertEqual([row["scheduler_key"] for row in comparisons], ["density_a", "density_b"])
         self.assertAlmostEqual(comparisons[1]["student_relative_crps_gain_vs_best_baseline"], 1.0 - 1.25 / 2.0)
 
+    def test_evaluator_filters_shared_comparison_rows_before_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            schedule_path = root / "student_summary.json"
+            schedule_path.write_text(
+                json.dumps(
+                    {
+                        "dataset": "traffic_hourly",
+                        "schedules": [
+                            {
+                                "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                                "schedule_name": "GIPO Student Selected",
+                                "predictions": [
+                                    {
+                                        "solver_key": "euler",
+                                        "target_nfe": 4,
+                                        "macro_steps": 4,
+                                        "time_grid": _uniform_grid(4),
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            mixed_rows = [
+                {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": BASELINE_SCHEDULE_KEYS[0], "crps": 2.0, "mase": 3.0},
+                {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": SER_PTG_SCHEDULE_KEY, "crps": 1.5, "mase": 2.5},
+                {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY, "crps": 1.0, "mase": 2.0},
+            ]
+
+            class FakeDataset:
+                def __len__(self) -> int:
+                    return 1
+
+            fake_checkpoint = {
+                "model": object(),
+                "cfg": object(),
+                "splits": {"train": FakeDataset(), "val": FakeDataset(), "test": FakeDataset()},
+                "checkpoint_path": root / "model.pt",
+                "checkpoint_id": "ck",
+                "backbone_name": "otflow",
+                "train_steps": 20000,
+                "train_budget_label": "20k",
+            }
+            args = build_argparser().parse_args(
+                [
+                    "--dataset",
+                    "traffic_hourly",
+                    "--schedule_summary",
+                    str(schedule_path),
+                    "--split_phase",
+                    "locked_test",
+                    "--out_dir",
+                    str(root / "out"),
+                    "--solver_names",
+                    "euler",
+                    "--target_nfe_values",
+                    "4",
+                    "--seeds",
+                    "0",
+                    "--num_eval_samples",
+                    "1",
+                    "--eval_windows_test",
+                    "1",
+                    "--baseline_rows",
+                    str(root / "shared_rows.csv"),
+                    "--comparator_rows",
+                    str(root / "shared_rows.csv"),
+                    "--device",
+                    "cpu",
+                ]
+            )
+            with mock.patch(
+                "genode.gipo.evaluate_schedule_summary.load_forecast_checkpoint_splits",
+                return_value=fake_checkpoint,
+            ), mock.patch(
+                "genode.gipo.evaluate_schedule_summary.evaluate_forecast_schedule",
+                return_value={
+                    "crps": 1.0,
+                    "mse": 1.5,
+                    "mase": 2.0,
+                    "latency_ms_per_sample": 0.25,
+                    "num_eval_samples": 1,
+                    "eval_examples": 1,
+                    "eval_horizon": 168,
+                    "evaluation_protocol_hash": "protocol",
+                    "chosen_examples_hash": "examples",
+                    "realized_nfe": 4,
+                },
+            ), mock.patch(
+                "genode.gipo.evaluate_schedule_summary._load_rows_csv",
+                return_value=mixed_rows,
+            ), mock.patch(
+                "genode.gipo.evaluate_schedule_summary.build_comparison_summary",
+                return_value={"status": "captured"},
+            ) as build_mock:
+                evaluate_schedule_summary(args)
+
+        call_kwargs = build_mock.call_args.kwargs
+        self.assertEqual([row["scheduler_key"] for row in call_kwargs["baseline_rows"]], [BASELINE_SCHEDULE_KEYS[0]])
+        self.assertEqual([row["scheduler_key"] for row in call_kwargs["comparator_rows"]], [SER_PTG_SCHEDULE_KEY])
+
     def test_validation_schedule_selection_supports_arbitrary_candidate_keys(self) -> None:
         rows = []
         fixed_rows = []

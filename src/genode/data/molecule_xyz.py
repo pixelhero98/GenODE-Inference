@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import fnmatch
 import json
-import math
 import re
 import copy
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from zipfile import ZipFile
 
 import numpy as np

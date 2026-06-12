@@ -63,6 +63,9 @@ class BackboneArtifactSpec:
     summary_path: str
     status: str
     seed: int = DEFAULT_SEED
+    checkpoint_budget_steps: Optional[int] = None
+    effective_train_steps: Optional[int] = None
+    checkpoint_export_protocol: Optional[str] = None
     source_kind: str = "planned"
     metadata_path: Optional[str] = None
     field_network_type: Optional[str] = None
@@ -89,6 +92,22 @@ def train_budget_label(train_steps: int) -> str:
     if steps % 1000 == 0:
         return f"{steps // 1000}k"
     return f"{steps}_steps"
+
+
+def _metadata_int(metadata: Mapping[str, Any] | None, key: str) -> Optional[int]:
+    if metadata is None:
+        return None
+    value = metadata.get(key)
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def _metadata_str(metadata: Mapping[str, Any] | None, key: str) -> Optional[str]:
+    if metadata is None:
+        return None
+    value = str(metadata.get(key, "") or "").strip()
+    return value or None
 
 
 def project_backbone_matrix_root() -> Path:
@@ -536,7 +555,7 @@ def _existing_matrix_artifact(
         benchmark_family=str(benchmark_family),
         dataset_key=str(dataset_key),
         train_steps=int(train_steps),
-        train_budget_label=train_budget_label(int(train_steps)),
+        train_budget_label=str((metadata or {}).get("train_budget_label", train_budget_label(int(train_steps)))),
         checkpoint_id=str(
             checkpoint_id
             or build_backbone_checkpoint_id(
@@ -552,6 +571,9 @@ def _existing_matrix_artifact(
         summary_path=_project_display_path(summary_path),
         status=str(status),
         seed=int(seed),
+        checkpoint_budget_steps=_metadata_int(metadata, "checkpoint_budget_steps"),
+        effective_train_steps=_metadata_int(metadata, "effective_train_steps"),
+        checkpoint_export_protocol=_metadata_str(metadata, "checkpoint_export_protocol"),
         source_kind="matrix_output",
         metadata_path=_project_display_path(paths["metadata_path"]),
         field_network_type=None if field_network_type is None else str(field_network_type),
@@ -608,7 +630,7 @@ def _existing_molecule_artifact(
         benchmark_family=MOLECULE_FAMILY,
         dataset_key=dataset_key,
         train_steps=int(train_steps),
-        train_budget_label=train_budget_label(int(train_steps)),
+        train_budget_label=str((metadata or {}).get("train_budget_label", train_budget_label(int(train_steps)))),
         checkpoint_id=str(
             checkpoint_id
             or build_backbone_checkpoint_id(
@@ -625,6 +647,9 @@ def _existing_molecule_artifact(
         summary_path=_project_display_path(paths["summary_path"]),
         status=status,
         seed=int(seed),
+        checkpoint_budget_steps=_metadata_int(metadata, "checkpoint_budget_steps"),
+        effective_train_steps=_metadata_int(metadata, "effective_train_steps"),
+        checkpoint_export_protocol=_metadata_str(metadata, "checkpoint_export_protocol"),
         source_kind="molecule_backbone_output",
         metadata_path=_project_display_path(paths["metadata_path"]),
         notes=compatibility_error,
@@ -687,7 +712,7 @@ def _existing_otflow_reuse_artifact(
         benchmark_family=str(benchmark_family),
         dataset_key=str(dataset_key),
         train_steps=resolved_steps,
-        train_budget_label=train_budget_label(resolved_steps),
+        train_budget_label=str(metadata.get("train_budget_label", train_budget_label(resolved_steps))),
         checkpoint_id=build_backbone_checkpoint_id(
             backbone_name=BACKBONE_NAME_OTFLOW,
             benchmark_family=str(benchmark_family),
@@ -700,6 +725,9 @@ def _existing_otflow_reuse_artifact(
         summary_path=_project_display_path(summary_path if summary_path.exists() else metadata_path),
         status=str(status),
         seed=int(seed),
+        checkpoint_budget_steps=_metadata_int(metadata, "checkpoint_budget_steps"),
+        effective_train_steps=_metadata_int(metadata, "effective_train_steps"),
+        checkpoint_export_protocol=_metadata_str(metadata, "checkpoint_export_protocol"),
         source_kind="reused_shared_20k",
         metadata_path=_project_display_path(metadata_path),
         field_network_type=field_network_type,

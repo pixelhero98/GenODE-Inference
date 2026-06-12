@@ -49,7 +49,6 @@ from genode.data.otflow_paths import (
 )
 from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _restore_sample_overrides
 from genode.runtime import ProgressBar
-from genode.schedule_transfer.otflow_schedule_diagnostics import _collect_calibration
 from genode.schedule_transfer.otflow_signal_traces import (
     NATIVE_INFO_GROWTH_TRACE_KEY,
     compute_info_growth_hardness_numpy,
@@ -830,6 +829,32 @@ def _metadata_path_for_checkpoint(manifest_artifact: Optional[Mapping[str, Any]]
     return Path(ckpt_path).resolve().with_name("checkpoint_metadata.json")
 
 
+def _metadata_int_value(
+    manifest_artifact: Optional[Mapping[str, Any]],
+    metadata: Mapping[str, Any],
+    key: str,
+    default: int,
+) -> int:
+    for source in (manifest_artifact or {}, metadata):
+        value = source.get(key)
+        if value not in (None, ""):
+            return int(value)
+    return int(default)
+
+
+def _metadata_str_value(
+    manifest_artifact: Optional[Mapping[str, Any]],
+    metadata: Mapping[str, Any],
+    key: str,
+    default: str = "",
+) -> str:
+    for source in (manifest_artifact or {}, metadata):
+        value = str(source.get(key, "") or "").strip()
+        if value:
+            return value
+    return str(default)
+
+
 def _metadata_split_cond_dim(metadata: Mapping[str, Any]) -> int:
     split_stats = dict(metadata.get("split_stats", {}) or {})
     if "cond_dim" in split_stats:
@@ -1036,6 +1061,23 @@ def load_forecast_checkpoint_splits(
         raise FileNotFoundError(f"Forecast checkpoint not found: {ckpt_path}")
     metadata_path = _metadata_path_for_checkpoint(manifest_artifact, ckpt_path)
     metadata = _safe_json(metadata_path) or {}
+    checkpoint_budget_steps = _metadata_int_value(
+        manifest_artifact,
+        metadata,
+        "checkpoint_budget_steps",
+        resolved_checkpoint_steps,
+    )
+    effective_train_steps = _metadata_int_value(
+        manifest_artifact,
+        metadata,
+        "effective_train_steps",
+        resolved_checkpoint_steps,
+    )
+    checkpoint_export_protocol = _metadata_str_value(
+        manifest_artifact,
+        metadata,
+        "checkpoint_export_protocol",
+    )
     model, cfg = load_checkpoint_model(ckpt_path, device=device)
     _validate_forecast_checkpoint_task(
         dataset=str(dataset),
@@ -1066,6 +1108,9 @@ def load_forecast_checkpoint_splits(
         "checkpoint_id": str(checkpoint_id),
         "backbone_name": str(backbone_name),
         "train_steps": int(resolved_checkpoint_steps),
+        "checkpoint_budget_steps": int(checkpoint_budget_steps),
+        "effective_train_steps": int(effective_train_steps),
+        "checkpoint_export_protocol": str(checkpoint_export_protocol),
         "train_budget_label": str(resolved_budget_label),
     }
 
@@ -1129,6 +1174,23 @@ def load_conditional_generation_checkpoint_splits(
         raise FileNotFoundError(f"Conditional-generation checkpoint not found: {ckpt_path}")
     metadata_path = _metadata_path_for_checkpoint(manifest_artifact, ckpt_path)
     metadata = _safe_json(metadata_path) or {}
+    checkpoint_budget_steps = _metadata_int_value(
+        manifest_artifact,
+        metadata,
+        "checkpoint_budget_steps",
+        resolved_checkpoint_steps,
+    )
+    effective_train_steps = _metadata_int_value(
+        manifest_artifact,
+        metadata,
+        "effective_train_steps",
+        resolved_checkpoint_steps,
+    )
+    checkpoint_export_protocol = _metadata_str_value(
+        manifest_artifact,
+        metadata,
+        "checkpoint_export_protocol",
+    )
     model, cfg = load_checkpoint_model(ckpt_path, device=device)
     checkpoint_model_cond_dim = int(getattr(cfg.model, "cond_dim", 0))
     checkpoint_train_steps = int(getattr(cfg.train, "steps", 0))
@@ -1177,6 +1239,9 @@ def load_conditional_generation_checkpoint_splits(
         "checkpoint_id": str(checkpoint_id),
         "backbone_name": str(backbone_name),
         "train_steps": int(resolved_checkpoint_steps),
+        "checkpoint_budget_steps": int(checkpoint_budget_steps),
+        "effective_train_steps": int(effective_train_steps),
+        "checkpoint_export_protocol": str(checkpoint_export_protocol),
         "train_budget_label": str(resolved_budget_label),
     }
 

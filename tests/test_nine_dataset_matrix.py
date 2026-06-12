@@ -7,7 +7,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from zipfile import ZipFile
 
-import numpy as np
 import torch
 
 from genode.data.experiment_common import DATASET_PLANS, OTFLOW_PAPER_BACKBONE_PRESETS, OTFLOW_PAPER_DATASET_CHOICES

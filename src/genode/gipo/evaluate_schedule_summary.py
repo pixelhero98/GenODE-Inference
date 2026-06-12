@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
 
 from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
 from genode.solver_protocol import CANONICAL_SOLVER_KEYS, normalize_solver_key, normalize_solver_keys
@@ -73,6 +72,15 @@ SER_REFERENCE_SCHEDULE_KEYS: Tuple[str, ...] = (
     SER_PTG_REVERSED_SCHEDULE_KEY,
     SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
 )
+
+
+def _filter_rows_to_schedule_keys(
+    rows: Sequence[Mapping[str, Any]],
+    schedule_keys: Sequence[str],
+) -> List[Dict[str, Any]]:
+    allowed = {str(key) for key in schedule_keys}
+    return [dict(row) for row in rows if str(row.get("scheduler_key", "")) in allowed]
+
 
 SCHEDULE_ROW_FIELDS: Tuple[str, ...] = (
     "benchmark_family",
@@ -1455,6 +1463,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
             solver_names=solver_names,
             target_nfe_values=target_nfes,
         )
+        baseline_rows = _filter_rows_to_schedule_keys(baseline_rows, BASELINE_SCHEDULE_KEYS)
         comparator_rows: List[Dict[str, Any]] = []
         if str(args.comparator_rows).strip():
             comparator_rows = _load_rows_csv(
@@ -1465,6 +1474,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                 solver_names=solver_names,
                 target_nfe_values=target_nfes,
             )
+            comparator_rows = _filter_rows_to_schedule_keys(comparator_rows, SER_REFERENCE_SCHEDULE_KEYS)
         comparison = build_comparison_summary(
             baseline_rows=baseline_rows,
             student_rows=rows,

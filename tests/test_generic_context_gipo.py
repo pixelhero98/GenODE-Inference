@@ -1,4 +1,5 @@
 import argparse
+import csv
 import math
 import tempfile
 import unittest
@@ -24,6 +25,7 @@ from genode.gipo.policy import (
     _teacher_metric_weights,
     context_embedding_id_from_row,
     read_metric_rows_csv,
+    save_context_embedding_table,
     stable_context_id,
 )
 from genode.gipo import report_locked_test
@@ -34,6 +36,7 @@ from genode.gipo.train_gipo import (
     _validate_context_embedding_checkpoint_scope,
     _validate_support_group_counts,
     _validate_unique_schedule_rows,
+    train_gipo,
 )
 
 
@@ -56,13 +59,134 @@ class GenericContextGipoTests(unittest.TestCase):
             "reward_anchor_schedule_key",
             "reward_utility_transform",
             "reward_granularity",
+            "effective_train_steps",
+            "checkpoint_export_protocol",
         ):
             self.assertIn(field, fields)
+
+    def test_context_artifact_arg_defaults(self) -> None:
         parser = runner.build_argparser()
         args = parser.parse_args([])
         self.assertEqual(args.context_row_csv_name, "context_rows.csv")
         self.assertEqual(args.context_embeddings_npz_name, "context_embeddings.npz")
         self.assertFalse(args.write_context_rows)
+
+    def test_locked_report_filters_shared_context_rows_to_baseline_and_ser_sets(self) -> None:
+        rows = [
+            {"scheduler_key": "uniform"},
+            {"scheduler_key": "late_power_3"},
+            {"scheduler_key": "ser_ptg_local_defect_eta005"},
+            {"scheduler_key": "gipo"},
+        ]
+        baseline_rows = report_locked_test._filter_rows_to_schedule_keys(rows, ["uniform", "late_power_3"])
+        ser_rows = report_locked_test._filter_rows_to_schedule_keys(rows, ["ser_ptg_local_defect_eta005"])
+
+        self.assertEqual([row["scheduler_key"] for row in baseline_rows], ["uniform", "late_power_3"])
+        self.assertEqual([row["scheduler_key"] for row in ser_rows], ["ser_ptg_local_defect_eta005"])
+
+    def test_forecast_pseudo_rows_are_reward_materialized_before_student_distillation(self) -> None:
+        def write_rows(path: Path, target_nfes: tuple[int, ...]) -> None:
+            schedules = {
+                "uniform": (2.0, 2.0),
+                "late_power_3": (1.0, 1.0),
+                "flowts_power_sampling": (1.5, 1.5),
+                "ays": (1.4, 1.4),
+            }
+            fields = [
+                "benchmark_family",
+                "dataset",
+                "split_phase",
+                "seed",
+                "solver_key",
+                "target_nfe",
+                "scheduler_key",
+                "context_id",
+                "series_id",
+                "target_t",
+                "forecast_crps",
+                "forecast_mase",
+            ]
+            with path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fields)
+                writer.writeheader()
+                for ctx_idx in range(2):
+                    for nfe in target_nfes:
+                        for scheduler_key, (crps, mase) in schedules.items():
+                            writer.writerow(
+                                {
+                                    "benchmark_family": FORECAST_FAMILY,
+                                    "dataset": "solar_energy_10m",
+                                    "split_phase": "train_tuning",
+                                    "seed": 0,
+                                    "solver_key": "euler",
+                                    "target_nfe": nfe,
+                                    "scheduler_key": scheduler_key,
+                                    "context_id": f"ctx_{ctx_idx}",
+                                    "series_id": f"series_{ctx_idx}",
+                                    "target_t": 100 + ctx_idx,
+                                    "forecast_crps": crps,
+                                    "forecast_mase": mase,
+                                }
+                            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            seen_rows = root / "seen.csv"
+            pseudo_rows = root / "pseudo.csv"
+            embeddings = root / "context_embeddings.npz"
+            write_rows(seen_rows, (4, 8, 12, 16))
+            write_rows(pseudo_rows, (6, 10, 14, 20))
+            save_context_embedding_table(
+                embeddings,
+                {"ctx_0": [0.0, 1.0], "ctx_1": [1.0, 0.0]},
+            )
+            args = SimpleNamespace(
+                rows_csv=str(seen_rows),
+                context_embeddings_npz=str(embeddings),
+                schedule_summary_json="",
+                out_dir=str(root / "out"),
+                support_schedule_keys="uniform,late_power_3,flowts_power_sampling,ays",
+                context_sample_count=2,
+                context_holdout_fraction=0.5,
+                teacher_steps=1,
+                teacher_checkpoint_every=1,
+                teacher_loss_log_every=0,
+                teacher_density_holdout_schedule_keys="flowts_power_sampling,ays",
+                teacher_unseen_selection_rows_csv="",
+                teacher_unseen_selection_context_embeddings_npz="",
+                teacher_unseen_selection_schedule_summary_json="",
+                teacher_unseen_selection_target_nfe_values="6,10,14,20",
+                student_pseudo_rows_csv=str(pseudo_rows),
+                student_pseudo_context_embeddings_npz=str(embeddings),
+                student_pseudo_schedule_summary_json="",
+                student_pseudo_target_weight=0.25,
+                student_steps=1,
+                student_log_every=0,
+                student_checkpoint_every=1,
+                student_selection_holdout_fraction=0.5,
+                teacher_lr=1e-3,
+                student_lr=1e-3,
+                transformer_hidden_dim=16,
+                transformer_layers=1,
+                transformer_heads=4,
+                transformer_dropout=0.0,
+                teacher_temperature=0.05,
+                teacher_utility_crps_weight=0.5,
+                teacher_utility_mase_weight=0.5,
+                teacher_metric_target_keys="",
+                teacher_utility_weights="",
+                student_weight_decay=0.0,
+                seed=0,
+                device="cpu",
+                dry_run=False,
+            )
+
+            summary = train_gipo(args)
+
+        self.assertTrue(summary["student_pseudo_distillation"]["enabled"])
+        pseudo_summary = summary["student_training"]["student_pseudo_target_summary"]
+        self.assertTrue(pseudo_summary["pseudo_distillation_used"])
+        self.assertEqual(pseudo_summary["pseudo_target_nfes"], [6, 10, 14, 20])
 
     def test_conditional_context_rows_use_checkpoint_scoped_ids_and_component_utility(self) -> None:
         rows = runner._conditional_context_records(

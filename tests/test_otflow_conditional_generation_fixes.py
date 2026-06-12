@@ -59,6 +59,9 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
                         "dataset_key": "traffic_hourly",
                         "benchmark_family": FORECAST_FAMILY,
                         "train_steps": 8000,
+                        "checkpoint_budget_steps": 8000,
+                        "effective_train_steps": 7600,
+                        "checkpoint_export_protocol": "best_validation_state_within_budget",
                         "history_len": int(cfg.history_len),
                         "future_block_len": int(cfg.prediction_horizon),
                     }
@@ -91,6 +94,9 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
 
         self.assertEqual(result["train_steps"], 8000)
         self.assertEqual(result["train_budget_label"], "8k")
+        self.assertEqual(result["checkpoint_budget_steps"], 8000)
+        self.assertEqual(result["effective_train_steps"], 7600)
+        self.assertEqual(result["checkpoint_export_protocol"], "best_validation_state_within_budget")
         self.assertEqual(result["checkpoint_id"], "otflow_temporal_extrapolation_traffic_hourly_8k")
 
     def test_dataset_builder_updates_model_cond_dim_without_shadow_field(self) -> None:
