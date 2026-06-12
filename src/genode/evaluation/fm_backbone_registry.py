@@ -23,7 +23,7 @@ from genode.data.molecule_xyz import (
     default_molecule_group_root,
     load_molecule_group_manifest,
 )
-from genode.data.otflow_paths import default_lobster_synthetic_profile_path, project_backbone_matrix_root as default_project_backbone_matrix_root, project_data_root, project_outputs_root, project_paper_dataset_root
+from genode.data.otflow_paths import default_lobster_synthetic_profile_path, project_backbone_matrix_root as default_project_backbone_matrix_root, project_data_root, project_outputs_root, project_paper_dataset_root, project_root
 
 MOLECULE_FAMILY = "molecule_3d_coordinate_generation"
 BACKBONE_NAME_OTFLOW = "otflow"
@@ -105,6 +105,22 @@ def default_otflow_reuse_root() -> Path:
 
 def default_imported_otflow_backbone_root() -> Path:
     return project_outputs_root() / "imported_backbones" / "otflow"
+
+
+def _project_display_path(path: str | Path) -> str:
+    resolved = Path(path).expanduser().resolve()
+    try:
+        return resolved.relative_to(project_root()).as_posix()
+    except ValueError:
+        parts = tuple(str(part) for part in resolved.parts)
+        for marker in ("projects", "tmp"):
+            if marker in parts:
+                tail = parts[parts.index(marker) + 1 :]
+                return PurePosixPath(*tail).as_posix() if tail else resolved.name
+        tail = parts[-min(8, len(parts)) :]
+        if tail and (tail[0].endswith(":") or tail[0] == resolved.anchor):
+            tail = tail[1:]
+        return PurePosixPath(*tail).as_posix()
 
 
 def build_backbone_checkpoint_id(
@@ -532,12 +548,12 @@ def _existing_matrix_artifact(
                 field_network_type=field_network_type if field_network_type else None,
             )
         ),
-        checkpoint_path=str(paths["checkpoint_path"]),
-        summary_path=str(summary_path),
+        checkpoint_path=_project_display_path(paths["checkpoint_path"]),
+        summary_path=_project_display_path(summary_path),
         status=str(status),
         seed=int(seed),
         source_kind="matrix_output",
-        metadata_path=str(paths["metadata_path"]),
+        metadata_path=_project_display_path(paths["metadata_path"]),
         field_network_type=None if field_network_type is None else str(field_network_type),
         notes=compatibility_error,
         model_cond_dim=model_cond_dim,
@@ -605,12 +621,12 @@ def _existing_molecule_artifact(
                 stratum=stratum,
             )
         ),
-        checkpoint_path=str(paths["checkpoint_path"]),
-        summary_path=str(paths["summary_path"]),
+        checkpoint_path=_project_display_path(paths["checkpoint_path"]),
+        summary_path=_project_display_path(paths["summary_path"]),
         status=status,
         seed=int(seed),
         source_kind="molecule_backbone_output",
-        metadata_path=str(paths["metadata_path"]),
+        metadata_path=_project_display_path(paths["metadata_path"]),
         notes=compatibility_error,
         compatibility_error=compatibility_error,
         member_key=member_key,
@@ -680,12 +696,12 @@ def _existing_otflow_reuse_artifact(
             seed=int(seed),
             field_network_type=field_network_type,
         ),
-        checkpoint_path=str(checkpoint_path),
-        summary_path=str(summary_path if summary_path.exists() else metadata_path),
+        checkpoint_path=_project_display_path(checkpoint_path),
+        summary_path=_project_display_path(summary_path if summary_path.exists() else metadata_path),
         status=str(status),
         seed=int(seed),
         source_kind="reused_shared_20k",
-        metadata_path=str(metadata_path),
+        metadata_path=_project_display_path(metadata_path),
         field_network_type=field_network_type,
         notes=compatibility_error,
         model_cond_dim=model_cond_dim,
@@ -718,14 +734,14 @@ def _rewrite_normalized_json_payload(
 ) -> Dict[str, Any]:
     data = dict(payload)
     if "checkpoint_path" in data:
-        data["checkpoint_path"] = str(checkpoint_path)
+        data["checkpoint_path"] = _project_display_path(checkpoint_path)
     if "checkpoint_metadata_path" in data:
-        data["checkpoint_metadata_path"] = str(metadata_path)
+        data["checkpoint_metadata_path"] = _project_display_path(metadata_path)
     if "metadata_path" in data:
-        data["metadata_path"] = str(metadata_path)
+        data["metadata_path"] = _project_display_path(metadata_path)
     if "summary_path" in data:
-        data["summary_path"] = str(summary_path)
-    data["normalized_from"] = str(normalized_from)
+        data["summary_path"] = _project_display_path(summary_path)
+    data["normalized_from"] = _project_display_path(normalized_from)
     return data
 
 
@@ -831,8 +847,8 @@ def normalize_imported_backbone_artifacts(
     normalized: List[Dict[str, Any]] = []
     if not resolved_import_root.exists():
         return {
-            "matrix_root": str(resolved_matrix_root),
-            "imported_root": str(resolved_import_root),
+            "matrix_root": _project_display_path(resolved_matrix_root),
+            "imported_root": _project_display_path(resolved_import_root),
             "normalized_count": 0,
             "normalized": normalized,
         }
@@ -861,8 +877,8 @@ def normalize_imported_backbone_artifacts(
                     }
                 )
     return {
-        "matrix_root": str(resolved_matrix_root),
-        "imported_root": str(resolved_import_root),
+        "matrix_root": _project_display_path(resolved_matrix_root),
+        "imported_root": _project_display_path(resolved_import_root),
         "normalized_count": int(len(normalized)),
         "normalized": normalized,
     }
@@ -903,12 +919,12 @@ def _planned_artifact(
             seed=int(seed),
             field_network_type=field_network_type,
         ),
-        checkpoint_path=str(paths["checkpoint_path"]),
-        summary_path=str(paths["summary_path"]),
+        checkpoint_path=_project_display_path(paths["checkpoint_path"]),
+        summary_path=_project_display_path(paths["summary_path"]),
         status="missing",
         seed=int(seed),
         source_kind="planned",
-        metadata_path=str(paths["metadata_path"]),
+        metadata_path=_project_display_path(paths["metadata_path"]),
         field_network_type=field_network_type,
     )
 
@@ -951,12 +967,12 @@ def _planned_molecule_artifact(
             member_key=member_key,
             stratum=stratum,
         ),
-        checkpoint_path=str(paths["checkpoint_path"]),
-        summary_path=str(paths["summary_path"]),
+        checkpoint_path=_project_display_path(paths["checkpoint_path"]),
+        summary_path=_project_display_path(paths["summary_path"]),
         status="missing",
         seed=int(seed),
         source_kind="planned",
-        metadata_path=str(paths["metadata_path"]),
+        metadata_path=_project_display_path(paths["metadata_path"]),
         member_key=member_key,
         stratum=stratum,
         atom_count=int(member["atom_count"]),
@@ -1076,11 +1092,11 @@ def materialize_backbone_manifest(
         "version": MANIFEST_VERSION,
         "seed": int(seed),
         "train_budget_steps": [int(value) for value in budget_steps],
-        "matrix_root": str(resolved_matrix_root),
-        "otflow_reuse_root": str(resolved_reuse_root),
-        "imported_backbone_root": str(resolved_import_root),
-        "molecule_group_root": str(resolved_molecule_group_root),
-        "molecule_backbone_root": str(resolved_molecule_backbone_root),
+        "matrix_root": _project_display_path(resolved_matrix_root),
+        "otflow_reuse_root": _project_display_path(resolved_reuse_root),
+        "imported_backbone_root": _project_display_path(resolved_import_root),
+        "molecule_group_root": _project_display_path(resolved_molecule_group_root),
+        "molecule_backbone_root": _project_display_path(resolved_molecule_backbone_root),
         "temporal_artifact_count": int(
             sum(1 for row in artifacts if str(row.get("benchmark_family")) in {FORECAST_FAMILY, CONDITIONAL_GENERATION_FAMILY})
         ),
@@ -1173,10 +1189,10 @@ def build_runtime_probe(
         },
     }
     return {
-        "dataset_root": str(resolved_dataset_root),
+        "dataset_root": _project_display_path(resolved_dataset_root),
         "lobster_synthetic_profile_name": str(resolved_lobster_profile_path.name),
         "long_term_st_prepared_dir": str(resolved_long_term_st_path.name),
-        "molecule_group_root": str(resolved_molecule_group_root),
+        "molecule_group_root": _project_display_path(resolved_molecule_group_root),
         "imports": imports,
         "dataset_presence": dataset_presence,
     }
@@ -1213,7 +1229,7 @@ def build_backbone_readiness_audit(
     )
     readiness = {
         "version": AUDIT_VERSION,
-        "manifest_path": str(Path(write_path or default_backbone_manifest_path()).resolve()),
+        "manifest_path": _project_display_path(Path(write_path or default_backbone_manifest_path()).resolve()),
         "manifest": manifest,
         "normalization": normalization,
         "runtime_probe": build_runtime_probe(

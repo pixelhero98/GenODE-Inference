@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -9,7 +8,16 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
+from genode.canonical_experiment_layout import (
+    CANONICAL_CONTEXT_SAMPLE_COUNT,
+    CANONICAL_SEEN_NFES,
+    SCENARIO_FAMILY_CONDITIONAL_GENERATION,
+    SCENARIO_FAMILY_FORECAST,
+    SCENARIO_FAMILY_MOLECULE,
+    scenario_family_for_key,
+)
+from genode.data.molecule_xyz import default_molecule_group_root, load_molecule_group_manifest, trainable_molecule_group_members
+from genode.solver_protocol import CANONICAL_SOLVER_KEYS, normalize_solver_keys, solver_order_p
 from genode.gipo.density_representation import (
     average_density_masses,
     density_mass_hash,
@@ -19,12 +27,19 @@ from genode.gipo.density_representation import (
     uniform_reference_grid,
 )
 from genode.gipo.models import validate_time_grid
+from genode.gipo.schedule_hash import schedule_grid_hash
 from genode.data.otflow_paths import (
     default_backbone_manifest_path,
+    default_cryptos_data_path,
+    default_lobster_synthetic_profile_path,
+    default_long_term_st_data_path,
     project_outputs_root,
     project_paper_dataset_root,
     resolve_project_path,
 )
+from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW_MOLECULE, MOLECULE_FAMILY, find_backbone_artifact, load_backbone_manifest
+from genode.evaluation.molecule_metrics import load_molecule_checkpoint_splits
+from genode.evaluation.otflow_sampling_support import _choose_valid_windows
 from genode.evaluation.otflow_evaluation_support import (
     DEFAULT_SHARED_BACKBONE_ROOT,
     DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION,
@@ -36,20 +51,22 @@ from genode.evaluation.otflow_evaluation_support import (
     VALIDATION_PHASE,
     choose_forecast_example_indices,
     choose_forecast_train_tuning_indices,
+    load_conditional_generation_checkpoint_splits,
     load_forecast_checkpoint_splits,
+    resolved_eval_horizon,
     resolve_reference_macro_steps,
     solver_eval_multiplier,
     solver_macro_steps,
     train_tuning_sampler_key,
 )
-from genode.models.otflow_train_val import save_json, seed_all
+from genode.models.otflow_train_val import _get_dataset_item_by_t, _parse_batch, save_json, seed_all
 from genode.runtime import resolve_torch_device
 
 SER_PTG_SCHEDULE_KEY = "ser_ptg_local_defect_eta005"
 SER_PTG_SCHEDULE_NAME = "SER-PTG local defect eta=0.05"
 SER_PTG_REVERSED_SCHEDULE_KEY = "ser_ptg_local_defect_eta005_reversed"
 SER_PTG_AVG_REVERSED_SCHEDULE_KEY = "ser_ptg_local_defect_eta005_avg_reversed"
-DEFAULT_SOLVERS: Tuple[str, ...] = ("euler", "heun", "midpoint_rk2", "dpmpp2m")
+DEFAULT_SOLVERS: Tuple[str, ...] = CANONICAL_SOLVER_KEYS
 DEFAULT_TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 
 
@@ -62,15 +79,11 @@ def _parse_int_csv(text: str) -> List[int]:
 
 
 def _hash_grid(grid: Sequence[float]) -> str:
-    return hashlib.sha256(json.dumps([float(x) for x in grid], separators=(",", ":")).encode("utf-8")).hexdigest()
+    return schedule_grid_hash(grid)
 
 
 def solver_order_for_ptg(solver_key: str) -> float:
-    if str(solver_key) == "euler":
-        return 1.0
-    if str(solver_key) in {"heun", "midpoint_rk2", "dpmpp2m"}:
-        return 2.0
-    raise ValueError(f"Unsupported solver key {solver_key!r}.")
+    return solver_order_p(str(solver_key))
 
 
 def grid_geometry(time_grid: Sequence[float]) -> Dict[str, float]:
@@ -221,16 +234,6 @@ def ser_ptg_grid_from_trace(
     return validate_time_grid(grid.tolist(), macro_steps=int(macro_steps))
 
 
-def _parse_forecast_batch(batch: Any) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
-    if len(batch) == 3:
-        hist, tgt, meta = batch
-        return hist, tgt, None, meta
-    if len(batch) == 4:
-        hist, tgt, fut, meta = batch
-        return hist, tgt, fut, meta
-    raise ValueError(f"Unexpected forecast batch format with {len(batch)} items.")
-
-
 def _local_defect_trace_from_oracle(oracle: np.ndarray, reference_time_grid: Sequence[float], *, solver_order_p: float) -> np.ndarray:
     grid = np.asarray(reference_time_grid, dtype=np.float64)
     widths = np.diff(grid)
@@ -250,6 +253,7 @@ def collect_batched_local_defect_trace(
     example_indices: Sequence[int],
     calibration_trace_samples: int = 1,
     batch_size: int = 64,
+    item_getter: Any | None = None,
 ) -> Dict[str, Any]:
     device = cfg.train.device
     indices = [int(idx) for idx in example_indices]
@@ -263,17 +267,26 @@ def collect_batched_local_defect_trace(
         for chunk_start in range(0, len(indices), effective_batch_size):
             chunk = indices[chunk_start : chunk_start + effective_batch_size]
             hist_rows = []
+            cond_rows = []
+            saw_cond = False
             for example_idx in chunk:
-                hist_t, _tgt_t, _fut_t, _meta = _parse_forecast_batch(ds[int(example_idx)])
+                batch = item_getter(ds, int(example_idx)) if item_getter is not None else ds[int(example_idx)]
+                hist_t, _tgt_t, _fut_t, cond_t, _meta = _parse_batch(batch)
                 hist_rows.append(hist_t.float())
+                if cond_t is not None:
+                    saw_cond = True
+                    cond_rows.append(cond_t.float())
             hist = torch.stack(hist_rows, dim=0).to(device).float()
+            cond = torch.stack(cond_rows, dim=0).to(device).float() if saw_cond else None
             seed_all(int(seed) + 1_000_000 * int(sample_idx) + int(chunk_start))
-            _pred, trace = model.sample_future_trace(
-                hist,
-                steps=int(reference_macro_steps),
-                solver=str(solver_name),
-                oracle_local_error=True,
-            )
+            trace_kwargs = {
+                "steps": int(reference_macro_steps),
+                "solver": str(solver_name),
+                "oracle_local_error": True,
+            }
+            if cond is not None:
+                trace_kwargs["cond"] = cond
+            _pred, trace = model.sample_future_trace(hist, **trace_kwargs)
             grid = [float(x) for x in trace["time_grid"].detach().cpu().numpy().astype(np.float64).tolist()]
             if reference_time_grid is None:
                 reference_time_grid = grid
@@ -294,9 +307,82 @@ def collect_batched_local_defect_trace(
     }
 
 
+@torch.no_grad()
+def collect_molecule_local_defect_trace(
+    model: Any,
+    ds: Any,
+    cfg: Any,
+    *,
+    solver_name: str,
+    reference_macro_steps: int,
+    solver_order_p: float,
+    seed: int,
+    example_indices: Sequence[int],
+    calibration_trace_samples: int = 1,
+    batch_size: int = 64,
+) -> Dict[str, Any]:
+    device = cfg.train.device
+    indices = [int(idx) for idx in example_indices]
+    if not indices:
+        raise ValueError("Molecule SER-PTG trace collection requires at least one example.")
+    reference_time_grid: Optional[List[float]] = None
+    trace_rows: List[np.ndarray] = []
+    oracle_rows: List[np.ndarray] = []
+    effective_batch_size = max(1, int(batch_size))
+    for sample_idx in range(int(calibration_trace_samples)):
+        for chunk_start in range(0, len(indices), effective_batch_size):
+            chunk = indices[chunk_start : chunk_start + effective_batch_size]
+            hist_rows = []
+            for example_idx in chunk:
+                item = ds.eval_item(int(example_idx))
+                history = np.asarray(item.get("history_coords", []), dtype=np.float32)
+                context = ds.context_features_from_history_coords(history)
+                hist = (context - ds.stats.context_mean[None, :]) / ds.stats.context_std[None, :]
+                hist_rows.append(torch.from_numpy(hist.astype(np.float32)))
+            hist_t = torch.stack(hist_rows, dim=0).to(device).float()
+            seed_all(int(seed) + 1_000_000 * int(sample_idx) + int(chunk_start))
+            _pred, trace = model.sample_future_trace(
+                hist_t,
+                steps=int(reference_macro_steps),
+                solver=str(solver_name),
+                oracle_local_error=True,
+            )
+            grid = [float(x) for x in trace["time_grid"].detach().cpu().numpy().astype(np.float64).tolist()]
+            if reference_time_grid is None:
+                reference_time_grid = grid
+            elif not np.allclose(np.asarray(reference_time_grid), np.asarray(grid), atol=1e-8, rtol=1e-8):
+                raise ValueError("Reference time grids changed during molecule SER-PTG trace collection.")
+            oracle = trace["oracle_local_error"].detach().cpu().numpy().astype(np.float64)
+            for row in oracle:
+                oracle_rows.append(row)
+                trace_rows.append(_local_defect_trace_from_oracle(row, grid, solver_order_p=float(solver_order_p)))
+    if reference_time_grid is None or not trace_rows:
+        raise ValueError("No molecule SER-PTG traces were collected.")
+    return {
+        "reference_time_grid": reference_time_grid,
+        "local_defect_trace": [float(x) for x in np.mean(np.stack(trace_rows, axis=0), axis=0).tolist()],
+        "oracle_local_error_trace": [float(x) for x in np.mean(np.stack(oracle_rows, axis=0), axis=0).tolist()],
+        "eval_examples": int(len(indices)),
+        "trace_count": int(len(trace_rows)),
+    }
+
+
+def _choose_molecule_indices(ds: Any, *, count: int, seed: int) -> List[int]:
+    total = int(len(ds))
+    if total <= 0:
+        raise ValueError("Empty molecule SER reference split.")
+    target = min(max(1, int(count)), total)
+    indices = np.arange(total, dtype=np.int64)
+    if target < total:
+        rng = np.random.default_rng(int(seed))
+        indices = np.sort(rng.choice(indices, size=target, replace=False))
+    return [int(x) for x in indices.tolist()]
+
+
 def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
     dataset = str(args.dataset)
-    solvers = _parse_csv(str(args.solver_names))
+    family = scenario_family_for_key(dataset)
+    solvers = list(normalize_solver_keys(str(args.solver_names)))
     target_nfes = _parse_int_csv(str(args.target_nfe_values))
     seeds = _parse_int_csv(str(args.seeds))
     reference_split = str(args.reference_split)
@@ -309,18 +395,63 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
     dataset_root = resolve_project_path(str(args.dataset_root))
     shared_backbone_root = resolve_project_path(str(args.shared_backbone_root))
     device = resolve_torch_device(str(args.device))
-    checkpoint = load_forecast_checkpoint_splits(
-        cli_args=args,
-        dataset_root=dataset_root,
-        shared_backbone_root=shared_backbone_root,
-        dataset=dataset,
-        device=device,
-    )
-    model = checkpoint["model"]
-    cfg = checkpoint["cfg"]
     split_key = "train" if reference_split == TRAIN_TUNING_PHASE else "val"
-    reference_ds = checkpoint["splits"][split_key]
-    train_tuning_reference_examples = int(len(checkpoint["splits"].get("val", [])))
+    member_refs: List[Dict[str, Any]] = []
+    if family == SCENARIO_FAMILY_FORECAST:
+        checkpoint = load_forecast_checkpoint_splits(
+            cli_args=args,
+            dataset_root=dataset_root,
+            shared_backbone_root=shared_backbone_root,
+            dataset=dataset,
+            device=device,
+        )
+        member_refs.append({"checkpoint": checkpoint, "reference_ds": checkpoint["splits"][split_key], "member_key": "", "stratum": ""})
+    elif family == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
+        if not hasattr(args, "steps") or int(getattr(args, "steps", 0) or 0) <= 0:
+            args.steps = int(getattr(args, "otflow_train_steps", 0) or 0)
+        checkpoint = load_conditional_generation_checkpoint_splits(
+            cli_args=args,
+            shared_backbone_root=shared_backbone_root,
+            dataset=dataset,
+            device=device,
+        )
+        member_refs.append({"checkpoint": checkpoint, "reference_ds": checkpoint["splits"][split_key], "member_key": "", "stratum": ""})
+    elif family == SCENARIO_FAMILY_MOLECULE:
+        group_root = resolve_project_path(str(getattr(args, "molecule_group_root", "") or default_molecule_group_root()))
+        manifest = load_molecule_group_manifest(dataset, group_root)
+        backbone_manifest = load_backbone_manifest(resolve_project_path(str(args.backbone_manifest)))
+        for member in trainable_molecule_group_members(manifest):
+            artifact = find_backbone_artifact(
+                backbone_manifest,
+                backbone_name=BACKBONE_NAME_OTFLOW_MOLECULE,
+                benchmark_family=MOLECULE_FAMILY,
+                dataset_key=dataset,
+                train_steps=int(args.otflow_train_steps),
+                member_key=str(member["member_key"]),
+                stratum=str(member["stratum"]),
+            )
+            loaded = load_molecule_checkpoint_splits(
+                checkpoint_path=str(artifact["checkpoint_path"]),
+                dataset_key=dataset,
+                stratum=str(member["stratum"]),
+                processed_dir=group_root / dataset / str(member["processed_dir"]),
+                rollout_steps=1,
+                stride_eval=1,
+                device=device,
+            )
+            member_refs.append(
+                {
+                    "checkpoint": {"model": loaded["model"], "cfg": loaded["cfg"], "splits": loaded["splits"], "checkpoint_id": artifact["checkpoint_id"]},
+                    "reference_ds": loaded["splits"][split_key],
+                    "member_key": str(member["member_key"]),
+                    "stratum": str(member["stratum"]),
+                }
+            )
+        if not member_refs:
+            raise ValueError(f"Molecule group {dataset!r} has no trainable members for SER-PTG.")
+    else:
+        raise ValueError(f"Unsupported SER-PTG scenario family: {family!r}")
+    train_tuning_reference_examples = int(max(len(ref["checkpoint"]["splits"].get("val", [])) for ref in member_refs))
     predictions: List[Dict[str, Any]] = []
     for solver_idx, solver_key in enumerate(solvers):
         solver_name = str(SOLVER_RUNTIME_NAMES[str(solver_key)])
@@ -337,46 +468,79 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             eval_examples = 0
             trace_count = 0
             for seed in seeds:
-                if reference_split == TRAIN_TUNING_PHASE:
-                    chosen = choose_forecast_train_tuning_indices(
-                        reference_ds,
-                        fraction=float(args.train_tuning_fraction),
-                        seed=int(args.train_tuning_seed) + int(seed) + 10_000 * int(solver_idx) + 1_000 * int(target_idx),
-                        strata=int(args.train_tuning_strata),
-                        dataset=dataset,
-                        sampling_mode=str(args.train_tuning_sampling_mode),
-                        reference_examples=int(train_tuning_reference_examples),
-                        train_split_fraction=float(args.train_tuning_train_split_fraction),
-                        val_split_fraction=float(args.train_tuning_val_split_fraction),
+                for member_idx, ref in enumerate(member_refs):
+                    checkpoint = ref["checkpoint"]
+                    model = checkpoint["model"]
+                    cfg = checkpoint["cfg"]
+                    reference_ds = ref["reference_ds"]
+                    selection_seed = (
+                        int(args.train_tuning_seed)
+                        + int(seed)
+                        + 100_000 * int(member_idx)
+                        + 10_000 * int(solver_idx)
+                        + 1_000 * int(target_idx)
                     )
+                    if family == SCENARIO_FAMILY_FORECAST:
+                        if reference_split == TRAIN_TUNING_PHASE:
+                            chosen = choose_forecast_train_tuning_indices(
+                                reference_ds,
+                                fraction=float(args.train_tuning_fraction),
+                                seed=selection_seed,
+                                strata=int(args.train_tuning_strata),
+                                dataset=dataset,
+                                sampling_mode=str(args.train_tuning_sampling_mode),
+                                reference_examples=int(train_tuning_reference_examples),
+                                train_split_fraction=float(args.train_tuning_train_split_fraction),
+                                val_split_fraction=float(args.train_tuning_val_split_fraction),
+                            )
+                        else:
+                            chosen = choose_forecast_example_indices(
+                                reference_ds,
+                                n_examples=int(args.val_windows),
+                                seed=selection_seed,
+                            )
+                        item_getter = None
+                        collector = collect_batched_local_defect_trace
+                    elif family == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
+                        horizon = resolved_eval_horizon(args, dataset)
+                        available = len(getattr(reference_ds, "start_indices", []))
+                        window_count = int(args.val_windows) if int(args.val_windows) > 0 else int(args.context_sample_count)
+                        chosen = _choose_valid_windows(
+                            reference_ds,
+                            horizon=int(horizon),
+                            n_windows=min(max(1, int(window_count)), max(1, int(available))),
+                            seed=selection_seed,
+                        )
+                        item_getter = lambda ds, t0: _get_dataset_item_by_t(ds, int(t0))
+                        collector = collect_batched_local_defect_trace
+                    else:
+                        window_count = int(args.val_windows) if int(args.val_windows) > 0 else int(args.context_sample_count)
+                        chosen = _choose_molecule_indices(reference_ds, count=int(window_count), seed=selection_seed)
+                        item_getter = None
+                        collector = collect_molecule_local_defect_trace
                     if bool(args.smoke):
                         chosen = chosen[: min(2, len(chosen))]
-                else:
-                    chosen = choose_forecast_example_indices(
+                    collected = collector(
+                        model,
                         reference_ds,
-                        n_examples=int(args.val_windows),
-                        seed=int(seed) + 10_000 * int(solver_idx) + 1_000 * int(target_idx),
+                        cfg,
+                        solver_name=solver_name,
+                        reference_macro_steps=int(reference_macro_steps),
+                        solver_order_p=float(solver_p),
+                        seed=int(seed) + 100_000 * int(member_idx) + 10_000 * int(solver_idx) + 1_000 * int(target_idx),
+                        example_indices=chosen,
+                        calibration_trace_samples=int(args.calibration_trace_samples),
+                        batch_size=int(args.calibration_batch_size),
+                        **({"item_getter": item_getter} if item_getter is not None else {}),
                     )
-                collected = collect_batched_local_defect_trace(
-                    model,
-                    reference_ds,
-                    cfg,
-                    solver_name=solver_name,
-                    reference_macro_steps=int(reference_macro_steps),
-                    solver_order_p=float(solver_p),
-                    seed=int(seed) + 100_000 * int(solver_idx) + 10_000 * int(target_idx),
-                    example_indices=chosen,
-                    calibration_trace_samples=int(args.calibration_trace_samples),
-                    batch_size=int(args.calibration_batch_size),
-                )
-                grid = [float(x) for x in collected["reference_time_grid"]]
-                if reference_grid is None:
-                    reference_grid = grid
-                elif not np.allclose(np.asarray(reference_grid), np.asarray(grid), atol=1e-8, rtol=1e-8):
-                    raise ValueError(f"Reference grids changed for {solver_key}/{target_nfe}.")
-                seed_traces.append(np.asarray(collected["local_defect_trace"], dtype=np.float64))
-                eval_examples = int(collected["eval_examples"])
-                trace_count += int(collected["trace_count"])
+                    grid = [float(x) for x in collected["reference_time_grid"]]
+                    if reference_grid is None:
+                        reference_grid = grid
+                    elif not np.allclose(np.asarray(reference_grid), np.asarray(grid), atol=1e-8, rtol=1e-8):
+                        raise ValueError(f"Reference grids changed for {solver_key}/{target_nfe}.")
+                    seed_traces.append(np.asarray(collected["local_defect_trace"], dtype=np.float64))
+                    eval_examples += int(collected["eval_examples"])
+                    trace_count += int(collected["trace_count"])
             if reference_grid is None:
                 raise ValueError(f"No reference grid collected for {solver_key}/{target_nfe}.")
             mean_trace = np.mean(np.stack(seed_traces, axis=0), axis=0)
@@ -391,6 +555,8 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                 {
                     "solver_key": str(solver_key),
                     "target_nfe": int(target_nfe),
+                    "checkpoint_step": int(args.otflow_train_steps),
+                    "train_steps": int(args.otflow_train_steps),
                     "runtime_nfe": int(macro_steps),
                     "macro_steps": int(macro_steps),
                     "realized_nfe": int(macro_steps) * int(solver_eval_multiplier(str(solver_key))),
@@ -466,7 +632,7 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
         "density_floor_eta": float(args.density_floor_eta),
         "reference_macro_factor": float(args.reference_macro_factor),
         "calibration_trace_samples": int(args.calibration_trace_samples),
-        "reference_examples": int(len(reference_ds) if reference_split == TRAIN_TUNING_PHASE else (len(reference_ds) if int(args.val_windows) <= 0 else min(int(args.val_windows), len(reference_ds)))),
+        "reference_examples": int(sum(len(ref["reference_ds"]) for ref in member_refs)),
         "train_tuning": {
             "fraction": float(args.train_tuning_fraction),
             "seed": int(args.train_tuning_seed),
@@ -478,9 +644,9 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             "train_split_fraction": float(args.train_tuning_train_split_fraction),
             "val_split_fraction": float(args.train_tuning_val_split_fraction),
         } if reference_split == TRAIN_TUNING_PHASE else None,
-        "checkpoint_id": str(checkpoint["checkpoint_id"]),
-        "checkpoint_path": str(checkpoint["checkpoint_path"]),
-        "schedules": [schedule],
+        "checkpoint_step": int(args.otflow_train_steps),
+        "checkpoint_ids": sorted(str(ref["checkpoint"].get("checkpoint_id", "")) for ref in member_refs),
+        "member_keys": sorted(str(ref.get("member_key", "")) for ref in member_refs if str(ref.get("member_key", ""))),
         "predictions": predictions,
     }
     save_json(summary, str(out_dir / "ser_ptg_schedule_summary.json"))
@@ -497,6 +663,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--target_nfe_values", default=",".join(str(x) for x in DEFAULT_TARGET_NFES))
     parser.add_argument("--reference_split", choices=(TRAIN_TUNING_PHASE, VALIDATION_PHASE), default=TRAIN_TUNING_PHASE)
     parser.add_argument("--val_windows", type=int, default=0)
+    parser.add_argument("--context_sample_count", type=int, default=CANONICAL_CONTEXT_SAMPLE_COUNT)
     parser.add_argument("--train_tuning_fraction", type=float, default=0.20)
     parser.add_argument("--train_tuning_seed", type=int, default=0)
     parser.add_argument("--train_tuning_strata", type=int, default=20)
@@ -513,7 +680,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
     parser.add_argument("--shared_backbone_root", default=str(DEFAULT_SHARED_BACKBONE_ROOT))
     parser.add_argument("--backbone_manifest", default=str(default_backbone_manifest_path()))
+    parser.add_argument("--cryptos_path", default=str(default_cryptos_data_path()))
+    parser.add_argument("--lobster_synthetic_profile_path", default=str(default_lobster_synthetic_profile_path()))
+    parser.add_argument("--long_term_st_path", default=str(default_long_term_st_data_path()))
+    parser.add_argument("--molecule_group_root", default=str(default_molecule_group_root()))
     parser.add_argument("--otflow_train_steps", type=int, default=20000)
+    parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--smoke", action="store_true", default=False)
     return parser

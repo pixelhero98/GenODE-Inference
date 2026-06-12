@@ -528,7 +528,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         conditional_phase.assert_not_called()
         self.assertEqual(payload["prep"]["split_phase"], "train_tuning")
 
-    def test_train_tuning_rejects_non_empty_conditional_generation_phase(self) -> None:
+    def test_train_tuning_allows_non_empty_conditional_generation_phase(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             args = runner.build_argparser().parse_args(
                 [
@@ -551,9 +551,15 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "--allow_execute",
                 ]
             )
-            with mock.patch.object(runner, "validate_execution_preflight"), mock.patch.object(runner, "_run_forecast_phase", return_value=[]):
-                with self.assertRaisesRegex(ValueError, "train_tuning split is only supported"):
-                    runner.run_diffusion_flow_time_reparameterization(args)
+            with mock.patch.object(runner, "validate_execution_preflight"), mock.patch.object(runner, "_run_forecast_phase", return_value=[]), mock.patch.object(
+                runner,
+                "_run_conditional_generation_phase",
+                return_value=[{"benchmark_family": runner.CONDITIONAL_GENERATION_FAMILY, "split_phase": "train_tuning"}],
+            ) as conditional_phase:
+                payload = runner.run_diffusion_flow_time_reparameterization(args)
+
+        conditional_phase.assert_called_once()
+        self.assertEqual(payload["prep"]["split_phase"], "train_tuning")
 
     def test_forecast_phase_uses_requested_split_dataset(self) -> None:
         class FakeDataset:

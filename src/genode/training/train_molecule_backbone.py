@@ -19,6 +19,7 @@ from genode.data.molecule_xyz import (
     ensure_molecule_processed,
 )
 from genode.data.otflow_paths import project_outputs_root, project_root, resolve_project_path
+from genode.evaluation.fm_backbone_registry import materialize_backbone_manifest
 from genode.models.config import OTFlowConfig
 from genode.models.otflow_train_val import evaluate_average_loss, save_json, seed_all, train_loop
 from genode.runtime import resolve_torch_device
@@ -442,6 +443,13 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         member_key=member_key,
         stratum=stratum,
     )
+    molecule_backbone_root = project_outputs_root() / "molecule_3d_backbones" if args.out_dir is None else resolve_project_path(str(args.out_dir))
+    manifest = materialize_backbone_manifest(
+        budget_steps=budget_steps,
+        seed=int(args.seed),
+        molecule_backbone_root=molecule_backbone_root,
+        molecule_group_root=None if getattr(args, "molecule_group_root", None) is None else resolve_project_path(str(args.molecule_group_root)),
+    )
     summary = {
         "status": "ready",
         "dataset": dataset_key,
@@ -456,6 +464,8 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         "selection_score": float(final_candidate["score"]),
         "validation": final_candidate["validation"],
         "budget_artifacts": budget_artifacts,
+        "manifest_path": _project_display_path(project_outputs_root() / "backbone_matrix" / "backbone_manifest.json"),
+        "manifest_ready_count": int(manifest.get("ready_count", 0)),
         "split_examples": {
             "train": int(len(splits["train"])),
             "val": int(len(splits["val"])),
@@ -475,6 +485,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--zip_path", default=None)
     parser.add_argument("--processed_dir", default=None)
     parser.add_argument("--out_dir", default=None)
+    parser.add_argument("--molecule_group_root", default=None)
     parser.add_argument("--variant", default="")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)

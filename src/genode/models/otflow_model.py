@@ -183,6 +183,10 @@ class OTFlow(RectifiedFlow):
         solver_name = str(getattr(self.cfg.sample, "solver", "euler") if solver is None else solver).lower().strip()
         if solver_name in {"dpmpp_2m", "dpm++", "dpm++2m"}:
             solver_name = "dpmpp2m"
+        if solver_name in {"rk2", "heun_rk2", "heun/rk2"}:
+            solver_name = "heun"
+        if solver_name in {"midpoint-rk2", "rk2_midpoint", "midpoint rk2"}:
+            solver_name = "midpoint_rk2"
         if solver_name in {"dormand_prince", "dormand-prince", "dormand_prince_45", "dopri5"}:
             solver_name = "dopri5"
         if solver_name in {"dopri5_adapt", "dopri5-adaptive", "dormand_prince_adaptive", "dormand-prince-adaptive"}:
@@ -594,8 +598,8 @@ class OTFlow(RectifiedFlow):
         adaptive_cfg = self._adaptive_sampler_settings()
         refine_cfg = self._refine_sampler_settings()
         time_grid = self._resolved_time_grid(n_steps)
-        prev_u: Optional[torch.Tensor] = None
-        prev_t: Optional[float] = None
+        prev_dpm_v: Optional[torch.Tensor] = None
+        prev_dpm_dt: Optional[float] = None
         ema_v: Optional[torch.Tensor] = None
         ema_v_sq: Optional[torch.Tensor] = None
         ema_u: Optional[torch.Tensor] = None
@@ -973,6 +977,14 @@ class OTFlow(RectifiedFlow):
                 field_evals = torch.full_like(field_evals, 6.0)
             elif solver_name == "euler":
                 x = x + dt * v
+            elif solver_name == "dpmpp2m":
+                if prev_dpm_v is None or prev_dpm_dt is None:
+                    x = x + dt * v
+                else:
+                    ratio = float(dt) / max(float(prev_dpm_dt), 1e-12)
+                    x = x + dt * ((1.0 + 0.5 * ratio) * v - 0.5 * ratio * prev_dpm_v)
+                prev_dpm_v = v
+                prev_dpm_dt = dt
             elif solver_name in {"euler_refine_half", "euler_refine_heun"}:
                 trigger_eligible, fired, trigger_strength = self._refine_trigger_state(
                     disagreement,
@@ -998,26 +1010,7 @@ class OTFlow(RectifiedFlow):
                 else:
                     x = x_euler
             else:
-                tail_next = max(0.0, 1.0 - t_next)
-                u = x + tail_cur * v
-
-                if prev_u is None or prev_t is None:
-                    coeff_x = 0.0 if tail_next <= 1e-12 else tail_next / tail_cur
-                    x = coeff_x * x + (1.0 - coeff_x) * u
-                else:
-                    prev_dt = max(t_cur - prev_t, 1e-12)
-                    slope = (u - prev_u) / prev_dt
-                    coeff_x = 0.0 if tail_next <= 1e-12 else tail_next / tail_cur
-                    coeff_u = 1.0 - coeff_x
-                    if tail_next <= 1e-12:
-                        corr_coeff = tail_cur
-                    else:
-                        ratio = tail_next / tail_cur
-                        corr_coeff = tail_next * ((1.0 / ratio) - 1.0 + math.log(ratio))
-                    x = coeff_x * x + coeff_u * u + corr_coeff * slope
-
-                prev_u = u
-                prev_t = t_cur
+                raise ValueError(f"Unhandled sample solver={solver_name}")
 
             ema_beta = adaptive_cfg["beta"] if solver_name == "euler_adaptive" else refine_cfg["beta"]
             ema_v = ema_beta * ema_v + (1.0 - ema_beta) * v_flat.detach()

@@ -620,6 +620,96 @@ class MoleculeBackboneTests(unittest.TestCase):
         self.assertEqual(calls[2][0].shape, (1, 2, 3))
         self.assertIn("motion_distribution", summary["metrics"])
         self.assertIn("rollout_stability_by_horizon", summary["metrics"])
+        self.assertEqual(summary["benchmark_family"], "molecule_3d_coordinate_generation")
+        self.assertEqual(summary["scenario_key"], "demo")
+        self.assertEqual(summary["solver_key"], "euler")
+        self.assertEqual(summary["target_nfe"], 1)
+        self.assertEqual(summary["runtime_nfe"], 1)
+        self.assertEqual(summary["realized_nfe"], 1)
+
+    def test_molecule_solver_grid_uses_canonical_runtime_steps(self) -> None:
+        args = SimpleNamespace(solver_names="dpm++2m,rk2", target_nfe_values="4", nfe_role="seen")
+        cases = molecule_metrics._molecule_solver_cases(args)
+        self.assertEqual(cases, [("dpmpp2m", 4, 4), ("heun", 4, 2)])
+
+    def test_schedule_aware_molecule_rollout_uses_time_grid_and_restores(self) -> None:
+        cfg = molecule_xyz.configure_molecule_otflow(
+            OTFlowConfig(),
+            history_len=2,
+            future_horizon=1,
+            rollout_mode="autoregressive",
+            atom_count=2,
+        )
+        checkpoint_stats = molecule_xyz.MoleculeStats(
+            target_mean=np.zeros(6, dtype=np.float32),
+            target_std=np.ones(6, dtype=np.float32),
+            context_mean=np.zeros(22, dtype=np.float32),
+            context_std=np.ones(22, dtype=np.float32),
+            reference_coords=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+        )
+
+        class FakeDataset:
+            H = 2
+            data = SimpleNamespace(atom_symbols=["C", "H"], atom_count=2)
+            stats = checkpoint_stats
+
+            def eval_item(self, idx: int):
+                previous = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+                current = previous + 0.1 * float(idx)
+                return {
+                    "context": np.zeros((2, 22), dtype=np.float32),
+                    "history_coords": np.stack([previous, current], axis=0).astype(np.float32),
+                    "future_coords": (current + 0.05)[None, :, :].astype(np.float32),
+                    "current_coords": current.astype(np.float32),
+                    "target_idx": 10 + idx,
+                    "trajectory_key": "traj",
+                    "iso_id": 1,
+                }
+
+            def context_features_from_history_coords(self, history_coords):
+                del history_coords
+                return np.zeros((2, 22), dtype=np.float32)
+
+            def denormalize_target(self, values):
+                return np.asarray(values, dtype=np.float32)
+
+        class FakeModel:
+            def __init__(self, cfg):
+                self.cfg = cfg
+                self.grids = []
+
+            def sample_future(self, hist_t, *, steps: int, solver: str):
+                del hist_t, steps, solver
+                self.grids.append(tuple(float(x) for x in self.cfg.sample.time_grid))
+                return torch.full((1, 1, 6), 0.05, dtype=torch.float32)
+
+        model = FakeModel(cfg)
+        result = molecule_metrics.evaluate_molecule_rollout_schedule(
+            model=model,
+            ds=FakeDataset(),
+            cfg=cfg,
+            scheduler_key="late_power_3",
+            solver_key="euler",
+            target_nfe=2,
+            runtime_nfe=2,
+            time_grid=(0.0, 0.25, 1.0),
+            example_indices=[0],
+            sample_count=1,
+            rollout_steps=1,
+            seed=0,
+            split_phase="locked_test",
+            checkpoint_id="ckpt",
+            dataset_key="molecule_3d_set1",
+            member_key="member",
+            stratum="Dynamic_Test",
+            formula="CH",
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(model.grids, [(0.0, 0.25, 1.0)])
+        self.assertEqual(tuple(cfg.sample.time_grid), ())
+        self.assertEqual(result["per_context_rows"][0]["context_schema"], molecule_metrics.MOLECULE_CONTEXT_SCHEMA)
+        self.assertAlmostEqual(float(result["molecule_kabsch_rmsd_3d"]), 0.0, places=6)
 
 
 if __name__ == "__main__":

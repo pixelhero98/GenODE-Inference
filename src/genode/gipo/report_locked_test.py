@@ -10,7 +10,18 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 import torch
 
-from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
+from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES, SCENARIO_FAMILY_MOLECULE
+from genode.data.molecule_xyz import default_molecule_group_root, load_molecule_group_manifest, trainable_molecule_group_members
+from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW_MOLECULE, MOLECULE_FAMILY, find_backbone_artifact, load_backbone_manifest
+from genode.evaluation.molecule_metrics import evaluate_molecule_rollout_schedule, load_molecule_checkpoint_splits
+from genode.solver_protocol import CANONICAL_SOLVER_KEYS, normalize_solver_keys
+from genode.gipo.objectives import (
+    CONDITIONAL_METRIC_SPECS,
+    FORECAST_METRIC_SPECS,
+    MOLECULE_METRIC_SPECS,
+    UNIFORM_SCHEDULE_KEY,
+    uniform_anchored_objective_columns,
+)
 from genode.gipo.policy import (
     ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
     GIPO_PROTOCOL,
@@ -18,6 +29,7 @@ from genode.gipo.policy import (
     TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
     EmbeddingNormalizer,
     build_gipo_student_model,
+    context_embedding_id_from_row,
     context_id_from_row,
     load_context_embedding_table,
     normalize_teacher_utility_weights,
@@ -38,14 +50,18 @@ from genode.data.otflow_paths import (
     resolve_project_path,
 )
 from genode.evaluation.otflow_evaluation_support import (
+    CONDITIONAL_GENERATION_FAMILY,
     DEFAULT_SHARED_BACKBONE_ROOT,
+    FORECAST_FAMILY,
     LOCKED_TEST_PHASE,
     SOLVER_RUNTIME_NAMES,
     TRAIN_TUNING_PHASE,
     VALIDATION_PHASE,
     evaluate_forecast_schedule,
+    load_conditional_generation_checkpoint_splits,
     load_forecast_checkpoint_splits,
 )
+from genode.schedule_transfer.diffusion_flow_schedules import run_fixed_schedule_variant
 from genode.runtime import ProgressBar, resolve_torch_device
 
 GIPO_SCHEDULE_KEY = "gipo"
@@ -154,13 +170,21 @@ def _evaluation_seed_from_row(row: Mapping[str, Any]) -> int:
     return int(row["seed"])
 
 
-def _row_group_key(row: Mapping[str, Any]) -> Tuple[str, str, int, str, int, str]:
+def _checkpoint_step_from_row(row: Mapping[str, Any]) -> int:
+    raw = row.get("checkpoint_step", row.get("train_steps", row.get("otflow_train_steps", "")))
+    if raw in (None, ""):
+        return 0
+    return int(raw)
+
+
+def _row_group_key(row: Mapping[str, Any]) -> Tuple[str, str, int, str, int, int, str]:
     return (
         _source_split_phase(row),
         str(row.get("dataset", row.get("dataset_key", ""))),
         _evaluation_seed_from_row(row),
         str(row["solver_key"]),
         int(row["target_nfe"]),
+        _checkpoint_step_from_row(row),
         context_id_from_row(row),
     )
 
@@ -179,13 +203,14 @@ def _representative_context_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict
     return [grouped[key] for key in sorted(grouped)]
 
 
-def _context_match_key(row: Mapping[str, Any]) -> Tuple[str, str, int, str, int, str]:
+def _context_match_key(row: Mapping[str, Any]) -> Tuple[str, str, int, str, int, int, str]:
     return (
         _source_split_phase(row),
         str(row.get("dataset", row.get("dataset_key", ""))),
         _evaluation_seed_from_row(row),
         str(row["solver_key"]),
         int(row["target_nfe"]),
+        _checkpoint_step_from_row(row),
         context_id_from_row(row),
     )
 
@@ -325,7 +350,7 @@ def _conditioning_metadata_for_summary(
 
 
 def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str) -> List[Dict[str, Any]]:
-    grouped: Dict[Tuple[str, int, str, int, str], List[Mapping[str, Any]]] = defaultdict(list)
+    grouped: Dict[Tuple[str, int, str, int, int, str], List[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[
             (
@@ -333,31 +358,95 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str)
                 int(row["seed"]),
                 str(row["solver_key"]),
                 int(row["target_nfe"]),
+                _checkpoint_step_from_row(row),
                 str(row["scheduler_key"]),
             )
         ].append(row)
     out: List[Dict[str, Any]] = []
-    for (dataset, seed, solver, target_nfe, scheduler_key), group in sorted(grouped.items()):
-        crps = np.asarray([float(row["crps"]) for row in group], dtype=np.float64)
-        mase = np.asarray([float(row["mase"]) for row in group], dtype=np.float64)
+    for (dataset, seed, solver, target_nfe, checkpoint_step, scheduler_key), group in sorted(grouped.items()):
         row: Dict[str, Any] = {
             "dataset": dataset,
             "split_phase": str(split_phase),
             "seed": int(seed),
             "solver_key": solver,
             "target_nfe": int(target_nfe),
+            "checkpoint_step": int(checkpoint_step),
+            "checkpoint_id": str(group[0].get("checkpoint_id", "")),
+            "checkpoint_maturity_label": str(group[0].get("checkpoint_maturity_label", "")),
+            "checkpoint_maturity_index": group[0].get("checkpoint_maturity_index", ""),
             "scheduler_key": scheduler_key,
-            "crps": float(np.mean(crps)),
-            "mase": float(np.mean(mase)),
             "context_count": int(len(group)),
-            "crps_std": float(np.std(crps)),
-            "mase_std": float(np.std(mase)),
         }
-        if all(row.get("mse") not in (None, "") for row in group):
-            mse = np.asarray([float(row["mse"]) for row in group], dtype=np.float64)
-            row["mse"] = float(np.mean(mse))
-            row["mse_std"] = float(np.std(mse))
+        for metric_key in (
+            "crps",
+            "mase",
+            "mse",
+            "score_main",
+            "temporal_uw1",
+            "temporal_cw1",
+            "temporal_tstr_f1",
+            "disc_auc",
+            "disc_auc_gap",
+            "u_l1",
+            "c_l1",
+            "spread_specific_error",
+            "imbalance_specific_error",
+            "ret_vol_acf_error",
+            "impact_response_error",
+            "molecule_kabsch_rmsd_3d",
+            "molecule_ensemble_velocity_norm_w1",
+            "molecule_ensemble_acceleration_norm_w1",
+            "molecule_rollout_velocity_norm_w1",
+            "molecule_rollout_acceleration_norm_w1",
+            "molecule_coordinate_w1_mean",
+            "molecule_pair_distance_w1",
+            "u_comp_uniform",
+        ):
+            vals = []
+            for item in group:
+                value = item.get(metric_key, "")
+                if value in (None, ""):
+                    continue
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(numeric):
+                    vals.append(float(numeric))
+            if vals:
+                arr = np.asarray(vals, dtype=np.float64)
+                row[metric_key] = float(np.mean(arr))
+                row[f"{metric_key}_std"] = float(np.std(arr))
+        if any("temporal_tstr_f1_applicable" in item for item in group):
+            row["temporal_tstr_f1_applicable"] = bool(
+                any(str(item.get("temporal_tstr_f1_applicable", "")).lower() == "true" for item in group)
+            )
         out.append(row)
+    return out
+
+
+def _aggregate_molecule_member_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[str, str], List[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        member_key = str(row.get("member_key") or row.get("axis_member") or "").strip()
+        stratum = str(row.get("stratum") or row.get("axis_stratum") or "").strip()
+        if not member_key or not stratum:
+            raise ValueError("Molecule member aggregate rows require member_key/stratum on every context row.")
+        grouped[(member_key, stratum)].append(row)
+    out: List[Dict[str, Any]] = []
+    for (member_key, stratum), group in sorted(grouped.items()):
+        for row in _aggregate_seed_rows(group, split_phase=split_phase):
+            first = group[0]
+            row.update(
+                {
+                    "member_key": member_key,
+                    "stratum": stratum,
+                    "formula": str(first.get("formula", first.get("axis_formula", ""))),
+                    "atom_count": str(first.get("atom_count", first.get("axis_atom_count", ""))),
+                    "source_zip_name": str(first.get("source_zip_name", "")),
+                }
+            )
+            out.append(row)
     return out
 
 
@@ -394,12 +483,90 @@ def _forecast_dataset_for_source_phase(splits: Mapping[str, Any], source_phase: 
     raise ValueError(f"Unsupported source split_phase {source_phase!r}.")
 
 
+def _benchmark_family_from_rows(rows: Sequence[Mapping[str, Any]], requested: str = "") -> str:
+    requested = str(requested or "").strip()
+    families = {str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()}
+    if requested:
+        if families and families != {requested}:
+            raise ValueError(f"context rows benchmark_family mismatch: requested {requested!r}, found {sorted(families)}.")
+        return requested
+    if not families:
+        has_generic_context_schema = any(
+            str(row.get("context_schema", "") or "").strip()
+            or any(str(row.get(key, "") or "").strip() for key in row if str(key).startswith("axis_"))
+            for row in rows
+        )
+        if has_generic_context_schema:
+            raise ValueError("Generic GIPO context rows require benchmark_family for locked-test reporting.")
+        return FORECAST_FAMILY
+    if len(families) != 1:
+        raise ValueError(f"GIPO reporter requires one benchmark_family per report; found {sorted(families)}.")
+    return next(iter(families))
+
+
 def _output_prefix(split_phase: str, selection_mode: str, report_label: str = "") -> str:
     if str(split_phase) == LOCKED_TEST_PHASE and str(selection_mode) == SELECTION_MODE_REPORTING:
         return "locked_test_gipo"
     label = str(report_label).strip() or str(split_phase).strip() or "gipo"
     safe = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in label)
     return f"{safe}_gipo"
+
+
+def _molecule_member_from_row(row: Mapping[str, Any]) -> Tuple[str, str]:
+    member_key = str(row.get("member_key") or row.get("axis_member") or "").strip()
+    stratum = str(row.get("stratum") or row.get("axis_stratum") or "").strip()
+    if not member_key or not stratum:
+        raise ValueError("Molecule GIPO reporting rows require member_key/axis_member and stratum/axis_stratum.")
+    return member_key, stratum
+
+
+def _molecule_group_member_lookup(dataset: str, group_root: Path) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    manifest = load_molecule_group_manifest(str(dataset), group_root)
+    return {
+        (str(member["member_key"]), str(member["stratum"])): dict(member)
+        for member in trainable_molecule_group_members(manifest)
+    }
+
+
+def _molecule_processed_dir(group_root: Path, dataset: str, member: Mapping[str, Any]) -> Path:
+    return group_root / str(dataset) / str(member["processed_dir"])
+
+
+def _metric_specs_for_family(benchmark_family: str):
+    if str(benchmark_family) == FORECAST_FAMILY:
+        return FORECAST_METRIC_SPECS
+    if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
+        return CONDITIONAL_METRIC_SPECS
+    if str(benchmark_family) == SCENARIO_FAMILY_MOLECULE:
+        return MOLECULE_METRIC_SPECS
+    raise ValueError(f"Unsupported benchmark_family={benchmark_family!r}.")
+
+
+def _attach_uniform_rewards_to_gipo_row(
+    row: Mapping[str, Any],
+    *,
+    uniform_row: Mapping[str, Any] | None,
+    benchmark_family: str,
+) -> Dict[str, Any]:
+    out = dict(row)
+    if uniform_row is None:
+        raise ValueError(
+            "Locked-test GIPO reporting requires a matched uniform row for every "
+            f"context/solver/NFE/checkpoint cell; missing context_id={context_id_from_row(row)!r} "
+            f"solver={row.get('solver_key')!r} target_nfe={row.get('target_nfe')!r}."
+        )
+    reward_columns = uniform_anchored_objective_columns(
+        {**out, "scheduler_key": GIPO_SCHEDULE_KEY},
+        {**dict(uniform_row), "scheduler_key": UNIFORM_SCHEDULE_KEY},
+        _metric_specs_for_family(benchmark_family),
+        uniform_schedule_key=UNIFORM_SCHEDULE_KEY,
+    )
+    out.update(reward_columns)
+    out["gipo_reward_protocol"] = GIPO_PROTOCOL
+    out["reward_anchor_schedule_key"] = UNIFORM_SCHEDULE_KEY
+    out["reward_utility_transform"] = "directional_log_uniform_anchor"
+    out["reward_granularity"] = "context_window_metric_components"
+    return out
 
 
 def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
@@ -443,38 +610,100 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("GIPO reporter requires --context_embeddings_npz.")
     context_rows = _read_csvs(context_rows_arg)
     _validate_context_rows(context_rows, split_phase=split_phase, selection_mode=selection_mode)
+    _benchmark_family_from_rows(context_rows, str(getattr(args, "benchmark_family", "") or ""))
     representatives = _representative_context_rows(context_rows)
     dataset = str(args.dataset)
+    benchmark_family = _benchmark_family_from_rows(representatives, str(getattr(args, "benchmark_family", "") or ""))
     seeds = tuple(_parse_int_csv(str(args.seeds)))
-    solvers = tuple(_parse_csv(str(args.solver_names)))
+    solvers = tuple(normalize_solver_keys(str(args.solver_names)))
     target_nfes = tuple(_parse_int_csv(str(args.target_nfe_values)))
-    expected_cells = {(dataset, seed, solver, target_nfe) for seed in seeds for solver in solvers for target_nfe in target_nfes}
-    observed_cells = {
-        (str(row.get("dataset", row.get("dataset_key", ""))), int(row["evaluation_seed"]), str(row["solver_key"]), int(row["target_nfe"]))
-        for row in representatives
-    }
+    molecule_group_root = resolve_project_path(str(getattr(args, "molecule_group_root", "") or default_molecule_group_root()))
+    molecule_members_for_coverage: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    if benchmark_family == SCENARIO_FAMILY_MOLECULE:
+        molecule_members_for_coverage = _molecule_group_member_lookup(dataset, molecule_group_root)
+        expected_cells = {
+            (dataset, member_key, stratum, seed, solver, target_nfe)
+            for member_key, stratum in sorted(molecule_members_for_coverage)
+            for seed in seeds
+            for solver in solvers
+            for target_nfe in target_nfes
+        }
+        observed_cells = {
+            (
+                str(row.get("dataset", row.get("dataset_key", ""))),
+                str(row.get("member_key") or row.get("axis_member") or ""),
+                str(row.get("stratum") or row.get("axis_stratum") or ""),
+                int(row["evaluation_seed"]),
+                str(row["solver_key"]),
+                int(row["target_nfe"]),
+            )
+            for row in representatives
+        }
+    else:
+        expected_cells = {(dataset, seed, solver, target_nfe) for seed in seeds for solver in solvers for target_nfe in target_nfes}
+        observed_cells = {
+            (str(row.get("dataset", row.get("dataset_key", ""))), int(row["evaluation_seed"]), str(row["solver_key"]), int(row["target_nfe"]))
+            for row in representatives
+        }
     missing_cells = sorted(expected_cells - observed_cells)
     if missing_cells:
         raise ValueError(f"context rows are missing seed/solver/NFE cells: {missing_cells[:8]}")
 
+    baseline_rows = _read_csvs(str(args.baseline_rows)) if str(args.baseline_rows).strip() else []
+    comparator_rows = _read_csvs(str(args.comparator_rows)) if str(args.comparator_rows).strip() else []
+    if baseline_rows:
+        _benchmark_family_from_rows(baseline_rows, benchmark_family)
+    if comparator_rows:
+        _benchmark_family_from_rows(comparator_rows, benchmark_family)
+    if selection_mode == SELECTION_MODE_CALIBRATION:
+        baseline_rows = _filter_rows_to_contexts(baseline_rows, representatives)
+        comparator_rows = _filter_rows_to_contexts(comparator_rows, representatives)
+    uniform_context_rows = {
+        _context_match_key(row): dict(row)
+        for row in baseline_rows
+        if str(row.get("scheduler_key", "")) == UNIFORM_SCHEDULE_KEY
+    }
+
     raw_embeddings = load_context_embedding_table(resolve_project_path(embeddings_arg))
-    missing_context_embeddings = sorted({context_id_from_row(row) for row in representatives} - set(raw_embeddings))
+    missing_context_embeddings = sorted({context_embedding_id_from_row(row) for row in representatives} - set(raw_embeddings))
     if missing_context_embeddings:
         raise KeyError(f"context embeddings NPZ is missing contexts: {missing_context_embeddings[:8]}")
     embeddings = normalizer.transform_table(raw_embeddings)
 
     device = resolve_torch_device(str(args.device))
     student.to(device)
-    checkpoint = load_forecast_checkpoint_splits(
-        cli_args=args,
-        dataset_root=resolve_project_path(str(args.dataset_root)),
-        shared_backbone_root=resolve_project_path(str(args.shared_backbone_root)),
-        dataset=dataset,
-        device=device,
-    )
-    model = checkpoint["model"]
-    cfg = checkpoint["cfg"]
-    splits = checkpoint["splits"]
+    if benchmark_family == FORECAST_FAMILY:
+        checkpoint = load_forecast_checkpoint_splits(
+            cli_args=args,
+            dataset_root=resolve_project_path(str(args.dataset_root)),
+            shared_backbone_root=resolve_project_path(str(args.shared_backbone_root)),
+            dataset=dataset,
+            device=device,
+        )
+    elif benchmark_family == CONDITIONAL_GENERATION_FAMILY:
+        if not hasattr(args, "steps") or int(getattr(args, "steps", 0) or 0) <= 0:
+            args.steps = int(getattr(args, "otflow_train_steps", 0) or 0)
+        checkpoint = load_conditional_generation_checkpoint_splits(
+            cli_args=args,
+            shared_backbone_root=resolve_project_path(str(args.shared_backbone_root)),
+            dataset=dataset,
+            device=device,
+        )
+    elif benchmark_family == SCENARIO_FAMILY_MOLECULE:
+        checkpoint = None
+        molecule_manifest = load_backbone_manifest(resolve_project_path(str(args.backbone_manifest)))
+        molecule_members = molecule_members_for_coverage or _molecule_group_member_lookup(dataset, molecule_group_root)
+        molecule_cache: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+    else:
+        raise NotImplementedError(f"GIPO locked-test reporting does not support benchmark_family={benchmark_family!r}.")
+    if checkpoint is not None:
+        model = checkpoint["model"]
+        cfg = checkpoint["cfg"]
+        splits = checkpoint["splits"]
+    else:
+        model = None
+        cfg = None
+        splits = None
 
     out_dir = resolve_project_path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -495,38 +724,121 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         for row_idx, row in enumerate(representatives):
             context_id = context_id_from_row(row)
             source_phase = _source_split_phase(row)
-            eval_ds = _forecast_dataset_for_source_phase(splits, source_phase)
             prediction = predictions[row_idx]
             example_idx = int(row.get("example_idx", row.get("example_index", 0)))
             solver = str(row["solver_key"])
             target_nfe = int(row["target_nfe"])
             eval_seed = int(row["evaluation_seed"]) + 10_000 * int(row_idx)
-            metrics = evaluate_forecast_schedule(
-                model,
-                eval_ds,
-                cfg,
-                solver_name=str(SOLVER_RUNTIME_NAMES[solver]),
-                runtime_nfe=int(solver_macro_steps(solver, target_nfe)),
-                target_nfe=int(target_nfe),
-                time_grid=prediction["time_grid"],
-                num_eval_samples=int(args.num_eval_samples),
-                seed=int(eval_seed),
-                scheduler_key=GIPO_SCHEDULE_KEY,
-                dataset_key=dataset,
-                split_phase=source_phase,
-                checkpoint_id=str(checkpoint["checkpoint_id"]),
-                example_indices=[example_idx],
-                batch_size=int(args.forecast_eval_batch_size),
-                progress_label="",
-                return_per_example_rows=False,
-            )
+            runtime_nfe = int(solver_macro_steps(solver, target_nfe))
+            if benchmark_family == FORECAST_FAMILY:
+                eval_ds = _forecast_dataset_for_source_phase(splits, source_phase)
+                metrics = evaluate_forecast_schedule(
+                    model,
+                    eval_ds,
+                    cfg,
+                    solver_name=str(SOLVER_RUNTIME_NAMES[solver]),
+                    runtime_nfe=int(runtime_nfe),
+                    target_nfe=int(target_nfe),
+                    time_grid=prediction["time_grid"],
+                    num_eval_samples=int(args.num_eval_samples),
+                    seed=int(eval_seed),
+                    scheduler_key=GIPO_SCHEDULE_KEY,
+                    dataset_key=dataset,
+                    split_phase=source_phase,
+                    checkpoint_id=str(checkpoint["checkpoint_id"]),
+                    example_indices=[example_idx],
+                    batch_size=int(args.forecast_eval_batch_size),
+                    progress_label="",
+                    return_per_example_rows=False,
+                )
+            elif benchmark_family == CONDITIONAL_GENERATION_FAMILY:
+                eval_ds = _forecast_dataset_for_source_phase(splits, source_phase)
+                target_t = int(row["target_t"])
+                eval_horizon = int(row.get("eval_horizon") or (int(row.get("target_stop", target_t + 1)) - target_t))
+                metrics = run_fixed_schedule_variant(
+                    model=model,
+                    ds=eval_ds,
+                    cfg=cfg,
+                    eval_horizon=int(eval_horizon),
+                    eval_windows=1,
+                    grid_spec={
+                        "grid_name": GIPO_SCHEDULE_KEY,
+                        "grid_kind": "gipo_density_time_grid",
+                        "selection_group": GIPO_SCHEDULE_KEY,
+                        "comparison_role": "student",
+                        "solver_name": str(SOLVER_RUNTIME_NAMES[solver]),
+                        "nfe": int(runtime_nfe),
+                        "time_grid": prediction["time_grid"],
+                    },
+                    chosen_t0s=[int(target_t)],
+                    generation_seed_base=int(eval_seed),
+                    metrics_seed=int(eval_seed),
+                    score_main_only=False,
+                )
+            else:
+                member_key, stratum = _molecule_member_from_row(row)
+                member = molecule_members.get((member_key, stratum))
+                if member is None:
+                    raise ValueError(f"Molecule member {member_key}/{stratum} is not present in group manifest for {dataset}.")
+                checkpoint_step = int(row.get("checkpoint_step", getattr(args, "steps", 0) or getattr(args, "otflow_train_steps", 0) or 0))
+                cache_key = (member_key, stratum, int(checkpoint_step))
+                if cache_key not in molecule_cache:
+                    artifact = find_backbone_artifact(
+                        molecule_manifest,
+                        backbone_name=BACKBONE_NAME_OTFLOW_MOLECULE,
+                        benchmark_family=MOLECULE_FAMILY,
+                        dataset_key=dataset,
+                        train_steps=int(checkpoint_step),
+                        member_key=member_key,
+                        stratum=stratum,
+                    )
+                    molecule_cache[cache_key] = load_molecule_checkpoint_splits(
+                        checkpoint_path=str(artifact["checkpoint_path"]),
+                        dataset_key=dataset,
+                        stratum=stratum,
+                        processed_dir=_molecule_processed_dir(molecule_group_root, dataset, member),
+                        rollout_steps=int(getattr(args, "rollout_steps", 16)),
+                        stride_eval=int(getattr(args, "molecule_stride_eval", 1)),
+                        device=device,
+                    )
+                    molecule_cache[cache_key]["checkpoint_id"] = str(artifact["checkpoint_id"])
+                loaded = molecule_cache[cache_key]
+                mol_splits = loaded["splits"]
+                eval_ds = _forecast_dataset_for_source_phase(mol_splits, source_phase)
+                metrics = evaluate_molecule_rollout_schedule(
+                    model=loaded["model"],
+                    ds=eval_ds,
+                    cfg=loaded["cfg"],
+                    scheduler_key=GIPO_SCHEDULE_KEY,
+                    solver_key=solver,
+                    target_nfe=int(target_nfe),
+                    runtime_nfe=int(runtime_nfe),
+                    time_grid=prediction["time_grid"],
+                    example_indices=[int(example_idx)],
+                    sample_count=int(getattr(args, "molecule_sample_count", 1)),
+                    rollout_steps=int(getattr(args, "rollout_steps", 16)),
+                    seed=int(eval_seed),
+                    split_phase=source_phase,
+                    checkpoint_id=str(loaded["checkpoint_id"]),
+                    dataset_key=dataset,
+                    member_key=member_key,
+                    stratum=stratum,
+                    formula=str(member.get("formula", "")),
+                    source_zip_name=str(member.get("source_zip_name", "")),
+                    device=device,
+                )
             selected_row = {
+                "benchmark_family": benchmark_family,
                 "dataset": dataset,
                 "split_phase": str(split_phase),
                 "source_split_phase": source_phase,
                 "selection_mode": selection_mode,
                 "selection_split": _selection_split(row),
                 "seed": int(row["evaluation_seed"]),
+                "checkpoint_step": _checkpoint_step_from_row(row),
+                "checkpoint_id": str(row.get("checkpoint_id", "")),
+                "checkpoint_maturity_label": str(row.get("checkpoint_maturity_label", "")),
+                "checkpoint_maturity_index": row.get("checkpoint_maturity_index", ""),
                 "solver_key": solver,
                 "target_nfe": int(target_nfe),
                 "scheduler_key": GIPO_SCHEDULE_KEY,
@@ -534,10 +846,10 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 "example_idx": int(example_idx),
                 "series_id": row.get("series_id", ""),
                 "series_idx": row.get("series_idx", ""),
+                "member_key": row.get("member_key", row.get("axis_member", "")),
+                "stratum": row.get("stratum", row.get("axis_stratum", "")),
+                "formula": row.get("formula", row.get("axis_formula", "")),
                 "target_t": row.get("target_t", ""),
-                "crps": float(metrics["forecast_crps"]),
-                "mase": float(metrics["forecast_mase"]),
-                "mse": metrics.get("forecast_mse", ""),
                 "time_grid_json": json.dumps(prediction["time_grid"], separators=(",", ":")),
                 "density_mass_hash": prediction["density_mass_hash"],
                 "schedule_grid_hash": prediction["schedule_grid_hash"],
@@ -546,6 +858,49 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 "setting_feature_mode": prediction["setting_feature_mode"],
                 "setting_encoder_mode": prediction["setting_encoder_mode"],
             }
+            if benchmark_family == FORECAST_FAMILY:
+                selected_row.update(
+                    {
+                        "crps": float(metrics["forecast_crps"]),
+                        "mase": float(metrics["forecast_mase"]),
+                        "mse": metrics.get("forecast_mse", ""),
+                    }
+                )
+            elif benchmark_family == CONDITIONAL_GENERATION_FAMILY:
+                selected_row.update(
+                    {
+                        "score_main": metrics.get("score_main"),
+                        "temporal_uw1": metrics.get("temporal_uw1"),
+                        "temporal_cw1": metrics.get("temporal_cw1"),
+                        "temporal_tstr_f1": metrics.get("temporal_tstr_f1"),
+                        "temporal_tstr_f1_applicable": metrics.get("temporal_tstr_f1_applicable"),
+                        "disc_auc": metrics.get("disc_auc"),
+                        "disc_auc_gap": metrics.get("disc_auc_gap"),
+                        "u_l1": metrics.get("u_l1"),
+                        "c_l1": metrics.get("c_l1"),
+                        "spread_specific_error": metrics.get("spread_specific_error"),
+                        "imbalance_specific_error": metrics.get("imbalance_specific_error"),
+                        "ret_vol_acf_error": metrics.get("ret_vol_acf_error"),
+                        "impact_response_error": metrics.get("impact_response_error"),
+                    }
+                )
+            else:
+                selected_row.update(
+                    {
+                        "molecule_kabsch_rmsd_3d": metrics.get("molecule_kabsch_rmsd_3d"),
+                        "molecule_ensemble_velocity_norm_w1": metrics.get("molecule_ensemble_velocity_norm_w1"),
+                        "molecule_ensemble_acceleration_norm_w1": metrics.get("molecule_ensemble_acceleration_norm_w1"),
+                        "molecule_rollout_velocity_norm_w1": metrics.get("molecule_rollout_velocity_norm_w1"),
+                        "molecule_rollout_acceleration_norm_w1": metrics.get("molecule_rollout_acceleration_norm_w1"),
+                        "molecule_coordinate_w1_mean": metrics.get("molecule_coordinate_w1_mean"),
+                        "molecule_pair_distance_w1": metrics.get("molecule_pair_distance_w1"),
+                    }
+                )
+            selected_row = _attach_uniform_rewards_to_gipo_row(
+                selected_row,
+                uniform_row=uniform_context_rows.get(_context_match_key(row)),
+                benchmark_family=benchmark_family,
+            )
             per_context_rows.append(selected_row)
             decision_rows.append(
                 {
@@ -559,15 +914,17 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
             progress.update()
 
     aggregate_rows = _aggregate_seed_rows(per_context_rows, split_phase=split_phase)
+    member_aggregate_rows = (
+        _aggregate_molecule_member_rows(per_context_rows, split_phase=split_phase)
+        if benchmark_family == SCENARIO_FAMILY_MOLECULE
+        else []
+    )
     _write_csv(out_dir / f"{output_prefix}_rows.csv", per_context_rows)
     _write_csv(out_dir / f"{output_prefix}_aggregate_rows.csv", aggregate_rows)
+    if member_aggregate_rows:
+        _write_csv(out_dir / f"{output_prefix}_member_aggregate_rows.csv", member_aggregate_rows)
     _write_csv(out_dir / f"{output_prefix}_decisions.csv", decision_rows)
 
-    baseline_rows = _read_csvs(str(args.baseline_rows)) if str(args.baseline_rows).strip() else []
-    comparator_rows = _read_csvs(str(args.comparator_rows)) if str(args.comparator_rows).strip() else []
-    if selection_mode == SELECTION_MODE_CALIBRATION:
-        baseline_rows = _filter_rows_to_contexts(baseline_rows, representatives)
-        comparator_rows = _filter_rows_to_contexts(comparator_rows, representatives)
     comparison = None
     if baseline_rows:
         comparison_student_rows = per_context_rows if selection_mode == SELECTION_MODE_CALIBRATION else aggregate_rows
@@ -576,6 +933,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
             comparator_rows=comparator_rows,
             student_rows=comparison_student_rows,
             dataset=dataset,
+            benchmark_family=benchmark_family,
             split_phase=split_phase,
             seeds=seeds,
             solver_names=solvers,
@@ -586,8 +944,19 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
             encoding="utf-8",
         )
 
-    crps_values = [float(row["crps"]) for row in aggregate_rows]
-    mase_values = [float(row["mase"]) for row in aggregate_rows]
+    crps_values = [float(row["crps"]) for row in aggregate_rows if row.get("crps") not in (None, "")]
+    mase_values = [float(row["mase"]) for row in aggregate_rows if row.get("mase") not in (None, "")]
+    score_values = [float(row["score_main"]) for row in aggregate_rows if row.get("score_main") not in (None, "")]
+    molecule_kabsch_values = [
+        float(row["molecule_kabsch_rmsd_3d"])
+        for row in aggregate_rows
+        if row.get("molecule_kabsch_rmsd_3d") not in (None, "")
+    ]
+    molecule_rollout_velocity_values = [
+        float(row["molecule_rollout_velocity_norm_w1"])
+        for row in aggregate_rows
+        if row.get("molecule_rollout_velocity_norm_w1") not in (None, "")
+    ]
     artifact_name = (
         "gipo_locked_test_report"
         if split_phase == LOCKED_TEST_PHASE and selection_mode == SELECTION_MODE_REPORTING
@@ -600,6 +969,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "protocol": GIPO_PROTOCOL,
         "student_policy_type": "continuous_density",
         "scheduler_key": GIPO_SCHEDULE_KEY,
+        "benchmark_family": benchmark_family,
         "dataset": dataset,
         "split_phase": split_phase,
         "selection_mode": selection_mode,
@@ -607,10 +977,14 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "target_nfe_values": [int(value) for value in target_nfes],
         "context_row_count": int(len(per_context_rows)),
         "aggregate_row_count": int(len(aggregate_rows)),
+        "member_aggregate_row_count": int(len(member_aggregate_rows)),
         "missing_expected_cells": missing_cells,
         "missing_cell_count": int(len(missing_cells)),
         "mean_crps": float(np.mean(np.asarray(crps_values, dtype=np.float64))) if crps_values else None,
         "mean_mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else None,
+        "mean_score_main": float(np.mean(np.asarray(score_values, dtype=np.float64))) if score_values else None,
+        "mean_molecule_kabsch_rmsd_3d": float(np.mean(np.asarray(molecule_kabsch_values, dtype=np.float64))) if molecule_kabsch_values else None,
+        "mean_molecule_rollout_velocity_norm_w1": float(np.mean(np.asarray(molecule_rollout_velocity_values, dtype=np.float64))) if molecule_rollout_velocity_values else None,
         "metric_means": _numeric_metric_means(aggregate_rows),
         "density_representation": checkpoint_payload.get("density_representation", {}),
         **conditioning_metadata,
@@ -639,15 +1013,34 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--baseline_rows", default="")
     parser.add_argument("--comparator_rows", default="")
+    parser.add_argument("--benchmark_family", default="")
     parser.add_argument("--dataset", default="solar_energy_10m")
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
     parser.add_argument("--shared_backbone_root", default=str(DEFAULT_SHARED_BACKBONE_ROOT))
     parser.add_argument("--backbone_manifest", default=str(default_backbone_manifest_path()))
+    parser.add_argument("--molecule_group_root", default=str(default_molecule_group_root()))
+    parser.add_argument("--molecule_sample_count", type=int, default=1)
+    parser.add_argument("--molecule_stride_eval", type=int, default=1)
     parser.add_argument("--output_root", default=str(project_outputs_root()))
+    parser.add_argument("--cryptos_path", default="")
+    parser.add_argument("--lobster_synthetic_profile_path", default="")
+    parser.add_argument("--long_term_st_path", default="")
     parser.add_argument("--otflow_train_steps", type=int, default=20000)
+    parser.add_argument("--steps", type=int, default=0)
+    parser.add_argument("--eval_horizon", type=int, default=0)
+    parser.add_argument("--future_block_len", type=int, default=0)
+    parser.add_argument("--rollout_mode", default="non_ar")
+    parser.add_argument("--rollout_steps", type=int, default=16)
+    parser.add_argument("--dataset_seed", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--hidden_dim", type=int, default=160)
+    parser.add_argument("--fu_net_layers", type=int, default=3)
+    parser.add_argument("--fu_net_heads", type=int, default=4)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seeds", default="0,1,2")
-    parser.add_argument("--solver_names", default="euler,heun,midpoint_rk2,dpmpp2m")
+    parser.add_argument("--solver_names", default=",".join(CANONICAL_SOLVER_KEYS))
     parser.add_argument("--target_nfe_values", default=",".join(str(value) for value in CANONICAL_SEEN_NFES))
     parser.add_argument("--num_eval_samples", type=int, default=5)
     parser.add_argument("--forecast_eval_batch_size", type=int, default=1)

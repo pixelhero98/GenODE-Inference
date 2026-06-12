@@ -531,6 +531,7 @@ def run_fixed_schedule_variant(
             "metrics_seed": int(result["meta"]["metrics_seed"]),
             "main_metrics_only": bool(result["meta"].get("main_metrics_only", False)),
         },
+        "per_window_metric_rows": [dict(row) for row in list(result["meta"].get("per_window_metric_rows", []) or [])],
         "score_main_only": bool(result["meta"].get("main_metrics_only", False)),
     }
     row.update(_metric_bundle(result))

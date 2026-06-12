@@ -21,6 +21,7 @@ dependencies = [
 
 [project.scripts]
 genode-run-schedules = "genode.evaluation.diffusion_flow_time_reparameterization:main"
+genode-run-full-pipeline = "genode.pipeline.full_pipeline:main"
 genode-train-backbone = "genode.training.train_backbone:main"
 genode-prepare-molecule-xyz = "genode.data.prepare_molecule_xyz:main"
 genode-train-molecule-backbone = "genode.training.train_molecule_backbone:main"

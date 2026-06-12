@@ -222,9 +222,13 @@ genode-run-schedules \
   --nfe_role seen \
   --checkpoint_steps 4000,8000,12000,16000,20000 \
   --baseline_scheduler_names uniform,late_power_3,flowts_power_sampling,ays,gits,ots \
-  --write_forecast_context_rows \
+  --write_context_rows \
   --device auto
 ```
+
+Use the same runner for other families by leaving inactive family flags empty,
+for example `--conditional_generation_datasets lobster_synthetic` or
+`--molecule_datasets molecule_3d_set1 --molecule_group_root data/molecule_3d`.
 
 If a SER schedule summary already exists, evaluate it with row writing enabled:
 

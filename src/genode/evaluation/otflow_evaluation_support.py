@@ -13,7 +13,14 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from genode.canonical_experiment_layout import CANONICAL_CHECKPOINT_STEPS
+from genode.canonical_experiment_layout import CANONICAL_CHECKPOINT_STEPS, SCENARIO_FAMILY_MOLECULE
+from genode.solver_protocol import (
+    CANONICAL_SOLVER_KEYS,
+    CANONICAL_SOLVER_RUNTIME_NAMES,
+    solver_eval_multiplier,
+    solver_macro_steps,
+    solver_order_p,
+)
 from genode.data.experiment_common import DATASET_PLANS, build_dataset_splits, get_otflow_paper_backbone_preset
 from genode.evaluation.fm_backbone_registry import (
     BACKBONE_NAME_OTFLOW,
@@ -92,13 +99,8 @@ DEFAULT_FORECAST_DATASETS = tuple(CANONICAL_FORECAST_PAPER_DATASETS)
 SUPPORTED_FORECAST_DATASETS = tuple(CANONICAL_FORECAST_PAPER_DATASETS)
 DEFAULT_CONDITIONAL_GENERATION_DATASETS = tuple(CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS)
 SUPPORTED_CONDITIONAL_GENERATION_DATASETS = tuple(ALL_SUPPORTED_CONDITIONAL_GENERATION_DATASETS)
-ALL_SOLVER_ORDER: Tuple[str, ...] = ("euler", "heun", "midpoint_rk2", "dpmpp2m")
-SOLVER_RUNTIME_NAMES: Dict[str, str] = {
-    "euler": "euler",
-    "heun": "heun",
-    "midpoint_rk2": "midpoint_rk2",
-    "dpmpp2m": "dpmpp2m",
-}
+ALL_SOLVER_ORDER: Tuple[str, ...] = CANONICAL_SOLVER_KEYS
+SOLVER_RUNTIME_NAMES: Dict[str, str] = dict(CANONICAL_SOLVER_RUNTIME_NAMES)
 
 def _empirical_crps(samples: np.ndarray, target: np.ndarray) -> float:
     samples = np.asarray(samples, dtype=np.float64)
@@ -386,40 +388,13 @@ def selection_metric_for_family(benchmark_family: str) -> str:
         return "forecast_crps"
     if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
         return "score_main"
+    if str(benchmark_family) == SCENARIO_FAMILY_MOLECULE:
+        return "molecule_kabsch_rmsd_3d"
     raise ValueError(f"Unsupported benchmark_family={benchmark_family}")
-
-
-def solver_eval_multiplier(solver_key: str) -> int:
-    key = str(solver_key)
-    if key in {"euler", "dpmpp2m"}:
-        return 1
-    if key in {"heun", "midpoint_rk2"}:
-        return 2
-    raise ValueError(f"Unsupported solver_key={solver_key}")
-
-
-def solver_macro_steps(solver_key: str, target_nfe: int) -> int:
-    if str(solver_key) in {"heun", "midpoint_rk2"}:
-        if int(target_nfe) % 2 != 0:
-            raise ValueError(f"{solver_key} requires an even target_nfe, got {target_nfe}")
-        return int(target_nfe) // 2
-    multiplier = int(solver_eval_multiplier(str(solver_key)))
-    if multiplier == 1:
-        return int(target_nfe)
-    return max(1, int(round(float(target_nfe) / float(multiplier))))
 
 
 def solver_experiment_scope(solver_key: str) -> str:
     return "solver_transfer" if str(solver_key) == "dpmpp2m" else "main"
-
-
-def solver_order_p(solver_key: str) -> float:
-    key = str(solver_key)
-    if key == "euler":
-        return 1.0
-    if key in {"heun", "midpoint_rk2", "dpmpp2m"}:
-        return 2.0
-    raise ValueError(f"Unsupported solver order mapping for {solver_key}")
 
 
 def resolve_reference_macro_steps(
@@ -1397,7 +1372,8 @@ def evaluate_forecast_schedule(
                         from genode.gipo.policy import schedule_grid_hash
 
                         metadata = metadata_rows[row_idx]
-                        context_id = chunk_context_ids[row_idx]
+                        raw_context_id = chunk_context_ids[row_idx]
+                        context_id = f"{checkpoint_id}:{raw_context_id}" if return_context_embeddings else raw_context_id
                         sample_seed_values = [
                             int(evaluation_seed) + 1_000_000 * int(chunk_start) + int(sample_idx)
                             for sample_idx in range(int(num_eval_samples))
@@ -1429,11 +1405,14 @@ def evaluate_forecast_schedule(
                                 "axis_dataset": str(metadata["dataset"]),
                                 "axis_series": str(metadata["series_id"] or f"series_idx:{metadata['series_idx']}"),
                                 "axis_time_bin": str(metadata["target_t"]),
+                                "axis_record": "",
+                                "axis_window": str(raw_context_id),
                                 "axis_stratum": "",
                                 "axis_member": "",
                                 "axis_formula": "",
                                 "axis_atom_count": "",
                                 "axis_trajectory": "",
+                                "axis_iso_id": "",
                                 "axis_flags": "",
                                 "schedule_grid_hash": schedule_grid_hash(time_grid),
                                 "example_idx": int(metadata["example_idx"]),
@@ -1444,11 +1423,14 @@ def evaluate_forecast_schedule(
                                 "history_stop": metadata.get("history_stop", ""),
                                 "target_stop": metadata.get("target_stop", ""),
                                 "context_id": str(context_id),
-                                "context_embedding_id": f"{checkpoint_id}:{context_id}" if return_context_embeddings else "",
+                                "context_embedding_id": str(context_id) if return_context_embeddings else "",
                                 "checkpoint_id": str(checkpoint_id),
                                 "forecast_crps": float(crps),
                                 "forecast_mase": float(mase),
                                 "forecast_mse": float(mse),
+                                "crps": float(crps),
+                                "mase": float(mase),
+                                "mse": float(mse),
                                 "forecast_mase_scale_kind": "seasonal"
                                 if int(getattr(ds, "mase_seasonal_period", 1) or 1) > 1
                                 else "nonseasonal",

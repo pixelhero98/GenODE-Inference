@@ -60,9 +60,11 @@ class TrainBackboneTests(unittest.TestCase):
         self.assertEqual(cfg.future_block_len, 1008)
         self.assertEqual(cfg.steps, 20_000)
 
-    def test_training_rejects_non_forecast_dataset(self) -> None:
-        with self.assertRaisesRegex(ValueError, "forecast datasets only"):
-            train_backbone_module._forecast_spec("cryptos")
+    def test_conditional_cfg_uses_dataset_default_batch_size(self) -> None:
+        cfg = train_backbone_module.build_conditional_cfg(_args(dataset="long_term_st", batch_size=0, steps=20_000))
+        self.assertEqual(cfg.history_len, 12000)
+        self.assertEqual(cfg.future_block_len, 3000)
+        self.assertEqual(cfg.batch_size, 2)
 
     def test_train_backbone_exports_validation_best_budget_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

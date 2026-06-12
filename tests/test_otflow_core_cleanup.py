@@ -112,6 +112,19 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(set(logs), {"mean", "ot_cost", "ot_used", "loss"})
 
+    def test_dpmpp2m_sampler_runs_with_one_eval_per_macro_step(self) -> None:
+        torch.manual_seed(4)
+        cfg = self._cfg(use_minibatch_ot=True)
+        model = OTFlow(cfg)
+        hist = torch.randn(2, cfg.history_len, cfg.context_dim)
+
+        sample, trace = model.sample_trace(hist, steps=4, solver="dpm++2m")
+
+        self.assertEqual(tuple(sample.shape), (2, cfg.snapshot_dim))
+        self.assertEqual(trace["solver"], "dpmpp2m")
+        self.assertEqual(trace["steps"], 4)
+        self.assertTrue(torch.allclose(trace["field_evals_by_step"], torch.ones_like(trace["field_evals_by_step"])))
+
     def test_checkpoint_loader_rejects_removed_otflow_keys(self) -> None:
         torch.manual_seed(3)
         cfg = self._cfg(use_minibatch_ot=True)

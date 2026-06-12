@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from genode.canonical_experiment_layout import (
@@ -40,6 +41,7 @@ from genode.gipo.policy import (
     build_gipo_student_model,
     build_gipo_teacher_model,
     build_series_index_map,
+    context_embedding_id_from_row,
     context_id_from_row,
     context_pair_key,
     density_mass_for_row,
@@ -73,8 +75,10 @@ from genode.gipo.models import (
     validate_time_grid,
 )
 from genode.data.otflow_paths import resolve_project_path
+from genode.evaluation.otflow_evaluation_support import FORECAST_FAMILY
 from genode.models.otflow_train_val import seed_all
 from genode.runtime import resolve_torch_device
+from genode.solver_protocol import normalize_solver_key
 
 CANONICAL_DENSITY_BIN_COUNT = 64
 CANONICAL_TEACHER_SELECTION_COMPONENT_WEIGHTS: Dict[str, float] = {
@@ -89,6 +93,34 @@ CANONICAL_TEACHER_PAIR_MARGIN = 0.0
 
 def _parse_csv(text: str) -> List[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
+
+
+def _read_metric_rows_csvs(paths_text: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for path_text in _parse_csv(str(paths_text)):
+        rows.extend(read_metric_rows_csv(resolve_project_path(path_text)))
+    return rows
+
+
+def _load_context_embedding_tables(paths_text: str) -> Dict[str, np.ndarray]:
+    merged: Dict[str, np.ndarray] = {}
+    for path_text in _parse_csv(str(paths_text)):
+        table = load_context_embedding_table(resolve_project_path(path_text))
+        _merge_embedding_tables_guarded(merged, table, label="context_embeddings")
+    return merged
+
+
+def _artifact_input_summary(paths_text: str) -> List[Dict[str, Any]]:
+    summary: List[Dict[str, Any]] = []
+    for path_text in _parse_csv(str(paths_text)):
+        path = resolve_project_path(path_text)
+        digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
+        item: Dict[str, Any] = {"name": path.name, "path_hash": digest, "exists": bool(path.exists())}
+        if path.exists() and path.is_file():
+            stat = path.stat()
+            item.update({"size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)})
+        summary.append(item)
+    return summary
 
 
 def _parse_int_csv(text: str) -> List[int]:
@@ -111,6 +143,58 @@ def _parse_float_mapping(text: str) -> Dict[str, float]:
 def _rows_for_target_nfes(rows: Sequence[Mapping[str, Any]], target_nfes: Sequence[int]) -> List[Dict[str, Any]]:
     allowed = {int(value) for value in target_nfes}
     return [dict(row) for row in rows if int(row["target_nfe"]) in allowed]
+
+
+def _has_nonempty_value(row: Mapping[str, Any], key: str) -> bool:
+    value = row.get(key, None)
+    if value is None:
+        return False
+    if isinstance(value, str) and value.strip() == "":
+        return False
+    return True
+
+
+def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
+    requested = validate_teacher_metric_target_keys(str(args.teacher_metric_target_keys))
+    if requested == ("u_comp_uniform",):
+        return requested
+    has_forecast_utility = any(
+        _has_nonempty_value(row, "u_crps_uniform")
+        or _has_nonempty_value(row, "u_mase_uniform")
+        or _has_nonempty_value(row, "forecast_crps")
+        or _has_nonempty_value(row, "forecast_mase")
+        for row in rows
+    )
+    has_canonical_composite = any(_has_nonempty_value(row, "u_comp_uniform") for row in rows)
+    if has_canonical_composite and not has_forecast_utility:
+        return ("u_comp_uniform",)
+    return requested
+
+
+def _rows_are_forecast_family(rows: Sequence[Mapping[str, Any]]) -> bool:
+    families = {str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()}
+    return not families or families == {FORECAST_FAMILY}
+
+
+def _rows_have_forecast_metrics(rows: Sequence[Mapping[str, Any]]) -> bool:
+    return any(
+        _has_nonempty_value(row, "forecast_crps")
+        or _has_nonempty_value(row, "forecast_mase")
+        or _has_nonempty_value(row, "crps")
+        or _has_nonempty_value(row, "mase")
+        for row in rows
+    )
+
+
+def _missing_target_value_keys(rows: Sequence[Mapping[str, Any]], target_keys: Sequence[str]) -> List[str]:
+    return sorted({key for key in target_keys if any(not _has_nonempty_value(row, key) for row in rows)})
+
+
+def _needs_forecast_uniform_rewards(rows: Sequence[Mapping[str, Any]], target_keys: Sequence[str]) -> bool:
+    reward_keys = {"u_comp_uniform", "u_crps_uniform", "u_mase_uniform"}
+    if not any(key in reward_keys for key in target_keys):
+        return False
+    return bool(_rows_are_forecast_family(rows) and _rows_have_forecast_metrics(rows) and _missing_target_value_keys(rows, target_keys))
 
 
 def _rows_without_schedule_keys(rows: Sequence[Mapping[str, Any]], schedule_keys: Sequence[str]) -> List[Dict[str, Any]]:
@@ -216,8 +300,18 @@ def _select_context_density_regret_step(
     }
 
 
-def _load_schedule_summary_grids(paths: Sequence[str]) -> Dict[Tuple[str, str, int], Tuple[float, ...]]:
-    grids: Dict[Tuple[str, str, int], Tuple[float, ...]] = {}
+def _checkpoint_step_from_payload(payload: Mapping[str, Any], schedule: Mapping[str, Any], item: Mapping[str, Any]) -> int | None:
+    for source in (item, schedule, payload):
+        for key in ("checkpoint_step", "train_steps", "otflow_train_steps"):
+            value = source.get(key)
+            if value in (None, ""):
+                continue
+            return int(value)
+    return None
+
+
+def _load_schedule_summary_grids(paths: Sequence[str]) -> Dict[Tuple[Any, ...], Tuple[float, ...]]:
+    grids: Dict[Tuple[Any, ...], Tuple[float, ...]] = {}
     for path_text in paths:
         path = resolve_project_path(path_text)
         if not path.exists():
@@ -236,26 +330,40 @@ def _load_schedule_summary_grids(paths: Sequence[str]) -> Dict[Tuple[str, str, i
         for schedule in schedule_items:
             schedule_key = str(schedule.get("scheduler_key", schedule.get("schedule_key", ""))).strip()
             for item in list(schedule.get("predictions", []) or []):
-                solver = str(item["solver_key"])
+                solver = normalize_solver_key(str(item["solver_key"]))
                 target_nfe = int(item["target_nfe"])
                 macro_steps = solver_macro_steps(solver, target_nfe)
                 base_grid = validate_time_grid(item["time_grid"], macro_steps=macro_steps)
-                grids[(schedule_key, solver, target_nfe)] = base_grid
+                checkpoint_step = _checkpoint_step_from_payload(payload, schedule, item)
+                base_key = (schedule_key, solver, target_nfe)
+                if checkpoint_step is None:
+                    grids[base_key] = base_grid
+                else:
+                    grids[(*base_key, int(checkpoint_step))] = base_grid
                 if schedule_key == "ser_ptg_local_defect_eta005":
                     reversed_grid = validate_time_grid(
                         [1.0 - float(value) for value in reversed(base_grid)],
                         macro_steps=macro_steps,
                     )
-                    grids[("ser_ptg_local_defect_eta005_reversed", solver, target_nfe)] = reversed_grid
+                    reversed_key = ("ser_ptg_local_defect_eta005_reversed", solver, target_nfe)
+                    if checkpoint_step is None:
+                        grids[reversed_key] = reversed_grid
+                    else:
+                        grids[(*reversed_key, int(checkpoint_step))] = reversed_grid
                     reference = uniform_reference_grid(CANONICAL_DENSITY_BIN_COUNT)
                     base_mass = grid_to_density_mass(base_grid, reference_time_grid=reference, macro_steps=macro_steps)
                     reversed_mass = grid_to_density_mass(reversed_grid, reference_time_grid=reference, macro_steps=macro_steps)
                     averaged_mass = average_density_masses(base_mass, reversed_mass)
-                    grids[("ser_ptg_local_defect_eta005_avg_reversed", solver, target_nfe)] = density_mass_to_time_grid(
+                    avg_key = ("ser_ptg_local_defect_eta005_avg_reversed", solver, target_nfe)
+                    avg_grid = density_mass_to_time_grid(
                         averaged_mass,
                         reference_time_grid=reference,
                         macro_steps=macro_steps,
                     )
+                    if checkpoint_step is None:
+                        grids[avg_key] = avg_grid
+                    else:
+                        grids[(*avg_key, int(checkpoint_step))] = avg_grid
     return grids
 
 
@@ -300,6 +408,8 @@ def _split_counts(rows: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
 
 def _validate_support_group_counts(rows: Sequence[Mapping[str, Any]], support_schedule_keys: Sequence[str]) -> None:
     support_keys = tuple(str(key) for key in support_schedule_keys)
+    if "uniform" not in set(support_keys):
+        raise ValueError("GIPO supervision support must include the uniform reward anchor schedule.")
     support_set = set(support_keys)
     grouped: Dict[Tuple[Any, ...], Dict[str, int]] = {}
     for row in rows:
@@ -319,6 +429,42 @@ def _validate_support_group_counts(rows: Sequence[Mapping[str, Any]], support_sc
             "GIPO supervision requires exactly one row for every support schedule in each "
             f"context/seed/solver/NFE group; first bad group={first_key}, counts={bad[first_key]}."
         )
+
+
+def _embedding_ids(rows: Sequence[Mapping[str, Any]]) -> set[str]:
+    return {context_embedding_id_from_row(row) for row in rows}
+
+
+def _assert_embedding_overlap_compatible(
+    base: Mapping[str, Sequence[float]],
+    extra: Mapping[str, Sequence[float]],
+    *,
+    label: str,
+    atol: float = 1e-6,
+) -> None:
+    overlap = sorted(set(base) & set(extra))
+    bad: List[str] = []
+    for key in overlap:
+        left = np.asarray(base[key], dtype=np.float32)
+        right = np.asarray(extra[key], dtype=np.float32)
+        if left.shape != right.shape or not np.allclose(left, right, rtol=1e-5, atol=float(atol)):
+            bad.append(str(key))
+    if bad:
+        raise ValueError(
+            f"{label} context embeddings collide with different vectors; first incompatible IDs: {bad[:8]}"
+        )
+
+
+def _merge_embedding_tables_guarded(
+    base: Dict[str, np.ndarray],
+    extra: Mapping[str, Sequence[float]],
+    *,
+    label: str,
+) -> None:
+    _assert_embedding_overlap_compatible(base, extra, label=label)
+    for key, value in extra.items():
+        if str(key) not in base:
+            base[str(key)] = np.asarray(value, dtype=np.float32)
 
 
 def _source_split_phase(row: Mapping[str, Any]) -> str:
@@ -415,7 +561,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher_utility_mase_weight", type=float, default=0.5)
     parser.add_argument(
         "--teacher_metric_target_keys",
-        default="u_crps_uniform,u_mase_uniform",
+        default="u_comp_uniform",
         help="Comma-separated utility columns predicted by the metric-vector teacher.",
     )
     parser.add_argument(
@@ -439,7 +585,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     conditioning_style = CONDITIONING_STYLE_ADDITIVE_MLP
     requested_setting_mode = SETTING_ENCODER_MODE_CONTINUOUS_V3
     setting_feature_mode = validate_setting_feature_mode(requested_setting_mode)
-    rows = read_metric_rows_csv(resolve_project_path(str(args.rows_csv)))
+    rows = _read_metric_rows_csvs(str(args.rows_csv))
     if not rows:
         raise ValueError("rows_csv contains no rows.")
     locked_rows = [
@@ -467,7 +613,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     if missing_support_rows:
         raise ValueError(f"Supervision schedules must have measured context rows; missing rows for {missing_support_rows}")
 
-    teacher_metric_target_keys = validate_teacher_metric_target_keys(str(args.teacher_metric_target_keys))
+    teacher_metric_target_keys = _resolve_teacher_metric_target_keys(args, rows)
     explicit_teacher_weights = _parse_float_mapping(str(args.teacher_utility_weights)) if str(args.teacher_utility_weights).strip() else None
     if explicit_teacher_weights is None and teacher_metric_target_keys == ("u_crps_uniform", "u_mase_uniform"):
         explicit_teacher_weights = {
@@ -478,9 +624,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         teacher_metric_target_keys,
         normalize_teacher_utility_weights(teacher_metric_target_keys, explicit_teacher_weights),
     )
-    forecast_utility_keys = {"u_crps_uniform", "u_mase_uniform"}
-    missing_requested_metric_keys = {key for key in teacher_metric_target_keys if any(key not in row for row in rows)}
-    if missing_requested_metric_keys & forecast_utility_keys:
+    if _needs_forecast_uniform_rewards(rows, teacher_metric_target_keys):
         rewarded_rows = attach_uniform_gipo_rewards(
             rows,
             support_schedule_keys=support_keys,
@@ -493,7 +637,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         for row in rewarded_rows:
             row["context_id"] = context_id_from_row(row)
     _validate_support_group_counts(rewarded_rows, support_keys)
-    missing_metric_columns = sorted({key for key in teacher_metric_target_keys if any(key not in row for row in rewarded_rows)})
+    missing_metric_columns = _missing_target_value_keys(rewarded_rows, teacher_metric_target_keys)
     if missing_metric_columns:
         raise ValueError(f"GIPO rows are missing teacher metric target columns: {missing_metric_columns}")
     available_context_ids = sorted({context_id_from_row(row) for row in rewarded_rows})
@@ -526,7 +670,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     unseen_selection_rows: List[Dict[str, Any]] = []
     unseen_selection_target_nfes = _parse_int_csv(str(args.teacher_unseen_selection_target_nfe_values))
     if str(args.teacher_unseen_selection_rows_csv).strip():
-        unseen_raw_rows = read_metric_rows_csv(resolve_project_path(str(args.teacher_unseen_selection_rows_csv)))
+        unseen_raw_rows = _read_metric_rows_csvs(str(args.teacher_unseen_selection_rows_csv))
         if not unseen_raw_rows:
             raise ValueError("teacher_unseen_selection_rows_csv contains no rows.")
         unseen_locked_rows = [
@@ -557,12 +701,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
                 "teacher_unseen_selection_rows_csv has no rows after filtering to "
                 f"teacher_unseen_selection_target_nfe_values={unseen_selection_target_nfes}."
             )
-        missing_unseen_metric_keys = {
-            key
-            for key in teacher_metric_target_keys
-            if any(key not in row for row in unseen_filtered_rows)
-        }
-        if missing_unseen_metric_keys & forecast_utility_keys:
+        if _needs_forecast_uniform_rewards(unseen_filtered_rows, teacher_metric_target_keys):
             unseen_rewarded_rows = attach_uniform_gipo_rewards(
                 unseen_filtered_rows,
                 support_schedule_keys=support_keys,
@@ -575,9 +714,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             for row in unseen_rewarded_rows:
                 row["context_id"] = context_id_from_row(row)
         _validate_support_group_counts(unseen_rewarded_rows, support_keys)
-        missing_unseen_columns = sorted(
-            {key for key in teacher_metric_target_keys if any(key not in row for row in unseen_rewarded_rows)}
-        )
+        missing_unseen_columns = _missing_target_value_keys(unseen_rewarded_rows, teacher_metric_target_keys)
         if missing_unseen_columns:
             raise ValueError(f"Teacher unseen selection rows are missing metric target columns: {missing_unseen_columns}")
         unseen_context_ids = set(
@@ -622,21 +759,26 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("Final teacher fitting requires at least one eligible non-test calibration row.")
     setting_encoder_config = setting_encoder_config_for_rows(final_fit_rows, mode=setting_feature_mode)
 
-    context_embeddings = load_context_embedding_table(resolve_project_path(str(args.context_embeddings_npz)))
+    context_embeddings = _load_context_embedding_tables(str(args.context_embeddings_npz))
     fit_rows = final_fit_rows
     fit_context_ids = sorted({context_id_from_row(row) for row in fit_rows})
-    embedding_normalizer = EmbeddingNormalizer.fit(context_embeddings, fit_context_ids)
+    fit_embedding_ids = sorted(_embedding_ids(fit_rows))
+    embedding_normalizer = EmbeddingNormalizer.fit(context_embeddings, fit_embedding_ids)
     normalized_embeddings = embedding_normalizer.transform_table(context_embeddings)
-    missing_embeddings = sorted({context_id_from_row(row) for row in sampled_rows} - set(normalized_embeddings))
+    missing_embeddings = sorted(_embedding_ids(sampled_rows) - set(normalized_embeddings))
     if missing_embeddings:
         raise KeyError(f"Context embeddings are missing sampled contexts: {missing_embeddings[:8]}")
     if unseen_selection_rows:
         unseen_embeddings_path = str(args.teacher_unseen_selection_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
-        unseen_raw_embeddings = load_context_embedding_table(resolve_project_path(unseen_embeddings_path))
-        missing_unseen_embeddings = sorted({context_id_from_row(row) for row in unseen_selection_rows} - set(unseen_raw_embeddings))
+        unseen_raw_embeddings = _load_context_embedding_tables(unseen_embeddings_path)
+        missing_unseen_embeddings = sorted(_embedding_ids(unseen_selection_rows) - set(unseen_raw_embeddings))
         if missing_unseen_embeddings:
             raise KeyError(f"Unseen selection context embeddings are missing contexts: {missing_unseen_embeddings[:8]}")
-        normalized_embeddings.update(embedding_normalizer.transform_table(unseen_raw_embeddings))
+        _merge_embedding_tables_guarded(
+            normalized_embeddings,
+            embedding_normalizer.transform_table(unseen_raw_embeddings),
+            label="teacher_unseen_selection",
+        )
 
     series_index_map = build_series_index_map(fit_rows)
     fit_series_keys = sorted({series_key_from_row(row) for row in fit_rows})
@@ -665,7 +807,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     pseudo_source_rows: List[Dict[str, Any]] = []
     pseudo_support_keys: Tuple[str, ...] = ()
     if str(args.student_pseudo_rows_csv).strip():
-        raw_pseudo_rows = read_metric_rows_csv(resolve_project_path(str(args.student_pseudo_rows_csv)))
+        raw_pseudo_rows = _read_metric_rows_csvs(str(args.student_pseudo_rows_csv))
         if not raw_pseudo_rows:
             raise ValueError("student_pseudo_rows_csv contains no rows.")
         _validate_train_tuning_rows(raw_pseudo_rows, label="Student pseudo distillation")
@@ -689,12 +831,12 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         )
         pseudo_rows = [row for row in pseudo_source_rows if context_id_from_row(row) in pseudo_context_ids]
         pseudo_embeddings_path = str(args.student_pseudo_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
-        raw_pseudo_embeddings = load_context_embedding_table(resolve_project_path(pseudo_embeddings_path))
-        missing_pseudo_embeddings = sorted({context_id_from_row(row) for row in pseudo_rows} - set(raw_pseudo_embeddings))
+        raw_pseudo_embeddings = _load_context_embedding_tables(pseudo_embeddings_path)
+        missing_pseudo_embeddings = sorted(_embedding_ids(pseudo_rows) - set(raw_pseudo_embeddings))
         if missing_pseudo_embeddings:
             raise KeyError(f"Pseudo distillation context embeddings are missing contexts: {missing_pseudo_embeddings[:8]}")
+        _assert_embedding_overlap_compatible(context_embeddings, raw_pseudo_embeddings, label="student_pseudo")
         pseudo_embeddings = embedding_normalizer.transform_table(raw_pseudo_embeddings)
-        normalized_embeddings.update(pseudo_embeddings)
         pseudo_schedule_grids = dict(schedule_grids)
         pseudo_schedule_summary_paths = _parse_csv(str(args.student_pseudo_schedule_summary_json))
         if pseudo_schedule_summary_paths:
@@ -808,9 +950,9 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "enabled": bool(pseudo_rows) and pseudo_target_weight > 0.0,
             "pseudo_target_weight": float(pseudo_target_weight),
             "target_nfes": [int(value) for value in CANONICAL_UNSEEN_NFES],
-            "raw_csv": str(args.student_pseudo_rows_csv),
-            "context_embeddings_npz": str(args.student_pseudo_context_embeddings_npz or args.context_embeddings_npz),
-            "schedule_summary_json": str(args.student_pseudo_schedule_summary_json),
+            "raw_csv": _artifact_input_summary(str(args.student_pseudo_rows_csv)),
+            "context_embeddings_npz": _artifact_input_summary(str(args.student_pseudo_context_embeddings_npz or args.context_embeddings_npz)),
+            "schedule_summary_json": _artifact_input_summary(str(args.student_pseudo_schedule_summary_json)),
             "source_row_count": int(len(pseudo_source_rows)),
             "selected_row_count": int(len(pseudo_rows)),
             "selected_context_count": int(len({context_id_from_row(row) for row in pseudo_rows})),
@@ -830,9 +972,9 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "protocol": "unseen_train_tuning_selection_diagnostic",
             "enabled": bool(unseen_selection_rows),
             "target_nfes": [int(value) for value in unseen_selection_target_nfes],
-            "raw_csv": str(args.teacher_unseen_selection_rows_csv),
-            "context_embeddings_npz": str(args.teacher_unseen_selection_context_embeddings_npz or args.context_embeddings_npz),
-            "schedule_summary_json": str(args.teacher_unseen_selection_schedule_summary_json),
+            "raw_csv": _artifact_input_summary(str(args.teacher_unseen_selection_rows_csv)),
+            "context_embeddings_npz": _artifact_input_summary(str(args.teacher_unseen_selection_context_embeddings_npz or args.context_embeddings_npz)),
+            "schedule_summary_json": _artifact_input_summary(str(args.teacher_unseen_selection_schedule_summary_json)),
             "source_row_count": int(len(unseen_selection_rows)),
             "diagnostic": _split_counts(unseen_nfe_diagnostic_rows),
             "excluded_density_holdout_schedule_keys": list(density_holdout_keys),

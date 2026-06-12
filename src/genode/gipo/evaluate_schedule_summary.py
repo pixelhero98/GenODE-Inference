@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
+from genode.solver_protocol import CANONICAL_SOLVER_KEYS, normalize_solver_key, normalize_solver_keys
 from genode.gipo.density_representation import (
     average_density_masses,
     density_mass_to_time_grid,
@@ -20,6 +21,7 @@ from genode.gipo.density_representation import (
 )
 from genode.gipo.models import validate_time_grid
 from genode.gipo.policy import load_context_embedding_table, save_context_embedding_table
+from genode.gipo.schedule_hash import schedule_grid_hash
 from genode.gipo.objectives import attach_reward_columns, crps_mase_reward, rewards_by_setting, seed_mean_metric_rows
 from genode.gipo.ser_ptg_reference import (
     SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
@@ -61,7 +63,7 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
     schedule_display_name,
 )
 
-DEFAULT_SOLVERS: Tuple[str, ...] = ("euler", "heun", "midpoint_rk2", "dpmpp2m")
+DEFAULT_SOLVERS: Tuple[str, ...] = CANONICAL_SOLVER_KEYS
 DEFAULT_TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 SELECTED_STUDENT_SCHEDULE_KEY = "gipo"
 SELECTED_STUDENT_SCHEDULE_NAME = "GIPO"
@@ -232,8 +234,7 @@ def _safe_gain(value: Any, reference: Any) -> Optional[float]:
 
 
 def _schedule_grid_hash(grid: Sequence[float]) -> str:
-    payload = json.dumps([float(x) for x in grid], separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return schedule_grid_hash(grid)
 
 
 def expected_realized_nfe(solver_key: str, target_nfe: int) -> int:
@@ -269,7 +270,7 @@ def _protocol_hash(args: argparse.Namespace) -> str:
         "dataset": str(args.dataset),
         "split_phase": str(args.split_phase),
         "seeds": _parse_int_csv(str(args.seeds)),
-        "solver_names": _parse_csv(str(args.solver_names)),
+        "solver_names": list(normalize_solver_keys(str(args.solver_names))),
         "target_nfe_values": _parse_int_csv(str(args.target_nfe_values)),
         "num_eval_samples": int(args.num_eval_samples),
         "forecast_eval_batch_size": int(args.forecast_eval_batch_size),
@@ -393,7 +394,7 @@ def load_schedule_predictions(
         schedule_name = str(schedule.get("schedule_name") or schedule_display_name_for_key(scheduler_key))
         budget = schedule.get("gipo_step_budget", schedule.get("student_gipo_steps", schedule.get("selected_gipo_step_budget")))
         for item in list(schedule.get("predictions", []) or []):
-            solver_key = str(item.get("solver_key"))
+            solver_key = normalize_solver_key(str(item.get("solver_key")))
             target_nfe = int(item.get("target_nfe"))
             if solver_key not in allowed_solvers or target_nfe not in allowed_nfes:
                 continue
@@ -408,6 +409,7 @@ def load_schedule_predictions(
             if realized_nfe != int(target_nfe):
                 raise ValueError(f"Realized NFE {realized_nfe} does not match target NFE {target_nfe} for {solver_key}.")
             prediction = dict(item)
+            prediction["solver_key"] = solver_key
             for meta_key in (
                 "candidate_source",
                 "active_round",
@@ -646,13 +648,18 @@ def _load_rows_csv(path: str | Path, *, dataset: str, split_phase: Optional[str]
                 target_nfe = int(row.get("target_nfe", -1))
             except (TypeError, ValueError):
                 continue
-            if seed not in seed_set or target_nfe not in nfe_set or str(row.get("solver_key")) not in solver_set:
+            try:
+                solver_key = normalize_solver_key(str(row.get("solver_key")))
+            except ValueError:
+                continue
+            if seed not in seed_set or target_nfe not in nfe_set or solver_key not in solver_set:
                 continue
             crps = _optional_float(row.get("crps"))
             mase = _optional_float(row.get("mase"))
             if crps is None or mase is None:
                 continue
             clean = dict(row)
+            clean["solver_key"] = solver_key
             clean["seed"] = int(seed)
             clean["target_nfe"] = int(target_nfe)
             clean["crps"] = float(crps)
@@ -706,7 +713,23 @@ def _aggregate_schedule_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str
         budgets = {int(row["gipo_step_budget"]) for row in group if row.get("gipo_step_budget") not in (None, "")}
         if len(budgets) == 1:
             summary["gipo_step_budget"] = int(next(iter(budgets)))
-        for metric in ("crps", "mase", "mse", "latency_ms_per_sample", "realized_nfe"):
+        for metric in (
+            "crps",
+            "mase",
+            "mse",
+            "score_main",
+            "temporal_cw1",
+            "temporal_uw1",
+            "temporal_tstr_f1",
+            "molecule_kabsch_rmsd_3d",
+            "molecule_ensemble_velocity_norm_w1",
+            "molecule_ensemble_acceleration_norm_w1",
+            "molecule_rollout_velocity_norm_w1",
+            "molecule_rollout_acceleration_norm_w1",
+            "u_comp_uniform",
+            "latency_ms_per_sample",
+            "realized_nfe",
+        ):
             values = [row.get(metric) for row in group]
             summary[f"{metric}_mean"] = _mean(values)
             summary[f"{metric}_std"] = _std(values)
@@ -720,6 +743,11 @@ def _aggregate_schedule_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str
 def _finite_metric(row: Mapping[str, Any], metric: str) -> float:
     value = _optional_float(row.get(f"{metric}_mean"))
     return float("inf") if value is None else float(value)
+
+
+def _finite_metric_high(row: Mapping[str, Any], metric: str) -> float:
+    value = _optional_float(row.get(f"{metric}_mean"))
+    return float("-inf") if value is None else float(value)
 
 
 def _candidate_centered_rewards_by_setting(rows: Sequence[Mapping[str, Any]]) -> Dict[Tuple[str, int], Dict[str, float]]:
@@ -917,11 +945,108 @@ def build_comparison_summary(
     student_rows: Sequence[Mapping[str, Any]],
     comparator_rows: Sequence[Mapping[str, Any]] = (),
     dataset: str,
+    benchmark_family: str = FORECAST_FAMILY,
     split_phase: str,
     seeds: Sequence[int],
     solver_names: Sequence[str],
     target_nfe_values: Sequence[int],
 ) -> Dict[str, Any]:
+    family = str(benchmark_family or FORECAST_FAMILY)
+    if family != FORECAST_FAMILY:
+        if family == "temporal_conditional_generation":
+            metric_keys = ("score_main", "temporal_cw1", "temporal_uw1", "u_comp_uniform")
+        elif family == "molecule_3d_coordinate_generation":
+            metric_keys = (
+                "molecule_kabsch_rmsd_3d",
+                "molecule_ensemble_velocity_norm_w1",
+                "molecule_ensemble_acceleration_norm_w1",
+                "molecule_rollout_velocity_norm_w1",
+                "molecule_rollout_acceleration_norm_w1",
+                "u_comp_uniform",
+            )
+        else:
+            raise ValueError(f"Unsupported benchmark_family={family!r} for comparison summary.")
+        all_rows = [dict(row) for row in baseline_rows] + [dict(row) for row in comparator_rows] + [dict(row) for row in student_rows]
+        aggregate_rows = _aggregate_schedule_rows(all_rows)
+        by_cell: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+        for row in aggregate_rows:
+            by_cell.setdefault((str(row["solver_key"]), int(row["target_nfe"])), []).append(row)
+        student_schedule_keys = sorted({str(row.get("scheduler_key")) for row in student_rows})
+        rankings: List[Dict[str, Any]] = []
+        for solver in solver_names:
+            for target_nfe in target_nfe_values:
+                cell_rows = by_cell.get((str(solver), int(target_nfe)), [])
+                uniform = next((row for row in cell_rows if row["scheduler_key"] == "uniform"), None)
+                ser_ptg = next((row for row in cell_rows if row["scheduler_key"] == SER_PTG_SCHEDULE_KEY), None)
+                baselines = [row for row in cell_rows if row["scheduler_key"] in BASELINE_SCHEDULE_KEYS]
+                ranking: Dict[str, Any] = {
+                    "benchmark_family": family,
+                    "solver_key": str(solver),
+                    "target_nfe": int(target_nfe),
+                    "student_comparisons": [],
+                    "metric_rankings": {},
+                }
+                for metric in metric_keys:
+                    mean_key = f"{metric}_mean"
+                    if metric == "u_comp_uniform":
+                        ordered = sorted(cell_rows, key=lambda row: (-_finite_metric_high(row, metric), str(row["scheduler_key"])))
+                        best_baseline = max(baselines, key=lambda row: _finite_metric_high(row, metric), default=None)
+                    else:
+                        ordered = sorted(cell_rows, key=lambda row: (_finite_metric(row, metric), str(row["scheduler_key"])))
+                        best_baseline = min(baselines, key=lambda row: _finite_metric(row, metric), default=None)
+                    ranking["metric_rankings"][metric] = [row["scheduler_key"] for row in ordered if row.get(mean_key) not in (None, "")]
+                    ranking[f"best_baseline_by_{metric}"] = None if best_baseline is None else best_baseline["scheduler_key"]
+                for student_row in sorted([row for row in cell_rows if str(row["scheduler_key"]) in student_schedule_keys], key=lambda row: str(row["scheduler_key"])):
+                    comparison: Dict[str, Any] = {"scheduler_key": student_row["scheduler_key"]}
+                    for metric in metric_keys:
+                        mean_key = f"{metric}_mean"
+                        comparison[f"student_{metric}_mean"] = student_row.get(mean_key)
+                        if metric == "u_comp_uniform":
+                            comparison[f"student_{metric}_delta_vs_uniform"] = None if uniform is None else (
+                                _finite_metric_high(student_row, metric) - _finite_metric_high(uniform, metric)
+                            )
+                        else:
+                            best_baseline = min(baselines, key=lambda row: _finite_metric(row, metric), default=None)
+                            comparison[f"student_{metric}_gain_vs_uniform"] = _safe_gain(
+                                student_row.get(mean_key),
+                                None if uniform is None else uniform.get(mean_key),
+                            )
+                            comparison[f"student_{metric}_gain_vs_best_baseline"] = _safe_gain(
+                                student_row.get(mean_key),
+                                None if best_baseline is None else best_baseline.get(mean_key),
+                            )
+                            comparison[f"student_{metric}_gain_vs_ser_ptg"] = _safe_gain(
+                                student_row.get(mean_key),
+                                None if ser_ptg is None else ser_ptg.get(mean_key),
+                            )
+                    ranking["student_comparisons"].append(comparison)
+                rankings.append(ranking)
+        student_missing = _missing_cells(
+            student_rows,
+            seeds=seeds,
+            solver_names=solver_names,
+            target_nfe_values=target_nfe_values,
+            schedule_keys=student_schedule_keys,
+        )
+        return {
+            "evaluator_signature": EVALUATOR_SIGNATURE_VERSION,
+            "benchmark_family": family,
+            "dataset": str(dataset),
+            "split_phase": str(split_phase),
+            "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
+            "ser_reference_schedule_keys": list(SER_REFERENCE_SCHEDULE_KEYS),
+            "student_schedule_key": student_schedule_keys[0] if len(student_schedule_keys) == 1 else None,
+            "student_schedule_keys": student_schedule_keys,
+            "seeds": [int(seed) for seed in seeds],
+            "solver_names": [str(solver) for solver in solver_names],
+            "target_nfe_values": [int(nfe) for nfe in target_nfe_values],
+            "expected_student_rows": int(len(seeds) * len(solver_names) * len(target_nfe_values) * len(student_schedule_keys)),
+            "observed_student_rows": int(len(student_rows)),
+            "missing_student_cells": student_missing,
+            "metric_keys": list(metric_keys),
+            "schedule_summaries": aggregate_rows,
+            "cell_rankings": rankings,
+        }
     all_rows = [dict(row) for row in baseline_rows] + [dict(row) for row in comparator_rows] + [dict(row) for row in student_rows]
     aggregate_rows = _aggregate_schedule_rows(all_rows)
     by_cell: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
@@ -1056,7 +1181,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
     out_dir = resolve_project_path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
     seeds = _parse_int_csv(str(args.seeds))
-    solver_names = _parse_csv(str(args.solver_names))
+    solver_names = list(normalize_solver_keys(str(args.solver_names)))
     target_nfes = _parse_int_csv(str(args.target_nfe_values))
     split_phase = str(args.split_phase)
     if split_phase not in {TRAIN_TUNING_PHASE, VALIDATION_PHASE, LOCKED_TEST_PHASE}:

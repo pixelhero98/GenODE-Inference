@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Mapping, Tuple
 
+from genode.solver_protocol import CANONICAL_SOLVER_KEYS
+
 CANONICAL_LAYOUT_VERSION = "seen_unseen_nfe_layout"
 
 CANONICAL_SEEN_NFES: Tuple[int, ...] = (4, 8, 12, 16)
@@ -166,6 +168,7 @@ def canonical_layout_summary() -> Dict[str, object]:
         "unseen_nfes": list(CANONICAL_UNSEEN_NFES),
         "checkpoint_steps": list(CANONICAL_CHECKPOINT_STEPS),
         "context_sample_count": int(CANONICAL_CONTEXT_SAMPLE_COUNT),
+        "solver_keys": list(CANONICAL_SOLVER_KEYS),
         "scenario_keys": list(CANONICAL_SCENARIO_KEYS),
         "physical_schedule_keys": list(PHYSICAL_SCHEDULE_KEYS),
         "reversed_schedule_keys": list(REVERSED_SCHEDULE_KEYS),
@@ -183,6 +186,7 @@ __all__ = [
     "CANONICAL_PSEUDO_TARGET_WEIGHT",
     "CANONICAL_SCENARIO_KEYS",
     "CANONICAL_SEEN_NFES",
+    "CANONICAL_SOLVER_KEYS",
     "CANONICAL_SUPERVISION_SCHEDULE_KEYS",
     "CANONICAL_UNSEEN_NFES",
     "CONDITIONAL_GENERATION_SCENARIO_KEYS",

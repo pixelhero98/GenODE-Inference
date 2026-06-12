@@ -8,36 +8,22 @@ from typing import Any, Dict, Mapping, Sequence, Tuple
 import torch
 
 from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
+from genode.solver_protocol import (
+    CANONICAL_SOLVER_KEYS,
+    normalize_solver_key,
+    solver_effective_order,
+    solver_eval_multiplier,
+    solver_id_map,
+    solver_macro_steps,
+)
 
-SOLVER_TO_ID: Dict[str, int] = {"euler": 0, "heun": 1, "midpoint_rk2": 2, "dpmpp2m": 3}
+SOLVER_TO_ID: Dict[str, int] = solver_id_map(CANONICAL_SOLVER_KEYS)
 TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 DEFAULT_NFE_REFERENCE = 16
 SETTING_ENCODER_MODE_CONTINUOUS_V3 = "continuous_v3"
 SERIES_ENCODING_NONE_CONTEXT_ONLY = "none_context_only"
 DEFAULT_SERIES_ENCODING = SERIES_ENCODING_NONE_CONTEXT_ONLY
 SOLVER_METADATA_VERSION = "solver_metadata"
-
-
-def solver_macro_steps(solver_key: str, target_nfe: int) -> int:
-    if str(solver_key) in {"heun", "midpoint_rk2"}:
-        if int(target_nfe) % 2 != 0:
-            raise ValueError(f"{solver_key} requires an even target NFE, got {target_nfe}")
-        return int(target_nfe) // 2
-    if str(solver_key) in {"euler", "dpmpp2m"}:
-        return int(target_nfe)
-    raise ValueError(f"Unknown solver_key={solver_key}")
-
-
-def solver_eval_multiplier(solver_key: str) -> int:
-    if str(solver_key) in {"heun", "midpoint_rk2"}:
-        return 2
-    if str(solver_key) in {"euler", "dpmpp2m"}:
-        return 1
-    raise ValueError(f"Unknown solver_key={solver_key}")
-
-
-def solver_effective_order(solver_key: str) -> int:
-    return 1 if str(solver_key) == "euler" else 2
 
 
 def validate_time_grid(grid: Sequence[float], *, macro_steps: int) -> Tuple[float, ...]:
@@ -180,18 +166,19 @@ def setting_feature_dim(
 
 
 def _continuous_v3_features(solver_key: str, target_nfe: int, config: SettingEncoderConfig) -> torch.Tensor:
+    solver = normalize_solver_key(str(solver_key))
     target = float(target_nfe)
-    macro_steps = float(solver_macro_steps(str(solver_key), int(target_nfe)))
+    macro_steps = float(solver_macro_steps(solver, int(target_nfe)))
     reference = float(max(int(config.nfe_reference), int(max(config.observed_target_nfes)), int(target_nfe)))
     log_reference = math.log(max(reference, 1.000001))
-    solver_phase = 2.0 * math.pi * _hash_unit(f"solver:{solver_key}")
+    solver_phase = 2.0 * math.pi * _hash_unit(f"solver:{solver}")
     nfe_phase = math.pi * (math.log(max(target, 1.0)) / log_reference)
     below_flag = 1.0 if target < float(min(config.observed_target_nfes)) else 0.0
     above_flag = 1.0 if target > float(max(config.observed_target_nfes)) else 0.0
     features = [
         *_fourier_phase_features(solver_phase, (1.0, 2.0)),
-        float(solver_effective_order(str(solver_key))) / 2.0,
-        float(solver_eval_multiplier(str(solver_key))) / 2.0,
+        float(solver_effective_order(solver)) / 2.0,
+        float(solver_eval_multiplier(solver)) / 2.0,
         math.log1p(macro_steps) / math.log1p(reference),
         math.log1p(target) / math.log1p(reference),
         below_flag,

@@ -1823,6 +1823,68 @@ def _wrap_optional_scalar_as_mean_std(value: Any) -> Dict[str, Any]:
     return _wrap_scalar_as_mean_std(float(value))
 
 
+def _optional_numeric(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return float(numeric)
+
+
+def _per_window_metric_rows(rows: Sequence[Dict[str, Any]], dataset_kind: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for eval_row in rows:
+        cmp = dict(eval_row.get("cmp", {}) or {})
+        meta = dict(eval_row.get("meta", {}) or {})
+        row: Dict[str, Any] = {"target_t": int(meta.get("t", len(out)))}
+        score = _optional_numeric(cmp.get("score_main"))
+        if score is not None:
+            row["score_main"] = float(score)
+        if str(dataset_kind) == LONG_TERM_ST_DATASET_KEY:
+            error = dict(cmp.get("error", {}) or {})
+            signal_mae = _optional_numeric(error.get("signal_mae"))
+            spectral_mae = _optional_numeric(error.get("spectral_mae"))
+            if signal_mae is not None:
+                row["spread_specific_error"] = float(signal_mae)
+                row["u_l1"] = float(signal_mae)
+            if spectral_mae is not None:
+                row["imbalance_specific_error"] = float(spectral_mae)
+                row["c_l1"] = float(spectral_mae)
+            temporal_errors: List[float] = []
+            for payload in dict(cmp.get("temporal", {}) or {}).values():
+                if isinstance(payload, dict):
+                    acf_l1 = _optional_numeric(payload.get("acf_l1"))
+                    if acf_l1 is not None:
+                        temporal_errors.append(float(acf_l1))
+            if temporal_errors:
+                row["ret_vol_acf_error"] = float(np.mean(np.asarray(temporal_errors, dtype=np.float64)))
+        else:
+            error = dict(cmp.get("error", {}) or {})
+            spread_mae = _optional_numeric(error.get("spread_mae"))
+            imbalance_mae = _optional_numeric(error.get("imbalance_mae"))
+            if spread_mae is not None:
+                row["spread_specific_error"] = float(spread_mae)
+                row["u_l1"] = float(spread_mae)
+            if imbalance_mae is not None:
+                row["imbalance_specific_error"] = float(imbalance_mae)
+                row["c_l1"] = float(imbalance_mae)
+            temporal = dict(cmp.get("temporal", {}) or {})
+            ret_acf = _optional_numeric(dict(temporal.get("ret", {}) or {}).get("acf_l1"))
+            vol_acf = _optional_numeric(dict(temporal.get("volatility", {}) or {}).get("acf_l1"))
+            ret_vol = [value for value in (ret_acf, vol_acf) if value is not None]
+            if ret_vol:
+                row["ret_vol_acf_error"] = float(np.mean(np.asarray(ret_vol, dtype=np.float64)))
+            impact = _optional_numeric(dict(cmp.get("microstructure", {}) or {}).get("impact_response_l1"))
+            if impact is not None:
+                row["impact_response_error"] = float(impact)
+        out.append(row)
+    return out
+
+
 @torch.no_grad()
 def eval_many_windows(
     ds: WindowedParamSequenceDataset,
@@ -1963,6 +2025,7 @@ def eval_many_windows(
             "metrics_seed": int(metrics_seed_value),
             "main_metrics_only": bool(main_metrics_only),
             "dataset_kind": dataset_kind,
+            "per_window_metric_rows": _per_window_metric_rows(rows, dataset_kind),
         },
     }
 

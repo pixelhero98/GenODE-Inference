@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -11,6 +12,48 @@ SettingKey = Tuple[str, int]
 ScheduleKey = Tuple[str, int, str]
 DEFAULT_REWARD_EPS = 1e-12
 UNIFORM_SCHEDULE_KEY = "uniform"
+METRIC_DIRECTION_LOWER = "lower"
+METRIC_DIRECTION_HIGHER = "higher"
+
+
+@dataclass(frozen=True)
+class MetricObjectiveSpec:
+    metric_key: str
+    utility_key: str
+    direction: str
+    weight: float = 1.0
+    aliases: Tuple[str, ...] = ()
+    applicable_key: str = ""
+
+
+FORECAST_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+    MetricObjectiveSpec("crps", "u_crps_uniform", METRIC_DIRECTION_LOWER, 0.5, aliases=("forecast_crps",)),
+    MetricObjectiveSpec("mase", "u_mase_uniform", METRIC_DIRECTION_LOWER, 0.5, aliases=("forecast_mase",)),
+)
+CONDITIONAL_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+    MetricObjectiveSpec("temporal_cw1", "u_temporal_cw1_uniform", METRIC_DIRECTION_LOWER, 0.4),
+    MetricObjectiveSpec("temporal_uw1", "u_temporal_uw1_uniform", METRIC_DIRECTION_LOWER, 0.4),
+    MetricObjectiveSpec(
+        "temporal_tstr_f1",
+        "u_temporal_tstr_f1_uniform",
+        METRIC_DIRECTION_HIGHER,
+        0.2,
+        applicable_key="temporal_tstr_f1_applicable",
+    ),
+    MetricObjectiveSpec("u_l1", "u_temporal_u_l1_uniform", METRIC_DIRECTION_LOWER, 0.1),
+    MetricObjectiveSpec("c_l1", "u_temporal_c_l1_uniform", METRIC_DIRECTION_LOWER, 0.1),
+    MetricObjectiveSpec("spread_specific_error", "u_temporal_spread_specific_error_uniform", METRIC_DIRECTION_LOWER, 0.1),
+    MetricObjectiveSpec("imbalance_specific_error", "u_temporal_imbalance_specific_error_uniform", METRIC_DIRECTION_LOWER, 0.1),
+    MetricObjectiveSpec("ret_vol_acf_error", "u_temporal_ret_vol_acf_error_uniform", METRIC_DIRECTION_LOWER, 0.1),
+    MetricObjectiveSpec("impact_response_error", "u_temporal_impact_response_error_uniform", METRIC_DIRECTION_LOWER, 0.1),
+)
+MOLECULE_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+    MetricObjectiveSpec("molecule_kabsch_rmsd_3d", "u_molecule_kabsch_rmsd_3d_uniform", METRIC_DIRECTION_LOWER, 0.40),
+    MetricObjectiveSpec("molecule_ensemble_velocity_norm_w1", "u_molecule_ensemble_velocity_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15),
+    MetricObjectiveSpec("molecule_ensemble_acceleration_norm_w1", "u_molecule_ensemble_acceleration_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15),
+    MetricObjectiveSpec("molecule_rollout_velocity_norm_w1", "u_molecule_rollout_velocity_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15),
+    MetricObjectiveSpec("molecule_rollout_acceleration_norm_w1", "u_molecule_rollout_acceleration_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15),
+)
 
 
 def _finite_positive(value: object) -> float:
@@ -18,6 +61,127 @@ def _finite_positive(value: object) -> float:
     if not math.isfinite(val) or val <= 0.0:
         raise ValueError(f"Metric values must be finite and positive, got {value!r}")
     return val
+
+
+def _finite_nonnegative(value: object) -> float:
+    val = float(value)
+    if not math.isfinite(val) or val < 0.0:
+        raise ValueError(f"Metric values must be finite and nonnegative, got {value!r}")
+    return val
+
+
+def _optional_finite(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val):
+        return None
+    return val
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _metric_value(row: Mapping[str, object], spec: MetricObjectiveSpec) -> float | None:
+    for key in (spec.metric_key, *spec.aliases):
+        if key in row:
+            value = _optional_finite(row.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _metric_applicable(row: Mapping[str, object], spec: MetricObjectiveSpec) -> bool:
+    if not spec.applicable_key:
+        return True
+    value = row.get(spec.applicable_key)
+    if value in (None, ""):
+        return False
+    return _truthy(value)
+
+
+def directional_uniform_utility(
+    candidate_value: object,
+    uniform_value: object,
+    *,
+    direction: str,
+    eps: float = DEFAULT_REWARD_EPS,
+) -> float:
+    candidate = _finite_nonnegative(candidate_value)
+    uniform = _finite_nonnegative(uniform_value)
+    e = float(eps)
+    if not math.isfinite(e) or e < 0.0:
+        raise ValueError(f"eps must be finite and nonnegative, got {eps!r}")
+    if str(direction) == METRIC_DIRECTION_LOWER:
+        return float(math.log(uniform + e) - math.log(candidate + e))
+    if str(direction) == METRIC_DIRECTION_HIGHER:
+        return float(math.log(candidate + e) - math.log(uniform + e))
+    raise ValueError(f"Unknown metric direction={direction!r}.")
+
+
+def uniform_anchored_objective_columns(
+    row: MetricRow,
+    uniform_row: MetricRow,
+    specs: Sequence[MetricObjectiveSpec],
+    *,
+    uniform_schedule_key: str = UNIFORM_SCHEDULE_KEY,
+    eps: float = DEFAULT_REWARD_EPS,
+) -> Dict[str, object]:
+    schedule_key = str(row.get("scheduler_key", ""))
+    is_uniform = schedule_key == str(uniform_schedule_key)
+    utilities: Dict[str, float] = {}
+    weights: Dict[str, float] = {}
+    metric_directions: Dict[str, str] = {}
+    references: Dict[str, float] = {}
+    out: Dict[str, object] = {
+        "u_comp_uniform": None,
+        "reward_metric_count": 0,
+        "reward_metric_weights_json": "{}",
+        "reward_metric_directions_json": "{}",
+    }
+    for spec in specs:
+        if not _metric_applicable(row, spec) or not _metric_applicable(uniform_row, spec):
+            out[spec.utility_key] = None
+            continue
+        candidate = _metric_value(row, spec)
+        reference = _metric_value(uniform_row, spec)
+        if candidate is None or reference is None:
+            out[spec.utility_key] = None
+            continue
+        utility = 0.0 if is_uniform else directional_uniform_utility(
+            candidate,
+            reference,
+            direction=spec.direction,
+            eps=float(eps),
+        )
+        utilities[spec.utility_key] = float(utility)
+        weights[spec.utility_key] = float(spec.weight)
+        metric_directions[spec.metric_key] = str(spec.direction)
+        references[f"uniform_{spec.metric_key}"] = float(reference)
+        out[spec.utility_key] = float(utility)
+        out[f"uniform_{spec.metric_key}"] = float(reference)
+    if utilities:
+        total_weight = float(sum(weight for weight in weights.values() if math.isfinite(weight) and weight > 0.0))
+        if total_weight <= 0.0:
+            raise ValueError("At least one applicable reward metric must have a positive weight.")
+        normalized = {key: float(weight / total_weight) for key, weight in weights.items() if weight > 0.0}
+        out["u_comp_uniform"] = float(sum(float(utilities[key]) * float(normalized[key]) for key in normalized))
+        out["reward_metric_count"] = int(len(normalized))
+        out["reward_metric_weights_json"] = json_dumps_stable(normalized)
+        out["reward_metric_directions_json"] = json_dumps_stable(metric_directions)
+    return out
+
+
+def json_dumps_stable(payload: Mapping[str, object]) -> str:
+    import json
+
+    return json.dumps(dict(payload), sort_keys=True, separators=(",", ":"))
 
 
 def crps_mase_reward(
@@ -33,14 +197,9 @@ def crps_mase_reward(
     ``crps_center`` and ``mase_center`` are reference metrics for the same
     solver/NFE cell, usually fixed-support baselines used in reporting.
     """
-    c = _finite_positive(crps)
-    m = _finite_positive(mase)
-    c0 = _finite_positive(crps_center)
-    m0 = _finite_positive(mase_center)
-    e = float(eps)
-    if not math.isfinite(e) or e < 0.0:
-        raise ValueError(f"eps must be finite and nonnegative, got {eps!r}")
-    return float(-0.5 * (math.log((c + e) / (c0 + e)) + math.log((m + e) / (m0 + e))))
+    u_crps = directional_uniform_utility(crps, crps_center, direction=METRIC_DIRECTION_LOWER, eps=float(eps))
+    u_mase = directional_uniform_utility(mase, mase_center, direction=METRIC_DIRECTION_LOWER, eps=float(eps))
+    return float(0.5 * (u_crps + u_mase))
 
 
 def seed_mean_metric_rows(rows: Iterable[MetricRow]) -> List[Dict[str, object]]:
@@ -173,8 +332,8 @@ def reward_columns_for_row(
     best_fixed_crps = _finite_positive(reference["best_fixed_crps"])
     best_fixed_mase = _finite_positive(reference["best_fixed_mase"])
     e = float(eps)
-    u_crps_best = float(-math.log((crps + e) / (best_fixed_crps + e)))
-    u_mase_best = float(-math.log((mase + e) / (best_fixed_mase + e)))
+    u_crps_best = directional_uniform_utility(crps, best_fixed_crps, direction=METRIC_DIRECTION_LOWER, eps=e)
+    u_mase_best = directional_uniform_utility(mase, best_fixed_mase, direction=METRIC_DIRECTION_LOWER, eps=e)
     out: Dict[str, float | str | int | None] = {
         "best_fixed_crps": float(best_fixed_crps),
         "best_fixed_mase": float(best_fixed_mase),
@@ -195,15 +354,25 @@ def reward_columns_for_row(
     if uniform_crps is not None and uniform_mase is not None:
         uniform_crps_f = _finite_positive(uniform_crps)
         uniform_mase_f = _finite_positive(uniform_mase)
-        u_crps_uniform = float(-math.log((crps + e) / (uniform_crps_f + e)))
-        u_mase_uniform = float(-math.log((mase + e) / (uniform_mase_f + e)))
+        generic = uniform_anchored_objective_columns(
+            row,
+            {"scheduler_key": str(reference.get("uniform_schedule_key", UNIFORM_SCHEDULE_KEY)), "crps": uniform_crps_f, "mase": uniform_mase_f},
+            FORECAST_METRIC_SPECS,
+            uniform_schedule_key=str(reference.get("uniform_schedule_key", UNIFORM_SCHEDULE_KEY)),
+            eps=e,
+        )
+        u_crps_uniform = float(generic["u_crps_uniform"])
+        u_mase_uniform = float(generic["u_mase_uniform"])
         out.update(
             {
                 "uniform_crps": float(uniform_crps_f),
                 "uniform_mase": float(uniform_mase_f),
                 "u_crps_uniform": u_crps_uniform,
                 "u_mase_uniform": u_mase_uniform,
-                "u_comp_uniform": float(0.5 * (u_crps_uniform + u_mase_uniform)),
+                "u_comp_uniform": float(generic["u_comp_uniform"]),
+                "reward_metric_count": generic.get("reward_metric_count"),
+                "reward_metric_weights_json": generic.get("reward_metric_weights_json"),
+                "reward_metric_directions_json": generic.get("reward_metric_directions_json"),
             }
         )
     return out

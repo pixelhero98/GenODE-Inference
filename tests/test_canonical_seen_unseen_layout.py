@@ -8,6 +8,7 @@ from genode.canonical_experiment_layout import (
     CANONICAL_CONTEXT_SAMPLE_COUNT,
     CANONICAL_SCENARIO_KEYS,
     CANONICAL_SEEN_NFES,
+    CANONICAL_SOLVER_KEYS,
     CANONICAL_SUPERVISION_SCHEDULE_KEYS,
     CANONICAL_UNSEEN_NFES,
     PHYSICAL_SCHEDULE_KEYS,
@@ -15,6 +16,7 @@ from genode.canonical_experiment_layout import (
     canonical_nfes_for_role,
 )
 from genode.evaluation import diffusion_flow_time_reparameterization as runner
+from genode.solver_protocol import expected_realized_nfe, normalize_solver_key, normalize_solver_keys, solver_macro_steps
 from genode.gipo.train_gipo import build_argparser as build_gipo_argparser
 
 
@@ -23,6 +25,7 @@ class CanonicalSeenUnseenLayoutTests(unittest.TestCase):
         self.assertEqual(CANONICAL_SEEN_NFES, (4, 8, 12, 16))
         self.assertEqual(CANONICAL_UNSEEN_NFES, (6, 10, 14, 20))
         self.assertEqual(CANONICAL_CHECKPOINT_STEPS, (4000, 8000, 12000, 16000, 20000))
+        self.assertEqual(CANONICAL_SOLVER_KEYS, ("euler", "dpmpp2m", "heun", "midpoint_rk2"))
         self.assertEqual(len(CANONICAL_SCENARIO_KEYS), 9)
         self.assertEqual(len(PHYSICAL_SCHEDULE_KEYS), 7)
         self.assertEqual(len(REVERSED_SCHEDULE_KEYS), 6)
@@ -60,6 +63,17 @@ class CanonicalSeenUnseenLayoutTests(unittest.TestCase):
         self.assertEqual(args.context_sample_count, CANONICAL_CONTEXT_SAMPLE_COUNT)
         self.assertEqual(args.teacher_unseen_selection_target_nfe_values, "6,10,14,20")
         self.assertAlmostEqual(float(args.student_pseudo_target_weight), 0.25)
+
+    def test_solver_protocol_is_canonical_and_aliases_do_not_persist(self) -> None:
+        self.assertEqual(normalize_solver_key("dpm++2m"), "dpmpp2m")
+        self.assertEqual(normalize_solver_key("rk2"), "heun")
+        self.assertEqual(normalize_solver_keys("euler,dpm++2m,rk2,midpoint rk2"), CANONICAL_SOLVER_KEYS)
+        with self.assertRaisesRegex(ValueError, "Duplicate solver keys"):
+            normalize_solver_keys("heun,rk2")
+        self.assertEqual(solver_macro_steps("heun", 4), 2)
+        self.assertEqual(solver_macro_steps("dpmpp2m", 4), 4)
+        self.assertEqual(expected_realized_nfe("heun", 4), 4)
+        self.assertEqual(expected_realized_nfe("dpmpp2m", 4), 4)
 
 
 if __name__ == "__main__":

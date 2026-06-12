@@ -486,6 +486,34 @@ def load_molecule_group_manifest(dataset_key: str, group_root: str | Path | None
     return payload
 
 
+def trainable_molecule_group_members(manifest: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Return canonical fixed-shape trainable members from a group manifest."""
+
+    members: List[Dict[str, Any]] = []
+    for raw_member in manifest.get("strata", []):
+        member = dict(raw_member)
+        stratum = str(member.get("stratum", "")).strip()
+        if not stratum or stratum.startswith("Direct_"):
+            continue
+        if not bool(member.get("trainable", True)) or bool(member.get("mixed_shape", False)):
+            continue
+        source_zip_name = str(member.get("source_zip_name", "")).strip()
+        if Path(source_zip_name).name != source_zip_name:
+            raise ValueError("Molecule group manifest source_zip_name must be a file name, not a path.")
+        processed_dir = PurePosixPath(str(member.get("processed_dir", "")))
+        if processed_dir.is_absolute() or ".." in processed_dir.parts:
+            raise ValueError(f"Molecule group manifest has unsafe processed_dir={processed_dir}.")
+        members.append(member)
+    return sorted(
+        members,
+        key=lambda row: (
+            str(row.get("source_zip_name", "")),
+            str(row.get("member_key", "")),
+            str(row.get("stratum", "")),
+        ),
+    )
+
+
 def prepare_molecule_xyz_group_datasets(
     zip_paths: Sequence[str | Path],
     group_root: str | Path | None = None,
@@ -500,7 +528,7 @@ def prepare_molecule_xyz_group_datasets(
     for dataset_key in manifest_summary["grouping"]["dataset_keys"]:
         manifest = load_molecule_group_manifest(str(dataset_key), root)
         rows: Dict[str, Any] = {}
-        for member_idx, member in enumerate(manifest["strata"]):
+        for member_idx, member in enumerate(trainable_molecule_group_members(manifest)):
             source_zip = zip_by_name[str(member["source_zip_name"])]
             processed_dir = root / str(dataset_key) / str(member["processed_dir"])
             rows[str(member["member_key"])] = prepare_molecule_xyz_zip(
@@ -1674,5 +1702,6 @@ __all__ = [
     "prepare_molecule_xyz_all_strata",
     "prepare_molecule_xyz_group_datasets",
     "prepare_molecule_xyz_zip",
+    "trainable_molecule_group_members",
     "write_molecule_group_manifests",
 ]

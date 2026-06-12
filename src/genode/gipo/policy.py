@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import csv
-import hashlib
 import json
 import math
 from collections import defaultdict
@@ -44,7 +43,15 @@ from genode.gipo.models import (
     validate_setting_feature_mode,
     validate_time_grid,
 )
-from genode.gipo.objectives import DEFAULT_REWARD_EPS, UNIFORM_SCHEDULE_KEY
+from genode.gipo.objectives import (
+    DEFAULT_REWARD_EPS,
+    FORECAST_METRIC_SPECS,
+    UNIFORM_SCHEDULE_KEY,
+    uniform_anchored_objective_columns,
+)
+from genode.gipo.schedule_hash import json_hash as _canonical_json_hash
+from genode.gipo.schedule_hash import schedule_grid_hash
+from genode.solver_protocol import normalize_solver_key
 from genode.gipo.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
@@ -54,7 +61,7 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
 
 MetricRow = Mapping[str, Any]
 ContextPairKey = Tuple[str, str, int, str, int | None]
-ScheduleGridKey = Tuple[str, str, int]
+ScheduleGridKey = Tuple[str, str, int] | Tuple[str, str, int, int]
 
 GIPO_PROTOCOL = "gipo_density"
 DEFAULT_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = CANONICAL_SUPERVISION_SCHEDULE_KEYS
@@ -74,7 +81,7 @@ CONDITIONING_STYLE_ADDITIVE_MLP = "additive_mlp"
 DENSITY_TOKEN_ATTENTION_ROPE = "bin_self_attention_rope"
 TEACHER_OUTPUT_METRIC_VECTOR = "metric_vector"
 TEACHER_SCALARIZATION_WEIGHTED_AVERAGE = "weighted_metric_average"
-DEFAULT_TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = ("u_crps_uniform", "u_mase_uniform")
+DEFAULT_TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = ("u_comp_uniform",)
 TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = DEFAULT_TEACHER_METRIC_TARGET_KEYS
 TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET = "weighted_normalized_regret"
 DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
@@ -353,13 +360,7 @@ def _setting_features_for_config(
 
 
 def _json_hash(payload: Mapping[str, Any], *, prefix: str) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return f"{prefix}_{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:24]}"
-
-
-def schedule_grid_hash(time_grid: Sequence[float]) -> str:
-    values = [round(float(value), 12) for value in time_grid]
-    return _json_hash({"time_grid": values}, prefix="grid")
+    return _canonical_json_hash(payload, prefix=prefix)
 
 
 def stable_context_id(
@@ -416,11 +417,14 @@ def context_id_from_row(row: MetricRow) -> str:
             "split_phase": split_phase,
             "axis_series": str(row.get("axis_series", row.get("series_id", row.get("series_idx", "")))),
             "axis_time_bin": str(row.get("axis_time_bin", "")),
+            "axis_record": str(row.get("axis_record", row.get("record_id", ""))),
+            "axis_window": str(row.get("axis_window", "")),
             "axis_stratum": str(row.get("axis_stratum", row.get("stratum", ""))),
             "axis_member": str(row.get("axis_member", row.get("member_key", ""))),
             "axis_formula": str(row.get("axis_formula", row.get("formula", ""))),
             "axis_atom_count": str(row.get("axis_atom_count", row.get("atom_count", ""))),
             "axis_trajectory": str(row.get("axis_trajectory", row.get("trajectory_key", row.get("trajectory_id", "")))),
+            "axis_iso_id": str(row.get("axis_iso_id", row.get("iso_id", ""))),
             "axis_flags": str(row.get("axis_flags", "")),
             "example_idx": str(row.get("example_idx", row.get("example_index", ""))),
             "target_t": str(row.get("target_t", "")),
@@ -452,6 +456,21 @@ def context_id_from_row(row: MetricRow) -> str:
         history_stop=_optional_int(row.get("history_stop")),
         context_schema=context_schema or "forecast_window",
     )
+
+
+def context_embedding_id_from_row(row: MetricRow) -> str:
+    """Return the canonical key for looking up frozen context embeddings.
+
+    `context_id` is the logical reward-pairing key. Generic multi-family
+    artifacts may reuse the same logical context across checkpoint maturities,
+    so the embedding lookup must prefer the checkpoint-scoped
+    `context_embedding_id` when present.
+    """
+
+    existing = str(row.get("context_embedding_id", "") or "").strip()
+    if existing:
+        return existing
+    return context_id_from_row(row)
 
 
 def logical_seed_from_row(row: MetricRow) -> int | None:
@@ -778,23 +797,22 @@ def attach_uniform_gipo_rewards(
         uniform_rows = [row for row in group if str(row["scheduler_key"]) == uniform_key]
         if len(uniform_rows) != 1:
             raise ValueError(f"Uniform-anchored context rewards require exactly one uniform row in paired context {key}.")
-        uniform_crps = _finite_positive(uniform_rows[0]["crps"], label="uniform_crps")
-        uniform_mase = _finite_positive(uniform_rows[0]["mase"], label="uniform_mase")
-        e = float(eps)
         for row in group:
-            crps = _finite_positive(row["crps"], label="crps")
-            mase = _finite_positive(row["mase"], label="mase")
-            u_crps = float(-math.log((crps + e) / (uniform_crps + e)))
-            u_mase = float(-math.log((mase + e) / (uniform_mase + e)))
+            reward_columns = uniform_anchored_objective_columns(
+                row,
+                uniform_rows[0],
+                FORECAST_METRIC_SPECS,
+                uniform_schedule_key=uniform_key,
+                eps=float(eps),
+            )
+            u_crps = float(reward_columns["u_crps_uniform"])
+            u_mase = float(reward_columns["u_mase_uniform"])
             copied = dict(row)
             copied.update(
                 {
                     "gipo_reward_protocol": GIPO_PROTOCOL,
                     "reward_anchor_schedule_key": uniform_key,
-                    "uniform_crps": float(uniform_crps),
-                    "uniform_mase": float(uniform_mase),
-                    "u_crps_uniform": u_crps,
-                    "u_mase_uniform": u_mase,
+                    **reward_columns,
                     "u_comp_crps_weight": float(crps_weight),
                     "u_comp_mase_weight": float(mase_weight),
                     "u_comp_uniform": float(crps_weight * u_crps + mase_weight * u_mase),
@@ -999,6 +1017,21 @@ class DensityFeatureNormalizer:
         return cls(mean=np.asarray(payload["mean"], dtype=np.float32), std=np.asarray(payload["std"], dtype=np.float32))
 
 
+def _sanitize_public_manifest_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _sanitize_public_manifest_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_public_manifest_value(item) for item in value]
+    if isinstance(value, str):
+        text = str(value)
+        looks_absolute = Path(text).is_absolute() or text.startswith("/") or (
+            len(text) >= 3 and text[1:3] == ":\\"
+        )
+        if looks_absolute:
+            return Path(text).name
+    return value
+
+
 def save_context_embedding_table(
     path: str | Path,
     embeddings: Mapping[str, Sequence[float]],
@@ -1017,10 +1050,10 @@ def save_context_embedding_table(
     manifest = {
         "artifact": "context_embedding_table",
         "protocol": GIPO_PROTOCOL,
-        "path": str(resolved),
+        "path": resolved.name,
         "context_count": int(context_ids.size),
         "embedding_dim": int(matrix.shape[1]),
-        "metadata": dict(metadata or {}),
+        "metadata": _sanitize_public_manifest_value(dict(metadata or {})),
     }
     manifest_path = resolved.with_suffix(resolved.suffix + ".manifest.json")
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -1058,13 +1091,26 @@ def grid_for_schedule(
     target_nfe: int,
     *,
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None = None,
+    checkpoint_step: int | None = None,
 ) -> Tuple[float, ...]:
     key = str(schedule_key)
     macro_steps = solver_macro_steps(str(solver_key), int(target_nfe))
     if key in AVERAGED_SCHEDULE_COMPONENTS:
         left_key, right_key = AVERAGED_SCHEDULE_COMPONENTS[key]
-        left_grid = grid_for_schedule(left_key, solver_key, target_nfe, schedule_grids=schedule_grids)
-        right_grid = grid_for_schedule(right_key, solver_key, target_nfe, schedule_grids=schedule_grids)
+        left_grid = grid_for_schedule(
+            left_key,
+            solver_key,
+            target_nfe,
+            schedule_grids=schedule_grids,
+            checkpoint_step=checkpoint_step,
+        )
+        right_grid = grid_for_schedule(
+            right_key,
+            solver_key,
+            target_nfe,
+            schedule_grids=schedule_grids,
+            checkpoint_step=checkpoint_step,
+        )
         reference = uniform_reference_grid()
         left_mass = grid_to_density_mass(left_grid, reference_time_grid=reference, macro_steps=macro_steps)
         right_mass = grid_to_density_mass(right_grid, reference_time_grid=reference, macro_steps=macro_steps)
@@ -1075,11 +1121,23 @@ def grid_for_schedule(
             macro_steps=macro_steps,
         )
     if key in REVERSED_SCHEDULE_BASE and key not in EXPERIMENTAL_FIXED_SCHEDULE_KEYS:
-        base_grid = grid_for_schedule(REVERSED_SCHEDULE_BASE[key], solver_key, target_nfe, schedule_grids=schedule_grids)
+        base_grid = grid_for_schedule(
+            REVERSED_SCHEDULE_BASE[key],
+            solver_key,
+            target_nfe,
+            schedule_grids=schedule_grids,
+            checkpoint_step=checkpoint_step,
+        )
         reversed_grid = [1.0 - float(value) for value in reversed(tuple(base_grid))]
         return validate_time_grid(reversed_grid, macro_steps=macro_steps)
-    if schedule_grids is not None and (key, str(solver_key), int(target_nfe)) in schedule_grids:
-        return validate_time_grid(schedule_grids[(key, str(solver_key), int(target_nfe))], macro_steps=macro_steps)
+    if schedule_grids is not None:
+        base_key = (key, str(solver_key), int(target_nfe))
+        if checkpoint_step is not None:
+            checkpoint_key = (*base_key, int(checkpoint_step))
+            if checkpoint_key in schedule_grids:
+                return validate_time_grid(schedule_grids[checkpoint_key], macro_steps=macro_steps)
+        if base_key in schedule_grids:
+            return validate_time_grid(schedule_grids[base_key], macro_steps=macro_steps)
     if key in EXPERIMENTAL_FIXED_SCHEDULE_KEYS:
         grid = build_schedule_grid(key, macro_steps)
         if grid is None:
@@ -1096,7 +1154,16 @@ def density_mass_for_row(
 ) -> Tuple[float, ...]:
     solver = str(row["solver_key"])
     target_nfe = int(row["target_nfe"])
-    grid = grid_for_schedule(str(row["scheduler_key"]), solver, target_nfe, schedule_grids=schedule_grids)
+    checkpoint_step = None
+    if row.get("checkpoint_step", "") not in (None, ""):
+        checkpoint_step = int(row["checkpoint_step"])
+    grid = grid_for_schedule(
+        str(row["scheduler_key"]),
+        solver,
+        target_nfe,
+        schedule_grids=schedule_grids,
+        checkpoint_step=checkpoint_step,
+    )
     return grid_to_density_mass(grid, reference_time_grid=reference_time_grid, macro_steps=solver_macro_steps(solver, target_nfe))
 
 
@@ -1801,16 +1868,16 @@ def _teacher_training_tensors(
     schedule_keys: List[str] = []
     density_masses: List[Tuple[float, ...]] = []
     for row in rows:
-        context_id = context_id_from_row(row)
-        if context_id not in context_embeddings:
-            raise KeyError(f"Missing context embedding for {context_id}.")
-        solver = str(row["solver_key"])
+        context_embedding_id = context_embedding_id_from_row(row)
+        if context_embedding_id not in context_embeddings:
+            raise KeyError(f"Missing context embedding for {context_embedding_id}.")
+        solver = normalize_solver_key(str(row["solver_key"]))
         target_nfe = int(row["target_nfe"])
         mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
         setting_rows.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
         density_rows.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
         series_rows.append(0)
-        context_rows.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
+        context_rows.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
         pair_keys.append(context_pair_key(row, pair_on_seed=True))
         schedule_keys.append(str(row["scheduler_key"]))
         density_masses.append(mass)
@@ -2579,9 +2646,9 @@ def build_teacher_weighted_density_targets(
     score_context: List[np.ndarray] = []
     score_masses: Dict[int, Tuple[float, ...]] = {}
     for row in rows:
-        context_id = context_id_from_row(row)
-        if context_id not in context_embeddings:
-            raise KeyError(f"Missing context embedding for {context_id}.")
+        context_embedding_id = context_embedding_id_from_row(row)
+        if context_embedding_id not in context_embeddings:
+            raise KeyError(f"Missing context embedding for {context_embedding_id}.")
         solver = str(row["solver_key"])
         target_nfe = int(row["target_nfe"])
         mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
@@ -2589,7 +2656,7 @@ def build_teacher_weighted_density_targets(
         score_settings.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
         score_density.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
         score_series.append(0)
-        score_context.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
+        score_context.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
     with torch.no_grad():
         metric_score_values = _teacher_metric_scores(
             teacher,
@@ -2621,9 +2688,9 @@ def build_teacher_weighted_density_targets(
         if bad_counts:
             raise ValueError(f"Teacher-weighted density targets require exactly one row per supervision schedule; counts={bad_counts}.")
         first = group[0]
-        context_id = context_id_from_row(first)
-        if context_id not in context_embeddings:
-            raise KeyError(f"Missing context embedding for {context_id}.")
+        context_embedding_id = context_embedding_id_from_row(first)
+        if context_embedding_id not in context_embeddings:
+            raise KeyError(f"Missing context embedding for {context_embedding_id}.")
         solver = str(first["solver_key"])
         target_nfe = int(first["target_nfe"])
         masses: List[Tuple[float, ...]] = []
@@ -2645,7 +2712,7 @@ def build_teacher_weighted_density_targets(
         mixture = mixture / max(float(np.sum(mixture)), 1e-12)
         setting_rows.append(setting_row)
         series_rows.append(0)
-        context_rows.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
+        context_rows.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
         target_masses.append(mixture.astype(np.float32))
         entropy_values.append(float(-np.sum(weights * np.log(np.maximum(weights, 1e-12)))))
         ess_values.append(_teacher_candidate_ess(weights))
@@ -3066,7 +3133,7 @@ def predict_gipo_density(
     return predict_gipo_density_many(
         student,
         rows=[row],
-        context_embeddings={context_id_from_row(row): context_embedding},
+        context_embeddings={context_embedding_id_from_row(row): context_embedding},
         series_index_map=series_index_map,
         reference_time_grid=reference_time_grid,
         setting_feature_mode=setting_feature_mode,
@@ -3094,12 +3161,12 @@ def predict_gipo_density_many(
     series_rows: List[int] = []
     context_rows: List[np.ndarray] = []
     for row in rows:
-        context_id = context_id_from_row(row)
-        if context_id not in context_embeddings:
-            raise KeyError(f"Missing context embedding for {context_id}.")
+        context_embedding_id = context_embedding_id_from_row(row)
+        if context_embedding_id not in context_embeddings:
+            raise KeyError(f"Missing context embedding for {context_embedding_id}.")
         setting_rows.append(setting_features(str(row["solver_key"]), int(row["target_nfe"]), mode=feature_mode, config=encoder_config))
         series_rows.append(0)
-        context_rows.append(np.asarray(context_embeddings[context_id], dtype=np.float32))
+        context_rows.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
     student.to(device)
     student.eval()
     with torch.no_grad():
@@ -3137,7 +3204,11 @@ def predict_gipo_density_many(
 
 def read_metric_rows_csv(path: str | Path) -> List[Dict[str, Any]]:
     with Path(path).open("r", newline="", encoding="utf-8") as fh:
-        return [dict(row) for row in csv.DictReader(fh)]
+        rows = [dict(row) for row in csv.DictReader(fh)]
+    for row in rows:
+        if str(row.get("solver_key", "")).strip():
+            row["solver_key"] = normalize_solver_key(str(row["solver_key"]))
+    return rows
 
 
 __all__ = [
@@ -3179,6 +3250,7 @@ __all__ = [
     "build_gipo_teacher_model",
     "build_teacher_weighted_density_targets",
     "context_calibration_train_val_counts",
+    "context_embedding_id_from_row",
     "context_id_from_row",
     "context_pair_key",
     "density_family_for_schedule_key",

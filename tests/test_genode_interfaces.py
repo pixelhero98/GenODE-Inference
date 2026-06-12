@@ -26,6 +26,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         expected = {
             "genode-train-backbone",
             "genode-run-schedules",
+            "genode-run-full-pipeline",
             "genode-prepare-molecule-xyz",
             "genode-train-molecule-backbone",
             "genode-eval-molecule-backbone",
