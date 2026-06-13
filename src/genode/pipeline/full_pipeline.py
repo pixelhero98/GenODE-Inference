@@ -36,6 +36,17 @@ from genode.data.otflow_paths import (
     resolve_project_path,
 )
 from genode.gipo.objectives import objective_specs_for_family
+from genode.gipo.policy import (
+    DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
+    DEFAULT_STUDENT_TARGET_ELITE_FRACTION,
+    DEFAULT_STUDENT_TARGET_ELITE_K,
+    DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT,
+    DEFAULT_STUDENT_TARGET_MIXTURE_MODE,
+    DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
+    DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT,
+    DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION,
+    STUDENT_TARGET_MIXTURE_MODES,
+)
 
 PIPELINE_VERSION = "canonical_multi_family_gipo_pipeline"
 DEFAULT_STAGES = (
@@ -124,6 +135,28 @@ def _teacher_target_args_for_family(dataset: str) -> List[str]:
     ]
 
 
+def _student_objective_args(args: argparse.Namespace) -> List[Any]:
+    values: List[Any] = [
+        "--student_teacher_score_weight",
+        float(args.student_teacher_score_weight),
+        "--student_teacher_score_warmup_fraction",
+        float(args.student_teacher_score_warmup_fraction),
+        "--student_target_mixture_mode",
+        str(args.student_target_mixture_mode),
+        "--student_target_elite_fraction",
+        float(args.student_target_elite_fraction),
+        "--student_target_elite_k",
+        int(args.student_target_elite_k),
+        "--student_target_elite_min_count",
+        int(args.student_target_elite_min_count),
+        "--student_target_elite_blend_all_weight",
+        float(args.student_target_elite_blend_all_weight),
+    ]
+    if bool(args.student_teacher_score_include_pseudo):
+        values.append("--student_teacher_score_include_pseudo")
+    return values
+
+
 def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
     dataset = str(args.scenario_key or args.dataset)
     family = scenario_family_for_key(dataset)
@@ -161,6 +194,16 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "unseen_nfes": _parse_int_csv(str(args.unseen_nfes), CANONICAL_UNSEEN_NFES),
         "schedules": _parse_csv(str(args.schedule_keys)) or list(CANONICAL_SUPERVISION_SCHEDULE_KEYS),
         "context_sample_count": int(args.context_sample_count),
+        "student_teacher_score_weight": float(args.student_teacher_score_weight),
+        "student_teacher_score_warmup_fraction": float(args.student_teacher_score_warmup_fraction),
+        "student_teacher_score_clip": float(DEFAULT_STUDENT_TEACHER_SCORE_CLIP),
+        "student_teacher_score_protocol": "late_ramped_per_cell_teacher_utility_z_score",
+        "student_teacher_score_include_pseudo": bool(args.student_teacher_score_include_pseudo),
+        "student_target_mixture_mode": str(args.student_target_mixture_mode),
+        "student_target_elite_fraction": float(args.student_target_elite_fraction),
+        "student_target_elite_k": int(args.student_target_elite_k),
+        "student_target_elite_min_count": int(args.student_target_elite_min_count),
+        "student_target_elite_blend_all_weight": float(args.student_target_elite_blend_all_weight),
         "synthetic_length": int(args.synthetic_length),
         "locked_test_rows": str(args.locked_test_rows),
         "dataset_root": _display_path(str(args.dataset_root)),
@@ -526,6 +569,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                         "--support_schedule_keys",
                         support_schedules,
                         *_teacher_target_args_for_family(dataset),
+                        *_student_objective_args(args),
                         "--context_sample_count",
                         int(args.context_sample_count),
                         "--out_dir",
@@ -550,6 +594,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                         "--support_schedule_keys",
                         support_schedules,
                         *_teacher_target_args_for_family(dataset),
+                        *_student_objective_args(args),
                         "--student_pseudo_rows_csv",
                         _csv_list("unseen", "train_tuning", "context_rows.csv"),
                         "--student_pseudo_context_embeddings_npz",
@@ -676,6 +721,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--unseen_nfes", default=",".join(str(value) for value in CANONICAL_UNSEEN_NFES))
     parser.add_argument("--schedule_keys", default=",".join(CANONICAL_SUPERVISION_SCHEDULE_KEYS))
     parser.add_argument("--context_sample_count", type=int, default=CANONICAL_CONTEXT_SAMPLE_COUNT)
+    parser.add_argument("--student_teacher_score_weight", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT)
+    parser.add_argument("--student_teacher_score_warmup_fraction", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION)
+    parser.add_argument("--student_teacher_score_include_pseudo", action="store_true", default=False)
+    parser.add_argument("--student_target_mixture_mode", choices=STUDENT_TARGET_MIXTURE_MODES, default=DEFAULT_STUDENT_TARGET_MIXTURE_MODE)
+    parser.add_argument("--student_target_elite_fraction", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_FRACTION)
+    parser.add_argument("--student_target_elite_k", type=int, default=DEFAULT_STUDENT_TARGET_ELITE_K)
+    parser.add_argument("--student_target_elite_min_count", type=int, default=DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT)
+    parser.add_argument("--student_target_elite_blend_all_weight", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT)
     parser.add_argument("--synthetic_length", type=int, default=2_000_000)
     parser.add_argument("--locked_test_rows", default="")
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))

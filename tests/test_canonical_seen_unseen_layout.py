@@ -63,6 +63,14 @@ class CanonicalSeenUnseenLayoutTests(unittest.TestCase):
         self.assertEqual(args.context_sample_count, CANONICAL_CONTEXT_SAMPLE_COUNT)
         self.assertEqual(args.teacher_unseen_selection_target_nfe_values, "6,10,14,20")
         self.assertAlmostEqual(float(args.student_pseudo_target_weight), 0.25)
+        self.assertAlmostEqual(float(args.student_teacher_score_weight), 0.05)
+        self.assertAlmostEqual(float(args.student_teacher_score_warmup_fraction), 0.6)
+        self.assertFalse(args.student_teacher_score_include_pseudo)
+        self.assertEqual(args.student_target_mixture_mode, "full")
+        self.assertAlmostEqual(float(args.student_target_elite_fraction), 0.3)
+        self.assertEqual(int(args.student_target_elite_k), 0)
+        self.assertEqual(int(args.student_target_elite_min_count), 2)
+        self.assertAlmostEqual(float(args.student_target_elite_blend_all_weight), 0.2)
 
     def test_solver_protocol_is_canonical_and_aliases_do_not_persist(self) -> None:
         self.assertEqual(normalize_solver_key("dpm++2m"), "dpmpp2m")

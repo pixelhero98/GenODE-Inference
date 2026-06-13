@@ -69,8 +69,16 @@ mixtures of measured candidate densities:
 ```text
 w_i = softmax(teacher_utility_i / temperature)
 target_density = sum_i w_i * density_mass_i
-loss = KL(target_density || student_density)
+loss = KL(target_density || student_density) - eta(step) * z_teacher(student_density)
 ```
+
+The teacher-score term is a late-ramped utility sharpening term on the
+student's own predicted density. It is normalized within each context/solver/NFE
+candidate cell, defaults to a small weight, and keeps the CE/FKL anchor active
+throughout training. The student objective does not use smoothness or guard
+regularizers; Huber/smooth loss is only part of teacher metric regression.
+Target construction defaults to the full soft mixture above, with opt-in
+`elite` and `elite_blend` modes for controlled ablations.
 
 Teacher checkpoint selection uses `weighted_normalized_regret` over
 context-disjoint and density-family calibration diagnostics. Optional unseen-NFE

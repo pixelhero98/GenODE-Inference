@@ -32,8 +32,14 @@ from genode.gipo.policy import (
     TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
     TEACHER_OUTPUT_METRIC_VECTOR,
     TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
+    DensityFeatureNormalizer,
     build_gipo_student_model,
     build_gipo_teacher_model,
+    build_teacher_weighted_density_targets,
+    density_mass_for_row,
+    _density_mass_to_normalized_log_features_torch,
+    _student_teacher_score_objective,
+    _student_teacher_score_eta,
     validate_canonical_conditioning_style,
 )
 from genode.gipo.train_gipo import build_argparser as build_train_argparser
@@ -55,6 +61,32 @@ def _teacher_training_payload() -> dict:
     }
 
 
+class _RowScoreTeacher(torch.nn.Module):
+    architecture = ARCHITECTURE_DENSITY_FORM_TRANSFORMER
+    teacher_metric_targets = ("u_comp_uniform",)
+
+    def forward(self, setting_feature_batch, density_feature_batch, series_index_batch, context_embedding_batch, *, rows=None):
+        values = [float(row["teacher_score"]) for row in rows]
+        return torch.tensor(values, dtype=density_feature_batch.dtype, device=density_feature_batch.device).unsqueeze(-1)
+
+
+class _TwoMetricRowScoreTeacher(torch.nn.Module):
+    architecture = ARCHITECTURE_DENSITY_FORM_TRANSFORMER
+    teacher_metric_targets = ("u_comp_uniform", "u_alt_uniform")
+
+    def forward(self, setting_feature_batch, density_feature_batch, series_index_batch, context_embedding_batch, *, rows=None):
+        values = [[float(row["teacher_score"]), float(row["teacher_score"])] for row in rows]
+        return torch.tensor(values, dtype=density_feature_batch.dtype, device=density_feature_batch.device)
+
+
+class _DensityDependentTeacher(torch.nn.Module):
+    architecture = ARCHITECTURE_DENSITY_FORM_TRANSFORMER
+    teacher_metric_targets = ("u_comp_uniform",)
+
+    def forward(self, setting_feature_batch, density_feature_batch, series_index_batch, context_embedding_batch, *, rows=None):
+        return density_feature_batch.sum(dim=1, keepdim=True)
+
+
 class GIPOCanonicalTests(unittest.TestCase):
     def test_density_grid_roundtrip_uses_canonical_64_bins(self) -> None:
         reference = uniform_reference_grid(64)
@@ -69,6 +101,191 @@ class GIPOCanonicalTests(unittest.TestCase):
         self.assertEqual(len(reconstructed), 4)
         self.assertEqual(metadata["density_protocol"], DENSITY_PROTOCOL)
         self.assertEqual(metadata["reference_bin_count"], 64)
+
+    def test_torch_density_features_match_numpy_and_keep_gradients(self) -> None:
+        reference = uniform_reference_grid(4)
+        masses = [
+            (0.40, 0.30, 0.20, 0.10),
+            (0.10, 0.20, 0.30, 0.40),
+        ]
+        normalizer = DensityFeatureNormalizer.fit(masses, reference_time_grid=reference)
+        mass = torch.tensor([[0.40, 0.30, 0.20, 0.10]], dtype=torch.float32, requires_grad=True)
+
+        features = _density_mass_to_normalized_log_features_torch(
+            mass,
+            reference_time_grid=reference,
+            density_normalizer=normalizer,
+        )
+        expected = normalizer.transform_one(masses[0], reference_time_grid=reference)
+
+        self.assertTrue(torch.allclose(features.detach().cpu(), torch.from_numpy(np.asarray([expected])), atol=1e-6))
+        features.sum().backward()
+        self.assertIsNotNone(mass.grad)
+        self.assertTrue(torch.isfinite(mass.grad).all())
+
+    def test_student_teacher_score_eta_late_ramps(self) -> None:
+        self.assertEqual(_student_teacher_score_eta(step=0, steps=10, base_weight=0.05, warmup_fraction=0.6), 0.0)
+        self.assertAlmostEqual(_student_teacher_score_eta(step=6, steps=10, base_weight=0.05, warmup_fraction=0.6), 0.0125)
+        self.assertAlmostEqual(_student_teacher_score_eta(step=9, steps=10, base_weight=0.05, warmup_fraction=0.6), 0.05)
+
+    def test_teacher_score_objective_backpropagates_through_frozen_teacher_input(self) -> None:
+        reference = uniform_reference_grid(4)
+        normalizer = DensityFeatureNormalizer(mean=np.zeros(4, dtype=np.float32), std=np.ones(4, dtype=np.float32))
+        logits = torch.tensor([[0.4, -0.2, 0.1, -0.3]], dtype=torch.float32, requires_grad=True)
+        setting = torch.zeros(1, int(setting_features("euler", 4).numel()), dtype=torch.float32)
+        series = torch.zeros(1, dtype=torch.long)
+        context = torch.zeros(1, 2, dtype=torch.float32)
+        rows = [{"solver_key": "euler", "target_nfe": 4, "u_comp_uniform": 1.0}]
+        teacher = _DensityDependentTeacher()
+        for param in teacher.parameters():
+            param.requires_grad_(False)
+
+        objective, score = _student_teacher_score_objective(
+            teacher,
+            logits,
+            setting,
+            series,
+            context,
+            rows,
+            reference_time_grid=reference,
+            density_normalizer=normalizer,
+            score_mean=torch.zeros(1),
+            score_std=torch.ones(1),
+            teacher_utility_weights=None,
+            clip=5.0,
+        )
+        (-objective).backward()
+
+        self.assertTrue(torch.isfinite(score.detach()).all())
+        self.assertIsNotNone(logits.grad)
+        self.assertGreater(float(torch.sum(torch.abs(logits.grad)).detach().cpu().item()), 0.0)
+
+    def test_teacher_weighted_targets_support_elite_and_blend_modes(self) -> None:
+        reference = uniform_reference_grid(64)
+        schedules = ("uniform", "late_power_3", "flowts_power_sampling", "ays")
+        scores = {
+            "uniform": 0.0,
+            "late_power_3": 3.0,
+            "flowts_power_sampling": 1.0,
+            "ays": 2.0,
+        }
+        rows = [
+            {
+                "dataset": "lobster_synthetic",
+                "split_phase": "train_tuning",
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": schedule,
+                "context_id": "ctx_0",
+                "series_id": "series_0",
+                "target_t": 0,
+                "u_comp_uniform": scores[schedule],
+                "teacher_score": scores[schedule],
+            }
+            for schedule in schedules
+        ]
+        normalizer = DensityFeatureNormalizer.fit(
+            [density_mass_for_row(row, schedule_grids=None, reference_time_grid=reference) for row in rows],
+            reference_time_grid=reference,
+        )
+        kwargs = {
+            "context_embeddings": {"ctx_0": [0.0, 0.0]},
+            "series_index_map": {"series_0": 0},
+            "schedule_grids": None,
+            "reference_time_grid": reference,
+            "density_normalizer": normalizer,
+            "supervision_schedule_keys": schedules,
+            "temperature": 1.0,
+            "device": "cpu",
+        }
+        teacher = _RowScoreTeacher()
+
+        _, _, _, full_mass, full_summary = build_teacher_weighted_density_targets(teacher, rows, **kwargs)
+        _, _, _, elite_mass, elite_summary = build_teacher_weighted_density_targets(
+            teacher,
+            rows,
+            student_target_mixture_mode="elite",
+            student_target_elite_k=1,
+            student_target_elite_min_count=1,
+            **kwargs,
+        )
+        _, _, _, blend_mass, blend_summary = build_teacher_weighted_density_targets(
+            teacher,
+            rows,
+            student_target_mixture_mode="elite_blend",
+            student_target_elite_k=1,
+            student_target_elite_min_count=1,
+            student_target_elite_blend_all_weight=0.2,
+            **kwargs,
+        )
+        best_mass = torch.tensor(
+            [density_mass_for_row(rows[1], schedule_grids=None, reference_time_grid=reference)],
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(full_summary["student_target_mixture_mode"], "full")
+        self.assertEqual(elite_summary["student_target_mixture_mode"], "elite")
+        self.assertEqual(blend_summary["student_target_mixture_mode"], "elite_blend")
+        self.assertTrue(torch.allclose(elite_mass.cpu(), best_mass, atol=1e-6))
+        self.assertTrue(torch.allclose(blend_mass.cpu(), 0.8 * best_mass + 0.2 * full_mass.cpu(), atol=1e-6))
+        self.assertEqual(elite_summary["teacher_candidate_elite_count_mean"], 1.0)
+        self.assertLess(elite_summary["teacher_candidate_retained_full_weight_mean"], 1.0)
+
+    def test_teacher_weighted_targets_reject_mixed_cell_scalarization(self) -> None:
+        reference = uniform_reference_grid(64)
+        rows = [
+            {
+                "dataset": "lobster_synthetic",
+                "split_phase": "train_tuning",
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "uniform",
+                "context_id": "ctx_0",
+                "series_id": "series_0",
+                "target_t": 0,
+                "u_comp_uniform": 1.0,
+                "u_alt_uniform": 1.0,
+                "teacher_score": 1.0,
+                "u_comp_uniform_weight": 1.0,
+                "u_alt_uniform_weight": 0.0,
+            },
+            {
+                "dataset": "lobster_synthetic",
+                "split_phase": "train_tuning",
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "late_power_3",
+                "context_id": "ctx_0",
+                "series_id": "series_0",
+                "target_t": 0,
+                "u_comp_uniform": 2.0,
+                "u_alt_uniform": 2.0,
+                "teacher_score": 2.0,
+                "u_comp_uniform_weight": 0.0,
+                "u_alt_uniform_weight": 1.0,
+            },
+        ]
+        normalizer = DensityFeatureNormalizer.fit(
+            [density_mass_for_row(row, schedule_grids=None, reference_time_grid=reference) for row in rows],
+            reference_time_grid=reference,
+        )
+
+        with self.assertRaisesRegex(ValueError, "identical teacher metric masks"):
+            build_teacher_weighted_density_targets(
+                _TwoMetricRowScoreTeacher(),
+                rows,
+                context_embeddings={"ctx_0": [0.0, 0.0]},
+                series_index_map={"series_0": 0},
+                schedule_grids=None,
+                reference_time_grid=reference,
+                density_normalizer=normalizer,
+                supervision_schedule_keys=("uniform", "late_power_3"),
+                temperature=1.0,
+                device="cpu",
+            )
 
     def test_additive_models_are_context_only_for_series_identity(self) -> None:
         setting_batch = torch.stack(

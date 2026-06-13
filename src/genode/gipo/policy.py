@@ -22,6 +22,7 @@ from genode.canonical_experiment_layout import (
 )
 from genode.gipo.density_representation import (
     DEFAULT_DENSITY_BIN_COUNT,
+    DEFAULT_LOG_DENSITY_EPS,
     DENSITY_PROTOCOL,
     average_density_masses,
     density_log_features,
@@ -75,6 +76,22 @@ MIN_CONTEXT_CALIBRATION_TOTAL = 72
 MAX_CONTEXT_CALIBRATION_TOTAL = CANONICAL_CONTEXT_SAMPLE_COUNT
 DEFAULT_TEACHER_TARGET_TEMPERATURE = 0.05
 STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE = "teacher_weighted_soft_mixture"
+STUDENT_TARGET_MIXTURE_MODE_FULL = "full"
+STUDENT_TARGET_MIXTURE_MODE_ELITE = "elite"
+STUDENT_TARGET_MIXTURE_MODE_ELITE_BLEND = "elite_blend"
+STUDENT_TARGET_MIXTURE_MODES: Tuple[str, ...] = (
+    STUDENT_TARGET_MIXTURE_MODE_FULL,
+    STUDENT_TARGET_MIXTURE_MODE_ELITE,
+    STUDENT_TARGET_MIXTURE_MODE_ELITE_BLEND,
+)
+DEFAULT_STUDENT_TARGET_MIXTURE_MODE = STUDENT_TARGET_MIXTURE_MODE_FULL
+DEFAULT_STUDENT_TARGET_ELITE_FRACTION = 0.30
+DEFAULT_STUDENT_TARGET_ELITE_K = 0
+DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT = 2
+DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT = 0.20
+DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT = 0.05
+DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION = 0.60
+DEFAULT_STUDENT_TEACHER_SCORE_CLIP = 5.0
 MODEL_PAYLOAD_VERSION = 4
 ARCHITECTURE_DENSITY_FORM_TRANSFORMER = "density_form_transformer"
 ARCHITECTURE_DENSITY_QUERY_TRANSFORMER = "density_query_transformer"
@@ -357,6 +374,131 @@ def _teacher_candidate_weights(utilities: Sequence[float], *, temperature: float
 def _teacher_candidate_ess(weights: Sequence[float]) -> float:
     arr = np.asarray(weights, dtype=np.float64)
     return float(1.0 / max(float(np.sum(np.square(arr))), 1e-12))
+
+
+def validate_student_target_mixture_mode(value: str) -> str:
+    mode = str(value).strip() or DEFAULT_STUDENT_TARGET_MIXTURE_MODE
+    if mode not in STUDENT_TARGET_MIXTURE_MODES:
+        raise ValueError(f"student_target_mixture_mode must be one of {STUDENT_TARGET_MIXTURE_MODES}, got {value!r}.")
+    return mode
+
+
+def _validate_student_target_elite_config(
+    *,
+    elite_fraction: float,
+    elite_k: int,
+    elite_min_count: int,
+    elite_blend_all_weight: float,
+) -> Tuple[float, int, int, float]:
+    fraction = float(elite_fraction)
+    if not math.isfinite(fraction) or fraction <= 0.0 or fraction > 1.0:
+        raise ValueError("student_target_elite_fraction must be finite and in (0, 1].")
+    top_k = int(elite_k)
+    if top_k < 0:
+        raise ValueError("student_target_elite_k must be nonnegative.")
+    min_count = int(elite_min_count)
+    if min_count <= 0:
+        raise ValueError("student_target_elite_min_count must be positive.")
+    blend = float(elite_blend_all_weight)
+    if not math.isfinite(blend) or blend < 0.0 or blend > 1.0:
+        raise ValueError("student_target_elite_blend_all_weight must be finite and in [0, 1].")
+    return fraction, top_k, min_count, blend
+
+
+def _student_target_elite_indices(
+    utilities: Sequence[float],
+    *,
+    elite_fraction: float,
+    elite_k: int,
+    elite_min_count: int,
+    tie_breaker_keys: Sequence[str] | None = None,
+) -> np.ndarray:
+    values = np.asarray([float(value) for value in utilities], dtype=np.float64)
+    if values.size <= 0:
+        raise ValueError("Elite student targets require at least one candidate.")
+    requested = int(elite_k) if int(elite_k) > 0 else int(math.ceil(float(elite_fraction) * int(values.size)))
+    count = min(int(values.size), max(1, int(elite_min_count), requested))
+    if tie_breaker_keys is None:
+        tie_keys = np.asarray([str(idx) for idx in range(int(values.size))])
+    else:
+        if len(tie_breaker_keys) != int(values.size):
+            raise ValueError("Elite target tie breaker keys must match utilities length.")
+        tie_keys = np.asarray([str(key) for key in tie_breaker_keys])
+    order = np.lexsort((tie_keys, -values))
+    return np.asarray(order[:count], dtype=np.int64)
+
+
+def _student_target_active_weights(
+    utilities: Sequence[float],
+    full_weights: Sequence[float],
+    *,
+    mixture_mode: str,
+    elite_fraction: float,
+    elite_k: int,
+    elite_min_count: int,
+    elite_blend_all_weight: float,
+    tie_breaker_keys: Sequence[str] | None = None,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    mode = validate_student_target_mixture_mode(mixture_mode)
+    weights = np.asarray(full_weights, dtype=np.float64)
+    if weights.ndim != 1 or weights.size <= 0:
+        raise ValueError("Student target candidate weights must be a non-empty 1D vector.")
+    weights = weights / max(float(np.sum(weights)), 1e-12)
+    if mode == STUDENT_TARGET_MIXTURE_MODE_FULL:
+        active = weights
+        elite_indices = np.arange(int(weights.size), dtype=np.int64)
+        retained = 1.0
+    else:
+        elite_indices = _student_target_elite_indices(
+            utilities,
+            elite_fraction=float(elite_fraction),
+            elite_k=int(elite_k),
+            elite_min_count=int(elite_min_count),
+            tie_breaker_keys=tie_breaker_keys,
+        )
+        retained = float(np.sum(weights[elite_indices]))
+        elite_weights = np.zeros_like(weights)
+        if retained <= 1e-12:
+            elite_weights[elite_indices] = 1.0 / float(len(elite_indices))
+        else:
+            elite_weights[elite_indices] = weights[elite_indices] / retained
+        if mode == STUDENT_TARGET_MIXTURE_MODE_ELITE:
+            active = elite_weights
+        else:
+            blend = float(elite_blend_all_weight)
+            active = (1.0 - blend) * elite_weights + blend * weights
+            active = active / max(float(np.sum(active)), 1e-12)
+    stats = {
+        "elite_count": float(len(elite_indices)),
+        "retained_full_weight": float(retained),
+        "dropped_full_weight": float(max(0.0, 1.0 - retained)),
+        "weight_l1_distance_from_full": float(np.sum(np.abs(active - weights))),
+    }
+    return active.astype(np.float64), stats
+
+
+def _student_teacher_score_eta(
+    *,
+    step: int,
+    steps: int,
+    base_weight: float,
+    warmup_fraction: float,
+) -> float:
+    weight = float(base_weight)
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError("student_teacher_score_weight must be finite and nonnegative.")
+    warmup = float(warmup_fraction)
+    if not math.isfinite(warmup) or warmup < 0.0 or warmup >= 1.0:
+        raise ValueError("student_teacher_score_warmup_fraction must be finite and in [0, 1).")
+    if weight <= 0.0:
+        return 0.0
+    total_steps = max(1, int(steps))
+    warmup_steps = int(math.floor(float(total_steps) * warmup))
+    current_step = min(total_steps, max(1, int(step) + 1))
+    if current_step <= warmup_steps:
+        return 0.0
+    ramp_steps = max(1, total_steps - warmup_steps)
+    return float(weight) * min(1.0, float(current_step - warmup_steps) / float(ramp_steps))
 
 
 def _resolve_setting_encoder_config(
@@ -1043,6 +1185,36 @@ class DensityFeatureNormalizer:
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "DensityFeatureNormalizer":
         return cls(mean=np.asarray(payload["mean"], dtype=np.float32), std=np.asarray(payload["std"], dtype=np.float32))
+
+
+def _density_mass_to_normalized_log_features_torch(
+    density_mass: torch.Tensor,
+    *,
+    reference_time_grid: Sequence[float],
+    density_normalizer: DensityFeatureNormalizer,
+) -> torch.Tensor:
+    if density_mass.ndim != 2:
+        raise ValueError("density_mass must be a 2D [batch, bins] tensor.")
+    reference = np.asarray(validate_reference_grid(reference_time_grid), dtype=np.float32)
+    if int(reference.size) != int(density_mass.shape[-1]) + 1:
+        raise ValueError("reference_time_grid must have density_mass.shape[-1] + 1 edges.")
+    if density_normalizer.mean.shape != (int(density_mass.shape[-1]),) or density_normalizer.std.shape != (int(density_mass.shape[-1]),):
+        raise ValueError("density_normalizer shape must match density_mass bins.")
+    widths = torch.tensor(
+        np.diff(reference).astype(np.float32),
+        dtype=density_mass.dtype,
+        device=density_mass.device,
+    ).unsqueeze(0)
+    mean = torch.tensor(
+        density_normalizer.mean.astype(np.float32),
+        dtype=density_mass.dtype,
+        device=density_mass.device,
+    ).unsqueeze(0)
+    std_values = np.where(density_normalizer.std < 1e-6, 1.0, density_normalizer.std).astype(np.float32)
+    std = torch.tensor(std_values, dtype=density_mass.dtype, device=density_mass.device).unsqueeze(0)
+    density = density_mass / widths
+    log_density = torch.log(torch.clamp(density, min=float(DEFAULT_LOG_DENSITY_EPS)))
+    return (log_density - mean) / std
 
 
 def _sanitize_public_manifest_value(value: Any) -> Any:
@@ -1931,6 +2103,59 @@ def _student_density_mass(
     )
 
 
+def _teacher_score_normalization_tensors(
+    target_summary: Mapping[str, Any],
+    *,
+    batch: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    mean_values = target_summary.get("teacher_score_normalization_mean_values")
+    std_values = target_summary.get("teacher_score_normalization_std_values")
+    if not isinstance(mean_values, Sequence) or not isinstance(std_values, Sequence):
+        raise ValueError("Student teacher-score loss requires target score normalization values.")
+    if len(mean_values) != int(batch) or len(std_values) != int(batch):
+        raise ValueError("Teacher-score normalization values must align with student target rows.")
+    means = torch.tensor([float(value) for value in mean_values], dtype=dtype, device=device)
+    stds = torch.tensor([max(float(value), 1e-6) for value in std_values], dtype=dtype, device=device)
+    return means, stds
+
+
+def _student_teacher_score_objective(
+    teacher: nn.Module,
+    logits: torch.Tensor,
+    setting_features_batch: torch.Tensor,
+    series_index_batch: torch.Tensor,
+    context_embedding_batch: torch.Tensor,
+    rows: Sequence[MetricRow],
+    *,
+    reference_time_grid: Sequence[float],
+    density_normalizer: DensityFeatureNormalizer,
+    score_mean: torch.Tensor,
+    score_std: torch.Tensor,
+    teacher_utility_weights: Mapping[str, float] | None,
+    clip: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    student_mass = torch.softmax(logits, dim=-1)
+    density_features = _density_mass_to_normalized_log_features_torch(
+        student_mass,
+        reference_time_grid=reference_time_grid,
+        density_normalizer=density_normalizer,
+    )
+    score = _teacher_scores(
+        teacher,
+        setting_features_batch,
+        density_features,
+        series_index_batch,
+        context_embedding_batch,
+        rows=rows,
+        teacher_utility_weights=teacher_utility_weights,
+    )
+    z_score = (score - score_mean.to(device=score.device, dtype=score.dtype)) / score_std.to(device=score.device, dtype=score.dtype)
+    z_score = torch.clamp(z_score, min=-float(clip), max=float(clip))
+    return z_score.mean(), score.mean()
+
+
 def _pair_indices(
     targets: torch.Tensor,
     pair_keys: Sequence[ContextPairKey],
@@ -2802,11 +3027,23 @@ def build_teacher_weighted_density_targets(
     teacher_utility_weights: Mapping[str, float] | None = None,
     setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
+    student_target_mixture_mode: str = DEFAULT_STUDENT_TARGET_MIXTURE_MODE,
+    student_target_elite_fraction: float = DEFAULT_STUDENT_TARGET_ELITE_FRACTION,
+    student_target_elite_k: int = DEFAULT_STUDENT_TARGET_ELITE_K,
+    student_target_elite_min_count: int = DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT,
+    student_target_elite_blend_all_weight: float = DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
     device: torch.device | str = "cpu",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     fixed_temperature = _finite_positive(temperature, label="teacher_temperature")
+    target_mode = validate_student_target_mixture_mode(student_target_mixture_mode)
+    elite_fraction, elite_k, elite_min_count, elite_blend_all_weight = _validate_student_target_elite_config(
+        elite_fraction=float(student_target_elite_fraction),
+        elite_k=int(student_target_elite_k),
+        elite_min_count=int(student_target_elite_min_count),
+        elite_blend_all_weight=float(student_target_elite_blend_all_weight),
+    )
     observed_keys = {str(row["scheduler_key"]) for row in rows}
     supervision_keys = validate_gipo_support_schedule_keys(
         sorted(observed_keys) if supervision_schedule_keys is None else supervision_schedule_keys
@@ -2827,6 +3064,16 @@ def build_teacher_weighted_density_targets(
     entropy_values: List[float] = []
     ess_values: List[float] = []
     max_weight_values: List[float] = []
+    full_entropy_values: List[float] = []
+    full_ess_values: List[float] = []
+    full_max_weight_values: List[float] = []
+    retained_full_weight_values: List[float] = []
+    dropped_full_weight_values: List[float] = []
+    weight_l1_distance_values: List[float] = []
+    target_l1_distance_values: List[float] = []
+    elite_count_values: List[float] = []
+    score_mean_values: List[float] = []
+    score_std_values: List[float] = []
     candidate_counts: List[int] = []
     teacher.to(device)
     teacher.eval()
@@ -2876,6 +3123,14 @@ def build_teacher_weighted_density_targets(
         id(row): float(value)
         for row, value in zip(rows, score_values.detach().cpu().tolist())
     }
+    score_weights_by_row_id = {
+        id(row): tuple(float(part) for part in value)
+        for row, value in zip(rows, score_weights.detach().cpu().tolist())
+    }
+    score_mask_by_row_id = {
+        id(row): tuple(float(part) for part in value)
+        for row, value in zip(rows, metric_score_mask.detach().cpu().tolist())
+    }
     for _, group in target_groups:
         counts: Dict[str, int] = {key: 0 for key in supervision_keys}
         for row in group:
@@ -2893,35 +3148,80 @@ def build_teacher_weighted_density_targets(
         masses: List[Tuple[float, ...]] = []
         utilities: List[float] = []
         setting_row = setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config)
+        reference_weight = score_weights_by_row_id[id(group[0])]
+        reference_mask = score_mask_by_row_id[id(group[0])]
         for row in group:
+            row_weight = score_weights_by_row_id[id(row)]
+            row_mask = score_mask_by_row_id[id(row)]
+            if row_weight != reference_weight or row_mask != reference_mask:
+                raise ValueError(
+                    "Teacher-weighted density targets require identical teacher metric masks and "
+                    "scalarization weights within each context/solver/NFE target cell."
+                )
             masses.append(score_masses[id(row)])
             utilities.append(float(utility_by_row_id[id(row)]))
         chosen_temperature = fixed_temperature
         utility_array = np.asarray(utilities, dtype=np.float64)
-        if utility_array.size > 1:
-            ordered = np.argsort(-utility_array)
-        else:
-            ordered = np.asarray([0], dtype=np.int64)
-        weights = _teacher_candidate_weights(utilities, temperature=chosen_temperature)
+        full_weights = _teacher_candidate_weights(utilities, temperature=chosen_temperature)
+        active_weights, active_stats = _student_target_active_weights(
+            utilities,
+            full_weights,
+            mixture_mode=target_mode,
+            elite_fraction=elite_fraction,
+            elite_k=elite_k,
+            elite_min_count=elite_min_count,
+            elite_blend_all_weight=elite_blend_all_weight,
+            tie_breaker_keys=[str(row["scheduler_key"]) for row in group],
+        )
+        full_mixture = np.zeros(len(reference_time_grid) - 1, dtype=np.float64)
         mixture = np.zeros(len(reference_time_grid) - 1, dtype=np.float64)
-        for weight, mass in zip(weights, masses):
-            mixture += float(weight) * np.asarray(mass, dtype=np.float64)
+        for full_weight, active_weight, mass in zip(full_weights, active_weights, masses):
+            mass_arr = np.asarray(mass, dtype=np.float64)
+            full_mixture += float(full_weight) * mass_arr
+            mixture += float(active_weight) * mass_arr
+        full_mixture = full_mixture / max(float(np.sum(full_mixture)), 1e-12)
         mixture = mixture / max(float(np.sum(mixture)), 1e-12)
+        score_std = float(np.std(utility_array)) if utility_array.size > 1 else 1.0
+        if score_std < 1e-6 or not math.isfinite(score_std):
+            score_std = 1.0
         setting_rows.append(setting_row)
         series_rows.append(0)
         context_rows.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
         target_masses.append(mixture.astype(np.float32))
-        entropy_values.append(float(-np.sum(weights * np.log(np.maximum(weights, 1e-12)))))
-        ess_values.append(_teacher_candidate_ess(weights))
-        max_weight_values.append(float(np.max(weights)))
+        entropy_values.append(float(-np.sum(active_weights * np.log(np.maximum(active_weights, 1e-12)))))
+        ess_values.append(_teacher_candidate_ess(active_weights))
+        max_weight_values.append(float(np.max(active_weights)))
+        full_entropy_values.append(float(-np.sum(full_weights * np.log(np.maximum(full_weights, 1e-12)))))
+        full_ess_values.append(_teacher_candidate_ess(full_weights))
+        full_max_weight_values.append(float(np.max(full_weights)))
+        retained_full_weight_values.append(float(active_stats["retained_full_weight"]))
+        dropped_full_weight_values.append(float(active_stats["dropped_full_weight"]))
+        weight_l1_distance_values.append(float(active_stats["weight_l1_distance_from_full"]))
+        target_l1_distance_values.append(float(np.sum(np.abs(mixture - full_mixture))))
+        elite_count_values.append(float(active_stats["elite_count"]))
+        score_mean_values.append(float(np.mean(utility_array)))
+        score_std_values.append(float(score_std))
         candidate_counts.append(int(len(group)))
     entropy_stats = _summary_percentiles(entropy_values)
     ess_stats = _summary_percentiles(ess_values)
     max_weight_stats = _summary_percentiles(max_weight_values)
+    full_entropy_stats = _summary_percentiles(full_entropy_values)
+    full_ess_stats = _summary_percentiles(full_ess_values)
+    full_max_weight_stats = _summary_percentiles(full_max_weight_values)
+    elite_count_stats = _summary_percentiles(elite_count_values)
+    retained_stats = _summary_percentiles(retained_full_weight_values)
+    dropped_stats = _summary_percentiles(dropped_full_weight_values)
+    weight_l1_stats = _summary_percentiles(weight_l1_distance_values)
+    target_l1_stats = _summary_percentiles(target_l1_distance_values)
     sequence_pairs = student_nfe_sequence_pairs(rows)
     summary = {
         "target_protocol": "teacher_weighted_density_mle",
         "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
+        "student_target_mixture_mode": target_mode,
+        "student_target_elite_fraction": float(elite_fraction),
+        "student_target_elite_k": int(elite_k),
+        "student_target_elite_min_count": int(elite_min_count),
+        "student_target_elite_blend_all_weight": float(elite_blend_all_weight),
         "teacher_output": TEACHER_OUTPUT_METRIC_VECTOR,
         "teacher_metric_targets": list(teacher_metric_target_keys),
         "teacher_metric_target_protocol": TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
@@ -2950,6 +3250,38 @@ def build_teacher_weighted_density_targets(
         "teacher_candidate_max_weight_p05": max_weight_stats["p05"],
         "teacher_candidate_max_weight_p50": max_weight_stats["p50"],
         "teacher_candidate_max_weight_p95": max_weight_stats["p95"],
+        "teacher_candidate_active_entropy_mean": entropy_stats["mean"],
+        "teacher_candidate_active_ess_mean": ess_stats["mean"],
+        "teacher_candidate_active_max_weight_mean": max_weight_stats["mean"],
+        "teacher_candidate_full_entropy_mean": full_entropy_stats["mean"],
+        "teacher_candidate_full_entropy_p05": full_entropy_stats["p05"],
+        "teacher_candidate_full_entropy_p50": full_entropy_stats["p50"],
+        "teacher_candidate_full_entropy_p95": full_entropy_stats["p95"],
+        "teacher_candidate_full_ess_mean": full_ess_stats["mean"],
+        "teacher_candidate_full_ess_p05": full_ess_stats["p05"],
+        "teacher_candidate_full_ess_p50": full_ess_stats["p50"],
+        "teacher_candidate_full_ess_p95": full_ess_stats["p95"],
+        "teacher_candidate_full_max_weight_mean": full_max_weight_stats["mean"],
+        "teacher_candidate_full_max_weight_p05": full_max_weight_stats["p05"],
+        "teacher_candidate_full_max_weight_p50": full_max_weight_stats["p50"],
+        "teacher_candidate_full_max_weight_p95": full_max_weight_stats["p95"],
+        "teacher_candidate_elite_count_mean": elite_count_stats["mean"],
+        "teacher_candidate_elite_count_p05": elite_count_stats["p05"],
+        "teacher_candidate_elite_count_p50": elite_count_stats["p50"],
+        "teacher_candidate_elite_count_p95": elite_count_stats["p95"],
+        "teacher_candidate_retained_full_weight_mean": retained_stats["mean"],
+        "teacher_candidate_retained_full_weight_p05": retained_stats["p05"],
+        "teacher_candidate_retained_full_weight_p50": retained_stats["p50"],
+        "teacher_candidate_retained_full_weight_p95": retained_stats["p95"],
+        "teacher_candidate_dropped_full_weight_mean": dropped_stats["mean"],
+        "teacher_candidate_dropped_full_weight_p05": dropped_stats["p05"],
+        "teacher_candidate_dropped_full_weight_p50": dropped_stats["p50"],
+        "teacher_candidate_dropped_full_weight_p95": dropped_stats["p95"],
+        "teacher_candidate_weight_l1_distance_from_full_mean": weight_l1_stats["mean"],
+        "teacher_candidate_target_l1_distance_from_full_mean": target_l1_stats["mean"],
+        "teacher_score_normalization_protocol": "per_context_solver_nfe_candidate_score_mean_std",
+        "teacher_score_normalization_mean_values": [float(value) for value in score_mean_values],
+        "teacher_score_normalization_std_values": [float(value) for value in score_std_values],
         "mean_candidate_count": float(np.mean(np.asarray(candidate_counts, dtype=np.float64))) if candidate_counts else 0.0,
         "nfe_sequence_pair_count": int(len(sequence_pairs)),
         "supervision_schedule_keys": list(supervision_keys),
@@ -2985,6 +3317,15 @@ def train_gipo_student(
     pseudo_context_embeddings: Mapping[str, Sequence[float]] | None = None,
     pseudo_schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None = None,
     pseudo_target_weight: float = 0.0,
+    student_teacher_score_weight: float = DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT,
+    student_teacher_score_warmup_fraction: float = DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION,
+    student_teacher_score_schedule_steps: int | None = None,
+    student_teacher_score_include_pseudo: bool = False,
+    student_target_mixture_mode: str = DEFAULT_STUDENT_TARGET_MIXTURE_MODE,
+    student_target_elite_fraction: float = DEFAULT_STUDENT_TARGET_ELITE_FRACTION,
+    student_target_elite_k: int = DEFAULT_STUDENT_TARGET_ELITE_K,
+    student_target_elite_min_count: int = DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT,
+    student_target_elite_blend_all_weight: float = DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
     validation_rows: Sequence[MetricRow] | None = None,
     validation_context_embeddings: Mapping[str, Sequence[float]] | None = None,
     student_log_every: int = 0,
@@ -3002,6 +3343,22 @@ def train_gipo_student(
     pseudo_weight = float(pseudo_target_weight)
     if not math.isfinite(pseudo_weight) or pseudo_weight < 0.0:
         raise ValueError("student_pseudo_target_weight must be finite and nonnegative.")
+    teacher_score_weight = float(student_teacher_score_weight)
+    if not math.isfinite(teacher_score_weight) or teacher_score_weight < 0.0:
+        raise ValueError("student_teacher_score_weight must be finite and nonnegative.")
+    teacher_score_warmup_fraction = float(student_teacher_score_warmup_fraction)
+    if not math.isfinite(teacher_score_warmup_fraction) or teacher_score_warmup_fraction < 0.0 or teacher_score_warmup_fraction >= 1.0:
+        raise ValueError("student_teacher_score_warmup_fraction must be finite and in [0, 1).")
+    teacher_score_schedule_steps = int(student_teacher_score_schedule_steps or int(steps))
+    if teacher_score_schedule_steps <= 0:
+        raise ValueError("student_teacher_score_schedule_steps must be positive.")
+    target_mode = validate_student_target_mixture_mode(student_target_mixture_mode)
+    elite_fraction, elite_k, elite_min_count, elite_blend_all_weight = _validate_student_target_elite_config(
+        elite_fraction=float(student_target_elite_fraction),
+        elite_k=int(student_target_elite_k),
+        elite_min_count=int(student_target_elite_min_count),
+        elite_blend_all_weight=float(student_target_elite_blend_all_weight),
+    )
     selection_mode = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE
     use_validation_selection = not bool(final_retrain_mode)
     checkpoint_every = max(1, int(student_checkpoint_every))
@@ -3018,6 +3375,8 @@ def train_gipo_student(
     student.to(device)
     teacher.to(device)
     teacher.eval()
+    for param in teacher.parameters():
+        param.requires_grad_(False)
     sx, base_series_idx, cx, target_mass, target_summary = build_teacher_weighted_density_targets(
         teacher,
         rows,
@@ -3031,7 +3390,18 @@ def train_gipo_student(
         teacher_utility_weights=teacher_utility_weights,
         setting_feature_mode=feature_mode,
         setting_encoder_config=encoder_config,
+        student_target_mixture_mode=target_mode,
+        student_target_elite_fraction=elite_fraction,
+        student_target_elite_k=elite_k,
+        student_target_elite_min_count=elite_min_count,
+        student_target_elite_blend_all_weight=elite_blend_all_weight,
         device=device,
+    )
+    score_mean, score_std = _teacher_score_normalization_tensors(
+        target_summary,
+        batch=int(target_mass.shape[0]),
+        device=target_mass.device,
+        dtype=target_mass.dtype,
     )
     sequence_pairs = student_nfe_sequence_pairs(rows)
     target_rows = _student_target_representative_rows(rows)
@@ -3040,6 +3410,8 @@ def train_gipo_student(
     pseudo_base_series_idx: torch.Tensor | None = None
     pseudo_cx: torch.Tensor | None = None
     pseudo_target_mass: torch.Tensor | None = None
+    pseudo_score_mean: torch.Tensor | None = None
+    pseudo_score_std: torch.Tensor | None = None
     pseudo_target_rows: List[MetricRow] = []
     pseudo_summary: Dict[str, Any] = {
         "pseudo_distillation_used": False,
@@ -3061,7 +3433,18 @@ def train_gipo_student(
             teacher_utility_weights=teacher_utility_weights,
             setting_feature_mode=feature_mode,
             setting_encoder_config=encoder_config,
+            student_target_mixture_mode=target_mode,
+            student_target_elite_fraction=elite_fraction,
+            student_target_elite_k=elite_k,
+            student_target_elite_min_count=elite_min_count,
+            student_target_elite_blend_all_weight=elite_blend_all_weight,
             device=device,
+        )
+        pseudo_score_mean, pseudo_score_std = _teacher_score_normalization_tensors(
+            built_pseudo_summary,
+            batch=int(pseudo_target_mass.shape[0]),
+            device=pseudo_target_mass.device,
+            dtype=pseudo_target_mass.dtype,
         )
         pseudo_target_rows = _student_target_representative_rows(list(pseudo_rows or []))
         pseudo_summary = {
@@ -3096,6 +3479,11 @@ def train_gipo_student(
             teacher_utility_weights=teacher_utility_weights,
             setting_feature_mode=feature_mode,
             setting_encoder_config=encoder_config,
+            student_target_mixture_mode=target_mode,
+            student_target_elite_fraction=elite_fraction,
+            student_target_elite_k=elite_k,
+            student_target_elite_min_count=elite_min_count,
+            student_target_elite_blend_all_weight=elite_blend_all_weight,
             device=device,
         )
         validation_target_rows = _student_target_representative_rows(validation_fit_rows)
@@ -3152,6 +3540,31 @@ def train_gipo_student(
         log_probs = torch.log_softmax(logits, dim=-1)
         ce_loss = -(target_mass * log_probs).sum(dim=-1).mean()
         pseudo_ce_loss = logits.new_zeros(())
+        teacher_score_z = logits.new_zeros(())
+        teacher_score_mean = logits.new_zeros(())
+        pseudo_teacher_score_z = logits.new_zeros(())
+        pseudo_teacher_score_mean = logits.new_zeros(())
+        eta = _student_teacher_score_eta(
+            step=step,
+            steps=int(teacher_score_schedule_steps),
+            base_weight=teacher_score_weight,
+            warmup_fraction=teacher_score_warmup_fraction,
+        )
+        if eta > 0.0:
+            teacher_score_z, teacher_score_mean = _student_teacher_score_objective(
+                teacher,
+                logits,
+                sx,
+                series_idx,
+                cx,
+                target_rows,
+                reference_time_grid=reference_time_grid,
+                density_normalizer=density_normalizer,
+                score_mean=score_mean,
+                score_std=score_std,
+                teacher_utility_weights=teacher_utility_weights,
+                clip=DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
+            )
         if pseudo_enabled:
             assert pseudo_sx is not None
             assert pseudo_base_series_idx is not None
@@ -3167,7 +3580,28 @@ def train_gipo_student(
             )
             pseudo_log_probs = torch.log_softmax(pseudo_logits, dim=-1)
             pseudo_ce_loss = -(pseudo_target_mass * pseudo_log_probs).sum(dim=-1).mean()
-        loss = ce_loss + float(pseudo_weight) * pseudo_ce_loss
+            if eta > 0.0 and bool(student_teacher_score_include_pseudo):
+                assert pseudo_score_mean is not None
+                assert pseudo_score_std is not None
+                pseudo_teacher_score_z, pseudo_teacher_score_mean = _student_teacher_score_objective(
+                    teacher,
+                    pseudo_logits,
+                    pseudo_sx,
+                    pseudo_series_idx,
+                    pseudo_cx,
+                    pseudo_target_rows,
+                    reference_time_grid=reference_time_grid,
+                    density_normalizer=density_normalizer,
+                    score_mean=pseudo_score_mean,
+                    score_std=pseudo_score_std,
+                    teacher_utility_weights=teacher_utility_weights,
+                    clip=DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
+                )
+        teacher_score_objective = teacher_score_z
+        if bool(student_teacher_score_include_pseudo):
+            teacher_score_objective = teacher_score_objective + float(pseudo_weight) * pseudo_teacher_score_z
+        teacher_score_loss = -float(eta) * teacher_score_objective
+        loss = ce_loss + float(pseudo_weight) * pseudo_ce_loss + teacher_score_loss
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -3192,6 +3626,12 @@ def train_gipo_student(
                     "student_eval_kl_ce_loss": float(train_ce_for_checkpoint),
                     "student_pseudo_kl_ce_loss": float(pseudo_ce_loss.detach().cpu().item()),
                     "student_pseudo_weighted_loss": float((float(pseudo_weight) * pseudo_ce_loss).detach().cpu().item()),
+                    "student_teacher_score_eta": float(eta),
+                    "student_teacher_score_z_mean": float(teacher_score_z.detach().cpu().item()),
+                    "student_teacher_score_mean": float(teacher_score_mean.detach().cpu().item()),
+                    "student_teacher_score_loss": float(teacher_score_loss.detach().cpu().item()),
+                    "student_pseudo_teacher_score_z_mean": float(pseudo_teacher_score_z.detach().cpu().item()),
+                    "student_pseudo_teacher_score_mean": float(pseudo_teacher_score_mean.detach().cpu().item()),
                     "student_entropy": float(train_entropy_for_checkpoint),
                 }
             )
@@ -3215,6 +3655,9 @@ def train_gipo_student(
                     "validation_ce_loss": float(validation_ce),
                     "train_entropy": float(train_entropy_for_checkpoint),
                     "validation_entropy": float(validation_entropy),
+                    "student_teacher_score_eta": float(eta),
+                    "student_teacher_score_loss": float(teacher_score_loss.detach().cpu().item()),
+                    "student_teacher_score_z_mean": float(teacher_score_z.detach().cpu().item()),
                     "selection_constraints_passed": True,
                     "selection_constraint_failures": [],
                     "locked_test_used_for_selection": False,
@@ -3271,8 +3714,15 @@ def train_gipo_student(
         }
     return {
         "student_policy_type": "continuous_density",
-        "student_objective": "teacher_weighted_density_mle_kl",
+        "student_objective": "teacher_weighted_density_mle_kl_plus_teacher_score"
+        if teacher_score_weight > 0.0
+        else "teacher_weighted_density_mle_kl",
         "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
+        "student_target_mixture_mode": target_mode,
+        "student_target_elite_fraction": float(elite_fraction),
+        "student_target_elite_k": int(elite_k),
+        "student_target_elite_min_count": int(elite_min_count),
+        "student_target_elite_blend_all_weight": float(elite_blend_all_weight),
         "density_protocol": DENSITY_PROTOCOL,
         "student_target_summary": target_summary,
         "student_validation_target_summary": validation_target_summary,
@@ -3280,6 +3730,17 @@ def train_gipo_student(
         "teacher_utility_weights": dict(target_summary.get("teacher_utility_weights", {})),
         "pseudo_distillation_used": bool(pseudo_enabled),
         "pseudo_target_weight": float(pseudo_weight),
+        "student_teacher_score_enabled": bool(teacher_score_weight > 0.0),
+        "student_teacher_score_weight": float(teacher_score_weight),
+        "student_teacher_score_warmup_fraction": float(teacher_score_warmup_fraction),
+        "student_teacher_score_schedule_steps": int(teacher_score_schedule_steps),
+        "student_teacher_score_clip": float(DEFAULT_STUDENT_TEACHER_SCORE_CLIP),
+        "student_teacher_score_include_pseudo": bool(student_teacher_score_include_pseudo),
+        "student_teacher_score_protocol": "late_ramped_per_cell_teacher_utility_z_score",
+        "student_regularizers": {
+            "smooth": False,
+            "guard": False,
+        },
         "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "student_weight_decay": float(weight_decay),
         "setting_feature_mode": feature_mode,
@@ -3289,6 +3750,7 @@ def train_gipo_student(
         "losses": losses,
         "student_loss_tail_slope": _loss_tail_slope(losses, "student_kl_ce_loss"),
         "student_eval_loss_tail_slope": _loss_tail_slope(losses, "student_eval_kl_ce_loss"),
+        "student_teacher_score_loss_tail_slope": _loss_tail_slope(losses, "student_teacher_score_loss"),
         "student_optimizer": {
             "optimizer": "AdamW",
             "lr": float(lr),
@@ -3297,6 +3759,11 @@ def train_gipo_student(
             "student_log_every": int(student_log_every),
             "student_checkpoint_every": int(checkpoint_every),
             "student_checkpoint_selection_mode": selection_mode,
+            "student_teacher_score_weight": float(teacher_score_weight),
+            "student_teacher_score_warmup_fraction": float(teacher_score_warmup_fraction),
+            "student_teacher_score_schedule_steps": int(teacher_score_schedule_steps),
+            "student_teacher_score_include_pseudo": bool(student_teacher_score_include_pseudo),
+            "student_target_mixture_mode": target_mode,
         },
         "student_log_every": int(student_log_every),
         "student_checkpoint_every": int(checkpoint_every),
@@ -3422,6 +3889,18 @@ __all__ = [
     "EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS",
     "DEFAULT_TEACHER_TARGET_TEMPERATURE",
     "STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE",
+    "STUDENT_TARGET_MIXTURE_MODE_FULL",
+    "STUDENT_TARGET_MIXTURE_MODE_ELITE",
+    "STUDENT_TARGET_MIXTURE_MODE_ELITE_BLEND",
+    "STUDENT_TARGET_MIXTURE_MODES",
+    "DEFAULT_STUDENT_TARGET_MIXTURE_MODE",
+    "DEFAULT_STUDENT_TARGET_ELITE_FRACTION",
+    "DEFAULT_STUDENT_TARGET_ELITE_K",
+    "DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT",
+    "DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT",
+    "DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT",
+    "DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION",
+    "DEFAULT_STUDENT_TEACHER_SCORE_CLIP",
     "DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS",
     "DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE",
     "DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE",
@@ -3486,6 +3965,7 @@ __all__ = [
     "validate_gipo_architecture",
     "validate_gipo_teacher_training_metadata",
     "validate_gipo_support_schedule_keys",
+    "validate_student_target_mixture_mode",
     "validate_density_family_holdout_schedule_keys",
     "validate_series_conditioning",
     "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET",

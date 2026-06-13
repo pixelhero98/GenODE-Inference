@@ -27,7 +27,16 @@ from genode.gipo.policy import (
     SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
     DEFAULT_SUPPORT_SCHEDULE_KEYS,
     DEFAULT_TEACHER_TARGET_TEMPERATURE,
+    DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
+    DEFAULT_STUDENT_TARGET_ELITE_FRACTION,
+    DEFAULT_STUDENT_TARGET_ELITE_K,
+    DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT,
+    DEFAULT_STUDENT_TARGET_MIXTURE_MODE,
+    DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
+    DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT,
+    DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION,
     STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
+    STUDENT_TARGET_MIXTURE_MODES,
     TEACHER_METRIC_MASK_PROTOCOL,
     TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
     TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
@@ -67,6 +76,7 @@ from genode.gipo.policy import (
     teacher_utility_weights_for_summary,
     validate_gipo_attention_heads,
     validate_gipo_support_schedule_keys,
+    validate_student_target_mixture_mode,
     validate_teacher_metric_target_keys,
     validate_teacher_objective_hyperparameters,
 )
@@ -602,6 +612,14 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Schedule summaries for pseudo rows, such as unseen SER-derived references.",
     )
     parser.add_argument("--student_pseudo_target_weight", type=float, default=CANONICAL_PSEUDO_TARGET_WEIGHT)
+    parser.add_argument("--student_teacher_score_weight", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT)
+    parser.add_argument("--student_teacher_score_warmup_fraction", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION)
+    parser.add_argument("--student_teacher_score_include_pseudo", action="store_true", default=False)
+    parser.add_argument("--student_target_mixture_mode", choices=STUDENT_TARGET_MIXTURE_MODES, default=DEFAULT_STUDENT_TARGET_MIXTURE_MODE)
+    parser.add_argument("--student_target_elite_fraction", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_FRACTION)
+    parser.add_argument("--student_target_elite_k", type=int, default=DEFAULT_STUDENT_TARGET_ELITE_K)
+    parser.add_argument("--student_target_elite_min_count", type=int, default=DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT)
+    parser.add_argument("--student_target_elite_blend_all_weight", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT)
     parser.add_argument("--student_steps", type=int, default=500)
     parser.add_argument("--student_log_every", type=int, default=0)
     parser.add_argument("--student_checkpoint_every", type=int, default=100)
@@ -858,6 +876,28 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     )
     density_family_diagnostic_rows = [dict(row) for row in density_holdout_rows]
     unseen_nfe_diagnostic_rows = _rows_without_schedule_keys(unseen_selection_rows, density_holdout_keys)
+    student_teacher_score_weight = float(getattr(args, "student_teacher_score_weight", DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT))
+    if not np.isfinite(student_teacher_score_weight) or student_teacher_score_weight < 0.0:
+        raise ValueError("student_teacher_score_weight must be finite and nonnegative.")
+    student_teacher_score_warmup_fraction = float(
+        getattr(args, "student_teacher_score_warmup_fraction", DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION)
+    )
+    if (
+        not np.isfinite(student_teacher_score_warmup_fraction)
+        or student_teacher_score_warmup_fraction < 0.0
+        or student_teacher_score_warmup_fraction >= 1.0
+    ):
+        raise ValueError("student_teacher_score_warmup_fraction must be finite and in [0, 1).")
+    student_teacher_score_include_pseudo = bool(getattr(args, "student_teacher_score_include_pseudo", False))
+    student_target_mixture_mode = validate_student_target_mixture_mode(
+        str(getattr(args, "student_target_mixture_mode", DEFAULT_STUDENT_TARGET_MIXTURE_MODE))
+    )
+    student_target_elite_fraction = float(getattr(args, "student_target_elite_fraction", DEFAULT_STUDENT_TARGET_ELITE_FRACTION))
+    student_target_elite_k = int(getattr(args, "student_target_elite_k", DEFAULT_STUDENT_TARGET_ELITE_K))
+    student_target_elite_min_count = int(getattr(args, "student_target_elite_min_count", DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT))
+    student_target_elite_blend_all_weight = float(
+        getattr(args, "student_target_elite_blend_all_weight", DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT)
+    )
     pseudo_rows: List[Dict[str, Any]] = []
     pseudo_embeddings: Dict[str, Any] | None = None
     pseudo_schedule_grids: Dict[Tuple[str, str, int], Tuple[float, ...]] | None = None
@@ -992,8 +1032,26 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "artifact": "gipo_training_summary",
         "protocol": GIPO_PROTOCOL,
         "student_policy_type": "continuous_density",
-        "student_objective": "teacher_weighted_density_mle_kl",
+        "student_objective": "teacher_weighted_density_mle_kl_plus_teacher_score"
+        if student_teacher_score_weight > 0.0
+        else "teacher_weighted_density_mle_kl",
         "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
+        "student_target_mixture_mode": student_target_mixture_mode,
+        "student_target_elite_fraction": float(student_target_elite_fraction),
+        "student_target_elite_k": int(student_target_elite_k),
+        "student_target_elite_min_count": int(student_target_elite_min_count),
+        "student_target_elite_blend_all_weight": float(student_target_elite_blend_all_weight),
+        "student_teacher_score_enabled": bool(student_teacher_score_weight > 0.0),
+        "student_teacher_score_weight": float(student_teacher_score_weight),
+        "student_teacher_score_warmup_fraction": float(student_teacher_score_warmup_fraction),
+        "student_teacher_score_schedule_steps": int(args.student_steps),
+        "student_teacher_score_clip": float(DEFAULT_STUDENT_TEACHER_SCORE_CLIP),
+        "student_teacher_score_protocol": "late_ramped_per_cell_teacher_utility_z_score",
+        "student_teacher_score_include_pseudo": bool(student_teacher_score_include_pseudo),
+        "student_regularizers": {
+            "smooth": False,
+            "guard": False,
+        },
         "teacher_objective": "pairwise_rank_plus_huber_regression",
         "model_payload_version": MODEL_PAYLOAD_VERSION,
         "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
@@ -1037,6 +1095,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "selected_row_count": int(len(pseudo_rows)),
             "selected_context_count": int(len({context_id_from_row(row) for row in pseudo_rows})),
             "support_schedule_keys": list(pseudo_support_keys),
+            "student_target_mixture_mode": student_target_mixture_mode,
+            "student_teacher_score_include_pseudo": bool(student_teacher_score_include_pseudo),
             "used_for_teacher_fitting": False,
             "used_for_teacher_selection": False,
             "locked_test_used_for_pseudo": False,
@@ -1264,6 +1324,15 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             pseudo_context_embeddings=pseudo_embeddings,
             pseudo_schedule_grids=pseudo_schedule_grids,
             pseudo_target_weight=float(pseudo_target_weight),
+            student_teacher_score_weight=float(student_teacher_score_weight),
+            student_teacher_score_warmup_fraction=float(student_teacher_score_warmup_fraction),
+            student_teacher_score_schedule_steps=int(args.student_steps),
+            student_teacher_score_include_pseudo=bool(student_teacher_score_include_pseudo),
+            student_target_mixture_mode=student_target_mixture_mode,
+            student_target_elite_fraction=float(student_target_elite_fraction),
+            student_target_elite_k=int(student_target_elite_k),
+            student_target_elite_min_count=int(student_target_elite_min_count),
+            student_target_elite_blend_all_weight=float(student_target_elite_blend_all_weight),
             validation_rows=validation_rows,
             validation_context_embeddings=normalized_embeddings,
             student_log_every=int(args.student_log_every),
@@ -1327,6 +1396,27 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "student_final_retrain": student_final_retrain,
     }
 
+    student_objective_settings = {
+        "student_objective": student_training.get("student_objective", summary_base["student_objective"]),
+        "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
+        "student_target_mixture_mode": student_target_mixture_mode,
+        "student_target_elite_fraction": float(student_target_elite_fraction),
+        "student_target_elite_k": int(student_target_elite_k),
+        "student_target_elite_min_count": int(student_target_elite_min_count),
+        "student_target_elite_blend_all_weight": float(student_target_elite_blend_all_weight),
+        "student_teacher_score_enabled": bool(student_teacher_score_weight > 0.0),
+        "student_teacher_score_weight": float(student_teacher_score_weight),
+        "student_teacher_score_warmup_fraction": float(student_teacher_score_warmup_fraction),
+        "student_teacher_score_schedule_steps": int(args.student_steps),
+        "student_teacher_score_clip": float(DEFAULT_STUDENT_TEACHER_SCORE_CLIP),
+        "student_teacher_score_protocol": "late_ramped_per_cell_teacher_utility_z_score",
+        "student_teacher_score_include_pseudo": bool(student_teacher_score_include_pseudo),
+        "student_regularizers": {
+            "smooth": False,
+            "guard": False,
+        },
+    }
+
     teacher_path = out_dir / "gipo_teacher.pt"
     student_path = out_dir / "gipo_student.pt"
     torch.save(
@@ -1349,6 +1439,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "support_schedule_keys": list(support_keys),
             "teacher_utility_weights": teacher_utility_weights,
             "teacher_training": teacher_training,
+            "student_objective_settings": student_objective_settings,
             "conditioning_style": conditioning_style,
             "teacher_checkpoint_selection_mode": selection_mode,
             "teacher_checkpoint_selection": teacher_training.get("teacher_checkpoint_selection", {}),
@@ -1390,6 +1481,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "teacher_checkpoint": teacher_path.name,
             "teacher_training": teacher_training,
             "student_training": student_training,
+            "student_objective_settings": student_objective_settings,
             "teacher_checkpoint_selection_mode": selection_mode,
             "teacher_checkpoint_selection": teacher_training.get("teacher_checkpoint_selection", {}),
             "student_checkpoint_selection_mode": student_selection_mode,
@@ -1412,6 +1504,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "support_schedule_keys": list(support_keys),
         "teacher_selected_step": teacher_training.get("teacher_checkpoint_selection", {}).get("selected_step"),
         "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
+        "student_objective_settings": student_objective_settings,
         "setting_feature_mode": setting_feature_mode,
         "setting_encoder_config": setting_encoder_config.to_payload(),
         "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
@@ -1445,6 +1538,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "student_final_retrain": student_training.get("student_final_retrain", {}),
         "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
         "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
+        "student_objective_settings": student_objective_settings,
         "student_training": student_training,
     }
     (out_dir / "gipo_training_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")

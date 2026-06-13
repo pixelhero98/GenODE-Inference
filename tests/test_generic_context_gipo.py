@@ -184,9 +184,22 @@ class GenericContextGipoTests(unittest.TestCase):
             summary = train_gipo(args)
 
         self.assertTrue(summary["student_pseudo_distillation"]["enabled"])
+        self.assertEqual(summary["student_objective_settings"]["student_teacher_score_weight"], 0.05)
+        self.assertEqual(summary["student_objective_settings"]["student_teacher_score_warmup_fraction"], 0.6)
+        self.assertEqual(summary["student_objective_settings"]["student_teacher_score_schedule_steps"], 1)
+        self.assertEqual(summary["student_objective_settings"]["student_teacher_score_clip"], 5.0)
+        self.assertEqual(
+            summary["student_objective_settings"]["student_teacher_score_protocol"],
+            "late_ramped_per_cell_teacher_utility_z_score",
+        )
+        self.assertEqual(summary["student_objective_settings"]["student_target_mixture_mode"], "full")
+        self.assertFalse(summary["student_objective_settings"]["student_teacher_score_include_pseudo"])
+        self.assertFalse(summary["student_objective_settings"]["student_regularizers"]["smooth"])
+        self.assertFalse(summary["student_objective_settings"]["student_regularizers"]["guard"])
         pseudo_summary = summary["student_training"]["student_pseudo_target_summary"]
         self.assertTrue(pseudo_summary["pseudo_distillation_used"])
         self.assertEqual(pseudo_summary["pseudo_target_nfes"], [6, 10, 14, 20])
+        self.assertEqual(pseudo_summary["student_target_mixture_mode"], "full")
 
     def test_conditional_context_rows_use_checkpoint_scoped_ids_and_component_utility(self) -> None:
         rows = runner._conditional_context_records(
@@ -697,9 +710,20 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertNotIn("--teacher_unseen_selection_rows_csv", zero_shot)
         self.assertNotIn("--teacher_unseen_selection_context_embeddings_npz", zero_shot)
         self.assertIn("--teacher_metric_target_keys u_temporal_cw1_uniform,u_temporal_uw1_uniform,u_temporal_tstr_f1_uniform", zero_shot)
+        self.assertIn("--student_teacher_score_weight 0.05", zero_shot)
+        self.assertIn("--student_teacher_score_warmup_fraction 0.6", zero_shot)
+        self.assertIn("--student_target_mixture_mode full", zero_shot)
+        self.assertIn("--student_target_elite_blend_all_weight 0.2", zero_shot)
         self.assertIn("--student_pseudo_rows_csv", pseudo)
+        self.assertIn("--student_teacher_score_weight 0.05", pseudo)
+        self.assertNotIn("--student_teacher_score_include_pseudo", pseudo)
         self.assertIn("--teacher_metric_target_keys u_temporal_cw1_uniform,u_temporal_uw1_uniform,u_temporal_tstr_f1_uniform", pseudo)
         self.assertIn("--teacher_utility_weights", pseudo)
+        protocol = full_pipeline._protocol_payload(args)
+        self.assertEqual(protocol["student_teacher_score_weight"], 0.05)
+        self.assertEqual(protocol["student_teacher_score_clip"], 5.0)
+        self.assertEqual(protocol["student_teacher_score_protocol"], "late_ramped_per_cell_teacher_utility_z_score")
+        self.assertEqual(protocol["student_target_mixture_mode"], "full")
 
     def _dry_run_gipo_commands_for_scenario(self, scenario_key: str) -> str:
         with tempfile.TemporaryDirectory() as tmpdir:

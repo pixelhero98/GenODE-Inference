@@ -108,6 +108,14 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertIn("--teacher_unseen_selection_rows_csv", options)
         self.assertIn("--student_pseudo_rows_csv", options)
         self.assertIn("--student_pseudo_target_" + "weight", options)
+        self.assertIn("--student_teacher_score_" + "weight", options)
+        self.assertIn("--student_teacher_score_warmup_" + "fraction", options)
+        self.assertIn("--student_teacher_score_include_" + "pseudo", options)
+        self.assertIn("--student_target_mixture_" + "mode", options)
+        self.assertIn("--student_target_elite_" + "fraction", options)
+        self.assertIn("--student_target_elite_" + "k", options)
+        self.assertIn("--student_target_elite_min_" + "count", options)
+        self.assertIn("--student_target_elite_blend_all_" + "weight", options)
         removed_options = {
             "--gipo_" + "conditioning_style",
             "--gipo_teacher_" + "conditioning_style",
