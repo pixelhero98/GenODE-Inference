@@ -685,6 +685,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--molecule_group_root", default=str(default_molecule_group_root()))
     parser.add_argument("--otflow_train_steps", type=int, default=20000)
     parser.add_argument("--steps", type=int, default=0)
+    parser.add_argument("--dataset_seed", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--hidden_dim", type=int, default=160)
+    parser.add_argument("--fu_net_layers", type=int, default=3)
+    parser.add_argument("--fu_net_heads", type=int, default=4)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--smoke", action="store_true", default=False)
     return parser

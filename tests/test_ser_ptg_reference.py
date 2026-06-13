@@ -4,11 +4,56 @@ import unittest
 
 import torch
 
-from genode.gipo.ser_ptg_reference import collect_batched_local_defect_trace
+from genode.gipo.ser_ptg_reference import build_argparser, collect_batched_local_defect_trace
+from genode.evaluation.otflow_evaluation_support import build_conditional_generation_dataset_args_from_cfg
 from genode.models.config import OTFlowConfig
 
 
 class SerPtgReferenceTests(unittest.TestCase):
+    def test_argparser_provides_conditional_loader_defaults(self) -> None:
+        args = build_argparser().parse_args([])
+        self.assertEqual(args.dataset_seed, 0)
+        self.assertEqual(args.lr, 2e-4)
+        self.assertEqual(args.weight_decay, 1e-4)
+        self.assertEqual(args.grad_clip, 1.0)
+        self.assertEqual(args.hidden_dim, 160)
+        self.assertEqual(args.fu_net_layers, 3)
+        self.assertEqual(args.fu_net_heads, 4)
+
+    def test_argparser_defaults_rebuild_conditional_dataset_args(self) -> None:
+        cfg = OTFlowConfig(
+            device=torch.device("cpu"),
+            levels=1,
+            token_dim=4,
+            history_len=12000,
+            hidden_dim=160,
+            dropout=0.0,
+            ctx_heads=4,
+            ctx_layers=1,
+            fu_net_layers=3,
+            fu_net_heads=4,
+            rollout_mode="non_ar",
+            future_block_len=3000,
+            use_cond_features=True,
+            cond_standardize=True,
+            cond_dim=5,
+            use_amp=False,
+        )
+        cfg.apply_overrides(steps=20000)
+        args = build_argparser().parse_args(["--dataset", "long_term_st", "--device", "cpu"])
+
+        dataset_args = build_conditional_generation_dataset_args_from_cfg(
+            args,
+            "long_term_st",
+            "transformer",
+            cfg,
+        )
+
+        self.assertEqual(dataset_args.seed, 0)
+        self.assertEqual(dataset_args.lr, 2e-4)
+        self.assertEqual(dataset_args.fu_net_layers, 3)
+        self.assertEqual(dataset_args.future_block_len, 3000)
+
     def test_collect_batched_local_defect_trace_handles_sample_seed_above_numpy_limit(self) -> None:
         cfg = OTFlowConfig(
             device=torch.device("cpu"),
