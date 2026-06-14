@@ -690,6 +690,24 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertFalse(any("report_locked_test" in command for command in commands if command[:1] == ["internal"]))
         self.assertEqual(summary["status"], "dry_run")
 
+    def test_full_pipeline_requests_exact_budget_temporal_backbones(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "cryptos",
+                    "--run_root",
+                    str(Path(tmpdir) / "run"),
+                    "--stages",
+                    "backbone_training",
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+        commands = [" ".join(cmd) for stage in summary["stages"] for cmd in stage["commands"]]
+        backbone_command = next(command for command in commands if "genode.training.train_backbone" in command)
+        self.assertIn("--checkpoint_export_mode exact_budget", backbone_command)
+
     def test_full_pipeline_zero_shot_stage_does_not_use_unseen_selection_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             args = full_pipeline.build_argparser().parse_args(

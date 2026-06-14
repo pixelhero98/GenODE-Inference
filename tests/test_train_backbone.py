@@ -36,6 +36,11 @@ def _args(**overrides):
         "val_every": 1,
         "val_max_batches": None,
         "checkpoint_steps": "1,2",
+        "checkpoint_export_mode": "best_validation_within_budget",
+        "training_state_out": "",
+        "resume_training_state": "",
+        "save_training_state_every": 0,
+        "no_auto_resume_training_state": True,
         "prepare_data": False,
         "use_amp": False,
     }
@@ -66,13 +71,64 @@ class TrainBackboneTests(unittest.TestCase):
         self.assertEqual(cfg.future_block_len, 3000)
         self.assertEqual(cfg.batch_size, 2)
 
-    def test_train_backbone_exports_validation_best_budget_artifacts(self) -> None:
+    def test_train_backbone_exports_exact_budget_artifacts_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             matrix_root = Path(tmpdir) / "matrix"
             fake_model = _FakeModel()
 
-            def fake_train_loop(ds, cfg, *, model_name, steps, log_every, on_step):
-                del ds, cfg, model_name, log_every
+            def fake_train_loop(ds, cfg, *, model_name, steps, log_every, on_step, **kwargs):
+                del ds, cfg, model_name, log_every, kwargs
+                for step in range(1, int(steps) + 1):
+                    fake_model.step = step
+                    on_step(step, fake_model, float(10 - step), {"loss": float(10 - step)})
+                return fake_model
+
+            def fake_eval(ds, model, cfg, **kwargs):
+                del ds, cfg, kwargs
+                return {"loss": {1: 5.0, 2: 4.0}[int(model.step)], "examples": 3, "batches": 1}
+
+            with patch.object(train_backbone_module, "ensure_forecast_dataset"), patch.object(
+                train_backbone_module,
+                "build_monash_forecast_splits",
+                return_value={
+                    "train": object(),
+                    "val": object(),
+                    "stats": {"history_len": 1008, "n_val_examples": 3},
+                },
+            ), patch.object(train_backbone_module, "train_loop", side_effect=fake_train_loop), patch.object(
+                train_backbone_module,
+                "evaluate_average_loss",
+                side_effect=fake_eval,
+            ), patch.object(
+                train_backbone_module,
+                "project_backbone_matrix_root",
+                return_value=matrix_root,
+            ), patch.object(
+                train_backbone_module,
+                "materialize_backbone_manifest",
+                return_value={"ready_count": 2},
+            ):
+                summary = train_backbone_module.train_backbone(
+                    _args(dataset_root=tmpdir, checkpoint_export_mode="exact_budget")
+                )
+
+            self.assertEqual(summary["checkpoint_export_mode"], "exact_budget")
+            for steps in (1, 2):
+                artifact_root = matrix_root / "otflow" / "temporal_extrapolation" / f"{steps}_steps" / "solar_energy_10m"
+                metadata = json.loads((artifact_root / "checkpoint_metadata.json").read_text(encoding="utf-8"))
+                checkpoint = torch.load(artifact_root / "model.pt", map_location="cpu", weights_only=False)
+                self.assertEqual(metadata["effective_train_steps"], steps)
+                self.assertEqual(metadata["checkpoint_export_protocol"], "exact_budget_step_state")
+                self.assertEqual(metadata["selection"]["selected_step"], steps)
+                self.assertEqual(float(checkpoint["model_state"]["weight"].item()), float(steps))
+
+    def test_train_backbone_supports_validation_best_budget_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            matrix_root = Path(tmpdir) / "matrix"
+            fake_model = _FakeModel()
+
+            def fake_train_loop(ds, cfg, *, model_name, steps, log_every, on_step, **kwargs):
+                del ds, cfg, model_name, log_every, kwargs
                 for step in range(1, int(steps) + 1):
                     fake_model.step = step
                     on_step(step, fake_model, float(10 - step), {"loss": float(10 - step)})
@@ -118,6 +174,234 @@ class TrainBackboneTests(unittest.TestCase):
                 self.assertEqual(metadata["cfg"]["train"]["steps"], steps)
                 self.assertEqual(metadata["selection"]["selection_metric"], "validation_loss")
                 self.assertEqual(metadata["selection"]["selected_step"], selected_step)
+
+    def test_train_backbone_resumes_from_restart_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            matrix_root = Path(tmpdir) / "matrix"
+            state_path = Path(tmpdir) / "restart.pt"
+            fake_model = _FakeModel()
+
+            def fake_eval(ds, model, cfg, **kwargs):
+                del ds, cfg, kwargs
+                return {"loss": {1: 5.0, 2: 4.0}[int(model.step)], "examples": 3, "batches": 1}
+
+            def interrupted_train_loop(ds, cfg, *, model_name, steps, log_every, on_step, on_training_state, **kwargs):
+                del ds, cfg, model_name, steps, log_every, kwargs
+                fake_model.step = 1
+                on_step(1, fake_model, 9.0, {"loss": 9.0})
+                optimizer = torch.optim.SGD(fake_model.parameters(), lr=0.1)
+                scaler = torch.cuda.amp.GradScaler(enabled=False)
+                on_training_state(
+                    1,
+                    fake_model,
+                    optimizer,
+                    None,
+                    scaler,
+                    {"loader_state": {"seed": 11, "epoch": 0, "batch_index": 1}},
+                )
+                raise RuntimeError("simulated timeout")
+
+            resume_seen = {}
+
+            def resumed_train_loop(ds, cfg, *, model_name, steps, log_every, on_step, start_step, initial_model_state, **kwargs):
+                del ds, cfg, model_name, log_every
+                resume_seen["start_step"] = int(start_step)
+                resume_seen["weight"] = float(initial_model_state["weight"].item())
+                on_training_state = kwargs["on_training_state"]
+                for step in range(int(start_step) + 1, int(steps) + 1):
+                    fake_model.step = step
+                    on_step(step, fake_model, float(10 - step), {"loss": float(10 - step)})
+                    optimizer = torch.optim.SGD(fake_model.parameters(), lr=0.1)
+                    scaler = torch.cuda.amp.GradScaler(enabled=False)
+                    on_training_state(
+                        step,
+                        fake_model,
+                        optimizer,
+                        None,
+                        scaler,
+                        {"loader_state": {"seed": 11, "epoch": 0, "batch_index": step}},
+                    )
+                return fake_model
+
+            def run_with_patches(train_loop_side_effect, args):
+                with patch.object(train_backbone_module, "ensure_forecast_dataset"), patch.object(
+                    train_backbone_module,
+                    "build_monash_forecast_splits",
+                    return_value={
+                        "train": object(),
+                        "val": object(),
+                        "stats": {"history_len": 1008, "n_val_examples": 3},
+                    },
+                ), patch.object(train_backbone_module, "evaluate_average_loss", side_effect=fake_eval), patch.object(
+                    train_backbone_module,
+                    "project_backbone_matrix_root",
+                    return_value=matrix_root,
+                ), patch.object(
+                    train_backbone_module,
+                    "materialize_backbone_manifest",
+                    return_value={"ready_count": 2},
+                ), patch.object(
+                    train_backbone_module,
+                    "train_loop",
+                    side_effect=train_loop_side_effect,
+                ):
+                    return train_backbone_module.train_backbone(args)
+
+            with self.assertRaisesRegex(RuntimeError, "simulated timeout"):
+                run_with_patches(
+                    interrupted_train_loop,
+                    _args(
+                        dataset_root=tmpdir,
+                        checkpoint_export_mode="exact_budget",
+                        training_state_out=str(state_path),
+                        save_training_state_every=1,
+                    ),
+                )
+
+            self.assertTrue(state_path.exists())
+
+            summary = run_with_patches(
+                resumed_train_loop,
+                _args(
+                    dataset_root=tmpdir,
+                    checkpoint_export_mode="exact_budget",
+                    training_state_out=str(state_path),
+                    resume_training_state=str(state_path),
+                    save_training_state_every=1,
+                ),
+            )
+
+            self.assertTrue(summary["resumed_from_training_state"])
+            self.assertEqual(summary["resume_start_step"], 1)
+            self.assertEqual(resume_seen, {"start_step": 1, "weight": 1.0})
+            artifact_root = matrix_root / "otflow" / "temporal_extrapolation" / "2_steps" / "solar_energy_10m"
+            metadata = json.loads((artifact_root / "checkpoint_metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["checkpoint_export_protocol"], "exact_budget_step_state")
+            self.assertEqual(metadata["effective_train_steps"], 2)
+
+    def test_train_backbone_rejects_resume_mode_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            matrix_root = Path(tmpdir) / "matrix"
+            state_path = Path(tmpdir) / "restart.pt"
+            fake_model = _FakeModel()
+
+            def fake_eval(ds, model, cfg, **kwargs):
+                del ds, cfg, kwargs
+                return {"loss": {1: 5.0, 2: 4.0}[int(model.step)], "examples": 3, "batches": 1}
+
+            def interrupted_train_loop(ds, cfg, *, model_name, steps, log_every, on_step, on_training_state, **kwargs):
+                del ds, cfg, model_name, steps, log_every, kwargs
+                fake_model.step = 1
+                on_step(1, fake_model, 9.0, {"loss": 9.0})
+                optimizer = torch.optim.SGD(fake_model.parameters(), lr=0.1)
+                scaler = torch.cuda.amp.GradScaler(enabled=False)
+                on_training_state(
+                    1,
+                    fake_model,
+                    optimizer,
+                    None,
+                    scaler,
+                    {"loader_state": {"seed": 11, "epoch": 0, "batch_index": 1}},
+                )
+                raise RuntimeError("simulated timeout")
+
+            def run_with_patches(train_loop_side_effect, args):
+                with patch.object(train_backbone_module, "ensure_forecast_dataset"), patch.object(
+                    train_backbone_module,
+                    "build_monash_forecast_splits",
+                    return_value={
+                        "train": object(),
+                        "val": object(),
+                        "stats": {"history_len": 1008, "n_val_examples": 3},
+                    },
+                ), patch.object(train_backbone_module, "evaluate_average_loss", side_effect=fake_eval), patch.object(
+                    train_backbone_module,
+                    "project_backbone_matrix_root",
+                    return_value=matrix_root,
+                ), patch.object(
+                    train_backbone_module,
+                    "materialize_backbone_manifest",
+                    return_value={"ready_count": 2},
+                ), patch.object(
+                    train_backbone_module,
+                    "train_loop",
+                    side_effect=train_loop_side_effect,
+                ):
+                    return train_backbone_module.train_backbone(args)
+
+            with self.assertRaisesRegex(RuntimeError, "simulated timeout"):
+                run_with_patches(
+                    interrupted_train_loop,
+                    _args(
+                        dataset_root=tmpdir,
+                        checkpoint_export_mode="exact_budget",
+                        training_state_out=str(state_path),
+                        save_training_state_every=1,
+                    ),
+                )
+
+            with self.assertRaisesRegex(ValueError, "does not match this run signature"):
+                run_with_patches(
+                    lambda *args, **kwargs: fake_model,
+                    _args(
+                        dataset_root=tmpdir,
+                        training_state_out=str(state_path),
+                        resume_training_state=str(state_path),
+                    ),
+                )
+
+    def test_train_backbone_detects_missing_exported_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            matrix_root = Path(tmpdir) / "matrix"
+            fake_model = _FakeModel()
+
+            def fake_train_loop(ds, cfg, *, model_name, steps, log_every, on_step, **kwargs):
+                del ds, cfg, model_name, log_every, kwargs
+                for step in range(1, int(steps) + 1):
+                    fake_model.step = step
+                    on_step(step, fake_model, float(10 - step), {"loss": float(10 - step)})
+                return fake_model
+
+            def fake_eval(ds, model, cfg, **kwargs):
+                del ds, cfg, kwargs
+                return {"loss": {1: 5.0, 2: 4.0}[int(model.step)], "examples": 3, "batches": 1}
+
+            original_save = train_backbone_module._save_backbone_artifact
+
+            def save_then_remove_second_budget_model(**kwargs):
+                metadata = original_save(**kwargs)
+                if int(kwargs["budget_steps"]) == 2:
+                    artifact_root = matrix_root / "otflow" / "temporal_extrapolation" / "2_steps" / "solar_energy_10m"
+                    (artifact_root / "model.pt").unlink()
+                return metadata
+
+            with patch.object(train_backbone_module, "ensure_forecast_dataset"), patch.object(
+                train_backbone_module,
+                "build_monash_forecast_splits",
+                return_value={
+                    "train": object(),
+                    "val": object(),
+                    "stats": {"history_len": 1008, "n_val_examples": 3},
+                },
+            ), patch.object(train_backbone_module, "train_loop", side_effect=fake_train_loop), patch.object(
+                train_backbone_module,
+                "evaluate_average_loss",
+                side_effect=fake_eval,
+            ), patch.object(
+                train_backbone_module,
+                "project_backbone_matrix_root",
+                return_value=matrix_root,
+            ), patch.object(
+                train_backbone_module,
+                "_save_backbone_artifact",
+                side_effect=save_then_remove_second_budget_model,
+            ), patch.object(
+                train_backbone_module,
+                "materialize_backbone_manifest",
+                return_value={"ready_count": 2},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "valid budget artifacts"):
+                    train_backbone_module.train_backbone(_args(dataset_root=tmpdir, checkpoint_export_mode="exact_budget"))
 
 
 if __name__ == "__main__":

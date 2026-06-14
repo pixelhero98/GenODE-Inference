@@ -316,6 +316,8 @@ def _backbone_training_commands(args: argparse.Namespace, dataset: str, checkpoi
                     int(args.backbone_steps),
                     "--checkpoint_steps",
                     checkpoints,
+                    "--checkpoint_export_mode",
+                    "exact_budget",
                     "--synthetic_length",
                     int(args.synthetic_length),
                     *_temporal_training_data_path_args(args),

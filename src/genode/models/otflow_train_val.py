@@ -11,13 +11,14 @@ Adds evaluation helpers:
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from contextlib import contextmanager
 import copy
 import hashlib
 import json
 import random
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -51,9 +52,38 @@ def _bounded_numpy_seed(seed: int) -> int:
 
 def seed_all(seed: int = 0):
     normalized_seed = _bounded_numpy_seed(seed)
+    random.seed(normalized_seed)
     np.random.seed(normalized_seed)
     torch.manual_seed(normalized_seed)
     torch.cuda.manual_seed_all(normalized_seed)
+
+
+def capture_rng_state() -> Dict[str, Any]:
+    """Capture RNG state for restart checkpoints."""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.random.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(state: Optional[Mapping[str, Any]]) -> None:
+    """Restore RNG state captured by :func:`capture_rng_state`."""
+    if not state:
+        return
+    python_state = state.get("python")
+    numpy_state = state.get("numpy")
+    torch_state = state.get("torch")
+    cuda_state = state.get("cuda")
+    if python_state is not None:
+        random.setstate(python_state)
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+    if torch_state is not None:
+        torch.random.set_rng_state(torch_state)
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
 
 
 def make_loader(
@@ -62,6 +92,7 @@ def make_loader(
     shuffle: bool = True,
     num_workers: int = 0,
     drop_last: bool = False,
+    generator: Optional[torch.Generator] = None,
 ) -> DataLoader:
     """Build a DataLoader with safe defaults for small split sizes.
 
@@ -77,6 +108,7 @@ def make_loader(
             weights=weights,
             num_samples=int(num_samples) if num_samples is not None else int(len(weights)),
             replacement=True,
+            generator=generator,
         )
         effective_shuffle = False
     elif bool(shuffle) and bool(getattr(ds, "sampler_replacement", False)):
@@ -86,6 +118,7 @@ def make_loader(
                 ds,
                 replacement=True,
                 num_samples=int(num_samples),
+                generator=generator,
             )
             effective_shuffle = False
     return DataLoader(
@@ -95,6 +128,7 @@ def make_loader(
         sampler=sampler,
         num_workers=num_workers,
         drop_last=drop_last,
+        generator=generator,
     )
 
 
@@ -351,6 +385,19 @@ def evaluate_average_loss(
     }
 
 
+_MAX_TORCH_GENERATOR_SEED = 2**63 - 1
+
+
+def _loader_epoch_seed(base_seed: int, epoch: int) -> int:
+    return int((int(base_seed) + (int(epoch) + 1) * 0x9E3779B97F4A7C15) % _MAX_TORCH_GENERATOR_SEED)
+
+
+def _tensor_mapping_to_cpu(mapping: Optional[Mapping[str, torch.Tensor]]) -> Optional[Dict[str, torch.Tensor]]:
+    if mapping is None:
+        return None
+    return {str(key): value.detach().cpu().clone() for key, value in mapping.items()}
+
+
 def train_loop(
     ds: WindowedParamSequenceDataset,
     cfg: OTFlowConfig,
@@ -362,6 +409,28 @@ def train_loop(
     loss_mode: Optional[str] = None,
     shuffle: bool = True,
     on_step: Optional[Callable[[int, torch.nn.Module, float, Dict[str, float]], None]] = None,
+    initial_model_state: Optional[Mapping[str, torch.Tensor]] = None,
+    optimizer_state: Optional[Mapping[str, Any]] = None,
+    scheduler_state: Optional[Mapping[str, Any]] = None,
+    scaler_state: Optional[Mapping[str, Any]] = None,
+    ema_state: Optional[Mapping[str, torch.Tensor]] = None,
+    swa_model_state: Optional[Mapping[str, Any]] = None,
+    rng_state: Optional[Mapping[str, Any]] = None,
+    loader_state: Optional[Mapping[str, Any]] = None,
+    start_step: int = 0,
+    on_training_state: Optional[
+        Callable[
+            [
+                int,
+                torch.nn.Module,
+                torch.optim.Optimizer,
+                Optional[Any],
+                torch.cuda.amp.GradScaler,
+                Dict[str, Any],
+            ],
+            None,
+        ]
+    ] = None,
 ) -> torch.nn.Module:
     """Train a model on next-step prediction in normalized param space.
 
@@ -369,49 +438,94 @@ def train_loop(
     - EMA model averaging (cfg.ema_decay > 0)
     - LR warmup + cosine decay (cfg.lr_schedule, cfg.lr_warmup_steps)
     """
-    device = cfg.device
-    loader = make_loader(ds, cfg.batch_size, shuffle=shuffle, drop_last=False)
-    if len(loader) == 0:
-        raise ValueError(
-            "Training loader is empty. Check dataset construction, history_len, "
-            "split boundaries, and batch_size."
-        )
+    total_steps = int(steps)
+    if total_steps <= 0:
+        raise ValueError(f"steps must be positive, got {steps!r}.")
+    start_step = int(start_step)
+    if start_step < 0 or start_step > total_steps:
+        raise ValueError(f"start_step must be in [0, {total_steps}], got {start_step}.")
 
+    device = cfg.device
     model_name = _normalize_model_name(model_name)
     _validate_model_dataset_support(model_name, cfg)
     if model is None:
         model = _build_model(model_name, cfg, device)
     else:
         model = model.to(device)
+    if initial_model_state is not None:
+        model.load_state_dict(dict(initial_model_state))
 
     opt = optimizer or torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    if optimizer_state is not None:
+        opt.load_state_dict(dict(optimizer_state))
     accum_steps = max(1, int(getattr(cfg.train, "grad_accum_steps", 1)))
     use_amp = _amp_enabled(cfg, device)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    if scaler_state is not None:
+        scaler.load_state_dict(dict(scaler_state))
 
     # LR scheduler
-    scheduler = _build_scheduler(opt, cfg, steps)
+    scheduler = _build_scheduler(opt, cfg, total_steps)
+    if scheduler is not None and scheduler_state is not None:
+        scheduler.load_state_dict(dict(scheduler_state))
 
     # EMA
     ema_decay = float(getattr(cfg, "ema_decay", 0.0))
     ema = EMAModel(model, decay=ema_decay) if ema_decay > 0 else None
+    if ema is not None and ema_state is not None:
+        ema.shadow = {str(key): value.detach().clone().to(device) for key, value in ema_state.items()}
 
     # SWA
     use_swa = getattr(cfg, "use_swa", False)
     swa_model = AveragedModel(model) if use_swa else None
-    swa_start = int(0.75 * steps)
+    if swa_model is not None and swa_model_state is not None:
+        swa_model.load_state_dict(dict(swa_model_state))
+    swa_start = int(0.75 * total_steps)
+
+    restore_rng_state(rng_state)
+
+    raw_loader_state = dict(loader_state or {})
+    loader_seed = int(raw_loader_state.get("seed", torch.initial_seed()))
+    loader_epoch = int(raw_loader_state.get("epoch", 0) or 0)
+    loader_batch_index = int(raw_loader_state.get("batch_index", 0) or 0)
+
+    def _make_epoch_loader(epoch: int) -> DataLoader:
+        generator = torch.Generator()
+        generator.manual_seed(_loader_epoch_seed(loader_seed, int(epoch)))
+        loader = make_loader(ds, cfg.batch_size, shuffle=shuffle, drop_last=False, generator=generator)
+        if len(loader) == 0:
+            raise ValueError(
+                "Training loader is empty. Check dataset construction, history_len, "
+                "split boundaries, and batch_size."
+            )
+        return loader
+
+    loader = _make_epoch_loader(loader_epoch)
+    loader_len = len(loader)
+    if loader_batch_index >= loader_len:
+        loader_epoch += int(loader_batch_index // loader_len)
+        loader_batch_index = int(loader_batch_index % loader_len)
+        loader = _make_epoch_loader(loader_epoch)
+        loader_len = len(loader)
+    it = iter(loader)
+    for _ in range(loader_batch_index):
+        next(it)
 
     model.train()
-    it = iter(loader)
     opt.zero_grad(set_to_none=True)
-    opt_step = 0
+    opt_step = start_step
     micro_step = 0
-    while opt_step < int(steps):
+    while opt_step < total_steps:
         try:
             batch = next(it)
         except StopIteration:
+            loader_epoch += 1
+            loader_batch_index = 0
+            loader = _make_epoch_loader(loader_epoch)
+            loader_len = len(loader)
             it = iter(loader)
             batch = next(it)
+        loader_batch_index += 1
 
         hist, tgt, fut, cond, meta = _parse_batch(batch)
         hist = hist.to(device).float()
@@ -463,14 +577,27 @@ def train_loop(
         if opt_step % log_every == 0:
             lr_now = opt.param_groups[0]["lr"]
             print(
-                f"[{model_name}] step {opt_step}/{steps}  "
+                f"[{model_name}] step {opt_step}/{total_steps}  "
                 f"loss={latest_train_loss:.4f}  "
                 f"lr={lr_now:.2e}  details={logs}"
             )
 
+        if on_training_state is not None:
+            training_state = {
+                "loader_state": {
+                    "seed": int(loader_seed),
+                    "epoch": int(loader_epoch),
+                    "batch_index": int(loader_batch_index),
+                    "loader_batches_per_epoch": int(loader_len),
+                },
+                "ema_state": _tensor_mapping_to_cpu(ema.shadow) if ema is not None else None,
+                "swa_model_state": swa_model.state_dict() if swa_model is not None else None,
+            }
+            on_training_state(int(opt_step), model, opt, scheduler, scaler, training_state)
+
     # Apply SWA weights if used
     if swa_model is not None:
-        print(f"[{model_name}] Applying SWA weights tracked over the last {steps - swa_start + 1} steps")
+        print(f"[{model_name}] Applying SWA weights tracked over the last {total_steps - swa_start + 1} steps")
         model.load_state_dict(swa_model.module.state_dict())
     # Apply EMA weights for evaluation (overrides SWA if both are enabled, but usually one is chosen)
     elif ema is not None:
@@ -2243,13 +2370,19 @@ def save_json(obj: Dict[str, Any], path: str):
         if isinstance(x, np.ndarray):
             return x.tolist()
         return x
-    with open(path, "w", encoding="utf-8") as f:
+    path_obj = Path(path)
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path_obj.with_name(f".{path_obj.name}.{time.time_ns()}.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, default=_conv)
-    print(f"Saved JSON -> {path}")
+    tmp_path.replace(path_obj)
+    print(f"Saved JSON -> {path_obj}")
 
 
 __all__ = [
     "seed_all",
+    "capture_rng_state",
+    "restore_rng_state",
     "resolve_context_length",
     "crop_history_window",
     "sample_training_context_length",
