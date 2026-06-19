@@ -35,6 +35,11 @@ from genode.data.otflow_paths import (
     project_root,
     resolve_project_path,
 )
+from genode.backbone_packages import (
+    apply_backbone_package_to_args,
+    backbone_package_protocol_payload,
+    validate_provided_backbone_manifest,
+)
 from genode.gipo.objectives import objective_specs_for_family
 from genode.gipo.policy import (
     DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
@@ -164,6 +169,19 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("--synthetic_length must be positive.")
     requested_stages = set(_parse_csv(str(args.stages)))
     includes_backbone_training = not requested_stages or "backbone_training" in requested_stages
+    if bool(getattr(args, "use_provided_backbones", False)) or str(getattr(args, "backbone_package_root", "") or "").strip():
+        if includes_backbone_training:
+            raise ValueError("Provided-backbone mode cannot include backbone_training; run downstream stages only.")
+        manifest_path = resolve_project_path(str(args.backbone_manifest))
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Provided-backbone mode requires an existing backbone manifest: {manifest_path}")
+        provided_validation = validate_provided_backbone_manifest(
+            manifest_path,
+            scenario_key=str(args.scenario_key or args.dataset),
+            benchmark_family=family,
+        )
+        if provided_validation["status"] != "complete":
+            raise ValueError("Invalid provided backbone manifest:\n- " + "\n- ".join(provided_validation["errors"]))
     if includes_backbone_training and family in {SCENARIO_FAMILY_FORECAST, SCENARIO_FAMILY_CONDITIONAL_GENERATION}:
         requested_manifest = resolve_project_path(str(args.backbone_manifest))
         default_manifest = default_backbone_manifest_path().resolve()
@@ -214,6 +232,7 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "long_term_st_path": _display_path(str(args.long_term_st_path)),
         "molecule_group_root": _display_path(str(getattr(args, "molecule_group_root", "") or default_molecule_group_root())),
         "molecule_backbone_root": _display_path(str(getattr(args, "molecule_backbone_root", "") or (project_outputs_root() / "molecule_3d_backbones"))),
+        "backbone_package": backbone_package_protocol_payload(args),
     }
 
 
@@ -625,6 +644,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
 
 
 def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
+    args = apply_backbone_package_to_args(args)
     run_root = resolve_project_path(str(args.run_root)) if str(args.run_root).strip() else project_outputs_root() / "full_pipeline" / str(args.scenario_key or args.dataset)
     run_root.mkdir(parents=True, exist_ok=True)
     preflight = _validate_inputs_preflight(args)
@@ -741,6 +761,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--long_term_st_path", default=str(default_long_term_st_data_path()))
     parser.add_argument("--molecule_group_root", default=str(default_molecule_group_root()))
     parser.add_argument("--molecule_backbone_root", default=str(project_outputs_root() / "molecule_3d_backbones"))
+    parser.add_argument("--backbone_package_root", default="", help="Portable backbone package root to use for downstream-only GIPO stages.")
+    parser.add_argument("--use_provided_backbones", action="store_true", default=False, help="Require existing packaged/provided backbones and refuse backbone_training stages.")
     parser.add_argument("--dry_run", action="store_true", default=False)
     parser.add_argument("--resume", action="store_true", default=False)
     parser.add_argument("--overwrite", action="store_true", default=False)

@@ -1143,9 +1143,31 @@ def materialize_backbone_manifest(
     return payload
 
 
+def _resolve_manifest_relative_path(manifest_path: Path, value: Any, *, path_base: str) -> Any:
+    if not isinstance(value, str) or not value.strip():
+        return value
+    raw = Path(value)
+    if raw.is_absolute():
+        return str(raw)
+    base = (manifest_path.parent / str(path_base)).resolve()
+    return str((base / value).resolve())
+
+
 def load_backbone_manifest(path: str | Path) -> Dict[str, Any]:
     resolved = Path(path).resolve()
-    return json.loads(resolved.read_text(encoding="utf-8"))
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    path_base = str(payload.get("path_base", "") or "").strip()
+    if path_base:
+        for artifact in payload.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            for field in ("checkpoint_path", "summary_path", "metadata_path"):
+                if field in artifact:
+                    artifact[field] = _resolve_manifest_relative_path(resolved, artifact[field], path_base=path_base)
+        for field in ("matrix_root", "otflow_reuse_root", "imported_backbone_root", "molecule_group_root", "molecule_backbone_root"):
+            if field in payload:
+                payload[field] = _resolve_manifest_relative_path(resolved, payload[field], path_base=path_base)
+    return payload
 
 
 def find_backbone_artifact(

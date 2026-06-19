@@ -32,6 +32,8 @@ genode-build-ser-ptg-reference = "genode.gipo.ser_ptg_reference:main"
 genode-evaluate-schedule-summary = "genode.gipo.evaluate_schedule_summary:main"
 genode-build-hardness-figure = "genode.visualization.build_hardness_mismatch_figure:main"
 genode-build-ptg-figure = "genode.visualization.build_ptg_observed_gain_figure:main"
+genode-package-backbone-family = "genode.backbone_packages:package_main"
+genode-validate-backbone-package = "genode.backbone_packages:validate_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

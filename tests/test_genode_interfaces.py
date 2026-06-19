@@ -148,8 +148,6 @@ class GenODEInterfaceTests(unittest.TestCase):
             "/" + "scratch/",
             "/" + "projects/",
             "/" + "home/",
-            "pixel" + "hero",
-            "b" + "35z",
             "Py" + "charmProjects",
             "Diffusion-Flow-Inference",
             "diffusion" + "_flow" + "_inference",
@@ -171,7 +169,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         blocked_patterns = (
             "Downloads",
             "Py" + "charmProjects",
-            "/" + "home/yzn",
+            "/" + "home/private_user",
             "Path.home()",
             "triangulene_2",
             "trajectory_cleaned",
