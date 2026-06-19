@@ -80,7 +80,7 @@ class LongTermSTTests(unittest.TestCase):
                 LongTermSTSeriesSpec("s1::ch0::ML2", "s1", "s1", 0, "ML2", "series/s1.npy", "train", 30, 75),
                 LongTermSTSeriesSpec("s2::ch0::ML2", "s2", "s2", 0, "ML2", "series/s2.npy", "train", 30, 75),
             ]
-            ds = LazyLongTermSTConditionalDataset(
+            with LazyLongTermSTConditionalDataset(
                 dataset_root=root,
                 split_name="train",
                 history_len=4,
@@ -89,16 +89,15 @@ class LongTermSTTests(unittest.TestCase):
                 mean=10.0,
                 std=2.0,
                 stride=3,
-            )
-
-            hist, tgt, fut, meta = ds[0]
-            self.assertEqual(tuple(hist.shape), (4, 1))
-            self.assertEqual(tuple(tgt.shape), (1,))
-            self.assertEqual(tuple(fut.shape), (2, 1))
-            self.assertIsNone(ds.cond)
-            self.assertEqual(meta["dataset_kind"], LONG_TERM_ST_DATASET_KEY)
-            np.testing.assert_array_equal(ds.segment_end_for_t(np.asarray([4, 31])), np.asarray([30, 60]))
-            self.assertEqual(ds.params[4:7].shape, (3, 1))
+            ) as ds:
+                hist, tgt, fut, meta = ds[0]
+                self.assertEqual(tuple(hist.shape), (4, 1))
+                self.assertEqual(tuple(tgt.shape), (1,))
+                self.assertEqual(tuple(fut.shape), (2, 1))
+                self.assertIsNone(ds.cond)
+                self.assertEqual(meta["dataset_kind"], LONG_TERM_ST_DATASET_KEY)
+                np.testing.assert_array_equal(ds.segment_end_for_t(np.asarray([4, 31])), np.asarray([30, 60]))
+                self.assertEqual(ds.params[4:7].shape, (3, 1))
 
     def test_manifest_validation_rejects_group_leakage_and_unsafe_series_paths(self) -> None:
         base_rows = [

@@ -683,6 +683,19 @@ class LazyLongTermSTConditionalDataset(torch.utils.data.Dataset):
             self._arrays[idx] = np.load(str(path), mmap_mode="r")
         return self._arrays[idx]
 
+    def close(self) -> None:
+        for array in self._arrays.values():
+            mmap = getattr(array, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
+        self._arrays.clear()
+
+    def __enter__(self) -> "LazyLongTermSTConditionalDataset":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
     def _series_index_for_global_t(self, t: Union[int, np.ndarray]) -> np.ndarray:
         arr = np.asarray(t, dtype=np.int64)
         return np.searchsorted(self.segment_ends, arr, side="right").astype(np.int64)

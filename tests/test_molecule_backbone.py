@@ -203,8 +203,8 @@ class MoleculeBackboneTests(unittest.TestCase):
             )
 
             npz_path = molecule_xyz.molecule_processed_npz_path(processed)
-            payload = np.load(npz_path, allow_pickle=False)
-            arrays = {key: payload[key] for key in payload.files}
+            with np.load(npz_path, allow_pickle=False) as payload:
+                arrays = {key: payload[key] for key in payload.files}
             arrays["discontinuity_step_mask"] = arrays["discontinuity_step_mask"].copy()
             train_trajectory = json.loads(molecule_xyz.molecule_processed_metadata_path(processed).read_text())["split_trajectory_ids"]["train"][0]
             train_start = int(np.where(arrays["trajectory_ids"] == int(train_trajectory))[0][0])

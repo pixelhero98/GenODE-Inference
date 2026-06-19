@@ -923,30 +923,37 @@ def load_molecule_processed(
             f"Processed molecule dataset at {npz_path} is for "
             f"{metadata.get('dataset_key')}/{metadata.get('stratum')}, not {dataset_key}/{stratum}."
         )
-    payload = np.load(npz_path, allow_pickle=False)
-    coords = payload["coords"].astype(np.float32)
+    with np.load(npz_path, allow_pickle=False) as payload:
+        coords = payload["coords"].astype(np.float32)
+        trajectory_ids = payload["trajectory_ids"].astype(np.int64)
+        trajectory_keys = tuple(str(value) for value in payload["trajectory_keys"].tolist()) if "trajectory_keys" in payload.files else tuple()
+        atom_symbols = tuple(str(value) for value in payload["atom_symbols"].tolist())
+        iso_ids = payload["iso_ids"].astype(np.int64)
+        segment_ends = payload["segment_ends"].astype(np.int64)
+        duplicate_step_mask = payload["duplicate_step_mask"].astype(bool)
+        transition_step_mask = payload["transition_step_mask"].astype(bool)
+        discontinuity_step_mask = payload["discontinuity_step_mask"].astype(bool)
+        frame_rmsd = payload["frame_rmsd"].astype(np.float32)
     if coords.ndim != 3 or coords.shape[2] != MOLECULE_TOKEN_DIM:
         raise ValueError(f"Expected coords shape [frames, atoms, 3], got {coords.shape}.")
     if not np.isfinite(coords).all():
         raise ValueError("Processed molecule coordinates contain non-finite values.")
-    trajectory_ids = payload["trajectory_ids"].astype(np.int64)
     frame_counts = {
         int(trajectory_id): int(np.sum(trajectory_ids == int(trajectory_id)))
         for trajectory_id in sorted(set(int(value) for value in trajectory_ids.tolist()))
     }
-    trajectory_keys = tuple(str(value) for value in payload["trajectory_keys"].tolist()) if "trajectory_keys" in payload.files else tuple()
     return MoleculeProcessedData(
         coords=coords,
-        atom_symbols=tuple(str(value) for value in payload["atom_symbols"].tolist()),
-        iso_ids=payload["iso_ids"].astype(np.int64),
+        atom_symbols=atom_symbols,
+        iso_ids=iso_ids,
         trajectory_ids=trajectory_ids,
         trajectory_keys=trajectory_keys,
-        segment_ends=payload["segment_ends"].astype(np.int64),
+        segment_ends=segment_ends,
         frame_counts=frame_counts,
-        duplicate_step_mask=payload["duplicate_step_mask"].astype(bool),
-        transition_step_mask=payload["transition_step_mask"].astype(bool),
-        discontinuity_step_mask=payload["discontinuity_step_mask"].astype(bool),
-        frame_rmsd=payload["frame_rmsd"].astype(np.float32),
+        duplicate_step_mask=duplicate_step_mask,
+        transition_step_mask=transition_step_mask,
+        discontinuity_step_mask=discontinuity_step_mask,
+        frame_rmsd=frame_rmsd,
         metadata=metadata,
     )
 

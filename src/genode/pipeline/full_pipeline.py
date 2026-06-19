@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 from genode.canonical_experiment_layout import (
     CANONICAL_CHECKPOINT_STEPS,
     CANONICAL_CONTEXT_SAMPLE_COUNT,
+    CANONICAL_PSEUDO_TARGET_WEIGHT,
     CANONICAL_SEEN_NFES,
     CANONICAL_SOLVER_KEYS,
     CANONICAL_SUPERVISION_SCHEDULE_KEYS,
@@ -41,6 +42,12 @@ from genode.backbone_packages import (
     validate_provided_backbone_manifest,
 )
 from genode.gipo.objectives import objective_specs_for_family
+from genode.gipo.ablation_plan import (
+    DEFAULT_GIPO_ABLATION_PRESET,
+    GipoAblationArm,
+    gipo_ablation_arms,
+    gipo_ablation_preset_choices,
+)
 from genode.gipo.policy import (
     DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
     DEFAULT_STUDENT_TARGET_ELITE_FRACTION,
@@ -64,6 +71,17 @@ DEFAULT_STAGES = (
     "gipo_student_seen_plus_unseen_pseudo",
     "locked_test_reports",
 )
+GIPO_ABLATION_STUDENT_STAGE = "gipo_ablation_students"
+GIPO_ABLATION_LOCKED_TEST_STAGE = "gipo_ablation_locked_test_reports"
+DEFAULT_ABLATION_FIRST_STAGES = (
+    "data_prep",
+    "ser_summaries",
+    "schedule_rows_seen",
+    "schedule_rows_unseen",
+    GIPO_ABLATION_STUDENT_STAGE,
+    GIPO_ABLATION_LOCKED_TEST_STAGE,
+)
+PIPELINE_STAGE_ORDER = (*DEFAULT_STAGES, GIPO_ABLATION_STUDENT_STAGE, GIPO_ABLATION_LOCKED_TEST_STAGE)
 
 
 @dataclass(frozen=True)
@@ -80,6 +98,19 @@ def _parse_csv(text: str) -> List[str]:
 def _parse_int_csv(text: str, default: Sequence[int]) -> List[int]:
     raw = _parse_csv(text)
     return [int(part) for part in raw] if raw else [int(value) for value in default]
+
+
+def _effective_stage_names(args: argparse.Namespace) -> List[str]:
+    requested = _parse_csv(str(args.stages))
+    if requested:
+        requested_set = set(requested)
+        unknown = sorted(requested_set - set(PIPELINE_STAGE_ORDER))
+        if unknown:
+            raise ValueError(f"Unknown pipeline stages: {', '.join(unknown)}")
+        return [stage for stage in PIPELINE_STAGE_ORDER if stage in requested_set]
+    if bool(getattr(args, "ablation_first", False)):
+        return list(DEFAULT_ABLATION_FIRST_STAGES)
+    return list(DEFAULT_STAGES)
 
 
 def _json_hash(payload: Mapping[str, Any]) -> str:
@@ -128,6 +159,19 @@ def _display_stage(entry: StageCommand) -> Dict[str, Any]:
     }
 
 
+def _git_head_commit() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root()), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    return result.stdout.strip()
+
+
 def _teacher_target_args_for_family(dataset: str) -> List[str]:
     specs = objective_specs_for_family(scenario_family_for_key(str(dataset)))
     target_keys = [str(spec.utility_key) for spec in specs]
@@ -140,24 +184,25 @@ def _teacher_target_args_for_family(dataset: str) -> List[str]:
     ]
 
 
-def _student_objective_args(args: argparse.Namespace) -> List[Any]:
+def _student_objective_args(args: argparse.Namespace, override: GipoAblationArm | None = None) -> List[Any]:
+    source: Any = override if override is not None else args
     values: List[Any] = [
         "--student_teacher_score_weight",
-        float(args.student_teacher_score_weight),
+        float(source.student_teacher_score_weight),
         "--student_teacher_score_warmup_fraction",
-        float(args.student_teacher_score_warmup_fraction),
+        float(source.student_teacher_score_warmup_fraction),
         "--student_target_mixture_mode",
-        str(args.student_target_mixture_mode),
+        str(source.student_target_mixture_mode),
         "--student_target_elite_fraction",
-        float(args.student_target_elite_fraction),
+        float(source.student_target_elite_fraction),
         "--student_target_elite_k",
-        int(args.student_target_elite_k),
+        int(source.student_target_elite_k),
         "--student_target_elite_min_count",
-        int(args.student_target_elite_min_count),
+        int(source.student_target_elite_min_count),
         "--student_target_elite_blend_all_weight",
-        float(args.student_target_elite_blend_all_weight),
+        float(source.student_target_elite_blend_all_weight),
     ]
-    if bool(args.student_teacher_score_include_pseudo):
+    if bool(source.student_teacher_score_include_pseudo):
         values.append("--student_teacher_score_include_pseudo")
     return values
 
@@ -167,8 +212,8 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
     family = scenario_family_for_key(dataset)
     if int(args.synthetic_length) <= 0:
         raise ValueError("--synthetic_length must be positive.")
-    requested_stages = set(_parse_csv(str(args.stages)))
-    includes_backbone_training = not requested_stages or "backbone_training" in requested_stages
+    effective_stages = set(_effective_stage_names(args))
+    includes_backbone_training = "backbone_training" in effective_stages
     if bool(getattr(args, "use_provided_backbones", False)) or str(getattr(args, "backbone_package_root", "") or "").strip():
         if includes_backbone_training:
             raise ValueError("Provided-backbone mode cannot include backbone_training; run downstream stages only.")
@@ -182,6 +227,15 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         )
         if provided_validation["status"] != "complete":
             raise ValueError("Invalid provided backbone manifest:\n- " + "\n- ".join(provided_validation["errors"]))
+    elif bool(getattr(args, "ablation_first", False)) and not includes_backbone_training and not bool(getattr(args, "dry_run", False)):
+        manifest_path = resolve_project_path(str(args.backbone_manifest))
+        provided_validation = validate_provided_backbone_manifest(
+            manifest_path,
+            scenario_key=str(args.scenario_key or args.dataset),
+            benchmark_family=family,
+        )
+        if provided_validation["status"] != "complete":
+            raise ValueError("Ablation-first mode requires ready provided backbones:\n- " + "\n- ".join(provided_validation["errors"]))
     if includes_backbone_training and family in {SCENARIO_FAMILY_FORECAST, SCENARIO_FAMILY_CONDITIONAL_GENERATION}:
         requested_manifest = resolve_project_path(str(args.backbone_manifest))
         default_manifest = default_backbone_manifest_path().resolve()
@@ -202,10 +256,17 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
 def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
     dataset = str(args.scenario_key or args.dataset)
     plan = experiment_plan_by_key().get(dataset)
+    effective_stages = _effective_stage_names(args)
+    includes_ablations = any(stage in {GIPO_ABLATION_STUDENT_STAGE, GIPO_ABLATION_LOCKED_TEST_STAGE} for stage in effective_stages)
+    ablation_preset = str(getattr(args, "gipo_ablation_preset", DEFAULT_GIPO_ABLATION_PRESET))
     return {
         "version": PIPELINE_VERSION,
         "scenario_key": dataset,
         "benchmark_family": "" if plan is None else str(plan.benchmark_family),
+        "stages": effective_stages,
+        "ablation_first": bool(getattr(args, "ablation_first", False)),
+        "gipo_ablation_preset": ablation_preset if includes_ablations else "",
+        "gipo_ablation_arms": [arm.manifest_record() for arm in gipo_ablation_arms(ablation_preset)] if includes_ablations else [],
         "backbone_steps": int(args.backbone_steps),
         "checkpoint_steps": _parse_int_csv(str(args.checkpoint_steps), CANONICAL_CHECKPOINT_STEPS),
         "seen_nfes": _parse_int_csv(str(args.seen_nfes), CANONICAL_SEEN_NFES),
@@ -234,6 +295,81 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "molecule_backbone_root": _display_path(str(getattr(args, "molecule_backbone_root", "") or (project_outputs_root() / "molecule_3d_backbones"))),
         "backbone_package": backbone_package_protocol_payload(args),
     }
+
+
+def _has_ablation_stage(commands: Sequence[StageCommand]) -> bool:
+    ablation_stages = {GIPO_ABLATION_STUDENT_STAGE, GIPO_ABLATION_LOCKED_TEST_STAGE}
+    return any(entry.stage in ablation_stages for entry in commands)
+
+
+def _ablation_root(run_root: Path, preset: str) -> Path:
+    if run_root.name == str(preset) and run_root.parent.name == "gipo_ablations":
+        return run_root
+    return run_root / "gipo_ablations" / str(preset)
+
+
+def _run_relative_path(run_root: Path, path: Path) -> str:
+    rel = path.relative_to(run_root).as_posix()
+    return "." if rel == "." else rel
+
+
+def _resolve_run_root(args: argparse.Namespace) -> Path:
+    explicit = str(args.run_root).strip()
+    if explicit:
+        return resolve_project_path(explicit)
+    scenario_root = project_outputs_root() / "full_pipeline" / str(args.scenario_key or args.dataset)
+    if bool(getattr(args, "ablation_first", False)):
+        preset = str(getattr(args, "gipo_ablation_preset", DEFAULT_GIPO_ABLATION_PRESET))
+        return scenario_root / "gipo_ablations" / preset
+    return scenario_root
+
+
+def _build_ablation_manifest(
+    args: argparse.Namespace,
+    run_root: Path,
+    *,
+    protocol_hash: str,
+    status: str,
+    extra: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    dataset = str(args.scenario_key or args.dataset)
+    family = scenario_family_for_key(dataset)
+    preset = str(getattr(args, "gipo_ablation_preset", DEFAULT_GIPO_ABLATION_PRESET))
+    root = _ablation_root(run_root, preset)
+    arms = []
+    for arm in gipo_ablation_arms(preset):
+        train_root = root / arm.arm_id / "gipo" / arm.student_training_mode
+        report_root = root / arm.arm_id / "locked_test_reports" / arm.student_training_mode
+        arms.append(
+            {
+                **arm.manifest_record(),
+                "outputs": {
+                    "training_summary": _run_relative_path(run_root, train_root / "gipo_training_summary.json"),
+                    "student_checkpoint": _run_relative_path(run_root, train_root / "gipo_student.pt"),
+                    "locked_test_report_root": _run_relative_path(run_root, report_root),
+                },
+            }
+        )
+    manifest = {
+        "artifact": "gipo_ablation_manifest",
+        "schema_version": "genode_gipo_ablation_v1",
+        "status": status,
+        "ablation_set_id": preset,
+        "scenario_key": dataset,
+        "benchmark_family": family,
+        "commit_sha": _git_head_commit(),
+        "protocol_hash": protocol_hash,
+        "ablation_root": _run_relative_path(run_root, root),
+        "checkpoint_steps": _parse_int_csv(str(args.checkpoint_steps), CANONICAL_CHECKPOINT_STEPS),
+        "seen_nfes": _parse_int_csv(str(args.seen_nfes), CANONICAL_SEEN_NFES),
+        "unseen_nfes": _parse_int_csv(str(args.unseen_nfes), CANONICAL_UNSEEN_NFES),
+        "schedule_keys": _parse_csv(str(args.schedule_keys)) or list(CANONICAL_SUPERVISION_SCHEDULE_KEYS),
+        "arms": arms,
+        "arm_count": int(len(arms)),
+    }
+    if extra:
+        manifest.update(dict(extra))
+    return manifest
 
 
 def _status_path(run_root: Path) -> Path:
@@ -394,6 +530,9 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
     rows_root = run_root / "schedule_rows"
     ser_root = run_root / "ser_summaries"
     gipo_root = run_root / "gipo"
+    ablation_preset = str(getattr(args, "gipo_ablation_preset", DEFAULT_GIPO_ABLATION_PRESET))
+    gipo_ablation_root = _ablation_root(run_root, ablation_preset)
+    ablation_arms = gipo_ablation_arms(ablation_preset)
     split_phases = ("train_tuning", "validation_tuning", "locked_test")
     role_nfes = {"seen": seen_nfes, "unseen": unseen_nfes}
 
@@ -410,6 +549,43 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
         if not ser_schedules:
             return ""
         return ",".join(str(_ser_summary_path(role, int(step))) for step in checkpoint_values)
+
+    def _gipo_train_command(mode: str, out_dir: Path, arm: GipoAblationArm | None = None) -> List[str]:
+        command_args: List[Any] = [
+            "--rows_csv",
+            _csv_list("seen", "train_tuning", "context_rows.csv"),
+            "--context_embeddings_npz",
+            _csv_list("seen", "train_tuning", "context_embeddings.npz"),
+            "--schedule_summary_json",
+            _ser_summary_list("seen"),
+            "--support_schedule_keys",
+            support_schedules,
+            *_teacher_target_args_for_family(dataset),
+            *_student_objective_args(args, arm),
+        ]
+        if mode == STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO:
+            pseudo_weight = CANONICAL_PSEUDO_TARGET_WEIGHT if arm is None else float(arm.student_pseudo_target_weight)
+            command_args.extend(
+                [
+                    "--student_pseudo_rows_csv",
+                    _csv_list("unseen", "train_tuning", "context_rows.csv"),
+                    "--student_pseudo_context_embeddings_npz",
+                    _csv_list("unseen", "train_tuning", "context_embeddings.npz"),
+                    "--student_pseudo_schedule_summary_json",
+                    _ser_summary_list("unseen"),
+                    "--student_pseudo_target_weight",
+                    f"{float(pseudo_weight):g}",
+                ]
+            )
+        command_args.extend(
+            [
+                "--context_sample_count",
+                int(args.context_sample_count),
+                "--out_dir",
+                out_dir,
+            ]
+        )
+        return _python_module_command("genode.gipo.train_gipo", command_args)
 
     def _schedule_row_commands(role: str, nfe_values: str) -> List[List[str]]:
         commands: List[List[str]] = []
@@ -457,56 +633,91 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                 )
         return commands
 
-    def _locked_test_report_commands() -> List[List[str]]:
+    def _locked_test_report_commands_for_student(
+        *,
+        student_root: Path,
+        report_root: Path,
+    ) -> List[List[str]]:
         commands: List[List[str]] = []
         family = scenario_family_for_key(dataset)
-        for mode in (STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO):
-            for role, nfe_values in role_nfes.items():
-                for checkpoint_step in checkpoint_values:
-                    report_dir = run_root / "locked_test_reports" / mode / role / f"{int(checkpoint_step)}_steps"
-                    locked_dir = _rows_dir(role, "locked_test", int(checkpoint_step))
-                    commands.append(
-                        _python_module_command(
-                            "genode.gipo.report_locked_test",
-                            [
-                                "--gipo_student_checkpoint",
-                                gipo_root / mode / "gipo_student.pt",
-                                "--training_summary",
-                                gipo_root / mode / "gipo_training_summary.json",
-                                "--context_rows",
-                                locked_dir / "context_rows.csv",
-                                "--context_embeddings_npz",
-                                locked_dir / "context_embeddings.npz",
-                                "--baseline_rows",
-                                locked_dir / "context_rows.csv",
-                                "--comparator_rows",
-                                locked_dir / "context_rows.csv",
-                                "--benchmark_family",
-                                family,
-                                "--dataset",
-                                dataset,
-                                "--split_phase",
-                                "locked_test",
-                                "--solver_names",
-                                ",".join(str(key) for key in CANONICAL_SOLVER_KEYS),
-                                "--target_nfe_values",
-                                nfe_values,
-                                "--otflow_train_steps",
-                                int(checkpoint_step),
-                                "--steps",
-                                int(checkpoint_step),
-                                "--molecule_group_root",
-                                str(args.molecule_group_root),
-                                "--backbone_manifest",
-                                str(args.backbone_manifest),
-                                *_data_path_args(args),
-                                "--out_dir",
-                                report_dir,
-                                "--device",
-                                str(args.device),
-                            ],
-                        )
+        for role, nfe_values in role_nfes.items():
+            for checkpoint_step in checkpoint_values:
+                report_dir = report_root / role / f"{int(checkpoint_step)}_steps"
+                locked_dir = _rows_dir(role, "locked_test", int(checkpoint_step))
+                commands.append(
+                    _python_module_command(
+                        "genode.gipo.report_locked_test",
+                        [
+                            "--gipo_student_checkpoint",
+                            student_root / "gipo_student.pt",
+                            "--training_summary",
+                            student_root / "gipo_training_summary.json",
+                            "--context_rows",
+                            locked_dir / "context_rows.csv",
+                            "--context_embeddings_npz",
+                            locked_dir / "context_embeddings.npz",
+                            "--baseline_rows",
+                            locked_dir / "context_rows.csv",
+                            "--comparator_rows",
+                            locked_dir / "context_rows.csv",
+                            "--benchmark_family",
+                            family,
+                            "--dataset",
+                            dataset,
+                            "--split_phase",
+                            "locked_test",
+                            "--solver_names",
+                            ",".join(str(key) for key in CANONICAL_SOLVER_KEYS),
+                            "--target_nfe_values",
+                            nfe_values,
+                            "--otflow_train_steps",
+                            int(checkpoint_step),
+                            "--steps",
+                            int(checkpoint_step),
+                            "--molecule_group_root",
+                            str(args.molecule_group_root),
+                            "--backbone_manifest",
+                            str(args.backbone_manifest),
+                            *_data_path_args(args),
+                            "--out_dir",
+                            report_dir,
+                            "--device",
+                            str(args.device),
+                        ],
                     )
+                )
+        return commands
+
+    def _locked_test_report_commands() -> List[List[str]]:
+        commands: List[List[str]] = []
+        for mode in (STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO):
+            commands.extend(
+                _locked_test_report_commands_for_student(
+                    student_root=gipo_root / mode,
+                    report_root=run_root / "locked_test_reports" / mode,
+                )
+            )
+        return commands
+
+    def _gipo_ablation_student_commands() -> List[List[str]]:
+        return [
+            _gipo_train_command(
+                arm.student_training_mode,
+                gipo_ablation_root / arm.arm_id / "gipo" / arm.student_training_mode,
+                arm,
+            )
+            for arm in ablation_arms
+        ]
+
+    def _gipo_ablation_locked_test_commands() -> List[List[str]]:
+        commands: List[List[str]] = []
+        for arm in ablation_arms:
+            commands.extend(
+                _locked_test_report_commands_for_student(
+                    student_root=gipo_ablation_root / arm.arm_id / "gipo" / arm.student_training_mode,
+                    report_root=gipo_ablation_root / arm.arm_id / "locked_test_reports" / arm.student_training_mode,
+                )
+            )
         return commands
 
     ser_commands = [
@@ -577,60 +788,12 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
         ),
         StageCommand(
             "gipo_student_seen_only_zero_shot",
-            [
-                _python_module_command(
-                    "genode.gipo.train_gipo",
-                    [
-                        "--rows_csv",
-                        _csv_list("seen", "train_tuning", "context_rows.csv"),
-                        "--context_embeddings_npz",
-                        _csv_list("seen", "train_tuning", "context_embeddings.npz"),
-                        "--schedule_summary_json",
-                        _ser_summary_list("seen"),
-                        "--support_schedule_keys",
-                        support_schedules,
-                        *_teacher_target_args_for_family(dataset),
-                        *_student_objective_args(args),
-                        "--context_sample_count",
-                        int(args.context_sample_count),
-                        "--out_dir",
-                        gipo_root / STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
-                    ],
-                )
-            ],
+            [_gipo_train_command(STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, gipo_root / STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT)],
             "gipo_seen_only_manifest.json",
         ),
         StageCommand(
             "gipo_student_seen_plus_unseen_pseudo",
-            [
-                _python_module_command(
-                    "genode.gipo.train_gipo",
-                    [
-                        "--rows_csv",
-                        _csv_list("seen", "train_tuning", "context_rows.csv"),
-                        "--context_embeddings_npz",
-                        _csv_list("seen", "train_tuning", "context_embeddings.npz"),
-                        "--schedule_summary_json",
-                        _ser_summary_list("seen"),
-                        "--support_schedule_keys",
-                        support_schedules,
-                        *_teacher_target_args_for_family(dataset),
-                        *_student_objective_args(args),
-                        "--student_pseudo_rows_csv",
-                        _csv_list("unseen", "train_tuning", "context_rows.csv"),
-                        "--student_pseudo_context_embeddings_npz",
-                        _csv_list("unseen", "train_tuning", "context_embeddings.npz"),
-                        "--student_pseudo_schedule_summary_json",
-                        _ser_summary_list("unseen"),
-                        "--student_pseudo_target_weight",
-                        "0.25",
-                        "--context_sample_count",
-                        int(args.context_sample_count),
-                        "--out_dir",
-                        gipo_root / STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO,
-                    ],
-                )
-            ],
+            [_gipo_train_command(STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO, gipo_root / STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO)],
             "gipo_seen_plus_pseudo_manifest.json",
         ),
         StageCommand(
@@ -638,20 +801,39 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             _locked_test_report_commands(),
             "locked_test_reports_manifest.json",
         ),
+        StageCommand(
+            GIPO_ABLATION_STUDENT_STAGE,
+            _gipo_ablation_student_commands(),
+            "gipo_ablation_students_manifest.json",
+        ),
+        StageCommand(
+            GIPO_ABLATION_LOCKED_TEST_STAGE,
+            _gipo_ablation_locked_test_commands(),
+            "gipo_ablation_locked_test_reports_manifest.json",
+        ),
     ]
-    stage_filter = set(_parse_csv(str(args.stages)))
-    return [entry for entry in commands if not stage_filter or entry.stage in stage_filter]
+    stage_filter = set(_effective_stage_names(args))
+    return [entry for entry in commands if entry.stage in stage_filter]
 
 
 def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     args = apply_backbone_package_to_args(args)
-    run_root = resolve_project_path(str(args.run_root)) if str(args.run_root).strip() else project_outputs_root() / "full_pipeline" / str(args.scenario_key or args.dataset)
+    run_root = _resolve_run_root(args)
     run_root.mkdir(parents=True, exist_ok=True)
     preflight = _validate_inputs_preflight(args)
     protocol = _protocol_payload(args)
     protocol_hash = _json_hash(protocol)
     _validate_run_root(run_root, protocol_hash, resume=bool(args.resume), overwrite=bool(args.overwrite))
     commands = _build_stage_commands(args, run_root)
+    has_ablation_stage = _has_ablation_stage(commands)
+    if has_ablation_stage:
+        ablation_manifest = _build_ablation_manifest(
+            args,
+            run_root,
+            protocol_hash=protocol_hash,
+            status="dry_run" if bool(args.dry_run) else "running",
+        )
+        _write_json(_ablation_root(run_root, str(args.gipo_ablation_preset)) / "ablation_manifest.json", ablation_manifest)
     _write_json(run_root / "protocol.json", {**protocol, "protocol_hash": protocol_hash})
     _write_json(
         _status_path(run_root),
@@ -692,6 +874,22 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 if int(result.returncode) != 0:
                     manifest["status"] = "failed"
                     _write_json(run_root / entry.manifest_name, manifest)
+                    if has_ablation_stage:
+                        failed_ablation_manifest = _build_ablation_manifest(
+                            args,
+                            run_root,
+                            protocol_hash=protocol_hash,
+                            status="failed",
+                            extra={
+                                "failed_stage": entry.stage,
+                                "failed_command_index": int(command_idx),
+                                "failed_log_path": str(log_path.relative_to(run_root)),
+                            },
+                        )
+                        _write_json(
+                            _ablation_root(run_root, str(args.gipo_ablation_preset)) / "ablation_manifest.json",
+                            failed_ablation_manifest,
+                        )
                     _write_json(
                         _status_path(run_root),
                         {
@@ -727,6 +925,14 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     }
     _write_json(run_root / "pipeline_summary.json", summary)
     _write_json(_status_path(run_root), summary)
+    if has_ablation_stage:
+        final_ablation_manifest = _build_ablation_manifest(
+            args,
+            run_root,
+            protocol_hash=protocol_hash,
+            status="dry_run" if bool(args.dry_run) else "complete",
+        )
+        _write_json(_ablation_root(run_root, str(args.gipo_ablation_preset)) / "ablation_manifest.json", final_ablation_manifest)
     return summary
 
 
@@ -763,6 +969,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--molecule_backbone_root", default=str(project_outputs_root() / "molecule_3d_backbones"))
     parser.add_argument("--backbone_package_root", default="", help="Portable backbone package root to use for downstream-only GIPO stages.")
     parser.add_argument("--use_provided_backbones", action="store_true", default=False, help="Require existing packaged/provided backbones and refuse backbone_training stages.")
+    parser.add_argument("--ablation_first", action="store_true", default=False, help="Run prerequisite artifacts plus GIPO ablations before stock GIPO stages.")
+    parser.add_argument("--gipo_ablation_preset", choices=gipo_ablation_preset_choices(), default=DEFAULT_GIPO_ABLATION_PRESET)
     parser.add_argument("--dry_run", action="store_true", default=False)
     parser.add_argument("--resume", action="store_true", default=False)
     parser.add_argument("--overwrite", action="store_true", default=False)

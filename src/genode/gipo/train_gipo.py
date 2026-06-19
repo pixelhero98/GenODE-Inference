@@ -1440,6 +1440,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "teacher_utility_weights": teacher_utility_weights,
             "teacher_training": teacher_training,
             "student_objective_settings": student_objective_settings,
+            "student_target_summary": student_training.get("student_target_summary", {}),
             "conditioning_style": conditioning_style,
             "teacher_checkpoint_selection_mode": selection_mode,
             "teacher_checkpoint_selection": teacher_training.get("teacher_checkpoint_selection", {}),
@@ -1482,6 +1483,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "teacher_training": teacher_training,
             "student_training": student_training,
             "student_objective_settings": student_objective_settings,
+            "student_target_summary": student_training.get("student_target_summary", {}),
             "teacher_checkpoint_selection_mode": selection_mode,
             "teacher_checkpoint_selection": teacher_training.get("teacher_checkpoint_selection", {}),
             "student_checkpoint_selection_mode": student_selection_mode,
@@ -1539,6 +1541,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
         "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
         "student_objective_settings": student_objective_settings,
+        "student_target_summary": student_training.get("student_target_summary", {}),
         "student_training": student_training,
     }
     (out_dir / "gipo_training_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")

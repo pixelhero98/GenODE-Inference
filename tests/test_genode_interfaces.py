@@ -73,6 +73,8 @@ class GenODEInterfaceTests(unittest.TestCase):
             "genode-evaluate-schedule-summary",
             "genode-build-hardness-figure",
             "genode-build-ptg-figure",
+            "genode-package-backbone-family",
+            "genode-validate-backbone-package",
         }
         self.assertEqual(set(scripts), expected)
         for target in scripts.values():
@@ -135,6 +137,15 @@ class GenODEInterfaceTests(unittest.TestCase):
             "--series_unknown_" + "dropout",
         }
         self.assertFalse(removed_options & options)
+
+    def test_full_pipeline_public_contract_includes_ablation_first(self) -> None:
+        from genode.pipeline.full_pipeline import build_argparser
+
+        parser = build_argparser()
+        options = {option for action in parser._actions for option in action.option_strings}
+
+        self.assertIn("--ablation_first", options)
+        self.assertIn("--gipo_ablation_preset", options)
 
     def test_gipo_policy_public_surface_excludes_teacher_prediction_helper(self) -> None:
         from genode.gipo import policy

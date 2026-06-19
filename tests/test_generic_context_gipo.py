@@ -1,10 +1,12 @@
 import argparse
 import csv
+import json
 import math
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -29,6 +31,10 @@ from genode.gipo.policy import (
     stable_context_id,
 )
 from genode.gipo import report_locked_test
+from genode.gipo.ablation_plan import (
+    GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX,
+    gipo_ablation_arms,
+)
 from genode.pipeline import full_pipeline
 from genode.gipo.train_gipo import (
     _merge_embedding_tables_guarded,
@@ -777,6 +783,151 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertIn(f"--teacher_metric_target_keys {expected}", commands)
         self.assertIn("u_molecule_kabsch_rmsd_3d_uniform=0.4", commands)
         self.assertNotIn("--teacher_metric_target_keys u_comp_uniform", commands)
+
+    def test_gipo_ablation_preset_covers_main_and_appendix_arms(self) -> None:
+        arms = gipo_ablation_arms(GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX)
+        self.assertEqual(len(arms), 16)
+        self.assertEqual(len({arm.arm_id for arm in arms}), 16)
+        self.assertEqual([arm.paper_group for arm in arms[:6]], ["main"] * 6)
+        self.assertNotIn("elite-bend", " ".join(arm.arm_id for arm in arms))
+        full_scores_by_mode = {}
+        blend_weights_by_mode = {}
+        for arm in arms:
+            if arm.student_target_mixture_mode == "full":
+                full_scores_by_mode.setdefault(arm.student_training_mode, set()).add(float(arm.student_teacher_score_weight))
+            if arm.student_target_mixture_mode == "elite_blend":
+                blend_weights_by_mode.setdefault(arm.student_training_mode, set()).add(float(arm.student_target_elite_blend_all_weight))
+        self.assertEqual(set(full_scores_by_mode), {"seen_only_zero_shot", "seen_plus_unseen_pseudo"})
+        for weights in full_scores_by_mode.values():
+            self.assertEqual(weights, {0.0, 0.01, 0.05, 0.10})
+        for weights in blend_weights_by_mode.values():
+            self.assertEqual(weights, {0.10, 0.20, 0.40})
+
+    def test_full_pipeline_ablation_first_default_dry_run_grid_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                    "--ablation_first",
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+            manifest = json.loads(
+                (run_root / "gipo_ablations" / GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX / "ablation_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(
+            [stage["stage"] for stage in summary["stages"]],
+            [
+                "data_prep",
+                "ser_summaries",
+                "schedule_rows_seen",
+                "schedule_rows_unseen",
+                "gipo_ablation_students",
+                "gipo_ablation_locked_test_reports",
+            ],
+        )
+        self.assertFalse(any(stage["stage"] == "backbone_training" for stage in summary["stages"]))
+        self.assertFalse(any(stage["stage"].startswith("gipo_student_") for stage in summary["stages"]))
+        by_stage = {stage["stage"]: stage["commands"] for stage in summary["stages"]}
+        self.assertEqual(len(by_stage["gipo_ablation_students"]), 16)
+        self.assertEqual(len(by_stage["gipo_ablation_locked_test_reports"]), 160)
+        self.assertEqual(manifest["status"], "dry_run")
+        self.assertEqual(manifest["arm_count"], 16)
+        self.assertEqual(manifest["ablation_root"], f"gipo_ablations/{GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX}")
+        self.assertTrue(all(not str(value).startswith(("/", "C:")) for arm in manifest["arms"] for value in arm["outputs"].values()))
+
+    def test_full_pipeline_ablation_first_routes_arm_knobs_and_locked_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(Path(tmpdir) / "run"),
+                    "--ablation_first",
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+        by_stage = {stage["stage"]: [" ".join(command) for command in stage["commands"]] for stage in summary["stages"]}
+        train_commands = by_stage["gipo_ablation_students"]
+        report_commands = by_stage["gipo_ablation_locked_test_reports"]
+        for arm in gipo_ablation_arms(GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX):
+            command = next(item for item in train_commands if arm.arm_id in item)
+            self.assertIn(f"--student_target_mixture_mode {arm.student_target_mixture_mode}", command)
+            self.assertIn(f"--student_teacher_score_weight {float(arm.student_teacher_score_weight)}", command)
+            self.assertIn("--student_teacher_score_warmup_fraction 0.6", command)
+            self.assertNotIn("--student_teacher_score_include_pseudo", command)
+            if arm.student_target_mixture_mode == "elite_blend":
+                self.assertIn(f"--student_target_elite_blend_all_weight {float(arm.student_target_elite_blend_all_weight)}", command)
+            if arm.uses_unseen_pseudo_targets:
+                self.assertIn("--student_pseudo_rows_csv", command)
+                self.assertIn("--student_pseudo_target_weight 0.25", command)
+            else:
+                self.assertNotIn("--student_pseudo_rows_csv", command)
+        self.assertTrue(all("gipo_ablations" in command for command in report_commands))
+        self.assertTrue(all("locked_test" in command for command in report_commands))
+        self.assertTrue(all("--training_summary" in command and "--gipo_student_checkpoint" in command for command in report_commands))
+
+    def test_full_pipeline_default_ablation_first_run_root_is_namespaced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_root = Path(tmpdir) / "outputs"
+            expected_root = outputs_root / "full_pipeline" / "lobster_synthetic" / "gipo_ablations" / GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--ablation_first",
+                    "--dry_run",
+                ]
+            )
+            with mock.patch.object(full_pipeline, "project_outputs_root", return_value=outputs_root):
+                summary = full_pipeline.run_full_pipeline(args)
+            self.assertTrue((expected_root / "protocol.json").exists())
+            self.assertTrue((expected_root / "gipo_ablation_students_manifest.json").exists())
+            self.assertTrue((expected_root / "ablation_manifest.json").exists())
+            self.assertFalse((outputs_root / "full_pipeline" / "lobster_synthetic" / "protocol.json").exists())
+            self.assertIn("gipo_ablations", summary["run_root"])
+
+    def test_full_pipeline_failed_ablation_stage_marks_ablation_manifest_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                    "--ablation_first",
+                ]
+            )
+            failing_stage = full_pipeline.StageCommand(
+                full_pipeline.GIPO_ABLATION_STUDENT_STAGE,
+                [[full_pipeline.sys.executable, "-c", "import sys; sys.exit(3)"]],
+                "gipo_ablation_students_manifest.json",
+            )
+            with (
+                mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
+                mock.patch.object(full_pipeline, "_build_stage_commands", return_value=[failing_stage]),
+            ):
+                with self.assertRaises(RuntimeError):
+                    full_pipeline.run_full_pipeline(args)
+            manifest = json.loads(
+                (run_root / "gipo_ablations" / GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX / "ablation_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["failed_stage"], full_pipeline.GIPO_ABLATION_STUDENT_STAGE)
+        self.assertEqual(manifest["failed_command_index"], 0)
 
 
 if __name__ == "__main__":
