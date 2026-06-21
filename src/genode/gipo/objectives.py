@@ -11,6 +11,7 @@ from genode.canonical_experiment_layout import (
     SCENARIO_FAMILY_CONDITIONAL_GENERATION,
     SCENARIO_FAMILY_FORECAST,
     SCENARIO_FAMILY_MOLECULE,
+    scenario_family_for_key,
 )
 
 MetricRow = Mapping[str, object]
@@ -36,22 +37,32 @@ FORECAST_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec("crps", "u_crps_uniform", METRIC_DIRECTION_LOWER, 0.5, aliases=("forecast_crps",)),
     MetricObjectiveSpec("mase", "u_mase_uniform", METRIC_DIRECTION_LOWER, 0.5, aliases=("forecast_mase",)),
 )
-CONDITIONAL_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
-    MetricObjectiveSpec("temporal_cw1", "u_temporal_cw1_uniform", METRIC_DIRECTION_LOWER, 0.4),
-    MetricObjectiveSpec("temporal_uw1", "u_temporal_uw1_uniform", METRIC_DIRECTION_LOWER, 0.4),
+CONDITIONAL_PRIMARY_LOB_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+    MetricObjectiveSpec("temporal_uw1", "u_temporal_uw1_uniform", METRIC_DIRECTION_LOWER, 1.0 / 3.0),
+    MetricObjectiveSpec("temporal_cw1", "u_temporal_cw1_uniform", METRIC_DIRECTION_LOWER, 1.0 / 3.0),
     MetricObjectiveSpec(
         "temporal_tstr_f1",
         "u_temporal_tstr_f1_uniform",
         METRIC_DIRECTION_HIGHER,
-        0.2,
+        1.0 / 3.0,
         applicable_key="temporal_tstr_f1_applicable",
     ),
-    MetricObjectiveSpec("u_l1", "u_temporal_u_l1_uniform", METRIC_DIRECTION_LOWER, 0.1),
-    MetricObjectiveSpec("c_l1", "u_temporal_c_l1_uniform", METRIC_DIRECTION_LOWER, 0.1),
-    MetricObjectiveSpec("spread_specific_error", "u_temporal_spread_specific_error_uniform", METRIC_DIRECTION_LOWER, 0.1),
-    MetricObjectiveSpec("imbalance_specific_error", "u_temporal_imbalance_specific_error_uniform", METRIC_DIRECTION_LOWER, 0.1),
-    MetricObjectiveSpec("ret_vol_acf_error", "u_temporal_ret_vol_acf_error_uniform", METRIC_DIRECTION_LOWER, 0.1),
-    MetricObjectiveSpec("impact_response_error", "u_temporal_impact_response_error_uniform", METRIC_DIRECTION_LOWER, 0.1),
+)
+CONDITIONAL_PRIMARY_ECG_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+    MetricObjectiveSpec("temporal_uw1", "u_temporal_uw1_uniform", METRIC_DIRECTION_LOWER, 0.5),
+    MetricObjectiveSpec("temporal_cw1", "u_temporal_cw1_uniform", METRIC_DIRECTION_LOWER, 0.5),
+)
+CONDITIONAL_DIAGNOSTIC_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+    MetricObjectiveSpec("u_l1", "u_temporal_u_l1_uniform", METRIC_DIRECTION_LOWER, 0.0),
+    MetricObjectiveSpec("c_l1", "u_temporal_c_l1_uniform", METRIC_DIRECTION_LOWER, 0.0),
+    MetricObjectiveSpec("spread_specific_error", "u_temporal_spread_specific_error_uniform", METRIC_DIRECTION_LOWER, 0.0),
+    MetricObjectiveSpec("imbalance_specific_error", "u_temporal_imbalance_specific_error_uniform", METRIC_DIRECTION_LOWER, 0.0),
+    MetricObjectiveSpec("ret_vol_acf_error", "u_temporal_ret_vol_acf_error_uniform", METRIC_DIRECTION_LOWER, 0.0),
+    MetricObjectiveSpec("impact_response_error", "u_temporal_impact_response_error_uniform", METRIC_DIRECTION_LOWER, 0.0),
+)
+CONDITIONAL_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+    *CONDITIONAL_PRIMARY_LOB_METRIC_SPECS,
+    *CONDITIONAL_DIAGNOSTIC_METRIC_SPECS,
 )
 MOLECULE_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec("molecule_kabsch_rmsd_3d", "u_molecule_kabsch_rmsd_3d_uniform", METRIC_DIRECTION_LOWER, 0.40),
@@ -74,8 +85,51 @@ def objective_specs_for_family(benchmark_family: str) -> Tuple[MetricObjectiveSp
     return OBJECTIVE_SPECS_BY_FAMILY[family]
 
 
+def teacher_objective_specs_for_family(benchmark_family: str) -> Tuple[MetricObjectiveSpec, ...]:
+    family = str(benchmark_family).strip()
+    if family == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
+        return CONDITIONAL_PRIMARY_LOB_METRIC_SPECS
+    return objective_specs_for_family(family)
+
+
+def teacher_objective_specs_for_scenario(scenario_key: str) -> Tuple[MetricObjectiveSpec, ...]:
+    key = str(scenario_key).strip()
+    family = scenario_family_for_key(key)
+    if family == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
+        if key == "long_term_st":
+            return CONDITIONAL_PRIMARY_ECG_METRIC_SPECS
+        if key in {"cryptos", "lobster_synthetic"}:
+            return CONDITIONAL_PRIMARY_LOB_METRIC_SPECS
+        raise ValueError(f"Unsupported conditional-generation scenario for GIPO teacher targets: {scenario_key!r}")
+    return objective_specs_for_family(family)
+
+
 def objective_utility_keys_for_family(benchmark_family: str) -> Tuple[str, ...]:
     return tuple(spec.utility_key for spec in objective_specs_for_family(benchmark_family))
+
+
+def teacher_objective_utility_keys_for_family(benchmark_family: str) -> Tuple[str, ...]:
+    return tuple(spec.utility_key for spec in teacher_objective_specs_for_family(benchmark_family))
+
+
+def teacher_objective_utility_keys_for_scenario(scenario_key: str) -> Tuple[str, ...]:
+    return tuple(spec.utility_key for spec in teacher_objective_specs_for_scenario(scenario_key))
+
+
+def teacher_metric_profile_for_scenario(scenario_key: str) -> Dict[str, object]:
+    specs = teacher_objective_specs_for_scenario(str(scenario_key))
+    diagnostic_specs: Tuple[MetricObjectiveSpec, ...] = ()
+    if scenario_family_for_key(str(scenario_key)) == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
+        diagnostic_specs = CONDITIONAL_DIAGNOSTIC_METRIC_SPECS
+    return {
+        "scenario_key": str(scenario_key),
+        "benchmark_family": scenario_family_for_key(str(scenario_key)),
+        "target_metric_keys": [spec.metric_key for spec in specs],
+        "target_utility_keys": [spec.utility_key for spec in specs],
+        "target_weights": {spec.utility_key: float(spec.weight) for spec in specs},
+        "diagnostic_metric_keys": [spec.metric_key for spec in diagnostic_specs],
+        "diagnostic_utility_keys": [spec.utility_key for spec in diagnostic_specs],
+    }
 
 
 def objective_weight_map_for_keys(target_keys: Sequence[str]) -> Dict[str, float]:

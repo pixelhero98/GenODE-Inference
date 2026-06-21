@@ -241,6 +241,14 @@ def _safe_gain(value: Any, reference: Any) -> Optional[float]:
     return float(1.0 - float(v) / float(r))
 
 
+def _safe_high_gain(value: Any, reference: Any) -> Optional[float]:
+    v = _optional_float(value)
+    r = _optional_float(reference)
+    if v is None or r is None or abs(float(r)) <= 1e-12:
+        return None
+    return float(float(v) / float(r) - 1.0)
+
+
 def _schedule_grid_hash(grid: Sequence[float]) -> str:
     return schedule_grid_hash(grid)
 
@@ -775,6 +783,10 @@ def _finite_metric_high(row: Mapping[str, Any], metric: str) -> float:
     return float("-inf") if value is None else float(value)
 
 
+def _metric_higher_is_better(metric: str) -> bool:
+    return str(metric) in {"u_comp_uniform", "temporal_tstr_f1"}
+
+
 def _candidate_centered_rewards_by_setting(rows: Sequence[Mapping[str, Any]]) -> Dict[Tuple[str, int], Dict[str, float]]:
     by_setting: Dict[Tuple[str, int], List[Mapping[str, Any]]] = {}
     for row in rows:
@@ -979,7 +991,7 @@ def build_comparison_summary(
     family = str(benchmark_family or FORECAST_FAMILY)
     if family != FORECAST_FAMILY:
         if family == "temporal_conditional_generation":
-            metric_keys = ("score_main", "temporal_cw1", "temporal_uw1", "u_comp_uniform")
+            metric_keys = ("temporal_uw1", "temporal_cw1", "temporal_tstr_f1", "u_comp_uniform")
         elif family == "molecule_3d_coordinate_generation":
             metric_keys = (
                 "molecule_kabsch_rmsd_3d",
@@ -1013,7 +1025,7 @@ def build_comparison_summary(
                 }
                 for metric in metric_keys:
                     mean_key = f"{metric}_mean"
-                    if metric == "u_comp_uniform":
+                    if _metric_higher_is_better(metric):
                         ordered = sorted(cell_rows, key=lambda row: (-_finite_metric_high(row, metric), str(row["scheduler_key"])))
                         best_baseline = max(baselines, key=lambda row: _finite_metric_high(row, metric), default=None)
                     else:
@@ -1026,9 +1038,22 @@ def build_comparison_summary(
                     for metric in metric_keys:
                         mean_key = f"{metric}_mean"
                         comparison[f"student_{metric}_mean"] = student_row.get(mean_key)
-                        if metric == "u_comp_uniform":
+                        if _metric_higher_is_better(metric):
                             comparison[f"student_{metric}_delta_vs_uniform"] = None if uniform is None else (
                                 _finite_metric_high(student_row, metric) - _finite_metric_high(uniform, metric)
+                            )
+                            best_baseline = max(baselines, key=lambda row: _finite_metric_high(row, metric), default=None)
+                            comparison[f"student_{metric}_gain_vs_uniform"] = _safe_high_gain(
+                                student_row.get(mean_key),
+                                None if uniform is None else uniform.get(mean_key),
+                            )
+                            comparison[f"student_{metric}_gain_vs_best_baseline"] = _safe_high_gain(
+                                student_row.get(mean_key),
+                                None if best_baseline is None else best_baseline.get(mean_key),
+                            )
+                            comparison[f"student_{metric}_gain_vs_ser_ptg"] = _safe_high_gain(
+                                student_row.get(mean_key),
+                                None if ser_ptg is None else ser_ptg.get(mean_key),
                             )
                         else:
                             best_baseline = min(baselines, key=lambda row: _finite_metric(row, metric), default=None)

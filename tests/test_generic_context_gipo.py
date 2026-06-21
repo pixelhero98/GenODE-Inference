@@ -16,8 +16,11 @@ from genode.gipo import evaluate_schedule_summary
 from genode.gipo.evaluate_schedule_summary import build_comparison_summary
 from genode.gipo.objectives import (
     CONDITIONAL_METRIC_SPECS,
+    CONDITIONAL_PRIMARY_ECG_METRIC_SPECS,
+    CONDITIONAL_PRIMARY_LOB_METRIC_SPECS,
     FORECAST_METRIC_SPECS,
     MOLECULE_METRIC_SPECS,
+    teacher_metric_profile_for_scenario,
     uniform_anchored_objective_columns,
 )
 from genode.gipo.policy import (
@@ -67,6 +70,12 @@ class GenericContextGipoTests(unittest.TestCase):
             "reward_granularity",
             "effective_train_steps",
             "checkpoint_export_protocol",
+            "u_l1",
+            "c_l1",
+            "spread_specific_error",
+            "imbalance_specific_error",
+            "ret_vol_acf_error",
+            "impact_response_error",
         ):
             self.assertIn(field, fields)
 
@@ -303,32 +312,52 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(rows[0]["gipo_reward_protocol"], GIPO_PROTOCOL)
         self.assertEqual(rows[0]["reward_anchor_schedule_key"], "uniform")
         self.assertEqual(rows[0]["reward_utility_transform"], "directional_log_uniform_anchor")
+        reward_weights = json.loads(str(rows[0]["reward_metric_weights_json"]))
+        self.assertEqual(
+            set(reward_weights),
+            {"u_temporal_uw1_uniform", "u_temporal_cw1_uniform", "u_temporal_tstr_f1_uniform"},
+        )
         self.assertEqual({row["axis_window"] for row in rows}, {"512", "768"})
 
-    def test_conditional_context_rows_do_not_promote_score_gain_to_composite(self) -> None:
-        with self.assertRaises(ValueError):
-            runner._conditional_context_records(
-                benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-                dataset="lobster_synthetic",
-                split_phase="train_tuning",
-                seed=7,
-                evaluation_seed=17,
-                solver_key="euler",
-                target_nfe=4,
-                runtime_nfe=4,
-                scheduler_key="late_power_3",
-                details={"time_grid": [0.0, 0.5, 1.0]},
-                checkpoint={"checkpoint_id": "lobster_synthetic_4000_steps"},
-                checkpoint_step=4000,
-                nfe_role="seen",
-                parent_row_signature="parent",
-                protocol_hash="proto",
-                cfg=SimpleNamespace(history_len=256),
-                eval_horizon=200,
-                chosen_t0s=[512],
-                score_main=0.75,
-                uniform_score_main=1.0,
-            )
+    def test_conditional_context_rows_use_aggregate_primary_metrics_not_score_gain(self) -> None:
+        rows = runner._conditional_context_records(
+            benchmark_family=CONDITIONAL_GENERATION_FAMILY,
+            dataset="lobster_synthetic",
+            split_phase="train_tuning",
+            seed=7,
+            evaluation_seed=17,
+            solver_key="euler",
+            target_nfe=4,
+            runtime_nfe=4,
+            scheduler_key="late_power_3",
+            details={"time_grid": [0.0, 0.5, 1.0]},
+            checkpoint={"checkpoint_id": "lobster_synthetic_4000_steps"},
+            checkpoint_step=4000,
+            nfe_role="seen",
+            parent_row_signature="parent",
+            protocol_hash="proto",
+            cfg=SimpleNamespace(history_len=256),
+            eval_horizon=200,
+            chosen_t0s=[512],
+            score_main=0.75,
+            uniform_score_main=1.0,
+            metric_row={
+                "temporal_uw1": 0.5,
+                "temporal_cw1": 0.25,
+                "temporal_tstr_f1": 0.8,
+                "temporal_tstr_f1_applicable": True,
+            },
+            uniform_metric_row={
+                "temporal_uw1": 1.0,
+                "temporal_cw1": 0.5,
+                "temporal_tstr_f1": 0.4,
+                "temporal_tstr_f1_applicable": True,
+            },
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(float(rows[0]["u_score_uniform"]), math.log(1.0 / 0.75))
+        self.assertAlmostEqual(float(rows[0]["u_comp_uniform"]), math.log(2.0))
+        self.assertNotAlmostEqual(float(rows[0]["u_comp_uniform"]), float(rows[0]["u_score_uniform"]))
 
     def test_directional_objective_columns_mix_lower_and_higher_metrics(self) -> None:
         row = {"scheduler_key": "late_power_3", "temporal_cw1": 0.5, "temporal_uw1": 1.0, "temporal_tstr_f1": 0.8, "temporal_tstr_f1_applicable": True}
@@ -529,7 +558,7 @@ class GenericContextGipoTests(unittest.TestCase):
         ]
         self.assertEqual(_resolve_teacher_metric_target_keys(args, rows), ("u_crps_uniform", "u_mase_uniform"))
 
-    def test_auto_teacher_target_keys_are_family_vectors_after_csv_roundtrip(self) -> None:
+    def test_auto_teacher_target_keys_are_scenario_primary_vectors_after_csv_roundtrip(self) -> None:
         args = argparse.Namespace(teacher_metric_target_keys="auto")
         row = {field: "" for field in runner.CONTEXT_ROW_FIELDS}
         row.update(
@@ -549,7 +578,10 @@ class GenericContextGipoTests(unittest.TestCase):
             path = Path(tmpdir) / "context_rows.csv"
             runner._write_context_row_csv(path, [row])
             loaded = read_metric_rows_csv(path)
-        self.assertEqual(_resolve_teacher_metric_target_keys(args, loaded), tuple(spec.utility_key for spec in CONDITIONAL_METRIC_SPECS))
+        self.assertEqual(
+            _resolve_teacher_metric_target_keys(args, loaded),
+            tuple(spec.utility_key for spec in CONDITIONAL_PRIMARY_LOB_METRIC_SPECS),
+        )
 
     def test_auto_teacher_target_keys_cover_all_families(self) -> None:
         args = argparse.Namespace(teacher_metric_target_keys="auto")
@@ -559,12 +591,29 @@ class GenericContextGipoTests(unittest.TestCase):
         )
         self.assertEqual(
             _resolve_teacher_metric_target_keys(args, [{"benchmark_family": CONDITIONAL_GENERATION_FAMILY, "dataset": "lobster_synthetic"}]),
-            tuple(spec.utility_key for spec in CONDITIONAL_METRIC_SPECS),
+            tuple(spec.utility_key for spec in CONDITIONAL_PRIMARY_LOB_METRIC_SPECS),
+        )
+        self.assertEqual(
+            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": CONDITIONAL_GENERATION_FAMILY, "dataset": "long_term_st"}]),
+            tuple(spec.utility_key for spec in CONDITIONAL_PRIMARY_ECG_METRIC_SPECS),
         )
         self.assertEqual(
             _resolve_teacher_metric_target_keys(args, [{"benchmark_family": "molecule_3d_coordinate_generation", "dataset": "molecule_3d_set1"}]),
             tuple(spec.utility_key for spec in MOLECULE_METRIC_SPECS),
         )
+
+    def test_teacher_metric_profiles_canonicalize_conditional_scenarios(self) -> None:
+        lob = teacher_metric_profile_for_scenario("cryptos")
+        self.assertEqual(
+            lob["target_utility_keys"],
+            ["u_temporal_uw1_uniform", "u_temporal_cw1_uniform", "u_temporal_tstr_f1_uniform"],
+        )
+        self.assertTrue(all(math.isclose(float(value), 1.0 / 3.0) for value in lob["target_weights"].values()))
+        self.assertIn("spread_specific_error", lob["diagnostic_metric_keys"])
+
+        ecg = teacher_metric_profile_for_scenario("long_term_st")
+        self.assertEqual(ecg["target_utility_keys"], ["u_temporal_uw1_uniform", "u_temporal_cw1_uniform"])
+        self.assertEqual(ecg["target_weights"], {"u_temporal_uw1_uniform": 0.5, "u_temporal_cw1_uniform": 0.5})
 
     def test_reporter_family_detection_and_conditional_aggregation(self) -> None:
         rows = [
@@ -673,6 +722,52 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(ranking["metric_rankings"]["molecule_kabsch_rmsd_3d"], ["gipo", "uniform"])
         self.assertGreater(ranking["student_comparisons"][0]["student_molecule_kabsch_rmsd_3d_gain_vs_uniform"], 0.0)
 
+    def test_conditional_comparison_summary_uses_primary_metrics_and_tstr_high_direction(self) -> None:
+        baseline = [
+            {
+                "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+                "dataset": "lobster_synthetic",
+                "split_phase": "locked_test",
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "uniform",
+                "temporal_uw1": 1.0,
+                "temporal_cw1": 1.0,
+                "temporal_tstr_f1": 0.5,
+                "u_comp_uniform": 0.0,
+            }
+        ]
+        student = [
+            {
+                "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+                "dataset": "lobster_synthetic",
+                "split_phase": "locked_test",
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "gipo",
+                "temporal_uw1": 0.5,
+                "temporal_cw1": 0.5,
+                "temporal_tstr_f1": 0.8,
+                "u_comp_uniform": 0.4,
+            }
+        ]
+        summary = build_comparison_summary(
+            baseline_rows=baseline,
+            student_rows=student,
+            dataset="lobster_synthetic",
+            benchmark_family=CONDITIONAL_GENERATION_FAMILY,
+            split_phase="locked_test",
+            seeds=[0],
+            solver_names=["euler"],
+            target_nfe_values=[4],
+        )
+        ranking = summary["cell_rankings"][0]
+        self.assertEqual(summary["metric_keys"], ["temporal_uw1", "temporal_cw1", "temporal_tstr_f1", "u_comp_uniform"])
+        self.assertEqual(ranking["metric_rankings"]["temporal_tstr_f1"], ["gipo", "uniform"])
+        self.assertGreater(ranking["student_comparisons"][0]["student_temporal_tstr_f1_gain_vs_uniform"], 0.0)
+
     def test_full_pipeline_dry_run_accepts_molecule_scenario_without_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             args = full_pipeline.build_argparser().parse_args(
@@ -733,7 +828,7 @@ class GenericContextGipoTests(unittest.TestCase):
         pseudo = " ".join(by_stage["gipo_student_seen_plus_unseen_pseudo"])
         self.assertNotIn("--teacher_unseen_selection_rows_csv", zero_shot)
         self.assertNotIn("--teacher_unseen_selection_context_embeddings_npz", zero_shot)
-        self.assertIn("--teacher_metric_target_keys u_temporal_cw1_uniform,u_temporal_uw1_uniform,u_temporal_tstr_f1_uniform", zero_shot)
+        self.assertIn("--teacher_metric_target_keys u_temporal_uw1_uniform,u_temporal_cw1_uniform,u_temporal_tstr_f1_uniform", zero_shot)
         self.assertIn("--student_teacher_score_weight 0.05", zero_shot)
         self.assertIn("--student_teacher_score_warmup_fraction 0.6", zero_shot)
         self.assertIn("--student_target_mixture_mode full", zero_shot)
@@ -741,7 +836,7 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertIn("--student_pseudo_rows_csv", pseudo)
         self.assertIn("--student_teacher_score_weight 0.05", pseudo)
         self.assertNotIn("--student_teacher_score_include_pseudo", pseudo)
-        self.assertIn("--teacher_metric_target_keys u_temporal_cw1_uniform,u_temporal_uw1_uniform,u_temporal_tstr_f1_uniform", pseudo)
+        self.assertIn("--teacher_metric_target_keys u_temporal_uw1_uniform,u_temporal_cw1_uniform,u_temporal_tstr_f1_uniform", pseudo)
         self.assertIn("--teacher_utility_weights", pseudo)
         protocol = full_pipeline._protocol_payload(args)
         self.assertEqual(protocol["student_teacher_score_weight"], 0.05)
@@ -772,10 +867,22 @@ class GenericContextGipoTests(unittest.TestCase):
 
     def test_full_pipeline_conditional_uses_conditional_teacher_target_vector(self) -> None:
         commands = self._dry_run_gipo_commands_for_scenario("lobster_synthetic")
-        expected = ",".join(spec.utility_key for spec in CONDITIONAL_METRIC_SPECS)
+        expected = ",".join(spec.utility_key for spec in CONDITIONAL_PRIMARY_LOB_METRIC_SPECS)
         self.assertIn(f"--teacher_metric_target_keys {expected}", commands)
-        self.assertIn("u_temporal_cw1_uniform=0.4", commands)
+        self.assertIn("u_temporal_uw1_uniform=0.333333", commands)
+        self.assertIn("u_temporal_cw1_uniform=0.333333", commands)
+        self.assertIn("u_temporal_tstr_f1_uniform=0.333333", commands)
+        self.assertNotIn("u_temporal_u_l1_uniform=", commands)
         self.assertNotIn("--teacher_metric_target_keys u_comp_uniform", commands)
+
+    def test_full_pipeline_ecg_uses_two_metric_teacher_target_vector(self) -> None:
+        commands = self._dry_run_gipo_commands_for_scenario("long_term_st")
+        expected = ",".join(spec.utility_key for spec in CONDITIONAL_PRIMARY_ECG_METRIC_SPECS)
+        self.assertIn(f"--teacher_metric_target_keys {expected}", commands)
+        self.assertIn("u_temporal_uw1_uniform=0.5", commands)
+        self.assertIn("u_temporal_cw1_uniform=0.5", commands)
+        self.assertNotIn("u_temporal_tstr_f1_uniform=", commands)
+        self.assertNotIn("u_temporal_u_l1_uniform=", commands)
 
     def test_full_pipeline_molecule_uses_molecule_teacher_target_vector(self) -> None:
         commands = self._dry_run_gipo_commands_for_scenario("molecule_3d_set1")

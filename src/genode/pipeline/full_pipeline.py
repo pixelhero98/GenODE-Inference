@@ -42,7 +42,7 @@ from genode.backbone_packages import (
     backbone_package_protocol_payload,
     validate_provided_backbone_manifest,
 )
-from genode.gipo.objectives import objective_specs_for_family
+from genode.gipo.objectives import teacher_metric_profile_for_scenario, teacher_objective_specs_for_scenario
 from genode.gipo.ablation_plan import (
     DEFAULT_GIPO_ABLATION_PRESET,
     GipoAblationArm,
@@ -161,8 +161,8 @@ def _git_head_commit() -> str:
     return result.stdout.strip()
 
 
-def _teacher_target_args_for_family(dataset: str) -> List[str]:
-    specs = objective_specs_for_family(scenario_family_for_key(str(dataset)))
+def _teacher_target_args_for_scenario(dataset: str) -> List[str]:
+    specs = teacher_objective_specs_for_scenario(str(dataset))
     target_keys = [str(spec.utility_key) for spec in specs]
     weights = [f"{spec.utility_key}={float(spec.weight):g}" for spec in specs]
     return [
@@ -278,6 +278,7 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "student_target_elite_k": int(args.student_target_elite_k),
         "student_target_elite_min_count": int(args.student_target_elite_min_count),
         "student_target_elite_blend_all_weight": float(args.student_target_elite_blend_all_weight),
+        "teacher_metric_profile": teacher_metric_profile_for_scenario(dataset),
         "synthetic_length": int(args.synthetic_length),
         "locked_test_rows": str(args.locked_test_rows),
         "dataset_root": _display_path(str(args.dataset_root)),
@@ -555,7 +556,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             _ser_summary_list("seen"),
             "--support_schedule_keys",
             support_schedules,
-            *_teacher_target_args_for_family(dataset),
+            *_teacher_target_args_for_scenario(dataset),
             *_student_objective_args(args, arm),
         ]
         if mode == STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO:

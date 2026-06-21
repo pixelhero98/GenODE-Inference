@@ -86,7 +86,13 @@ from genode.evaluation.otflow_evaluation_support import (
     train_tuning_sampler_key,
     validate_execution_preflight,
 )
-from genode.gipo.objectives import CONDITIONAL_METRIC_SPECS, MOLECULE_METRIC_SPECS, uniform_anchored_objective_columns
+from genode.gipo.objectives import (
+    CONDITIONAL_METRIC_SPECS,
+    MOLECULE_METRIC_SPECS,
+    teacher_metric_profile_for_scenario,
+    teacher_objective_specs_for_scenario,
+    uniform_anchored_objective_columns,
+)
 from genode.gipo.models import validate_time_grid
 from genode.solver_protocol import normalize_solver_keys
 from genode.schedule_transfer.otflow_paper_registry import METHOD_KEY
@@ -107,6 +113,7 @@ from genode.gipo.policy import GIPO_PROTOCOL, load_context_embedding_table, save
 from genode.gipo.schedule_hash import schedule_grid_hash
 
 RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen"
+CONTEXT_REWARD_PROTOCOL_VERSION = "conditional_primary_metric_context_rewards_v2"
 DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
 DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
@@ -297,6 +304,12 @@ CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "temporal_cw1",
     "temporal_tstr_f1",
     "temporal_tstr_f1_applicable",
+    "u_l1",
+    "c_l1",
+    "spread_specific_error",
+    "imbalance_specific_error",
+    "ret_vol_acf_error",
+    "impact_response_error",
     "molecule_kabsch_rmsd_3d",
     "molecule_ensemble_velocity_norm_w1",
     "molecule_ensemble_acceleration_norm_w1",
@@ -583,6 +596,27 @@ def _sanitized_cli_args(cli_args: argparse.Namespace) -> Dict[str, Any]:
     return payload
 
 
+def _context_reward_protocol_payload(cli_args: argparse.Namespace) -> Dict[str, Any]:
+    conditional_datasets = parse_conditional_generation_datasets(str(cli_args.conditional_generation_datasets))
+    return {
+        "version": CONTEXT_REWARD_PROTOCOL_VERSION,
+        "conditional_generation_reward_granularity": "aggregate_primary_metric_components",
+        "conditional_generation_profiles": {
+            str(dataset): teacher_metric_profile_for_scenario(str(dataset))
+            for dataset in conditional_datasets
+        },
+        "conditional_diagnostic_metrics_are_teacher_targets": False,
+        "conditional_diagnostic_columns": [
+            "u_l1",
+            "c_l1",
+            "spread_specific_error",
+            "imbalance_specific_error",
+            "ret_vol_acf_error",
+            "impact_response_error",
+        ],
+    }
+
+
 def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
     payload = {
         "runner_signature": RUNNER_SIGNATURE_VERSION,
@@ -625,6 +659,7 @@ def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
         "backbone_manifest": _path_fingerprint(str(cli_args.backbone_manifest)) if str(cli_args.backbone_manifest).strip() else None,
         "molecule_group_root": _path_fingerprint(str(getattr(cli_args, "molecule_group_root", default_molecule_group_root()))),
         "data_path_fingerprints": _data_path_fingerprints(cli_args),
+        "context_reward_protocol": _context_reward_protocol_payload(cli_args),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -719,6 +754,7 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
             "runner_signature": RUNNER_SIGNATURE_VERSION,
             "method_key": METHOD_KEY,
             "protocol_hash": protocol_hash,
+            "context_reward_protocol": _context_reward_protocol_payload(cli_args),
             "args": _sanitized_cli_args(cli_args),
             "data_path_fingerprints": _data_path_fingerprints(cli_args),
         },
@@ -896,25 +932,28 @@ def _conditional_context_records(
 
     rows: List[Dict[str, Any]] = []
     history_len = int(getattr(cfg, "history_len", 0) or 0)
-    del metric_row, uniform_metric_row
+    aggregate_metrics = dict(metric_row or {})
+    uniform_aggregate_metrics = dict(uniform_metric_row or {})
     per_window = {int(key): dict(value) for key, value in dict(per_window_metrics_by_t0 or {}).items()}
     uniform_per_window = {int(key): dict(value) for key, value in dict(uniform_per_window_metrics_by_t0 or {}).items()}
+    teacher_specs = teacher_objective_specs_for_scenario(str(dataset))
     for window_idx, t0 in enumerate([int(x) for x in chosen_t0s]):
-        metrics_for_row = dict(per_window.get(int(t0), {}))
+        metrics_for_row = dict(per_window.get(int(t0), {}) or aggregate_metrics)
         if not metrics_for_row:
             raise ValueError(
-                "Conditional context rows require per-window metrics; aggregate schedule metrics cannot be "
-                "repeated as context-level GIPO rewards."
+                "Conditional context rows require per-window diagnostics or aggregate schedule metrics."
             )
         if scheduler_key == UNIFORM_SCHEDULER_KEY:
             uniform_metrics_for_row = dict(metrics_for_row)
         else:
-            uniform_metrics_for_row = dict(uniform_per_window.get(int(t0), {}))
+            uniform_metrics_for_row = dict(uniform_per_window.get(int(t0), {}) or uniform_aggregate_metrics)
         if not uniform_metrics_for_row:
             raise ValueError(
-                "Conditional context reward construction requires a matched uniform per-window metric row "
+                "Conditional context reward construction requires a matched uniform per-window or aggregate metric row "
                 f"for target_t={int(t0)}."
             )
+        reward_metric_row = {**metrics_for_row, **aggregate_metrics}
+        uniform_reward_metric_row = {**uniform_metrics_for_row, **uniform_aggregate_metrics}
         score_value = metrics_for_row.get("score_main", score_main)
         uniform_score_value = uniform_metrics_for_row.get("score_main", uniform_score_main)
         score_gain = (
@@ -923,9 +962,9 @@ def _conditional_context_records(
             else _safe_log_utility_gain(score_value, uniform_score_value)
         )
         reward_columns = uniform_anchored_objective_columns(
-            {**metrics_for_row, "scheduler_key": scheduler_key},
-            {**uniform_metrics_for_row, "scheduler_key": UNIFORM_SCHEDULER_KEY},
-            CONDITIONAL_METRIC_SPECS,
+            {**reward_metric_row, "scheduler_key": scheduler_key},
+            {**uniform_reward_metric_row, "scheduler_key": UNIFORM_SCHEDULER_KEY},
+            teacher_specs,
             uniform_schedule_key=UNIFORM_SCHEDULER_KEY,
         )
         if reward_columns.get("u_comp_uniform") in (None, ""):
@@ -1007,10 +1046,10 @@ def _conditional_context_records(
                 "context_embedding_id": str(context_id),
                 "checkpoint_id": str(checkpoint["checkpoint_id"]),
                 "score_main": score_value,
-                "temporal_uw1": metrics_for_row.get("temporal_uw1", ""),
-                "temporal_cw1": metrics_for_row.get("temporal_cw1", ""),
-                "temporal_tstr_f1": metrics_for_row.get("temporal_tstr_f1", ""),
-                "temporal_tstr_f1_applicable": metrics_for_row.get("temporal_tstr_f1_applicable", ""),
+                "temporal_uw1": reward_metric_row.get("temporal_uw1", ""),
+                "temporal_cw1": reward_metric_row.get("temporal_cw1", ""),
+                "temporal_tstr_f1": reward_metric_row.get("temporal_tstr_f1", ""),
+                "temporal_tstr_f1_applicable": reward_metric_row.get("temporal_tstr_f1_applicable", ""),
                 "u_l1": metrics_for_row.get("u_l1", ""),
                 "c_l1": metrics_for_row.get("c_l1", ""),
                 "spread_specific_error": metrics_for_row.get("spread_specific_error", ""),
@@ -1022,7 +1061,7 @@ def _conditional_context_records(
                 "gipo_reward_protocol": GIPO_PROTOCOL,
                 "reward_anchor_schedule_key": UNIFORM_SCHEDULER_KEY,
                 "reward_utility_transform": "directional_log_uniform_anchor",
-                "reward_granularity": "context_window_metric_components",
+                "reward_granularity": "aggregate_primary_metric_components",
                 "num_eval_samples": "",
                 "eval_horizon": int(eval_horizon),
                 "batch_size": "",

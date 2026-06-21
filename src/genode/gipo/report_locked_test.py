@@ -20,6 +20,7 @@ from genode.gipo.objectives import (
     FORECAST_METRIC_SPECS,
     MOLECULE_METRIC_SPECS,
     UNIFORM_SCHEDULE_KEY,
+    teacher_objective_specs_for_scenario,
     uniform_anchored_objective_columns,
 )
 from genode.gipo.policy import (
@@ -536,11 +537,11 @@ def _molecule_processed_dir(group_root: Path, dataset: str, member: Mapping[str,
     return group_root / str(dataset) / str(member["processed_dir"])
 
 
-def _metric_specs_for_family(benchmark_family: str):
+def _metric_specs_for_family(benchmark_family: str, dataset: str = ""):
     if str(benchmark_family) == FORECAST_FAMILY:
         return FORECAST_METRIC_SPECS
     if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
-        return CONDITIONAL_METRIC_SPECS
+        return teacher_objective_specs_for_scenario(str(dataset)) if str(dataset).strip() else CONDITIONAL_METRIC_SPECS
     if str(benchmark_family) == SCENARIO_FAMILY_MOLECULE:
         return MOLECULE_METRIC_SPECS
     raise ValueError(f"Unsupported benchmark_family={benchmark_family!r}.")
@@ -551,6 +552,7 @@ def _attach_uniform_rewards_to_gipo_row(
     *,
     uniform_row: Mapping[str, Any] | None,
     benchmark_family: str,
+    dataset: str = "",
 ) -> Dict[str, Any]:
     out = dict(row)
     if uniform_row is None:
@@ -562,7 +564,7 @@ def _attach_uniform_rewards_to_gipo_row(
     reward_columns = uniform_anchored_objective_columns(
         {**out, "scheduler_key": GIPO_SCHEDULE_KEY},
         {**dict(uniform_row), "scheduler_key": UNIFORM_SCHEDULE_KEY},
-        _metric_specs_for_family(benchmark_family),
+        _metric_specs_for_family(benchmark_family, dataset),
         uniform_schedule_key=UNIFORM_SCHEDULE_KEY,
     )
     out.update(reward_columns)
@@ -906,6 +908,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 selected_row,
                 uniform_row=uniform_context_rows.get(_context_match_key(row)),
                 benchmark_family=benchmark_family,
+                dataset=dataset,
             )
             per_context_rows.append(selected_row)
             decision_rows.append(

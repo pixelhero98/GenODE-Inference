@@ -329,6 +329,30 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             )
             self.assertNotEqual(runner._protocol_config_fingerprint(args_a), runner._protocol_config_fingerprint(args_b))
 
+    def test_protocol_hash_tracks_context_reward_protocol(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        args = runner.build_argparser().parse_args(
+            [
+                "--forecast_datasets",
+                "",
+                "--conditional_generation_datasets",
+                "cryptos",
+                "--backbone_manifest",
+                str(manifest),
+                "--write_context_rows",
+            ]
+        )
+        payload = runner._context_reward_protocol_payload(args)
+        self.assertEqual(
+            payload["conditional_generation_profiles"]["cryptos"]["target_utility_keys"],
+            ["u_temporal_uw1_uniform", "u_temporal_cw1_uniform", "u_temporal_tstr_f1_uniform"],
+        )
+        self.assertFalse(payload["conditional_diagnostic_metrics_are_teacher_targets"])
+
+        with mock.patch.object(runner, "_context_reward_protocol_payload", return_value={"version": "changed"}):
+            changed_hash = runner._protocol_config_fingerprint(args)
+        self.assertNotEqual(runner._protocol_config_fingerprint(args), changed_hash)
+
     def test_preflight_resolves_relative_shared_backbone_root_from_project_root(self) -> None:
         with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as tmpdir:
             root = Path(tmpdir)

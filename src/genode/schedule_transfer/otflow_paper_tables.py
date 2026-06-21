@@ -54,7 +54,7 @@ def build_conditional_generation_table_layout(nfe_values: Sequence[int]) -> Tabl
         metric_blocks=tuple(
             TableMetricBlock(
                 nfe=int(nfe),
-                metrics=("relative_score_gain_vs_uniform", "temporal_cw1", "temporal_tstr_f1"),
+                metrics=("temporal_uw1", "temporal_cw1", "temporal_tstr_f1"),
             )
             for nfe in nfe_values
         ),
@@ -70,7 +70,18 @@ def build_conditional_generation_appendix_table_layout(nfe_values: Sequence[int]
         metric_blocks=tuple(
             TableMetricBlock(
                 nfe=int(nfe),
-                metrics=("score_main", "temporal_uw1", "temporal_cw1", "temporal_tstr_f1"),
+                metrics=(
+                    "score_main",
+                    "relative_score_gain_vs_uniform",
+                    "disc_auc",
+                    "disc_auc_gap",
+                    "u_l1",
+                    "c_l1",
+                    "spread_specific_error",
+                    "imbalance_specific_error",
+                    "ret_vol_acf_error",
+                    "impact_response_error",
+                ),
             )
             for nfe in nfe_values
         ),

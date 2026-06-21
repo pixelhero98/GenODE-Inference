@@ -20,7 +20,11 @@ from genode.canonical_experiment_layout import (
     STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO,
     scenario_family_for_key,
 )
-from genode.gipo.objectives import objective_utility_keys_for_family
+from genode.gipo.objectives import (
+    objective_utility_keys_for_family,
+    teacher_objective_utility_keys_for_family,
+    teacher_objective_utility_keys_for_scenario,
+)
 from genode.gipo.policy import (
     GIPO_PROTOCOL,
     MODEL_PAYLOAD_VERSION,
@@ -199,10 +203,27 @@ def _infer_single_benchmark_family(rows: Sequence[Mapping[str, Any]]) -> str:
     return family
 
 
+def _infer_single_dataset_key(rows: Sequence[Mapping[str, Any]]) -> str:
+    datasets = {
+        str(row.get("scenario_key") or row.get("dataset") or row.get("dataset_key") or "").strip()
+        for row in rows
+        if str(row.get("scenario_key") or row.get("dataset") or row.get("dataset_key") or "").strip()
+    }
+    if len(datasets) > 1:
+        raise ValueError(f"GIPO training rows must contain exactly one dataset/scenario key; found {sorted(datasets)}.")
+    return next(iter(datasets)) if datasets else ""
+
+
 def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
     raw = str(args.teacher_metric_target_keys).strip()
     if not raw or raw.lower() == "auto":
-        return objective_utility_keys_for_family(_infer_single_benchmark_family(rows))
+        dataset_key = _infer_single_dataset_key(rows)
+        if dataset_key:
+            try:
+                return teacher_objective_utility_keys_for_scenario(dataset_key)
+            except ValueError:
+                pass
+        return teacher_objective_utility_keys_for_family(_infer_single_benchmark_family(rows))
     return validate_teacher_metric_target_keys(raw)
 
 
