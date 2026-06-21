@@ -170,7 +170,7 @@ def _resolve_manifest_relative_path(manifest_path: Path, value: Any, *, path_bas
     if raw.is_absolute():
         return str(raw)
     base = (manifest_path.parent / str(path_base)).resolve()
-    return str((base / value).resolve())
+    return str((base / _strip_known_prefix(value)).resolve())
 
 
 def load_portable_backbone_manifest(path: str | Path) -> Dict[str, Any]:

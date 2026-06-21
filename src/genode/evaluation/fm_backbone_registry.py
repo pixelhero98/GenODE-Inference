@@ -23,7 +23,16 @@ from genode.data.molecule_xyz import (
     default_molecule_group_root,
     load_molecule_group_manifest,
 )
-from genode.data.otflow_paths import default_lobster_synthetic_profile_path, project_backbone_matrix_root as default_project_backbone_matrix_root, project_data_root, project_outputs_root, project_paper_dataset_root, project_root
+from genode.data.otflow_paths import (
+    default_lobster_synthetic_profile_path,
+    display_project_path,
+    normalize_project_relative_path,
+    project_backbone_matrix_root as default_project_backbone_matrix_root,
+    project_data_root,
+    project_outputs_root,
+    project_paper_dataset_root,
+    project_root,
+)
 
 MOLECULE_FAMILY = "molecule_3d_coordinate_generation"
 BACKBONE_NAME_OTFLOW = "otflow"
@@ -127,19 +136,7 @@ def default_imported_otflow_backbone_root() -> Path:
 
 
 def _project_display_path(path: str | Path) -> str:
-    resolved = Path(path).expanduser().resolve()
-    try:
-        return resolved.relative_to(project_root()).as_posix()
-    except ValueError:
-        parts = tuple(str(part) for part in resolved.parts)
-        for marker in ("projects", "tmp"):
-            if marker in parts:
-                tail = parts[parts.index(marker) + 1 :]
-                return PurePosixPath(*tail).as_posix() if tail else resolved.name
-        tail = parts[-min(8, len(parts)) :]
-        if tail and (tail[0].endswith(":") or tail[0] == resolved.anchor):
-            tail = tail[1:]
-        return PurePosixPath(*tail).as_posix()
+    return display_project_path(path)
 
 
 def build_backbone_checkpoint_id(
@@ -1146,11 +1143,11 @@ def materialize_backbone_manifest(
 def _resolve_manifest_relative_path(manifest_path: Path, value: Any, *, path_base: str) -> Any:
     if not isinstance(value, str) or not value.strip():
         return value
-    raw = Path(value)
+    raw = normalize_project_relative_path(value)
     if raw.is_absolute():
         return str(raw)
     base = (manifest_path.parent / str(path_base)).resolve()
-    return str((base / value).resolve())
+    return str((base / raw).resolve())
 
 
 def load_backbone_manifest(path: str | Path) -> Dict[str, Any]:

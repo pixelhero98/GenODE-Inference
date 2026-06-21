@@ -38,8 +38,12 @@ from genode.gipo.policy import (
     build_teacher_weighted_density_targets,
     density_mass_for_row,
     _density_mass_to_normalized_log_features_torch,
+    _group_indices_by_pair_key,
+    _make_group_minibatch_sampler,
+    _make_index_minibatch_sampler,
     _student_teacher_score_objective,
     _student_teacher_score_eta,
+    train_gipo_teacher,
     validate_canonical_conditioning_style,
 )
 from genode.gipo.train_gipo import build_argparser as build_train_argparser
@@ -286,6 +290,88 @@ class GIPOCanonicalTests(unittest.TestCase):
                 temperature=1.0,
                 device="cpu",
             )
+
+    def test_minibatch_samplers_do_not_duplicate_within_epoch_wrap(self) -> None:
+        index_sampler = _make_index_minibatch_sampler(5, batch_size=3, seed=0)
+        first = index_sampler()
+        second = index_sampler()
+        third = index_sampler()
+        self.assertEqual(len(first), len(set(first)))
+        self.assertEqual(len(second), len(set(second)))
+        self.assertEqual(len(third), len(set(third)))
+        self.assertEqual(len(first), 3)
+        self.assertEqual(len(second), 2)
+        self.assertEqual(len(third), 3)
+
+        group_sampler = _make_group_minibatch_sampler([[idx] for idx in range(5)], group_batch_size=3, seed=0)
+        first_groups = group_sampler()
+        second_groups = group_sampler()
+        third_groups = group_sampler()
+        self.assertEqual(len(first_groups), len(set(first_groups)))
+        self.assertEqual(len(second_groups), len(set(second_groups)))
+        self.assertEqual(len(third_groups), len(set(third_groups)))
+        self.assertEqual(len(first_groups), 3)
+        self.assertEqual(len(second_groups), 2)
+        self.assertEqual(len(third_groups), 3)
+
+    def test_group_indices_accept_mixed_seed_none_values(self) -> None:
+        pair_keys = [
+            ("dataset", "euler", 4, "ctx_0", 0),
+            ("dataset", "euler", 4, "ctx_0", None),
+            ("dataset", "euler", 4, "ctx_0", 0),
+        ]
+        grouped = _group_indices_by_pair_key(pair_keys)
+        self.assertEqual(grouped, [[0, 2], [1]])
+
+    def test_teacher_training_summary_keeps_global_pair_count_under_minibatching(self) -> None:
+        reference = uniform_reference_grid(64)
+        rows = []
+        for idx in range(70):
+            for schedule, score in (("uniform", 0.0), ("late_power_3", 1.0)):
+                rows.append(
+                    {
+                        "dataset": "lobster_synthetic",
+                        "split_phase": "train_tuning",
+                        "seed": 0,
+                        "solver_key": "euler",
+                        "target_nfe": 4,
+                        "scheduler_key": schedule,
+                        "context_id": f"ctx_{idx}",
+                        "series_id": f"series_{idx}",
+                        "target_t": 0,
+                        "u_comp_uniform": score,
+                    }
+                )
+        normalizer = DensityFeatureNormalizer.fit(
+            [density_mass_for_row(row, schedule_grids=None, reference_time_grid=reference) for row in rows],
+            reference_time_grid=reference,
+        )
+        teacher = build_gipo_teacher_model(
+            architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
+            setting_dim=int(setting_features("euler", 4).numel()),
+            density_dim=64,
+            context_dim=2,
+            num_series=1,
+            model_config={"hidden_dim": 16, "hidden_layers": 1, "attention_heads": 4, "dropout": 0.0},
+        )
+
+        summary = train_gipo_teacher(
+            teacher,
+            rows,
+            context_embeddings={f"ctx_{idx}": [0.0, 0.0] for idx in range(70)},
+            series_index_map={f"series_{idx}": 0 for idx in range(70)},
+            schedule_grids=None,
+            reference_time_grid=reference,
+            density_normalizer=normalizer,
+            steps=1,
+            teacher_loss_log_every=1,
+            final_retrain_mode=True,
+            device="cpu",
+        )
+
+        self.assertEqual(summary["teacher_pair_count"], 70)
+        self.assertEqual(summary["losses"][0]["teacher_pair_count"], 70)
+        self.assertLess(summary["losses"][0]["teacher_batch_pair_count"], summary["teacher_pair_count"])
 
     def test_additive_models_are_context_only_for_series_identity(self) -> None:
         setting_batch = torch.stack(

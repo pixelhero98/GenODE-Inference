@@ -92,6 +92,9 @@ DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT = 0.20
 DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT = 0.05
 DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION = 0.60
 DEFAULT_STUDENT_TEACHER_SCORE_CLIP = 5.0
+DEFAULT_GIPO_TEACHER_GROUP_BATCH_SIZE = 64
+DEFAULT_GIPO_TEACHER_SCORE_BATCH_SIZE = 2048
+DEFAULT_GIPO_STUDENT_BATCH_SIZE = 512
 MODEL_PAYLOAD_VERSION = 4
 ARCHITECTURE_DENSITY_FORM_TRANSFORMER = "density_form_transformer"
 ARCHITECTURE_DENSITY_QUERY_TRANSFORMER = "density_query_transformer"
@@ -499,6 +502,91 @@ def _student_teacher_score_eta(
         return 0.0
     ramp_steps = max(1, total_steps - warmup_steps)
     return float(weight) * min(1.0, float(current_step - warmup_steps) / float(ramp_steps))
+
+
+def _group_indices_by_pair_key(pair_keys: Sequence[ContextPairKey]) -> List[List[int]]:
+    grouped: Dict[ContextPairKey, List[int]] = defaultdict(list)
+    for idx, key in enumerate(pair_keys):
+        grouped[key].append(int(idx))
+    return [indices for indices in grouped.values()]
+
+
+def _rank_pair_count_for_groups(
+    targets: torch.Tensor,
+    grouped_indices: Sequence[Sequence[int]],
+    *,
+    margin: float,
+) -> int:
+    values = [float(value) for value in targets.detach().cpu().tolist()]
+    min_delta = float(margin)
+    count = 0
+    for indices in grouped_indices:
+        for pos, i in enumerate(indices):
+            left_value = values[int(i)]
+            for j in indices[pos + 1 :]:
+                if abs(left_value - values[int(j)]) > min_delta:
+                    count += 1
+    return int(count)
+
+
+def _make_group_minibatch_sampler(
+    grouped_indices: Sequence[Sequence[int]],
+    *,
+    group_batch_size: int,
+    seed: int,
+):
+    groups = [list(map(int, indices)) for indices in grouped_indices if indices]
+    if not groups:
+        raise ValueError("Cannot build minibatches without teacher candidate groups.")
+    rng = np.random.default_rng(int(seed))
+    order = np.arange(len(groups), dtype=np.int64)
+    cursor = 0
+
+    def _next_indices() -> List[int]:
+        nonlocal cursor, order
+        if cursor == 0:
+            rng.shuffle(order)
+        target_count = min(len(groups), max(1, int(group_batch_size)))
+        remaining = len(order) - cursor
+        take = min(target_count, remaining)
+        selected = [int(value) for value in order[cursor : cursor + take]]
+        cursor += take
+        if cursor >= len(order):
+            cursor = 0
+        row_indices: List[int] = []
+        for group_idx in selected:
+            row_indices.extend(groups[int(group_idx)])
+        return row_indices
+
+    return _next_indices
+
+
+def _make_index_minibatch_sampler(total_count: int, *, batch_size: int, seed: int):
+    total = int(total_count)
+    if total <= 0:
+        raise ValueError("Cannot build minibatches for an empty tensor.")
+    rng = np.random.default_rng(int(seed))
+    order = np.arange(total, dtype=np.int64)
+    cursor = 0
+
+    def _next_indices() -> List[int]:
+        nonlocal cursor, order
+        if cursor == 0:
+            rng.shuffle(order)
+        target_count = min(total, max(1, int(batch_size)))
+        remaining = total - cursor
+        take = min(target_count, remaining)
+        selected = [int(value) for value in order[cursor : cursor + take]]
+        cursor += take
+        if cursor >= total:
+            cursor = 0
+        return selected
+
+    return _next_indices
+
+
+def _index_tensor(indices: Sequence[int], *, device: torch.device | str) -> torch.Tensor:
+    return torch.tensor([int(idx) for idx in indices], dtype=torch.long, device=device)
 
 
 def _resolve_setting_encoder_config(
@@ -2032,6 +2120,40 @@ def _teacher_metric_scores(
     return scores
 
 
+def _teacher_metric_scores_batched(
+    teacher: nn.Module,
+    setting_features_batch: torch.Tensor,
+    density_features_batch: torch.Tensor,
+    series_index_batch: torch.Tensor,
+    context_embedding_batch: torch.Tensor,
+    *,
+    rows: Sequence[MetricRow],
+    device: torch.device | str,
+    batch_size: int = DEFAULT_GIPO_TEACHER_SCORE_BATCH_SIZE,
+) -> torch.Tensor:
+    if int(setting_features_batch.shape[0]) != len(rows):
+        raise ValueError("Batched teacher scoring rows must match feature batch length.")
+    chunks: List[torch.Tensor] = []
+    total = int(setting_features_batch.shape[0])
+    step = max(1, int(batch_size))
+    for start in range(0, total, step):
+        end = min(total, start + step)
+        batch_rows = list(rows[start:end])
+        metric_scores = _teacher_metric_scores(
+            teacher,
+            setting_features_batch[start:end].to(device=device),
+            density_features_batch[start:end].to(device=device),
+            series_index_batch[start:end].to(device=device),
+            context_embedding_batch[start:end].to(device=device),
+            rows=batch_rows,
+        )
+        chunks.append(metric_scores.detach().cpu())
+    if not chunks:
+        target_count = len(teacher_metric_target_keys_for_model(teacher))
+        return torch.empty((0, target_count), dtype=torch.float32)
+    return torch.cat(chunks, dim=0)
+
+
 def _teacher_scores(
     teacher: nn.Module,
     setting_features_batch: torch.Tensor,
@@ -2365,6 +2487,7 @@ def gipo_teacher_diagnostics(
         return base
     teacher_metric_target_keys = teacher_metric_target_keys_for_model(teacher)
     was_training = bool(teacher.training)
+    teacher.to(device)
     teacher.eval()
     with torch.no_grad():
         sx, dx, series_idx, cx, metric_targets, metric_target_mask, pair_keys, schedule_keys, _ = _teacher_training_tensors(
@@ -2377,7 +2500,7 @@ def gipo_teacher_diagnostics(
             setting_feature_mode=feature_mode,
             setting_encoder_config=encoder_config,
             teacher_metric_target_keys=teacher_metric_target_keys,
-            device=device,
+            device="cpu",
         )
         target_weights = _teacher_metric_weights(
             rows,
@@ -2397,7 +2520,15 @@ def gipo_teacher_diagnostics(
         if not pair_on_seed:
             pair_keys = [key[:4] + (None,) for key in pair_keys]
         rank_left, rank_right, rank_sign = _pair_indices(targets, pair_keys, margin=float(pair_margin), device=sx.device)
-        metric_pred = _teacher_metric_scores(teacher, sx, dx, series_idx, cx, rows=rows)
+        metric_pred = _teacher_metric_scores_batched(
+            teacher,
+            sx,
+            dx,
+            series_idx,
+            cx,
+            rows=rows,
+            device=device,
+        )
         pred = _scalarize_teacher_metric_values(
             metric_pred,
             target_weights,
@@ -2845,11 +2976,11 @@ def train_gipo_teacher(
         schedule_grids=schedule_grids,
         reference_time_grid=reference_time_grid,
         density_normalizer=density_normalizer,
-        device=device,
         setting_feature_mode=feature_mode,
         setting_encoder_config=encoder_config,
         teacher_metric_target_keys=teacher_metric_target_keys,
         seed=int(seed),
+        device="cpu",
     )
     target_weights = _teacher_metric_weights(
         rows,
@@ -2868,9 +2999,15 @@ def train_gipo_teacher(
     )
     if not pair_on_seed:
         pair_keys = [key[:4] + (None,) for key in pair_keys]
-    left, right, sign = _pair_indices(targets, pair_keys, margin=float(pair_margin), device=sx.device)
-    if require_rank_pairs and left.numel() == 0:
+    grouped_indices = _group_indices_by_pair_key(pair_keys)
+    global_pair_count = _rank_pair_count_for_groups(targets, grouped_indices, margin=float(pair_margin))
+    if require_rank_pairs and global_pair_count == 0:
         raise ValueError("Context teacher training found no same-context schedule pairs for ranking.")
+    next_teacher_batch = _make_group_minibatch_sampler(
+        grouped_indices,
+        group_batch_size=DEFAULT_GIPO_TEACHER_GROUP_BATCH_SIZE,
+        seed=int(seed),
+    )
     opt = torch.optim.AdamW(teacher.parameters(), lr=float(lr), weight_decay=1e-4)
     losses: List[Dict[str, Any]] = []
     checkpoint_history: List[Dict[str, Any]] = []
@@ -2883,15 +3020,28 @@ def train_gipo_teacher(
     }
     checkpoint_every = max(1, int(teacher_checkpoint_every))
     for step in range(int(steps)):
-        metric_pred = _teacher_metric_scores(teacher, sx, dx, series_idx, cx, rows=rows)
+        batch_indices = next_teacher_batch()
+        batch_cpu_idx = _index_tensor(batch_indices, device="cpu")
+        batch_rows = [rows[int(idx)] for idx in batch_indices]
+        batch_pair_keys = [pair_keys[int(idx)] for idx in batch_indices]
+        batch_sx = sx.index_select(0, batch_cpu_idx).to(device=device)
+        batch_dx = dx.index_select(0, batch_cpu_idx).to(device=device)
+        batch_series_idx = series_idx.index_select(0, batch_cpu_idx).to(device=device)
+        batch_cx = cx.index_select(0, batch_cpu_idx).to(device=device)
+        batch_metric_targets = metric_targets.index_select(0, batch_cpu_idx).to(device=device)
+        batch_metric_target_mask = metric_target_mask.index_select(0, batch_cpu_idx).to(device=device)
+        batch_target_weights = target_weights.index_select(0, batch_cpu_idx).to(device=device)
+        batch_targets = targets.index_select(0, batch_cpu_idx).to(device=device)
+        left, right, sign = _pair_indices(batch_targets, batch_pair_keys, margin=float(pair_margin), device=batch_targets.device)
+        metric_pred = _teacher_metric_scores(teacher, batch_sx, batch_dx, batch_series_idx, batch_cx, rows=batch_rows)
         pred = _scalarize_teacher_metric_values(
             metric_pred,
-            target_weights,
+            batch_target_weights,
             target_keys=teacher_metric_target_keys,
-            target_mask=metric_target_mask,
+            target_mask=batch_metric_target_mask,
         )
         rank = pairwise_rank_loss(pred, left, right, sign, temperature=float(rank_temperature))
-        huber = _masked_smooth_l1_loss(metric_pred, metric_targets, metric_target_mask)
+        huber = _masked_smooth_l1_loss(metric_pred, batch_metric_targets, batch_metric_target_mask)
         loss = rank + float(regression_weight) * huber
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -2903,7 +3053,11 @@ def train_gipo_teacher(
                     "teacher_total_loss": float(loss.detach().cpu().item()),
                     "teacher_rank_loss": float(rank.detach().cpu().item()),
                     "teacher_huber_loss": float(huber.detach().cpu().item()),
-                    "teacher_pair_count": int(left.numel()),
+                    "teacher_pair_count": int(global_pair_count),
+                    "teacher_batch_pair_count": int(left.numel()),
+                    "teacher_global_pair_count": int(global_pair_count),
+                    "teacher_group_batch_size": int(DEFAULT_GIPO_TEACHER_GROUP_BATCH_SIZE),
+                    "teacher_row_batch_count": int(len(batch_indices)),
                     "teacher_target": "metric_vector",
                     "teacher_scalar_target": "weighted_metric_utility",
                     "reward_anchor_schedule_key": UNIFORM_SCHEDULE_KEY,
@@ -2989,7 +3143,8 @@ def train_gipo_teacher(
         "setting_feature_mode": feature_mode,
         "setting_encoder_mode": encoder_config.mode,
         "setting_encoder_config": encoder_config.to_payload(),
-        "teacher_pair_count": int(left.numel()),
+        "teacher_pair_count": int(global_pair_count),
+        "teacher_group_batch_size": int(DEFAULT_GIPO_TEACHER_GROUP_BATCH_SIZE),
         "rank_temperature": float(rank_temperature),
         "regression_weight": float(regression_weight),
         "pair_margin": float(pair_margin),
@@ -3095,14 +3250,15 @@ def build_teacher_weighted_density_targets(
         score_series.append(0)
         score_context.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
     with torch.no_grad():
-        _, metric_score_mask = _teacher_metric_targets(rows, target_keys=teacher_metric_target_keys, device=device)
-        metric_score_values = _teacher_metric_scores(
+        _, metric_score_mask = _teacher_metric_targets(rows, target_keys=teacher_metric_target_keys, device="cpu")
+        metric_score_values = _teacher_metric_scores_batched(
             teacher,
-            torch.stack(score_settings, dim=0).to(device=device),
-            torch.tensor(np.stack(score_density, axis=0), dtype=torch.float32, device=device),
-            torch.tensor(score_series, dtype=torch.long, device=device),
-            torch.tensor(np.stack(score_context, axis=0), dtype=torch.float32, device=device),
+            torch.stack(score_settings, dim=0),
+            torch.tensor(np.stack(score_density, axis=0), dtype=torch.float32),
+            torch.tensor(score_series, dtype=torch.long),
+            torch.tensor(np.stack(score_context, axis=0), dtype=torch.float32),
             rows=rows,
+            device=device,
         )
         score_weights = _teacher_metric_weights(
             rows,
@@ -3500,6 +3656,20 @@ def train_gipo_student(
     losses: List[Dict[str, Any]] = []
     checkpoint_history: List[Dict[str, Any]] = []
     checkpoint_states: Dict[int, Mapping[str, torch.Tensor]] = {}
+    next_student_batch = _make_index_minibatch_sampler(
+        int(target_mass.shape[0]),
+        batch_size=DEFAULT_GIPO_STUDENT_BATCH_SIZE,
+        seed=int(17 + len(rows)),
+    )
+    next_pseudo_batch = (
+        _make_index_minibatch_sampler(
+            int(pseudo_target_mass.shape[0]),
+            batch_size=DEFAULT_GIPO_STUDENT_BATCH_SIZE,
+            seed=int(31 + len(pseudo_rows or [])),
+        )
+        if pseudo_enabled and pseudo_target_mass is not None
+        else None
+    )
 
     def _evaluate_student_ce(
         eval_sx: torch.Tensor,
@@ -3510,35 +3680,54 @@ def train_gipo_student(
     ) -> Tuple[float, float]:
         was_training = bool(student.training)
         student.eval()
+        total_ce = 0.0
+        total_entropy = 0.0
+        total_count = 0
         with torch.no_grad():
-            eval_logits = _student_logits(
-                student,
-                eval_sx,
-                eval_series_idx,
-                eval_cx,
-                rows=eval_rows,
-            )
-            eval_log_probs = torch.log_softmax(eval_logits, dim=-1)
-            eval_ce = float((-(eval_target_mass * eval_log_probs).sum(dim=-1).mean()).detach().cpu().item())
-            eval_entropy = float(
-                (-(torch.softmax(eval_logits, dim=-1) * eval_log_probs).sum(dim=-1).mean()).detach().cpu().item()
-            )
+            total = int(eval_target_mass.shape[0])
+            step_size = max(1, int(DEFAULT_GIPO_STUDENT_BATCH_SIZE))
+            for start in range(0, total, step_size):
+                end = min(total, start + step_size)
+                batch_rows = list(eval_rows[start:end])
+                eval_logits = _student_logits(
+                    student,
+                    eval_sx[start:end],
+                    eval_series_idx[start:end],
+                    eval_cx[start:end],
+                    rows=batch_rows,
+                )
+                eval_log_probs = torch.log_softmax(eval_logits, dim=-1)
+                row_ce = -(eval_target_mass[start:end] * eval_log_probs).sum(dim=-1)
+                row_entropy = -(torch.softmax(eval_logits, dim=-1) * eval_log_probs).sum(dim=-1)
+                count = int(end - start)
+                total_ce += float(row_ce.sum().detach().cpu().item())
+                total_entropy += float(row_entropy.sum().detach().cpu().item())
+                total_count += count
         if was_training:
             student.train()
-        return eval_ce, eval_entropy
+        denom = max(1, int(total_count))
+        return total_ce / float(denom), total_entropy / float(denom)
 
     student.train()
     for step in range(int(steps)):
-        series_idx = base_series_idx
+        batch_indices = next_student_batch()
+        batch_idx = _index_tensor(batch_indices, device=target_mass.device)
+        batch_rows = [target_rows[int(idx)] for idx in batch_indices]
+        batch_sx = sx.index_select(0, batch_idx)
+        batch_series_idx = base_series_idx.index_select(0, batch_idx)
+        batch_cx = cx.index_select(0, batch_idx)
+        batch_target_mass = target_mass.index_select(0, batch_idx)
+        batch_score_mean = score_mean.index_select(0, batch_idx)
+        batch_score_std = score_std.index_select(0, batch_idx)
         logits = _student_logits(
             student,
-            sx,
-            series_idx,
-            cx,
-            rows=target_rows,
+            batch_sx,
+            batch_series_idx,
+            batch_cx,
+            rows=batch_rows,
         )
         log_probs = torch.log_softmax(logits, dim=-1)
-        ce_loss = -(target_mass * log_probs).sum(dim=-1).mean()
+        ce_loss = -(batch_target_mass * log_probs).sum(dim=-1).mean()
         pseudo_ce_loss = logits.new_zeros(())
         teacher_score_z = logits.new_zeros(())
         teacher_score_mean = logits.new_zeros(())
@@ -3554,14 +3743,14 @@ def train_gipo_student(
             teacher_score_z, teacher_score_mean = _student_teacher_score_objective(
                 teacher,
                 logits,
-                sx,
-                series_idx,
-                cx,
-                target_rows,
+                batch_sx,
+                batch_series_idx,
+                batch_cx,
+                batch_rows,
                 reference_time_grid=reference_time_grid,
                 density_normalizer=density_normalizer,
-                score_mean=score_mean,
-                score_std=score_std,
+                score_mean=batch_score_mean,
+                score_std=batch_score_std,
                 teacher_utility_weights=teacher_utility_weights,
                 clip=DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
             )
@@ -3570,30 +3759,39 @@ def train_gipo_student(
             assert pseudo_base_series_idx is not None
             assert pseudo_cx is not None
             assert pseudo_target_mass is not None
-            pseudo_series_idx = pseudo_base_series_idx
+            assert next_pseudo_batch is not None
+            pseudo_batch_indices = next_pseudo_batch()
+            pseudo_batch_idx = _index_tensor(pseudo_batch_indices, device=pseudo_target_mass.device)
+            pseudo_batch_rows = [pseudo_target_rows[int(idx)] for idx in pseudo_batch_indices]
+            pseudo_batch_sx = pseudo_sx.index_select(0, pseudo_batch_idx)
+            pseudo_series_idx = pseudo_base_series_idx.index_select(0, pseudo_batch_idx)
+            pseudo_batch_cx = pseudo_cx.index_select(0, pseudo_batch_idx)
+            pseudo_batch_target_mass = pseudo_target_mass.index_select(0, pseudo_batch_idx)
             pseudo_logits = _student_logits(
                 student,
-                pseudo_sx,
+                pseudo_batch_sx,
                 pseudo_series_idx,
-                pseudo_cx,
-                rows=pseudo_target_rows,
+                pseudo_batch_cx,
+                rows=pseudo_batch_rows,
             )
             pseudo_log_probs = torch.log_softmax(pseudo_logits, dim=-1)
-            pseudo_ce_loss = -(pseudo_target_mass * pseudo_log_probs).sum(dim=-1).mean()
+            pseudo_ce_loss = -(pseudo_batch_target_mass * pseudo_log_probs).sum(dim=-1).mean()
             if eta > 0.0 and bool(student_teacher_score_include_pseudo):
                 assert pseudo_score_mean is not None
                 assert pseudo_score_std is not None
+                pseudo_batch_score_mean = pseudo_score_mean.index_select(0, pseudo_batch_idx)
+                pseudo_batch_score_std = pseudo_score_std.index_select(0, pseudo_batch_idx)
                 pseudo_teacher_score_z, pseudo_teacher_score_mean = _student_teacher_score_objective(
                     teacher,
                     pseudo_logits,
-                    pseudo_sx,
+                    pseudo_batch_sx,
                     pseudo_series_idx,
-                    pseudo_cx,
-                    pseudo_target_rows,
+                    pseudo_batch_cx,
+                    pseudo_batch_rows,
                     reference_time_grid=reference_time_grid,
                     density_normalizer=density_normalizer,
-                    score_mean=pseudo_score_mean,
-                    score_std=pseudo_score_std,
+                    score_mean=pseudo_batch_score_mean,
+                    score_std=pseudo_batch_score_std,
                     teacher_utility_weights=teacher_utility_weights,
                     clip=DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
                 )

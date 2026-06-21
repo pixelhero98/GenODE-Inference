@@ -31,6 +31,7 @@ from genode.data.otflow_paths import (
     default_cryptos_data_path,
     default_lobster_synthetic_profile_path,
     default_long_term_st_data_path,
+    display_project_path,
     project_outputs_root,
     project_paper_dataset_root,
     project_root,
@@ -124,19 +125,7 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _display_path(path: str | Path) -> str:
-    resolved = Path(path).expanduser().resolve()
-    try:
-        return resolved.relative_to(project_root()).as_posix()
-    except ValueError:
-        parts = tuple(str(part) for part in resolved.parts)
-        for marker in ("projects", "tmp"):
-            if marker in parts:
-                tail = parts[parts.index(marker) + 1 :]
-                return "/".join(tail) if tail else resolved.name
-        tail = parts[-min(8, len(parts)) :]
-        if tail and (tail[0].endswith(":") or tail[0] == resolved.anchor):
-            tail = tail[1:]
-        return "/".join(str(part) for part in tail)
+    return display_project_path(path)
 
 
 def _display_command(command: Sequence[str]) -> List[str]:
@@ -212,6 +201,10 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
     family = scenario_family_for_key(dataset)
     if int(args.synthetic_length) <= 0:
         raise ValueError("--synthetic_length must be positive.")
+    if int(args.ser_calibration_batch_size) <= 0:
+        raise ValueError("--ser_calibration_batch_size must be positive.")
+    if int(args.ser_val_windows) < 0:
+        raise ValueError("--ser_val_windows must be nonnegative.")
     effective_stages = set(_effective_stage_names(args))
     includes_backbone_training = "backbone_training" in effective_stages
     if bool(getattr(args, "use_provided_backbones", False)) or str(getattr(args, "backbone_package_root", "") or "").strip():
@@ -273,6 +266,8 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "unseen_nfes": _parse_int_csv(str(args.unseen_nfes), CANONICAL_UNSEEN_NFES),
         "schedules": _parse_csv(str(args.schedule_keys)) or list(CANONICAL_SUPERVISION_SCHEDULE_KEYS),
         "context_sample_count": int(args.context_sample_count),
+        "ser_calibration_batch_size": int(args.ser_calibration_batch_size),
+        "ser_val_windows": int(args.ser_val_windows),
         "student_teacher_score_weight": float(args.student_teacher_score_weight),
         "student_teacher_score_warmup_fraction": float(args.student_teacher_score_warmup_fraction),
         "student_teacher_score_clip": float(DEFAULT_STUDENT_TEACHER_SCORE_CLIP),
@@ -738,6 +733,10 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                 int(checkpoint_step),
                 "--context_sample_count",
                 int(args.context_sample_count),
+                "--calibration_batch_size",
+                int(args.ser_calibration_batch_size),
+                "--val_windows",
+                int(args.ser_val_windows),
                 *_data_path_args(args),
                 "--backbone_manifest",
                 str(args.backbone_manifest),
@@ -949,6 +948,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--unseen_nfes", default=",".join(str(value) for value in CANONICAL_UNSEEN_NFES))
     parser.add_argument("--schedule_keys", default=",".join(CANONICAL_SUPERVISION_SCHEDULE_KEYS))
     parser.add_argument("--context_sample_count", type=int, default=CANONICAL_CONTEXT_SAMPLE_COUNT)
+    parser.add_argument("--ser_calibration_batch_size", type=int, default=64)
+    parser.add_argument("--ser_val_windows", type=int, default=0)
     parser.add_argument("--student_teacher_score_weight", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT)
     parser.add_argument("--student_teacher_score_warmup_fraction", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION)
     parser.add_argument("--student_teacher_score_include_pseudo", action="store_true", default=False)

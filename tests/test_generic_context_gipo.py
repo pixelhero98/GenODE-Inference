@@ -844,6 +844,40 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(manifest["ablation_root"], f"gipo_ablations/{GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX}")
         self.assertTrue(all(not str(value).startswith(("/", "C:")) for arm in manifest["arms"] for value in arm["outputs"].values()))
 
+    def test_full_pipeline_ser_controls_are_protocolized_and_ser_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(Path(tmpdir) / "run"),
+                    "--ablation_first",
+                    "--ser_calibration_batch_size",
+                    "1",
+                    "--ser_val_windows",
+                    "0",
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+        by_stage = {stage["stage"]: [" ".join(command) for command in stage["commands"]] for stage in summary["stages"]}
+        ser_commands = by_stage["ser_summaries"]
+        non_ser_commands = [
+            command
+            for stage, commands in by_stage.items()
+            if stage != "ser_summaries"
+            for command in commands
+        ]
+        self.assertTrue(ser_commands)
+        self.assertTrue(all("--calibration_batch_size 1" in command for command in ser_commands))
+        self.assertTrue(all("--val_windows 0" in command for command in ser_commands))
+        self.assertTrue(all("--calibration_batch_size" not in command for command in non_ser_commands))
+        self.assertTrue(all("--val_windows" not in command for command in non_ser_commands))
+        protocol = full_pipeline._protocol_payload(args)
+        self.assertEqual(protocol["ser_calibration_batch_size"], 1)
+        self.assertEqual(protocol["ser_val_windows"], 0)
+
     def test_full_pipeline_ablation_first_routes_arm_knobs_and_locked_reports(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             args = full_pipeline.build_argparser().parse_args(

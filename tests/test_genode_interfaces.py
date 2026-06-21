@@ -146,6 +146,19 @@ class GenODEInterfaceTests(unittest.TestCase):
 
         self.assertIn("--ablation_first", options)
         self.assertIn("--gipo_ablation_preset", options)
+        self.assertIn("--ser_calibration_batch_size", options)
+        self.assertIn("--ser_val_windows", options)
+
+    def test_project_path_resolver_accepts_legacy_package_prefixes(self) -> None:
+        from genode.data import otflow_paths
+
+        with mock.patch.object(otflow_paths, "project_root", return_value=PROJECT_ROOT):
+            self.assertEqual(otflow_paths.resolve_project_path("genode/outputs/example"), (PROJECT_ROOT / "outputs" / "example").resolve())
+            self.assertEqual(otflow_paths.resolve_project_path("genode/data/example"), (PROJECT_ROOT / "data" / "example").resolve())
+            self.assertEqual(
+                otflow_paths.resolve_project_path("genode/paper_datasets/example"),
+                (PROJECT_ROOT / "paper_datasets" / "example").resolve(),
+            )
 
     def test_gipo_policy_public_surface_excludes_teacher_prediction_helper(self) -> None:
         from genode.gipo import policy

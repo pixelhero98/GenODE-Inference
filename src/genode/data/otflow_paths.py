@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+
+_LOGICAL_PROJECT_ROOTS = {"outputs", "data", "paper_datasets"}
 
 
 def code_root() -> Path:
@@ -14,10 +17,48 @@ def project_root() -> Path:
 
 
 def resolve_project_path(path: str | Path) -> Path:
-    raw = Path(path).expanduser()
+    raw = normalize_project_relative_path(path).expanduser()
     if raw.is_absolute():
         return raw.resolve()
     return (project_root() / raw).resolve()
+
+
+def normalize_project_relative_path(path: str | Path) -> Path:
+    raw = Path(path)
+    if raw.is_absolute():
+        return raw
+    posix = PurePosixPath(str(path).replace("\\", "/"))
+    if posix.is_absolute() or not posix.parts or posix.parts[0].endswith(":"):
+        return raw
+    if len(posix.parts) >= 2 and posix.parts[0] == "genode" and posix.parts[1] in _LOGICAL_PROJECT_ROOTS:
+        return Path(*posix.parts[1:])
+    return raw
+
+
+def display_project_path(path: str | Path) -> str:
+    resolved = Path(path).expanduser().resolve()
+    for root_name, root in (
+        ("outputs", project_outputs_root()),
+        ("data", project_data_root()),
+        ("paper_datasets", project_paper_dataset_root()),
+    ):
+        try:
+            rel = resolved.relative_to(Path(root).expanduser().resolve())
+        except ValueError:
+            continue
+        return PurePosixPath(root_name, *rel.parts).as_posix()
+    try:
+        return resolved.relative_to(project_root().resolve()).as_posix()
+    except ValueError:
+        parts = tuple(str(part) for part in resolved.parts)
+        for marker in ("projects", "tmp"):
+            if marker in parts:
+                tail = parts[parts.index(marker) + 1 :]
+                return PurePosixPath(*tail).as_posix() if tail else resolved.name
+        tail = parts[-min(8, len(parts)) :]
+        if tail and (tail[0].endswith(":") or tail[0] == resolved.anchor):
+            tail = tail[1:]
+        return PurePosixPath(*tail).as_posix()
 
 
 def project_data_root() -> Path:

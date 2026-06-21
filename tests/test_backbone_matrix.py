@@ -21,8 +21,10 @@ from genode.evaluation.fm_backbone_registry import (
     MOLECULE_FAMILY,
     build_backbone_readiness_audit,
     find_backbone_artifact,
+    load_backbone_manifest,
     materialize_backbone_manifest,
 )
+from genode.data.otflow_paths import display_project_path
 from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
 
 
@@ -95,6 +97,52 @@ class BackboneMatrixTests(unittest.TestCase):
         self.assertTrue(all(artifact["backbone_name"] == BACKBONE_NAME_OTFLOW for artifact in payload["artifacts"]))
         active = {(row["benchmark_family"], row["dataset_key"]) for row in payload["artifacts"]}
         self.assertEqual(active, {(FORECAST_FAMILY, key) for key in FORECAST_KEYS} | {(CONDITIONAL_GENERATION_FAMILY, key) for key in CONDITIONAL_KEYS})
+
+    def test_manifest_loader_normalizes_legacy_package_relative_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            manifest_path = root / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": "fm_backbone_manifest",
+                "path_base": "../..",
+                "artifact_count": 1,
+                "ready_count": 1,
+                "artifacts": [
+                    {
+                        "checkpoint_path": "genode/outputs/backbone_matrix/example/model.pt",
+                        "summary_path": "genode/outputs/backbone_matrix/example/artifact_summary.json",
+                        "metadata_path": "genode/outputs/backbone_matrix/example/checkpoint_metadata.json",
+                    }
+                ],
+            }
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            loaded = load_backbone_manifest(manifest_path)
+
+        artifact = loaded["artifacts"][0]
+        self.assertEqual(Path(artifact["checkpoint_path"]), root / "outputs" / "backbone_matrix" / "example" / "model.pt")
+        self.assertEqual(Path(artifact["summary_path"]), root / "outputs" / "backbone_matrix" / "example" / "artifact_summary.json")
+
+    def test_display_path_uses_logical_outputs_root_for_symlink_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            scratch_outputs = Path(tmpdir) / "scratch" / "genode" / "outputs"
+            root.mkdir()
+            scratch_outputs.mkdir(parents=True)
+            outputs_link = root / "outputs"
+            try:
+                outputs_link.symlink_to(scratch_outputs, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks are unavailable: {exc}")
+            target = scratch_outputs / "backbone_matrix" / "example" / "model.pt"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"ckpt")
+
+            with patch("genode.data.otflow_paths.project_root", return_value=root):
+                display = display_project_path(target)
+
+        self.assertEqual(display, "outputs/backbone_matrix/example/model.pt")
 
     def test_manifest_extends_temporal_grid_with_trainable_molecule_strata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
