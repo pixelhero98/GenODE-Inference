@@ -83,6 +83,8 @@ DEFAULT_ABLATION_FIRST_STAGES = (
     GIPO_ABLATION_LOCKED_TEST_STAGE,
 )
 PIPELINE_STAGE_ORDER = (*DEFAULT_STAGES, GIPO_ABLATION_STUDENT_STAGE, GIPO_ABLATION_LOCKED_TEST_STAGE)
+DEFAULT_GIPO_TEACHER_STEPS = 500
+DEFAULT_GIPO_STUDENT_STEPS = 500
 
 
 @dataclass(frozen=True)
@@ -268,6 +270,8 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "context_sample_count": int(args.context_sample_count),
         "ser_calibration_batch_size": int(args.ser_calibration_batch_size),
         "ser_val_windows": int(args.ser_val_windows),
+        "gipo_teacher_steps": int(args.gipo_teacher_steps),
+        "gipo_student_steps": int(args.gipo_student_steps),
         "student_teacher_score_weight": float(args.student_teacher_score_weight),
         "student_teacher_score_warmup_fraction": float(args.student_teacher_score_warmup_fraction),
         "student_teacher_score_clip": float(DEFAULT_STUDENT_TEACHER_SCORE_CLIP),
@@ -359,6 +363,8 @@ def _build_ablation_manifest(
         "checkpoint_steps": _parse_int_csv(str(args.checkpoint_steps), CANONICAL_CHECKPOINT_STEPS),
         "seen_nfes": _parse_int_csv(str(args.seen_nfes), CANONICAL_SEEN_NFES),
         "unseen_nfes": _parse_int_csv(str(args.unseen_nfes), CANONICAL_UNSEEN_NFES),
+        "gipo_teacher_steps": int(args.gipo_teacher_steps),
+        "gipo_student_steps": int(args.gipo_student_steps),
         "schedule_keys": _parse_csv(str(args.schedule_keys)) or list(CANONICAL_SUPERVISION_SCHEDULE_KEYS),
         "arms": arms,
         "arm_count": int(len(arms)),
@@ -556,6 +562,14 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             _ser_summary_list("seen"),
             "--support_schedule_keys",
             support_schedules,
+            "--teacher_steps",
+            int(args.gipo_teacher_steps),
+            "--student_steps",
+            int(args.gipo_student_steps),
+            "--seen_target_nfe_values",
+            seen_nfes,
+            "--pseudo_target_nfe_values",
+            unseen_nfes,
             *_teacher_target_args_for_scenario(dataset),
             *_student_objective_args(args, arm),
         ]
@@ -951,6 +965,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--context_sample_count", type=int, default=CANONICAL_CONTEXT_SAMPLE_COUNT)
     parser.add_argument("--ser_calibration_batch_size", type=int, default=64)
     parser.add_argument("--ser_val_windows", type=int, default=0)
+    parser.add_argument("--gipo_teacher_steps", type=int, default=DEFAULT_GIPO_TEACHER_STEPS)
+    parser.add_argument("--gipo_student_steps", type=int, default=DEFAULT_GIPO_STUDENT_STEPS)
     parser.add_argument("--student_teacher_score_weight", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT)
     parser.add_argument("--student_teacher_score_warmup_fraction", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION)
     parser.add_argument("--student_teacher_score_include_pseudo", action="store_true", default=False)

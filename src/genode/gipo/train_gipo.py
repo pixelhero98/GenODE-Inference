@@ -147,6 +147,11 @@ def _parse_int_csv(text: str) -> List[int]:
     return [int(part) for part in _parse_csv(text)]
 
 
+def _parse_int_csv_or_default(text: Any, default: Sequence[int]) -> List[int]:
+    parsed = _parse_int_csv(str(text))
+    return parsed if parsed else [int(value) for value in default]
+
+
 def _parse_float_mapping(text: str) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for part in _parse_csv(text):
@@ -184,7 +189,7 @@ def _infer_single_benchmark_family(rows: Sequence[Mapping[str, Any]]) -> str:
                 continue
             try:
                 dataset_families.add(scenario_family_for_key(dataset))
-            except ValueError:
+            except (KeyError, ValueError):
                 pass
         families = dataset_families
     if not families:
@@ -221,7 +226,7 @@ def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence
         if dataset_key:
             try:
                 return teacher_objective_utility_keys_for_scenario(dataset_key)
-            except ValueError:
+            except (KeyError, ValueError):
                 pass
         return teacher_objective_utility_keys_for_family(_infer_single_benchmark_family(rows))
     return validate_teacher_metric_target_keys(raw)
@@ -590,6 +595,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--support_schedule_keys", default="", help="Comma-separated fixed/SER supervision keys. Defaults to observed row keys.")
     parser.add_argument("--context_sample_count", type=int, default=CANONICAL_CONTEXT_SAMPLE_COUNT)
     parser.add_argument("--context_holdout_fraction", type=float, default=0.20)
+    parser.add_argument(
+        "--seen_target_nfe_values",
+        default=",".join(str(value) for value in CANONICAL_SEEN_NFES),
+        help="Comma-separated seen calibration NFEs expected in --rows_csv.",
+    )
     parser.add_argument("--teacher_steps", type=int, default=500)
     parser.add_argument("--teacher_checkpoint_every", type=int, default=100)
     parser.add_argument("--teacher_loss_log_every", type=int, default=0)
@@ -631,6 +641,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--student_pseudo_schedule_summary_json",
         default="",
         help="Schedule summaries for pseudo rows, such as unseen SER-derived references.",
+    )
+    parser.add_argument(
+        "--pseudo_target_nfe_values",
+        default=",".join(str(value) for value in CANONICAL_UNSEEN_NFES),
+        help="Comma-separated pseudo-distillation NFEs selected from --student_pseudo_rows_csv.",
     )
     parser.add_argument("--student_pseudo_target_weight", type=float, default=CANONICAL_PSEUDO_TARGET_WEIGHT)
     parser.add_argument("--student_teacher_score_weight", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT)
@@ -709,6 +724,22 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     missing_support_rows = sorted(set(support_keys) - observed_keys)
     if missing_support_rows:
         raise ValueError(f"Supervision schedules must have measured context rows; missing rows for {missing_support_rows}")
+    seen_target_nfes = sorted(
+        set(
+            _parse_int_csv_or_default(
+                getattr(args, "seen_target_nfe_values", ",".join(str(value) for value in CANONICAL_SEEN_NFES)),
+                CANONICAL_SEEN_NFES,
+            )
+        )
+    )
+    pseudo_target_nfes = sorted(
+        set(
+            _parse_int_csv_or_default(
+                getattr(args, "pseudo_target_nfe_values", ",".join(str(value) for value in CANONICAL_UNSEEN_NFES)),
+                CANONICAL_UNSEEN_NFES,
+            )
+        )
+    )
 
     teacher_metric_target_keys = _resolve_teacher_metric_target_keys(args, rows)
     explicit_teacher_weights = _parse_float_mapping(str(args.teacher_utility_weights)) if str(args.teacher_utility_weights).strip() else None
@@ -757,11 +788,10 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "context=0.25,density_family=0.25,unseen_nfe=0.50."
         )
     sampled_target_nfes = sorted({int(row["target_nfe"]) for row in sampled_rows})
-    canonical_seen_nfes = list(CANONICAL_SEEN_NFES)
-    if sampled_target_nfes != canonical_seen_nfes:
+    if sampled_target_nfes != seen_target_nfes:
         raise ValueError(
             "weighted_normalized_regret final teacher/student fitting expects seen calibration NFEs "
-            f"{canonical_seen_nfes}; "
+            f"{seen_target_nfes}; "
             f"found {sampled_target_nfes}."
         )
     unseen_selection_rows: List[Dict[str, Any]] = []
@@ -934,17 +964,24 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         _validate_unique_schedule_rows(raw_pseudo_rows, label="Student pseudo distillation rows")
         _validate_context_embedding_checkpoint_scope(raw_pseudo_rows, label="Student pseudo distillation rows")
         _validate_train_tuning_rows(raw_pseudo_rows, label="Student pseudo distillation")
-        pseudo_filtered_rows = _rows_for_target_nfes(raw_pseudo_rows, CANONICAL_UNSEEN_NFES)
+        pseudo_filtered_rows = _rows_for_target_nfes(raw_pseudo_rows, pseudo_target_nfes)
         if not pseudo_filtered_rows:
             raise ValueError(
-                "student_pseudo_rows_csv has no rows after filtering to canonical unseen NFEs "
-                f"{list(CANONICAL_UNSEEN_NFES)}."
+                "student_pseudo_rows_csv has no rows after filtering to pseudo_target_nfe_values "
+                f"{pseudo_target_nfes}."
             )
         pseudo_support_keys = _observed_support(pseudo_filtered_rows)
+        missing_pseudo_support = sorted(set(support_keys) - set(pseudo_support_keys))
+        extra_pseudo_support = sorted(set(pseudo_support_keys) - set(support_keys))
+        if missing_pseudo_support or extra_pseudo_support:
+            raise ValueError(
+                "Student pseudo distillation rows must contain the same support schedule universe as seen rows; "
+                f"missing={missing_pseudo_support}, extra={extra_pseudo_support}."
+            )
         if _needs_forecast_uniform_rewards(pseudo_filtered_rows, teacher_metric_target_keys):
             pseudo_source_rows = attach_uniform_gipo_rewards(
                 pseudo_filtered_rows,
-                support_schedule_keys=pseudo_support_keys,
+                support_schedule_keys=support_keys,
                 utility_crps_weight=float(args.teacher_utility_crps_weight),
                 utility_mase_weight=float(args.teacher_utility_mase_weight),
                 pair_on_seed=True,
@@ -953,7 +990,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             pseudo_source_rows = [dict(row) for row in pseudo_filtered_rows]
             for row in pseudo_source_rows:
                 row["context_id"] = context_id_from_row(row)
-        _validate_support_group_counts(pseudo_source_rows, pseudo_support_keys)
+        _validate_support_group_counts(pseudo_source_rows, support_keys)
         missing_pseudo_columns = _missing_target_value_keys(pseudo_source_rows, teacher_metric_target_keys)
         if len(missing_pseudo_columns) == len(teacher_metric_target_keys):
             raise ValueError(f"Student pseudo distillation rows are missing all metric target columns: {missing_pseudo_columns}")
@@ -1102,13 +1139,15 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "support_schedule_keys": list(support_keys),
         "canonical_seen_nfes": [int(value) for value in CANONICAL_SEEN_NFES],
         "canonical_unseen_nfes": [int(value) for value in CANONICAL_UNSEEN_NFES],
+        "seen_target_nfe_values": [int(value) for value in seen_target_nfes],
+        "pseudo_target_nfe_values": [int(value) for value in pseudo_target_nfes],
         "context_sample_count": int(sample_count),
         "sampled_context_count": int(len(selected_context_ids)),
         "student_training_mode": student_training_mode,
         "student_pseudo_distillation": {
             "enabled": bool(pseudo_rows) and pseudo_target_weight > 0.0,
             "pseudo_target_weight": float(pseudo_target_weight),
-            "target_nfes": [int(value) for value in CANONICAL_UNSEEN_NFES],
+            "target_nfes": [int(value) for value in pseudo_target_nfes],
             "raw_csv": _artifact_input_summary(str(args.student_pseudo_rows_csv)),
             "context_embeddings_npz": _artifact_input_summary(str(args.student_pseudo_context_embeddings_npz or args.context_embeddings_npz)),
             "schedule_summary_json": _artifact_input_summary(str(args.student_pseudo_schedule_summary_json)),
@@ -1116,6 +1155,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "selected_row_count": int(len(pseudo_rows)),
             "selected_context_count": int(len({context_id_from_row(row) for row in pseudo_rows})),
             "support_schedule_keys": list(pseudo_support_keys),
+            "required_support_schedule_keys": list(support_keys),
             "student_target_mixture_mode": student_target_mixture_mode,
             "student_teacher_score_include_pseudo": bool(student_teacher_score_include_pseudo),
             "used_for_teacher_fitting": False,
@@ -1458,6 +1498,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "density_feature_normalizer": density_normalizer.to_payload(),
             "density_representation": density_meta,
             "support_schedule_keys": list(support_keys),
+            "seen_target_nfe_values": [int(value) for value in seen_target_nfes],
+            "pseudo_target_nfe_values": [int(value) for value in pseudo_target_nfes],
             "teacher_utility_weights": teacher_utility_weights,
             "teacher_training": teacher_training,
             "student_objective_settings": student_objective_settings,
@@ -1499,6 +1541,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "density_feature_normalizer": density_normalizer.to_payload(),
             "density_representation": density_meta,
             "support_schedule_keys": list(support_keys),
+            "seen_target_nfe_values": [int(value) for value in seen_target_nfes],
+            "pseudo_target_nfe_values": [int(value) for value in pseudo_target_nfes],
             "teacher_utility_weights": teacher_utility_weights,
             "teacher_checkpoint": teacher_path.name,
             "teacher_training": teacher_training,
@@ -1525,6 +1569,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "protocol": GIPO_PROTOCOL,
         "reference_grid_hash": reference_grid_hash(reference_time_grid),
         "support_schedule_keys": list(support_keys),
+        "seen_target_nfe_values": [int(value) for value in seen_target_nfes],
+        "pseudo_target_nfe_values": [int(value) for value in pseudo_target_nfes],
         "teacher_selected_step": teacher_training.get("teacher_checkpoint_selection", {}).get("selected_step"),
         "student_target_protocol": STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
         "student_objective_settings": student_objective_settings,

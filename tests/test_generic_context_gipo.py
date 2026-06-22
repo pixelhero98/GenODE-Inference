@@ -828,21 +828,66 @@ class GenericContextGipoTests(unittest.TestCase):
         pseudo = " ".join(by_stage["gipo_student_seen_plus_unseen_pseudo"])
         self.assertNotIn("--teacher_unseen_selection_rows_csv", zero_shot)
         self.assertNotIn("--teacher_unseen_selection_context_embeddings_npz", zero_shot)
-        self.assertIn("--teacher_metric_target_keys u_temporal_uw1_uniform,u_temporal_cw1_uniform,u_temporal_tstr_f1_uniform", zero_shot)
-        self.assertIn("--student_teacher_score_weight 0.05", zero_shot)
-        self.assertIn("--student_teacher_score_warmup_fraction 0.6", zero_shot)
-        self.assertIn("--student_target_mixture_mode full", zero_shot)
-        self.assertIn("--student_target_elite_blend_all_weight 0.2", zero_shot)
+        for command in (zero_shot, pseudo):
+            self.assertIn("--teacher_metric_target_keys u_temporal_uw1_uniform,u_temporal_cw1_uniform,u_temporal_tstr_f1_uniform", command)
+            self.assertIn("--teacher_steps 500", command)
+            self.assertIn("--student_steps 500", command)
+            self.assertIn("--seen_target_nfe_values 4,8,12,16", command)
+            self.assertIn("--pseudo_target_nfe_values 6,10,14,20", command)
+            self.assertIn("--student_teacher_score_weight 0.05", command)
+            self.assertIn("--student_teacher_score_warmup_fraction 0.6", command)
+            self.assertIn("--student_target_mixture_mode full", command)
+            self.assertIn("--student_target_elite_fraction 0.3", command)
+            self.assertIn("--student_target_elite_k 0", command)
+            self.assertIn("--student_target_elite_min_count 2", command)
+            self.assertIn("--student_target_elite_blend_all_weight 0.2", command)
         self.assertIn("--student_pseudo_rows_csv", pseudo)
-        self.assertIn("--student_teacher_score_weight 0.05", pseudo)
         self.assertNotIn("--student_teacher_score_include_pseudo", pseudo)
-        self.assertIn("--teacher_metric_target_keys u_temporal_uw1_uniform,u_temporal_cw1_uniform,u_temporal_tstr_f1_uniform", pseudo)
         self.assertIn("--teacher_utility_weights", pseudo)
         protocol = full_pipeline._protocol_payload(args)
+        self.assertEqual(protocol["gipo_teacher_steps"], 500)
+        self.assertEqual(protocol["gipo_student_steps"], 500)
         self.assertEqual(protocol["student_teacher_score_weight"], 0.05)
         self.assertEqual(protocol["student_teacher_score_clip"], 5.0)
         self.assertEqual(protocol["student_teacher_score_protocol"], "late_ramped_per_cell_teacher_utility_z_score")
         self.assertEqual(protocol["student_target_mixture_mode"], "full")
+
+    def test_full_pipeline_gipo_step_budgets_are_protocolized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(Path(tmpdir) / "run_a"),
+                    "--stages",
+                    "gipo_student_seen_only_zero_shot",
+                    "--dry_run",
+                ]
+            )
+            changed_args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(Path(tmpdir) / "run_b"),
+                    "--stages",
+                    "gipo_student_seen_only_zero_shot",
+                    "--gipo_teacher_steps",
+                    "501",
+                    "--gipo_student_steps",
+                    "503",
+                    "--dry_run",
+                ]
+            )
+
+        base_protocol = full_pipeline._protocol_payload(base_args)
+        changed_protocol = full_pipeline._protocol_payload(changed_args)
+        self.assertEqual(base_protocol["gipo_teacher_steps"], 500)
+        self.assertEqual(base_protocol["gipo_student_steps"], 500)
+        self.assertEqual(changed_protocol["gipo_teacher_steps"], 501)
+        self.assertEqual(changed_protocol["gipo_student_steps"], 503)
+        self.assertNotEqual(full_pipeline._json_hash(base_protocol), full_pipeline._json_hash(changed_protocol))
 
     def _dry_run_gipo_commands_for_scenario(self, scenario_key: str) -> str:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -948,6 +993,8 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(len(by_stage["gipo_ablation_locked_test_reports"]), 160)
         self.assertEqual(manifest["status"], "dry_run")
         self.assertEqual(manifest["arm_count"], 16)
+        self.assertEqual(manifest["gipo_teacher_steps"], 500)
+        self.assertEqual(manifest["gipo_student_steps"], 500)
         self.assertEqual(manifest["ablation_root"], f"gipo_ablations/{GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX}")
         self.assertTrue(all(not str(value).startswith(("/", "C:")) for arm in manifest["arms"] for value in arm["outputs"].values()))
 
@@ -994,6 +1041,14 @@ class GenericContextGipoTests(unittest.TestCase):
                     "--run_root",
                     str(Path(tmpdir) / "run"),
                     "--ablation_first",
+                    "--gipo_teacher_steps",
+                    "37",
+                    "--gipo_student_steps",
+                    "43",
+                    "--seen_nfes",
+                    "4,8",
+                    "--unseen_nfes",
+                    "6,10",
                     "--dry_run",
                 ]
             )
@@ -1006,6 +1061,10 @@ class GenericContextGipoTests(unittest.TestCase):
             self.assertIn(f"--student_target_mixture_mode {arm.student_target_mixture_mode}", command)
             self.assertIn(f"--student_teacher_score_weight {float(arm.student_teacher_score_weight)}", command)
             self.assertIn("--student_teacher_score_warmup_fraction 0.6", command)
+            self.assertIn("--teacher_steps 37", command)
+            self.assertIn("--student_steps 43", command)
+            self.assertIn("--seen_target_nfe_values 4,8", command)
+            self.assertIn("--pseudo_target_nfe_values 6,10", command)
             self.assertNotIn("--student_teacher_score_include_pseudo", command)
             if arm.student_target_mixture_mode == "elite_blend":
                 self.assertIn(f"--student_target_elite_blend_all_weight {float(arm.student_target_elite_blend_all_weight)}", command)
