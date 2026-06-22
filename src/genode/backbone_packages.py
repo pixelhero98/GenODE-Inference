@@ -45,6 +45,7 @@ LOCAL_PATH_MARKERS = (
     "/" + "Users" + "/",
 )
 REDACTED_LOCAL_PATH = "<local_path_redacted>"
+MIN_CHECKPOINT_SIZE_BYTES = 1024
 
 
 @dataclass(frozen=True)
@@ -544,6 +545,60 @@ def _validate_file_record(package_root: Path, record: Mapping[str, Any]) -> List
     return errors
 
 
+def _known_text_checkpoint_header(header: bytes) -> bool:
+    stripped = header.lstrip().lower()
+    return (
+        stripped.startswith(b"version https://git-lfs.github.com/spec")
+        or stripped.startswith(b"<!doctype html")
+        or stripped.startswith(b"<html")
+    )
+
+
+def _checkpoint_label(artifact: Mapping[str, Any]) -> str:
+    parts = [
+        str(artifact.get("checkpoint_id", "") or "").strip(),
+        str(artifact.get("benchmark_family", "") or "").strip(),
+        str(artifact.get("dataset_key", "") or "").strip(),
+        str(artifact.get("train_steps", "") or "").strip(),
+    ]
+    return "/".join(part for part in parts if part)
+
+
+def _validate_artifact_checkpoint_integrity(artifact: Mapping[str, Any], checkpoint_path: Path) -> List[str]:
+    label = _checkpoint_label(artifact)
+    errors: List[str] = []
+    if not checkpoint_path.exists():
+        return [f"Provided artifact {label} is missing checkpoint_path: {checkpoint_path}"]
+    if not checkpoint_path.is_file():
+        return [f"Provided artifact {label} checkpoint_path is not a file: {checkpoint_path}"]
+    size_bytes = int(checkpoint_path.stat().st_size)
+    if size_bytes < MIN_CHECKPOINT_SIZE_BYTES:
+        errors.append(
+            f"Provided artifact {label} checkpoint is too small to be valid: "
+            f"{checkpoint_path} has {size_bytes} bytes."
+        )
+    with checkpoint_path.open("rb") as fh:
+        header = fh.read(256)
+    if _known_text_checkpoint_header(header):
+        errors.append(f"Provided artifact {label} checkpoint looks like text or a pointer: {checkpoint_path}")
+    if errors:
+        return errors
+    if (
+        str(artifact.get("backbone_name", "")) == "otflow"
+        and str(artifact.get("benchmark_family", "")) in {FORECAST_FAMILY, CONDITIONAL_GENERATION_FAMILY}
+    ):
+        try:
+            from genode.evaluation.otflow_evaluation_support import load_otflow_checkpoint_payload
+
+            load_otflow_checkpoint_payload(
+                checkpoint_path,
+                expected_identity=f"provided backbone artifact {label}",
+            )
+        except Exception as exc:
+            errors.append(f"Provided artifact {label} checkpoint is not loadable: {exc}")
+    return errors
+
+
 def validate_backbone_package(
     package_root: str | Path,
     *,
@@ -632,6 +687,8 @@ def validate_backbone_package(
                         resolved = root / _safe_rel(_strip_known_prefix(path_value))
                     if not resolved.exists():
                         errors.append(f"Artifact {artifact.get('checkpoint_id', '')} missing {field}: {path_value}")
+                    elif field == "checkpoint_path":
+                        errors.extend(_validate_artifact_checkpoint_integrity(artifact, resolved))
     if require_clean_paths:
         for json_path in sorted(root.rglob("*.json")):
             try:
@@ -708,6 +765,8 @@ def validate_provided_backbone_manifest(
             resolved = _resolve_loaded_artifact_path(value)
             if not resolved.exists():
                 errors.append(f"Provided artifact {artifact.get('checkpoint_id', '')} is missing {field}: {value}")
+            elif field == "checkpoint_path":
+                errors.extend(_validate_artifact_checkpoint_integrity(artifact, resolved))
     return {
         "status": "complete" if not errors else "failed",
         "errors": errors,

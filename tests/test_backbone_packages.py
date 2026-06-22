@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from genode.backbone_packages import (
@@ -10,6 +11,7 @@ from genode.backbone_packages import (
     load_portable_backbone_manifest,
     package_backbone_family,
     validate_backbone_package,
+    validate_provided_backbone_manifest,
 )
 from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY
 from genode.canonical_experiment_layout import CANONICAL_CHECKPOINT_STEPS, SCENARIO_FAMILY_MOLECULE
@@ -138,7 +140,8 @@ class BackbonePackageTests(unittest.TestCase):
             )
 
             package_root = Path(summary["package_root"])
-            validation = validate_backbone_package(package_root, expected_family="temporal-extrapolation")
+            with mock.patch("genode.backbone_packages._validate_artifact_checkpoint_integrity", return_value=[]):
+                validation = validate_backbone_package(package_root, expected_family="temporal-extrapolation")
             self.assertEqual(validation["status"], "complete", validation.get("errors"))
             raw_manifest = json.loads((package_root / PACKAGED_BACKBONE_MANIFEST).read_text(encoding="utf-8"))
             artifact = raw_manifest["artifacts"][0]
@@ -146,6 +149,87 @@ class BackbonePackageTests(unittest.TestCase):
             self.assertEqual(raw_manifest["path_base"], "../..")
             loaded = load_portable_backbone_manifest(package_root / PACKAGED_BACKBONE_MANIFEST)
             self.assertTrue(Path(loaded["artifacts"][0]["checkpoint_path"]).exists())
+
+    def test_package_validation_rejects_existing_tiny_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_root = Path(tmpdir) / "source"
+            output_dir = Path(tmpdir) / "packages"
+            self._source_tree(source_root)
+            package_root = Path(
+                package_backbone_family(
+                    family="temporal-extrapolation",
+                    source_root=source_root,
+                    output_dir=output_dir,
+                    overwrite=True,
+                    make_zip=False,
+                )["package_root"]
+            )
+
+            validation = validate_backbone_package(package_root, expected_family="temporal-extrapolation")
+
+        self.assertEqual(validation["status"], "failed")
+        self.assertTrue(
+            any("checkpoint is too small to be valid" in error for error in validation["errors"]),
+            validation["errors"],
+        )
+
+    def test_provided_manifest_validation_rejects_unloadable_ready_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            checkpoint = root / "outputs/backbone_matrix/otflow/temporal_extrapolation/4k/solar_energy_10m/model.pt"
+            _write(checkpoint, "exists")
+            _write(checkpoint.with_name("checkpoint_metadata.json"), "{}")
+            _write(checkpoint.with_name("artifact_summary.json"), "{}")
+            manifest_path = root / "outputs/backbone_matrix/backbone_manifest.json"
+            _write(
+                manifest_path,
+                json.dumps(
+                    {
+                        "version": "fm_backbone_manifest",
+                        "path_base": "../..",
+                        "artifact_count": 1,
+                        "ready_count": 1,
+                        "artifacts": [
+                            {
+                                "backbone_name": "otflow",
+                                "benchmark_family": FORECAST_FAMILY,
+                                "dataset_key": "solar_energy_10m",
+                                "train_steps": 4000,
+                                "train_budget_label": "4k",
+                                "checkpoint_id": "solar_energy_10m_4k",
+                                "checkpoint_path": "outputs/backbone_matrix/otflow/temporal_extrapolation/4k/solar_energy_10m/model.pt",
+                                "summary_path": "outputs/backbone_matrix/otflow/temporal_extrapolation/4k/solar_energy_10m/artifact_summary.json",
+                                "metadata_path": "outputs/backbone_matrix/otflow/temporal_extrapolation/4k/solar_energy_10m/checkpoint_metadata.json",
+                                "status": "ready",
+                                "seed": 0,
+                            }
+                        ],
+                    }
+                ),
+            )
+
+            validation = validate_provided_backbone_manifest(
+                manifest_path,
+                scenario_key="solar_energy_10m",
+                benchmark_family=FORECAST_FAMILY,
+            )
+
+        self.assertEqual(validation["status"], "failed")
+        self.assertTrue(
+            any("checkpoint is too small to be valid" in error for error in validation["errors"]),
+            validation["errors"],
+        )
+
+    def test_load_checkpoint_model_wraps_unreadable_torch_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "model.pt"
+            checkpoint.write_bytes(b"not a torch checkpoint\n" * 100)
+            import torch
+
+            from genode.evaluation.otflow_evaluation_support import load_checkpoint_model
+
+            with self.assertRaisesRegex(RuntimeError, "Invalid OTFlow checkpoint.*torch.load failed"):
+                load_checkpoint_model(checkpoint, torch.device("cpu"))
 
     def test_pipeline_rejects_backbone_training_with_provided_package(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -165,19 +249,20 @@ class BackbonePackageTests(unittest.TestCase):
                 from genode.pipeline.full_pipeline import build_argparser, run_full_pipeline
             except Exception as exc:  # pragma: no cover - exercised only in minimal dependency environments.
                 self.skipTest(f"full pipeline dependencies are unavailable: {exc}")
-            args = build_argparser().parse_args(
-                [
-                    "--scenario_key",
-                    "solar_energy_10m",
-                    "--run_root",
-                    str(Path(tmpdir) / "run"),
-                    "--backbone_package_root",
-                    str(package_root),
-                    "--dry_run",
-                ]
-            )
-            with self.assertRaisesRegex(ValueError, "cannot include backbone_training"):
-                run_full_pipeline(args)
+            with mock.patch("genode.backbone_packages._validate_artifact_checkpoint_integrity", return_value=[]):
+                args = build_argparser().parse_args(
+                    [
+                        "--scenario_key",
+                        "solar_energy_10m",
+                        "--run_root",
+                        str(Path(tmpdir) / "run"),
+                        "--backbone_package_root",
+                        str(package_root),
+                        "--dry_run",
+                    ]
+                )
+                with self.assertRaisesRegex(ValueError, "cannot include backbone_training"):
+                    run_full_pipeline(args)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import time
+from collections.abc import Mapping as MappingABC
 from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -781,10 +782,63 @@ def build_conditional_generation_dataset_args_from_cfg(
     return args
 
 
+def _checkpoint_header_is_known_text_placeholder(header: bytes) -> bool:
+    stripped = header.lstrip().lower()
+    return (
+        stripped.startswith(b"version https://git-lfs.github.com/spec")
+        or stripped.startswith(b"<!doctype html")
+        or stripped.startswith(b"<html")
+    )
+
+
+def load_otflow_checkpoint_payload(
+    ckpt_path: str | Path,
+    *,
+    expected_identity: str = "OTFlow checkpoint",
+) -> Mapping[str, Any]:
+    path = Path(ckpt_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"OTFlow checkpoint not found: {path}")
+    if not path.is_file():
+        raise RuntimeError(f"Invalid OTFlow checkpoint at {path}: expected a file for {expected_identity}.")
+    size_bytes = int(path.stat().st_size)
+    if size_bytes < 1024:
+        raise RuntimeError(
+            f"Invalid OTFlow checkpoint at {path}: file is only {size_bytes} bytes; "
+            f"expected {expected_identity}."
+        )
+    with path.open("rb") as fh:
+        header = fh.read(256)
+    if _checkpoint_header_is_known_text_placeholder(header):
+        raise RuntimeError(
+            f"Invalid OTFlow checkpoint at {path}: file looks like text or a pointer, "
+            f"not {expected_identity}."
+        )
+    try:
+        payload = torch.load(str(path), map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Invalid OTFlow checkpoint at {path} ({size_bytes} bytes; expected {expected_identity}): "
+            f"torch.load failed with {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(payload, MappingABC):
+        raise RuntimeError(
+            f"Invalid OTFlow checkpoint at {path}: expected a mapping payload for {expected_identity}, "
+            f"found {type(payload).__name__}."
+        )
+    missing_keys = sorted({"cfg", "model_state"} - set(payload.keys()))
+    if missing_keys:
+        raise RuntimeError(
+            f"Invalid OTFlow checkpoint at {path}: missing required keys {missing_keys} "
+            f"for {expected_identity}."
+        )
+    return payload
+
+
 def load_checkpoint_model(ckpt_path: Path, device: torch.device) -> Tuple[OTFlow, Any]:
     from genode.models.config import OTFlowConfig
 
-    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    ckpt = load_otflow_checkpoint_payload(ckpt_path, expected_identity="OTFlow model checkpoint")
     cfg_dict = ckpt["cfg"]
     cfg = OTFlowConfig()
     section_types = {
