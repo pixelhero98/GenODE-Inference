@@ -809,6 +809,32 @@ class GenericContextGipoTests(unittest.TestCase):
         backbone_command = next(command for command in commands if "genode.training.train_backbone" in command)
         self.assertIn("--checkpoint_export_mode exact_budget", backbone_command)
 
+    def test_full_pipeline_passes_backbone_manifest_to_molecule_training(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "molecule_3d_set1",
+                    "--run_root",
+                    str(Path(tmpdir) / "run"),
+                    "--molecule_group_root",
+                    str(Path(tmpdir) / "groups"),
+                    "--molecule_backbone_root",
+                    str(Path(tmpdir) / "molecule_backbones"),
+                    "--backbone_manifest",
+                    str(Path(tmpdir) / "matrix" / "backbone_manifest.json"),
+                    "--checkpoint_steps",
+                    "4000,8000",
+                ]
+            )
+            member = {"stratum": "Dynamic_A", "processed_dir": "Dynamic_A", "trainable": True}
+            with mock.patch.object(full_pipeline, "load_molecule_group_manifest", return_value={"strata": [member]}):
+                commands = full_pipeline._backbone_training_commands(args, "molecule_3d_set1", "4000,8000")
+
+        command = " ".join(str(part) for part in commands[0])
+        self.assertIn("--backbone_manifest", command)
+        self.assertIn(str(Path(tmpdir) / "matrix" / "backbone_manifest.json"), command)
+
     def test_full_pipeline_zero_shot_stage_does_not_use_unseen_selection_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             args = full_pipeline.build_argparser().parse_args(

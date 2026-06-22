@@ -502,6 +502,8 @@ def _backbone_training_commands(args: argparse.Namespace, dataset: str, checkpoi
                     _molecule_processed_dir_arg(group_root, str(dataset), member),
                     "--out_dir",
                     str(args.molecule_backbone_root),
+                    "--backbone_manifest",
+                    str(args.backbone_manifest),
                     "--molecule_group_root",
                     group_root,
                     "--steps",

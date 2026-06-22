@@ -264,6 +264,10 @@ class MoleculeBackboneTests(unittest.TestCase):
     def test_molecule_training_exports_validation_selected_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            project_outputs = root / "project_outputs"
+            sentinel_manifest = project_outputs / "backbone_matrix" / "backbone_manifest.json"
+            sentinel_manifest.parent.mkdir(parents=True, exist_ok=True)
+            sentinel_manifest.write_text("sentinel", encoding="utf-8")
             fake_model = torch.nn.Linear(1, 1)
             fake_model.step = 0  # type: ignore[attr-defined]
 
@@ -360,6 +364,10 @@ class MoleculeBackboneTests(unittest.TestCase):
                 train_molecule_module,
                 "_evaluate_iso_balanced_loss",
                 return_value={"loss": 1.0, "examples": 2, "iso_count": 1},
+            ), patch.object(
+                train_molecule_module,
+                "project_outputs_root",
+                return_value=project_outputs,
             ):
                 summary = train_molecule_module.train_molecule_backbone(args)
 
@@ -372,6 +380,9 @@ class MoleculeBackboneTests(unittest.TestCase):
             self.assertEqual(metadata["selection"]["selection_metric"], "clean_validation_loss")
             self.assertEqual(metadata["selection"]["selected_step"], 2)
             self.assertNotIn(str(root), json.dumps(metadata))
+            self.assertEqual(sentinel_manifest.read_text(encoding="utf-8"), "sentinel")
+            self.assertEqual(Path(summary["manifest_path"]), Path("backbone_manifest.json"))
+            self.assertTrue((root / "outputs" / "backbone_matrix" / "backbone_manifest.json").exists())
 
     def test_molecule_evaluation_reuses_checkpoint_stats_and_resolves_default_processed_dir(self) -> None:
         cfg = molecule_xyz.configure_molecule_otflow(

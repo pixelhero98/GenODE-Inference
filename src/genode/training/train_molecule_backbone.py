@@ -54,6 +54,15 @@ def molecule_artifact_root(
     return out
 
 
+def _backbone_manifest_write_path(args: argparse.Namespace, molecule_backbone_root: Path) -> Path:
+    raw = str(getattr(args, "backbone_manifest", "") or "").strip()
+    if raw:
+        return resolve_project_path(raw)
+    resolved_root = Path(molecule_backbone_root).expanduser().resolve()
+    manifest_base = resolved_root.parent if resolved_root.name == "molecule_3d_backbones" else resolved_root
+    return manifest_base / "backbone_matrix" / "backbone_manifest.json"
+
+
 def _project_display_path(path: str | Path) -> str:
     resolved = Path(path).expanduser().resolve()
     try:
@@ -444,11 +453,14 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         stratum=stratum,
     )
     molecule_backbone_root = project_outputs_root() / "molecule_3d_backbones" if args.out_dir is None else resolve_project_path(str(args.out_dir))
+    manifest_path = _backbone_manifest_write_path(args, molecule_backbone_root)
     manifest = materialize_backbone_manifest(
+        matrix_root=manifest_path.parent,
         budget_steps=budget_steps,
         seed=int(args.seed),
         molecule_backbone_root=molecule_backbone_root,
         molecule_group_root=None if getattr(args, "molecule_group_root", None) is None else resolve_project_path(str(args.molecule_group_root)),
+        write_path=manifest_path,
     )
     summary = {
         "status": "ready",
@@ -464,7 +476,7 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         "selection_score": float(final_candidate["score"]),
         "validation": final_candidate["validation"],
         "budget_artifacts": budget_artifacts,
-        "manifest_path": _project_display_path(project_outputs_root() / "backbone_matrix" / "backbone_manifest.json"),
+        "manifest_path": _project_display_path(manifest_path),
         "manifest_ready_count": int(manifest.get("ready_count", 0)),
         "split_examples": {
             "train": int(len(splits["train"])),
@@ -485,6 +497,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--zip_path", default=None)
     parser.add_argument("--processed_dir", default=None)
     parser.add_argument("--out_dir", default=None)
+    parser.add_argument("--backbone_manifest", default="")
     parser.add_argument("--molecule_group_root", default=None)
     parser.add_argument("--variant", default="")
     parser.add_argument("--device", default="auto")
