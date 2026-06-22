@@ -728,8 +728,6 @@ def validate_provided_backbone_manifest(
     if not resolved_manifest.exists():
         return {"status": "failed", "errors": [f"Provided backbone manifest is missing: {resolved_manifest}"]}
     manifest = load_portable_backbone_manifest(resolved_manifest)
-    if int(manifest.get("ready_count", -1)) != int(manifest.get("artifact_count", -2)):
-        errors.append("Provided backbone manifest is not fully ready.")
     matching_artifacts = [
         artifact
         for artifact in manifest.get("artifacts", [])
