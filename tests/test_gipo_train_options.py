@@ -13,7 +13,7 @@ from genode.canonical_experiment_layout import (
     SCENARIO_FAMILY_FORECAST,
 )
 from genode.gipo.objectives import CONDITIONAL_PRIMARY_LOB_METRIC_SPECS, FORECAST_METRIC_SPECS
-from genode.gipo.policy import save_context_embedding_table
+from genode.gipo.policy import GIPO_PROTOCOL, save_context_embedding_table
 from genode.gipo.train_gipo import _resolve_teacher_metric_target_keys, build_argparser, train_gipo
 
 
@@ -29,7 +29,9 @@ ROW_FIELDS = (
     "context_id",
     "series_id",
     "target_t",
+    "gipo_reward_protocol",
     "u_comp_uniform",
+    "u_alt_uniform",
 )
 
 
@@ -58,7 +60,9 @@ def _write_rows(
                             "context_id": context_id,
                             "series_id": f"series_{ctx_idx}",
                             "target_t": 100 + ctx_idx,
+                            "gipo_reward_protocol": GIPO_PROTOCOL,
                             "u_comp_uniform": float(schedule_idx),
+                            "u_alt_uniform": "",
                         }
                     )
 
@@ -120,6 +124,8 @@ class GipoTrainOptionsTests(unittest.TestCase):
 
         self.assertEqual(args.seen_target_nfe_values, "4,8,12,16")
         self.assertEqual(args.pseudo_target_nfe_values, "6,10,14,20")
+        self.assertEqual(args.teacher_metric_min_coverage_fraction, 1.0)
+        self.assertEqual(args.teacher_metric_min_valid_rows, 1)
 
     def test_auto_teacher_targets_fall_back_from_noncanonical_dataset_keys(self) -> None:
         args = argparse.Namespace(teacher_metric_target_keys="auto")
@@ -165,6 +171,79 @@ class GipoTrainOptionsTests(unittest.TestCase):
         self.assertEqual(summary["status"], "dry_run")
         self.assertEqual(summary["seen_target_nfe_values"], [5, 7])
         self.assertEqual(summary["canonical_seen_nfes"], list(CANONICAL_SEEN_NFES))
+
+    def test_dry_run_reports_split_normalizer_scopes_and_effective_selection_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            rows_csv = root / "seen.csv"
+            embeddings_npz = root / "ctx.npz"
+            _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES)
+            _write_embeddings(embeddings_npz)
+
+            summary = train_gipo(
+                _trainer_args(
+                    root,
+                    rows_csv,
+                    embeddings_npz,
+                    "--teacher_density_holdout_schedule_keys",
+                    "late_power_3",
+                )
+            )
+
+        self.assertEqual(summary["teacher_selection_nominal_axis_weights"], {"context": 0.25, "density_family": 0.25, "unseen_nfe": 0.5})
+        self.assertEqual(summary["teacher_selection_effective_axis_weights"], {"context": 0.5, "density_family": 0.5, "unseen_nfe": 0.0})
+        self.assertEqual(summary["teacher_selection_inactive_axes"], ["unseen_nfe"])
+        scopes = summary["normalizer_fit_scopes"]
+        self.assertEqual(scopes["protocol"], "selector_final_normalizer_scopes_v1")
+        self.assertEqual(scopes["selector"]["embedding"]["row_count"], 4)
+        self.assertEqual(scopes["selector"]["embedding"]["context_count"], 1)
+        self.assertEqual(scopes["selector"]["embedding"]["schedule_count"], 1)
+        self.assertEqual(scopes["final"]["embedding"]["row_count"], 16)
+        self.assertEqual(scopes["final"]["embedding"]["context_count"], 2)
+        self.assertEqual(scopes["final"]["embedding"]["schedule_count"], 2)
+        self.assertIn("membership_hash", scopes["selector"]["embedding"])
+        self.assertNotEqual(
+            scopes["selector"]["embedding"]["membership_hash"],
+            scopes["final"]["embedding"]["membership_hash"],
+        )
+
+    def test_teacher_metric_coverage_is_strict_by_default_and_summarized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            rows_csv = root / "seen.csv"
+            embeddings_npz = root / "ctx.npz"
+            _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES)
+            _write_embeddings(embeddings_npz)
+
+            with self.assertRaisesRegex(ValueError, r"Teacher metric target coverage failed.*u_alt_uniform"):
+                train_gipo(
+                    _trainer_args(
+                        root,
+                        rows_csv,
+                        embeddings_npz,
+                        "--teacher_metric_target_keys",
+                        "u_comp_uniform,u_alt_uniform",
+                    )
+                )
+
+            summary = train_gipo(
+                _trainer_args(
+                    root,
+                    rows_csv,
+                    embeddings_npz,
+                    "--teacher_metric_target_keys",
+                    "u_comp_uniform,u_alt_uniform",
+                    "--teacher_metric_min_coverage_fraction",
+                    "0",
+                    "--teacher_metric_min_valid_rows",
+                    "0",
+                )
+            )
+
+        coverage = summary["teacher_metric_target_coverage"]
+        self.assertEqual(coverage["thresholds"], {"min_coverage_fraction": 0.0, "min_valid_rows": 0})
+        self.assertEqual(coverage["scopes"]["rows_csv"]["metrics"]["u_comp_uniform"]["valid_row_count"], 16)
+        self.assertEqual(coverage["scopes"]["rows_csv"]["metrics"]["u_alt_uniform"]["valid_row_count"], 0)
 
     def test_pseudo_target_nfe_values_filter_rows_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

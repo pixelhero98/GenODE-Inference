@@ -27,7 +27,7 @@ from genode.data.otflow_experiment_plan import (
     canonical_forecast_paper_dataset_keys,
     experiment_plan_by_key,
 )
-from genode.data.otflow_medical_datasets import LONG_TERM_ST_DATASET_KEY
+from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 from genode.data.otflow_monash_datasets import get_monash_dataset_spec, monash_paper_dataset_keys
 from genode.evaluation import otflow_evaluation_support as eval_support
 from genode.evaluation.fm_backbone_registry import CONDITIONAL_GENERATION_FAMILY

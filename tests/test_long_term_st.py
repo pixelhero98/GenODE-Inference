@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 import numpy as np
 
+from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 from genode.data.otflow_medical_datasets import (
-    LONG_TERM_ST_DATASET_KEY,
     LazyLongTermSTConditionalDataset,
     LongTermSTSeriesSpec,
     _validate_long_term_st_manifest,

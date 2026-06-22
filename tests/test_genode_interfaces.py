@@ -68,6 +68,7 @@ class GenODEInterfaceTests(unittest.TestCase):
             "genode-train-molecule-backbone",
             "genode-eval-molecule-backbone",
             "genode-train-gipo",
+            "genode-preflight-gipo-rows",
             "genode-report-gipo-locked-test",
             "genode-build-ser-ptg-reference",
             "genode-evaluate-schedule-summary",

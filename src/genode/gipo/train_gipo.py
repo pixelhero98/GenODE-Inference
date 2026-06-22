@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -45,7 +46,6 @@ from genode.gipo.policy import (
     TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
     TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
     DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS,
-    DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS,
     TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
     STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE,
     ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
@@ -86,6 +86,11 @@ from genode.gipo.policy import (
 )
 from genode.gipo.density_representation import density_metadata, reference_grid_hash, uniform_reference_grid
 from genode.gipo.density_representation import average_density_masses, density_mass_to_time_grid, grid_to_density_mass
+from genode.gipo.preflight import (
+    build_gipo_support_preflight_report,
+    teacher_metric_target_coverage,
+    validate_gipo_support_preflight_report,
+)
 from genode.gipo.models import (
     SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config_for_rows,
@@ -106,6 +111,10 @@ CANONICAL_TEACHER_SELECTION_COMPONENT_WEIGHTS: Dict[str, float] = {
     "density_family": 0.25,
     "unseen_nfe": 0.50,
 }
+TEACHER_SELECTION_AXIS_ORDER: Tuple[str, ...] = ("context", "density_family", "unseen_nfe")
+GIPO_PREPROCESSING_PROTOCOL = "selector_final_normalizer_scopes_v1"
+GIPO_TEACHER_TARGET_COVERAGE_PROTOCOL = "strict_per_metric_finite_coverage_v1"
+GIPO_TEACHER_SELECTION_WEIGHT_PROTOCOL = "nominal_effective_axis_weights_v1"
 CANONICAL_TEACHER_RANK_TEMPERATURE = 0.5
 CANONICAL_TEACHER_REGRESSION_WEIGHT = 0.25
 CANONICAL_TEACHER_PAIR_MARGIN = 0.0
@@ -299,15 +308,15 @@ def _select_weighted_normalized_regret_step(
             "unseen_nfe_holdout": dict(unseen_diagnostics.get("unseen_nfe_holdout", {}) or {}),
         }
         combined_history.append({"step": int(step), "diagnostics": diagnostics})
-    weights = {key: float(component_weights.get(key, 0.0)) for key in DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS}
-    total = sum(weights.values())
-    if total <= 0.0:
-        raise ValueError("Weighted normalized-regret checkpoint selection requires a positive component weight total.")
-    weights = {key: value / total for key, value in weights.items()}
+    weight_summary = _teacher_selection_weight_summary(
+        component_weights,
+        active_axes=("context", "density_family", "unseen_nfe"),
+    )
+    effective_weights = dict(weight_summary["effective_axis_weights"])
     split_weights = {
-        "context": float(weights["context"]),
-        "density_family": float(weights["density_family"]),
-        "unseen_nfe_holdout": float(weights["unseen_nfe"]),
+        "context": float(effective_weights["context"]),
+        "density_family": float(effective_weights["density_family"]),
+        "unseen_nfe_holdout": float(effective_weights["unseen_nfe"]),
     }
     selection = select_weighted_normalized_regret_checkpoint(
         combined_history,
@@ -316,7 +325,10 @@ def _select_weighted_normalized_regret_step(
     )
     return {
         **selection,
-        "selection_component_axis_weights": dict(weights),
+        "selection_component_axis_weights": dict(effective_weights),
+        "selection_nominal_axis_weights": dict(weight_summary["nominal_axis_weights"]),
+        "selection_effective_axis_weights": dict(effective_weights),
+        "selection_inactive_axes": list(weight_summary["inactive_axes"]),
         "uses_unseen_nfe_selection_diagnostics": True,
         "component_histories": {
             "context_density": context_density_training.get("teacher_checkpoint_selection", {}).get("history", []),
@@ -334,16 +346,14 @@ def _select_context_density_regret_step(
     if not context_history:
         raise ValueError("Context/density checkpoint selection found no eligible checkpoint steps.")
     required_splits = ("context_disjoint", "density_family_holdout")
-    adjusted_weights = {
-        "context": float(component_weights.get("context", 0.0)),
-        "density_family": float(component_weights.get("density_family", 0.0)),
-    }
-    total = sum(adjusted_weights.values())
-    if total <= 0.0:
-        raise ValueError("Context/density checkpoint selection requires positive context or density weights.")
+    weight_summary = _teacher_selection_weight_summary(
+        component_weights,
+        active_axes=("context", "density_family"),
+    )
+    effective_weights = dict(weight_summary["effective_axis_weights"])
     split_weights = {
-        "context": adjusted_weights["context"] / total,
-        "density_family": adjusted_weights["density_family"] / total,
+        "context": float(effective_weights["context"]),
+        "density_family": float(effective_weights["density_family"]),
     }
     selection = select_weighted_normalized_regret_checkpoint(
         [{"step": int(step), "diagnostics": dict(entry.get("diagnostics", {}) or {})} for step, entry in sorted(context_history.items())],
@@ -352,7 +362,10 @@ def _select_context_density_regret_step(
     )
     return {
         **selection,
-        "selection_component_axis_weights": dict(split_weights),
+        "selection_component_axis_weights": dict(effective_weights),
+        "selection_nominal_axis_weights": dict(weight_summary["nominal_axis_weights"]),
+        "selection_effective_axis_weights": dict(effective_weights),
+        "selection_inactive_axes": list(weight_summary["inactive_axes"]),
         "uses_unseen_nfe_selection_diagnostics": False,
         "component_histories": {
             "context_density": context_density_training.get("teacher_checkpoint_selection", {}).get("history", []),
@@ -440,6 +453,20 @@ def _stable_hash(values: Sequence[str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _row_membership_key(row: Mapping[str, Any]) -> str:
+    payload = {
+        "dataset": str(row.get("dataset", row.get("dataset_key", ""))),
+        "solver_key": normalize_solver_key(str(row.get("solver_key", ""))),
+        "target_nfe": int(row["target_nfe"]),
+        "context_id": context_id_from_row(row),
+        "context_embedding_id": context_embedding_id_from_row(row),
+        "seed": str(row.get("seed", "")),
+        "checkpoint_id": str(row.get("checkpoint_id", "") or ""),
+        "scheduler_key": str(row["scheduler_key"]),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
 def _split_membership_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     context_ids = sorted({context_id_from_row(row) for row in rows})
     series_keys = sorted({series_key_from_row(row) for row in rows})
@@ -456,6 +483,28 @@ def _split_membership_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, An
     }
 
 
+def _normalizer_fit_scope_summary(scope: str, rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    context_ids = sorted({context_id_from_row(row) for row in rows})
+    embedding_ids = sorted(_embedding_ids(rows))
+    series_keys = sorted({series_key_from_row(row) for row in rows})
+    schedule_keys = sorted({str(row["scheduler_key"]) for row in rows})
+    row_keys = sorted(_row_membership_key(row) for row in rows)
+    return {
+        "scope": str(scope),
+        "row_count": int(len(rows)),
+        "context_count": int(len(context_ids)),
+        "embedding_count": int(len(embedding_ids)),
+        "series_count": int(len(series_keys)),
+        "schedule_count": int(len(schedule_keys)),
+        "context_id_hash": _stable_hash(context_ids),
+        "embedding_id_hash": _stable_hash(embedding_ids),
+        "series_key_hash": _stable_hash(series_keys),
+        "schedule_key_hash": _stable_hash(schedule_keys),
+        "row_membership_hash": _stable_hash(row_keys),
+        "membership_hash": _stable_hash(row_keys),
+    }
+
+
 def _split_counts(rows: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
     from genode.gipo.policy import series_key_from_row
 
@@ -464,6 +513,109 @@ def _split_counts(rows: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
         "context_count": int(len({context_id_from_row(row) for row in rows})),
         "series_count": int(len({series_key_from_row(row) for row in rows})),
         "schedule_count": int(len({str(row["scheduler_key"]) for row in rows})),
+    }
+
+
+def _finite_metric_target_present(row: Mapping[str, Any], key: str) -> bool:
+    value = row.get(key, None)
+    if value is None:
+        return False
+    if isinstance(value, str) and value.strip() == "":
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _teacher_metric_coverage_summary(
+    rows: Sequence[Mapping[str, Any]],
+    target_keys: Sequence[str],
+    *,
+    scope: str,
+) -> Dict[str, Any]:
+    row_count = int(len(rows))
+    raw_coverage = teacher_metric_target_coverage(rows, target_keys)
+    metrics: Dict[str, Dict[str, Any]] = {}
+    for key, item in raw_coverage.items():
+        valid_count = int(item["valid_count"])
+        metrics[str(key)] = {
+            "valid_row_count": valid_count,
+            "applicable_row_count": int(item["applicable_count"]),
+            "missing_row_count": int(item["missing_count"]),
+            "nonfinite_row_count": int(item["nonfinite_count"]),
+            "inapplicable_row_count": int(item["inapplicable_count"]),
+            "missing_or_invalid_row_count": int(item["missing_count"]) + int(item["nonfinite_count"]),
+            "coverage_fraction": float(item["coverage_fraction"]),
+        }
+    all_target_valid_count = int(
+        sum(1 for row in rows if all(_finite_metric_target_present(row, key) for key in target_keys))
+    )
+    any_target_valid_count = int(
+        sum(1 for row in rows if any(_finite_metric_target_present(row, key) for key in target_keys))
+    )
+    return {
+        "scope": str(scope),
+        "row_count": row_count,
+        "metric_count": int(len(tuple(target_keys))),
+        "all_target_valid_row_count": all_target_valid_count,
+        "any_target_valid_row_count": any_target_valid_count,
+        "metrics": metrics,
+    }
+
+
+def _validate_teacher_metric_coverage(
+    coverage: Mapping[str, Any],
+    *,
+    min_coverage_fraction: float,
+    min_valid_rows: int,
+) -> None:
+    failures: List[str] = []
+    for key, item in dict(coverage.get("metrics", {}) or {}).items():
+        valid_count = int(dict(item).get("valid_row_count", 0))
+        fraction = float(dict(item).get("coverage_fraction", 0.0))
+        if valid_count < int(min_valid_rows) or fraction + 1e-12 < float(min_coverage_fraction):
+            failures.append(
+                f"{key}: valid_rows={valid_count}/{int(coverage.get('row_count', 0))}, "
+                f"coverage={fraction:.6g}"
+            )
+    if failures:
+        raise ValueError(
+            f"Teacher metric target coverage failed for {coverage.get('scope', 'rows')}: "
+            f"min_coverage_fraction={float(min_coverage_fraction):.6g}, "
+            f"min_valid_rows={int(min_valid_rows)}, failures={failures}."
+        )
+
+
+def _normalized_teacher_selection_axis_weights(component_weights: Mapping[str, float]) -> Dict[str, float]:
+    raw = {axis: max(0.0, float(component_weights.get(axis, 0.0))) for axis in TEACHER_SELECTION_AXIS_ORDER}
+    total = float(sum(raw.values()))
+    if total <= 0.0:
+        raise ValueError("Teacher selection axis weights require a positive total.")
+    return {axis: float(value / total) for axis, value in raw.items()}
+
+
+def _teacher_selection_weight_summary(
+    component_weights: Mapping[str, float],
+    *,
+    active_axes: Sequence[str],
+) -> Dict[str, Any]:
+    nominal = _normalized_teacher_selection_axis_weights(component_weights)
+    active_set = {str(axis) for axis in active_axes if str(axis) in set(TEACHER_SELECTION_AXIS_ORDER)}
+    inactive_axes = [axis for axis in TEACHER_SELECTION_AXIS_ORDER if axis not in active_set]
+    active_total = float(sum(nominal[axis] for axis in active_set))
+    if active_set and active_total <= 0.0:
+        raise ValueError("Teacher selection active axes have zero nominal weight.")
+    effective = {
+        axis: float(nominal[axis] / active_total) if axis in active_set and active_total > 0.0 else 0.0
+        for axis in TEACHER_SELECTION_AXIS_ORDER
+    }
+    return {
+        "protocol": GIPO_TEACHER_SELECTION_WEIGHT_PROTOCOL,
+        "nominal_axis_weights": nominal,
+        "effective_axis_weights": effective,
+        "inactive_axes": inactive_axes,
+        "active_axes": [axis for axis in TEACHER_SELECTION_AXIS_ORDER if axis in active_set],
     }
 
 
@@ -679,6 +831,18 @@ def build_argparser() -> argparse.ArgumentParser:
         default="",
         help="Optional comma-separated name=value weights for --teacher_metric_target_keys.",
     )
+    parser.add_argument(
+        "--teacher_metric_min_coverage_fraction",
+        type=float,
+        default=1.0,
+        help="Minimum finite-row coverage required for each requested teacher metric before training.",
+    )
+    parser.add_argument(
+        "--teacher_metric_min_valid_rows",
+        type=int,
+        default=1,
+        help="Minimum finite rows required for each requested teacher metric before training.",
+    )
     parser.add_argument("--student_weight_decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
@@ -752,6 +916,17 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         teacher_metric_target_keys,
         normalize_teacher_utility_weights(teacher_metric_target_keys, explicit_teacher_weights),
     )
+    teacher_metric_min_coverage_fraction = float(getattr(args, "teacher_metric_min_coverage_fraction", 1.0))
+    if (
+        not math.isfinite(teacher_metric_min_coverage_fraction)
+        or teacher_metric_min_coverage_fraction < 0.0
+        or teacher_metric_min_coverage_fraction > 1.0
+    ):
+        raise ValueError("teacher_metric_min_coverage_fraction must be finite and in [0, 1].")
+    teacher_metric_min_valid_rows = int(getattr(args, "teacher_metric_min_valid_rows", 1))
+    if teacher_metric_min_valid_rows < 0:
+        raise ValueError("teacher_metric_min_valid_rows must be nonnegative.")
+    teacher_metric_coverage_scopes: Dict[str, Any] = {}
     if _needs_forecast_uniform_rewards(rows, teacher_metric_target_keys):
         rewarded_rows = attach_uniform_gipo_rewards(
             rows,
@@ -768,6 +943,17 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     missing_metric_columns = _missing_target_value_keys(rewarded_rows, teacher_metric_target_keys)
     if len(missing_metric_columns) == len(teacher_metric_target_keys):
         raise ValueError(f"GIPO rows are missing all teacher metric target columns: {missing_metric_columns}")
+    primary_metric_coverage = _teacher_metric_coverage_summary(
+        rewarded_rows,
+        teacher_metric_target_keys,
+        scope="rows_csv",
+    )
+    _validate_teacher_metric_coverage(
+        primary_metric_coverage,
+        min_coverage_fraction=teacher_metric_min_coverage_fraction,
+        min_valid_rows=teacher_metric_min_valid_rows,
+    )
+    teacher_metric_coverage_scopes["rows_csv"] = primary_metric_coverage
     available_context_ids = sorted({context_id_from_row(row) for row in rewarded_rows})
     sample_count = int(args.context_sample_count)
     if sample_count <= 0:
@@ -846,6 +1032,17 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         missing_unseen_columns = _missing_target_value_keys(unseen_rewarded_rows, teacher_metric_target_keys)
         if len(missing_unseen_columns) == len(teacher_metric_target_keys):
             raise ValueError(f"Teacher unseen selection rows are missing all metric target columns: {missing_unseen_columns}")
+        unseen_metric_coverage = _teacher_metric_coverage_summary(
+            unseen_rewarded_rows,
+            teacher_metric_target_keys,
+            scope="teacher_unseen_selection_rows_csv",
+        )
+        _validate_teacher_metric_coverage(
+            unseen_metric_coverage,
+            min_coverage_fraction=teacher_metric_min_coverage_fraction,
+            min_valid_rows=teacher_metric_min_valid_rows,
+        )
+        teacher_metric_coverage_scopes["teacher_unseen_selection_rows_csv"] = unseen_metric_coverage
         unseen_context_ids = set(
             sample_context_ids_stratified(
                 unseen_rewarded_rows,
@@ -888,15 +1085,28 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("Final teacher fitting requires at least one eligible non-test calibration row.")
     setting_encoder_config = setting_encoder_config_for_rows(final_fit_rows, mode=setting_feature_mode)
 
+    density_family_diagnostic_rows = [dict(row) for row in density_holdout_rows]
+    unseen_nfe_diagnostic_rows = _rows_without_schedule_keys(unseen_selection_rows, density_holdout_keys)
     context_embeddings = _load_context_embedding_tables(str(args.context_embeddings_npz))
     fit_rows = final_fit_rows
     fit_context_ids = sorted({context_id_from_row(row) for row in fit_rows})
-    fit_embedding_ids = sorted(_embedding_ids(fit_rows))
-    embedding_normalizer = EmbeddingNormalizer.fit(context_embeddings, fit_embedding_ids)
-    normalized_embeddings = embedding_normalizer.transform_table(context_embeddings)
-    missing_embeddings = sorted(_embedding_ids(sampled_rows) - set(normalized_embeddings))
-    if missing_embeddings:
-        raise KeyError(f"Context embeddings are missing sampled contexts: {missing_embeddings[:8]}")
+    final_embedding_ids = sorted(_embedding_ids(fit_rows))
+    selector_embedding_ids = sorted(_embedding_ids(selector_fit_rows))
+    final_embedding_normalizer = EmbeddingNormalizer.fit(context_embeddings, final_embedding_ids)
+    selector_embedding_normalizer = EmbeddingNormalizer.fit(context_embeddings, selector_embedding_ids)
+    final_normalized_embeddings = final_embedding_normalizer.transform_table(context_embeddings)
+    selector_normalized_embeddings = selector_embedding_normalizer.transform_table(context_embeddings)
+    missing_final_embeddings = sorted(_embedding_ids(sampled_rows) - set(final_normalized_embeddings))
+    if missing_final_embeddings:
+        raise KeyError(f"Context embeddings are missing sampled contexts: {missing_final_embeddings[:8]}")
+    selector_required_rows = [
+        *selector_fit_rows,
+        *context_holdout_diagnostic_rows,
+        *density_family_diagnostic_rows,
+    ]
+    missing_selector_embeddings = sorted(_embedding_ids(selector_required_rows) - set(selector_normalized_embeddings))
+    if missing_selector_embeddings:
+        raise KeyError(f"Selector context embeddings are missing sampled contexts: {missing_selector_embeddings[:8]}")
     if unseen_selection_rows:
         unseen_embeddings_path = str(args.teacher_unseen_selection_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
         unseen_raw_embeddings = _load_context_embedding_tables(unseen_embeddings_path)
@@ -904,10 +1114,12 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         if missing_unseen_embeddings:
             raise KeyError(f"Unseen selection context embeddings are missing contexts: {missing_unseen_embeddings[:8]}")
         _merge_embedding_tables_guarded(
-            normalized_embeddings,
-            embedding_normalizer.transform_table(unseen_raw_embeddings),
+            selector_normalized_embeddings,
+            selector_embedding_normalizer.transform_table(unseen_raw_embeddings),
             label="teacher_unseen_selection",
         )
+    embedding_normalizer = final_embedding_normalizer
+    normalized_embeddings = final_normalized_embeddings
 
     series_index_map = build_series_index_map(fit_rows)
     fit_series_keys = sorted({series_key_from_row(row) for row in fit_rows})
@@ -918,15 +1130,21 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     unseen_schedule_summary_paths = _parse_csv(str(args.teacher_unseen_selection_schedule_summary_json))
     if unseen_schedule_summary_paths:
         schedule_grids.update(_load_schedule_summary_grids(unseen_schedule_summary_paths))
-    density_normalizer = DensityFeatureNormalizer.fit(
+    selector_density_normalizer = DensityFeatureNormalizer.fit(
+        (
+            density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
+            for row in selector_fit_rows
+        ),
+        reference_time_grid=reference_time_grid,
+    )
+    final_density_normalizer = DensityFeatureNormalizer.fit(
         (
             density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
             for row in fit_rows
         ),
         reference_time_grid=reference_time_grid,
     )
-    density_family_diagnostic_rows = [dict(row) for row in density_holdout_rows]
-    unseen_nfe_diagnostic_rows = _rows_without_schedule_keys(unseen_selection_rows, density_holdout_keys)
+    density_normalizer = final_density_normalizer
     student_teacher_score_weight = float(getattr(args, "student_teacher_score_weight", DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT))
     if not np.isfinite(student_teacher_score_weight) or student_teacher_score_weight < 0.0:
         raise ValueError("student_teacher_score_weight must be finite and nonnegative.")
@@ -994,6 +1212,17 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         missing_pseudo_columns = _missing_target_value_keys(pseudo_source_rows, teacher_metric_target_keys)
         if len(missing_pseudo_columns) == len(teacher_metric_target_keys):
             raise ValueError(f"Student pseudo distillation rows are missing all metric target columns: {missing_pseudo_columns}")
+        pseudo_metric_coverage = _teacher_metric_coverage_summary(
+            pseudo_source_rows,
+            teacher_metric_target_keys,
+            scope="student_pseudo_rows_csv",
+        )
+        _validate_teacher_metric_coverage(
+            pseudo_metric_coverage,
+            min_coverage_fraction=teacher_metric_min_coverage_fraction,
+            min_valid_rows=teacher_metric_min_valid_rows,
+        )
+        teacher_metric_coverage_scopes["student_pseudo_rows_csv"] = pseudo_metric_coverage
         pseudo_context_ids = set(
             sample_context_ids_stratified(
                 pseudo_source_rows,
@@ -1038,17 +1267,32 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             raise ValueError("student validation CE checkpoint selection requires non-empty selector fit and validation rows.")
 
     density_meta = density_metadata(reference_time_grid)
-    transformer_model_config = {
+    base_transformer_model_config = {
         "hidden_dim": int(args.transformer_hidden_dim),
         "hidden_layers": int(args.transformer_layers),
         "attention_heads": int(args.transformer_heads),
         "dropout": float(args.transformer_dropout),
         "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
-        "density_feature_mean": density_normalizer.mean.astype(float).tolist(),
-        "density_feature_std": density_normalizer.std.astype(float).tolist(),
     }
+
+    def _transformer_model_config_for(normalizer: DensityFeatureNormalizer) -> Dict[str, Any]:
+        return {
+            **base_transformer_model_config,
+            "density_feature_mean": normalizer.mean.astype(float).tolist(),
+            "density_feature_std": normalizer.std.astype(float).tolist(),
+        }
+
+    transformer_model_config = _transformer_model_config_for(final_density_normalizer)
     teacher_transformer_model_config = {
         **transformer_model_config,
+        "conditioning_style": conditioning_style,
+        "teacher_metric_targets": list(teacher_metric_target_keys),
+        "teacher_metric_target_protocol": TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
+        "teacher_metric_mask_protocol": TEACHER_METRIC_MASK_PROTOCOL,
+        "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
+    }
+    selector_teacher_transformer_model_config = {
+        **_transformer_model_config_for(selector_density_normalizer),
         "conditioning_style": conditioning_style,
         "teacher_metric_targets": list(teacher_metric_target_keys),
         "teacher_metric_target_protocol": TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
@@ -1059,7 +1303,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         **transformer_model_config,
         "conditioning_style": conditioning_style,
     }
-    def _build_teacher_instance(seed_offset: int = 0):
+
+    def _build_teacher_instance(seed_offset: int = 0, model_config: Mapping[str, Any] | None = None):
         seed_all(int(args.seed) + int(seed_offset))
         return build_gipo_teacher_model(
             architecture=ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
@@ -1067,7 +1312,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             density_dim=int(len(reference_time_grid) - 1),
             context_dim=context_dim,
             num_series=len(series_index_map),
-            model_config=teacher_transformer_model_config,
+            model_config=model_config or teacher_transformer_model_config,
         )
 
     def _build_student_instance(seed_offset: int = 0):
@@ -1080,6 +1325,44 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             num_series=len(series_index_map),
             model_config=student_transformer_model_config,
         )
+
+    active_selection_axes = []
+    if context_holdout_diagnostic_rows:
+        active_selection_axes.append("context")
+    if density_family_diagnostic_rows:
+        active_selection_axes.append("density_family")
+    if unseen_nfe_diagnostic_rows:
+        active_selection_axes.append("unseen_nfe")
+    teacher_selection_weight_metadata = _teacher_selection_weight_summary(
+        selection_component_weights,
+        active_axes=active_selection_axes,
+    )
+    normalizer_fit_scopes = {
+        "protocol": GIPO_PREPROCESSING_PROTOCOL,
+        "selector": {
+            "embedding": _normalizer_fit_scope_summary("selector_fit_rows", selector_fit_rows),
+            "density_feature": _normalizer_fit_scope_summary("selector_fit_rows", selector_fit_rows),
+        },
+        "final": {
+            "embedding": _normalizer_fit_scope_summary("final_fit_rows", final_fit_rows),
+            "density_feature": _normalizer_fit_scope_summary("final_fit_rows", final_fit_rows),
+        },
+    }
+    teacher_metric_target_coverage = {
+        "protocol": GIPO_TEACHER_TARGET_COVERAGE_PROTOCOL,
+        "thresholds": {
+            "min_coverage_fraction": float(teacher_metric_min_coverage_fraction),
+            "min_valid_rows": int(teacher_metric_min_valid_rows),
+        },
+        "scopes": teacher_metric_coverage_scopes,
+    }
+    gipo_protocol_metadata = {
+        "protocol_revision": "gipo_cleanup_selector_final_normalizers_strict_metric_coverage_v1",
+        "preprocessing_protocol": GIPO_PREPROCESSING_PROTOCOL,
+        "teacher_target_coverage_protocol": GIPO_TEACHER_TARGET_COVERAGE_PROTOCOL,
+        "teacher_selection_weight_protocol": GIPO_TEACHER_SELECTION_WEIGHT_PROTOCOL,
+        "model_payload_version": int(MODEL_PAYLOAD_VERSION),
+    }
 
     teacher = _build_teacher_instance(0)
     student = _build_student_instance(10_000)
@@ -1122,7 +1405,13 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_utility_weights": teacher_utility_weights,
         "teacher_checkpoint_selection_mode": selection_mode,
-        "teacher_selection_axis_weights": selection_component_weights,
+        "teacher_selection_axis_weights": dict(teacher_selection_weight_metadata["nominal_axis_weights"]),
+        "teacher_selection_nominal_axis_weights": dict(teacher_selection_weight_metadata["nominal_axis_weights"]),
+        "teacher_selection_effective_axis_weights": dict(teacher_selection_weight_metadata["effective_axis_weights"]),
+        "teacher_selection_inactive_axes": list(teacher_selection_weight_metadata["inactive_axes"]),
+        "teacher_selection_active_axes": list(teacher_selection_weight_metadata["active_axes"]),
+        "teacher_selection_weight_protocol": GIPO_TEACHER_SELECTION_WEIGHT_PROTOCOL,
+        "teacher_metric_target_coverage": teacher_metric_target_coverage,
         "teacher_loss_log_every": int(args.teacher_loss_log_every),
         "teacher_checkpoint_every": int(args.teacher_checkpoint_every),
         "student_checkpoint_selection_mode": student_selection_mode,
@@ -1136,6 +1425,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "setting_encoder_mode": setting_encoder_config.mode,
         "setting_encoder_config": setting_encoder_config.to_payload(),
         "density_representation": density_meta,
+        "normalizer_fit_scopes": normalizer_fit_scopes,
+        "gipo_protocol_metadata": gipo_protocol_metadata,
         "support_schedule_keys": list(support_keys),
         "canonical_seen_nfes": [int(value) for value in CANONICAL_SEEN_NFES],
         "canonical_unseen_nfes": [int(value) for value in CANONICAL_UNSEEN_NFES],
@@ -1243,15 +1534,15 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         if not pass_fit_rows:
             raise ValueError(f"{pass_name} teacher pass requires non-empty fit rows.")
         active_diagnostics = {name: [dict(row) for row in split] for name, split in diagnostic_splits.items() if split}
-        pass_teacher = _build_teacher_instance(seed_offset)
+        pass_teacher = _build_teacher_instance(seed_offset, selector_teacher_transformer_model_config)
         return train_gipo_teacher(
             pass_teacher,
             pass_fit_rows,
-            context_embeddings=normalized_embeddings,
+            context_embeddings=selector_normalized_embeddings,
             series_index_map=series_index_map,
             schedule_grids=schedule_grids,
             reference_time_grid=reference_time_grid,
-            density_normalizer=density_normalizer,
+            density_normalizer=selector_density_normalizer,
             steps=int(steps),
             lr=float(args.teacher_lr),
             rank_temperature=CANONICAL_TEACHER_RANK_TEMPERATURE,
@@ -1497,10 +1788,16 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "embedding_normalizer": embedding_normalizer.to_payload(),
             "density_feature_normalizer": density_normalizer.to_payload(),
             "density_representation": density_meta,
+            "normalizer_fit_scopes": normalizer_fit_scopes,
+            "gipo_protocol_metadata": gipo_protocol_metadata,
             "support_schedule_keys": list(support_keys),
             "seen_target_nfe_values": [int(value) for value in seen_target_nfes],
             "pseudo_target_nfe_values": [int(value) for value in pseudo_target_nfes],
             "teacher_utility_weights": teacher_utility_weights,
+            "teacher_metric_target_coverage": teacher_metric_target_coverage,
+            "teacher_selection_nominal_axis_weights": dict(teacher_selection_weight_metadata["nominal_axis_weights"]),
+            "teacher_selection_effective_axis_weights": dict(teacher_selection_weight_metadata["effective_axis_weights"]),
+            "teacher_selection_inactive_axes": list(teacher_selection_weight_metadata["inactive_axes"]),
             "teacher_training": teacher_training,
             "student_objective_settings": student_objective_settings,
             "student_target_summary": student_training.get("student_target_summary", {}),
@@ -1540,10 +1837,16 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "embedding_normalizer": embedding_normalizer.to_payload(),
             "density_feature_normalizer": density_normalizer.to_payload(),
             "density_representation": density_meta,
+            "normalizer_fit_scopes": normalizer_fit_scopes,
+            "gipo_protocol_metadata": gipo_protocol_metadata,
             "support_schedule_keys": list(support_keys),
             "seen_target_nfe_values": [int(value) for value in seen_target_nfes],
             "pseudo_target_nfe_values": [int(value) for value in pseudo_target_nfes],
             "teacher_utility_weights": teacher_utility_weights,
+            "teacher_metric_target_coverage": teacher_metric_target_coverage,
+            "teacher_selection_nominal_axis_weights": dict(teacher_selection_weight_metadata["nominal_axis_weights"]),
+            "teacher_selection_effective_axis_weights": dict(teacher_selection_weight_metadata["effective_axis_weights"]),
+            "teacher_selection_inactive_axes": list(teacher_selection_weight_metadata["inactive_axes"]),
             "teacher_checkpoint": teacher_path.name,
             "teacher_training": teacher_training,
             "student_training": student_training,
@@ -1567,6 +1870,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
 
     policy_id_payload = {
         "protocol": GIPO_PROTOCOL,
+        "gipo_protocol_metadata": gipo_protocol_metadata,
         "reference_grid_hash": reference_grid_hash(reference_time_grid),
         "support_schedule_keys": list(support_keys),
         "seen_target_nfe_values": [int(value) for value in seen_target_nfes],
@@ -1580,8 +1884,13 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
         "teacher_model_config": teacher_model_config,
         "student_model_config": student_model_config,
+        "normalizer_fit_scopes": normalizer_fit_scopes,
         "conditioning_style": conditioning_style,
         "teacher_utility_weights": teacher_utility_weights,
+        "teacher_metric_target_coverage": teacher_metric_target_coverage,
+        "teacher_selection_nominal_axis_weights": dict(teacher_selection_weight_metadata["nominal_axis_weights"]),
+        "teacher_selection_effective_axis_weights": dict(teacher_selection_weight_metadata["effective_axis_weights"]),
+        "teacher_selection_inactive_axes": list(teacher_selection_weight_metadata["inactive_axes"]),
         "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "teacher_checkpoint_selection_mode": selection_mode,
         "student_checkpoint_selection_mode": student_selection_mode,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import importlib.util
 import shutil
 import zipfile
 from dataclasses import dataclass
@@ -15,20 +16,20 @@ import torch
 from genode.models.config import OTFlowConfig
 from genode.data.otflow_medical_constants import (
     LONG_TERM_ST_DATASET_KEY,
+    LONG_TERM_ST_CONTEXT_SECONDS,
+    LONG_TERM_ST_DEFAULT_STRIDE,
+    LONG_TERM_ST_FREQUENCY_LABEL,
+    LONG_TERM_ST_HISTORY_LEN,
+    LONG_TERM_ST_HORIZON_LEN,
+    LONG_TERM_ST_HORIZON_SECONDS,
+    LONG_TERM_ST_SAMPLING_RATE_HZ,
+    LONG_TERM_ST_SOURCE_SAMPLING_RATE_HZ,
     default_long_term_st_data_path,
     default_long_term_st_manifest_path,
 )
 
 DEFAULT_MEDICAL_STAGING_ROOT: Path | None = None
 
-LONG_TERM_ST_SOURCE_SAMPLING_RATE_HZ = 250.0
-LONG_TERM_ST_SAMPLING_RATE_HZ = 100.0
-LONG_TERM_ST_FREQUENCY_LABEL = "100_hz"
-LONG_TERM_ST_CONTEXT_SECONDS = 120
-LONG_TERM_ST_HORIZON_SECONDS = 30
-LONG_TERM_ST_HISTORY_LEN = int(LONG_TERM_ST_CONTEXT_SECONDS * LONG_TERM_ST_SAMPLING_RATE_HZ)
-LONG_TERM_ST_HORIZON_LEN = int(LONG_TERM_ST_HORIZON_SECONDS * LONG_TERM_ST_SAMPLING_RATE_HZ)
-LONG_TERM_ST_DEFAULT_STRIDE = LONG_TERM_ST_HORIZON_LEN
 LONG_TERM_ST_EXPECTED_RECORDS = 86
 LONG_TERM_ST_PATIENT_GROUPS: Tuple[Tuple[str, ...], ...] = (
     ("s20271", "s20272", "s20273", "s20274"),
@@ -146,6 +147,14 @@ def _coerce_archive_paths(archive_paths: Optional[Union[str, Path, Sequence[str 
             f"{long_term_st_raw_archive_dir()} or pass archive_paths explicitly."
         )
     return sorted(resolved)
+
+
+def _require_wfdb_for_long_term_st_preparation() -> None:
+    if importlib.util.find_spec("wfdb") is None:
+        raise ImportError(
+            "wfdb is required to prepare raw Long-Term ST data. "
+            "Install the medical extra with: python -m pip install -e .[medical]"
+        )
 
 
 def _sha256_file(path: Path) -> str:
@@ -418,6 +427,7 @@ def prepare_long_term_st_dataset(
     if manifest_path.exists() and not bool(force):
         return _validate_long_term_st_manifest(manifest_path, history_len=int(history_len), horizon=int(horizon))
 
+    _require_wfdb_for_long_term_st_preparation()
     resolved_archives = _coerce_archive_paths(archive_paths)
     headers, dat_members, archive_rows = _scan_long_term_st_archives(resolved_archives)
     if expected_record_count is not None and len(headers) != int(expected_record_count):
@@ -437,7 +447,10 @@ def prepare_long_term_st_dataset(
         import wfdb
         from scipy.signal import resample_poly
     except ImportError as exc:
-        raise ImportError("wfdb and scipy are required to prepare long_term_st.") from exc
+        raise ImportError(
+            "wfdb and scipy are required to prepare raw Long-Term ST data. "
+            "Install the medical extra with: python -m pip install -e .[medical]"
+        ) from exc
 
     prepared_series_dir = prepared_dir / "series"
     prepared_series_dir.mkdir(parents=True, exist_ok=True)

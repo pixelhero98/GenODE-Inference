@@ -28,6 +28,13 @@ Use Python 3.11 or newer.
 python -m pip install -e .
 ```
 
+Long-Term ST raw ECG preparation uses WFDB and is kept out of the core install.
+Install the medical extra only when preparing that dataset from raw archives:
+
+```bash
+python -m pip install -e ".[medical]"
+```
+
 For GPU environments, install the PyTorch build that matches your CUDA or
 accelerator stack before installing genODE. Generated data, checkpoints, logs,
 and reports should stay in ignored project-local directories such as `data/`,
@@ -188,6 +195,7 @@ mkdir -p "$OTFLOW_MEDICAL_STAGING_ROOT/raw/long_term_st"
 Prepare the context-only 100 Hz dataset:
 
 ```bash
+python -m pip install -e ".[medical]"
 python - <<'PY'
 from genode.data.otflow_medical_datasets import prepare_long_term_st_dataset
 prepare_long_term_st_dataset()

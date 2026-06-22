@@ -29,7 +29,7 @@ from genode.models.config import OTFlowConfig
 from genode.models.modules import EMAModel
 from genode.models.otflow_model import OTFlow
 from genode.data.otflow_datasets import L2FeatureMap, WindowedParamSequenceDataset, compute_basic_l2_metrics
-from genode.data.otflow_medical_datasets import LONG_TERM_ST_DATASET_KEY
+from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 from genode.models.otflow_utils import flatten_dict, unflatten_to_nested, microstructure_series
 
 

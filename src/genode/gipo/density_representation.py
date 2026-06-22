@@ -204,7 +204,7 @@ def density_log_features(
     return np.log(np.maximum(density, float(eps))).astype(np.float32)
 
 
-def density_metadata(reference_time_grid: Sequence[float] | None = None) -> Dict[str, Any]:
+def density_metadata(reference_time_grid: Sequence[float] | None = None) -> dict[str, Any]:
     grid = validate_reference_grid(
         uniform_reference_grid(DEFAULT_DENSITY_BIN_COUNT)
         if reference_time_grid is None

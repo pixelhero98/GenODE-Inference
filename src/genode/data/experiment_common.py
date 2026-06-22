@@ -20,12 +20,11 @@ from genode.data.otflow_datasets import (
     default_lobster_synth_profile_path,
     default_optiver_npz_path,
 )
-from genode.data.otflow_medical_datasets import (
+from genode.data.otflow_medical_constants import (
     LONG_TERM_ST_DATASET_KEY,
     LONG_TERM_ST_DEFAULT_STRIDE,
     LONG_TERM_ST_HISTORY_LEN,
     LONG_TERM_ST_HORIZON_LEN,
-    build_dataset_splits_from_long_term_st,
     default_long_term_st_data_path,
 )
 
@@ -395,6 +394,8 @@ def build_dataset_splits(args, cfg: OTFlowConfig):
             test_frac=args.test_frac,
         )
     if dataset == LONG_TERM_ST_DATASET_KEY:
+        from genode.data.otflow_medical_datasets import build_dataset_splits_from_long_term_st
+
         return build_dataset_splits_from_long_term_st(
             path=args.data_path or default_long_term_st_data_path(),
             cfg=cfg,

@@ -15,9 +15,10 @@ dependencies = [
   "scipy>=1.11",
   "matplotlib>=3.8,<4",
   "torch>=2.2",
-  "wfdb>=4.1",
-  "pyedflib>=0.1.38",
 ]
+
+[project.optional-dependencies]
+medical = ["wfdb>=4.1"]
 
 [project.scripts]
 genode-run-schedules = "genode.evaluation.diffusion_flow_time_reparameterization:main"
@@ -27,6 +28,7 @@ genode-prepare-molecule-xyz = "genode.data.prepare_molecule_xyz:main"
 genode-train-molecule-backbone = "genode.training.train_molecule_backbone:main"
 genode-eval-molecule-backbone = "genode.evaluation.molecule_metrics:main"
 genode-train-gipo = "genode.gipo.train_gipo:main"
+genode-preflight-gipo-rows = "genode.gipo.preflight:main"
 genode-report-gipo-locked-test = "genode.gipo.report_locked_test:main"
 genode-build-ser-ptg-reference = "genode.gipo.ser_ptg_reference:main"
 genode-evaluate-schedule-summary = "genode.gipo.evaluate_schedule_summary:main"

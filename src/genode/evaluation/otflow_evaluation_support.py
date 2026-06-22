@@ -39,7 +39,7 @@ from genode.data.otflow_experiment_plan import (
     experiment_plan_by_key,
 )
 from genode.data.otflow_forecast_data import build_monash_forecast_splits
-from genode.data.otflow_medical_datasets import LONG_TERM_ST_DATASET_KEY
+from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 from genode.models.otflow_model import OTFlow
 from genode.data.otflow_paths import (
     default_cryptos_data_path,
