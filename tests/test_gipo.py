@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -43,6 +44,7 @@ from genode.gipo.policy import (
     _make_index_minibatch_sampler,
     _student_teacher_score_objective,
     _student_teacher_score_eta,
+    realized_nfe_from_row,
     train_gipo_teacher,
     validate_canonical_conditioning_style,
 )
@@ -105,6 +107,12 @@ class GIPOCanonicalTests(unittest.TestCase):
         self.assertEqual(len(reconstructed), 4)
         self.assertEqual(metadata["density_protocol"], DENSITY_PROTOCOL)
         self.assertEqual(metadata["reference_bin_count"], 64)
+
+    def test_realized_nfe_from_row_uses_solver_protocol_not_runtime_macro_steps(self) -> None:
+        self.assertEqual(
+            realized_nfe_from_row({"solver_key": "heun", "target_nfe": 4, "runtime_nfe": 2}),
+            4,
+        )
 
     def test_torch_density_features_match_numpy_and_keep_gradients(self) -> None:
         reference = uniform_reference_grid(4)
@@ -515,6 +523,11 @@ class GIPOCanonicalTests(unittest.TestCase):
             }
             torch.save(payload, checkpoint_path)
 
+            with mock.patch("genode.gipo.report_locked_test.torch.load", return_value=payload) as mocked_load:
+                loaded_student, _, _, _, loaded_payload = _load_student_checkpoint(checkpoint_path)
+            self.assertTrue(mocked_load.call_args.kwargs["weights_only"])
+            self.assertEqual(loaded_student.setting_dim, setting_dim)
+            self.assertEqual(loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP)
             loaded_student, _, _, _, loaded_payload = _load_student_checkpoint(checkpoint_path)
             self.assertEqual(loaded_student.setting_dim, setting_dim)
             self.assertEqual(loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP)

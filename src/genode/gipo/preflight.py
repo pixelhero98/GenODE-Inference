@@ -25,6 +25,8 @@ from genode.gipo.objectives import (
     teacher_objective_utility_keys_for_family,
     teacher_objective_utility_keys_for_scenario,
 )
+from genode.gipo.density_representation import uniform_reference_grid
+from genode.gipo.schedule_grids import load_schedule_summary_grids, schedule_grid_coverage_report
 from genode.gipo.schedule_hash import json_hash as _canonical_json_hash
 from genode.solver_protocol import normalize_solver_key
 
@@ -804,13 +806,21 @@ def build_gipo_support_preflight_report(
 def validate_gipo_support_preflight_report(report: Mapping[str, Any], *, label: str = "GIPO rows") -> None:
     support_cells = dict(report.get("support_cells", {}) or {})
     identity = dict(report.get("context_identity", {}) or {})
+    context_count = dict(report.get("context_count_preflight", {}) or {})
+    schedule_grid = dict(report.get("schedule_grid_preflight", {}) or {})
     bad_group_count = int(support_cells.get("bad_group_count", 0))
     conflict_count = int(identity.get("conflict_group_count", 0))
-    if bad_group_count or conflict_count:
+    context_errors = list(context_count.get("errors", []) or [])
+    missing_grid_count = int(schedule_grid.get("missing_grid_row_count", 0) or 0)
+    schedule_grid_error = str(report.get("schedule_grid_preflight_error", "") or "")
+    if bad_group_count or conflict_count or context_errors or missing_grid_count or schedule_grid_error:
         raise ValueError(
             f"{label} failed GIPO row preflight: "
             f"bad_support_groups={bad_group_count}, "
             f"context_identity_conflicts={conflict_count}, "
+            f"context_count_errors={context_errors}, "
+            f"missing_schedule_grid_rows={missing_grid_count}, "
+            f"schedule_grid_error={schedule_grid_error!r}, "
             f"support={support_cells}, first_identity={list(identity.get('conflicts', []) or [])[:1]}."
         )
 
@@ -818,6 +828,8 @@ def validate_gipo_support_preflight_report(report: Mapping[str, Any], *, label: 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Preflight GIPO support rows without training.")
     parser.add_argument("--rows_csv", required=True, help="Comma-separated per-example fixed/SER metric rows CSVs.")
+    parser.add_argument("--schedule_summary_json", default="", help="Comma-separated schedule summaries used to validate non-fixed schedule grids.")
+    parser.add_argument("--min_context_count", type=int, default=3, help="Minimum complete clean contexts required for holdout-based GIPO training.")
     parser.add_argument(
         "--support_schedule_keys",
         default="",
@@ -850,6 +862,49 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
     identity_conflicts, dirty_rows, _, identity_row_errors = _identity_conflict_report(records)
     support, complete_cell_keys, complete_records = _support_report(records, support_keys, dirty_rows)
     support_rows = [record.row for record in records if str(record.row.get("scheduler_key", "") or "").strip() in support_set]
+    complete_clean_rows = [record.row for record in complete_records]
+    complete_clean_contexts = sorted({_context_id_from_row(row) for row in complete_clean_rows})
+    observed_context_ids: set[str] = set()
+    observed_context_row_errors: List[str] = []
+    for record in records:
+        try:
+            observed_context_ids.add(_context_id_from_row(record.row))
+        except Exception as exc:
+            observed_context_row_errors.append(
+                f"{display_project_path(record.source_path)}:{record.source_row_number}: {exc}"
+            )
+    min_context_count = int(getattr(args, "min_context_count", 3))
+    context_count_errors: List[str] = []
+    if min_context_count < 1:
+        context_count_errors.append("min_context_count must be positive.")
+    elif len(complete_clean_contexts) < min_context_count:
+        context_count_errors.append(
+            f"Only {len(complete_clean_contexts)} complete clean contexts are available; "
+            f"at least {min_context_count} are required for holdout-based GIPO training."
+        )
+    context_count_preflight = {
+        "observed_context_count": int(len(observed_context_ids)),
+        "complete_clean_context_count": int(len(complete_clean_contexts)),
+        "minimum_required_context_count": int(min_context_count),
+        "row_error_count": int(len(observed_context_row_errors)),
+        "row_errors": observed_context_row_errors,
+        "errors": context_count_errors,
+    }
+    schedule_grid_error = ""
+    schedule_grid_report: Dict[str, Any] = {
+        "row_count": int(len(rows)),
+        "missing_grid_row_count": 0,
+        "missing_grid_rows": [],
+    }
+    try:
+        schedule_grids = load_schedule_summary_grids(_parse_csv(str(args.schedule_summary_json)))
+        schedule_grid_report = schedule_grid_coverage_report(
+            rows,
+            schedule_grids=schedule_grids,
+            reference_time_grid=uniform_reference_grid(64),
+        )
+    except Exception as exc:
+        schedule_grid_error = str(exc)
 
     target_resolution_error = ""
     try:
@@ -879,6 +934,9 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
         "support": support,
         "teacher_metric_targets": _metric_target_coverage(rows, support_rows, [record.row for record in complete_records], target_keys),
         "teacher_metric_target_resolution_error": target_resolution_error,
+        "context_count_preflight": context_count_preflight,
+        "schedule_grid_preflight": schedule_grid_report,
+        "schedule_grid_preflight_error": schedule_grid_error,
         "context_identity_conflict_count": int(len(identity_conflicts)),
         "context_identity_conflicts": identity_conflicts,
         "identity_row_error_count": int(len(identity_row_errors)),
@@ -895,6 +953,9 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
         + len(support.get("support_semantic_errors", []))
         + int(len(identity_conflicts))
         + (1 if target_resolution_error else 0)
+        + len(context_count_errors)
+        + int(schedule_grid_report.get("missing_grid_row_count", 0))
+        + (1 if schedule_grid_error else 0)
     )
     report["issue_count"] = int(issue_count)
     report["status"] = "ok" if issue_count == 0 else "issues_found"

@@ -74,6 +74,7 @@ from genode.gipo.policy import (
     series_key_from_row,
     split_rows_by_context_holdout,
     split_rows_by_density_family_holdout,
+    teacher_rank_pair_diagnostics,
     train_gipo_student,
     train_gipo_teacher,
     normalize_teacher_utility_weights,
@@ -85,19 +86,17 @@ from genode.gipo.policy import (
     validate_teacher_objective_hyperparameters,
 )
 from genode.gipo.density_representation import density_metadata, reference_grid_hash, uniform_reference_grid
-from genode.gipo.density_representation import average_density_masses, density_mass_to_time_grid, grid_to_density_mass
 from genode.gipo.preflight import (
     build_gipo_support_preflight_report,
     teacher_metric_target_coverage,
     validate_gipo_support_preflight_report,
 )
+from genode.gipo.schedule_grids import load_schedule_summary_grids, validate_schedule_grid_coverage
 from genode.gipo.models import (
     SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config_for_rows,
     setting_feature_dim,
-    solver_macro_steps,
     validate_setting_feature_mode,
-    validate_time_grid,
 )
 from genode.data.otflow_paths import resolve_project_path
 from genode.evaluation.otflow_evaluation_support import FORECAST_FAMILY
@@ -372,73 +371,6 @@ def _select_context_density_regret_step(
             "unseen_nfe": [],
         },
     }
-
-
-def _checkpoint_step_from_payload(payload: Mapping[str, Any], schedule: Mapping[str, Any], item: Mapping[str, Any]) -> int | None:
-    for source in (item, schedule, payload):
-        for key in ("checkpoint_step", "train_steps", "otflow_train_steps"):
-            value = source.get(key)
-            if value in (None, ""):
-                continue
-            return int(value)
-    return None
-
-
-def _load_schedule_summary_grids(paths: Sequence[str]) -> Dict[Tuple[Any, ...], Tuple[float, ...]]:
-    grids: Dict[Tuple[Any, ...], Tuple[float, ...]] = {}
-    for path_text in paths:
-        path = resolve_project_path(path_text)
-        if not path.exists():
-            raise FileNotFoundError(f"Schedule summary not found: {path}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        schedules = payload.get("schedules")
-        if schedules:
-            schedule_items = list(schedules)
-        else:
-            schedule_items = [
-                {
-                    "scheduler_key": str(payload.get("scheduler_key", payload.get("schedule_key", ""))),
-                    "predictions": payload.get("predictions", []) or [],
-                }
-            ]
-        for schedule in schedule_items:
-            schedule_key = str(schedule.get("scheduler_key", schedule.get("schedule_key", ""))).strip()
-            for item in list(schedule.get("predictions", []) or []):
-                solver = normalize_solver_key(str(item["solver_key"]))
-                target_nfe = int(item["target_nfe"])
-                macro_steps = solver_macro_steps(solver, target_nfe)
-                base_grid = validate_time_grid(item["time_grid"], macro_steps=macro_steps)
-                checkpoint_step = _checkpoint_step_from_payload(payload, schedule, item)
-                base_key = (schedule_key, solver, target_nfe)
-                if checkpoint_step is None:
-                    grids[base_key] = base_grid
-                else:
-                    grids[(*base_key, int(checkpoint_step))] = base_grid
-                if schedule_key == "ser_ptg_local_defect_eta005":
-                    reversed_grid = validate_time_grid(
-                        [1.0 - float(value) for value in reversed(base_grid)],
-                        macro_steps=macro_steps,
-                    )
-                    reversed_key = ("ser_ptg_local_defect_eta005_reversed", solver, target_nfe)
-                    if checkpoint_step is None:
-                        grids[reversed_key] = reversed_grid
-                    else:
-                        grids[(*reversed_key, int(checkpoint_step))] = reversed_grid
-                    reference = uniform_reference_grid(CANONICAL_DENSITY_BIN_COUNT)
-                    base_mass = grid_to_density_mass(base_grid, reference_time_grid=reference, macro_steps=macro_steps)
-                    reversed_mass = grid_to_density_mass(reversed_grid, reference_time_grid=reference, macro_steps=macro_steps)
-                    averaged_mass = average_density_masses(base_mass, reversed_mass)
-                    avg_key = ("ser_ptg_local_defect_eta005_avg_reversed", solver, target_nfe)
-                    avg_grid = density_mass_to_time_grid(
-                        averaged_mass,
-                        reference_time_grid=reference,
-                        macro_steps=macro_steps,
-                    )
-                    if checkpoint_step is None:
-                        grids[avg_key] = avg_grid
-                    else:
-                        grids[(*avg_key, int(checkpoint_step))] = avg_grid
-    return grids
 
 
 def _observed_support(rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
@@ -738,6 +670,38 @@ def _validate_train_tuning_rows(rows: Sequence[Mapping[str, Any]], *, label: str
         raise ValueError(f"{label} requires train_tuning source rows; found {bad_source_phases}.")
 
 
+def _validate_positive_training_args(args: argparse.Namespace) -> None:
+    for name in ("teacher_steps", "student_steps", "teacher_checkpoint_every", "student_checkpoint_every"):
+        value = int(getattr(args, name))
+        if value <= 0:
+            raise ValueError(f"{name} must be positive.")
+
+
+def _validate_context_split_capacity(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    holdout_fraction: float,
+    label: str,
+    minimum_contexts: int = 3,
+) -> Dict[str, Any]:
+    context_ids = sorted({context_id_from_row(row) for row in rows})
+    report = {
+        "label": str(label),
+        "row_count": int(len(rows)),
+        "context_count": int(len(context_ids)),
+        "minimum_context_count": int(minimum_contexts),
+        "holdout_fraction": float(holdout_fraction),
+        "status": "ok",
+    }
+    if float(holdout_fraction) > 0.0 and len(context_ids) < int(minimum_contexts):
+        report["status"] = "insufficient_contexts"
+        raise ValueError(
+            f"{label} requires at least {minimum_contexts} distinct contexts when holdout_fraction is positive; "
+            f"found {len(context_ids)}."
+        )
+    return report
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train GIPO continuous-density from per-example fixed/SER rows.")
     parser.add_argument("--rows_csv", required=True, help="Per-example fixed/SER metric rows CSV.")
@@ -851,6 +815,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
+    _validate_positive_training_args(args)
     seed_all(int(args.seed))
     density_bin_count = CANONICAL_DENSITY_BIN_COUNT
     selection_mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
@@ -1057,12 +1022,27 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     support_set = set(support_keys)
     missing_density_holdout_keys = sorted(set(density_holdout_requested) - support_set)
     if missing_density_holdout_keys and tuple(density_holdout_requested) == DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS:
-        density_holdout_keys: List[str] = []
+        present_default_keys = [key for key in density_holdout_requested if key in support_set]
+        if not present_default_keys:
+            raise ValueError(
+                "Default teacher_density_holdout_schedule_keys require support schedules "
+                f"{list(DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS)}; reduced support "
+                f"{list(support_keys)} is missing {missing_density_holdout_keys}. "
+                "Pass --teacher_density_holdout_schedule_keys with supported non-uniform keys or include the default rows."
+            )
+        density_holdout_keys: List[str] = present_default_keys
     elif missing_density_holdout_keys:
         raise ValueError(f"density-family holdout keys must be in support_schedule_keys; unsupported={missing_density_holdout_keys}.")
     else:
         density_holdout_keys = list(density_holdout_requested)
 
+    context_split_preflight = {
+        "teacher_context_holdout": _validate_context_split_capacity(
+            sampled_rows,
+            holdout_fraction=float(args.context_holdout_fraction),
+            label="Teacher context holdout",
+        )
+    }
     context_fit_pool_rows, context_holdout_rows = split_rows_by_context_holdout(
         sampled_rows,
         holdout_fraction=float(args.context_holdout_fraction),
@@ -1126,10 +1106,43 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     context_dim = int(next(iter(normalized_embeddings.values())).shape[0])
     setting_dim = int(setting_feature_dim(setting_feature_mode, config=setting_encoder_config))
     reference_time_grid = uniform_reference_grid(density_bin_count)
-    schedule_grids = _load_schedule_summary_grids(_parse_csv(str(args.schedule_summary_json)))
+    schedule_grids = load_schedule_summary_grids(_parse_csv(str(args.schedule_summary_json)))
     unseen_schedule_summary_paths = _parse_csv(str(args.teacher_unseen_selection_schedule_summary_json))
     if unseen_schedule_summary_paths:
-        schedule_grids.update(_load_schedule_summary_grids(unseen_schedule_summary_paths))
+        schedule_grids.update(load_schedule_summary_grids(unseen_schedule_summary_paths))
+    schedule_grid_preflight = {
+        "selector_fit_rows": validate_schedule_grid_coverage(
+            selector_fit_rows,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference_time_grid,
+            label="Selector fit",
+        ),
+        "final_fit_rows": validate_schedule_grid_coverage(
+            fit_rows,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference_time_grid,
+            label="Final fit",
+        ),
+        "context_disjoint_diagnostic_rows": validate_schedule_grid_coverage(
+            context_holdout_diagnostic_rows,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference_time_grid,
+            label="Context-disjoint diagnostic",
+        ),
+        "density_family_diagnostic_rows": validate_schedule_grid_coverage(
+            density_family_diagnostic_rows,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference_time_grid,
+            label="Density-family diagnostic",
+        ),
+    }
+    if unseen_nfe_diagnostic_rows:
+        schedule_grid_preflight["unseen_nfe_diagnostic_rows"] = validate_schedule_grid_coverage(
+            unseen_nfe_diagnostic_rows,
+            schedule_grids=schedule_grids,
+            reference_time_grid=reference_time_grid,
+            label="Unseen-NFE diagnostic",
+        )
     selector_density_normalizer = DensityFeatureNormalizer.fit(
         (
             density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
@@ -1241,15 +1254,13 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         pseudo_schedule_grids = dict(schedule_grids)
         pseudo_schedule_summary_paths = _parse_csv(str(args.student_pseudo_schedule_summary_json))
         if pseudo_schedule_summary_paths:
-            pseudo_schedule_grids.update(_load_schedule_summary_grids(pseudo_schedule_summary_paths))
-        missing_pseudo_grid_rows: List[str] = []
-        for row in pseudo_rows:
-            try:
-                density_mass_for_row(row, schedule_grids=pseudo_schedule_grids, reference_time_grid=reference_time_grid)
-            except (KeyError, ValueError):
-                missing_pseudo_grid_rows.append(str((row["scheduler_key"], row["solver_key"], int(row["target_nfe"]))))
-        if missing_pseudo_grid_rows:
-            raise ValueError(f"Pseudo distillation rows are missing schedule grids: {missing_pseudo_grid_rows[:8]}")
+            pseudo_schedule_grids.update(load_schedule_summary_grids(pseudo_schedule_summary_paths))
+        schedule_grid_preflight["student_pseudo_rows"] = validate_schedule_grid_coverage(
+            pseudo_rows,
+            schedule_grids=pseudo_schedule_grids,
+            reference_time_grid=reference_time_grid,
+            label="Pseudo distillation",
+        )
     student_training_mode = (
         STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO
         if pseudo_rows and pseudo_target_weight > 0.0
@@ -1258,6 +1269,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     student_selector_fit_rows = [dict(row) for row in fit_rows]
     student_selector_validation_rows: List[Dict[str, Any]] = []
     if student_selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE:
+        context_split_preflight["student_validation_holdout"] = _validate_context_split_capacity(
+            fit_rows,
+            holdout_fraction=float(args.student_selection_holdout_fraction),
+            label="Student validation holdout",
+        )
         student_selector_fit_rows, student_selector_validation_rows = split_rows_by_context_holdout(
             fit_rows,
             holdout_fraction=float(args.student_selection_holdout_fraction),
@@ -1337,6 +1353,20 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         selection_component_weights,
         active_axes=active_selection_axes,
     )
+    rank_pair_preflight = {
+        "selector_fit_rows": teacher_rank_pair_diagnostics(
+            selector_fit_rows,
+            target_keys=teacher_metric_target_keys,
+            teacher_utility_weights=teacher_utility_weights,
+            pair_margin=CANONICAL_TEACHER_PAIR_MARGIN,
+        ),
+        "final_fit_rows": teacher_rank_pair_diagnostics(
+            final_fit_rows,
+            target_keys=teacher_metric_target_keys,
+            teacher_utility_weights=teacher_utility_weights,
+            pair_margin=CANONICAL_TEACHER_PAIR_MARGIN,
+        ),
+    }
     normalizer_fit_scopes = {
         "protocol": GIPO_PREPROCESSING_PROTOCOL,
         "selector": {
@@ -1427,6 +1457,9 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "density_representation": density_meta,
         "normalizer_fit_scopes": normalizer_fit_scopes,
         "gipo_protocol_metadata": gipo_protocol_metadata,
+        "context_split_preflight": context_split_preflight,
+        "rank_pair_preflight": rank_pair_preflight,
+        "schedule_grid_preflight": schedule_grid_preflight,
         "support_schedule_keys": list(support_keys),
         "canonical_seen_nfes": [int(value) for value in CANONICAL_SEEN_NFES],
         "canonical_unseen_nfes": [int(value) for value in CANONICAL_UNSEEN_NFES],

@@ -94,7 +94,7 @@ from genode.gipo.objectives import (
     uniform_anchored_objective_columns,
 )
 from genode.gipo.models import validate_time_grid
-from genode.solver_protocol import normalize_solver_keys
+from genode.solver_protocol import normalize_solver_keys, normalize_solver_nfe_fields
 from genode.schedule_transfer.otflow_paper_registry import METHOD_KEY
 from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
 from genode.data.otflow_paths import (
@@ -145,6 +145,7 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "train_budget_label",
     "target_nfe",
     "runtime_nfe",
+    "macro_steps",
     "solver_key",
     "solver_name",
     "scheduler_key",
@@ -238,6 +239,7 @@ CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "solver_key",
     "target_nfe",
     "runtime_nfe",
+    "macro_steps",
     "realized_nfe",
     "scheduler_key",
     "schedule_family",
@@ -452,15 +454,25 @@ def _load_schedule_summary_cases(path_text: str) -> List[Dict[str, Any]]:
             solver_key = str(item.get("solver_key", "")).strip()
             target_nfe = int(item.get("target_nfe", 0) or 0)
             checkpoint_step = item.get("checkpoint_step", schedule.get("checkpoint_step", payload.get("checkpoint_step", "")))
-            runtime_nfe = int(item.get("runtime_nfe", item.get("macro_steps", 0)) or 0)
-            if not solver_key or target_nfe <= 0 or runtime_nfe <= 0:
+            if not solver_key or target_nfe <= 0:
                 continue
-            grid = validate_time_grid(item["time_grid"], macro_steps=runtime_nfe)
+            nfe = normalize_solver_nfe_fields(
+                solver_key,
+                target_nfe,
+                macro_steps=item.get("macro_steps"),
+                runtime_nfe=item.get("runtime_nfe"),
+                realized_nfe=item.get("realized_nfe"),
+                source=f"schedule summary {path}",
+            )
+            grid = validate_time_grid(item["time_grid"], macro_steps=nfe.macro_steps)
             cases.append(
                 {
                     "scheduler_key": scheduler_key,
-                    "solver_key": solver_key,
+                    "solver_key": nfe.solver_key,
                     "target_nfe": int(target_nfe),
+                    "runtime_nfe": int(nfe.runtime_nfe),
+                    "macro_steps": int(nfe.macro_steps),
+                    "realized_nfe": int(nfe.realized_nfe),
                     "checkpoint_step": "" if checkpoint_step in (None, "") else int(checkpoint_step),
                     "time_grid": [float(x) for x in grid],
                     "schedule_grid_hash": schedule_grid_hash(grid),
@@ -468,7 +480,7 @@ def _load_schedule_summary_cases(path_text: str) -> List[Dict[str, Any]]:
                         item.get("reference_time_alignment", schedule.get("reference_time_alignment", "summary_density_time_grid"))
                     ),
                     "paper_duplicate_count": int(item.get("paper_duplicate_count", 0) or 0),
-                    "reference_macro_steps": int(item.get("reference_macro_steps", runtime_nfe) or runtime_nfe),
+                    "reference_macro_steps": int(item.get("reference_macro_steps", nfe.macro_steps) or nfe.macro_steps),
                     "schedule_summary_path": _logical_artifact_path(path),
                 }
             )
@@ -1017,6 +1029,7 @@ def _conditional_context_records(
                 "solver_key": str(solver_key),
                 "target_nfe": int(target_nfe),
                 "runtime_nfe": int(runtime_nfe),
+                "macro_steps": int(runtime_nfe),
                 "realized_nfe": _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)),
                 "scheduler_key": str(scheduler_key),
                 "schedule_family": schedule_family_for_key(str(scheduler_key)),
@@ -1209,6 +1222,7 @@ def _molecule_context_records(
                 "solver_key": str(solver_key),
                 "target_nfe": int(target_nfe),
                 "runtime_nfe": int(runtime_nfe),
+                "macro_steps": int(runtime_nfe),
                 "realized_nfe": _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)),
                 "scheduler_key": str(scheduler_key),
                 "schedule_family": schedule_family_for_key(str(scheduler_key)),
@@ -1313,6 +1327,9 @@ def _schedule_details_from_case(case: Mapping[str, Any], runtime_nfe: int) -> Di
         "schedule_grid_hash": str(case.get("schedule_grid_hash") or schedule_grid_hash(grid)),
         "reference_time_alignment": str(case.get("reference_time_alignment", "summary_density_time_grid")),
         "paper_duplicate_count": int(case.get("paper_duplicate_count", 0) or 0),
+        "macro_steps": int(case.get("macro_steps", runtime_nfe) or runtime_nfe),
+        "runtime_nfe": int(case.get("runtime_nfe", runtime_nfe) or runtime_nfe),
+        "realized_nfe": int(case.get("realized_nfe", _realized_nfe_for_solver(str(case.get("solver_key", "euler")), int(runtime_nfe)))),
         "reference_macro_steps": int(case.get("reference_macro_steps", runtime_nfe) or runtime_nfe),
     }
     details.update(fixed_schedule_shape_statistics(grid))
@@ -1333,9 +1350,14 @@ def _evaluation_protocol_fields(result_row: Mapping[str, Any], *, eval_horizon: 
 
 def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: str, checkpoint: Mapping[str, Any], checkpoint_step: int, nfe_role: str, target_nfe: int, runtime_nfe: int, solver_key: str, scheduler_key: str, details: Mapping[str, Any], metrics: Mapping[str, Any], row_signature: str, protocol_hash: str) -> Dict[str, Any]:
     selection_metric = selection_metric_for_family(str(benchmark_family))
-    realized_nfe = metrics.get("realized_nfe")
-    if realized_nfe is None:
-        realized_nfe = _realized_nfe_for_solver(str(solver_key), int(runtime_nfe))
+    nfe = normalize_solver_nfe_fields(
+        str(solver_key),
+        int(target_nfe),
+        macro_steps=details.get("macro_steps"),
+        runtime_nfe=runtime_nfe,
+        realized_nfe=metrics.get("realized_nfe", details.get("realized_nfe")),
+        source=f"{scheduler_key} row {solver_key}/{target_nfe}",
+    )
     return {
         "benchmark_family": str(benchmark_family),
         "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
@@ -1360,7 +1382,8 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "checkpoint_export_protocol": str(checkpoint.get("checkpoint_export_protocol", "")),
         "train_budget_label": str(checkpoint["train_budget_label"]),
         "target_nfe": int(target_nfe),
-        "runtime_nfe": int(runtime_nfe),
+        "runtime_nfe": int(nfe.runtime_nfe),
+        "macro_steps": int(nfe.macro_steps),
         "solver_key": str(solver_key),
         "solver_name": str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
         "scheduler_key": str(scheduler_key),
@@ -1379,7 +1402,7 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "experiment_scope": solver_experiment_scope(str(solver_key)),
         "selection_metric": str(selection_metric),
         "selection_metric_value": metrics.get(selection_metric),
-        "reference_macro_steps": int(details.get("reference_macro_steps", runtime_nfe)),
+        "reference_macro_steps": int(details.get("reference_macro_steps", nfe.macro_steps)),
         "reference_time_alignment": str(details.get("reference_time_alignment", schedule_time_alignment(str(scheduler_key)))),
         "runtime_grid_q25": details.get("runtime_grid_q25"),
         "runtime_grid_q50": details.get("runtime_grid_q50"),
@@ -1412,7 +1435,7 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "forecast_relative_crps_gain_vs_uniform": metrics.get("forecast_relative_crps_gain_vs_uniform"),
         "forecast_relative_mase_gain_vs_uniform": metrics.get("forecast_relative_mase_gain_vs_uniform"),
         "relative_score_gain_vs_uniform": metrics.get("relative_score_gain_vs_uniform"),
-        "realized_nfe": int(realized_nfe),
+        "realized_nfe": int(nfe.realized_nfe),
         "latency_ms_per_sample": metrics.get("latency_ms_per_sample", metrics.get("efficiency_ms_per_sample")),
         "num_eval_samples": metrics.get("num_eval_samples"),
         "eval_examples": metrics.get("eval_examples"),
@@ -1431,13 +1454,18 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
     }
 
 
-def _scheduler_cases_for_datasets(cli_args: argparse.Namespace, datasets: Iterable[str]) -> Dict[str, List[Dict[str, Any]]]:
+def _scheduler_cases_for_datasets(
+    cli_args: argparse.Namespace,
+    datasets: Iterable[str],
+    *,
+    include_summary_cases: bool = True,
+) -> Dict[str, List[Dict[str, Any]]]:
     schedule_names = _parse_schedule_names(str(cli_args.baseline_scheduler_names))
     if UNIFORM_SCHEDULER_KEY in schedule_names:
         schedule_names = [UNIFORM_SCHEDULER_KEY] + [key for key in schedule_names if key != UNIFORM_SCHEDULER_KEY]
-    summary_cases = _load_schedule_summary_cases(str(getattr(cli_args, "schedule_summary_json", "")))
+    summary_cases = _load_schedule_summary_cases(str(getattr(cli_args, "schedule_summary_json", ""))) if include_summary_cases else []
     requested_summary_names = _parse_summary_schedule_names(str(getattr(cli_args, "summary_scheduler_names", "")))
-    if requested_summary_names:
+    if requested_summary_names and include_summary_cases:
         summary_cases = [case for case in summary_cases if str(case.get("scheduler_key")) in set(requested_summary_names)]
         observed_summary_names = {str(case.get("scheduler_key")) for case in summary_cases}
         missing = sorted(set(requested_summary_names) - observed_summary_names)
@@ -2376,10 +2404,34 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
         str(cli_args.conditional_generation_datasets)
     )
     molecule_datasets = parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", "")))
-    scheduler_cases = _scheduler_cases_for_datasets(
-        cli_args,
-        list(forecast_datasets) + list(conditional_generation_datasets) + list(molecule_datasets),
-    )
+    summary_requested = bool(str(getattr(cli_args, "schedule_summary_json", "")).strip() or str(getattr(cli_args, "summary_scheduler_names", "")).strip())
+    if summary_requested and not forecast_datasets:
+        raise ValueError("schedule_summary_json and summary_scheduler_names are forecast-only; no forecast_datasets were requested.")
+    scheduler_cases: Dict[str, List[Dict[str, Any]]] = {}
+    if forecast_datasets:
+        scheduler_cases.update(
+            _scheduler_cases_for_datasets(
+                cli_args,
+                list(forecast_datasets),
+                include_summary_cases=True,
+            )
+        )
+    if conditional_generation_datasets:
+        scheduler_cases.update(
+            _scheduler_cases_for_datasets(
+                cli_args,
+                list(conditional_generation_datasets),
+                include_summary_cases=False,
+            )
+        )
+    if molecule_datasets:
+        scheduler_cases.update(
+            _scheduler_cases_for_datasets(
+                cli_args,
+                list(molecule_datasets),
+                include_summary_cases=False,
+            )
+        )
     try:
         if forecast_datasets:
             _run_forecast_phase(

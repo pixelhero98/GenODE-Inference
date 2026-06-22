@@ -82,6 +82,12 @@ class GenODEInterfaceTests(unittest.TestCase):
             module_name, func_name = str(target).split(":", 1)
             self.assertTrue(callable(getattr(importlib.import_module(module_name), func_name)))
 
+    def test_readme_locked_test_command_includes_uniform_baseline_rows(self) -> None:
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        marker = "genode-report-gipo-locked-test"
+        command_block = readme[readme.index(marker) : readme.index("## Development Checks")]
+        self.assertIn("--baseline_rows", command_block)
+
     def test_single_markdown_file_is_readme(self) -> None:
         markdown_files = sorted(
             path.relative_to(PROJECT_ROOT).as_posix()

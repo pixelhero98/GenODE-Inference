@@ -124,7 +124,7 @@ class GenericContextGipoTests(unittest.TestCase):
             with path.open("w", newline="", encoding="utf-8") as fh:
                 writer = csv.DictWriter(fh, fieldnames=fields)
                 writer.writeheader()
-                for ctx_idx in range(2):
+                for ctx_idx in range(3):
                     for nfe in target_nfes:
                         for scheduler_key, (crps, mase) in schedules.items():
                             writer.writerow(
@@ -153,7 +153,7 @@ class GenericContextGipoTests(unittest.TestCase):
             write_rows(pseudo_rows, (6, 10, 14, 20))
             save_context_embedding_table(
                 embeddings,
-                {"ctx_0": [0.0, 1.0], "ctx_1": [1.0, 0.0]},
+                {"ctx_0": [0.0, 1.0], "ctx_1": [1.0, 0.0], "ctx_2": [0.5, 0.5]},
             )
             args = SimpleNamespace(
                 rows_csv=str(seen_rows),
@@ -161,7 +161,7 @@ class GenericContextGipoTests(unittest.TestCase):
                 schedule_summary_json="",
                 out_dir=str(root / "out"),
                 support_schedule_keys="uniform,late_power_3,flowts_power_sampling,ays",
-                context_sample_count=2,
+                context_sample_count=3,
                 context_holdout_fraction=0.5,
                 teacher_steps=1,
                 teacher_checkpoint_every=1,
@@ -649,6 +649,75 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertAlmostEqual(float(aggregated[0]["temporal_uw1"]), 0.3)
         with self.assertRaises(ValueError):
             report_locked_test._benchmark_family_from_rows([rows[0], {"benchmark_family": FORECAST_FAMILY}])
+
+    def test_locked_reporter_infers_manual_matrix_selectors_from_context_rows(self) -> None:
+        rows = [
+            {
+                "dataset": "lobster_synthetic",
+                "evaluation_seed": "1",
+                "solver_key": "rk2",
+                "target_nfe": "6",
+            },
+            {
+                "dataset": "lobster_synthetic",
+                "evaluation_seed": "0",
+                "solver_key": "euler",
+                "target_nfe": "4",
+            },
+        ]
+
+        self.assertEqual(
+            report_locked_test._single_value_from_rows(rows, field="dataset", arg_name="dataset"),
+            "lobster_synthetic",
+        )
+        self.assertEqual(
+            report_locked_test._infer_int_values_from_rows(rows, field="evaluation_seed", arg_name="seeds"),
+            (0, 1),
+        )
+        self.assertEqual(report_locked_test._infer_solver_values_from_rows(rows), ("euler", "heun"))
+        self.assertEqual(
+            report_locked_test._infer_int_values_from_rows(rows, field="target_nfe", arg_name="target_nfe_values"),
+            (4, 6),
+        )
+        with self.assertRaisesRegex(ValueError, "not present"):
+            report_locked_test._single_value_from_rows(rows, field="dataset", requested="traffic_hourly", arg_name="dataset")
+
+    def test_locked_reporter_representatives_preserve_explicit_evaluation_seed_and_filter_matrix(self) -> None:
+        rows = [
+            {
+                "dataset": "lobster_synthetic",
+                "seed": "0",
+                "evaluation_seed": "11",
+                "solver_key": "euler",
+                "target_nfe": "4",
+                "scheduler_key": "uniform",
+                "context_id": "ctx_a",
+                "source_split_phase": "locked_test",
+            },
+            {
+                "dataset": "lobster_synthetic",
+                "seed": "0",
+                "evaluation_seed": "22",
+                "solver_key": "euler",
+                "target_nfe": "8",
+                "scheduler_key": "uniform",
+                "context_id": "ctx_b",
+                "source_split_phase": "locked_test",
+            },
+        ]
+
+        representatives = report_locked_test._representative_context_rows(rows)
+        filtered = report_locked_test._filter_representatives_to_matrix(
+            representatives,
+            dataset="lobster_synthetic",
+            seeds=[11],
+            solvers=["euler"],
+            target_nfes=[4],
+        )
+
+        self.assertEqual([row["evaluation_seed"] for row in representatives], [11, 22])
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["context_id"], "ctx_a")
 
     def test_reporter_aggregates_molecule_metrics(self) -> None:
         rows = [

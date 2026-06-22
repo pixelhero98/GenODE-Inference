@@ -120,6 +120,74 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         default_args = runner.build_argparser().parse_args([])
         self.assertNotIn("ays_reversed", runner._parse_schedule_names(default_args.baseline_scheduler_names))
 
+    def test_schedule_summary_cases_normalize_rk2_nfe_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "summary.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schedules": [
+                            {
+                                "scheduler_key": "gipo",
+                                "predictions": [
+                                    {
+                                        "solver_key": "heun",
+                                        "target_nfe": 4,
+                                        "runtime_nfe": 2,
+                                        "time_grid": [0.0, 0.5, 1.0],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cases = runner._load_schedule_summary_cases(str(path))
+
+        self.assertEqual(cases[0]["runtime_nfe"], 2)
+        self.assertEqual(cases[0]["macro_steps"], 2)
+        self.assertEqual(cases[0]["realized_nfe"], 4)
+
+    def test_summary_scheduler_cases_are_forecast_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "summary.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schedules": [
+                            {
+                                "scheduler_key": "gipo",
+                                "predictions": [
+                                    {
+                                        "solver_key": "euler",
+                                        "target_nfe": 4,
+                                        "macro_steps": 4,
+                                        "time_grid": [0.0, 0.25, 0.5, 0.75, 1.0],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = runner.build_argparser().parse_args(
+                [
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--schedule_summary_json",
+                    str(path),
+                    "--summary_scheduler_names",
+                    "gipo",
+                ]
+            )
+            forecast_cases = runner._scheduler_cases_for_datasets(args, ["traffic_hourly"], include_summary_cases=True)
+            conditional_cases = runner._scheduler_cases_for_datasets(args, ["lobster_synthetic"], include_summary_cases=False)
+
+        self.assertEqual([case["scheduler_key"] for case in forecast_cases["traffic_hourly"]], ["uniform", "gipo"])
+        self.assertEqual([case["scheduler_key"] for case in conditional_cases["lobster_synthetic"]], ["uniform"])
+
     def test_aggregate_relative_gain_uses_fraction_units(self) -> None:
         rows = [
             {

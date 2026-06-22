@@ -10,11 +10,11 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 import torch
 
-from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES, SCENARIO_FAMILY_MOLECULE
+from genode.canonical_experiment_layout import SCENARIO_FAMILY_MOLECULE
 from genode.data.molecule_xyz import default_molecule_group_root, load_molecule_group_manifest, trainable_molecule_group_members
 from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW_MOLECULE, MOLECULE_FAMILY, find_backbone_artifact, load_backbone_manifest
 from genode.evaluation.molecule_metrics import evaluate_molecule_rollout_schedule, load_molecule_checkpoint_splits
-from genode.solver_protocol import CANONICAL_SOLVER_KEYS, normalize_solver_keys
+from genode.solver_protocol import normalize_solver_key, normalize_solver_keys
 from genode.gipo.objectives import (
     CONDITIONAL_METRIC_SPECS,
     FORECAST_METRIC_SPECS,
@@ -165,6 +165,9 @@ def _validate_context_rows(
 
 
 def _evaluation_seed_from_row(row: Mapping[str, Any]) -> int:
+    explicit = row.get("evaluation_seed", "")
+    if explicit not in (None, "") and str(explicit).strip():
+        return int(explicit)
     parent = str(row.get("parent_row_signature", "") or "")
     parts = parent.split("|")
     if len(parts) >= 3:
@@ -239,7 +242,10 @@ def _filter_rows_to_contexts(
 def _load_student_checkpoint(
     path: str | Path,
 ) -> Tuple[Any, Dict[str, int], EmbeddingNormalizer, Tuple[float, ...], Dict[str, Any]]:
-    payload = torch.load(resolve_project_path(str(path)), map_location="cpu")
+    checkpoint_path = resolve_project_path(str(path))
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"GIPO student checkpoint {checkpoint_path} must contain a mapping payload.")
     if str(payload.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError(f"Unsupported GIPO student protocol {payload.get('protocol')!r}; expected {GIPO_PROTOCOL!r}.")
     if int(payload.get("model_payload_version", 0)) != MODEL_PAYLOAD_VERSION:
@@ -547,6 +553,81 @@ def _metric_specs_for_family(benchmark_family: str, dataset: str = ""):
     raise ValueError(f"Unsupported benchmark_family={benchmark_family!r}.")
 
 
+def _row_text_value(row: Mapping[str, Any], primary: str, aliases: Sequence[str] = ()) -> str:
+    for key in (primary, *aliases):
+        value = row.get(key, "")
+        if str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _single_value_from_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    field: str,
+    requested: str = "",
+    aliases: Sequence[str] = (),
+    arg_name: str | None = None,
+) -> str:
+    requested_text = str(requested or "").strip()
+    values = sorted({_row_text_value(row, field, aliases) for row in rows if _row_text_value(row, field, aliases)})
+    if requested_text:
+        if requested_text not in values:
+            raise ValueError(f"Requested {arg_name or field}={requested_text!r} is not present in context_rows values {values}.")
+        return requested_text
+    if len(values) != 1:
+        raise ValueError(f"Could not infer a single {arg_name or field} from context_rows; found {values}.")
+    return values[0]
+
+
+def _infer_int_values_from_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    field: str,
+    requested: str = "",
+    arg_name: str | None = None,
+) -> Tuple[int, ...]:
+    if str(requested or "").strip():
+        return tuple(_parse_int_csv(str(requested)))
+    values = sorted({int(row[field]) for row in rows if str(row.get(field, "")).strip()})
+    if not values:
+        raise ValueError(f"Could not infer {arg_name or field} from context_rows; pass --{arg_name or field}.")
+    return tuple(int(value) for value in values)
+
+
+def _infer_solver_values_from_rows(rows: Sequence[Mapping[str, Any]], *, requested: str = "") -> Tuple[str, ...]:
+    if str(requested or "").strip():
+        return tuple(normalize_solver_keys(str(requested)))
+    values = sorted({normalize_solver_key(str(row["solver_key"])) for row in rows if str(row.get("solver_key", "")).strip()})
+    if not values:
+        raise ValueError("Could not infer solver_names from context_rows; pass --solver_names.")
+    return tuple(values)
+
+
+def _filter_representatives_to_matrix(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    dataset: str,
+    seeds: Sequence[int],
+    solvers: Sequence[str],
+    target_nfes: Sequence[int],
+) -> List[Dict[str, Any]]:
+    seed_set = {int(seed) for seed in seeds}
+    solver_set = {normalize_solver_key(str(solver)) for solver in solvers}
+    nfe_set = {int(value) for value in target_nfes}
+    filtered = [
+        dict(row)
+        for row in rows
+        if str(row.get("dataset", row.get("dataset_key", ""))) == str(dataset)
+        and int(row["evaluation_seed"]) in seed_set
+        and normalize_solver_key(str(row["solver_key"])) in solver_set
+        and int(row["target_nfe"]) in nfe_set
+    ]
+    if not filtered:
+        raise ValueError("context_rows has no representative rows after applying dataset/seed/solver/NFE filters.")
+    return filtered
+
+
 def _attach_uniform_rewards_to_gipo_row(
     row: Mapping[str, Any],
     *,
@@ -618,11 +699,34 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     _validate_context_rows(context_rows, split_phase=split_phase, selection_mode=selection_mode)
     _benchmark_family_from_rows(context_rows, str(getattr(args, "benchmark_family", "") or ""))
     representatives = _representative_context_rows(context_rows)
-    dataset = str(args.dataset)
     benchmark_family = _benchmark_family_from_rows(representatives, str(getattr(args, "benchmark_family", "") or ""))
-    seeds = tuple(_parse_int_csv(str(args.seeds)))
-    solvers = tuple(normalize_solver_keys(str(args.solver_names)))
-    target_nfes = tuple(_parse_int_csv(str(args.target_nfe_values)))
+    dataset = _single_value_from_rows(
+        representatives,
+        field="dataset",
+        aliases=("dataset_key",),
+        requested=str(getattr(args, "dataset", "") or ""),
+        arg_name="dataset",
+    )
+    seeds = _infer_int_values_from_rows(
+        representatives,
+        field="evaluation_seed",
+        requested=str(getattr(args, "seeds", "") or ""),
+        arg_name="seeds",
+    )
+    solvers = _infer_solver_values_from_rows(representatives, requested=str(getattr(args, "solver_names", "") or ""))
+    target_nfes = _infer_int_values_from_rows(
+        representatives,
+        field="target_nfe",
+        requested=str(getattr(args, "target_nfe_values", "") or ""),
+        arg_name="target_nfe_values",
+    )
+    representatives = _filter_representatives_to_matrix(
+        representatives,
+        dataset=dataset,
+        seeds=seeds,
+        solvers=solvers,
+        target_nfes=target_nfes,
+    )
     molecule_group_root = resolve_project_path(str(getattr(args, "molecule_group_root", "") or default_molecule_group_root()))
     molecule_members_for_coverage: Dict[Tuple[str, str], Dict[str, Any]] = {}
     if benchmark_family == SCENARIO_FAMILY_MOLECULE:
@@ -655,7 +759,9 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     if missing_cells:
         raise ValueError(f"context rows are missing seed/solver/NFE cells: {missing_cells[:8]}")
 
-    baseline_rows = _read_csvs(str(args.baseline_rows)) if str(args.baseline_rows).strip() else []
+    if not str(args.baseline_rows).strip():
+        raise ValueError("GIPO locked-test reporting requires --baseline_rows with matched uniform rows.")
+    baseline_rows = _read_csvs(str(args.baseline_rows))
     comparator_rows = _read_csvs(str(args.comparator_rows)) if str(args.comparator_rows).strip() else []
     baseline_rows = _filter_rows_to_schedule_keys(baseline_rows, BASELINE_SCHEDULE_KEYS)
     comparator_rows = _filter_rows_to_schedule_keys(comparator_rows, SER_REFERENCE_SCHEDULE_KEYS)
@@ -1024,10 +1130,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--require_teacher_checkpoint_selection_mode", default="")
     parser.add_argument("--report_label", default="")
     parser.add_argument("--out_dir", required=True)
-    parser.add_argument("--baseline_rows", default="")
+    parser.add_argument("--baseline_rows", default="", help="Required uniform baseline context-row CSVs used as reward anchors.")
     parser.add_argument("--comparator_rows", default="")
     parser.add_argument("--benchmark_family", default="")
-    parser.add_argument("--dataset", default="solar_energy_10m")
+    parser.add_argument("--dataset", default="", help="Dataset key. Defaults to the single dataset inferred from --context_rows.")
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
     parser.add_argument("--shared_backbone_root", default=str(DEFAULT_SHARED_BACKBONE_ROOT))
     parser.add_argument("--backbone_manifest", default=str(default_backbone_manifest_path()))
@@ -1052,9 +1158,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--fu_net_layers", type=int, default=3)
     parser.add_argument("--fu_net_heads", type=int, default=4)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--seeds", default="0,1,2")
-    parser.add_argument("--solver_names", default=",".join(CANONICAL_SOLVER_KEYS))
-    parser.add_argument("--target_nfe_values", default=",".join(str(value) for value in CANONICAL_SEEN_NFES))
+    parser.add_argument("--seeds", default="", help="Comma-separated evaluation seeds. Defaults to seeds inferred from --context_rows.")
+    parser.add_argument("--solver_names", default="", help="Comma-separated solver keys. Defaults to solvers inferred from --context_rows.")
+    parser.add_argument("--target_nfe_values", default="", help="Comma-separated target NFEs. Defaults to NFEs inferred from --context_rows.")
     parser.add_argument("--num_eval_samples", type=int, default=5)
     parser.add_argument("--forecast_eval_batch_size", type=int, default=1)
     return parser

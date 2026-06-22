@@ -16,7 +16,7 @@ from genode.canonical_experiment_layout import (
     canonical_nfes_for_role,
 )
 from genode.evaluation import diffusion_flow_time_reparameterization as runner
-from genode.solver_protocol import expected_realized_nfe, normalize_solver_key, normalize_solver_keys, solver_macro_steps
+from genode.solver_protocol import expected_realized_nfe, normalize_solver_key, normalize_solver_keys, normalize_solver_nfe_fields, solver_macro_steps
 from genode.gipo.train_gipo import build_argparser as build_gipo_argparser
 
 
@@ -82,6 +82,10 @@ class CanonicalSeenUnseenLayoutTests(unittest.TestCase):
         self.assertEqual(solver_macro_steps("dpmpp2m", 4), 4)
         self.assertEqual(expected_realized_nfe("heun", 4), 4)
         self.assertEqual(expected_realized_nfe("dpmpp2m", 4), 4)
+        nfe = normalize_solver_nfe_fields("heun", 4, runtime_nfe=2, realized_nfe=4)
+        self.assertEqual((nfe.macro_steps, nfe.runtime_nfe, nfe.realized_nfe), (2, 2, 4))
+        with self.assertRaisesRegex(ValueError, "runtime_nfe=4"):
+            normalize_solver_nfe_fields("heun", 4, runtime_nfe=4)
 
 
 if __name__ == "__main__":

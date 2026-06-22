@@ -281,7 +281,14 @@ genode-train-gipo \
   --out_dir <output-dir>
 ```
 
-For non-forecast tasks, provide utility columns and weights:
+For non-forecast tasks, provide utility columns and weights. If density-family
+holdout is enabled, rows must also carry the reward metadata used to compare
+schedules within a context: `gipo_reward_protocol`, `reward_anchor_schedule_key`,
+`u_comp_uniform`, and, when row-specific scalarization is used,
+`reward_metric_weights_json`. Custom tasks that only provide arbitrary utility
+columns should either materialize those reward/protocol columns first or pass an
+explicit density holdout configuration that does not require uniform-anchored
+diagnostics.
 
 ```bash
 genode-train-gipo \
@@ -304,6 +311,7 @@ genode-report-gipo-locked-test \
   --gipo_student_checkpoint <output-dir>/gipo_student.pt \
   --training_summary <output-dir>/gipo_training_summary.json \
   --context_rows <locked-fixed-context.csv>,<locked-ser-context.csv> \
+  --baseline_rows <locked-fixed-context.csv> \
   --context_embeddings_npz <locked-context-embeddings.npz> \
   --out_dir <locked-report-dir> \
   --device auto

@@ -54,7 +54,7 @@ from genode.gipo.objectives import (
 )
 from genode.gipo.schedule_hash import json_hash as _canonical_json_hash
 from genode.gipo.schedule_hash import schedule_grid_hash
-from genode.solver_protocol import normalize_solver_key
+from genode.solver_protocol import normalize_solver_key, normalize_solver_nfe_fields
 from genode.gipo.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
 from genode.schedule_transfer.diffusion_flow_schedules import (
     EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
@@ -529,6 +529,104 @@ def _rank_pair_count_for_groups(
     return int(count)
 
 
+def teacher_rank_pair_diagnostics(
+    rows: Sequence[MetricRow],
+    *,
+    target_keys: Sequence[str],
+    teacher_utility_weights: Mapping[str, float] | None = None,
+    pair_margin: float = 0.0,
+    pair_on_seed: bool = True,
+) -> Dict[str, Any]:
+    keys = validate_teacher_metric_target_keys(target_keys)
+    if not rows:
+        return {
+            "row_count": 0,
+            "pair_group_count": 0,
+            "rankable_pair_count": 0,
+            "singleton_group_count": 0,
+            "tie_only_group_count": 0,
+            "margin_filtered_pair_count": 0,
+            "max_group_size": 0,
+            "example_bad_groups": [],
+        }
+    metric_targets, metric_target_mask = _teacher_metric_targets(rows, target_keys=keys, device="cpu")
+    target_weights = _teacher_metric_weights(
+        rows,
+        target_keys=keys,
+        batch=len(rows),
+        device=metric_targets.device,
+        dtype=metric_targets.dtype,
+        teacher_utility_weights=teacher_utility_weights,
+        target_mask=metric_target_mask,
+    )
+    targets = _scalarize_teacher_metric_values(
+        metric_targets,
+        target_weights,
+        target_keys=keys,
+        target_mask=metric_target_mask,
+    )
+    pair_keys: List[ContextPairKey] = [context_pair_key(row, pair_on_seed=True) for row in rows]
+    if not pair_on_seed:
+        pair_keys = [key[:4] + (None,) for key in pair_keys]
+    grouped_by_key: Dict[ContextPairKey, List[int]] = defaultdict(list)
+    for idx, key in enumerate(pair_keys):
+        grouped_by_key[key].append(int(idx))
+    values = [float(value) for value in targets.detach().cpu().tolist()]
+    min_delta = float(pair_margin)
+    rankable_pair_count = 0
+    margin_filtered_pair_count = 0
+    singleton_group_count = 0
+    tie_only_group_count = 0
+    max_group_size = 0
+    bad_examples: List[Dict[str, Any]] = []
+    for key, indices in sorted(grouped_by_key.items(), key=lambda item: item[0]):
+        max_group_size = max(max_group_size, len(indices))
+        pair_count = 0
+        filtered_count = 0
+        for pos, i in enumerate(indices):
+            left_value = values[int(i)]
+            for j in indices[pos + 1 :]:
+                if abs(left_value - values[int(j)]) > min_delta:
+                    pair_count += 1
+                else:
+                    filtered_count += 1
+        rankable_pair_count += pair_count
+        margin_filtered_pair_count += filtered_count
+        if len(indices) < 2:
+            singleton_group_count += 1
+        elif pair_count == 0:
+            tie_only_group_count += 1
+        if pair_count == 0 and len(bad_examples) < 8:
+            schedules = sorted({str(rows[int(index)]["scheduler_key"]) for index in indices})
+            bad_examples.append(
+                {
+                    "group": {
+                        "dataset": str(key[0]),
+                        "solver_key": str(key[1]),
+                        "target_nfe": int(key[2]),
+                        "context_id": str(key[3]),
+                        "logical_seed": None if key[4] is None else int(key[4]),
+                    },
+                    "row_count": int(len(indices)),
+                    "schedule_keys": schedules,
+                    "scalarized_utility_values": [float(values[int(index)]) for index in indices],
+                    "reason": "singleton_group" if len(indices) < 2 else "tie_or_margin_filtered",
+                }
+            )
+    return {
+        "row_count": int(len(rows)),
+        "pair_group_count": int(len(grouped_by_key)),
+        "rankable_pair_count": int(rankable_pair_count),
+        "singleton_group_count": int(singleton_group_count),
+        "tie_only_group_count": int(tie_only_group_count),
+        "margin_filtered_pair_count": int(margin_filtered_pair_count),
+        "max_group_size": int(max_group_size),
+        "pair_margin": float(pair_margin),
+        "target_keys": list(keys),
+        "example_bad_groups": bad_examples,
+    }
+
+
 def _make_group_minibatch_sampler(
     grouped_indices: Sequence[Sequence[int]],
     *,
@@ -752,6 +850,18 @@ def evaluation_seed_from_row(row: MetricRow) -> int | None:
 
 
 def realized_nfe_from_row(row: MetricRow) -> int | None:
+    solver = row.get("solver_key", "")
+    target = row.get("target_nfe", "")
+    if str(solver).strip() and str(target).strip():
+        nfe = normalize_solver_nfe_fields(
+            str(solver),
+            int(target),
+            macro_steps=row.get("macro_steps", row.get("reference_macro_steps", "")),
+            runtime_nfe=row.get("runtime_nfe", ""),
+            realized_nfe=row.get("realized_nfe", row.get("actual_nfe", "")),
+            source="GIPO row",
+        )
+        return int(nfe.realized_nfe)
     explicit = row.get("realized_nfe", "")
     if explicit is not None and str(explicit).strip() != "":
         return int(explicit)
@@ -2957,6 +3067,12 @@ def train_gipo_teacher(
 ) -> Dict[str, Any]:
     if not rows:
         raise ValueError("Teacher training requires at least one context reward row.")
+    steps = int(steps)
+    if steps <= 0:
+        raise ValueError("teacher steps must be positive.")
+    checkpoint_every = int(teacher_checkpoint_every)
+    if checkpoint_every <= 0:
+        raise ValueError("teacher_checkpoint_every must be positive.")
     validate_gipo_support_schedule_keys(sorted({str(row["scheduler_key"]) for row in rows}), allowed_schedule_keys=allowed_schedule_keys)
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
@@ -3001,8 +3117,18 @@ def train_gipo_teacher(
         pair_keys = [key[:4] + (None,) for key in pair_keys]
     grouped_indices = _group_indices_by_pair_key(pair_keys)
     global_pair_count = _rank_pair_count_for_groups(targets, grouped_indices, margin=float(pair_margin))
+    rank_pair_diagnostics = teacher_rank_pair_diagnostics(
+        rows,
+        target_keys=teacher_metric_target_keys,
+        teacher_utility_weights=teacher_utility_weights,
+        pair_margin=float(pair_margin),
+        pair_on_seed=bool(pair_on_seed),
+    )
     if require_rank_pairs and global_pair_count == 0:
-        raise ValueError("Context teacher training found no same-context schedule pairs for ranking.")
+        raise ValueError(
+            "Context teacher training found no same-context schedule pairs for ranking; "
+            f"diagnostics={rank_pair_diagnostics}."
+        )
     next_teacher_batch = _make_group_minibatch_sampler(
         grouped_indices,
         group_batch_size=DEFAULT_GIPO_TEACHER_GROUP_BATCH_SIZE,
@@ -3018,7 +3144,6 @@ def train_gipo_teacher(
         str(name): tuple(str(key) for key in keys)
         for name, keys in dict(diagnostic_candidate_schedule_keys or {}).items()
     }
-    checkpoint_every = max(1, int(teacher_checkpoint_every))
     for step in range(int(steps)):
         batch_indices = next_teacher_batch()
         batch_cpu_idx = _index_tensor(batch_indices, device="cpu")
@@ -3056,6 +3181,7 @@ def train_gipo_teacher(
                     "teacher_pair_count": int(global_pair_count),
                     "teacher_batch_pair_count": int(left.numel()),
                     "teacher_global_pair_count": int(global_pair_count),
+                    "teacher_rank_pair_diagnostics": rank_pair_diagnostics,
                     "teacher_group_batch_size": int(DEFAULT_GIPO_TEACHER_GROUP_BATCH_SIZE),
                     "teacher_row_batch_count": int(len(batch_indices)),
                     "teacher_target": "metric_vector",
@@ -3144,6 +3270,7 @@ def train_gipo_teacher(
         "setting_encoder_mode": encoder_config.mode,
         "setting_encoder_config": encoder_config.to_payload(),
         "teacher_pair_count": int(global_pair_count),
+        "teacher_rank_pair_diagnostics": rank_pair_diagnostics,
         "teacher_group_batch_size": int(DEFAULT_GIPO_TEACHER_GROUP_BATCH_SIZE),
         "rank_temperature": float(rank_temperature),
         "regression_weight": float(regression_weight),
@@ -3491,6 +3618,12 @@ def train_gipo_student(
 ) -> Dict[str, Any]:
     if not rows:
         raise ValueError("Student density training requires at least one fit row.")
+    steps = int(steps)
+    if steps <= 0:
+        raise ValueError("student steps must be positive.")
+    checkpoint_every = int(student_checkpoint_every)
+    if checkpoint_every <= 0:
+        raise ValueError("student_checkpoint_every must be positive.")
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     weight_decay = float(student_weight_decay)
@@ -3517,7 +3650,6 @@ def train_gipo_student(
     )
     selection_mode = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE
     use_validation_selection = not bool(final_retrain_mode)
-    checkpoint_every = max(1, int(student_checkpoint_every))
     validation_fit_rows = [dict(row) for row in (validation_rows or [])]
     if use_validation_selection and not validation_fit_rows:
         raise ValueError("student validation CE checkpoint selection requires non-empty validation_rows.")
@@ -4047,14 +4179,16 @@ def predict_gipo_density_many(
     for row, mass_t in zip(rows, masses_t):
         solver = str(row["solver_key"])
         target_nfe = int(row["target_nfe"])
-        macro_steps = solver_macro_steps(solver, target_nfe)
+        nfe = normalize_solver_nfe_fields(solver, target_nfe, source="GIPO prediction row")
         mass = tuple(float(x) for x in mass_t.detach().cpu().numpy().astype(np.float64).tolist())
-        grid = density_mass_to_time_grid(mass, macro_steps=macro_steps, reference_time_grid=reference_time_grid)
+        grid = density_mass_to_time_grid(mass, macro_steps=nfe.macro_steps, reference_time_grid=reference_time_grid)
         outputs.append(
             {
                 "solver_key": solver,
                 "target_nfe": int(target_nfe),
-                "macro_steps": int(macro_steps),
+                "macro_steps": int(nfe.macro_steps),
+                "runtime_nfe": int(nfe.runtime_nfe),
+                "realized_nfe": int(nfe.realized_nfe),
                 "time_grid": list(grid),
                 "schedule_grid_hash": schedule_grid_hash(grid),
                 "density_mass": [float(x) for x in mass],
@@ -4154,6 +4288,7 @@ __all__ = [
     "evaluation_seed_from_row",
     "realized_nfe_from_row",
     "teacher_selection_candidate_group_key",
+    "teacher_rank_pair_diagnostics",
     "split_rows_by_context_holdout",
     "split_rows_by_density_family_holdout",
     "student_nfe_sequence_pair_indices",

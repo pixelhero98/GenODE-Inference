@@ -18,6 +18,7 @@ from genode.gipo.evaluate_schedule_summary import (
     load_schedule_predictions,
     select_best_validation_schedule,
 )
+from genode.gipo.schedule_grids import load_schedule_summary_grids
 from genode.gipo.ser_ptg_reference import (
     SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
     SER_PTG_REVERSED_SCHEDULE_KEY,
@@ -138,6 +139,109 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         self.assertIn((SER_PTG_AVG_REVERSED_SCHEDULE_KEY, "heun", 4), predictions)
         self.assertEqual(predictions[(SER_PTG_SCHEDULE_KEY, "heun", 4)]["realized_nfe"], 4)
         self.assertNotIn(SER_PTG_SCHEDULE_KEY, BASELINE_SCHEDULE_KEYS)
+
+    def test_load_schedule_predictions_rejects_rk2_runtime_nfe_as_realized_nfe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ser_summary.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "dataset": "traffic_hourly",
+                        "schedules": [
+                            {
+                                "scheduler_key": SER_PTG_SCHEDULE_KEY,
+                                "predictions": [
+                                    {
+                                        "solver_key": "heun",
+                                        "target_nfe": 4,
+                                        "runtime_nfe": 4,
+                                        "time_grid": _uniform_grid(2),
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "runtime_nfe=4"):
+                load_schedule_predictions(
+                    path,
+                    dataset="traffic_hourly",
+                    solver_names=("heun",),
+                    target_nfe_values=(4,),
+                )
+
+    def test_load_schedule_predictions_accepts_legacy_runtime_macro_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ser_summary.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "dataset": "traffic_hourly",
+                        "schedules": [
+                            {
+                                "scheduler_key": SER_PTG_SCHEDULE_KEY,
+                                "predictions": [
+                                    {
+                                        "solver_key": "heun",
+                                        "target_nfe": 4,
+                                        "runtime_nfe": 2,
+                                        "time_grid": _uniform_grid(2),
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            predictions = load_schedule_predictions(
+                path,
+                dataset="traffic_hourly",
+                solver_names=("heun",),
+                target_nfe_values=(4,),
+            )
+
+        row = predictions[(SER_PTG_SCHEDULE_KEY, "heun", 4)]
+        self.assertEqual(row["runtime_nfe"], 2)
+        self.assertEqual(row["macro_steps"], 2)
+        self.assertEqual(row["realized_nfe"], 4)
+
+    def test_schedule_grid_loader_registers_base_keys_for_checkpoint_scoped_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ser_summary.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "dataset": "traffic_hourly",
+                        "checkpoint_step": 4000,
+                        "schedules": [
+                            {
+                                "scheduler_key": SER_PTG_SCHEDULE_KEY,
+                                "predictions": [
+                                    {
+                                        "solver_key": "euler",
+                                        "target_nfe": 4,
+                                        "macro_steps": 4,
+                                        "time_grid": _uniform_grid(4),
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            grids = load_schedule_summary_grids([str(path)])
+
+        self.assertIn((SER_PTG_SCHEDULE_KEY, "euler", 4), grids)
+        self.assertIn((SER_PTG_SCHEDULE_KEY, "euler", 4, 4000), grids)
+        self.assertIn((SER_PTG_REVERSED_SCHEDULE_KEY, "euler", 4), grids)
+        self.assertIn((SER_PTG_AVG_REVERSED_SCHEDULE_KEY, "euler", 4), grids)
 
     def test_load_schedule_predictions_rejects_empty_filtered_candidate_set(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

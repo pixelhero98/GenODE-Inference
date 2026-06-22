@@ -11,7 +11,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
-from genode.solver_protocol import CANONICAL_SOLVER_KEYS, normalize_solver_key, normalize_solver_keys
+from genode.solver_protocol import (
+    CANONICAL_SOLVER_KEYS,
+    normalize_solver_key,
+    normalize_solver_keys,
+    normalize_solver_nfe_fields,
+)
 from genode.gipo.density_representation import (
     average_density_masses,
     density_mass_to_time_grid,
@@ -50,8 +55,6 @@ from genode.evaluation.otflow_evaluation_support import (
     choose_forecast_train_tuning_indices,
     evaluate_forecast_schedule,
     load_forecast_checkpoint_splits,
-    solver_eval_multiplier,
-    solver_macro_steps,
     train_tuning_sampler_key,
 )
 from genode.models.otflow_train_val import save_json
@@ -94,6 +97,7 @@ SCHEDULE_ROW_FIELDS: Tuple[str, ...] = (
     "train_budget_label",
     "target_nfe",
     "runtime_nfe",
+    "macro_steps",
     "solver_key",
     "solver_name",
     "scheduler_key",
@@ -253,10 +257,6 @@ def _schedule_grid_hash(grid: Sequence[float]) -> str:
     return schedule_grid_hash(grid)
 
 
-def expected_realized_nfe(solver_key: str, target_nfe: int) -> int:
-    return int(solver_macro_steps(str(solver_key), int(target_nfe))) * int(solver_eval_multiplier(str(solver_key)))
-
-
 def _logical_artifact_path(path: str | Path) -> str:
     resolved = resolve_project_path(str(path))
     root = project_root().resolve()
@@ -414,16 +414,15 @@ def load_schedule_predictions(
             target_nfe = int(item.get("target_nfe"))
             if solver_key not in allowed_solvers or target_nfe not in allowed_nfes:
                 continue
-            macro_steps = solver_macro_steps(solver_key, target_nfe)
-            recorded_macro_steps = int(item.get("macro_steps", item.get("runtime_nfe", macro_steps)))
-            if recorded_macro_steps != macro_steps:
-                raise ValueError(
-                    f"Schedule {scheduler_key} {solver_key}/{target_nfe} has macro_steps={recorded_macro_steps}, expected {macro_steps}."
-                )
-            time_grid = validate_time_grid(item.get("time_grid", []), macro_steps=macro_steps)
-            realized_nfe = expected_realized_nfe(solver_key, target_nfe)
-            if realized_nfe != int(target_nfe):
-                raise ValueError(f"Realized NFE {realized_nfe} does not match target NFE {target_nfe} for {solver_key}.")
+            nfe = normalize_solver_nfe_fields(
+                solver_key,
+                target_nfe,
+                macro_steps=item.get("macro_steps"),
+                runtime_nfe=item.get("runtime_nfe"),
+                realized_nfe=item.get("realized_nfe"),
+                source=f"Schedule {scheduler_key} {solver_key}/{target_nfe}",
+            )
+            time_grid = validate_time_grid(item.get("time_grid", []), macro_steps=nfe.macro_steps)
             prediction = dict(item)
             prediction["solver_key"] = solver_key
             for meta_key in (
@@ -452,12 +451,12 @@ def load_schedule_predictions(
                 time_grid=time_grid,
                 solver_key=solver_key,
                 target_nfe=int(target_nfe),
-                macro_steps=int(macro_steps),
-                realized_nfe=int(realized_nfe),
+                macro_steps=int(nfe.macro_steps),
+                realized_nfe=int(nfe.realized_nfe),
             )
             if scheduler_key == SER_PTG_SCHEDULE_KEY:
                 for derived_key in (SER_PTG_REVERSED_SCHEDULE_KEY, SER_PTG_AVG_REVERSED_SCHEDULE_KEY):
-                    derived_grid = _derived_ser_time_grid(derived_key, time_grid, macro_steps=int(macro_steps))
+                    derived_grid = _derived_ser_time_grid(derived_key, time_grid, macro_steps=int(nfe.macro_steps))
                     _register_prediction(
                         predictions,
                         scheduler_key=derived_key,
@@ -467,8 +466,8 @@ def load_schedule_predictions(
                         time_grid=derived_grid,
                         solver_key=solver_key,
                         target_nfe=int(target_nfe),
-                        macro_steps=int(macro_steps),
-                        realized_nfe=int(realized_nfe),
+                        macro_steps=int(nfe.macro_steps),
+                        realized_nfe=int(nfe.realized_nfe),
                     )
     if require_complete:
         schedule_keys = sorted(set(expected_schedule_keys))
@@ -577,14 +576,18 @@ def _schedule_row(
 ) -> Dict[str, Any]:
     solver_key = str(prediction["solver_key"])
     target_nfe = int(prediction["target_nfe"])
-    runtime_nfe = int(prediction["runtime_nfe"])
     scheduler_key = str(prediction["scheduler_key"])
     time_grid = [float(x) for x in prediction["time_grid"]]
     shape = fixed_schedule_shape_statistics(time_grid)
     geom = grid_geometry(time_grid)
-    realized_nfe = int(metrics.get("realized_nfe", expected_realized_nfe(solver_key, target_nfe)))
-    if realized_nfe != int(target_nfe):
-        raise ValueError(f"{scheduler_key} row for {solver_key}/{target_nfe} realized NFE {realized_nfe}, expected {target_nfe}.")
+    nfe = normalize_solver_nfe_fields(
+        solver_key,
+        target_nfe,
+        macro_steps=prediction.get("macro_steps"),
+        runtime_nfe=prediction.get("runtime_nfe"),
+        realized_nfe=metrics.get("realized_nfe", prediction.get("realized_nfe")),
+        source=f"{scheduler_key} row {solver_key}/{target_nfe}",
+    )
     return {
         "benchmark_family": FORECAST_FAMILY,
         "split_phase": str(split_phase),
@@ -596,7 +599,8 @@ def _schedule_row(
         "train_steps": int(checkpoint["train_steps"]),
         "train_budget_label": str(checkpoint["train_budget_label"]),
         "target_nfe": int(target_nfe),
-        "runtime_nfe": int(runtime_nfe),
+        "runtime_nfe": int(nfe.runtime_nfe),
+        "macro_steps": int(nfe.macro_steps),
         "solver_key": solver_key,
         "solver_name": str(SOLVER_RUNTIME_NAMES[solver_key]),
         "scheduler_key": scheduler_key,
@@ -615,7 +619,7 @@ def _schedule_row(
         ),
         "selection_metric": "forecast_crps",
         "selection_metric_value": metrics.get("forecast_crps"),
-        "reference_macro_steps": int(runtime_nfe),
+        "reference_macro_steps": int(nfe.macro_steps),
         "runtime_grid_q25": shape.get("runtime_grid_q25"),
         "runtime_grid_q50": shape.get("runtime_grid_q50"),
         "runtime_grid_q75": shape.get("runtime_grid_q75"),
@@ -629,7 +633,7 @@ def _schedule_row(
         "mase": metrics.get("forecast_mase"),
         "forecast_mase_scale_kind": metrics.get("forecast_mase_scale_kind"),
         "forecast_mase_scale_period": metrics.get("forecast_mase_scale_period"),
-        "realized_nfe": int(realized_nfe),
+        "realized_nfe": int(nfe.realized_nfe),
         "latency_ms_per_sample": metrics.get("latency_ms_per_sample"),
         "num_eval_samples": metrics.get("num_eval_samples"),
         "eval_examples": metrics.get("eval_examples"),
@@ -660,7 +664,7 @@ def _schedule_row(
     }
 
 
-def _load_rows_csv(path: str | Path, *, dataset: str, split_phase: Optional[str], seeds: Sequence[int], solver_names: Sequence[str], target_nfe_values: Sequence[int]) -> List[Dict[str, Any]]:
+def _load_forecast_rows_csv(path: str | Path, *, dataset: str, split_phase: Optional[str], seeds: Sequence[int], solver_names: Sequence[str], target_nfe_values: Sequence[int]) -> List[Dict[str, Any]]:
     resolved = resolve_project_path(str(path))
     seed_set = {int(seed) for seed in seeds}
     solver_set = {str(solver) for solver in solver_names}
@@ -703,6 +707,9 @@ def _load_rows_csv(path: str | Path, *, dataset: str, split_phase: Optional[str]
                     clean[key] = int(value) if key in {"realized_nfe", "gipo_step_budget"} else float(value)
             rows.append(clean)
     return rows
+
+
+_load_rows_csv = _load_forecast_rows_csv
 
 
 def _missing_cells(
@@ -1516,7 +1523,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate generated schedule-summary grids on train-tuning, validation, or locked test splits.")
+    parser = argparse.ArgumentParser(description="Evaluate forecast schedule-summary grids on train-tuning, validation, or locked test splits.")
     parser.add_argument("--dataset", default="traffic_hourly")
     parser.add_argument("--schedule_summary", required=True)
     parser.add_argument("--split_phase", choices=(TRAIN_TUNING_PHASE, VALIDATION_PHASE, LOCKED_TEST_PHASE), required=True)

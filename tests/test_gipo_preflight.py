@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from genode.canonical_experiment_layout import SCENARIO_FAMILY_FORECAST
-from genode.gipo.preflight import build_argparser, preflight_gipo_rows
+from genode.gipo.preflight import build_argparser, preflight_gipo_rows, validate_gipo_support_preflight_report
 
 
 SUPPORT_SCHEDULES = ("uniform", "late_power_3")
@@ -152,6 +152,82 @@ class GipoPreflightTests(unittest.TestCase):
         self.assertEqual(exported_header, list(ROW_FIELDS))
         self.assertEqual([row["scheduler_key"] for row in exported_rows], ["late_power_3", "uniform"])
         self.assertEqual({row["context_id"] for row in exported_rows}, {"ctx_1"})
+
+    def test_preflight_reports_insufficient_complete_context_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows_csv = Path(tmpdir) / "rows.csv"
+            _write_rows(
+                rows_csv,
+                [
+                    _row("ctx_0", "uniform"),
+                    _row("ctx_0", "late_power_3"),
+                    _row("ctx_1", "uniform"),
+                    _row("ctx_1", "late_power_3"),
+                ],
+            )
+
+            report = _run_preflight(rows_csv, "--min_context_count", "3")
+
+        self.assertEqual(report["status"], "issues_found")
+        self.assertEqual(report["context_count_preflight"]["complete_clean_context_count"], 2)
+        self.assertIn("at least 3", report["context_count_preflight"]["errors"][0])
+
+    def test_preflight_reports_missing_schedule_summary_grids(self) -> None:
+        ser_key = "ser_ptg_local_defect_eta005"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows_csv = Path(tmpdir) / "rows.csv"
+            _write_rows(
+                rows_csv,
+                [
+                    _row("ctx_0", "uniform"),
+                    _row("ctx_0", ser_key),
+                    _row("ctx_1", "uniform"),
+                    _row("ctx_1", ser_key),
+                    _row("ctx_2", "uniform"),
+                    _row("ctx_2", ser_key),
+                ],
+            )
+            args = build_argparser().parse_args(
+                [
+                    "--rows_csv",
+                    str(rows_csv),
+                    "--support_schedule_keys",
+                    f"uniform,{ser_key}",
+                    "--teacher_metric_target_keys",
+                    "u_comp_uniform",
+                ]
+            )
+
+            report = preflight_gipo_rows(args)
+
+        self.assertEqual(report["status"], "issues_found")
+        self.assertEqual(report["schedule_grid_preflight"]["missing_grid_row_count"], 3)
+        self.assertEqual(report["schedule_grid_preflight"]["missing_grid_rows"][0]["scheduler_key"], ser_key)
+
+    def test_preflight_context_count_does_not_abort_on_bad_identity_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows_csv = Path(tmpdir) / "rows.csv"
+            bad = _row("", "uniform", series_id="", target_t=None)
+            bad["target_t"] = ""
+            _write_rows(rows_csv, [bad])
+
+            report = _run_preflight(rows_csv, "--min_context_count", "3")
+
+        self.assertEqual(report["status"], "issues_found")
+        self.assertGreaterEqual(report["context_count_preflight"]["row_error_count"], 1)
+        self.assertIn("Context rows require context_id", report["context_count_preflight"]["row_errors"][0])
+
+    def test_support_preflight_validator_rejects_schedule_grid_load_error(self) -> None:
+        report = {
+            "support_cells": {"bad_group_count": 0},
+            "context_identity": {"conflict_group_count": 0, "conflicts": []},
+            "context_count_preflight": {"errors": []},
+            "schedule_grid_preflight": {"missing_grid_row_count": 0},
+            "schedule_grid_preflight_error": "Schedule summary not found: missing.json",
+        }
+
+        with self.assertRaisesRegex(ValueError, "schedule_grid_error"):
+            validate_gipo_support_preflight_report(report)
 
 
 if __name__ == "__main__":
