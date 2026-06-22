@@ -2405,8 +2405,6 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
     )
     molecule_datasets = parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", "")))
     summary_requested = bool(str(getattr(cli_args, "schedule_summary_json", "")).strip() or str(getattr(cli_args, "summary_scheduler_names", "")).strip())
-    if summary_requested and not forecast_datasets:
-        raise ValueError("schedule_summary_json and summary_scheduler_names are forecast-only; no forecast_datasets were requested.")
     scheduler_cases: Dict[str, List[Dict[str, Any]]] = {}
     if forecast_datasets:
         scheduler_cases.update(
@@ -2421,7 +2419,7 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
             _scheduler_cases_for_datasets(
                 cli_args,
                 list(conditional_generation_datasets),
-                include_summary_cases=False,
+                include_summary_cases=summary_requested,
             )
         )
     if molecule_datasets:
@@ -2429,7 +2427,7 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
             _scheduler_cases_for_datasets(
                 cli_args,
                 list(molecule_datasets),
-                include_summary_cases=False,
+                include_summary_cases=summary_requested,
             )
         )
     try:

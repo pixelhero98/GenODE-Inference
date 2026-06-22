@@ -149,7 +149,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertEqual(cases[0]["macro_steps"], 2)
         self.assertEqual(cases[0]["realized_nfe"], 4)
 
-    def test_summary_scheduler_cases_are_forecast_only(self) -> None:
+    def test_summary_scheduler_cases_are_family_neutral(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "summary.json"
             path.write_text(
@@ -183,10 +183,10 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 ]
             )
             forecast_cases = runner._scheduler_cases_for_datasets(args, ["traffic_hourly"], include_summary_cases=True)
-            conditional_cases = runner._scheduler_cases_for_datasets(args, ["lobster_synthetic"], include_summary_cases=False)
+            conditional_cases = runner._scheduler_cases_for_datasets(args, ["lobster_synthetic"], include_summary_cases=True)
 
         self.assertEqual([case["scheduler_key"] for case in forecast_cases["traffic_hourly"]], ["uniform", "gipo"])
-        self.assertEqual([case["scheduler_key"] for case in conditional_cases["lobster_synthetic"]], ["uniform"])
+        self.assertEqual([case["scheduler_key"] for case in conditional_cases["lobster_synthetic"]], ["uniform", "gipo"])
 
     def test_aggregate_relative_gain_uses_fraction_units(self) -> None:
         rows = [
@@ -652,6 +652,67 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
 
         conditional_phase.assert_called_once()
         self.assertEqual(payload["prep"]["split_phase"], "train_tuning")
+
+    def test_conditional_generation_accepts_summary_schedule_args_without_forecast_datasets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_path = Path(tmpdir) / "summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "schedules": [
+                            {
+                                "scheduler_key": "gipo",
+                                "predictions": [
+                                    {
+                                        "solver_key": "euler",
+                                        "target_nfe": 4,
+                                        "macro_steps": 4,
+                                        "time_grid": [0.0, 0.25, 0.5, 0.75, 1.0],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "lobster_synthetic",
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--schedule_summary_json",
+                    str(summary_path),
+                    "--summary_scheduler_names",
+                    "gipo",
+                    "--target_nfe_values",
+                    "4",
+                    "--solver_names",
+                    "euler",
+                    "--seeds",
+                    "0",
+                    "--split_phase",
+                    "train_tuning",
+                    "--allow_execute",
+                ]
+            )
+            with mock.patch.object(runner, "validate_execution_preflight"), mock.patch.object(runner, "_run_forecast_phase", return_value=[]) as forecast_phase, mock.patch.object(
+                runner,
+                "_run_conditional_generation_phase",
+                return_value=[{"benchmark_family": runner.CONDITIONAL_GENERATION_FAMILY, "split_phase": "train_tuning"}],
+            ) as conditional_phase:
+                payload = runner.run_diffusion_flow_time_reparameterization(args)
+
+        forecast_phase.assert_not_called()
+        conditional_phase.assert_called_once()
+        cases = conditional_phase.call_args.kwargs["scheduler_cases_by_dataset"]["lobster_synthetic"]
+        self.assertEqual([case["scheduler_key"] for case in cases], ["uniform", "gipo"])
+        self.assertEqual(payload["schedule_selection_summary"]["summary_schedule_keys"], ["gipo"])
 
     def test_forecast_phase_uses_requested_split_dataset(self) -> None:
         class FakeDataset:

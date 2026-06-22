@@ -1086,6 +1086,15 @@ class GenericContextGipoTests(unittest.TestCase):
         by_stage = {stage["stage"]: stage["commands"] for stage in summary["stages"]}
         self.assertEqual(len(by_stage["gipo_ablation_students"]), 16)
         self.assertEqual(len(by_stage["gipo_ablation_locked_test_reports"]), 160)
+        for stage_name in ("schedule_rows_seen", "schedule_rows_unseen"):
+            self.assertTrue(by_stage[stage_name])
+            for command in by_stage[stage_name]:
+                self.assertIn("--forecast_datasets", command)
+                self.assertEqual(command[command.index("--forecast_datasets") + 1], "")
+                self.assertIn("--conditional_generation_datasets", command)
+                self.assertEqual(command[command.index("--conditional_generation_datasets") + 1], "lobster_synthetic")
+                self.assertIn("--schedule_summary_json", command)
+                self.assertIn("--summary_scheduler_names", command)
         self.assertEqual(manifest["status"], "dry_run")
         self.assertEqual(manifest["arm_count"], 16)
         self.assertEqual(manifest["gipo_teacher_steps"], 500)
@@ -1160,14 +1169,17 @@ class GenericContextGipoTests(unittest.TestCase):
             self.assertIn("--student_steps 43", command)
             self.assertIn("--seen_target_nfe_values 4,8", command)
             self.assertIn("--pseudo_target_nfe_values 6,10", command)
+            self.assertIn("--schedule_summary_json", command)
             self.assertNotIn("--student_teacher_score_include_pseudo", command)
             if arm.student_target_mixture_mode == "elite_blend":
                 self.assertIn(f"--student_target_elite_blend_all_weight {float(arm.student_target_elite_blend_all_weight)}", command)
             if arm.uses_unseen_pseudo_targets:
                 self.assertIn("--student_pseudo_rows_csv", command)
+                self.assertIn("--student_pseudo_schedule_summary_json", command)
                 self.assertIn("--student_pseudo_target_weight 0.25", command)
             else:
                 self.assertNotIn("--student_pseudo_rows_csv", command)
+                self.assertNotIn("--student_pseudo_schedule_summary_json", command)
         self.assertTrue(all("gipo_ablations" in command for command in report_commands))
         self.assertTrue(all("locked_test" in command for command in report_commands))
         self.assertTrue(all("--training_summary" in command and "--gipo_student_checkpoint" in command for command in report_commands))
