@@ -46,6 +46,14 @@ def _tiny_cfg(*, cond_dim: int = 0) -> OTFlowConfig:
 
 
 class ConditionalGenerationFixesTest(unittest.TestCase):
+    def test_manifest_metadata_path_uses_project_relative_resolution(self) -> None:
+        with mock.patch.object(eval_support, "resolve_project_path", side_effect=lambda value: Path("/repo") / str(value)):
+            path = eval_support._metadata_path_for_checkpoint(
+                {"metadata_path": "outputs/backbone_matrix/example/checkpoint_metadata.json"},
+                Path("/other/model.pt"),
+            )
+        self.assertEqual(path, Path("/repo/outputs/backbone_matrix/example/checkpoint_metadata.json"))
+
     def test_forecast_manifest_checkpoint_branch_returns_manifest_train_steps(self) -> None:
         cfg = _tiny_cfg(cond_dim=0)
         cfg.apply_overrides(steps=8000)

@@ -881,7 +881,7 @@ def load_checkpoint_model(ckpt_path: Path, device: torch.device) -> Tuple[OTFlow
 
 def _metadata_path_for_checkpoint(manifest_artifact: Optional[Mapping[str, Any]], ckpt_path: Path) -> Path:
     if manifest_artifact is not None and str(manifest_artifact.get("metadata_path", "") or "").strip():
-        return Path(str(manifest_artifact["metadata_path"])).resolve()
+        return resolve_project_path(str(manifest_artifact["metadata_path"]))
     return Path(ckpt_path).resolve().with_name("checkpoint_metadata.json")
 
 
