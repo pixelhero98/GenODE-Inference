@@ -43,6 +43,7 @@ from genode.backbone_packages import (
     validate_provided_backbone_manifest,
 )
 from genode.gipo.objectives import teacher_metric_profile_for_scenario, teacher_objective_specs_for_scenario
+from genode.gipo.ser_ptg_reference import SER_PTG_EXAMPLE_SELECTION_PROTOCOL, SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL
 from genode.gipo.ablation_plan import (
     DEFAULT_GIPO_ABLATION_PRESET,
     GipoAblationArm,
@@ -96,6 +97,10 @@ class StageCommand:
 
 def _parse_csv(text: str) -> List[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
+
+
+def _resolved_scenario_key(args: argparse.Namespace) -> str:
+    return str(getattr(args, "scenario_key", "") or getattr(args, "dataset", "") or "lobster_synthetic")
 
 
 def _parse_int_csv(text: str, default: Sequence[int]) -> List[int]:
@@ -199,7 +204,7 @@ def _student_objective_args(args: argparse.Namespace, override: GipoAblationArm 
 
 
 def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
-    dataset = str(args.scenario_key or args.dataset)
+    dataset = _resolved_scenario_key(args)
     family = scenario_family_for_key(dataset)
     if int(args.synthetic_length) <= 0:
         raise ValueError("--synthetic_length must be positive.")
@@ -207,8 +212,11 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("--ser_calibration_batch_size must be positive.")
     if int(args.ser_val_windows) < 0:
         raise ValueError("--ser_val_windows must be nonnegative.")
+    if int(args.ser_train_tuning_max_examples) < 0:
+        raise ValueError("--ser_train_tuning_max_examples must be nonnegative.")
     effective_stages = set(_effective_stage_names(args))
     includes_backbone_training = "backbone_training" in effective_stages
+    provided_validation: Dict[str, Any] | None = None
     if bool(getattr(args, "use_provided_backbones", False)) or str(getattr(args, "backbone_package_root", "") or "").strip():
         if includes_backbone_training:
             raise ValueError("Provided-backbone mode cannot include backbone_training; run downstream stages only.")
@@ -217,20 +225,29 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
             raise FileNotFoundError(f"Provided-backbone mode requires an existing backbone manifest: {manifest_path}")
         provided_validation = validate_provided_backbone_manifest(
             manifest_path,
-            scenario_key=str(args.scenario_key or args.dataset),
+            scenario_key=dataset,
             benchmark_family=family,
         )
         if provided_validation["status"] != "complete":
             raise ValueError("Invalid provided backbone manifest:\n- " + "\n- ".join(provided_validation["errors"]))
-    elif bool(getattr(args, "ablation_first", False)) and not includes_backbone_training and not bool(getattr(args, "dry_run", False)):
+    elif bool(getattr(args, "ablation_first", False)) and not includes_backbone_training:
         manifest_path = resolve_project_path(str(args.backbone_manifest))
-        provided_validation = validate_provided_backbone_manifest(
-            manifest_path,
-            scenario_key=str(args.scenario_key or args.dataset),
-            benchmark_family=family,
-        )
-        if provided_validation["status"] != "complete":
-            raise ValueError("Ablation-first mode requires ready provided backbones:\n- " + "\n- ".join(provided_validation["errors"]))
+        if manifest_path.exists():
+            provided_validation = validate_provided_backbone_manifest(
+                manifest_path,
+                scenario_key=dataset,
+                benchmark_family=family,
+            )
+            if provided_validation["status"] != "complete" and not bool(getattr(args, "dry_run", False)):
+                raise ValueError("Ablation-first mode requires ready provided backbones:\n- " + "\n- ".join(provided_validation["errors"]))
+        elif not bool(getattr(args, "dry_run", False)):
+            raise FileNotFoundError(f"Ablation-first mode requires an existing backbone manifest: {manifest_path}")
+        else:
+            provided_validation = {
+                "status": "skipped_missing_manifest",
+                "errors": [f"Backbone manifest is missing: {manifest_path}"],
+                "manifest_path": str(manifest_path),
+            }
     if includes_backbone_training and family in {SCENARIO_FAMILY_FORECAST, SCENARIO_FAMILY_CONDITIONAL_GENERATION}:
         requested_manifest = resolve_project_path(str(args.backbone_manifest))
         default_manifest = default_backbone_manifest_path().resolve()
@@ -240,16 +257,19 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
                 f"{_display_path(default_manifest)}; do not override --backbone_manifest for runs that include "
                 "backbone_training."
             )
-    return {
+    report = {
         "status": "complete",
         "scenario_key": dataset,
         "benchmark_family": family,
         "synthetic_length": int(args.synthetic_length),
     }
+    if provided_validation is not None:
+        report["provided_backbone_validation"] = provided_validation
+    return report
 
 
 def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
-    dataset = str(args.scenario_key or args.dataset)
+    dataset = _resolved_scenario_key(args)
     plan = experiment_plan_by_key().get(dataset)
     effective_stages = _effective_stage_names(args)
     includes_ablations = any(stage in {GIPO_ABLATION_STUDENT_STAGE, GIPO_ABLATION_LOCKED_TEST_STAGE} for stage in effective_stages)
@@ -270,6 +290,12 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "context_sample_count": int(args.context_sample_count),
         "ser_calibration_batch_size": int(args.ser_calibration_batch_size),
         "ser_val_windows": int(args.ser_val_windows),
+        "ser_train_tuning_max_examples": int(args.ser_train_tuning_max_examples),
+        "ser_train_tuning_effective_max_examples": int(args.ser_train_tuning_max_examples)
+        if int(args.ser_train_tuning_max_examples) > 0
+        else int(args.context_sample_count),
+        "ser_example_selection_protocol": SER_PTG_EXAMPLE_SELECTION_PROTOCOL,
+        "ser_local_defect_proxy_protocol": SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL,
         "gipo_teacher_steps": int(args.gipo_teacher_steps),
         "gipo_student_steps": int(args.gipo_student_steps),
         "student_teacher_score_weight": float(args.student_teacher_score_weight),
@@ -317,7 +343,7 @@ def _resolve_run_root(args: argparse.Namespace) -> Path:
     explicit = str(args.run_root).strip()
     if explicit:
         return resolve_project_path(explicit)
-    scenario_root = project_outputs_root() / "full_pipeline" / str(args.scenario_key or args.dataset)
+    scenario_root = project_outputs_root() / "full_pipeline" / _resolved_scenario_key(args)
     if bool(getattr(args, "ablation_first", False)):
         preset = str(getattr(args, "gipo_ablation_preset", DEFAULT_GIPO_ABLATION_PRESET))
         return scenario_root / "gipo_ablations" / preset
@@ -332,7 +358,7 @@ def _build_ablation_manifest(
     status: str,
     extra: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    dataset = str(args.scenario_key or args.dataset)
+    dataset = _resolved_scenario_key(args)
     family = scenario_family_for_key(dataset)
     preset = str(getattr(args, "gipo_ablation_preset", DEFAULT_GIPO_ABLATION_PRESET))
     root = _ablation_root(run_root, preset)
@@ -522,7 +548,7 @@ def _backbone_training_commands(args: argparse.Namespace, dataset: str, checkpoi
 
 
 def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[StageCommand]:
-    dataset = str(args.scenario_key or args.dataset)
+    dataset = _resolved_scenario_key(args)
     checkpoint_values = _parse_int_csv(str(args.checkpoint_steps), CANONICAL_CHECKPOINT_STEPS)
     checkpoints = ",".join(str(value) for value in checkpoint_values)
     seen_nfes = ",".join(str(value) for value in _parse_int_csv(str(args.seen_nfes), CANONICAL_SEEN_NFES))
@@ -754,6 +780,8 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                 int(args.ser_calibration_batch_size),
                 "--val_windows",
                 int(args.ser_val_windows),
+                "--train_tuning_max_examples",
+                int(args.ser_train_tuning_max_examples),
                 *_data_path_args(args),
                 "--backbone_manifest",
                 str(args.backbone_manifest),
@@ -938,6 +966,7 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         "stage_count": int(len(commands)),
         "stages": [_display_stage(entry) for entry in commands],
         "run_root": _display_path(run_root),
+        "preflight": preflight,
     }
     _write_json(run_root / "pipeline_summary.json", summary)
     _write_json(_status_path(run_root), summary)
@@ -954,7 +983,7 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the canonical multi-family GIPO pipeline with restartable status.")
-    parser.add_argument("--scenario_key", default="lobster_synthetic")
+    parser.add_argument("--scenario_key", default="")
     parser.add_argument("--dataset", default="")
     parser.add_argument("--run_root", default="")
     parser.add_argument("--stages", default="")
@@ -967,6 +996,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--context_sample_count", type=int, default=CANONICAL_CONTEXT_SAMPLE_COUNT)
     parser.add_argument("--ser_calibration_batch_size", type=int, default=64)
     parser.add_argument("--ser_val_windows", type=int, default=0)
+    parser.add_argument("--ser_train_tuning_max_examples", type=int, default=0)
     parser.add_argument("--gipo_teacher_steps", type=int, default=DEFAULT_GIPO_TEACHER_STEPS)
     parser.add_argument("--gipo_student_steps", type=int, default=DEFAULT_GIPO_STUDENT_STEPS)
     parser.add_argument("--student_teacher_score_weight", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT)

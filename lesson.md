@@ -1,0 +1,5 @@
+# Lessons
+
+- Symptom: checkpoint-prefixed `context_id` let the same physical window appear as separate identities across checkpoint maturities. Cause: generated rows used the embedding lookup key as the physical context key. Fix: keep physical `context_id`, store checkpoint-specific embeddings in `context_embedding_id`, and reject legacy checkpoint-prefixed `context_id` values in GIPO training inputs.
+- Symptom: checkpoint-step-only and legacy `train_steps` rows could collapse in support/pairing keys. Cause: sampling, preflight, policy, and training used different checkpoint scope fallbacks. Fix: use one checkpoint scope helper that prefers `checkpoint_id`, then `checkpoint_step`, `train_steps`, and `otflow_train_steps` consistently.
+- Symptom: context sampling and SER/schedule evaluation could silently over-select examples or under-report caps. Cause: cap metadata was inconsistent across forecast, conditional, molecule, and SER paths. Fix: route SER and schedule evaluation through explicit cap metadata and test `selection_was_capped`, selected counts, and cap source across scenario families.

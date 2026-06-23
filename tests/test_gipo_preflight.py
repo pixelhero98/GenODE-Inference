@@ -19,6 +19,8 @@ ROW_FIELDS = (
     "target_nfe",
     "scheduler_key",
     "context_id",
+    "context_embedding_id",
+    "checkpoint_id",
     "series_id",
     "target_t",
     "u_comp_uniform",
@@ -123,6 +125,24 @@ class GipoPreflightTests(unittest.TestCase):
         self.assertEqual(report["support"]["complete_context_identity_clean_support_cell_count"], 0)
         self.assertEqual(report["context_identity_conflict_count"], 1)
         self.assertEqual(report["context_identity_conflicts"][0]["type"], "context_id_multiple_identities")
+
+    def test_preflight_rejects_checkpoint_prefixed_physical_context_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows_csv = Path(tmpdir) / "rows.csv"
+            rows = []
+            for scheduler_key in SUPPORT_SCHEDULES:
+                row = _row("ckpt_a:ctx_0", scheduler_key)
+                row.update({"checkpoint_id": "ckpt_a", "context_embedding_id": "ckpt_a:ctx_0"})
+                rows.append(row)
+            _write_rows(rows_csv, rows)
+
+            report = _run_preflight(rows_csv)
+
+        self.assertEqual(report["status"], "issues_found")
+        self.assertTrue(
+            any(conflict["type"] == "checkpoint_prefixed_context_id" for conflict in report["context_identity_conflicts"]),
+            report["context_identity_conflicts"],
+        )
 
     def test_complete_rows_csv_preserves_header_and_input_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

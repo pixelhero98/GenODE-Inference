@@ -188,6 +188,7 @@ def train_tuning_target_example_count(
     *,
     fraction: float,
     sampling_mode: str = TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
+    strata: int = 20,
     reference_examples: Optional[int] = None,
     train_split_fraction: float = DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION,
     val_split_fraction: float = DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION,
@@ -202,7 +203,12 @@ def train_tuning_target_example_count(
     if mode == TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION:
         if frac >= 1.0:
             return total
-        return min(total, max(1, int(math.floor(float(total) * frac + 0.5))))
+        count = 0
+        for start, end in _strata_ranges(total, int(strata)):
+            size = int(end - start)
+            keep = max(1, int(round(float(size) * frac)))
+            count += min(size, keep)
+        return min(total, max(1, int(count)))
     ref = int(reference_examples or 0)
     if ref <= 0:
         raise ValueError("validation_normalized train-tuning sampling requires positive reference_examples.")
@@ -267,6 +273,7 @@ def choose_forecast_train_tuning_indices(
     reference_examples: Optional[int] = None,
     train_split_fraction: float = DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION,
     val_split_fraction: float = DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION,
+    max_examples: Optional[int] = None,
 ) -> np.ndarray:
     """Deterministically sample train windows by temporal strata."""
     total = int(len(ds))
@@ -276,7 +283,23 @@ def choose_forecast_train_tuning_indices(
     if not math.isfinite(frac) or frac <= 0.0:
         raise ValueError(f"train-tuning fraction must be positive, got {fraction!r}.")
     mode = normalize_train_tuning_sampling_mode(str(sampling_mode))
+    cap = None if max_examples is None or int(max_examples) <= 0 else int(max_examples)
     if mode == TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION:
+        target = train_tuning_target_example_count(total, fraction=frac, sampling_mode=mode, strata=int(strata))
+        if cap is not None and target > cap:
+            ranges = _strata_ranges(total, int(strata))
+            counts = _allocate_stratified_target_counts(total, int(strata), int(cap))
+            selected: List[int] = []
+            for stratum, ((start, end), keep) in enumerate(zip(ranges, counts)):
+                if int(keep) <= 0:
+                    continue
+                size = int(end - start)
+                token = f"{salt}|{mode}|capped|{dataset}|{int(seed)}|{stratum}|{start}|{end}|{cap}|{target}"
+                local_seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
+                rng = np.random.default_rng(local_seed)
+                chosen = rng.choice(size, size=int(keep), replace=False) + int(start)
+                selected.extend(int(idx) for idx in chosen.tolist())
+            return np.asarray(sorted(selected), dtype=np.int64)
         if frac >= 1.0:
             return np.arange(total, dtype=np.int64)
         strata_count = max(1, min(int(strata), total))
@@ -306,6 +329,8 @@ def choose_forecast_train_tuning_indices(
         train_split_fraction=train_split_fraction,
         val_split_fraction=val_split_fraction,
     )
+    if cap is not None:
+        target = min(int(target), int(cap))
     if target >= total:
         return np.arange(total, dtype=np.int64)
     ranges = _strata_ranges(total, int(strata))
@@ -1494,13 +1519,15 @@ def evaluate_forecast_schedule(
 
                         metadata = metadata_rows[row_idx]
                         raw_context_id = chunk_context_ids[row_idx]
-                        context_id = f"{checkpoint_id}:{raw_context_id}" if return_context_embeddings else raw_context_id
+                        context_id = raw_context_id
+                        context_embedding_id = f"{checkpoint_id}:{raw_context_id}" if return_context_embeddings else ""
                         sample_seed_values = [
                             int(evaluation_seed) + 1_000_000 * int(chunk_start) + int(sample_idx)
                             for sample_idx in range(int(num_eval_samples))
                         ]
                         row_signature_payload = {
                             "context_id": str(context_id),
+                            "context_embedding_id": str(context_embedding_id),
                             "checkpoint_id": str(checkpoint_id),
                             "logical_seed": int(logical_panel_seed),
                             "scheduler_key": str(scheduler_key),
@@ -1544,7 +1571,7 @@ def evaluate_forecast_schedule(
                                 "history_stop": metadata.get("history_stop", ""),
                                 "target_stop": metadata.get("target_stop", ""),
                                 "context_id": str(context_id),
-                                "context_embedding_id": str(context_id) if return_context_embeddings else "",
+                                "context_embedding_id": str(context_embedding_id),
                                 "checkpoint_id": str(checkpoint_id),
                                 "forecast_crps": float(crps),
                                 "forecast_mase": float(mase),

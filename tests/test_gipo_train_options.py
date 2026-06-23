@@ -27,6 +27,8 @@ ROW_FIELDS = (
     "target_nfe",
     "scheduler_key",
     "context_id",
+    "context_embedding_id",
+    "checkpoint_id",
     "series_id",
     "target_t",
     "gipo_reward_protocol",
@@ -58,6 +60,8 @@ def _write_rows(
                             "target_nfe": target_nfe,
                             "scheduler_key": scheduler_key,
                             "context_id": context_id,
+                            "context_embedding_id": context_id,
+                            "checkpoint_id": "",
                             "series_id": f"series_{ctx_idx}",
                             "target_t": 100 + ctx_idx,
                             "gipo_reward_protocol": GIPO_PROTOCOL,
@@ -216,6 +220,107 @@ class GipoTrainOptionsTests(unittest.TestCase):
         self.assertEqual(summary["status"], "dry_run")
         self.assertEqual(summary["seen_target_nfe_values"], [5, 7])
         self.assertEqual(summary["canonical_seen_nfes"], list(CANONICAL_SEEN_NFES))
+
+    def test_context_sample_count_is_per_checkpoint_maturity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            rows_csv = root / "seen.csv"
+            embeddings_npz = root / "ctx.npz"
+            contexts = tuple(f"ctx_{idx}" for idx in range(4))
+            with rows_csv.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=ROW_FIELDS)
+                writer.writeheader()
+                for checkpoint_id in ("ckpt_a", "ckpt_b"):
+                    for ctx_idx, context_id in enumerate(contexts):
+                        for target_nfe in (5, 7):
+                            for schedule_idx, scheduler_key in enumerate(SUPPORT_SCHEDULES):
+                                writer.writerow(
+                                    {
+                                        "benchmark_family": SCENARIO_FAMILY_FORECAST,
+                                        "dataset": "private_forecast_dataset",
+                                        "split_phase": "train_tuning",
+                                        "seed": 0,
+                                        "solver_key": "euler",
+                                        "target_nfe": target_nfe,
+                                        "scheduler_key": scheduler_key,
+                                        "context_id": context_id,
+                                        "context_embedding_id": f"{checkpoint_id}:{context_id}",
+                                        "checkpoint_id": checkpoint_id,
+                                        "series_id": f"series_{ctx_idx}",
+                                        "target_t": 100 + ctx_idx,
+                                        "gipo_reward_protocol": GIPO_PROTOCOL,
+                                        "u_comp_uniform": float(schedule_idx),
+                                        "u_alt_uniform": "",
+                                    }
+                                )
+            save_context_embedding_table(
+                embeddings_npz,
+                {
+                    f"{checkpoint_id}:{context_id}": [float(ctx_idx), float(checkpoint_idx)]
+                    for checkpoint_idx, checkpoint_id in enumerate(("ckpt_a", "ckpt_b"))
+                    for ctx_idx, context_id in enumerate(contexts)
+                },
+            )
+
+            args = _trainer_args(
+                root,
+                rows_csv,
+                embeddings_npz,
+                "--seen_target_nfe_values",
+                "5,7",
+                "--context_sample_count",
+                "3",
+                "--context_holdout_fraction",
+                "0",
+                "--student_selection_holdout_fraction",
+                "0.5",
+            )
+            summary = train_gipo(args)
+
+        self.assertEqual(summary["context_sampling"]["sample_count_per_checkpoint"], 3)
+        self.assertEqual(summary["context_sampling"]["per_checkpoint"]["ckpt_a"]["selected_contexts"], 3)
+        self.assertEqual(summary["context_sampling"]["per_checkpoint"]["ckpt_b"]["selected_contexts"], 3)
+        self.assertEqual(summary["context_sampling"]["checkpoint_count"], 2)
+
+    def test_legacy_checkpoint_prefixed_context_ids_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            rows_csv = root / "seen.csv"
+            embeddings_npz = root / "ctx.npz"
+            contexts = tuple(f"ctx_{idx}" for idx in range(3))
+            embeddings = {}
+            with rows_csv.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=ROW_FIELDS)
+                writer.writeheader()
+                for checkpoint_idx, checkpoint_id in enumerate(("ckpt_a", "ckpt_b")):
+                    for ctx_idx, physical_context_id in enumerate(contexts):
+                        legacy_context_id = f"{checkpoint_id}:{physical_context_id}"
+                        embeddings[legacy_context_id] = [float(ctx_idx), float(checkpoint_idx)]
+                        for target_nfe in (5, 7):
+                            for schedule_idx, scheduler_key in enumerate(SUPPORT_SCHEDULES):
+                                writer.writerow(
+                                    {
+                                        "benchmark_family": SCENARIO_FAMILY_FORECAST,
+                                        "dataset": "private_forecast_dataset",
+                                        "split_phase": "train_tuning",
+                                        "seed": 0,
+                                        "solver_key": "euler",
+                                        "target_nfe": target_nfe,
+                                        "scheduler_key": scheduler_key,
+                                        "context_id": legacy_context_id,
+                                        "context_embedding_id": legacy_context_id,
+                                        "checkpoint_id": checkpoint_id,
+                                        "series_id": f"series_{ctx_idx}",
+                                        "target_t": 100 + ctx_idx,
+                                        "gipo_reward_protocol": GIPO_PROTOCOL,
+                                        "u_comp_uniform": float(schedule_idx),
+                                        "u_alt_uniform": "",
+                                    }
+                                )
+            save_context_embedding_table(embeddings_npz, embeddings)
+
+            with self.assertRaisesRegex(ValueError, "physical context_id values without checkpoint prefixes"):
+                train_gipo(_trainer_args(root, rows_csv, embeddings_npz, "--seen_target_nfe_values", "5,7"))
 
     def test_dry_run_reports_split_normalizer_scopes_and_effective_selection_weights(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

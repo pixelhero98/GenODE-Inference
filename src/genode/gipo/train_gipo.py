@@ -61,6 +61,7 @@ from genode.gipo.policy import (
     build_gipo_student_model,
     build_gipo_teacher_model,
     build_series_index_map,
+    checkpoint_scope_from_row,
     context_embedding_id_from_row,
     context_id_from_row,
     context_pair_key,
@@ -385,6 +386,19 @@ def _stable_hash(values: Sequence[str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _checkpoint_scope_from_row(row: Mapping[str, Any]) -> str:
+    return checkpoint_scope_from_row(row, empty_label="unscoped")
+
+
+def _checkpoint_context_key(row: Mapping[str, Any]) -> Tuple[str, str]:
+    return (_checkpoint_scope_from_row(row), context_id_from_row(row))
+
+
+def _scope_seed(base_seed: int, scope: str) -> int:
+    digest = hashlib.sha256(str(scope).encode("utf-8")).hexdigest()
+    return int(base_seed) + int(digest[:8], 16)
+
+
 def _row_membership_key(row: Mapping[str, Any]) -> str:
     payload = {
         "dataset": str(row.get("dataset", row.get("dataset_key", ""))),
@@ -394,6 +408,7 @@ def _row_membership_key(row: Mapping[str, Any]) -> str:
         "context_embedding_id": context_embedding_id_from_row(row),
         "seed": str(row.get("seed", "")),
         "checkpoint_id": str(row.get("checkpoint_id", "") or ""),
+        "checkpoint_scope": _checkpoint_scope_from_row(row),
         "scheduler_key": str(row["scheduler_key"]),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -401,15 +416,19 @@ def _row_membership_key(row: Mapping[str, Any]) -> str:
 
 def _split_membership_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     context_ids = sorted({context_id_from_row(row) for row in rows})
+    checkpoint_scopes = sorted({_checkpoint_scope_from_row(row) for row in rows})
     series_keys = sorted({series_key_from_row(row) for row in rows})
     split_phases = sorted({str(row.get("split_phase", row.get("split", ""))) for row in rows})
     return {
         "row_count": int(len(rows)),
         "context_count": int(len(context_ids)),
+        "checkpoint_scope_count": int(len(checkpoint_scopes)),
         "series_count": int(len(series_keys)),
         "source_split_phases": split_phases,
         "context_ids": context_ids,
         "context_id_hash": _stable_hash(context_ids),
+        "checkpoint_scopes": checkpoint_scopes,
+        "checkpoint_scope_hash": _stable_hash(checkpoint_scopes),
         "series_keys": series_keys,
         "series_key_hash": _stable_hash(series_keys),
     }
@@ -443,6 +462,7 @@ def _split_counts(rows: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
     return {
         "row_count": int(len(rows)),
         "context_count": int(len({context_id_from_row(row) for row in rows})),
+        "checkpoint_scope_count": int(len({_checkpoint_scope_from_row(row) for row in rows})),
         "series_count": int(len({series_key_from_row(row) for row in rows})),
         "schedule_count": int(len({str(row["scheduler_key"]) for row in rows})),
     }
@@ -579,7 +599,7 @@ def _validate_support_group_counts(rows: Sequence[Mapping[str, Any]], support_sc
 def _validate_unique_schedule_rows(rows: Sequence[Mapping[str, Any]], *, label: str) -> None:
     counts: Dict[Tuple[Any, ...], int] = {}
     for row in rows:
-        key = (*context_pair_key(row, pair_on_seed=True), str(row.get("checkpoint_id", "") or ""), str(row["scheduler_key"]))
+        key = (*context_pair_key(row, pair_on_seed=True), str(row["scheduler_key"]))
         counts[key] = int(counts.get(key, 0)) + 1
     duplicates = {key: count for key, count in counts.items() if count != 1}
     if duplicates:
@@ -593,10 +613,14 @@ def _validate_unique_schedule_rows(rows: Sequence[Mapping[str, Any]], *, label: 
 
 def _validate_context_embedding_checkpoint_scope(rows: Sequence[Mapping[str, Any]], *, label: str) -> None:
     mismatches: List[str] = []
+    prefixed_context_ids: List[str] = []
     for row in rows:
         checkpoint_id = str(row.get("checkpoint_id", "") or "").strip()
         if not checkpoint_id:
             continue
+        context_id = context_id_from_row(row)
+        if str(context_id).startswith(f"{checkpoint_id}:"):
+            prefixed_context_ids.append(str(context_id))
         embedding_id = context_embedding_id_from_row(row)
         if not str(embedding_id).startswith(f"{checkpoint_id}:"):
             mismatches.append(f"{checkpoint_id}->{embedding_id}")
@@ -605,10 +629,84 @@ def _validate_context_embedding_checkpoint_scope(rows: Sequence[Mapping[str, Any
             f"{label} requires checkpoint-scoped context_embedding_id values; "
             f"first mismatches: {mismatches[:8]}."
         )
+    if prefixed_context_ids:
+        raise ValueError(
+            f"{label} requires physical context_id values without checkpoint prefixes; "
+            f"first prefixed context_ids: {prefixed_context_ids[:8]}."
+        )
 
 
 def _embedding_ids(rows: Sequence[Mapping[str, Any]]) -> set[str]:
     return {context_embedding_id_from_row(row) for row in rows}
+
+
+def _checkpoint_id_from_row(row: Mapping[str, Any]) -> str:
+    return _checkpoint_scope_from_row(row)
+
+
+def _sample_context_keys_by_checkpoint(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    sample_count: int,
+    seed: int,
+) -> set[Tuple[str, str]]:
+    by_checkpoint: Dict[str, List[Mapping[str, Any]]] = {}
+    for row in rows:
+        by_checkpoint.setdefault(_checkpoint_id_from_row(row), []).append(row)
+    selected: set[Tuple[str, str]] = set()
+    for checkpoint_idx, checkpoint_id in enumerate(sorted(by_checkpoint)):
+        checkpoint_rows = by_checkpoint[checkpoint_id]
+        per_checkpoint_count = min(
+            int(sample_count),
+            len({context_id_from_row(row) for row in checkpoint_rows}),
+        )
+        context_ids = sample_context_ids_stratified(
+            checkpoint_rows,
+            sample_count=per_checkpoint_count,
+            seed=_scope_seed(int(seed) + 10_000 * int(checkpoint_idx), checkpoint_id),
+        )
+        selected.update((str(checkpoint_id), str(context_id)) for context_id in context_ids)
+    return selected
+
+
+def _rows_for_context_keys(
+    rows: Sequence[Mapping[str, Any]],
+    selected: set[Tuple[str, str]],
+) -> List[Dict[str, Any]]:
+    return [
+        dict(row)
+        for row in rows
+        if _checkpoint_context_key(row) in selected
+    ]
+
+
+def _context_sampling_summary(
+    rows: Sequence[Mapping[str, Any]],
+    selected: set[Tuple[str, str]],
+    *,
+    sample_count: int,
+) -> Dict[str, Any]:
+    per_checkpoint: Dict[str, Dict[str, int]] = {}
+    available_by_checkpoint: Dict[str, set[str]] = {}
+    selected_by_checkpoint: Dict[str, set[str]] = {}
+    for row in rows:
+        checkpoint_id = _checkpoint_id_from_row(row)
+        available_by_checkpoint.setdefault(checkpoint_id, set()).add(context_id_from_row(row))
+    for checkpoint_id, context_id in selected:
+        selected_by_checkpoint.setdefault(str(checkpoint_id), set()).add(str(context_id))
+    for checkpoint_id in sorted(available_by_checkpoint):
+        per_checkpoint[checkpoint_id] = {
+            "available_contexts": int(len(available_by_checkpoint[checkpoint_id])),
+            "selected_contexts": int(len(selected_by_checkpoint.get(checkpoint_id, set()))),
+        }
+    return {
+        "protocol": "checkpoint_maturity_stratified_context_sample_v1",
+        "sample_count_per_checkpoint": int(sample_count),
+        "checkpoint_count": int(len(available_by_checkpoint)),
+        "available_physical_context_count": int(len({context_id for values in available_by_checkpoint.values() for context_id in values})),
+        "selected_physical_context_count": int(len({context_id for _checkpoint_id, context_id in selected})),
+        "per_checkpoint": per_checkpoint,
+    }
 
 
 def _assert_embedding_overlap_compatible(
@@ -923,8 +1021,17 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     sample_count = int(args.context_sample_count)
     if sample_count <= 0:
         sample_count = recommended_context_calibration_count(len(available_context_ids))
-    selected_context_ids = set(sample_context_ids_stratified(rewarded_rows, sample_count=sample_count, seed=int(args.seed)))
-    sampled_rows = [row for row in rewarded_rows if context_id_from_row(row) in selected_context_ids]
+    selected_context_keys = _sample_context_keys_by_checkpoint(
+        rewarded_rows,
+        sample_count=sample_count,
+        seed=int(args.seed),
+    )
+    sampled_rows = _rows_for_context_keys(rewarded_rows, selected_context_keys)
+    context_sampling = _context_sampling_summary(
+        rewarded_rows,
+        selected_context_keys,
+        sample_count=sample_count,
+    )
 
     selection_component_weights = dict(CANONICAL_TEACHER_SELECTION_COMPONENT_WEIGHTS)
     expected_weights = {"context": 0.25, "density_family": 0.25, "unseen_nfe": 0.50}
@@ -946,6 +1053,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             f"found {sampled_target_nfes}."
         )
     unseen_selection_rows: List[Dict[str, Any]] = []
+    unseen_context_sampling: Dict[str, Any] = {}
     unseen_selection_target_nfes = _parse_int_csv(str(args.teacher_unseen_selection_target_nfe_values))
     if str(args.teacher_unseen_selection_rows_csv).strip():
         unseen_raw_rows = _read_metric_rows_csvs(str(args.teacher_unseen_selection_rows_csv))
@@ -1008,14 +1116,17 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             min_valid_rows=teacher_metric_min_valid_rows,
         )
         teacher_metric_coverage_scopes["teacher_unseen_selection_rows_csv"] = unseen_metric_coverage
-        unseen_context_ids = set(
-            sample_context_ids_stratified(
-                unseen_rewarded_rows,
-                sample_count=min(sample_count, len({context_id_from_row(row) for row in unseen_rewarded_rows})),
-                seed=int(args.seed) + 404,
-            )
+        unseen_context_keys = _sample_context_keys_by_checkpoint(
+            unseen_rewarded_rows,
+            sample_count=sample_count,
+            seed=int(args.seed) + 404,
         )
-        unseen_selection_rows = [row for row in unseen_rewarded_rows if context_id_from_row(row) in unseen_context_ids]
+        unseen_selection_rows = _rows_for_context_keys(unseen_rewarded_rows, unseen_context_keys)
+        unseen_context_sampling = _context_sampling_summary(
+            unseen_rewarded_rows,
+            unseen_context_keys,
+            sample_count=sample_count,
+        )
     density_holdout_requested = _parse_csv(str(args.teacher_density_holdout_schedule_keys))
     if "uniform" in {str(key) for key in density_holdout_requested}:
         raise ValueError("density-family holdout must not include uniform; uniform is the reward anchor.")
@@ -1188,6 +1299,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("student_pseudo_target_weight must be finite and nonnegative.")
     pseudo_source_rows: List[Dict[str, Any]] = []
     pseudo_support_keys: Tuple[str, ...] = ()
+    pseudo_context_sampling: Dict[str, Any] = {}
     if str(args.student_pseudo_rows_csv).strip():
         raw_pseudo_rows = _read_metric_rows_csvs(str(args.student_pseudo_rows_csv))
         if not raw_pseudo_rows:
@@ -1236,14 +1348,17 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             min_valid_rows=teacher_metric_min_valid_rows,
         )
         teacher_metric_coverage_scopes["student_pseudo_rows_csv"] = pseudo_metric_coverage
-        pseudo_context_ids = set(
-            sample_context_ids_stratified(
-                pseudo_source_rows,
-                sample_count=min(sample_count, len({context_id_from_row(row) for row in pseudo_source_rows})),
-                seed=int(args.seed) + 808,
-            )
+        pseudo_context_keys = _sample_context_keys_by_checkpoint(
+            pseudo_source_rows,
+            sample_count=sample_count,
+            seed=int(args.seed) + 808,
         )
-        pseudo_rows = [row for row in pseudo_source_rows if context_id_from_row(row) in pseudo_context_ids]
+        pseudo_rows = _rows_for_context_keys(pseudo_source_rows, pseudo_context_keys)
+        pseudo_context_sampling = _context_sampling_summary(
+            pseudo_source_rows,
+            pseudo_context_keys,
+            sample_count=sample_count,
+        )
         pseudo_embeddings_path = str(args.student_pseudo_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
         raw_pseudo_embeddings = _load_context_embedding_tables(pseudo_embeddings_path)
         missing_pseudo_embeddings = sorted(_embedding_ids(pseudo_rows) - set(raw_pseudo_embeddings))
@@ -1387,7 +1502,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "scopes": teacher_metric_coverage_scopes,
     }
     gipo_protocol_metadata = {
-        "protocol_revision": "gipo_cleanup_selector_final_normalizers_strict_metric_coverage_v1",
+        "protocol_revision": "gipo_checkpoint_aware_cells_physical_context_holdout_v1",
         "preprocessing_protocol": GIPO_PREPROCESSING_PROTOCOL,
         "teacher_target_coverage_protocol": GIPO_TEACHER_TARGET_COVERAGE_PROTOCOL,
         "teacher_selection_weight_protocol": GIPO_TEACHER_SELECTION_WEIGHT_PROTOCOL,
@@ -1466,7 +1581,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "seen_target_nfe_values": [int(value) for value in seen_target_nfes],
         "pseudo_target_nfe_values": [int(value) for value in pseudo_target_nfes],
         "context_sample_count": int(sample_count),
-        "sampled_context_count": int(len(selected_context_ids)),
+        "context_sampling": context_sampling,
+        "sampled_context_count": int(context_sampling["selected_physical_context_count"]),
+        "sampled_checkpoint_context_count": int(
+            sum(item["selected_contexts"] for item in context_sampling["per_checkpoint"].values())
+        ),
         "student_training_mode": student_training_mode,
         "student_pseudo_distillation": {
             "enabled": bool(pseudo_rows) and pseudo_target_weight > 0.0,
@@ -1478,6 +1597,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "source_row_count": int(len(pseudo_source_rows)),
             "selected_row_count": int(len(pseudo_rows)),
             "selected_context_count": int(len({context_id_from_row(row) for row in pseudo_rows})),
+            "selected_checkpoint_context_count": int(len({_checkpoint_context_key(row) for row in pseudo_rows})),
+            "context_sampling": pseudo_context_sampling,
             "support_schedule_keys": list(pseudo_support_keys),
             "required_support_schedule_keys": list(support_keys),
             "student_target_mixture_mode": student_target_mixture_mode,
@@ -1501,6 +1622,8 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "context_embeddings_npz": _artifact_input_summary(str(args.teacher_unseen_selection_context_embeddings_npz or args.context_embeddings_npz)),
             "schedule_summary_json": _artifact_input_summary(str(args.teacher_unseen_selection_schedule_summary_json)),
             "source_row_count": int(len(unseen_selection_rows)),
+            "selected_checkpoint_context_count": int(len({_checkpoint_context_key(row) for row in unseen_selection_rows})),
+            "context_sampling": unseen_context_sampling,
             "diagnostic": _split_counts(unseen_nfe_diagnostic_rows),
             "excluded_density_holdout_schedule_keys": list(density_holdout_keys),
             "used_for_final_fitting": False,
@@ -1906,6 +2029,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "gipo_protocol_metadata": gipo_protocol_metadata,
         "reference_grid_hash": reference_grid_hash(reference_time_grid),
         "support_schedule_keys": list(support_keys),
+        "context_sampling": context_sampling,
         "seen_target_nfe_values": [int(value) for value in seen_target_nfes],
         "pseudo_target_nfe_values": [int(value) for value in pseudo_target_nfes],
         "teacher_selected_step": teacher_training.get("teacher_checkpoint_selection", {}).get("selected_step"),

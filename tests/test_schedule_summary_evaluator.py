@@ -27,6 +27,7 @@ from genode.gipo.ser_ptg_reference import (
 from genode.evaluation.otflow_evaluation_support import (
     TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED,
     choose_forecast_train_tuning_indices,
+    train_tuning_target_example_count,
 )
 from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS
 
@@ -46,6 +47,17 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         self.assertEqual(first.tolist(), second.tolist())
         self.assertEqual(len(first), 20)
         self.assertEqual(len({int(idx) // 5 for idx in first.tolist()}), 20)
+
+    def test_train_tuning_target_count_matches_small_split_stratified_sampler(self) -> None:
+        class FakeDataset:
+            def __len__(self) -> int:
+                return 10
+
+        chosen = choose_forecast_train_tuning_indices(FakeDataset(), fraction=0.20, seed=7, strata=20, dataset="small")
+        target = train_tuning_target_example_count(10, fraction=0.20, strata=20)
+
+        self.assertEqual(len(chosen), 10)
+        self.assertEqual(target, len(chosen))
 
     def test_validation_normalized_train_tuning_sampling_uses_holdout_scale(self) -> None:
         class FakeTrainDataset:
@@ -77,6 +89,24 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         self.assertEqual(first.tolist(), second.tolist())
         self.assertEqual(len(first), 1207)
         self.assertEqual(len({int(idx) * 20 // 14_399_710 for idx in first.tolist()}), 20)
+
+    def test_train_tuning_sampling_can_be_capped_before_large_candidate_materialization(self) -> None:
+        class FakeTrainDataset:
+            def __len__(self) -> int:
+                return 1_000_000
+
+        chosen = choose_forecast_train_tuning_indices(
+            FakeTrainDataset(),
+            fraction=1.0,
+            seed=7,
+            strata=20,
+            dataset="traffic_hourly",
+            max_examples=256,
+        )
+
+        self.assertEqual(len(chosen), 256)
+        self.assertEqual(chosen.tolist(), sorted(chosen.tolist()))
+        self.assertEqual(len(set(chosen.tolist())), 256)
 
     def test_schedule_evaluator_protocol_tracks_train_tuning_sampling_mode(self) -> None:
         base = [
@@ -686,6 +716,103 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             self.assertEqual(rows[0]["scheduler_key"], SELECTED_STUDENT_SCHEDULE_KEY)
             self.assertEqual(int(rows[0]["realized_nfe"]), 4)
 
+    def test_evaluate_schedule_summary_validation_defaults_to_context_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            schedule_path = root / "student_summary.json"
+            schedule_path.write_text(
+                json.dumps(
+                    {
+                        "dataset": "traffic_hourly",
+                        "schedules": [
+                            {
+                                "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                                "predictions": [
+                                    {
+                                        "solver_key": "euler",
+                                        "target_nfe": 4,
+                                        "macro_steps": 4,
+                                        "time_grid": _uniform_grid(4),
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class FakeDataset:
+                def __len__(self) -> int:
+                    return 1000
+
+            fake_checkpoint = {
+                "model": object(),
+                "cfg": object(),
+                "splits": {"train": FakeDataset(), "val": FakeDataset(), "test": FakeDataset()},
+                "checkpoint_path": root / "model.pt",
+                "checkpoint_id": "ck",
+                "backbone_name": "otflow",
+                "train_steps": 20000,
+                "train_budget_label": "20k",
+            }
+            captured_lengths = []
+
+            def fake_eval(*args, **kwargs):
+                del args
+                captured_lengths.append(len(kwargs["example_indices"]))
+                return {
+                    "crps": 1.0,
+                    "mse": 1.5,
+                    "mase": 2.0,
+                    "latency_ms_per_sample": 0.25,
+                    "num_eval_samples": 1,
+                    "eval_examples": len(kwargs["example_indices"]),
+                    "eval_horizon": 168,
+                    "evaluation_protocol_hash": "protocol",
+                    "chosen_examples_hash": "examples",
+                    "realized_nfe": 4,
+                }
+
+            args = build_argparser().parse_args(
+                [
+                    "--dataset",
+                    "traffic_hourly",
+                    "--schedule_summary",
+                    str(schedule_path),
+                    "--split_phase",
+                    "validation_tuning",
+                    "--out_dir",
+                    str(root / "out"),
+                    "--solver_names",
+                    "euler",
+                    "--target_nfe_values",
+                    "4",
+                    "--seeds",
+                    "0",
+                    "--num_eval_samples",
+                    "1",
+                    "--context_sample_count",
+                    "9",
+                    "--device",
+                    "cpu",
+                ]
+            )
+            with mock.patch(
+                "genode.gipo.evaluate_schedule_summary.load_forecast_checkpoint_splits",
+                return_value=fake_checkpoint,
+            ), mock.patch(
+                "genode.gipo.evaluate_schedule_summary.evaluate_forecast_schedule",
+                side_effect=fake_eval,
+            ):
+                evaluate_schedule_summary(args)
+
+            self.assertEqual(captured_lengths, [9])
+            with (root / "out" / "validation_rows.csv").open("r", newline="", encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(rows[0]["selected_examples"], "9")
+            self.assertEqual(rows[0]["selected_examples_cap_source"], "context_sample_count")
+
     def test_evaluate_schedule_summary_writes_train_tuning_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -726,6 +853,24 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 "train_steps": 20000,
                 "train_budget_label": "20k",
             }
+            captured_lengths = []
+
+            def fake_eval(*args, **kwargs):
+                del args
+                captured_lengths.append(len(kwargs["example_indices"]))
+                return {
+                    "crps": 1.0,
+                    "mse": 1.5,
+                    "mase": 2.0,
+                    "latency_ms_per_sample": 0.25,
+                    "num_eval_samples": 1,
+                    "eval_examples": len(kwargs["example_indices"]),
+                    "eval_horizon": 168,
+                    "evaluation_protocol_hash": "protocol",
+                    "chosen_examples_hash": "examples",
+                    "realized_nfe": 4,
+                }
+
             args = build_argparser().parse_args(
                 [
                     "--dataset",
@@ -745,7 +890,9 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "--num_eval_samples",
                     "1",
                     "--eval_train_fraction",
-                    "0.20",
+                    "1.0",
+                    "--context_sample_count",
+                    "7",
                     "--train_tuning_strata",
                     "20",
                     "--device",
@@ -757,28 +904,21 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 return_value=fake_checkpoint,
             ), mock.patch(
                 "genode.gipo.evaluate_schedule_summary.evaluate_forecast_schedule",
-                return_value={
-                    "crps": 1.0,
-                    "mse": 1.5,
-                    "mase": 2.0,
-                    "latency_ms_per_sample": 0.25,
-                    "num_eval_samples": 1,
-                    "eval_examples": 20,
-                    "eval_horizon": 168,
-                    "evaluation_protocol_hash": "protocol",
-                    "chosen_examples_hash": "examples",
-                    "realized_nfe": 4,
-                },
+                side_effect=fake_eval,
             ):
                 summary = evaluate_schedule_summary(args)
             self.assertEqual(summary["split_phase"], "train_tuning")
-            self.assertEqual(summary["train_tuning"]["fraction"], 0.20)
+            self.assertEqual(summary["train_tuning"]["fraction"], 1.0)
+            self.assertEqual(summary["train_tuning"]["max_examples"], 7)
+            self.assertEqual(captured_lengths, [7])
             with (root / "out" / "train_tuning_rows.csv").open("r", newline="", encoding="utf-8") as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["split_phase"], "train_tuning")
             self.assertEqual(rows[0]["train_tuning_sampler"], "temporal_stratified_hash")
             self.assertEqual(rows[0]["train_tuning_sampling_mode"], "train_window_fraction")
+            self.assertEqual(rows[0]["train_tuning_target_examples"], "7")
+            self.assertEqual(rows[0]["selected_examples_cap_source"], "context_sample_count")
 
 
 if __name__ == "__main__":

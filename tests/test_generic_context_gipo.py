@@ -28,9 +28,12 @@ from genode.gipo.policy import (
     _scalarize_teacher_metric_values,
     _teacher_metric_targets,
     _teacher_metric_weights,
+    checkpoint_scope_from_row,
     context_embedding_id_from_row,
+    context_pair_key,
     read_metric_rows_csv,
     save_context_embedding_table,
+    split_rows_by_context_holdout,
     stable_context_id,
 )
 from genode.gipo import report_locked_test
@@ -40,13 +43,18 @@ from genode.gipo.ablation_plan import (
 )
 from genode.pipeline import full_pipeline
 from genode.gipo.train_gipo import (
+    _context_sampling_summary,
     _merge_embedding_tables_guarded,
     _resolve_teacher_metric_target_keys,
+    _rows_for_context_keys,
+    _sample_context_keys_by_checkpoint,
+    _split_membership_summary,
     _validate_context_embedding_checkpoint_scope,
     _validate_support_group_counts,
     _validate_unique_schedule_rows,
     train_gipo,
 )
+from genode.gipo.preflight import _context_identity_fingerprint
 
 
 class GenericContextGipoTests(unittest.TestCase):
@@ -216,7 +224,7 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(pseudo_summary["pseudo_target_nfes"], [6, 10, 14, 20])
         self.assertEqual(pseudo_summary["student_target_mixture_mode"], "full")
 
-    def test_conditional_context_rows_use_checkpoint_scoped_ids_and_component_utility(self) -> None:
+    def test_conditional_context_rows_use_physical_ids_and_checkpoint_scoped_embeddings(self) -> None:
         rows = runner._conditional_context_records(
             benchmark_family=CONDITIONAL_GENERATION_FAMILY,
             dataset="lobster_synthetic",
@@ -288,8 +296,9 @@ class GenericContextGipoTests(unittest.TestCase):
             chosen_t0s_hash="t0-hash",
         )
         self.assertEqual(len(rows), 2)
-        self.assertTrue(all(row["context_id"].startswith("lobster_synthetic_4000_steps:") for row in rows))
-        self.assertTrue(all(row["context_id"] == row["context_embedding_id"] for row in rows))
+        self.assertTrue(all(not row["context_id"].startswith("lobster_synthetic_4000_steps:") for row in rows))
+        self.assertTrue(all(row["context_embedding_id"].startswith("lobster_synthetic_4000_steps:") for row in rows))
+        self.assertTrue(all(row["context_id"] != row["context_embedding_id"] for row in rows))
         self.assertTrue(all(row["context_schema"] == "conditional_generation_window" for row in rows))
         self.assertAlmostEqual(float(rows[0]["u_score_uniform"]), math.log(1.0 / 0.75))
         self.assertAlmostEqual(float(rows[1]["u_score_uniform"]), math.log(0.9 / 0.7))
@@ -306,7 +315,8 @@ class GenericContextGipoTests(unittest.TestCase):
             history_stop=512,
             context_schema="conditional_generation_window",
         )
-        self.assertEqual(rows[0]["context_id"], f"lobster_synthetic_4000_steps:{expected_raw_id}")
+        self.assertEqual(rows[0]["context_id"], expected_raw_id)
+        self.assertEqual(rows[0]["context_embedding_id"], f"lobster_synthetic_4000_steps:{expected_raw_id}")
         self.assertEqual(rows[0]["evaluation_protocol_hash"], "protocol-hash")
         self.assertEqual(rows[0]["chosen_examples_hash"], "t0-hash")
         self.assertEqual(rows[0]["gipo_reward_protocol"], GIPO_PROTOCOL)
@@ -418,11 +428,12 @@ class GenericContextGipoTests(unittest.TestCase):
             parent_row_signature="parent",
             protocol_hash="proto",
             per_context_metrics=[candidate],
-            uniform_by_context_id={"ckpt:ctx": dict(uniform, scheduler_key="uniform")},
+            uniform_by_context_id={"ctx": dict(uniform, scheduler_key="uniform")},
             rollout_steps=16,
         )
         self.assertEqual(rows[0]["context_schema"], "molecule_3d_window")
-        self.assertEqual(rows[0]["context_id"], "ckpt:ctx")
+        self.assertEqual(rows[0]["context_id"], "ctx")
+        self.assertEqual(rows[0]["context_embedding_id"], "ckpt:ctx")
         self.assertEqual(rows[0]["axis_member"], "member_a")
         self.assertAlmostEqual(float(rows[0]["u_molecule_kabsch_rmsd_3d_uniform"]), math.log(1.0 / 0.5))
         self.assertAlmostEqual(float(rows[0]["u_comp_uniform"]), math.log(1.0 / 0.5))
@@ -433,6 +444,23 @@ class GenericContextGipoTests(unittest.TestCase):
         row = {"context_id": "logical", "context_embedding_id": "ckpt:logical"}
         self.assertEqual(context_embedding_id_from_row(row), "ckpt:logical")
         self.assertEqual(context_embedding_id_from_row({"context_id": "legacy"}), "legacy")
+
+    def test_preflight_physical_context_fingerprint_ignores_checkpoint_embedding_id(self) -> None:
+        base = {
+            "context_schema": "forecast_window",
+            "dataset": "solar_energy_10m",
+            "split_phase": "train_tuning",
+            "axis_series": "series_1",
+            "axis_time_bin": "144",
+            "example_idx": "7",
+            "target_t": "144",
+            "history_start": "0",
+            "history_stop": "144",
+        }
+        first = {**base, "context_embedding_id": "ckpt_a:ctx"}
+        second = {**base, "context_embedding_id": "ckpt_b:ctx"}
+
+        self.assertEqual(_context_identity_fingerprint(first), _context_identity_fingerprint(second))
 
     def test_embedding_merge_rejects_colliding_vectors(self) -> None:
         base = {"ckpt:ctx": [0.0, 1.0]}
@@ -455,6 +483,105 @@ class GenericContextGipoTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _validate_support_group_counts([row], ["late_power_3"])
 
+    def test_support_group_counts_are_checkpoint_aware_for_physical_context_ids(self) -> None:
+        rows = []
+        for checkpoint_id in ("ckpt_a", "ckpt_b"):
+            for scheduler_key in ("uniform", "late_power_3"):
+                rows.append(
+                    {
+                        "dataset": "lobster_synthetic",
+                        "split_phase": "train_tuning",
+                        "seed": 0,
+                        "solver_key": "euler",
+                        "target_nfe": 4,
+                        "context_id": "physical_ctx",
+                        "context_embedding_id": f"{checkpoint_id}:physical_ctx",
+                        "checkpoint_id": checkpoint_id,
+                        "series_id": "series",
+                        "scheduler_key": scheduler_key,
+                    }
+                )
+
+        _validate_support_group_counts(rows, ["uniform", "late_power_3"])
+
+        self.assertEqual(len({context_pair_key(row, pair_on_seed=True) for row in rows}), 2)
+
+    def test_context_sampling_is_per_checkpoint_maturity(self) -> None:
+        rows = []
+        for checkpoint_id in ("ckpt_a", "ckpt_b"):
+            for context_idx in range(3):
+                for scheduler_key in ("uniform", "late_power_3"):
+                    rows.append(
+                        {
+                            "dataset": "lobster_synthetic",
+                            "split_phase": "train_tuning",
+                            "seed": 0,
+                            "solver_key": "euler",
+                            "target_nfe": 4,
+                            "context_id": f"ctx_{context_idx}",
+                            "context_embedding_id": f"{checkpoint_id}:ctx_{context_idx}",
+                            "checkpoint_id": checkpoint_id,
+                            "series_id": f"series_{context_idx}",
+                            "target_t": 100 + context_idx,
+                            "scheduler_key": scheduler_key,
+                        }
+                    )
+
+        selected = _sample_context_keys_by_checkpoint(rows, sample_count=1, seed=17)
+        sampled_rows = _rows_for_context_keys(rows, selected)
+        summary = _context_sampling_summary(rows, selected, sample_count=1)
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual({scope for scope, _ in selected}, {"ckpt_a", "ckpt_b"})
+        self.assertEqual(len(sampled_rows), 4)
+        self.assertEqual(summary["per_checkpoint"]["ckpt_a"]["selected_contexts"], 1)
+        self.assertEqual(summary["per_checkpoint"]["ckpt_b"]["selected_contexts"], 1)
+
+    def test_context_holdout_is_physical_across_checkpoint_maturities(self) -> None:
+        rows = []
+        for checkpoint_id in ("ckpt_a", "ckpt_b"):
+            for context_id in ("ctx_a", "ctx_b", "ctx_c", "ctx_d"):
+                rows.append(
+                    {
+                        "dataset": "lobster_synthetic",
+                        "split_phase": "train_tuning",
+                        "seed": 0,
+                        "solver_key": "euler",
+                        "target_nfe": 4,
+                        "context_id": context_id,
+                        "context_embedding_id": f"{checkpoint_id}:{context_id}",
+                        "checkpoint_id": checkpoint_id,
+                        "series_id": context_id,
+                        "target_t": 100,
+                        "scheduler_key": "uniform",
+                    }
+                )
+
+        fit_rows, holdout_rows = split_rows_by_context_holdout(rows, holdout_fraction=0.5, seed=3)
+
+        fit_contexts = {row["context_id"] for row in fit_rows}
+        holdout_contexts = {row["context_id"] for row in holdout_rows}
+        self.assertFalse(fit_contexts & holdout_contexts)
+        for context_id in holdout_contexts:
+            self.assertEqual({row["checkpoint_id"] for row in holdout_rows if row["context_id"] == context_id}, {"ckpt_a", "ckpt_b"})
+
+    def test_preflight_identity_fingerprint_ignores_checkpoint_scoped_embedding_id(self) -> None:
+        row = {
+            "dataset": "lobster_synthetic",
+            "split_phase": "train_tuning",
+            "context_schema": "conditional_generation_window",
+            "context_id": "ctx",
+            "series_id": "lobster_synthetic",
+            "target_t": 512,
+            "history_start": 256,
+            "history_stop": 512,
+        }
+
+        fp_a = _context_identity_fingerprint({**row, "checkpoint_id": "ckpt_a", "context_embedding_id": "ckpt_a:ctx"})
+        fp_b = _context_identity_fingerprint({**row, "checkpoint_id": "ckpt_b", "context_embedding_id": "ckpt_b:ctx"})
+
+        self.assertEqual(fp_a, fp_b)
+
     def test_duplicate_exact_schedule_rows_are_rejected(self) -> None:
         row = {
             "dataset": "lobster_synthetic",
@@ -472,6 +599,38 @@ class GenericContextGipoTests(unittest.TestCase):
         other_checkpoint = dict(row, checkpoint_id="ckpt_b")
         base_checkpoint = dict(row, checkpoint_id="ckpt_a")
         _validate_unique_schedule_rows([base_checkpoint, other_checkpoint], label="test")
+
+    def test_checkpoint_step_only_rows_remain_checkpoint_aware(self) -> None:
+        row = {
+            "dataset": "lobster_synthetic",
+            "split_phase": "train_tuning",
+            "seed": 0,
+            "solver_key": "euler",
+            "target_nfe": 4,
+            "context_id": "ctx",
+            "series_id": "series",
+            "scheduler_key": "uniform",
+        }
+        early = dict(row, checkpoint_step=4000)
+        late = dict(row, checkpoint_step=8000)
+
+        self.assertNotEqual(context_pair_key(early, pair_on_seed=True), context_pair_key(late, pair_on_seed=True))
+        _validate_unique_schedule_rows([early, late], label="test")
+        self.assertEqual(checkpoint_scope_from_row(dict(row, checkpoint_step="", train_steps=4000)), "checkpoint_step:4000")
+        self.assertEqual(checkpoint_scope_from_row(dict(row, checkpoint_step="", train_steps="", otflow_train_steps=8000)), "checkpoint_step:8000")
+
+        train_early = dict(row, train_steps=4000)
+        train_late = dict(row, train_steps=8000)
+        otflow_late = dict(row, otflow_train_steps=12000)
+        self.assertNotEqual(context_pair_key(train_early, pair_on_seed=True), context_pair_key(train_late, pair_on_seed=True))
+        self.assertNotEqual(context_pair_key(train_late, pair_on_seed=True), context_pair_key(otflow_late, pair_on_seed=True))
+        _validate_unique_schedule_rows([train_early, train_late, otflow_late], label="test")
+        split_summary = _split_membership_summary([train_early, train_late, otflow_late])
+        self.assertEqual(split_summary["checkpoint_scope_count"], 3)
+        self.assertEqual(
+            set(split_summary["checkpoint_scopes"]),
+            {"checkpoint_step:4000", "checkpoint_step:8000", "checkpoint_step:12000"},
+        )
 
     def test_checkpoint_scoped_embedding_id_is_required_when_checkpoint_id_present(self) -> None:
         good = {"checkpoint_id": "ckpt_a", "context_id": "ctx", "context_embedding_id": "ckpt_a:ctx"}
@@ -1102,6 +1261,50 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(manifest["ablation_root"], f"gipo_ablations/{GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX}")
         self.assertTrue(all(not str(value).startswith(("/", "C:")) for arm in manifest["arms"] for value in arm["outputs"].values()))
 
+    def test_full_pipeline_dataset_alias_routes_requested_scenario(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--dataset",
+                    "solar_energy_10m",
+                    "--run_root",
+                    str(run_root),
+                    "--stages",
+                    "schedule_rows_seen",
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+            protocol = json.loads((run_root / "protocol.json").read_text(encoding="utf-8"))
+
+        commands = [command for stage in summary["stages"] for command in stage["commands"]]
+        command = commands[0]
+        self.assertEqual(protocol["scenario_key"], "solar_energy_10m")
+        self.assertEqual(summary["preflight"]["scenario_key"], "solar_energy_10m")
+        self.assertEqual(command[command.index("--forecast_datasets") + 1], "solar_energy_10m")
+        self.assertEqual(command[command.index("--conditional_generation_datasets") + 1], "")
+
+    def test_full_pipeline_ablation_first_dry_run_reports_missing_backbone_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(Path(tmpdir) / "run"),
+                    "--backbone_manifest",
+                    str(Path(tmpdir) / "missing" / "backbone_manifest.json"),
+                    "--ablation_first",
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+
+        validation = summary["preflight"]["provided_backbone_validation"]
+        self.assertEqual(validation["status"], "skipped_missing_manifest")
+        self.assertTrue(any("Backbone manifest is missing" in error for error in validation["errors"]))
+
     def test_full_pipeline_ser_controls_are_protocolized_and_ser_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             args = full_pipeline.build_argparser().parse_args(
@@ -1115,6 +1318,8 @@ class GenericContextGipoTests(unittest.TestCase):
                     "1",
                     "--ser_val_windows",
                     "0",
+                    "--ser_train_tuning_max_examples",
+                    "17",
                     "--dry_run",
                 ]
             )
@@ -1130,11 +1335,38 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertTrue(ser_commands)
         self.assertTrue(all("--calibration_batch_size 1" in command for command in ser_commands))
         self.assertTrue(all("--val_windows 0" in command for command in ser_commands))
+        self.assertTrue(all("--train_tuning_max_examples 17" in command for command in ser_commands))
         self.assertTrue(all("--calibration_batch_size" not in command for command in non_ser_commands))
         self.assertTrue(all("--val_windows" not in command for command in non_ser_commands))
+        self.assertTrue(all("--train_tuning_max_examples" not in command for command in non_ser_commands))
         protocol = full_pipeline._protocol_payload(args)
         self.assertEqual(protocol["ser_calibration_batch_size"], 1)
         self.assertEqual(protocol["ser_val_windows"], 0)
+        self.assertEqual(protocol["ser_train_tuning_max_examples"], 17)
+        self.assertEqual(protocol["ser_train_tuning_effective_max_examples"], 17)
+        self.assertEqual(protocol["ser_example_selection_protocol"], "ser_ptg_reference_context_capped_v2")
+        self.assertEqual(protocol["ser_local_defect_proxy_protocol"], "otflow_midpoint_local_defect_proxy_v1")
+
+    def test_full_pipeline_default_ser_train_tuning_cap_tracks_context_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(Path(tmpdir) / "run"),
+                    "--ablation_first",
+                    "--context_sample_count",
+                    "123",
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+        by_stage = {stage["stage"]: [" ".join(command) for command in stage["commands"]] for stage in summary["stages"]}
+        self.assertTrue(all("--train_tuning_max_examples 0" in command for command in by_stage["ser_summaries"]))
+        protocol = full_pipeline._protocol_payload(args)
+        self.assertEqual(protocol["ser_train_tuning_max_examples"], 0)
+        self.assertEqual(protocol["ser_train_tuning_effective_max_examples"], 123)
 
     def test_full_pipeline_ablation_first_routes_arm_knobs_and_locked_reports(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

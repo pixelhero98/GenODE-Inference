@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
+from genode.canonical_experiment_layout import CANONICAL_CONTEXT_SAMPLE_COUNT, CANONICAL_SEEN_NFES
 from genode.solver_protocol import (
     CANONICAL_SOLVER_KEYS,
     normalize_solver_key,
@@ -56,6 +56,7 @@ from genode.evaluation.otflow_evaluation_support import (
     evaluate_forecast_schedule,
     load_forecast_checkpoint_splits,
     train_tuning_sampler_key,
+    train_tuning_target_example_count,
 )
 from genode.models.otflow_train_val import save_json
 from genode.runtime import ProgressBar, resolve_torch_device
@@ -70,6 +71,7 @@ DEFAULT_TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 SELECTED_STUDENT_SCHEDULE_KEY = "gipo"
 SELECTED_STUDENT_SCHEDULE_NAME = "GIPO"
 EVALUATOR_SIGNATURE_VERSION = "schedule_summary_evaluator_seen_unseen"
+SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_summary_context_capped_v1"
 SER_REFERENCE_SCHEDULE_KEYS: Tuple[str, ...] = (
     SER_PTG_SCHEDULE_KEY,
     SER_PTG_REVERSED_SCHEDULE_KEY,
@@ -136,6 +138,14 @@ SCHEDULE_ROW_FIELDS: Tuple[str, ...] = (
     "eval_horizon",
     "evaluation_protocol_hash",
     "chosen_examples_hash",
+    "example_selection_protocol",
+    "context_sample_count",
+    "selected_examples",
+    "selected_examples_cap",
+    "selected_examples_cap_source",
+    "uncapped_candidate_examples",
+    "candidate_examples_after_initial_selection",
+    "selection_was_capped",
     "schedule_grid_hash",
     "time_grid_json",
     "protocol_hash",
@@ -147,6 +157,7 @@ SCHEDULE_ROW_FIELDS: Tuple[str, ...] = (
     "train_tuning_sampling_mode",
     "train_tuning_reference_examples",
     "train_tuning_target_examples",
+    "train_tuning_uncapped_candidate_examples",
     "train_tuning_train_split_fraction",
     "train_tuning_val_split_fraction",
     "candidate_source",
@@ -280,6 +291,64 @@ def _path_fingerprint(path: str | Path) -> Dict[str, Any]:
     return payload
 
 
+def _context_sample_cap(args: argparse.Namespace) -> int:
+    cap = int(getattr(args, "context_sample_count", CANONICAL_CONTEXT_SAMPLE_COUNT))
+    if cap <= 0:
+        raise ValueError(f"--context_sample_count must be positive, got {cap!r}.")
+    return int(cap)
+
+
+def _split_example_cap(args: argparse.Namespace, split_phase: str) -> Tuple[int, str]:
+    context_cap = _context_sample_cap(args)
+    if str(split_phase) == TRAIN_TUNING_PHASE:
+        return int(context_cap), "context_sample_count"
+    attr = "eval_windows_val" if str(split_phase) == VALIDATION_PHASE else "eval_windows_test"
+    explicit = int(getattr(args, attr, 0))
+    if explicit < 0:
+        raise ValueError(f"--{attr} must be nonnegative, got {explicit!r}.")
+    if explicit > 0:
+        return int(explicit), attr
+    return int(context_cap), "context_sample_count"
+
+
+def _cap_context_indices(
+    indices: Sequence[int],
+    *,
+    cap: int,
+    seed: int,
+    salt: str,
+    uncapped_candidate_examples: int | None = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    candidate = [int(idx) for idx in indices]
+    selected_cap = int(cap)
+    if selected_cap <= 0:
+        raise ValueError(f"selected_examples_cap must be positive, got {selected_cap!r}.")
+    uncapped_count = int(len(candidate) if uncapped_candidate_examples is None else uncapped_candidate_examples)
+    if uncapped_count < len(candidate):
+        raise ValueError(
+            "uncapped_candidate_examples cannot be smaller than the selected candidate list "
+            f"({uncapped_count} < {len(candidate)})."
+        )
+    if len(candidate) <= selected_cap:
+        selected = list(candidate)
+        was_capped = uncapped_count > len(selected)
+    else:
+        token = f"{SCHEDULE_CONTEXT_SELECTION_PROTOCOL}|{salt}|{int(seed)}|{len(candidate)}|{selected_cap}"
+        local_seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
+        rng = np.random.default_rng(local_seed)
+        keep_positions = sorted(int(pos) for pos in rng.choice(np.arange(len(candidate)), size=selected_cap, replace=False).tolist())
+        selected = [candidate[pos] for pos in keep_positions]
+        was_capped = True
+    return np.asarray(selected, dtype=np.int64), {
+        "example_selection_protocol": SCHEDULE_CONTEXT_SELECTION_PROTOCOL,
+        "selected_examples": int(len(selected)),
+        "selected_examples_cap": int(selected_cap),
+        "uncapped_candidate_examples": int(uncapped_count),
+        "candidate_examples_after_initial_selection": int(len(candidate)),
+        "selection_was_capped": bool(was_capped),
+    }
+
+
 def _protocol_hash(args: argparse.Namespace) -> str:
     payload = {
         "signature": EVALUATOR_SIGNATURE_VERSION,
@@ -292,6 +361,8 @@ def _protocol_hash(args: argparse.Namespace) -> str:
         "forecast_eval_batch_size": int(args.forecast_eval_batch_size),
         "write_context_rows": bool(getattr(args, "write_context_rows", False)),
         "context_embedding_kind": str(getattr(args, "context_embedding_kind", "ctx_summary")),
+        "context_sample_count": _context_sample_cap(args),
+        "example_selection_protocol": SCHEDULE_CONTEXT_SELECTION_PROTOCOL,
         "eval_train_fraction": float(getattr(args, "eval_train_fraction", 0.20)),
         "train_tuning_seed": int(getattr(args, "train_tuning_seed", 0)),
         "train_tuning_strata": int(getattr(args, "train_tuning_strata", 20)),
@@ -1292,25 +1363,50 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
     split_key = {TRAIN_TUNING_PHASE: "train", VALIDATION_PHASE: "val", LOCKED_TEST_PHASE: "test"}[split_phase]
     eval_ds = checkpoint["splits"][split_key]
     train_tuning_reference_examples = int(len(checkpoint["splits"].get("val", [])))
-    eval_windows = int(args.eval_windows_val) if split_phase == VALIDATION_PHASE else int(args.eval_windows_test)
+    selected_examples_cap, selected_examples_cap_source = _split_example_cap(args, split_phase)
     mode = "a" if rows_by_key else "w"
     total_cells = len(seeds) * len(schedule_keys) * len(target_nfes) * len(solver_names)
     with jsonl_path.open(mode, encoding="utf-8") as fh, ProgressBar(total_cells, f"{split_phase} inference cells") as progress:
         for seed in seeds:
             if split_phase == TRAIN_TUNING_PHASE:
-                chosen_examples = choose_forecast_train_tuning_indices(
+                tuning_seed = int(args.train_tuning_seed) + int(seed)
+                uncapped_candidate_examples = train_tuning_target_example_count(
+                    len(eval_ds),
+                    fraction=float(args.eval_train_fraction),
+                    sampling_mode=str(args.train_tuning_sampling_mode),
+                    strata=int(args.train_tuning_strata),
+                    reference_examples=int(train_tuning_reference_examples),
+                    train_split_fraction=float(args.train_tuning_train_split_fraction),
+                    val_split_fraction=float(args.train_tuning_val_split_fraction),
+                )
+                candidate_examples = choose_forecast_train_tuning_indices(
                     eval_ds,
                     fraction=float(args.eval_train_fraction),
-                    seed=int(args.train_tuning_seed) + int(seed),
+                    seed=int(tuning_seed),
                     strata=int(args.train_tuning_strata),
                     dataset=str(args.dataset),
                     sampling_mode=str(args.train_tuning_sampling_mode),
                     reference_examples=int(train_tuning_reference_examples),
                     train_split_fraction=float(args.train_tuning_train_split_fraction),
                     val_split_fraction=float(args.train_tuning_val_split_fraction),
+                    max_examples=int(selected_examples_cap),
+                )
+                chosen_examples, selection_meta = _cap_context_indices(
+                    candidate_examples,
+                    cap=int(selected_examples_cap),
+                    seed=int(tuning_seed),
+                    salt=f"forecast_summary|{args.dataset}|{split_phase}",
+                    uncapped_candidate_examples=int(uncapped_candidate_examples),
                 )
             else:
-                chosen_examples = choose_forecast_example_indices(eval_ds, n_examples=eval_windows, seed=int(seed))
+                chosen = choose_forecast_example_indices(eval_ds, n_examples=int(selected_examples_cap), seed=int(seed))
+                chosen_examples, selection_meta = _cap_context_indices(
+                    chosen,
+                    cap=int(selected_examples_cap),
+                    seed=int(seed),
+                    salt=f"forecast_summary|{args.dataset}|{split_phase}",
+                    uncapped_candidate_examples=int(len(eval_ds)),
+                )
             for schedule_idx, schedule_key in enumerate(schedule_keys):
                 for target_idx, target_nfe in enumerate(target_nfes):
                     for solver_idx, solver_key in enumerate(solver_names):
@@ -1360,6 +1456,18 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                             metrics=metrics,
                             protocol_hash=protocol_hash,
                         )
+                        row.update(
+                            {
+                                "example_selection_protocol": str(selection_meta["example_selection_protocol"]),
+                                "context_sample_count": int(_context_sample_cap(args)),
+                                "selected_examples": int(selection_meta["selected_examples"]),
+                                "selected_examples_cap": int(selection_meta["selected_examples_cap"]),
+                                "selected_examples_cap_source": str(selected_examples_cap_source),
+                                "uncapped_candidate_examples": int(selection_meta["uncapped_candidate_examples"]),
+                                "candidate_examples_after_initial_selection": int(selection_meta["candidate_examples_after_initial_selection"]),
+                                "selection_was_capped": bool(selection_meta["selection_was_capped"]),
+                            }
+                        )
                         if split_phase == TRAIN_TUNING_PHASE:
                             row.update(
                                 {
@@ -1370,6 +1478,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                                     "train_tuning_sampling_mode": str(args.train_tuning_sampling_mode),
                                     "train_tuning_reference_examples": int(train_tuning_reference_examples),
                                     "train_tuning_target_examples": int(len(chosen_examples)),
+                                    "train_tuning_uncapped_candidate_examples": int(selection_meta["uncapped_candidate_examples"]),
                                     "train_tuning_train_split_fraction": float(args.train_tuning_train_split_fraction),
                                     "train_tuning_val_split_fraction": float(args.train_tuning_val_split_fraction),
                                 }
@@ -1458,6 +1567,8 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
             "sampler": train_tuning_sampler_key(str(args.train_tuning_sampling_mode)),
             "reference_split_key": "val",
             "reference_examples": int(train_tuning_reference_examples),
+            "max_examples": int(selected_examples_cap),
+            "max_examples_source": str(selected_examples_cap_source),
             "train_split_fraction": float(args.train_tuning_train_split_fraction),
             "val_split_fraction": float(args.train_tuning_val_split_fraction),
             "split_key": "train",
@@ -1540,6 +1651,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--target_nfe_values", default=",".join(str(x) for x in DEFAULT_TARGET_NFES))
     parser.add_argument("--num_eval_samples", type=int, default=5)
     parser.add_argument("--forecast_eval_batch_size", type=int, default=64)
+    parser.add_argument("--context_sample_count", type=int, default=CANONICAL_CONTEXT_SAMPLE_COUNT)
     parser.add_argument("--write_context_rows", action="store_true", default=False)
     parser.add_argument("--context_row_csv_name", default="")
     parser.add_argument("--context_embeddings_npz_name", default="")

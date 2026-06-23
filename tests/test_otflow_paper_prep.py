@@ -870,6 +870,361 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             [(4, 5, 5), (8, 1005, 5)],
         )
 
+    def test_forecast_phase_validation_defaults_to_context_cap(self) -> None:
+        class FakeDataset:
+            def __len__(self) -> int:
+                return 1000
+
+        fake_checkpoint = {
+            "model": object(),
+            "cfg": object(),
+            "splits": {"train": FakeDataset(), "val": FakeDataset(), "test": FakeDataset()},
+            "checkpoint_path": PROJECT_ROOT / "model.pt",
+            "checkpoint_id": "ck",
+            "backbone_name": "otflow",
+            "train_steps": 20000,
+            "train_budget_label": "20k",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "traffic_hourly",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--target_nfe_values",
+                    "4",
+                    "--solver_names",
+                    "euler",
+                    "--seeds",
+                    "0",
+                    "--split_phase",
+                    "validation_tuning",
+                    "--context_sample_count",
+                    "13",
+                    "--backbone_manifest",
+                    str(PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"),
+                    "--checkpoint_steps",
+                    "20000",
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            captured_lengths = []
+
+            def fake_eval(model, ds, cfg, **kwargs):
+                del model, ds, cfg
+                captured_lengths.append(len(kwargs["example_indices"]))
+                return {
+                    "forecast_crps": 1.0,
+                    "mse": 1.0,
+                    "forecast_mase": 1.0,
+                    "latency_ms_per_sample": 0.0,
+                    "num_eval_samples": 1,
+                    "eval_examples": len(kwargs["example_indices"]),
+                    "eval_horizon": 168,
+                    "evaluation_protocol_hash": "protocol",
+                    "chosen_examples_hash": "examples",
+                    "realized_nfe": 4,
+                }
+
+            try:
+                with mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint), mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval):
+                    rows = runner._run_forecast_phase(
+                        args,
+                        row_recorder=recorder,
+                        split_phase="validation_tuning",
+                        seeds=[0],
+                        scheduler_cases_by_dataset={"traffic_hourly": [{"scheduler_key": "uniform"}]},
+                    )
+            finally:
+                recorder["fh"].close()
+
+        self.assertEqual(captured_lengths, [13])
+        self.assertEqual(rows[0]["selected_examples"], 13)
+        self.assertEqual(rows[0]["selected_examples_cap_source"], "context_sample_count")
+
+    def test_forecast_phase_train_tuning_defaults_to_context_cap(self) -> None:
+        class FakeDataset:
+            def __len__(self) -> int:
+                return 1000
+
+        fake_checkpoint = {
+            "model": object(),
+            "cfg": object(),
+            "splits": {"train": FakeDataset(), "val": FakeDataset(), "test": FakeDataset()},
+            "checkpoint_path": PROJECT_ROOT / "model.pt",
+            "checkpoint_id": "ck",
+            "backbone_name": "otflow",
+            "train_steps": 20000,
+            "train_budget_label": "20k",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "traffic_hourly",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--target_nfe_values",
+                    "4",
+                    "--solver_names",
+                    "euler",
+                    "--seeds",
+                    "0",
+                    "--split_phase",
+                    "train_tuning",
+                    "--eval_train_fraction",
+                    "1.0",
+                    "--context_sample_count",
+                    "17",
+                    "--backbone_manifest",
+                    str(PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"),
+                    "--checkpoint_steps",
+                    "20000",
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            captured_lengths = []
+
+            def fake_eval(model, ds, cfg, **kwargs):
+                del model, ds, cfg
+                captured_lengths.append(len(kwargs["example_indices"]))
+                return {
+                    "forecast_crps": 1.0,
+                    "mse": 1.0,
+                    "forecast_mase": 1.0,
+                    "latency_ms_per_sample": 0.0,
+                    "num_eval_samples": 1,
+                    "eval_examples": len(kwargs["example_indices"]),
+                    "eval_horizon": 168,
+                    "evaluation_protocol_hash": "protocol",
+                    "chosen_examples_hash": "examples",
+                    "realized_nfe": 4,
+                }
+
+            try:
+                with mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint), mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval):
+                    rows = runner._run_forecast_phase(
+                        args,
+                        row_recorder=recorder,
+                        split_phase="train_tuning",
+                        seeds=[0],
+                        scheduler_cases_by_dataset={"traffic_hourly": [{"scheduler_key": "uniform"}]},
+                    )
+            finally:
+                recorder["fh"].close()
+
+        self.assertEqual(captured_lengths, [17])
+        self.assertEqual(rows[0]["selected_examples"], 17)
+        self.assertEqual(rows[0]["train_tuning_target_examples"], 17)
+        self.assertEqual(rows[0]["selected_examples_cap_source"], "context_sample_count")
+
+    def test_conditional_generation_validation_defaults_to_context_cap(self) -> None:
+        class FakeDataset:
+            start_indices = list(range(1000))
+
+            def __len__(self) -> int:
+                return len(self.start_indices)
+
+        fake_checkpoint = {
+            "model": object(),
+            "cfg": object(),
+            "splits": {"train": FakeDataset(), "val": FakeDataset(), "test": FakeDataset()},
+            "checkpoint_path": PROJECT_ROOT / "model.pt",
+            "checkpoint_id": "ck",
+            "backbone_name": "otflow",
+            "train_steps": 20000,
+            "train_budget_label": "20k",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "cryptos",
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--target_nfe_values",
+                    "4",
+                    "--solver_names",
+                    "euler",
+                    "--seeds",
+                    "0",
+                    "--split_phase",
+                    "validation_tuning",
+                    "--context_sample_count",
+                    "3",
+                    "--backbone_manifest",
+                    str(PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"),
+                    "--checkpoint_steps",
+                    "20000",
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            requested_windows = []
+
+            def fake_choose_valid_windows(ds, *, horizon: int, n_windows: int, seed: int):
+                del ds, horizon, seed
+                requested_windows.append(int(n_windows))
+                return [10, 20, 30][: int(n_windows)]
+
+            try:
+                with mock.patch.object(
+                    runner,
+                    "load_conditional_generation_checkpoint_splits",
+                    return_value=fake_checkpoint,
+                ), mock.patch.object(runner, "resolved_eval_windows", return_value=999), mock.patch.object(
+                    runner,
+                    "_choose_valid_windows",
+                    side_effect=fake_choose_valid_windows,
+                ), mock.patch.object(
+                    runner,
+                    "run_fixed_schedule_variant",
+                    return_value={
+                        "score_main": 1.0,
+                        "temporal_uw1": 0.1,
+                        "temporal_cw1": 0.2,
+                        "temporal_tstr_f1": None,
+                        "temporal_tstr_f1_applicable": False,
+                        "evaluation_protocol": {"chosen_t0s_hash": "hash"},
+                    },
+                ):
+                    rows = runner._run_conditional_generation_phase(
+                        args,
+                        row_recorder=recorder,
+                        split_phase="validation_tuning",
+                        seeds=[0],
+                        scheduler_cases_by_dataset={"cryptos": [{"scheduler_key": "uniform"}]},
+                    )
+            finally:
+                recorder["fh"].close()
+
+        self.assertEqual(requested_windows, [3])
+        self.assertEqual(rows[0]["eval_windows"], 3)
+        self.assertEqual(rows[0]["selected_examples"], 3)
+        self.assertEqual(rows[0]["selected_examples_cap"], 3)
+        self.assertEqual(rows[0]["selected_examples_cap_source"], "context_sample_count")
+        self.assertEqual(rows[0]["uncapped_candidate_examples"], 1000)
+        self.assertTrue(rows[0]["selection_was_capped"])
+
+    def test_molecule_validation_defaults_to_context_cap_and_records_selection_metadata(self) -> None:
+        class FakeDataset:
+            def __len__(self) -> int:
+                return 1000
+
+        loaded = {
+            "model": object(),
+            "cfg": object(),
+            "splits": {"train": FakeDataset(), "val": FakeDataset(), "test": FakeDataset()},
+        }
+        captured_lengths = []
+
+        def fake_eval(*args, **kwargs):
+            del args
+            captured_lengths.append(len(kwargs["example_indices"]))
+            return {
+                "molecule_kabsch_rmsd_3d": 1.0,
+                "molecule_ensemble_velocity_norm_w1": 1.0,
+                "molecule_ensemble_acceleration_norm_w1": 1.0,
+                "molecule_rollout_velocity_norm_w1": 1.0,
+                "molecule_rollout_acceleration_norm_w1": 1.0,
+                "molecule_coordinate_w1_mean": 1.0,
+                "molecule_pair_distance_w1": 1.0,
+                "selection_metric_value": 1.0,
+                "eval_windows": len(kwargs["example_indices"]),
+                "realized_nfe": 4,
+                "per_context_rows": [],
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "backbone_manifest.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--molecule_datasets",
+                    "molecule_3d_set1",
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--target_nfe_values",
+                    "4",
+                    "--solver_names",
+                    "euler",
+                    "--seeds",
+                    "0",
+                    "--split_phase",
+                    "validation_tuning",
+                    "--context_sample_count",
+                    "5",
+                    "--backbone_manifest",
+                    str(manifest_path),
+                    "--checkpoint_steps",
+                    "20000",
+                    "--molecule_group_root",
+                    tmpdir,
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            try:
+                with mock.patch.object(runner, "load_backbone_manifest", return_value={}), mock.patch.object(
+                    runner,
+                    "load_molecule_group_manifest",
+                    return_value={},
+                ), mock.patch.object(
+                    runner,
+                    "trainable_molecule_group_members",
+                    return_value=[{"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"}],
+                ), mock.patch.object(
+                    runner,
+                    "find_backbone_artifact",
+                    return_value={
+                        "checkpoint_path": str(Path(tmpdir) / "model.pt"),
+                        "checkpoint_id": "molecule_ckpt",
+                        "train_steps": 20000,
+                        "train_budget_label": "20k",
+                    },
+                ), mock.patch.object(
+                    runner,
+                    "load_molecule_checkpoint_splits",
+                    return_value=loaded,
+                ), mock.patch.object(
+                    runner,
+                    "evaluate_molecule_rollout_schedule",
+                    side_effect=fake_eval,
+                ):
+                    rows = runner._run_molecule_phase(
+                        args,
+                        row_recorder=recorder,
+                        split_phase="validation_tuning",
+                        seeds=[0],
+                        scheduler_cases_by_dataset={"molecule_3d_set1": [{"scheduler_key": "uniform"}]},
+                    )
+            finally:
+                recorder["fh"].close()
+
+        self.assertEqual(captured_lengths, [5])
+        self.assertEqual(rows[0]["selected_examples"], 5)
+        self.assertEqual(rows[0]["selected_examples_cap"], 5)
+        self.assertEqual(rows[0]["selected_examples_cap_source"], "context_sample_count")
+        self.assertEqual(rows[0]["uncapped_candidate_examples"], 1000)
+        self.assertTrue(rows[0]["selection_was_capped"])
+
     def test_site_specific_ops_scripts_are_not_in_source_release(self) -> None:
         self.assertFalse((PROJECT_ROOT / "code" / "ops").exists())
         self.assertFalse(any(PROJECT_ROOT.glob("opsi*")))

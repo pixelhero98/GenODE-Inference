@@ -25,6 +25,7 @@ from genode.gipo.objectives import (
     teacher_objective_utility_keys_for_family,
     teacher_objective_utility_keys_for_scenario,
 )
+from genode.gipo.checkpoint_scope import checkpoint_scope_from_row as _checkpoint_scope_from_row
 from genode.gipo.density_representation import uniform_reference_grid
 from genode.gipo.schedule_grids import load_schedule_summary_grids, schedule_grid_coverage_report
 from genode.gipo.schedule_hash import json_hash as _canonical_json_hash
@@ -170,7 +171,7 @@ def _logical_seed_from_row(row: Mapping[str, Any]) -> int | None:
     return _optional_int(row.get("seed"))
 
 
-def _context_pair_key(row: Mapping[str, Any], *, pair_on_seed: bool = True) -> Tuple[str, str, int, str, int | None]:
+def _context_pair_key(row: Mapping[str, Any], *, pair_on_seed: bool = True) -> Tuple[str, str, int, str, int | None, str]:
     seed = _logical_seed_from_row(row) if pair_on_seed else None
     return (
         str(row.get("dataset", row.get("dataset_key", ""))),
@@ -178,6 +179,7 @@ def _context_pair_key(row: Mapping[str, Any], *, pair_on_seed: bool = True) -> T
         int(row["target_nfe"]),
         _context_id_from_row(row),
         seed,
+        _checkpoint_scope_from_row(row),
     )
 
 
@@ -372,6 +374,7 @@ def _cell_payload(key: Tuple[Any, ...]) -> Dict[str, Any]:
         "target_nfe": int(key[2]),
         "context_id": str(key[3]),
         "logical_seed": key[4],
+        "checkpoint_id": str(key[5]) if len(key) > 5 else "",
     }
 
 
@@ -410,7 +413,6 @@ def _context_identity_fingerprint(row: Mapping[str, Any]) -> Tuple[Tuple[str, st
         "target_t": _optional_value(row, "target_t"),
         "history_start": _optional_value(row, "history_start"),
         "history_stop": _optional_value(row, "history_stop"),
-        "context_embedding_id": _context_embedding_id_from_row(row),
     }
     specific_keys = [key for key in payload if key not in {"context_schema", "dataset", "split_phase"}]
     if not any(payload[key] for key in specific_keys):
@@ -449,6 +451,16 @@ def _identity_conflict_report(
 
         checkpoint_id = str(row.get("checkpoint_id", "") or "").strip()
         if checkpoint_id:
+            if str(context_id).startswith(f"{checkpoint_id}:"):
+                dirty_rows.add(record.input_index)
+                checkpoint_scope_conflicts.append(
+                    {
+                        "type": "checkpoint_prefixed_context_id",
+                        "checkpoint_id": checkpoint_id,
+                        "context_id": context_id,
+                        "location": _location(record),
+                    }
+                )
             embedding_id = _context_embedding_id_from_row(row)
             if not str(embedding_id).startswith(f"{checkpoint_id}:"):
                 dirty_rows.add(record.input_index)

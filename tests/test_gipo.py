@@ -108,6 +108,28 @@ class GIPOCanonicalTests(unittest.TestCase):
         self.assertEqual(metadata["density_protocol"], DENSITY_PROTOCOL)
         self.assertEqual(metadata["reference_bin_count"], 64)
 
+    def test_density_mass_for_row_uses_train_steps_for_scoped_summary_grid(self) -> None:
+        reference = uniform_reference_grid(4)
+        scoped_grid = [0.0, 0.05, 0.4, 0.8, 1.0]
+        unscoped_grid = [0.0, 0.25, 0.5, 0.75, 1.0]
+        row = {
+            "solver_key": "euler",
+            "target_nfe": 4,
+            "scheduler_key": "ser_ptg_test",
+            "train_steps": 4000,
+        }
+
+        mass = density_mass_for_row(
+            row,
+            schedule_grids={
+                ("ser_ptg_test", "euler", 4): unscoped_grid,
+                ("ser_ptg_test", "euler", 4, 4000): scoped_grid,
+            },
+            reference_time_grid=reference,
+        )
+
+        self.assertEqual(mass, grid_to_density_mass(scoped_grid, reference_time_grid=reference, macro_steps=4))
+
     def test_realized_nfe_from_row_uses_solver_protocol_not_runtime_macro_steps(self) -> None:
         self.assertEqual(
             realized_nfe_from_row({"solver_key": "heun", "target_nfe": 4, "runtime_nfe": 2}),

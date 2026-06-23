@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -57,6 +58,7 @@ from genode.evaluation.otflow_evaluation_support import (
     solver_eval_multiplier,
     solver_macro_steps,
     train_tuning_sampler_key,
+    train_tuning_target_example_count,
 )
 from genode.models.otflow_train_val import _get_dataset_item_by_t, _parse_batch, save_json, seed_all
 from genode.runtime import resolve_torch_device
@@ -65,6 +67,8 @@ SER_PTG_SCHEDULE_KEY = "ser_ptg_local_defect_eta005"
 SER_PTG_SCHEDULE_NAME = "SER-PTG local defect eta=0.05"
 SER_PTG_REVERSED_SCHEDULE_KEY = "ser_ptg_local_defect_eta005_reversed"
 SER_PTG_AVG_REVERSED_SCHEDULE_KEY = "ser_ptg_local_defect_eta005_avg_reversed"
+SER_PTG_EXAMPLE_SELECTION_PROTOCOL = "ser_ptg_reference_context_capped_v2"
+SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL = "otflow_midpoint_local_defect_proxy_v1"
 DEFAULT_SOLVERS: Tuple[str, ...] = CANONICAL_SOLVER_KEYS
 DEFAULT_TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 
@@ -75,6 +79,78 @@ def _parse_csv(text: str) -> List[str]:
 
 def _parse_int_csv(text: str) -> List[int]:
     return [int(part) for part in _parse_csv(text)]
+
+
+def _positive_int(value: Any, *, name: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive, got {value!r}.")
+    return parsed
+
+
+def _optional_positive_int(value: Any, *, name: str) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError(f"{name} must be nonnegative, got {value!r}.")
+    return parsed if parsed > 0 else None
+
+
+def _reference_example_cap_and_source(args: argparse.Namespace, *, reference_split: str) -> Tuple[int, str]:
+    context_cap = _positive_int(getattr(args, "context_sample_count", CANONICAL_CONTEXT_SAMPLE_COUNT), name="--context_sample_count")
+    if str(reference_split) == TRAIN_TUNING_PHASE:
+        explicit = _optional_positive_int(getattr(args, "train_tuning_max_examples", None), name="--train_tuning_max_examples")
+        if explicit is not None:
+            return int(explicit), "train_tuning_max_examples"
+        return int(context_cap), "context_sample_count"
+    val_windows = int(getattr(args, "val_windows", 0))
+    if val_windows < 0:
+        raise ValueError(f"--val_windows must be nonnegative, got {val_windows!r}.")
+    if val_windows > 0:
+        return int(val_windows), "val_windows"
+    return int(context_cap), "context_sample_count"
+
+
+def _reference_example_cap(args: argparse.Namespace, *, reference_split: str) -> int:
+    cap, _source = _reference_example_cap_and_source(args, reference_split=reference_split)
+    return int(cap)
+
+
+def _deterministically_cap_indices(
+    indices: Sequence[int],
+    *,
+    cap: int,
+    seed: int,
+    salt: str,
+    uncapped_candidate_examples: Optional[int] = None,
+) -> Tuple[List[int], Dict[str, Any]]:
+    candidate = [int(idx) for idx in indices]
+    selected_cap = _positive_int(cap, name="selected_examples_cap")
+    uncapped_count = int(len(candidate) if uncapped_candidate_examples is None else uncapped_candidate_examples)
+    if uncapped_count < len(candidate):
+        raise ValueError(
+            "uncapped_candidate_examples cannot be smaller than the selected candidate list "
+            f"({uncapped_count} < {len(candidate)})."
+        )
+    if len(candidate) <= selected_cap:
+        selected = list(candidate)
+        was_capped = uncapped_count > len(selected)
+    else:
+        token = f"{SER_PTG_EXAMPLE_SELECTION_PROTOCOL}|{salt}|{int(seed)}|{len(candidate)}|{selected_cap}"
+        local_seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
+        rng = np.random.default_rng(local_seed)
+        keep_positions = sorted(int(pos) for pos in rng.choice(np.arange(len(candidate)), size=selected_cap, replace=False).tolist())
+        selected = [candidate[pos] for pos in keep_positions]
+        was_capped = True
+    return selected, {
+        "example_selection_protocol": SER_PTG_EXAMPLE_SELECTION_PROTOCOL,
+        "uncapped_candidate_examples": int(uncapped_count),
+        "candidate_examples_after_initial_selection": int(len(candidate)),
+        "selected_examples": int(len(selected)),
+        "selected_examples_cap": int(selected_cap),
+        "selection_was_capped": bool(was_capped),
+    }
 
 
 def _hash_grid(grid: Sequence[float]) -> str:
@@ -391,6 +467,7 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
         solvers = solvers[:1]
         target_nfes = target_nfes[:1]
         args.val_windows = min(max(1, int(args.val_windows) if int(args.val_windows) > 0 else 2), 2)
+    reference_example_cap, reference_example_cap_source = _reference_example_cap_and_source(args, reference_split=reference_split)
     dataset_root = resolve_project_path(str(args.dataset_root))
     shared_backbone_root = resolve_project_path(str(args.shared_backbone_root))
     device = resolve_torch_device(str(args.device))
@@ -466,6 +543,7 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             reference_grid: Optional[List[float]] = None
             eval_examples = 0
             trace_count = 0
+            selection_records: List[Dict[str, Any]] = []
             for seed in seeds:
                 for member_idx, ref in enumerate(member_refs):
                     checkpoint = ref["checkpoint"]
@@ -481,7 +559,16 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                     )
                     if family == SCENARIO_FAMILY_FORECAST:
                         if reference_split == TRAIN_TUNING_PHASE:
-                            chosen = choose_forecast_train_tuning_indices(
+                            forecast_uncapped_candidate_examples = train_tuning_target_example_count(
+                                len(reference_ds),
+                                fraction=float(args.train_tuning_fraction),
+                                sampling_mode=str(args.train_tuning_sampling_mode),
+                                strata=int(args.train_tuning_strata),
+                                reference_examples=int(train_tuning_reference_examples),
+                                train_split_fraction=float(args.train_tuning_train_split_fraction),
+                                val_split_fraction=float(args.train_tuning_val_split_fraction),
+                            )
+                            candidate_indices = choose_forecast_train_tuning_indices(
                                 reference_ds,
                                 fraction=float(args.train_tuning_fraction),
                                 seed=selection_seed,
@@ -491,20 +578,25 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                                 reference_examples=int(train_tuning_reference_examples),
                                 train_split_fraction=float(args.train_tuning_train_split_fraction),
                                 val_split_fraction=float(args.train_tuning_val_split_fraction),
+                                max_examples=int(reference_example_cap),
                             )
                         else:
-                            chosen = choose_forecast_example_indices(
+                            forecast_uncapped_candidate_examples = int(len(reference_ds))
+                            validation_request = int(args.val_windows) if int(args.val_windows) > 0 else 0
+                            candidate_indices = choose_forecast_example_indices(
                                 reference_ds,
-                                n_examples=int(args.val_windows),
+                                n_examples=int(validation_request),
                                 seed=selection_seed,
                             )
                         item_getter = None
                         collector = collect_batched_local_defect_trace
+                        available_examples = int(len(reference_ds))
+                        uncapped_candidate_examples = int(forecast_uncapped_candidate_examples)
                     elif family == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
                         horizon = resolved_eval_horizon(args, dataset)
                         available = len(getattr(reference_ds, "start_indices", []))
-                        window_count = int(args.val_windows) if int(args.val_windows) > 0 else int(args.context_sample_count)
-                        chosen = _choose_valid_windows(
+                        window_count = int(args.val_windows) if int(args.val_windows) > 0 else int(reference_example_cap)
+                        candidate_indices = _choose_valid_windows(
                             reference_ds,
                             horizon=int(horizon),
                             n_windows=min(max(1, int(window_count)), max(1, int(available))),
@@ -512,13 +604,43 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                         )
                         item_getter = lambda ds, t0: _get_dataset_item_by_t(ds, int(t0))
                         collector = collect_batched_local_defect_trace
+                        available_examples = int(available)
+                        uncapped_candidate_examples = int(available_examples)
                     else:
-                        window_count = int(args.val_windows) if int(args.val_windows) > 0 else int(args.context_sample_count)
-                        chosen = _choose_molecule_indices(reference_ds, count=int(window_count), seed=selection_seed)
+                        window_count = int(args.val_windows) if int(args.val_windows) > 0 else int(reference_example_cap)
+                        candidate_indices = _choose_molecule_indices(reference_ds, count=int(window_count), seed=selection_seed)
                         item_getter = None
                         collector = collect_molecule_local_defect_trace
+                        available_examples = int(len(reference_ds))
+                        uncapped_candidate_examples = int(available_examples)
+                    chosen, selection_meta = _deterministically_cap_indices(
+                        candidate_indices,
+                        cap=int(reference_example_cap),
+                        seed=selection_seed,
+                        salt=f"{family}|{reference_split}|{dataset}|{solver_key}|{target_nfe}|{member_idx}",
+                        uncapped_candidate_examples=int(uncapped_candidate_examples),
+                    )
                     if bool(args.smoke):
                         chosen = chosen[: min(2, len(chosen))]
+                        selection_meta = {
+                            **selection_meta,
+                            "selected_examples": int(len(chosen)),
+                            "smoke_selected_examples_cap": 2,
+                        }
+                    selection_records.append(
+                        {
+                            **selection_meta,
+                            "benchmark_family": str(family),
+                            "reference_split": str(reference_split),
+                            "seed": int(seed),
+                            "member_key": str(ref.get("member_key", "")),
+                            "stratum": str(ref.get("stratum", "")),
+                            "solver_key": str(solver_key),
+                            "target_nfe": int(target_nfe),
+                            "reference_available_examples": int(available_examples),
+                            "selected_examples_cap_source": str(reference_example_cap_source),
+                        }
+                    )
                     collected = collector(
                         model,
                         reference_ds,
@@ -542,6 +664,10 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                     trace_count += int(collected["trace_count"])
             if reference_grid is None:
                 raise ValueError(f"No reference grid collected for {solver_key}/{target_nfe}.")
+            selected_examples = int(sum(int(record["selected_examples"]) for record in selection_records))
+            uncapped_candidate_examples = int(sum(int(record["uncapped_candidate_examples"]) for record in selection_records))
+            selected_example_caps = sorted({int(record["selected_examples_cap"]) for record in selection_records})
+            selection_was_capped = any(bool(record.get("selection_was_capped", False)) for record in selection_records)
             mean_trace = np.mean(np.stack(seed_traces, axis=0), axis=0)
             time_grid = ser_ptg_grid_from_trace(
                 mean_trace.tolist(),
@@ -568,6 +694,14 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                     "density_floor_eta": float(args.density_floor_eta),
                     "solver_order_p": float(solver_p),
                     "reference_split": reference_split,
+                    "example_selection_protocol": SER_PTG_EXAMPLE_SELECTION_PROTOCOL,
+                    "context_sample_count": int(args.context_sample_count),
+                    "selected_examples": int(selected_examples),
+                    "selected_examples_cap": int(selected_example_caps[0]) if len(selected_example_caps) == 1 else selected_example_caps,
+                    "selected_examples_cap_source": str(reference_example_cap_source),
+                    "uncapped_candidate_examples": int(uncapped_candidate_examples),
+                    "selection_was_capped": bool(selection_was_capped),
+                    "selection_records": selection_records,
                     "reference_examples_per_seed": int(eval_examples),
                     "train_tuning_fraction": float(args.train_tuning_fraction) if reference_split == TRAIN_TUNING_PHASE else "",
                     "train_tuning_seed": int(args.train_tuning_seed) if reference_split == TRAIN_TUNING_PHASE else "",
@@ -576,6 +710,9 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                     "train_tuning_sampling_mode": str(args.train_tuning_sampling_mode) if reference_split == TRAIN_TUNING_PHASE else "",
                     "train_tuning_reference_examples": int(train_tuning_reference_examples) if reference_split == TRAIN_TUNING_PHASE else "",
                     "train_tuning_target_examples": int(eval_examples) if reference_split == TRAIN_TUNING_PHASE else "",
+                    "train_tuning_max_examples": int(reference_example_cap) if reference_split == TRAIN_TUNING_PHASE else "",
+                    "train_tuning_max_examples_source": str(reference_example_cap_source) if reference_split == TRAIN_TUNING_PHASE else "",
+                    "train_tuning_uncapped_candidate_examples": int(uncapped_candidate_examples) if reference_split == TRAIN_TUNING_PHASE else "",
                     "train_tuning_train_split_fraction": float(args.train_tuning_train_split_fraction) if reference_split == TRAIN_TUNING_PHASE else "",
                     "train_tuning_val_split_fraction": float(args.train_tuning_val_split_fraction) if reference_split == TRAIN_TUNING_PHASE else "",
                     "trace_count": int(trace_count),
@@ -618,6 +755,7 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
         "status": "ready",
         "artifact": "ser_ptg_schedule_summary",
         "dataset": dataset,
+        "example_selection_protocol": SER_PTG_EXAMPLE_SELECTION_PROTOCOL,
         "schedule_key": SER_PTG_SCHEDULE_KEY,
         "schedule_name": SER_PTG_SCHEDULE_NAME,
         "schedules": schedules,
@@ -632,6 +770,14 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
         "reference_macro_factor": float(args.reference_macro_factor),
         "calibration_trace_samples": int(args.calibration_trace_samples),
         "reference_examples": int(sum(len(ref["reference_ds"]) for ref in member_refs)),
+        "context_sample_count": int(args.context_sample_count),
+        "selected_examples_cap": int(reference_example_cap),
+        "selected_examples_cap_source": str(reference_example_cap_source),
+        "selected_examples": int(sum(int(prediction.get("selected_examples", 0)) for prediction in predictions)),
+        "uncapped_candidate_examples": int(sum(int(prediction.get("uncapped_candidate_examples", 0)) for prediction in predictions)),
+        "selection_was_capped": any(bool(prediction.get("selection_was_capped", False)) for prediction in predictions),
+        "local_defect_trace_protocol": SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL,
+        "oracle_local_error_semantics": "local_defect_proxy_not_teacher_oracle",
         "train_tuning": {
             "fraction": float(args.train_tuning_fraction),
             "seed": int(args.train_tuning_seed),
@@ -640,6 +786,8 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             "sampler": train_tuning_sampler_key(str(args.train_tuning_sampling_mode)),
             "reference_split_key": "val",
             "reference_examples": int(train_tuning_reference_examples),
+            "max_examples": int(reference_example_cap),
+            "max_examples_source": str(reference_example_cap_source),
             "train_split_fraction": float(args.train_tuning_train_split_fraction),
             "val_split_fraction": float(args.train_tuning_val_split_fraction),
         } if reference_split == TRAIN_TUNING_PHASE else None,
@@ -663,6 +811,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--reference_split", choices=(TRAIN_TUNING_PHASE, VALIDATION_PHASE), default=TRAIN_TUNING_PHASE)
     parser.add_argument("--val_windows", type=int, default=0)
     parser.add_argument("--context_sample_count", type=int, default=CANONICAL_CONTEXT_SAMPLE_COUNT)
+    parser.add_argument("--train_tuning_max_examples", type=int, default=0)
     parser.add_argument("--train_tuning_fraction", type=float, default=0.20)
     parser.add_argument("--train_tuning_seed", type=int, default=0)
     parser.add_argument("--train_tuning_strata", type=int, default=20)

@@ -19,6 +19,7 @@ from genode.canonical_experiment_layout import (
 )
 from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
 from genode.data.otflow_paths import project_root, resolve_project_path
+from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW, BACKBONE_NAME_OTFLOW_MOLECULE
 
 PACKAGE_SCHEMA_VERSION = "genode_backbone_package_v1"
 PACKAGE_MANIFEST_NAME = "package_manifest.json"
@@ -728,19 +729,60 @@ def validate_provided_backbone_manifest(
     if not resolved_manifest.exists():
         return {"status": "failed", "errors": [f"Provided backbone manifest is missing: {resolved_manifest}"]}
     manifest = load_portable_backbone_manifest(resolved_manifest)
-    matching_artifacts = [
+    candidate_artifacts = [
         artifact
         for artifact in manifest.get("artifacts", [])
         if str(artifact.get("status")) == "ready"
         and (not scenario_key or str(artifact.get("dataset_key")) == str(scenario_key))
         and (not benchmark_family or str(artifact.get("benchmark_family")) == str(benchmark_family))
     ]
+    expected_backbone_name = BACKBONE_NAME_OTFLOW_MOLECULE if benchmark_family == MOLECULE_FAMILY else BACKBONE_NAME_OTFLOW
+    wrong_backbone_names = sorted(
+        {
+            str(artifact.get("backbone_name", ""))
+            for artifact in candidate_artifacts
+            if str(artifact.get("backbone_name", "")) != expected_backbone_name
+        }
+    )
+    if wrong_backbone_names:
+        errors.append(
+            f"Provided backbone artifacts for scenario={scenario_key!r}, family={benchmark_family!r} "
+            f"use backbone names {wrong_backbone_names}; expected {expected_backbone_name!r}."
+        )
+    matching_artifacts = [
+        artifact
+        for artifact in candidate_artifacts
+        if str(artifact.get("backbone_name", "")) == expected_backbone_name
+    ]
     if not matching_artifacts:
-        errors.append(f"No ready provided backbone artifacts match scenario={scenario_key!r}, family={benchmark_family!r}.")
+        errors.append(
+            f"No ready provided backbone artifacts match scenario={scenario_key!r}, "
+            f"family={benchmark_family!r}, backbone={expected_backbone_name!r}."
+        )
     expected_steps = {int(step) for step in TRAIN_BUDGET_STEPS}
     observed_steps = {int(artifact.get("train_steps", -1)) for artifact in matching_artifacts}
     if matching_artifacts and not expected_steps.issubset(observed_steps):
         errors.append(f"Provided backbone artifacts have train steps {sorted(observed_steps)}; expected at least {sorted(expected_steps)}.")
+    lookup_counts: Dict[tuple[Any, ...], int] = {}
+    for artifact in matching_artifacts:
+        key = (
+            str(artifact.get("backbone_name", "")),
+            str(artifact.get("benchmark_family", "")),
+            str(artifact.get("dataset_key", "")),
+            int(artifact.get("train_steps", -1)),
+            str(artifact.get("member_key", "")) if benchmark_family == MOLECULE_FAMILY else "",
+            str(artifact.get("stratum", "")) if benchmark_family == MOLECULE_FAMILY else "",
+        )
+        lookup_counts[key] = int(lookup_counts.get(key, 0)) + 1
+    duplicate_keys = {key: count for key, count in lookup_counts.items() if count != 1}
+    if duplicate_keys:
+        first_key, first_count = next(iter(sorted(duplicate_keys.items(), key=lambda item: repr(item[0]))))
+        errors.append(f"Provided backbone manifest has duplicate runtime lookup key {first_key} count={first_count}.")
+    if matching_artifacts and benchmark_family != MOLECULE_FAMILY:
+        for step in sorted(expected_steps):
+            count = sum(1 for artifact in matching_artifacts if int(artifact.get("train_steps", -1)) == int(step))
+            if count != 1:
+                errors.append(f"Provided temporal scenario has {count} ready {expected_backbone_name} artifacts for train_steps={step}; expected 1.")
     if benchmark_family == MOLECULE_FAMILY:
         members: Dict[tuple[str, str, str], set[int]] = {}
         for artifact in matching_artifacts:

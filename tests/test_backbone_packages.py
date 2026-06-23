@@ -283,6 +283,97 @@ class BackbonePackageTests(unittest.TestCase):
         self.assertEqual(validation["status"], "complete", validation.get("errors"))
         self.assertEqual(validation["artifact_count"], len(TRAIN_BUDGET_STEPS))
 
+    def test_provided_manifest_validation_rejects_wrong_backbone_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifacts = [
+                {
+                    "backbone_name": "otflow_molecule_3d",
+                    "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+                    "dataset_key": "lobster_synthetic",
+                    "train_steps": int(train_steps),
+                    "train_budget_label": f"{int(train_steps) // 1000}k",
+                    "checkpoint_id": f"lobster_synthetic_{int(train_steps)}",
+                    "status": "ready",
+                    "seed": 0,
+                }
+                for train_steps in TRAIN_BUDGET_STEPS
+            ]
+            manifest_path = root / "outputs/backbone_matrix/backbone_manifest.json"
+            _write(
+                manifest_path,
+                json.dumps(
+                    {
+                        "version": "fm_backbone_manifest",
+                        "artifact_count": len(artifacts),
+                        "ready_count": len(artifacts),
+                        "artifacts": artifacts,
+                    }
+                ),
+            )
+
+            validation = validate_provided_backbone_manifest(
+                manifest_path,
+                scenario_key="lobster_synthetic",
+                benchmark_family=CONDITIONAL_GENERATION_FAMILY,
+            )
+
+        self.assertEqual(validation["status"], "failed")
+        self.assertTrue(any("expected 'otflow'" in error for error in validation["errors"]), validation["errors"])
+        self.assertTrue(any("No ready provided backbone artifacts match" in error for error in validation["errors"]))
+
+    def test_provided_manifest_validation_rejects_duplicate_runtime_lookup_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifacts = []
+            for train_steps in TRAIN_BUDGET_STEPS:
+                duplicate_count = 2 if int(train_steps) == int(TRAIN_BUDGET_STEPS[0]) else 1
+                for duplicate_idx in range(duplicate_count):
+                    label = f"{int(train_steps) // 1000}k"
+                    rel = f"outputs/backbone_matrix/otflow/temporal_conditional_generation/{label}/lobster_synthetic/duplicate_{duplicate_idx}"
+                    _write(root / rel / "model.pt", b"checkpoint" * 256)
+                    _write(root / rel / "checkpoint_metadata.json", "{}")
+                    _write(root / rel / "artifact_summary.json", "{}")
+                    artifacts.append(
+                        {
+                            "backbone_name": "otflow",
+                            "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+                            "dataset_key": "lobster_synthetic",
+                            "train_steps": int(train_steps),
+                            "train_budget_label": label,
+                            "checkpoint_id": f"lobster_synthetic_{label}_{duplicate_idx}",
+                            "checkpoint_path": f"{rel}/model.pt",
+                            "summary_path": f"{rel}/artifact_summary.json",
+                            "metadata_path": f"{rel}/checkpoint_metadata.json",
+                            "status": "ready",
+                            "seed": 0,
+                        }
+                    )
+            manifest_path = root / "outputs/backbone_matrix/backbone_manifest.json"
+            _write(
+                manifest_path,
+                json.dumps(
+                    {
+                        "version": "fm_backbone_manifest",
+                        "path_base": "../..",
+                        "artifact_count": len(artifacts),
+                        "ready_count": len(artifacts),
+                        "artifacts": artifacts,
+                    }
+                ),
+            )
+
+            with mock.patch("genode.backbone_packages._validate_artifact_checkpoint_integrity", return_value=[]):
+                validation = validate_provided_backbone_manifest(
+                    manifest_path,
+                    scenario_key="lobster_synthetic",
+                    benchmark_family=CONDITIONAL_GENERATION_FAMILY,
+                )
+
+        self.assertEqual(validation["status"], "failed")
+        self.assertTrue(any("duplicate runtime lookup key" in error for error in validation["errors"]), validation["errors"])
+        self.assertTrue(any("expected 1" in error and "train_steps=4000" in error for error in validation["errors"]))
+
     def test_load_checkpoint_model_wraps_unreadable_torch_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "model.pt"

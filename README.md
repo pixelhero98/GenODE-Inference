@@ -109,10 +109,20 @@ Training requires:
   distillation. These rows are never used for teacher fitting or checkpoint
   selection.
 
-Rows are paired inside exact `(dataset, solver, NFE, context_id, seed)` cells.
-They must not cross solver, NFE, seed, series, target time, or context identity.
-Default context calibration samples are capped at 256 unique contexts per
-scenario, checkpoint maturity, and split.
+Rows are paired inside exact `(dataset, solver, NFE, checkpoint_id, context_id,
+seed)` cells. `context_id` denotes the physical/logical example window, while
+`context_embedding_id` remains checkpoint-scoped because backbone embeddings
+change with checkpoint maturity. Context holdout splits are physical-context
+disjoint across checkpoint maturities, and default context calibration samples
+are capped at 256 unique contexts per scenario, checkpoint maturity, and split.
+
+SER-PTG summary generation uses the same context cap. With `--val_windows 0`,
+forecast train-tuning, conditional-generation windows, and molecule examples
+default to `--context_sample_count`; forecast train-tuning can be capped
+explicitly with `--train_tuning_max_examples`. The internal
+`oracle_local_error` trace is an OTFlow midpoint local-defect proxy used to
+derive SER schedules. It is not the GIPO teacher oracle, and it does not use
+locked-test rows.
 
 ## Evaluation Datasets
 

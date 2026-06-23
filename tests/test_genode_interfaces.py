@@ -155,6 +155,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertIn("--gipo_ablation_preset", options)
         self.assertIn("--ser_calibration_batch_size", options)
         self.assertIn("--ser_val_windows", options)
+        self.assertIn("--ser_train_tuning_max_examples", options)
 
     def test_project_path_resolver_accepts_legacy_package_prefixes(self) -> None:
         from genode.data import otflow_paths

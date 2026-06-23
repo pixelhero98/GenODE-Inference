@@ -84,6 +84,7 @@ from genode.evaluation.otflow_evaluation_support import (
     solver_experiment_scope,
     solver_macro_steps,
     train_tuning_sampler_key,
+    train_tuning_target_example_count,
     validate_execution_preflight,
 )
 from genode.gipo.objectives import (
@@ -118,6 +119,7 @@ DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterizat
 DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
 DEFAULT_SCHEDULES: Tuple[str, ...] = BASELINE_SCHEDULE_KEYS
+SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_evaluation_context_capped_v1"
 SUPPORTED_SPLIT_PHASES: Tuple[str, ...] = (LOCKED_TEST_PHASE, VALIDATION_PHASE, TRAIN_TUNING_PHASE)
 
 ROW_RECORD_FIELDS: Tuple[str, ...] = (
@@ -206,6 +208,14 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "evaluation_protocol_hash",
     "chosen_t0s_hash",
     "chosen_examples_hash",
+    "example_selection_protocol",
+    "context_sample_count",
+    "selected_examples",
+    "selected_examples_cap",
+    "selected_examples_cap_source",
+    "uncapped_candidate_examples",
+    "candidate_examples_after_initial_selection",
+    "selection_was_capped",
     "schedule_grid_hash",
     "protocol_hash",
     "row_status",
@@ -216,6 +226,7 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "train_tuning_sampling_mode",
     "train_tuning_reference_examples",
     "train_tuning_target_examples",
+    "train_tuning_uncapped_candidate_examples",
     "train_tuning_train_split_fraction",
     "train_tuning_val_split_fraction",
 )
@@ -629,6 +640,77 @@ def _context_reward_protocol_payload(cli_args: argparse.Namespace) -> Dict[str, 
     }
 
 
+def _context_sample_cap(cli_args: argparse.Namespace) -> int:
+    cap = int(getattr(cli_args, "context_sample_count", 256))
+    if cap <= 0:
+        raise ValueError(f"--context_sample_count must be positive, got {cap!r}.")
+    return int(cap)
+
+
+def _split_example_cap(cli_args: argparse.Namespace, split_phase: str) -> Tuple[int, str]:
+    context_cap = _context_sample_cap(cli_args)
+    if str(split_phase) == TRAIN_TUNING_PHASE:
+        return int(context_cap), "context_sample_count"
+    attr = "eval_windows_val" if str(split_phase) == VALIDATION_PHASE else "eval_windows_test"
+    explicit = int(getattr(cli_args, attr, 0))
+    if explicit < 0:
+        raise ValueError(f"--{attr} must be nonnegative, got {explicit!r}.")
+    if explicit > 0:
+        return int(explicit), attr
+    return int(context_cap), "context_sample_count"
+
+
+def _cap_context_indices(
+    indices: Sequence[int],
+    *,
+    cap: int,
+    seed: int,
+    salt: str,
+    uncapped_candidate_examples: int | None = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    candidate = [int(idx) for idx in indices]
+    selected_cap = int(cap)
+    if selected_cap <= 0:
+        raise ValueError(f"selected_examples_cap must be positive, got {selected_cap!r}.")
+    uncapped_count = int(len(candidate) if uncapped_candidate_examples is None else uncapped_candidate_examples)
+    if uncapped_count < len(candidate):
+        raise ValueError(
+            "uncapped_candidate_examples cannot be smaller than the selected candidate list "
+            f"({uncapped_count} < {len(candidate)})."
+        )
+    if len(candidate) <= selected_cap:
+        selected = list(candidate)
+        was_capped = uncapped_count > len(selected)
+    else:
+        token = f"{SCHEDULE_CONTEXT_SELECTION_PROTOCOL}|{salt}|{int(seed)}|{len(candidate)}|{selected_cap}"
+        local_seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
+        rng = np.random.default_rng(local_seed)
+        keep_positions = sorted(int(pos) for pos in rng.choice(np.arange(len(candidate)), size=selected_cap, replace=False).tolist())
+        selected = [candidate[pos] for pos in keep_positions]
+        was_capped = True
+    return np.asarray(selected, dtype=np.int64), {
+        "example_selection_protocol": SCHEDULE_CONTEXT_SELECTION_PROTOCOL,
+        "selected_examples": int(len(selected)),
+        "selected_examples_cap": int(selected_cap),
+        "uncapped_candidate_examples": int(uncapped_count),
+        "candidate_examples_after_initial_selection": int(len(candidate)),
+        "selection_was_capped": bool(was_capped),
+    }
+
+
+def _selection_metadata_row_fields(selection_meta: Mapping[str, Any], *, cap_source: str, context_sample_count: int) -> Dict[str, Any]:
+    return {
+        "example_selection_protocol": str(selection_meta["example_selection_protocol"]),
+        "context_sample_count": int(context_sample_count),
+        "selected_examples": int(selection_meta["selected_examples"]),
+        "selected_examples_cap": int(selection_meta["selected_examples_cap"]),
+        "selected_examples_cap_source": str(cap_source),
+        "uncapped_candidate_examples": int(selection_meta["uncapped_candidate_examples"]),
+        "candidate_examples_after_initial_selection": int(selection_meta["candidate_examples_after_initial_selection"]),
+        "selection_was_capped": bool(selection_meta["selection_was_capped"]),
+    }
+
+
 def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
     payload = {
         "runner_signature": RUNNER_SIGNATURE_VERSION,
@@ -655,6 +737,8 @@ def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
         "forecast_eval_batch_size": int(cli_args.forecast_eval_batch_size),
         "write_context_rows": _write_context_rows_enabled(cli_args),
         "context_embedding_kind": str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
+        "context_sample_count": _context_sample_cap(cli_args),
+        "example_selection_protocol": SCHEDULE_CONTEXT_SELECTION_PROTOCOL,
         "eval_horizon": int(cli_args.eval_horizon),
         "eval_windows_val": int(cli_args.eval_windows_val),
         "eval_windows_test": int(cli_args.eval_windows_test),
@@ -995,9 +1079,11 @@ def _conditional_context_records(
             history_stop=int(t0),
             context_schema="conditional_generation_window",
         )
-        context_id = f"{checkpoint['checkpoint_id']}:{raw_context_id}"
+        context_id = raw_context_id
+        context_embedding_id = f"{checkpoint['checkpoint_id']}:{raw_context_id}"
         row_signature_payload = {
             "context_id": str(context_id),
+            "context_embedding_id": str(context_embedding_id),
             "checkpoint_id": str(checkpoint["checkpoint_id"]),
             "seed": int(seed),
             "scheduler_key": str(scheduler_key),
@@ -1056,7 +1142,7 @@ def _conditional_context_records(
                 "history_stop": int(t0),
                 "target_stop": int(t0) + int(eval_horizon),
                 "context_id": str(context_id),
-                "context_embedding_id": str(context_id),
+                "context_embedding_id": str(context_embedding_id),
                 "checkpoint_id": str(checkpoint["checkpoint_id"]),
                 "score_main": score_value,
                 "temporal_uw1": reward_metric_row.get("temporal_uw1", ""),
@@ -1181,7 +1267,8 @@ def _molecule_context_records(
     uniform_by_context = dict(uniform_by_context_id or {})
     for metric_row in per_context_metrics:
         raw_context_id = str(metric_row["context_id"])
-        context_id = str(metric_row.get("context_embedding_id") or f"{checkpoint['checkpoint_id']}:{raw_context_id}")
+        context_id = raw_context_id
+        context_embedding_id = str(metric_row.get("context_embedding_id") or f"{checkpoint['checkpoint_id']}:{raw_context_id}")
         uniform_metric_row = metric_row if str(scheduler_key) == UNIFORM_SCHEDULER_KEY else uniform_by_context.get(context_id)
         reward_columns = uniform_anchored_objective_columns(
             dict(metric_row, scheduler_key=str(scheduler_key)),
@@ -1192,6 +1279,7 @@ def _molecule_context_records(
         row_signature_payload = {
             "checkpoint_id": str(checkpoint["checkpoint_id"]),
             "context_id": context_id,
+            "context_embedding_id": context_embedding_id,
             "scheduler_key": str(scheduler_key),
             "seed": int(seed),
             "solver_key": str(solver_key),
@@ -1249,7 +1337,7 @@ def _molecule_context_records(
                 "history_stop": int(metric_row.get("history_stop", 0)),
                 "target_stop": int(metric_row.get("target_stop", 0)),
                 "context_id": context_id,
-                "context_embedding_id": str(metric_row.get("context_embedding_id", context_id)),
+                "context_embedding_id": context_embedding_id,
                 "checkpoint_id": str(checkpoint["checkpoint_id"]),
                 "molecule_kabsch_rmsd_3d": metric_row.get("molecule_kabsch_rmsd_3d"),
                 "molecule_ensemble_velocity_norm_w1": metric_row.get("molecule_ensemble_velocity_norm_w1"),
@@ -1504,19 +1592,26 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
             cfg = checkpoint["cfg"]
             splits = checkpoint["splits"]
             train_tuning_reference_examples = int(len(splits.get("val", [])))
+            selected_examples_cap, selected_examples_cap_source = _split_example_cap(cli_args, str(split_phase))
             if str(split_phase) == TRAIN_TUNING_PHASE:
                 eval_ds = splits["train"]
-                eval_window_count = 0
             elif str(split_phase) == VALIDATION_PHASE:
                 eval_ds = splits["val"]
-                eval_window_count = int(cli_args.eval_windows_val)
             else:
                 eval_ds = splits["test"]
-                eval_window_count = int(cli_args.eval_windows_test)
             for seed in seeds:
                 if str(split_phase) == TRAIN_TUNING_PHASE:
                     tuning_seed = int(cli_args.train_tuning_seed) + int(seed) + 1_000 * dataset_idx
-                    chosen_examples = choose_forecast_train_tuning_indices(
+                    uncapped_candidate_examples = train_tuning_target_example_count(
+                        len(eval_ds),
+                        fraction=float(cli_args.eval_train_fraction),
+                        sampling_mode=str(cli_args.train_tuning_sampling_mode),
+                        strata=int(cli_args.train_tuning_strata),
+                        reference_examples=int(train_tuning_reference_examples),
+                        train_split_fraction=float(cli_args.train_tuning_train_split_fraction),
+                        val_split_fraction=float(cli_args.train_tuning_val_split_fraction),
+                    )
+                    candidate_examples = choose_forecast_train_tuning_indices(
                         eval_ds,
                         fraction=float(cli_args.eval_train_fraction),
                         seed=tuning_seed,
@@ -1526,13 +1621,28 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                         reference_examples=int(train_tuning_reference_examples),
                         train_split_fraction=float(cli_args.train_tuning_train_split_fraction),
                         val_split_fraction=float(cli_args.train_tuning_val_split_fraction),
+                        max_examples=int(selected_examples_cap),
+                    )
+                    chosen_examples, selection_meta = _cap_context_indices(
+                        candidate_examples,
+                        cap=int(selected_examples_cap),
+                        seed=int(tuning_seed),
+                        salt=f"forecast|{dataset}|{split_phase}|{checkpoint_step}",
+                        uncapped_candidate_examples=int(uncapped_candidate_examples),
                     )
                 else:
                     tuning_seed = int(seed) + 1_000 * dataset_idx
-                    chosen_examples = choose_forecast_example_indices(
+                    selected = choose_forecast_example_indices(
                         eval_ds,
-                        n_examples=int(eval_window_count),
+                        n_examples=int(selected_examples_cap),
                         seed=tuning_seed,
+                    )
+                    chosen_examples, selection_meta = _cap_context_indices(
+                        selected,
+                        cap=int(selected_examples_cap),
+                        seed=int(tuning_seed),
+                        salt=f"forecast|{dataset}|{split_phase}|{checkpoint_step}",
+                        uncapped_candidate_examples=int(len(eval_ds)),
                     )
                 for target_idx, target_nfe in enumerate(target_nfes):
                     for solver_idx, solver_key in enumerate(normalize_solver_keys(str(cli_args.solver_names))):
@@ -1608,6 +1718,13 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                 row_signature=str(case["row_signature"]),
                                 protocol_hash=str(row_recorder["protocol_hash"]),
                             )
+                            row.update(
+                                _selection_metadata_row_fields(
+                                    selection_meta,
+                                    cap_source=str(selected_examples_cap_source),
+                                    context_sample_count=_context_sample_cap(cli_args),
+                                )
+                            )
                             if str(split_phase) == TRAIN_TUNING_PHASE:
                                 row.update(
                                     {
@@ -1618,6 +1735,7 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                         "train_tuning_sampling_mode": str(cli_args.train_tuning_sampling_mode),
                                         "train_tuning_reference_examples": int(train_tuning_reference_examples),
                                         "train_tuning_target_examples": int(len(chosen_examples)),
+                                        "train_tuning_uncapped_candidate_examples": int(selection_meta["uncapped_candidate_examples"]),
                                         "train_tuning_train_split_fraction": float(cli_args.train_tuning_train_split_fraction),
                                         "train_tuning_val_split_fraction": float(cli_args.train_tuning_val_split_fraction),
                                     }
@@ -1713,22 +1831,37 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                 eval_ds = splits["test"]
                 split_key = "test"
             eval_horizon = resolved_eval_horizon(step_args, str(dataset))
+            selected_examples_cap, selected_examples_cap_source = _split_example_cap(cli_args, str(split_phase))
+            available_windows = int(len(getattr(eval_ds, "start_indices", [])))
             if str(split_phase) == TRAIN_TUNING_PHASE:
                 eval_windows = min(
-                    int(max(1, getattr(cli_args, "context_sample_count", 256))),
-                    int(max(1, len(getattr(eval_ds, "start_indices", [])))),
+                    int(max(1, selected_examples_cap)),
+                    int(max(1, available_windows)),
                 )
             else:
-                eval_windows = resolved_eval_windows(step_args, str(dataset), split_key)
+                requested_attr = "eval_windows_val" if str(split_phase) == VALIDATION_PHASE else "eval_windows_test"
+                requested_windows = int(getattr(cli_args, requested_attr, 0))
+                if requested_windows < 0:
+                    raise ValueError(f"--{requested_attr} must be nonnegative, got {requested_windows!r}.")
+                eval_windows = (
+                    int(requested_windows)
+                    if requested_windows > 0
+                    else min(int(resolved_eval_windows(step_args, str(dataset), split_key)), int(selected_examples_cap))
+                )
             for seed in seeds:
-                chosen_eval_t0s = np.asarray(
-                    _choose_valid_windows(
-                        eval_ds,
-                        horizon=int(eval_horizon),
-                        n_windows=int(eval_windows),
-                        seed=int(seed) + 1_000 * dataset_idx,
-                    ),
-                    dtype=np.int64,
+                selection_seed = int(seed) + 1_000 * dataset_idx
+                candidate_eval_t0s = _choose_valid_windows(
+                    eval_ds,
+                    horizon=int(eval_horizon),
+                    n_windows=int(eval_windows),
+                    seed=int(selection_seed),
+                )
+                chosen_eval_t0s, selection_meta = _cap_context_indices(
+                    candidate_eval_t0s,
+                    cap=int(selected_examples_cap),
+                    seed=int(selection_seed),
+                    salt=f"conditional|{dataset}|{split_phase}|{checkpoint_step}",
+                    uncapped_candidate_examples=max(int(available_windows), len(candidate_eval_t0s)),
                 )
                 for target_idx, target_nfe in enumerate(target_nfes):
                     for solver_idx, solver_key in enumerate(normalize_solver_keys(str(cli_args.solver_names))):
@@ -1841,6 +1974,13 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 metrics=metrics,
                                 row_signature=str(case["row_signature"]),
                                 protocol_hash=str(row_recorder["protocol_hash"]),
+                            )
+                            row.update(
+                                _selection_metadata_row_fields(
+                                    selection_meta,
+                                    cap_source=str(selected_examples_cap_source),
+                                    context_sample_count=_context_sample_cap(cli_args),
+                                )
                             )
                             _append_row_record(row_recorder, row)
                             if _write_context_rows_enabled(cli_args):
@@ -1968,17 +2108,23 @@ def _run_molecule_phase(
                 model = loaded["model"]
                 cfg = loaded["cfg"]
                 ds = loaded["splits"][split_key]
-                eval_count = (
-                    int(getattr(cli_args, "context_sample_count", 256))
-                    if str(split_phase) == TRAIN_TUNING_PHASE
-                    else int(getattr(cli_args, "eval_windows_val" if str(split_phase) == VALIDATION_PHASE else "eval_windows_test", 0) or getattr(cli_args, "context_sample_count", 256))
-                )
+                selected_examples_cap, selected_examples_cap_source = _split_example_cap(cli_args, str(split_phase))
+                eval_count = int(selected_examples_cap)
                 for seed in seeds:
-                    indices = _choose_molecule_indices(
+                    selection_seed = int(seed) + 10_000 * dataset_idx + 1_000 * member_idx
+                    candidate_indices = _choose_molecule_indices(
                         ds,
                         count=int(eval_count),
-                        seed=int(seed) + 10_000 * dataset_idx + 1_000 * member_idx,
+                        seed=int(selection_seed),
                     )
+                    selected_indices, selection_meta = _cap_context_indices(
+                        candidate_indices,
+                        cap=int(selected_examples_cap),
+                        seed=int(selection_seed),
+                        salt=f"molecule|{dataset}|{member_key}|{stratum}|{split_phase}|{checkpoint_step}",
+                        uncapped_candidate_examples=max(int(len(ds)), len(candidate_indices)),
+                    )
+                    indices = [int(idx) for idx in selected_indices.tolist()]
                     if _write_context_rows_enabled(cli_args):
                         context_embeddings = molecule_context_embeddings_for_indices(
                             model=model,
@@ -2095,11 +2241,18 @@ def _run_molecule_phase(
                                         "source_zip_name": str(member.get("source_zip_name", "")),
                                     }
                                 )
+                                row.update(
+                                    _selection_metadata_row_fields(
+                                        selection_meta,
+                                        cap_source=str(selected_examples_cap_source),
+                                        context_sample_count=_context_sample_cap(cli_args),
+                                    )
+                                )
                                 _append_row_record(row_recorder, row)
                                 if scheduler_key == UNIFORM_SCHEDULER_KEY:
                                     uniform_row = row
                                     uniform_context_by_id = {
-                                        str(ctx.get("context_embedding_id", ctx["context_id"])): dict(ctx, scheduler_key=UNIFORM_SCHEDULER_KEY)
+                                        str(ctx["context_id"]): dict(ctx, scheduler_key=UNIFORM_SCHEDULER_KEY)
                                         for ctx in list(metrics.get("per_context_rows", []) or [])
                                     }
                                 if _write_context_rows_enabled(cli_args):
@@ -2120,7 +2273,7 @@ def _run_molecule_phase(
                                         protocol_hash=str(row_recorder["protocol_hash"]),
                                         per_context_metrics=list(metrics.get("per_context_rows", []) or []),
                                         uniform_by_context_id=uniform_context_by_id if scheduler_key != UNIFORM_SCHEDULER_KEY else {
-                                            str(ctx.get("context_embedding_id", ctx["context_id"])): dict(ctx, scheduler_key=UNIFORM_SCHEDULER_KEY)
+                                            str(ctx["context_id"]): dict(ctx, scheduler_key=UNIFORM_SCHEDULER_KEY)
                                             for ctx in list(metrics.get("per_context_rows", []) or [])
                                         },
                                         rollout_steps=int(getattr(cli_args, "molecule_rollout_steps", 16)),

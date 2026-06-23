@@ -33,6 +33,7 @@ from genode.gipo.density_representation import (
     uniform_reference_grid,
     validate_reference_grid,
 )
+from genode.gipo.checkpoint_scope import checkpoint_scope_from_row
 from genode.gipo.models import (
     SETTING_ENCODER_MODE_CONTINUOUS_V3,
     SettingEncoderConfig,
@@ -62,7 +63,7 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
 )
 
 MetricRow = Mapping[str, Any]
-ContextPairKey = Tuple[str, str, int, str, int | None]
+ContextPairKey = Tuple[str, str, int, str, int | None, str]
 ScheduleGridKey = Tuple[str, str, int] | Tuple[str, str, int, int]
 
 GIPO_PROTOCOL = "gipo_density"
@@ -567,7 +568,7 @@ def teacher_rank_pair_diagnostics(
     )
     pair_keys: List[ContextPairKey] = [context_pair_key(row, pair_on_seed=True) for row in rows]
     if not pair_on_seed:
-        pair_keys = [key[:4] + (None,) for key in pair_keys]
+        pair_keys = [_context_pair_key_without_seed(key) for key in pair_keys]
     grouped_by_key: Dict[ContextPairKey, List[int]] = defaultdict(list)
     for idx, key in enumerate(pair_keys):
         grouped_by_key[key].append(int(idx))
@@ -903,10 +904,15 @@ def context_pair_key(row: MetricRow, *, pair_on_seed: bool = True) -> ContextPai
         int(row["target_nfe"]),
         context_id_from_row(row),
         seed,
+        checkpoint_scope_from_row(row),
     )
 
 
-def teacher_selection_candidate_group_key(row: MetricRow) -> Tuple[str, str, int, int | None, int | None, int | None]:
+def _context_pair_key_without_seed(key: ContextPairKey) -> ContextPairKey:
+    return (key[0], key[1], key[2], key[3], None, key[5])
+
+
+def teacher_selection_candidate_group_key(row: MetricRow) -> Tuple[str, str, int, int | None, int | None, int | None, str]:
     return (
         context_id_from_row(row),
         str(row["solver_key"]),
@@ -914,9 +920,10 @@ def teacher_selection_candidate_group_key(row: MetricRow) -> Tuple[str, str, int
         realized_nfe_from_row(row),
         logical_seed_from_row(row),
         evaluation_seed_from_row(row),
+        checkpoint_scope_from_row(row),
     )
 
-def complete_candidate_group_payload(key: Tuple[str, str, int, int | None, int | None, int | None]) -> Dict[str, Any]:
+def complete_candidate_group_payload(key: Tuple[str, str, int, int | None, int | None, int | None, str]) -> Dict[str, Any]:
     return {
         "context_id": str(key[0]),
         "solver_key": str(key[1]),
@@ -924,16 +931,19 @@ def complete_candidate_group_payload(key: Tuple[str, str, int, int | None, int |
         "realized_nfe": None if key[3] is None else int(key[3]),
         "logical_seed": None if key[4] is None else int(key[4]),
         "evaluation_seed": None if key[5] is None else int(key[5]),
+        "checkpoint_id": str(key[6]),
+        "checkpoint_scope": str(key[6]),
     }
 
 
-def _nfe_sequence_key(row: MetricRow) -> Tuple[str, int | None, str, str, str]:
+def _nfe_sequence_key(row: MetricRow) -> Tuple[str, int | None, str, str, str, str]:
     return (
         str(row.get("dataset", row.get("dataset_key", ""))),
         logical_seed_from_row(row),
         str(row["solver_key"]),
         context_id_from_row(row),
         series_key_from_row(row),
+        checkpoint_scope_from_row(row),
     )
 
 
@@ -946,7 +956,7 @@ def _student_target_groups(rows: Sequence[MetricRow]) -> List[Tuple[ContextPairK
 
 def student_nfe_sequence_pairs(rows: Sequence[MetricRow]) -> List[Tuple[int, int, float]]:
     """Return adjacent target rows plus their positive NFE distance."""
-    sequence_items: Dict[Tuple[str, int | None, str, str, str], List[Tuple[int, int]]] = defaultdict(list)
+    sequence_items: Dict[Tuple[str, int | None, str, str, str, str], List[Tuple[int, int]]] = defaultdict(list)
     for index, (_, group) in enumerate(_student_target_groups(rows)):
         if not group:
             continue
@@ -1553,8 +1563,10 @@ def density_mass_for_row(
     solver = str(row["solver_key"])
     target_nfe = int(row["target_nfe"])
     checkpoint_step = None
-    if row.get("checkpoint_step", "") not in (None, ""):
-        checkpoint_step = int(row["checkpoint_step"])
+    for step_key in ("checkpoint_step", "train_steps", "otflow_train_steps"):
+        if row.get(step_key, "") not in (None, ""):
+            checkpoint_step = int(row[step_key])
+            break
     grid = grid_for_schedule(
         str(row["scheduler_key"]),
         solver,
@@ -2628,7 +2640,7 @@ def gipo_teacher_diagnostics(
             target_mask=metric_target_mask,
         )
         if not pair_on_seed:
-            pair_keys = [key[:4] + (None,) for key in pair_keys]
+            pair_keys = [_context_pair_key_without_seed(key) for key in pair_keys]
         rank_left, rank_right, rank_sign = _pair_indices(targets, pair_keys, margin=float(pair_margin), device=sx.device)
         metric_pred = _teacher_metric_scores_batched(
             teacher,
@@ -2660,7 +2672,7 @@ def gipo_teacher_diagnostics(
         teacher.train()
 
     expected_schedule_set = set(expected_candidate_schedules)
-    candidate_groups: Dict[Tuple[str, str, int, int | None, int | None, int | None], Dict[str, List[int]]] = defaultdict(
+    candidate_groups: Dict[Tuple[str, str, int, int | None, int | None, int | None, str], Dict[str, List[int]]] = defaultdict(
         lambda: defaultdict(list)
     )
     unexpected_schedule_groups = 0
@@ -3114,7 +3126,7 @@ def train_gipo_teacher(
         target_mask=metric_target_mask,
     )
     if not pair_on_seed:
-        pair_keys = [key[:4] + (None,) for key in pair_keys]
+        pair_keys = [_context_pair_key_without_seed(key) for key in pair_keys]
     grouped_indices = _group_indices_by_pair_key(pair_keys)
     global_pair_count = _rank_pair_count_for_groups(targets, grouped_indices, margin=float(pair_margin))
     rank_pair_diagnostics = teacher_rank_pair_diagnostics(
@@ -4263,6 +4275,7 @@ __all__ = [
     "build_gipo_student_model",
     "build_gipo_teacher_model",
     "build_teacher_weighted_density_targets",
+    "checkpoint_scope_from_row",
     "context_calibration_train_val_counts",
     "context_embedding_id_from_row",
     "context_id_from_row",
