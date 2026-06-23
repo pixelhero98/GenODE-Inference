@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import csv
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from genode.canonical_experiment_layout import SCENARIO_FAMILY_FORECAST
-from genode.gipo.preflight import build_argparser, preflight_gipo_rows, validate_gipo_support_preflight_report
+from genode.gipo.preflight import build_argparser, main as preflight_main, preflight_gipo_rows, validate_gipo_support_preflight_report
 
 
 SUPPORT_SCHEDULES = ("uniform", "late_power_3")
@@ -27,7 +30,14 @@ ROW_FIELDS = (
 )
 
 
-def _row(context_id: str, scheduler_key: str, *, series_id: str | None = None, target_t: int | None = None) -> dict[str, object]:
+def _row(
+    context_id: str,
+    scheduler_key: str,
+    *,
+    series_id: str | None = None,
+    target_t: int | None = None,
+    utility: object = 1.0,
+) -> dict[str, object]:
     suffix = context_id.rsplit("_", 1)[-1]
     context_idx = int(suffix) if suffix.isdigit() else 0
     return {
@@ -41,7 +51,7 @@ def _row(context_id: str, scheduler_key: str, *, series_id: str | None = None, t
         "context_id": context_id,
         "series_id": series_id if series_id is not None else f"series_{context_idx}",
         "target_t": target_t if target_t is not None else 100 + context_idx,
-        "u_comp_uniform": 1.0,
+        "u_comp_uniform": utility,
     }
 
 
@@ -191,6 +201,76 @@ class GipoPreflightTests(unittest.TestCase):
         self.assertEqual(report["status"], "issues_found")
         self.assertEqual(report["context_count_preflight"]["complete_clean_context_count"], 2)
         self.assertIn("at least 3", report["context_count_preflight"]["errors"][0])
+
+    def test_preflight_metric_target_coverage_failures_count_as_issues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows_csv = Path(tmpdir) / "rows.csv"
+            _write_rows(
+                rows_csv,
+                [
+                    _row("ctx_0", "uniform", utility=1.0),
+                    _row("ctx_0", "late_power_3", utility=2.0),
+                    _row("ctx_1", "uniform", utility=1.0),
+                    _row("ctx_1", "late_power_3", utility=""),
+                ],
+            )
+
+            report = _run_preflight(rows_csv, "--min_context_count", "1")
+
+        self.assertEqual(report["status"], "issues_found")
+        self.assertGreater(report["issue_count"], 0)
+        self.assertEqual(report["teacher_metric_targets"]["failure_count"], 1)
+        self.assertEqual(report["teacher_metric_targets"]["failures"][0]["metric_key"], "u_comp_uniform")
+        self.assertEqual(report["teacher_metric_targets"]["failures"][0]["missing_count"], 1)
+
+    def test_preflight_reports_zero_rank_pair_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows_csv = Path(tmpdir) / "rows.csv"
+            rows = []
+            for context_idx in range(3):
+                for scheduler_key in SUPPORT_SCHEDULES:
+                    rows.append(_row(f"ctx_{context_idx}", scheduler_key, utility=1.0))
+            _write_rows(rows_csv, rows)
+
+            report = _run_preflight(rows_csv)
+
+        self.assertEqual(report["status"], "issues_found")
+        self.assertEqual(report["rank_pair_preflight"]["rankable_pair_count"], 0)
+        self.assertEqual(report["rank_pair_preflight"]["error_count"], 1)
+        self.assertTrue(report["rank_pair_preflight"]["example_bad_groups"])
+        self.assertGreater(report["issue_count"], 0)
+
+    def test_preflight_cli_exits_nonzero_when_issues_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows_csv = Path(tmpdir) / "rows.csv"
+            rows = []
+            for context_idx in range(3):
+                for scheduler_key in SUPPORT_SCHEDULES:
+                    rows.append(_row(f"ctx_{context_idx}", scheduler_key, utility=1.0))
+            _write_rows(rows_csv, rows)
+            argv = [
+                "--rows_csv",
+                str(rows_csv),
+                "--support_schedule_keys",
+                ",".join(SUPPORT_SCHEDULES),
+                "--teacher_metric_target_keys",
+                "u_comp_uniform",
+            ]
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+                preflight_main(argv)
+            report = json.loads(stdout.getvalue())
+            allow_stdout = io.StringIO()
+            with contextlib.redirect_stdout(allow_stdout):
+                preflight_main([*argv, "--allow_issues"])
+            allow_report = json.loads(allow_stdout.getvalue())
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(report["status"], "issues_found")
+        self.assertGreater(report["issue_count"], 0)
+        self.assertEqual(allow_report["status"], "issues_found")
+        self.assertGreater(allow_report["issue_count"], 0)
 
     def test_preflight_reports_missing_schedule_summary_grids(self) -> None:
         ser_key = "ser_ptg_local_defect_eta005"

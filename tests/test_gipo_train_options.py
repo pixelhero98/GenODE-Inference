@@ -5,6 +5,7 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from genode.canonical_experiment_layout import (
     CANONICAL_SEEN_NFES,
@@ -327,7 +328,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             root = Path(tmpdir)
             rows_csv = root / "seen.csv"
             embeddings_npz = root / "ctx.npz"
-            _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES)
+            _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES, schedules=("uniform", "late_power_3", "flowts_power_sampling"))
             _write_embeddings(embeddings_npz)
 
             summary = train_gipo(
@@ -335,8 +336,10 @@ class GipoTrainOptionsTests(unittest.TestCase):
                     root,
                     rows_csv,
                     embeddings_npz,
+                    "--support_schedule_keys",
+                    "uniform,late_power_3,flowts_power_sampling",
                     "--teacher_density_holdout_schedule_keys",
-                    "late_power_3",
+                    "flowts_power_sampling",
                 )
             )
 
@@ -345,12 +348,12 @@ class GipoTrainOptionsTests(unittest.TestCase):
         self.assertEqual(summary["teacher_selection_inactive_axes"], ["unseen_nfe"])
         scopes = summary["normalizer_fit_scopes"]
         self.assertEqual(scopes["protocol"], "selector_final_normalizer_scopes_v1")
-        self.assertEqual(scopes["selector"]["embedding"]["row_count"], 4)
+        self.assertEqual(scopes["selector"]["embedding"]["row_count"], 8)
         self.assertEqual(scopes["selector"]["embedding"]["context_count"], 1)
-        self.assertEqual(scopes["selector"]["embedding"]["schedule_count"], 1)
-        self.assertEqual(scopes["final"]["embedding"]["row_count"], 24)
+        self.assertEqual(scopes["selector"]["embedding"]["schedule_count"], 2)
+        self.assertEqual(scopes["final"]["embedding"]["row_count"], 36)
         self.assertEqual(scopes["final"]["embedding"]["context_count"], 3)
-        self.assertEqual(scopes["final"]["embedding"]["schedule_count"], 2)
+        self.assertEqual(scopes["final"]["embedding"]["schedule_count"], 3)
         self.assertIn("membership_hash", scopes["selector"]["embedding"])
         self.assertNotEqual(
             scopes["selector"]["embedding"]["membership_hash"],
@@ -394,6 +397,54 @@ class GipoTrainOptionsTests(unittest.TestCase):
         self.assertEqual(coverage["thresholds"], {"min_coverage_fraction": 0.0, "min_valid_rows": 0})
         self.assertEqual(coverage["scopes"]["rows_csv"]["metrics"]["u_comp_uniform"]["valid_row_count"], 24)
         self.assertEqual(coverage["scopes"]["rows_csv"]["metrics"]["u_alt_uniform"]["valid_row_count"], 0)
+
+    def test_train_gipo_rejects_zero_rank_pairs_before_teacher_training(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            rows_csv = root / "seen.csv"
+            embeddings_npz = root / "ctx.npz"
+            with rows_csv.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=ROW_FIELDS)
+                writer.writeheader()
+                for ctx_idx, context_id in enumerate(("ctx_0", "ctx_1", "ctx_2")):
+                    for target_nfe in (5, 7):
+                        for scheduler_key in SUPPORT_SCHEDULES:
+                            writer.writerow(
+                                {
+                                    "benchmark_family": SCENARIO_FAMILY_FORECAST,
+                                    "dataset": "private_forecast_dataset",
+                                    "split_phase": "train_tuning",
+                                    "seed": 0,
+                                    "solver_key": "euler",
+                                    "target_nfe": target_nfe,
+                                    "scheduler_key": scheduler_key,
+                                    "context_id": context_id,
+                                    "context_embedding_id": context_id,
+                                    "checkpoint_id": "",
+                                    "series_id": f"series_{ctx_idx}",
+                                    "target_t": 100 + ctx_idx,
+                                    "gipo_reward_protocol": GIPO_PROTOCOL,
+                                    "u_comp_uniform": 1.0,
+                                    "u_alt_uniform": "",
+                                }
+                            )
+            _write_embeddings(embeddings_npz)
+
+            with mock.patch("genode.gipo.train_gipo.train_gipo_teacher") as teacher_train:
+                with self.assertRaisesRegex(ValueError, "rank_pair_preflight.*rankable_pair_count=0"):
+                    train_gipo(
+                        _trainer_args(
+                            root,
+                            rows_csv,
+                            embeddings_npz,
+                            "--seen_target_nfe_values",
+                            "5,7",
+                            "--context_holdout_fraction",
+                            "0",
+                        )
+                    )
+
+        teacher_train.assert_not_called()
 
     def test_pseudo_target_nfe_values_filter_rows_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

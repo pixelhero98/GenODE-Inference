@@ -27,6 +27,7 @@ from genode.gipo.objectives import (
 )
 from genode.gipo.checkpoint_scope import checkpoint_scope_from_row as _checkpoint_scope_from_row
 from genode.gipo.density_representation import uniform_reference_grid
+from genode.gipo.policy import teacher_rank_pair_diagnostics
 from genode.gipo.schedule_grids import load_schedule_summary_grids, schedule_grid_coverage_report
 from genode.gipo.schedule_hash import json_hash as _canonical_json_hash
 from genode.solver_protocol import normalize_solver_key
@@ -374,7 +375,7 @@ def _cell_payload(key: Tuple[Any, ...]) -> Dict[str, Any]:
         "target_nfe": int(key[2]),
         "context_id": str(key[3]),
         "logical_seed": key[4],
-        "checkpoint_id": str(key[5]) if len(key) > 5 else "",
+        "checkpoint_scope": str(key[5]) if len(key) > 5 else "",
     }
 
 
@@ -752,6 +753,62 @@ def validate_teacher_metric_target_coverage(
     return coverage
 
 
+def _teacher_metric_target_validation_report(
+    rows: Sequence[Mapping[str, Any]],
+    target_keys: Sequence[str],
+    *,
+    min_coverage_fraction: float,
+    min_valid_rows: int,
+) -> Dict[str, Any]:
+    coverage = teacher_metric_target_coverage(rows, target_keys)
+    failures: List[Dict[str, Any]] = []
+    for key, item in coverage.items():
+        valid_count = int(item["valid_count"])
+        fraction = float(item["coverage_fraction"])
+        if valid_count < int(min_valid_rows) or fraction + 1e-12 < float(min_coverage_fraction):
+            failures.append(
+                {
+                    "metric_key": str(key),
+                    "valid_count": valid_count,
+                    "applicable_count": int(item["applicable_count"]),
+                    "missing_count": int(item["missing_count"]),
+                    "nonfinite_count": int(item["nonfinite_count"]),
+                    "coverage_fraction": fraction,
+                }
+            )
+    return {
+        "row_count": int(len(rows)),
+        "min_coverage_fraction": float(min_coverage_fraction),
+        "min_valid_rows": int(min_valid_rows),
+        "coverage": coverage,
+        "failure_count": int(len(failures)),
+        "failures": failures,
+    }
+
+
+def _rank_pair_preflight_report(
+    rows: Sequence[Mapping[str, Any]],
+    target_keys: Sequence[str],
+) -> Dict[str, Any]:
+    diagnostics = teacher_rank_pair_diagnostics(
+        rows,
+        target_keys=target_keys,
+        pair_margin=0.0,
+        pair_on_seed=True,
+    )
+    errors: List[str] = []
+    if int(diagnostics.get("row_count", 0) or 0) > 0 and int(diagnostics.get("rankable_pair_count", 0) or 0) <= 0:
+        errors.append(
+            "No rankable teacher pairs were found across complete support cells; "
+            "at least one same-context support group must contain different scalarized teacher utilities."
+        )
+    return {
+        **diagnostics,
+        "error_count": int(len(errors)),
+        "errors": errors,
+    }
+
+
 def build_gipo_support_preflight_report(
     rows: Sequence[Mapping[str, Any]],
     support_schedule_keys: Sequence[str],
@@ -765,7 +822,7 @@ def build_gipo_support_preflight_report(
     support_keys = _validate_gipo_support_schedule_keys(support_schedule_keys)
     identity_conflicts, dirty_rows, _, _ = _identity_conflict_report(records)
     support, complete_cell_keys, complete_records = _support_report(records, support_keys, dirty_rows)
-    issue_count = (
+    base_issue_count = (
         int(support["missing_support_cell_count"])
         + int(support["duplicate_support_cell_count"])
         + int(support["extra_support_cell_count"])
@@ -774,8 +831,41 @@ def build_gipo_support_preflight_report(
         + int(len(identity_conflicts))
     )
     target_keys: Tuple[str, ...] = ()
+    metric_target_report: Dict[str, Any] = {}
+    rank_pair_preflight: Dict[str, Any] = {"error_count": 0, "errors": []}
     if teacher_metric_target_keys:
         target_keys = _validate_teacher_metric_target_keys(teacher_metric_target_keys)
+        complete_rows = [record.row for record in complete_records]
+        support_rows = [record.row for record in records if str(record.row.get("scheduler_key", "") or "").strip() in set(support_keys)]
+        metric_validation = _teacher_metric_target_validation_report(
+            support_rows,
+            target_keys,
+            min_coverage_fraction=1.0,
+            min_valid_rows=1,
+        )
+        metric_target_report = {
+            "validation_scope": "support_rows",
+            "validation": metric_validation,
+            "failure_count": int(metric_validation["failure_count"]),
+            "failures": list(metric_validation["failures"]),
+            "coverage": metric_validation["coverage"],
+        }
+        if int(metric_validation["failure_count"]) == 0:
+            rank_pair_preflight = _rank_pair_preflight_report(complete_rows, target_keys)
+        else:
+            rank_pair_preflight = {
+                "status": "skipped",
+                "skip_reason": "metric_target_coverage_failed",
+                "row_count": int(len(complete_rows)),
+                "rankable_pair_count": 0,
+                "error_count": 0,
+                "errors": [],
+            }
+    issue_count = (
+        int(base_issue_count)
+        + int(metric_target_report.get("failure_count", 0) or 0)
+        + int(rank_pair_preflight.get("error_count", 0) or 0)
+    )
     return {
         "artifact": "gipo_rows_preflight_report",
         "schema_version": "genode_gipo_support_preflight_v1",
@@ -809,6 +899,8 @@ def build_gipo_support_preflight_report(
         "context_identity_conflict_count": int(len(identity_conflicts)),
         "context_identity_conflicts": identity_conflicts,
         "teacher_metric_target_coverage": teacher_metric_target_coverage(rows, target_keys) if target_keys else {},
+        "teacher_metric_targets": metric_target_report,
+        "rank_pair_preflight": rank_pair_preflight,
         "complete_rows_row_count": int(len(complete_records)),
         "complete_rows_support_cell_count": int(len(complete_cell_keys)),
         "issue_count": int(issue_count),
@@ -820,12 +912,24 @@ def validate_gipo_support_preflight_report(report: Mapping[str, Any], *, label: 
     identity = dict(report.get("context_identity", {}) or {})
     context_count = dict(report.get("context_count_preflight", {}) or {})
     schedule_grid = dict(report.get("schedule_grid_preflight", {}) or {})
+    teacher_metric_targets = dict(report.get("teacher_metric_targets", {}) or {})
+    rank_pair_preflight = dict(report.get("rank_pair_preflight", {}) or {})
     bad_group_count = int(support_cells.get("bad_group_count", 0))
     conflict_count = int(identity.get("conflict_group_count", 0))
     context_errors = list(context_count.get("errors", []) or [])
     missing_grid_count = int(schedule_grid.get("missing_grid_row_count", 0) or 0)
     schedule_grid_error = str(report.get("schedule_grid_preflight_error", "") or "")
-    if bad_group_count or conflict_count or context_errors or missing_grid_count or schedule_grid_error:
+    metric_failure_count = int(teacher_metric_targets.get("failure_count", 0) or 0)
+    rank_pair_error_count = int(rank_pair_preflight.get("error_count", 0) or 0)
+    if (
+        bad_group_count
+        or conflict_count
+        or context_errors
+        or missing_grid_count
+        or schedule_grid_error
+        or metric_failure_count
+        or rank_pair_error_count
+    ):
         raise ValueError(
             f"{label} failed GIPO row preflight: "
             f"bad_support_groups={bad_group_count}, "
@@ -833,6 +937,8 @@ def validate_gipo_support_preflight_report(report: Mapping[str, Any], *, label: 
             f"context_count_errors={context_errors}, "
             f"missing_schedule_grid_rows={missing_grid_count}, "
             f"schedule_grid_error={schedule_grid_error!r}, "
+            f"teacher_metric_target_failures={metric_failure_count}, "
+            f"rank_pair_errors={rank_pair_error_count}, "
             f"support={support_cells}, first_identity={list(identity.get('conflicts', []) or [])[:1]}."
         )
 
@@ -851,6 +957,23 @@ def build_argparser() -> argparse.ArgumentParser:
         "--teacher_metric_target_keys",
         default="auto",
         help="Comma-separated teacher utility columns, or auto for the same family defaults as genode-train-gipo.",
+    )
+    parser.add_argument(
+        "--teacher_metric_min_coverage_fraction",
+        type=float,
+        default=1.0,
+        help="Minimum finite/applicable coverage required for each teacher metric target.",
+    )
+    parser.add_argument(
+        "--teacher_metric_min_valid_rows",
+        type=int,
+        default=1,
+        help="Minimum finite row count required for each teacher metric target.",
+    )
+    parser.add_argument(
+        "--allow_issues",
+        action="store_true",
+        help="Print the report and exit zero even when issue_count is nonzero.",
     )
     parser.add_argument("--report_json", default="", help="Optional path to also write the JSON report.")
     parser.add_argument(
@@ -927,6 +1050,46 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
     except Exception as exc:
         target_keys = ()
         target_resolution_error = str(exc)
+    metric_min_coverage = float(getattr(args, "teacher_metric_min_coverage_fraction", 1.0))
+    if not math.isfinite(metric_min_coverage) or metric_min_coverage < 0.0 or metric_min_coverage > 1.0:
+        raise ValueError("teacher_metric_min_coverage_fraction must be finite and in [0, 1].")
+    metric_min_valid_rows = int(getattr(args, "teacher_metric_min_valid_rows", 1))
+    if metric_min_valid_rows < 0:
+        raise ValueError("teacher_metric_min_valid_rows must be nonnegative.")
+    metric_target_report = _metric_target_coverage(rows, support_rows, complete_clean_rows, target_keys)
+    rank_pair_preflight: Dict[str, Any] = {
+        "row_count": int(len(complete_clean_rows)),
+        "rankable_pair_count": 0,
+        "error_count": 0,
+        "errors": [],
+    }
+    if target_keys:
+        metric_validation = _teacher_metric_target_validation_report(
+            support_rows,
+            target_keys,
+            min_coverage_fraction=metric_min_coverage,
+            min_valid_rows=metric_min_valid_rows,
+        )
+        metric_target_report["validation_scope"] = "support_rows"
+        metric_target_report["validation"] = metric_validation
+        metric_target_report["failure_count"] = int(metric_validation["failure_count"])
+        metric_target_report["failures"] = list(metric_validation["failures"])
+        if int(metric_validation["failure_count"]) == 0:
+            rank_pair_preflight = _rank_pair_preflight_report(complete_clean_rows, target_keys)
+        else:
+            rank_pair_preflight = {
+                "status": "skipped",
+                "skip_reason": "metric_target_coverage_failed",
+                "row_count": int(len(complete_clean_rows)),
+                "rankable_pair_count": 0,
+                "error_count": 0,
+                "errors": [],
+            }
+    else:
+        metric_target_report["validation_scope"] = ""
+        metric_target_report["validation"] = {}
+        metric_target_report["failure_count"] = 0
+        metric_target_report["failures"] = []
 
     complete_rows_path = ""
     if str(args.complete_rows_csv).strip():
@@ -944,8 +1107,9 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
         "row_count": int(len(records)),
         "input_header": list(fieldnames),
         "support": support,
-        "teacher_metric_targets": _metric_target_coverage(rows, support_rows, [record.row for record in complete_records], target_keys),
+        "teacher_metric_targets": metric_target_report,
         "teacher_metric_target_resolution_error": target_resolution_error,
+        "rank_pair_preflight": rank_pair_preflight,
         "context_count_preflight": context_count_preflight,
         "schedule_grid_preflight": schedule_grid_report,
         "schedule_grid_preflight_error": schedule_grid_error,
@@ -965,6 +1129,8 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
         + len(support.get("support_semantic_errors", []))
         + int(len(identity_conflicts))
         + (1 if target_resolution_error else 0)
+        + int(metric_target_report.get("failure_count", 0) or 0)
+        + int(rank_pair_preflight.get("error_count", 0) or 0)
         + len(context_count_errors)
         + int(schedule_grid_report.get("missing_grid_row_count", 0))
         + (1 if schedule_grid_error else 0)
@@ -983,6 +1149,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     report = preflight_gipo_rows(args)
     text = json.dumps(report, indent=2, sort_keys=True)
     print(text)
+    if int(report.get("issue_count", 0) or 0) > 0 and not bool(getattr(args, "allow_issues", False)):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -64,6 +64,9 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
 
 MetricRow = Mapping[str, Any]
 ContextPairKey = Tuple[str, str, int, str, int | None, str]
+TeacherSelectionCandidateGroupKey = Tuple[str, str, int, int | None, int | None, int | None, str]
+NFESequenceKey = Tuple[str, int | None, str, str, str, str]
+NFECandidateSequenceKey = Tuple[str, int | None, str, str, str, str, str]
 ScheduleGridKey = Tuple[str, str, int] | Tuple[str, str, int, int]
 
 GIPO_PROTOCOL = "gipo_density"
@@ -912,7 +915,7 @@ def _context_pair_key_without_seed(key: ContextPairKey) -> ContextPairKey:
     return (key[0], key[1], key[2], key[3], None, key[5])
 
 
-def teacher_selection_candidate_group_key(row: MetricRow) -> Tuple[str, str, int, int | None, int | None, int | None, str]:
+def teacher_selection_candidate_group_key(row: MetricRow) -> TeacherSelectionCandidateGroupKey:
     return (
         context_id_from_row(row),
         str(row["solver_key"]),
@@ -923,7 +926,7 @@ def teacher_selection_candidate_group_key(row: MetricRow) -> Tuple[str, str, int
         checkpoint_scope_from_row(row),
     )
 
-def complete_candidate_group_payload(key: Tuple[str, str, int, int | None, int | None, int | None, str]) -> Dict[str, Any]:
+def complete_candidate_group_payload(key: TeacherSelectionCandidateGroupKey) -> Dict[str, Any]:
     return {
         "context_id": str(key[0]),
         "solver_key": str(key[1]),
@@ -931,12 +934,11 @@ def complete_candidate_group_payload(key: Tuple[str, str, int, int | None, int |
         "realized_nfe": None if key[3] is None else int(key[3]),
         "logical_seed": None if key[4] is None else int(key[4]),
         "evaluation_seed": None if key[5] is None else int(key[5]),
-        "checkpoint_id": str(key[6]),
         "checkpoint_scope": str(key[6]),
     }
 
 
-def _nfe_sequence_key(row: MetricRow) -> Tuple[str, int | None, str, str, str, str]:
+def _nfe_sequence_key(row: MetricRow) -> NFESequenceKey:
     return (
         str(row.get("dataset", row.get("dataset_key", ""))),
         logical_seed_from_row(row),
@@ -956,7 +958,7 @@ def _student_target_groups(rows: Sequence[MetricRow]) -> List[Tuple[ContextPairK
 
 def student_nfe_sequence_pairs(rows: Sequence[MetricRow]) -> List[Tuple[int, int, float]]:
     """Return adjacent target rows plus their positive NFE distance."""
-    sequence_items: Dict[Tuple[str, int | None, str, str, str, str], List[Tuple[int, int]]] = defaultdict(list)
+    sequence_items: Dict[NFESequenceKey, List[Tuple[int, int]]] = defaultdict(list)
     for index, (_, group) in enumerate(_student_target_groups(rows)):
         if not group:
             continue
@@ -991,7 +993,7 @@ def _physical_nfe_sequence_key(row: MetricRow) -> Tuple[Any, ...]:
 
 
 def nfe_sequence_diagnostic_summary(rows: Sequence[MetricRow]) -> Dict[str, Any]:
-    sequence_groups: Dict[Tuple[str, int | None, str, str, str], set[int]] = defaultdict(set)
+    sequence_groups: Dict[NFESequenceKey, set[int]] = defaultdict(set)
     physical_groups: Dict[Tuple[Any, ...], set[int]] = defaultdict(set)
     for row in rows:
         nfe = int(row["target_nfe"])
@@ -2585,6 +2587,7 @@ def gipo_teacher_diagnostics(
             "realized_nfe",
             "logical_seed",
             "evaluation_seed",
+            "checkpoint_scope",
         ],
         "complete_candidate_schedule_keys": list(expected_candidate_schedules),
     }
@@ -2672,7 +2675,7 @@ def gipo_teacher_diagnostics(
         teacher.train()
 
     expected_schedule_set = set(expected_candidate_schedules)
-    candidate_groups: Dict[Tuple[str, str, int, int | None, int | None, int | None, str], Dict[str, List[int]]] = defaultdict(
+    candidate_groups: Dict[TeacherSelectionCandidateGroupKey, Dict[str, List[int]]] = defaultdict(
         lambda: defaultdict(list)
     )
     unexpected_schedule_groups = 0
@@ -2750,7 +2753,7 @@ def gipo_teacher_diagnostics(
             )
     sequence_delta_values: List[float] = []
     sequence_second_diff_values: List[float] = []
-    by_candidate_sequence: Dict[Tuple[str, int | None, str, str, str, str], List[Tuple[int, int]]] = defaultdict(list)
+    by_candidate_sequence: Dict[NFECandidateSequenceKey, List[Tuple[int, int]]] = defaultdict(list)
     for idx, row in enumerate(rows):
         sequence_key = (*_nfe_sequence_key(row), str(schedule_keys[idx]))
         by_candidate_sequence[sequence_key].append((int(row["target_nfe"]), int(idx)))

@@ -195,7 +195,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(ValueError, "runtime_nfe=4"):
+            with self.assertRaisesRegex(ValueError, "runtime_nfe=4.*macro-step count.*realized_nfe=4"):
                 load_schedule_predictions(
                     path,
                     dataset="traffic_hourly",

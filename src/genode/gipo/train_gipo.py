@@ -596,6 +596,28 @@ def _validate_support_group_counts(rows: Sequence[Mapping[str, Any]], support_sc
         )
 
 
+def _validate_rank_pair_preflight(rank_pair_preflight: Mapping[str, Mapping[str, Any]]) -> None:
+    failures: List[str] = []
+    for split_name, diagnostics in rank_pair_preflight.items():
+        row_count = int(diagnostics.get("row_count", 0) or 0)
+        rankable_pair_count = int(diagnostics.get("rankable_pair_count", 0) or 0)
+        if row_count > 0 and rankable_pair_count <= 0:
+            failures.append(
+                f"{split_name}: row_count={row_count}, "
+                f"rankable_pair_count={rankable_pair_count}, "
+                f"pair_group_count={int(diagnostics.get('pair_group_count', 0) or 0)}, "
+                f"singleton_group_count={int(diagnostics.get('singleton_group_count', 0) or 0)}, "
+                f"tie_only_group_count={int(diagnostics.get('tie_only_group_count', 0) or 0)}, "
+                f"examples={list(diagnostics.get('example_bad_groups', []) or [])[:3]}"
+            )
+    if failures:
+        raise ValueError(
+            "GIPO rank_pair_preflight failed before teacher training; "
+            "each teacher fit split requires at least one same-context support pair with different scalarized utility. "
+            f"Failures: {failures}"
+        )
+
+
 def _validate_unique_schedule_rows(rows: Sequence[Mapping[str, Any]], *, label: str) -> None:
     counts: Dict[Tuple[Any, ...], int] = {}
     for row in rows:
@@ -606,7 +628,7 @@ def _validate_unique_schedule_rows(rows: Sequence[Mapping[str, Any]], *, label: 
         first_key = next(iter(duplicates))
         raise ValueError(
             f"{label} contains duplicate schedule rows for exact "
-            "(dataset,solver_key,target_nfe,context_id,seed,checkpoint_id,scheduler_key) cells; "
+            "(dataset,solver_key,target_nfe,context_id,seed,checkpoint_scope,scheduler_key) cells; "
             f"first duplicate={first_key}, count={duplicates[first_key]}."
         )
 
@@ -1482,6 +1504,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             pair_margin=CANONICAL_TEACHER_PAIR_MARGIN,
         ),
     }
+    _validate_rank_pair_preflight(rank_pair_preflight)
     normalizer_fit_scopes = {
         "protocol": GIPO_PREPROCESSING_PROTOCOL,
         "selector": {

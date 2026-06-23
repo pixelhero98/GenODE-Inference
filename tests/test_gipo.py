@@ -37,14 +37,18 @@ from genode.gipo.policy import (
     build_gipo_student_model,
     build_gipo_teacher_model,
     build_teacher_weighted_density_targets,
+    complete_candidate_group_payload,
     density_mass_for_row,
+    gipo_teacher_diagnostics,
     _density_mass_to_normalized_log_features_torch,
     _group_indices_by_pair_key,
     _make_group_minibatch_sampler,
     _make_index_minibatch_sampler,
     _student_teacher_score_objective,
     _student_teacher_score_eta,
+    nfe_sequence_diagnostic_summary,
     realized_nfe_from_row,
+    teacher_selection_candidate_group_key,
     train_gipo_teacher,
     validate_canonical_conditioning_style,
 )
@@ -107,6 +111,59 @@ class GIPOCanonicalTests(unittest.TestCase):
         self.assertEqual(len(reconstructed), 4)
         self.assertEqual(metadata["density_protocol"], DENSITY_PROTOCOL)
         self.assertEqual(metadata["reference_bin_count"], 64)
+
+    def test_teacher_diagnostics_candidate_schema_uses_checkpoint_scope(self) -> None:
+        diagnostics = gipo_teacher_diagnostics(
+            _RowScoreTeacher(),
+            [],
+            context_embeddings={},
+            series_index_map={},
+            schedule_grids=None,
+            reference_time_grid=uniform_reference_grid(64),
+            density_normalizer=None,
+        )
+        row = {
+            "dataset": "lobster_synthetic",
+            "solver_key": "euler",
+            "target_nfe": 4,
+            "realized_nfe": 4,
+            "seed": 0,
+            "context_id": "ctx",
+            "series_id": "series",
+            "scheduler_key": "uniform",
+            "checkpoint_step": 4000,
+        }
+        payload = complete_candidate_group_payload(teacher_selection_candidate_group_key(row))
+
+        self.assertEqual(diagnostics["complete_candidate_group_key_schema"][-1], "checkpoint_scope")
+        self.assertIn("checkpoint_scope", payload)
+        self.assertEqual(payload["checkpoint_scope"], "checkpoint_step:4000")
+        self.assertNotIn("checkpoint_id", payload)
+
+    def test_nfe_sequence_diagnostics_keep_checkpoint_scopes_distinct(self) -> None:
+        rows = []
+        for checkpoint_id in ("ckpt_a", "ckpt_b"):
+            for target_nfe in (4, 8):
+                rows.append(
+                    {
+                        "dataset": "lobster_synthetic",
+                        "split_phase": "train_tuning",
+                        "seed": 0,
+                        "solver_key": "euler",
+                        "target_nfe": target_nfe,
+                        "scheduler_key": "uniform",
+                        "context_id": "ctx",
+                        "context_embedding_id": f"{checkpoint_id}:ctx",
+                        "checkpoint_id": checkpoint_id,
+                        "series_id": "series",
+                    }
+                )
+
+        summary = nfe_sequence_diagnostic_summary(rows)
+
+        self.assertEqual(summary["sequence_group_count"], 2)
+        self.assertEqual(summary["sequence_multi_nfe_group_count"], 2)
+        self.assertEqual(summary["nfe_sequence_pair_count"], 2)
 
     def test_density_mass_for_row_uses_train_steps_for_scoped_summary_grid(self) -> None:
         reference = uniform_reference_grid(4)

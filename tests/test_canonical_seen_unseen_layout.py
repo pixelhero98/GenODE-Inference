@@ -84,7 +84,7 @@ class CanonicalSeenUnseenLayoutTests(unittest.TestCase):
         self.assertEqual(expected_realized_nfe("dpmpp2m", 4), 4)
         nfe = normalize_solver_nfe_fields("heun", 4, runtime_nfe=2, realized_nfe=4)
         self.assertEqual((nfe.macro_steps, nfe.runtime_nfe, nfe.realized_nfe), (2, 2, 4))
-        with self.assertRaisesRegex(ValueError, "runtime_nfe=4"):
+        with self.assertRaisesRegex(ValueError, "runtime_nfe=4.*macro-step count.*realized_nfe=4"):
             normalize_solver_nfe_fields("heun", 4, runtime_nfe=4)
 
 
