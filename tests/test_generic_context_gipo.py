@@ -1336,6 +1336,7 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertTrue(all("--calibration_batch_size 1" in command for command in ser_commands))
         self.assertTrue(all("--val_windows 0" in command for command in ser_commands))
         self.assertTrue(all("--train_tuning_max_examples 17" in command for command in ser_commands))
+        self.assertTrue(all("--train_tuning_max_examples_source train_tuning_max_examples" in command for command in ser_commands))
         self.assertTrue(all("--calibration_batch_size" not in command for command in non_ser_commands))
         self.assertTrue(all("--val_windows" not in command for command in non_ser_commands))
         self.assertTrue(all("--train_tuning_max_examples" not in command for command in non_ser_commands))
@@ -1344,7 +1345,7 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(protocol["ser_val_windows"], 0)
         self.assertEqual(protocol["ser_train_tuning_max_examples"], 17)
         self.assertEqual(protocol["ser_train_tuning_effective_max_examples"], 17)
-        self.assertEqual(protocol["ser_example_selection_protocol"], "ser_ptg_reference_context_capped_v2")
+        self.assertEqual(protocol["ser_example_selection_protocol"], "ser_ptg_reference_global_context_capped_v3")
         self.assertEqual(protocol["ser_local_defect_proxy_protocol"], "otflow_midpoint_local_defect_proxy_v1")
 
     def test_full_pipeline_default_ser_train_tuning_cap_tracks_context_count(self) -> None:
@@ -1363,7 +1364,8 @@ class GenericContextGipoTests(unittest.TestCase):
             )
             summary = full_pipeline.run_full_pipeline(args)
         by_stage = {stage["stage"]: [" ".join(command) for command in stage["commands"]] for stage in summary["stages"]}
-        self.assertTrue(all("--train_tuning_max_examples 0" in command for command in by_stage["ser_summaries"]))
+        self.assertTrue(all("--train_tuning_max_examples 123" in command for command in by_stage["ser_summaries"]))
+        self.assertTrue(all("--train_tuning_max_examples_source context_sample_count" in command for command in by_stage["ser_summaries"]))
         protocol = full_pipeline._protocol_payload(args)
         self.assertEqual(protocol["ser_train_tuning_max_examples"], 0)
         self.assertEqual(protocol["ser_train_tuning_effective_max_examples"], 123)

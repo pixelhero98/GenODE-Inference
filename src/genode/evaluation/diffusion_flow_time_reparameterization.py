@@ -113,13 +113,13 @@ from genode.runtime import resolve_torch_device
 from genode.gipo.policy import GIPO_PROTOCOL, load_context_embedding_table, save_context_embedding_table
 from genode.gipo.schedule_hash import schedule_grid_hash
 
-RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen"
+RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen_global_context_v2"
 CONTEXT_REWARD_PROTOCOL_VERSION = "conditional_primary_metric_context_rewards_v2"
 DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
 DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
 DEFAULT_SCHEDULES: Tuple[str, ...] = BASELINE_SCHEDULE_KEYS
-SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_evaluation_context_capped_v1"
+SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_evaluation_global_context_capped_v2"
 SUPPORTED_SPLIT_PHASES: Tuple[str, ...] = (LOCKED_TEST_PHASE, VALIDATION_PHASE, TRAIN_TUNING_PHASE)
 
 ROW_RECORD_FIELDS: Tuple[str, ...] = (
@@ -216,6 +216,10 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "uncapped_candidate_examples",
     "candidate_examples_after_initial_selection",
     "selection_was_capped",
+    "global_selected_examples",
+    "global_uncapped_candidate_examples",
+    "global_candidate_examples_after_initial_selection",
+    "global_selection_was_capped",
     "schedule_grid_hash",
     "protocol_hash",
     "row_status",
@@ -698,8 +702,96 @@ def _cap_context_indices(
     }
 
 
+def _cap_context_index_groups(
+    groups: Sequence[Mapping[str, Any]],
+    *,
+    cap: int,
+    seed: int,
+    salt: str,
+) -> Tuple[List[np.ndarray], List[Dict[str, Any]], Dict[str, Any]]:
+    selected_cap = int(cap)
+    if selected_cap <= 0:
+        raise ValueError(f"selected_examples_cap must be positive, got {selected_cap!r}.")
+    normalized: List[Dict[str, Any]] = []
+    flat_candidates: List[Tuple[int, int]] = []
+    uncapped_total = 0
+    for group_idx, group in enumerate(groups):
+        candidate = [int(idx) for idx in group.get("candidate_indices", [])]
+        uncapped_count = int(group.get("uncapped_candidate_examples", len(candidate)))
+        if uncapped_count < len(candidate):
+            raise ValueError(
+                "uncapped_candidate_examples cannot be smaller than the selected candidate list "
+                f"({uncapped_count} < {len(candidate)})."
+            )
+        normalized.append({**dict(group), "candidate_indices": candidate, "uncapped_candidate_examples": uncapped_count})
+        uncapped_total += int(uncapped_count)
+        flat_candidates.extend((int(group_idx), int(pos)) for pos in range(len(candidate)))
+    if not flat_candidates:
+        raise ValueError("Global context selection requires at least one candidate example.")
+    offsets: List[int] = []
+    cursor = 0
+    for group in normalized:
+        offsets.append(int(cursor))
+        cursor += len(group["candidate_indices"])
+    selected_target = min(int(selected_cap), int(len(flat_candidates)))
+    active_groups = [idx for idx, group in enumerate(normalized) if group["candidate_indices"]]
+    if len(flat_candidates) <= selected_cap and uncapped_total <= len(flat_candidates):
+        kept_positions = list(range(len(flat_candidates)))
+        was_capped = False
+    else:
+        shape = ",".join(str(len(group["candidate_indices"])) for group in normalized)
+        token = f"{SCHEDULE_CONTEXT_SELECTION_PROTOCOL}|global|{salt}|{int(seed)}|{shape}|{len(flat_candidates)}|{selected_cap}"
+        local_seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
+        rng = np.random.default_rng(local_seed)
+        kept_positions = []
+        if selected_target >= len(active_groups):
+            for group_idx in active_groups:
+                group_size = len(normalized[group_idx]["candidate_indices"])
+                token_one = f"{token}|group|{group_idx}|{group_size}"
+                candidate_pos = int(hashlib.sha256(token_one.encode("utf-8")).hexdigest()[:16], 16) % int(group_size)
+                kept_positions.append(int(offsets[group_idx]) + int(candidate_pos))
+        remaining = int(selected_target) - len(kept_positions)
+        if remaining > 0:
+            kept = set(kept_positions)
+            available_positions = [pos for pos in range(len(flat_candidates)) if pos not in kept]
+            chosen = rng.choice(np.arange(len(available_positions)), size=int(remaining), replace=False).tolist()
+            kept_positions.extend(int(available_positions[int(pos)]) for pos in chosen)
+        kept_positions = sorted(kept_positions)
+        was_capped = True
+    selected_by_group: List[List[int]] = [[] for _ in normalized]
+    for flat_pos in kept_positions:
+        group_idx, candidate_pos = flat_candidates[int(flat_pos)]
+        selected_by_group[group_idx].append(int(normalized[group_idx]["candidate_indices"][candidate_pos]))
+    selected_total = int(sum(len(indices) for indices in selected_by_group))
+    records: List[Dict[str, Any]] = []
+    for group, selected in zip(normalized, selected_by_group):
+        record = dict(group.get("selection_record", {}))
+        record.update(
+            {
+                "example_selection_protocol": SCHEDULE_CONTEXT_SELECTION_PROTOCOL,
+                "selected_examples": int(len(selected)),
+                "selected_examples_cap": int(selected_cap),
+                "uncapped_candidate_examples": int(group["uncapped_candidate_examples"]),
+                "candidate_examples_after_initial_selection": int(len(group["candidate_indices"])),
+                "selection_was_capped": bool(was_capped or int(group["uncapped_candidate_examples"]) > len(selected)),
+                "global_selected_examples": int(selected_total),
+                "global_uncapped_candidate_examples": int(uncapped_total),
+                "global_candidate_examples_after_initial_selection": int(len(flat_candidates)),
+                "global_selection_was_capped": bool(was_capped),
+            }
+        )
+        records.append(record)
+    return [np.asarray(indices, dtype=np.int64) for indices in selected_by_group], records, {
+        "selected_examples": int(selected_total),
+        "selected_examples_cap": int(selected_cap),
+        "uncapped_candidate_examples": int(uncapped_total),
+        "candidate_examples_after_initial_selection": int(len(flat_candidates)),
+        "selection_was_capped": bool(was_capped),
+    }
+
+
 def _selection_metadata_row_fields(selection_meta: Mapping[str, Any], *, cap_source: str, context_sample_count: int) -> Dict[str, Any]:
-    return {
+    fields = {
         "example_selection_protocol": str(selection_meta["example_selection_protocol"]),
         "context_sample_count": int(context_sample_count),
         "selected_examples": int(selection_meta["selected_examples"]),
@@ -709,6 +801,15 @@ def _selection_metadata_row_fields(selection_meta: Mapping[str, Any], *, cap_sou
         "candidate_examples_after_initial_selection": int(selection_meta["candidate_examples_after_initial_selection"]),
         "selection_was_capped": bool(selection_meta["selection_was_capped"]),
     }
+    for key in (
+        "global_selected_examples",
+        "global_uncapped_candidate_examples",
+        "global_candidate_examples_after_initial_selection",
+        "global_selection_was_capped",
+    ):
+        if key in selection_meta:
+            fields[key] = bool(selection_meta[key]) if key.endswith("was_capped") else int(selection_meta[key])
+    return fields
 
 
 def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
@@ -1599,6 +1700,7 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                 eval_ds = splits["val"]
             else:
                 eval_ds = splits["test"]
+            selection_groups: List[Dict[str, Any]] = []
             for seed in seeds:
                 if str(split_phase) == TRAIN_TUNING_PHASE:
                     tuning_seed = int(cli_args.train_tuning_seed) + int(seed) + 1_000 * dataset_idx
@@ -1623,27 +1725,37 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                         val_split_fraction=float(cli_args.train_tuning_val_split_fraction),
                         max_examples=int(selected_examples_cap),
                     )
-                    chosen_examples, selection_meta = _cap_context_indices(
-                        candidate_examples,
-                        cap=int(selected_examples_cap),
-                        seed=int(tuning_seed),
-                        salt=f"forecast|{dataset}|{split_phase}|{checkpoint_step}",
-                        uncapped_candidate_examples=int(uncapped_candidate_examples),
-                    )
                 else:
                     tuning_seed = int(seed) + 1_000 * dataset_idx
-                    selected = choose_forecast_example_indices(
+                    candidate_examples = choose_forecast_example_indices(
                         eval_ds,
                         n_examples=int(selected_examples_cap),
                         seed=tuning_seed,
                     )
-                    chosen_examples, selection_meta = _cap_context_indices(
-                        selected,
-                        cap=int(selected_examples_cap),
-                        seed=int(tuning_seed),
-                        salt=f"forecast|{dataset}|{split_phase}|{checkpoint_step}",
-                        uncapped_candidate_examples=int(len(eval_ds)),
-                    )
+                    uncapped_candidate_examples = int(len(eval_ds))
+                selection_groups.append(
+                    {
+                        "candidate_indices": [int(idx) for idx in candidate_examples],
+                        "uncapped_candidate_examples": int(uncapped_candidate_examples),
+                        "selection_record": {
+                            "seed": int(seed),
+                            "tuning_seed": int(tuning_seed),
+                        },
+                    }
+                )
+            selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
+                selection_groups,
+                cap=int(selected_examples_cap),
+                seed=int(cli_args.train_tuning_seed) + 1_000 * dataset_idx + int(checkpoint_step),
+                salt=f"forecast|{dataset}|{split_phase}|{checkpoint_step}",
+            )
+            selections_by_seed: Dict[int, Tuple[np.ndarray, Dict[str, Any], int]] = {}
+            for selected, record in zip(selected_groups, selection_records):
+                selections_by_seed[int(record["seed"])] = (selected, record, int(record["tuning_seed"]))
+            for seed in seeds:
+                chosen_examples, selection_meta, tuning_seed = selections_by_seed[int(seed)]
+                if len(chosen_examples) == 0:
+                    continue
                 for target_idx, target_nfe in enumerate(target_nfes):
                     for solver_idx, solver_key in enumerate(normalize_solver_keys(str(cli_args.solver_names))):
                         runtime_nfe = solver_macro_steps(str(solver_key), int(target_nfe))
@@ -1848,6 +1960,7 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                     if requested_windows > 0
                     else min(int(resolved_eval_windows(step_args, str(dataset), split_key)), int(selected_examples_cap))
                 )
+            selection_groups: List[Dict[str, Any]] = []
             for seed in seeds:
                 selection_seed = int(seed) + 1_000 * dataset_idx
                 candidate_eval_t0s = _choose_valid_windows(
@@ -1856,13 +1969,29 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                     n_windows=int(eval_windows),
                     seed=int(selection_seed),
                 )
-                chosen_eval_t0s, selection_meta = _cap_context_indices(
-                    candidate_eval_t0s,
-                    cap=int(selected_examples_cap),
-                    seed=int(selection_seed),
-                    salt=f"conditional|{dataset}|{split_phase}|{checkpoint_step}",
-                    uncapped_candidate_examples=max(int(available_windows), len(candidate_eval_t0s)),
+                selection_groups.append(
+                    {
+                        "candidate_indices": [int(t0) for t0 in candidate_eval_t0s],
+                        "uncapped_candidate_examples": max(int(available_windows), len(candidate_eval_t0s)),
+                        "selection_record": {
+                            "seed": int(seed),
+                            "selection_seed": int(selection_seed),
+                        },
+                    }
                 )
+            selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
+                selection_groups,
+                cap=int(selected_examples_cap),
+                seed=1_000 * int(dataset_idx) + int(checkpoint_step),
+                salt=f"conditional|{dataset}|{split_phase}|{checkpoint_step}",
+            )
+            selections_by_seed: Dict[int, Tuple[np.ndarray, Dict[str, Any], int]] = {}
+            for selected, record in zip(selected_groups, selection_records):
+                selections_by_seed[int(record["seed"])] = (selected, record, int(record["selection_seed"]))
+            for seed in seeds:
+                chosen_eval_t0s, selection_meta, selection_seed = selections_by_seed[int(seed)]
+                if len(chosen_eval_t0s) == 0:
+                    continue
                 for target_idx, target_nfe in enumerate(target_nfes):
                     for solver_idx, solver_key in enumerate(normalize_solver_keys(str(cli_args.solver_names))):
                         runtime_nfe = solver_macro_steps(str(solver_key), int(target_nfe))
@@ -2073,11 +2202,14 @@ def _run_molecule_phase(
         members = [dict(member) for member in trainable_molecule_group_members(group_manifest)]
         if not members:
             raise ValueError(f"Molecule group {dataset!r} has no trainable fixed-shape members.")
-        for member_idx, member in enumerate(members):
-            member_key = str(member["member_key"])
-            stratum = str(member["stratum"])
-            processed_dir = _molecule_member_processed_dir(group_root, str(dataset), member)
-            for checkpoint_step in checkpoint_steps:
+        for checkpoint_step in checkpoint_steps:
+            selected_examples_cap, selected_examples_cap_source = _split_example_cap(cli_args, str(split_phase))
+            selection_groups: List[Dict[str, Any]] = []
+            work_items: List[Dict[str, Any]] = []
+            for member_idx, member in enumerate(members):
+                member_key = str(member["member_key"])
+                stratum = str(member["stratum"])
+                processed_dir = _molecule_member_processed_dir(group_root, str(dataset), member)
                 artifact = find_backbone_artifact(
                     backbone_manifest,
                     backbone_name=BACKBONE_NAME_OTFLOW_MOLECULE,
@@ -2108,193 +2240,228 @@ def _run_molecule_phase(
                 model = loaded["model"]
                 cfg = loaded["cfg"]
                 ds = loaded["splits"][split_key]
-                selected_examples_cap, selected_examples_cap_source = _split_example_cap(cli_args, str(split_phase))
-                eval_count = int(selected_examples_cap)
                 for seed in seeds:
                     selection_seed = int(seed) + 10_000 * dataset_idx + 1_000 * member_idx
                     candidate_indices = _choose_molecule_indices(
                         ds,
-                        count=int(eval_count),
+                        count=int(selected_examples_cap),
                         seed=int(selection_seed),
                     )
-                    selected_indices, selection_meta = _cap_context_indices(
-                        candidate_indices,
-                        cap=int(selected_examples_cap),
-                        seed=int(selection_seed),
-                        salt=f"molecule|{dataset}|{member_key}|{stratum}|{split_phase}|{checkpoint_step}",
-                        uncapped_candidate_examples=max(int(len(ds)), len(candidate_indices)),
+                    selection_groups.append(
+                        {
+                            "candidate_indices": [int(idx) for idx in candidate_indices],
+                            "uncapped_candidate_examples": max(int(len(ds)), len(candidate_indices)),
+                            "selection_record": {
+                                "seed": int(seed),
+                                "selection_seed": int(selection_seed),
+                                "member_idx": int(member_idx),
+                                "member_key": member_key,
+                                "stratum": stratum,
+                            },
+                        }
                     )
-                    indices = [int(idx) for idx in selected_indices.tolist()]
-                    if _write_context_rows_enabled(cli_args):
-                        context_embeddings = molecule_context_embeddings_for_indices(
-                            model=model,
-                            ds=ds,
-                            example_indices=indices,
-                            checkpoint_id=str(checkpoint["checkpoint_id"]),
-                            dataset_key=str(dataset),
-                            member_key=member_key,
-                            stratum=stratum,
+                    work_items.append(
+                        {
+                            "member": member,
+                            "member_idx": int(member_idx),
+                            "member_key": member_key,
+                            "stratum": stratum,
+                            "model": model,
+                            "cfg": cfg,
+                            "ds": ds,
+                            "checkpoint": checkpoint,
+                            "seed": int(seed),
+                        }
+                    )
+            selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
+                selection_groups,
+                cap=int(selected_examples_cap),
+                seed=10_000 * int(dataset_idx) + int(checkpoint_step),
+                salt=f"molecule|{dataset}|{split_phase}|{checkpoint_step}",
+            )
+            for selected_indices, selection_meta, work_item in zip(selected_groups, selection_records, work_items):
+                indices = [int(idx) for idx in selected_indices.tolist()]
+                if not indices:
+                    continue
+                member = dict(work_item["member"])
+                member_idx = int(work_item["member_idx"])
+                member_key = str(work_item["member_key"])
+                stratum = str(work_item["stratum"])
+                model = work_item["model"]
+                cfg = work_item["cfg"]
+                ds = work_item["ds"]
+                checkpoint = work_item["checkpoint"]
+                seed = int(work_item["seed"])
+                if _write_context_rows_enabled(cli_args):
+                    context_embeddings = molecule_context_embeddings_for_indices(
+                        model=model,
+                        ds=ds,
+                        example_indices=indices,
+                        checkpoint_id=str(checkpoint["checkpoint_id"]),
+                        dataset_key=str(dataset),
+                        member_key=member_key,
+                        stratum=stratum,
+                        split_phase=str(split_phase),
+                        device=device,
+                        context_embedding_kind=str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
+                    )
+                else:
+                    context_embeddings = {}
+                for target_idx, target_nfe in enumerate(target_nfes):
+                    for solver_idx, solver_key in enumerate(normalize_solver_keys(str(cli_args.solver_names))):
+                        runtime_nfe = solver_macro_steps(str(solver_key), int(target_nfe))
+                        existing_rows, pending_cases = _pending_scheduler_cases(
+                            row_recorder,
+                            benchmark_family=SCENARIO_FAMILY_MOLECULE,
                             split_phase=str(split_phase),
-                            device=device,
-                            context_embedding_kind=str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
+                            seed=int(seed),
+                            dataset=str(dataset),
+                            checkpoint_id=str(checkpoint["checkpoint_id"]),
+                            checkpoint_step=int(checkpoint_step),
+                            target_nfe=int(target_nfe),
+                            solver_key=str(solver_key),
+                            scheduler_cases=list(scheduler_cases_by_dataset[str(dataset)]),
                         )
-                    else:
-                        context_embeddings = {}
-                    for target_idx, target_nfe in enumerate(target_nfes):
-                        for solver_idx, solver_key in enumerate(normalize_solver_keys(str(cli_args.solver_names))):
-                            runtime_nfe = solver_macro_steps(str(solver_key), int(target_nfe))
-                            existing_rows, pending_cases = _pending_scheduler_cases(
-                                row_recorder,
+                        rows.extend(existing_rows)
+                        uniform_row: Optional[Mapping[str, Any]] = next(
+                            (row for row in existing_rows if str(row.get("scheduler_key")) == UNIFORM_SCHEDULER_KEY),
+                            None,
+                        )
+                        uniform_context_by_id: Dict[str, Mapping[str, Any]] = _existing_uniform_context_rows(
+                            row_recorder,
+                            dataset=str(dataset),
+                            split_phase=str(split_phase),
+                            seed=int(seed),
+                            solver_key=str(solver_key),
+                            target_nfe=int(target_nfe),
+                            checkpoint_id=str(checkpoint["checkpoint_id"]),
+                        )
+                        for case in pending_cases:
+                            scheduler_key = str(case["scheduler_key"])
+                            details = _schedule_details_from_case(case, int(runtime_nfe))
+                            eval_seed = int(seed) + 1_000_000 * dataset_idx + 100_000 * member_idx + 10_000 * target_idx + solver_idx
+                            metrics = evaluate_molecule_rollout_schedule(
+                                model=model,
+                                ds=ds,
+                                cfg=cfg,
+                                scheduler_key=scheduler_key,
+                                solver_key=str(solver_key),
+                                target_nfe=int(target_nfe),
+                                runtime_nfe=int(runtime_nfe),
+                                time_grid=details["time_grid"],
+                                example_indices=indices,
+                                sample_count=int(getattr(cli_args, "molecule_sample_count", 1)),
+                                rollout_steps=int(getattr(cli_args, "molecule_rollout_steps", 16)),
+                                seed=int(eval_seed),
+                                split_phase=str(split_phase),
+                                checkpoint_id=str(checkpoint["checkpoint_id"]),
+                                dataset_key=str(dataset),
+                                member_key=member_key,
+                                stratum=stratum,
+                                formula=str(member.get("formula", "")),
+                                source_zip_name=str(member.get("source_zip_name", "")),
+                                device=device,
+                            )
+                            row_metrics = {
+                                key: metrics.get(key)
+                                for key in (
+                                    *MOLECULE_PRIMARY_METRICS,
+                                    "molecule_coordinate_w1_mean",
+                                    "molecule_pair_distance_w1",
+                                    "selection_metric_value",
+                                    "num_eval_samples",
+                                    "eval_windows",
+                                    "realized_nfe",
+                                )
+                            }
+                            row_metrics.update(
+                                {
+                                    "num_eval_samples": int(getattr(cli_args, "molecule_sample_count", 1)),
+                                    "eval_windows": int(metrics.get("eval_windows", len(indices))),
+                                    "eval_examples": int(metrics.get("eval_windows", len(indices))),
+                                    "eval_horizon": int(getattr(cli_args, "molecule_rollout_steps", 16)),
+                                    "realized_nfe": int(metrics.get("realized_nfe", _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)))),
+                                }
+                            )
+                            row = _build_row(
                                 benchmark_family=SCENARIO_FAMILY_MOLECULE,
                                 split_phase=str(split_phase),
                                 seed=int(seed),
                                 dataset=str(dataset),
-                                checkpoint_id=str(checkpoint["checkpoint_id"]),
+                                checkpoint=checkpoint,
                                 checkpoint_step=int(checkpoint_step),
+                                nfe_role=nfe_role,
                                 target_nfe=int(target_nfe),
+                                runtime_nfe=int(runtime_nfe),
                                 solver_key=str(solver_key),
-                                scheduler_cases=list(scheduler_cases_by_dataset[str(dataset)]),
+                                scheduler_key=scheduler_key,
+                                details=details,
+                                metrics=row_metrics,
+                                row_signature=str(case["row_signature"]),
+                                protocol_hash=str(row_recorder["protocol_hash"]),
                             )
-                            rows.extend(existing_rows)
-                            uniform_row: Optional[Mapping[str, Any]] = next(
-                                (row for row in existing_rows if str(row.get("scheduler_key")) == UNIFORM_SCHEDULER_KEY),
-                                None,
+                            row.update(
+                                {
+                                    "member_key": member_key,
+                                    "stratum": stratum,
+                                    "formula": str(member.get("formula", "")),
+                                    "source_zip_name": str(member.get("source_zip_name", "")),
+                                }
                             )
-                            uniform_context_by_id: Dict[str, Mapping[str, Any]] = _existing_uniform_context_rows(
-                                row_recorder,
-                                dataset=str(dataset),
-                                split_phase=str(split_phase),
-                                seed=int(seed),
-                                solver_key=str(solver_key),
-                                target_nfe=int(target_nfe),
-                                checkpoint_id=str(checkpoint["checkpoint_id"]),
+                            row.update(
+                                _selection_metadata_row_fields(
+                                    selection_meta,
+                                    cap_source=str(selected_examples_cap_source),
+                                    context_sample_count=_context_sample_cap(cli_args),
+                                )
                             )
-                            for case in pending_cases:
-                                scheduler_key = str(case["scheduler_key"])
-                                details = _schedule_details_from_case(case, int(runtime_nfe))
-                                eval_seed = int(seed) + 1_000_000 * dataset_idx + 100_000 * member_idx + 10_000 * target_idx + solver_idx
-                                metrics = evaluate_molecule_rollout_schedule(
-                                    model=model,
-                                    ds=ds,
-                                    cfg=cfg,
-                                    scheduler_key=scheduler_key,
+                            _append_row_record(row_recorder, row)
+                            if scheduler_key == UNIFORM_SCHEDULER_KEY:
+                                uniform_row = row
+                                uniform_context_by_id = {
+                                    str(ctx["context_id"]): dict(ctx, scheduler_key=UNIFORM_SCHEDULER_KEY)
+                                    for ctx in list(metrics.get("per_context_rows", []) or [])
+                                }
+                            if _write_context_rows_enabled(cli_args):
+                                context_rows = _molecule_context_records(
+                                    dataset=str(dataset),
+                                    split_phase=str(split_phase),
+                                    seed=int(seed),
+                                    evaluation_seed=int(eval_seed),
                                     solver_key=str(solver_key),
                                     target_nfe=int(target_nfe),
                                     runtime_nfe=int(runtime_nfe),
-                                    time_grid=details["time_grid"],
-                                    example_indices=indices,
-                                    sample_count=int(getattr(cli_args, "molecule_sample_count", 1)),
-                                    rollout_steps=int(getattr(cli_args, "molecule_rollout_steps", 16)),
-                                    seed=int(eval_seed),
-                                    split_phase=str(split_phase),
-                                    checkpoint_id=str(checkpoint["checkpoint_id"]),
-                                    dataset_key=str(dataset),
-                                    member_key=member_key,
-                                    stratum=stratum,
-                                    formula=str(member.get("formula", "")),
-                                    source_zip_name=str(member.get("source_zip_name", "")),
-                                    device=device,
-                                )
-                                row_metrics = {
-                                    key: metrics.get(key)
-                                    for key in (
-                                        *MOLECULE_PRIMARY_METRICS,
-                                        "molecule_coordinate_w1_mean",
-                                        "molecule_pair_distance_w1",
-                                        "selection_metric_value",
-                                        "num_eval_samples",
-                                        "eval_windows",
-                                        "realized_nfe",
-                                    )
-                                }
-                                row_metrics.update(
-                                    {
-                                        "num_eval_samples": int(getattr(cli_args, "molecule_sample_count", 1)),
-                                        "eval_windows": int(metrics.get("eval_windows", len(indices))),
-                                        "eval_examples": int(metrics.get("eval_windows", len(indices))),
-                                        "eval_horizon": int(getattr(cli_args, "molecule_rollout_steps", 16)),
-                                        "realized_nfe": int(metrics.get("realized_nfe", _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)))),
-                                    }
-                                )
-                                row = _build_row(
-                                    benchmark_family=SCENARIO_FAMILY_MOLECULE,
-                                    split_phase=str(split_phase),
-                                    seed=int(seed),
-                                    dataset=str(dataset),
+                                    scheduler_key=scheduler_key,
+                                    details=details,
                                     checkpoint=checkpoint,
                                     checkpoint_step=int(checkpoint_step),
                                     nfe_role=nfe_role,
-                                    target_nfe=int(target_nfe),
-                                    runtime_nfe=int(runtime_nfe),
-                                    solver_key=str(solver_key),
-                                    scheduler_key=scheduler_key,
-                                    details=details,
-                                    metrics=row_metrics,
-                                    row_signature=str(case["row_signature"]),
+                                    parent_row_signature=str(case["row_signature"]),
                                     protocol_hash=str(row_recorder["protocol_hash"]),
-                                )
-                                row.update(
-                                    {
-                                        "member_key": member_key,
-                                        "stratum": stratum,
-                                        "formula": str(member.get("formula", "")),
-                                        "source_zip_name": str(member.get("source_zip_name", "")),
-                                    }
-                                )
-                                row.update(
-                                    _selection_metadata_row_fields(
-                                        selection_meta,
-                                        cap_source=str(selected_examples_cap_source),
-                                        context_sample_count=_context_sample_cap(cli_args),
-                                    )
-                                )
-                                _append_row_record(row_recorder, row)
-                                if scheduler_key == UNIFORM_SCHEDULER_KEY:
-                                    uniform_row = row
-                                    uniform_context_by_id = {
+                                    per_context_metrics=list(metrics.get("per_context_rows", []) or []),
+                                    uniform_by_context_id=uniform_context_by_id if scheduler_key != UNIFORM_SCHEDULER_KEY else {
                                         str(ctx["context_id"]): dict(ctx, scheduler_key=UNIFORM_SCHEDULER_KEY)
                                         for ctx in list(metrics.get("per_context_rows", []) or [])
-                                    }
-                                if _write_context_rows_enabled(cli_args):
-                                    context_rows = _molecule_context_records(
-                                        dataset=str(dataset),
-                                        split_phase=str(split_phase),
-                                        seed=int(seed),
-                                        evaluation_seed=int(eval_seed),
-                                        solver_key=str(solver_key),
-                                        target_nfe=int(target_nfe),
-                                        runtime_nfe=int(runtime_nfe),
-                                        scheduler_key=scheduler_key,
-                                        details=details,
-                                        checkpoint=checkpoint,
-                                        checkpoint_step=int(checkpoint_step),
-                                        nfe_role=nfe_role,
-                                        parent_row_signature=str(case["row_signature"]),
-                                        protocol_hash=str(row_recorder["protocol_hash"]),
-                                        per_context_metrics=list(metrics.get("per_context_rows", []) or []),
-                                        uniform_by_context_id=uniform_context_by_id if scheduler_key != UNIFORM_SCHEDULER_KEY else {
-                                            str(ctx["context_id"]): dict(ctx, scheduler_key=UNIFORM_SCHEDULER_KEY)
-                                            for ctx in list(metrics.get("per_context_rows", []) or [])
-                                        },
-                                        rollout_steps=int(getattr(cli_args, "molecule_rollout_steps", 16)),
-                                    )
-                                    _append_context_records(
-                                        row_recorder,
-                                        context_rows,
-                                        context_embeddings=context_embeddings,
-                                        metadata={
-                                            "benchmark_family": SCENARIO_FAMILY_MOLECULE,
-                                            "checkpoint_id": str(checkpoint["checkpoint_id"]),
-                                            "checkpoint_step": int(checkpoint_step),
-                                            "dataset": str(dataset),
-                                            "split_phase": str(split_phase),
-                                            "context_schema": MOLECULE_CONTEXT_SCHEMA,
-                                            "context_embedding_kind": str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
-                                            "member_key": member_key,
-                                            "stratum": stratum,
-                                        },
-                                    )
-                                rows.append(row)
+                                    },
+                                    rollout_steps=int(getattr(cli_args, "molecule_rollout_steps", 16)),
+                                )
+                                _append_context_records(
+                                    row_recorder,
+                                    context_rows,
+                                    context_embeddings=context_embeddings,
+                                    metadata={
+                                        "benchmark_family": SCENARIO_FAMILY_MOLECULE,
+                                        "checkpoint_id": str(checkpoint["checkpoint_id"]),
+                                        "checkpoint_step": int(checkpoint_step),
+                                        "dataset": str(dataset),
+                                        "split_phase": str(split_phase),
+                                        "context_schema": MOLECULE_CONTEXT_SCHEMA,
+                                        "context_embedding_kind": str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
+                                        "member_key": member_key,
+                                        "stratum": stratum,
+                                    },
+                                )
+                            rows.append(row)
     return rows
 
 

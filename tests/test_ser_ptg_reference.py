@@ -390,6 +390,99 @@ class SerPtgReferenceTests(unittest.TestCase):
         self.assertEqual(prediction["selection_records"][0]["candidate_examples_after_initial_selection"], 400)
         self.assertEqual(prediction["selection_records"][0]["reference_available_examples"], 1000)
 
+    def test_molecule_context_cap_is_global_across_seeds_and_members(self) -> None:
+        captured = []
+
+        def fake_collector(*args, **kwargs):
+            del args
+            indices = [int(idx) for idx in kwargs["example_indices"]]
+            captured.append(indices)
+            steps = int(kwargs["reference_macro_steps"])
+            samples = int(kwargs["calibration_trace_samples"])
+            return {
+                "reference_time_grid": [float(i) / float(steps) for i in range(steps + 1)],
+                "local_defect_trace": [1.0] * steps,
+                "eval_examples": len(indices),
+                "trace_count": len(indices) * samples,
+            }
+
+        class FakeDataset:
+            def __len__(self) -> int:
+                return 1000
+
+        loaded = {
+            "model": object(),
+            "cfg": SimpleNamespace(),
+            "splits": {"train": FakeDataset(), "val": FakeDataset()},
+        }
+
+        def fake_artifact(*args, **kwargs):
+            del args
+            member_key = str(kwargs["member_key"])
+            return {"checkpoint_path": str(Path(tempdir) / f"{member_key}.pt"), "checkpoint_id": f"molecule_{member_key}"}
+
+        with tempfile.TemporaryDirectory() as tempdir, mock.patch.object(ser, "load_molecule_group_manifest", return_value={}), mock.patch.object(
+            ser,
+            "trainable_molecule_group_members",
+            return_value=[
+                {"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"},
+                {"member_key": "member_b", "stratum": "set1", "processed_dir": "member_b"},
+            ],
+        ), mock.patch.object(ser, "load_backbone_manifest", return_value={}), mock.patch.object(
+            ser,
+            "find_backbone_artifact",
+            side_effect=fake_artifact,
+        ), mock.patch.object(
+            ser,
+            "load_molecule_checkpoint_splits",
+            return_value=loaded,
+        ), mock.patch.object(
+            ser,
+            "_choose_molecule_indices",
+            return_value=list(range(100)),
+        ), mock.patch.object(
+            ser,
+            "collect_molecule_local_defect_trace",
+            side_effect=fake_collector,
+        ):
+            args = build_argparser().parse_args(
+                [
+                    "--dataset",
+                    "molecule_3d_set1",
+                    "--solver_names",
+                    "euler",
+                    "--target_nfe_values",
+                    "4",
+                    "--seeds",
+                    "0,1",
+                    "--context_sample_count",
+                    "5",
+                    "--calibration_trace_samples",
+                    "2",
+                    "--out_dir",
+                    tempdir,
+                    "--molecule_group_root",
+                    tempdir,
+                    "--backbone_manifest",
+                    str(Path(tempdir) / "backbone_manifest.json"),
+                    "--device",
+                    "cpu",
+                ]
+            )
+            summary = build_ser_ptg_reference(args)
+
+        self.assertEqual(sum(len(indices) for indices in captured), 5)
+        self.assertTrue(all(len(indices) >= 1 for indices in captured))
+        prediction = summary["predictions"][0]
+        self.assertEqual(prediction["selected_examples"], 5)
+        self.assertEqual(prediction["selected_examples_cap"], 5)
+        self.assertEqual(prediction["trace_count"], 10)
+        self.assertEqual(prediction["reference_seed_count"], 2)
+        self.assertEqual(prediction["reference_member_count"], 2)
+        self.assertEqual(prediction["reference_selection_group_count"], 4)
+        self.assertEqual(summary["selected_examples"], 5)
+        self.assertEqual(summary["trace_count_total_across_predictions"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -291,9 +291,7 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "ser_calibration_batch_size": int(args.ser_calibration_batch_size),
         "ser_val_windows": int(args.ser_val_windows),
         "ser_train_tuning_max_examples": int(args.ser_train_tuning_max_examples),
-        "ser_train_tuning_effective_max_examples": int(args.ser_train_tuning_max_examples)
-        if int(args.ser_train_tuning_max_examples) > 0
-        else int(args.context_sample_count),
+        "ser_train_tuning_effective_max_examples": _effective_ser_train_tuning_max_examples(args),
         "ser_example_selection_protocol": SER_PTG_EXAMPLE_SELECTION_PROTOCOL,
         "ser_local_defect_proxy_protocol": SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL,
         "gipo_teacher_steps": int(args.gipo_teacher_steps),
@@ -321,6 +319,19 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "molecule_backbone_root": _display_path(str(getattr(args, "molecule_backbone_root", "") or (project_outputs_root() / "molecule_3d_backbones"))),
         "backbone_package": backbone_package_protocol_payload(args),
     }
+
+
+def _effective_ser_train_tuning_max_examples(args: argparse.Namespace) -> int:
+    explicit = int(getattr(args, "ser_train_tuning_max_examples", 0))
+    if explicit > 0:
+        return int(explicit)
+    return int(getattr(args, "context_sample_count", CANONICAL_CONTEXT_SAMPLE_COUNT))
+
+
+def _effective_ser_train_tuning_max_examples_source(args: argparse.Namespace) -> str:
+    if int(getattr(args, "ser_train_tuning_max_examples", 0)) > 0:
+        return "train_tuning_max_examples"
+    return "context_sample_count"
 
 
 def _has_ablation_stage(commands: Sequence[StageCommand]) -> bool:
@@ -781,7 +792,9 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                 "--val_windows",
                 int(args.ser_val_windows),
                 "--train_tuning_max_examples",
-                int(args.ser_train_tuning_max_examples),
+                _effective_ser_train_tuning_max_examples(args),
+                "--train_tuning_max_examples_source",
+                _effective_ser_train_tuning_max_examples_source(args),
                 *_data_path_args(args),
                 "--backbone_manifest",
                 str(args.backbone_manifest),
