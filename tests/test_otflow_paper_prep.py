@@ -871,7 +871,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             [(4, 5, 5), (8, 1005, 5)],
         )
 
-    def test_forecast_phase_validation_defaults_to_context_cap(self) -> None:
+    def test_forecast_phase_locked_test_defaults_to_full_split_not_context_cap(self) -> None:
         class FakeDataset:
             def __len__(self) -> int:
                 return 1000
@@ -904,7 +904,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "--seeds",
                     "0",
                     "--split_phase",
-                    "validation_tuning",
+                    "locked_test",
                     "--context_sample_count",
                     "13",
                     "--backbone_manifest",
@@ -937,16 +937,17 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     rows = runner._run_forecast_phase(
                         args,
                         row_recorder=recorder,
-                        split_phase="validation_tuning",
+                        split_phase="locked_test",
                         seeds=[0],
                         scheduler_cases_by_dataset={"traffic_hourly": [{"scheduler_key": "uniform"}]},
                     )
             finally:
                 recorder["fh"].close()
 
-        self.assertEqual(captured_lengths, [13])
-        self.assertEqual(rows[0]["selected_examples"], 13)
-        self.assertEqual(rows[0]["selected_examples_cap_source"], "context_sample_count")
+        self.assertEqual(captured_lengths, [1000])
+        self.assertEqual(rows[0]["selected_examples"], 1000)
+        self.assertEqual(rows[0]["selected_examples_cap"], 1000)
+        self.assertEqual(rows[0]["selected_examples_cap_source"], "locked_test_default")
 
     def test_forecast_phase_context_cap_is_global_across_seeds(self) -> None:
         class FakeDataset:
@@ -982,7 +983,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "0,1",
                     "--split_phase",
                     "validation_tuning",
-                    "--context_sample_count",
+                    "--eval_windows_val",
                     "5",
                     "--backbone_manifest",
                     str(PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"),
@@ -1027,6 +1028,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertEqual(sum(int(row["selected_examples"]) for row in rows), 5)
         self.assertTrue(all(int(row["global_selected_examples"]) == 5 for row in rows))
         self.assertTrue(all(int(row["selected_examples_cap"]) == 5 for row in rows))
+        self.assertTrue(all(row["selected_examples_cap_source"] == "eval_windows_val" for row in rows))
         self.assertTrue(all(int(row["global_selected_examples"]) == 5 for row in csv_rows))
 
     def test_forecast_phase_train_tuning_defaults_to_context_cap(self) -> None:
@@ -1107,9 +1109,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertEqual(captured_lengths, [17])
         self.assertEqual(rows[0]["selected_examples"], 17)
         self.assertEqual(rows[0]["train_tuning_target_examples"], 17)
-        self.assertEqual(rows[0]["selected_examples_cap_source"], "context_sample_count")
+        self.assertEqual(rows[0]["selected_examples_cap_source"], "train_tuning_context_sample_count")
 
-    def test_conditional_generation_validation_defaults_to_context_cap(self) -> None:
+    def test_conditional_generation_locked_test_defaults_to_eval_plan_not_context_cap(self) -> None:
         class FakeDataset:
             start_indices = list(range(1000))
 
@@ -1144,7 +1146,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "--seeds",
                     "0",
                     "--split_phase",
-                    "validation_tuning",
+                    "locked_test",
                     "--context_sample_count",
                     "3",
                     "--backbone_manifest",
@@ -1185,18 +1187,18 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     rows = runner._run_conditional_generation_phase(
                         args,
                         row_recorder=recorder,
-                        split_phase="validation_tuning",
+                        split_phase="locked_test",
                         seeds=[0],
                         scheduler_cases_by_dataset={"cryptos": [{"scheduler_key": "uniform"}]},
                     )
             finally:
                 recorder["fh"].close()
 
-        self.assertEqual(requested_windows, [3])
+        self.assertEqual(requested_windows, [999])
         self.assertEqual(rows[0]["eval_windows"], 3)
         self.assertEqual(rows[0]["selected_examples"], 3)
         self.assertEqual(rows[0]["selected_examples_cap"], 3)
-        self.assertEqual(rows[0]["selected_examples_cap_source"], "context_sample_count")
+        self.assertEqual(rows[0]["selected_examples_cap_source"], "locked_test_default")
         self.assertEqual(rows[0]["uncapped_candidate_examples"], 1000)
         self.assertTrue(rows[0]["selection_was_capped"])
 
@@ -1236,7 +1238,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "0,1",
                     "--split_phase",
                     "validation_tuning",
-                    "--context_sample_count",
+                    "--eval_windows_val",
                     "5",
                     "--backbone_manifest",
                     str(PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"),
@@ -1289,8 +1291,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertEqual(sum(captured_windows), 5)
         self.assertEqual(sum(int(row["selected_examples"]) for row in rows), 5)
         self.assertTrue(all(int(row["global_selected_examples"]) == 5 for row in rows))
+        self.assertTrue(all(row["selected_examples_cap_source"] == "eval_windows_val" for row in rows))
 
-    def test_molecule_validation_defaults_to_context_cap_and_records_selection_metadata(self) -> None:
+    def test_molecule_locked_test_defaults_to_full_split_not_context_cap(self) -> None:
         class FakeDataset:
             def __len__(self) -> int:
                 return 1000
@@ -1341,7 +1344,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "--seeds",
                     "0",
                     "--split_phase",
-                    "validation_tuning",
+                    "locked_test",
                     "--context_sample_count",
                     "5",
                     "--backbone_manifest",
@@ -1383,19 +1386,19 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     rows = runner._run_molecule_phase(
                         args,
                         row_recorder=recorder,
-                        split_phase="validation_tuning",
+                        split_phase="locked_test",
                         seeds=[0],
                         scheduler_cases_by_dataset={"molecule_3d_set1": [{"scheduler_key": "uniform"}]},
                     )
             finally:
                 recorder["fh"].close()
 
-        self.assertEqual(captured_lengths, [5])
-        self.assertEqual(rows[0]["selected_examples"], 5)
-        self.assertEqual(rows[0]["selected_examples_cap"], 5)
-        self.assertEqual(rows[0]["selected_examples_cap_source"], "context_sample_count")
+        self.assertEqual(captured_lengths, [1000])
+        self.assertEqual(rows[0]["selected_examples"], 1000)
+        self.assertEqual(rows[0]["selected_examples_cap"], 1000)
+        self.assertEqual(rows[0]["selected_examples_cap_source"], "locked_test_default")
         self.assertEqual(rows[0]["uncapped_candidate_examples"], 1000)
-        self.assertTrue(rows[0]["selection_was_capped"])
+        self.assertFalse(rows[0]["selection_was_capped"])
 
     def test_molecule_context_cap_is_global_across_seeds_and_members(self) -> None:
         class FakeDataset:
@@ -1459,7 +1462,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "0,1",
                     "--split_phase",
                     "validation_tuning",
-                    "--context_sample_count",
+                    "--eval_windows_val",
                     "5",
                     "--backbone_manifest",
                     str(manifest_path),
@@ -1510,6 +1513,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertEqual(sum(int(row["selected_examples"]) for row in rows), 5)
         self.assertTrue(all(int(row["global_selected_examples"]) == 5 for row in rows))
         self.assertTrue(all(int(row["selected_examples_cap"]) == 5 for row in rows))
+        self.assertTrue(all(row["selected_examples_cap_source"] == "eval_windows_val" for row in rows))
 
     def test_site_specific_ops_scripts_are_not_in_source_release(self) -> None:
         self.assertFalse((PROJECT_ROOT / "code" / "ops").exists())

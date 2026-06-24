@@ -288,6 +288,9 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "unseen_nfes": _parse_int_csv(str(args.unseen_nfes), CANONICAL_UNSEEN_NFES),
         "schedules": _parse_csv(str(args.schedule_keys)) or list(CANONICAL_SUPERVISION_SCHEDULE_KEYS),
         "context_sample_count": int(args.context_sample_count),
+        "gipo_supervision_context_sample_count": int(args.context_sample_count),
+        "validation_tuning_eval_windows": int(args.validation_tuning_eval_windows),
+        "locked_test_eval_windows": int(args.locked_test_eval_windows),
         "ser_calibration_batch_size": int(args.ser_calibration_batch_size),
         "ser_val_windows": int(args.ser_val_windows),
         "ser_train_tuning_max_examples": int(args.ser_train_tuning_max_examples),
@@ -591,6 +594,21 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             return ""
         return ",".join(str(_ser_summary_path(role, int(step))) for step in checkpoint_values)
 
+    def _schedule_row_phase_budget_args(phase: str) -> List[Any]:
+        if str(phase) == "train_tuning":
+            return ["--train_tuning_context_sample_count", int(args.context_sample_count)]
+        if str(phase) == "validation_tuning":
+            windows = int(args.validation_tuning_eval_windows)
+            if windows < 0:
+                raise ValueError(f"--validation_tuning_eval_windows must be nonnegative, got {windows!r}.")
+            return ["--eval_windows_val", windows] if windows > 0 else []
+        if str(phase) == "locked_test":
+            windows = int(args.locked_test_eval_windows)
+            if windows < 0:
+                raise ValueError(f"--locked_test_eval_windows must be nonnegative, got {windows!r}.")
+            return ["--eval_windows_test", windows] if windows > 0 else []
+        raise ValueError(f"Unsupported split phase {phase!r}.")
+
     def _gipo_train_command(mode: str, out_dir: Path, arm: GipoAblationArm | None = None) -> List[str]:
         command_args: List[Any] = [
             "--rows_csv",
@@ -664,8 +682,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                             *summary_args,
                             "--split_phase",
                             phase,
-                            "--context_sample_count",
-                            int(args.context_sample_count),
+                            *_schedule_row_phase_budget_args(phase),
                             "--molecule_group_root",
                             str(args.molecule_group_root),
                             "--backbone_manifest",
@@ -1006,7 +1023,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seen_nfes", default=",".join(str(value) for value in CANONICAL_SEEN_NFES))
     parser.add_argument("--unseen_nfes", default=",".join(str(value) for value in CANONICAL_UNSEEN_NFES))
     parser.add_argument("--schedule_keys", default=",".join(CANONICAL_SUPERVISION_SCHEDULE_KEYS))
-    parser.add_argument("--context_sample_count", type=int, default=CANONICAL_CONTEXT_SAMPLE_COUNT)
+    parser.add_argument(
+        "--gipo_supervision_context_sample_count",
+        "--context_sample_count",
+        dest="context_sample_count",
+        type=int,
+        default=CANONICAL_CONTEXT_SAMPLE_COUNT,
+        help="Train-tuning context budget for GIPO teacher/student supervision. Locked-test evaluation is controlled separately.",
+    )
+    parser.add_argument("--validation_tuning_eval_windows", type=int, default=0)
+    parser.add_argument("--locked_test_eval_windows", type=int, default=0)
     parser.add_argument("--ser_calibration_batch_size", type=int, default=64)
     parser.add_argument("--ser_val_windows", type=int, default=0)
     parser.add_argument("--ser_train_tuning_max_examples", type=int, default=0)

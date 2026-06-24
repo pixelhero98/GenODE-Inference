@@ -113,13 +113,13 @@ from genode.runtime import resolve_torch_device
 from genode.gipo.policy import GIPO_PROTOCOL, load_context_embedding_table, save_context_embedding_table
 from genode.gipo.schedule_hash import schedule_grid_hash
 
-RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen_global_context_v2"
+RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen_phase_context_v3"
 CONTEXT_REWARD_PROTOCOL_VERSION = "conditional_primary_metric_context_rewards_v2"
 DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
 DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
 DEFAULT_SCHEDULES: Tuple[str, ...] = BASELINE_SCHEDULE_KEYS
-SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_evaluation_global_context_capped_v2"
+SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_evaluation_phase_context_capped_v3"
 SUPPORTED_SPLIT_PHASES: Tuple[str, ...] = (LOCKED_TEST_PHASE, VALIDATION_PHASE, TRAIN_TUNING_PHASE)
 
 ROW_RECORD_FIELDS: Tuple[str, ...] = (
@@ -651,17 +651,30 @@ def _context_sample_cap(cli_args: argparse.Namespace) -> int:
     return int(cap)
 
 
-def _split_example_cap(cli_args: argparse.Namespace, split_phase: str) -> Tuple[int, str]:
+def _split_example_cap(cli_args: argparse.Namespace, split_phase: str) -> Tuple[int | None, str]:
     context_cap = _context_sample_cap(cli_args)
     if str(split_phase) == TRAIN_TUNING_PHASE:
-        return int(context_cap), "context_sample_count"
+        return int(context_cap), "train_tuning_context_sample_count"
     attr = "eval_windows_val" if str(split_phase) == VALIDATION_PHASE else "eval_windows_test"
     explicit = int(getattr(cli_args, attr, 0))
     if explicit < 0:
         raise ValueError(f"--{attr} must be nonnegative, got {explicit!r}.")
     if explicit > 0:
         return int(explicit), attr
-    return int(context_cap), "context_sample_count"
+    return None, f"{split_phase}_default"
+
+
+def _selection_group_candidate_count(groups: Sequence[Mapping[str, Any]]) -> int:
+    return int(sum(len(group.get("candidate_indices", []) or []) for group in groups))
+
+
+def _selection_cap_for_groups(groups: Sequence[Mapping[str, Any]], requested_cap: int | None) -> int:
+    if requested_cap is not None:
+        return int(requested_cap)
+    total = _selection_group_candidate_count(groups)
+    if total <= 0:
+        raise ValueError("Default split evaluation requires at least one candidate example.")
+    return int(total)
 
 
 def _cap_context_indices(
@@ -1703,6 +1716,7 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
             selection_groups: List[Dict[str, Any]] = []
             for seed in seeds:
                 if str(split_phase) == TRAIN_TUNING_PHASE:
+                    assert selected_examples_cap is not None
                     tuning_seed = int(cli_args.train_tuning_seed) + int(seed) + 1_000 * dataset_idx
                     uncapped_candidate_examples = train_tuning_target_example_count(
                         len(eval_ds),
@@ -1727,9 +1741,10 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                     )
                 else:
                     tuning_seed = int(seed) + 1_000 * dataset_idx
+                    eval_examples = int(selected_examples_cap) if selected_examples_cap is not None else int(len(eval_ds))
                     candidate_examples = choose_forecast_example_indices(
                         eval_ds,
-                        n_examples=int(selected_examples_cap),
+                        n_examples=int(eval_examples),
                         seed=tuning_seed,
                     )
                     uncapped_candidate_examples = int(len(eval_ds))
@@ -1745,7 +1760,7 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                 )
             selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
                 selection_groups,
-                cap=int(selected_examples_cap),
+                cap=_selection_cap_for_groups(selection_groups, selected_examples_cap),
                 seed=int(cli_args.train_tuning_seed) + 1_000 * dataset_idx + int(checkpoint_step),
                 salt=f"forecast|{dataset}|{split_phase}|{checkpoint_step}",
             )
@@ -1946,6 +1961,7 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
             selected_examples_cap, selected_examples_cap_source = _split_example_cap(cli_args, str(split_phase))
             available_windows = int(len(getattr(eval_ds, "start_indices", [])))
             if str(split_phase) == TRAIN_TUNING_PHASE:
+                assert selected_examples_cap is not None
                 eval_windows = min(
                     int(max(1, selected_examples_cap)),
                     int(max(1, available_windows)),
@@ -1958,7 +1974,7 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                 eval_windows = (
                     int(requested_windows)
                     if requested_windows > 0
-                    else min(int(resolved_eval_windows(step_args, str(dataset), split_key)), int(selected_examples_cap))
+                    else int(resolved_eval_windows(step_args, str(dataset), split_key))
                 )
             selection_groups: List[Dict[str, Any]] = []
             for seed in seeds:
@@ -1981,7 +1997,7 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                 )
             selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
                 selection_groups,
-                cap=int(selected_examples_cap),
+                cap=_selection_cap_for_groups(selection_groups, selected_examples_cap),
                 seed=1_000 * int(dataset_idx) + int(checkpoint_step),
                 salt=f"conditional|{dataset}|{split_phase}|{checkpoint_step}",
             )
@@ -2242,9 +2258,10 @@ def _run_molecule_phase(
                 ds = loaded["splits"][split_key]
                 for seed in seeds:
                     selection_seed = int(seed) + 10_000 * dataset_idx + 1_000 * member_idx
+                    eval_count = int(selected_examples_cap) if selected_examples_cap is not None else int(len(ds))
                     candidate_indices = _choose_molecule_indices(
                         ds,
-                        count=int(selected_examples_cap),
+                        count=int(eval_count),
                         seed=int(selection_seed),
                     )
                     selection_groups.append(
@@ -2275,7 +2292,7 @@ def _run_molecule_phase(
                     )
             selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
                 selection_groups,
-                cap=int(selected_examples_cap),
+                cap=_selection_cap_for_groups(selection_groups, selected_examples_cap),
                 seed=10_000 * int(dataset_idx) + int(checkpoint_step),
                 salt=f"molecule|{dataset}|{split_phase}|{checkpoint_step}",
             )
@@ -2658,7 +2675,14 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--write_context_rows", action="store_true", default=False)
     ap.add_argument("--context_row_csv_name", type=str, default="context_rows.csv")
     ap.add_argument("--context_embeddings_npz_name", type=str, default="context_embeddings.npz")
-    ap.add_argument("--context_sample_count", type=int, default=256)
+    ap.add_argument(
+        "--train_tuning_context_sample_count",
+        "--context_sample_count",
+        dest="context_sample_count",
+        type=int,
+        default=256,
+        help="Train-tuning context budget for GIPO supervision rows; validation/locked-test use eval-window options.",
+    )
     ap.add_argument("--write_forecast_context_rows", action="store_true", default=False)
     ap.add_argument("--forecast_context_row_csv_name", type=str, default="")
     ap.add_argument("--forecast_context_embeddings_npz_name", type=str, default="")

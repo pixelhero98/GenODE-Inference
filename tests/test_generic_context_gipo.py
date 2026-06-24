@@ -1369,6 +1369,70 @@ class GenericContextGipoTests(unittest.TestCase):
         protocol = full_pipeline._protocol_payload(args)
         self.assertEqual(protocol["ser_train_tuning_max_examples"], 0)
         self.assertEqual(protocol["ser_train_tuning_effective_max_examples"], 123)
+        self.assertEqual(protocol["gipo_supervision_context_sample_count"], 123)
+
+    def test_full_pipeline_does_not_apply_supervision_cap_to_locked_test_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(Path(tmpdir) / "run"),
+                    "--ablation_first",
+                    "--gipo_supervision_context_sample_count",
+                    "7",
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+        by_stage = {stage["stage"]: stage["commands"] for stage in summary["stages"]}
+        schedule_commands = by_stage["schedule_rows_seen"] + by_stage["schedule_rows_unseen"]
+        train_commands = [command for command in schedule_commands if command[command.index("--split_phase") + 1] == "train_tuning"]
+        locked_commands = [command for command in schedule_commands if command[command.index("--split_phase") + 1] == "locked_test"]
+        self.assertTrue(train_commands)
+        self.assertTrue(locked_commands)
+        for command in train_commands:
+            self.assertIn("--train_tuning_context_sample_count", command)
+            self.assertEqual(command[command.index("--train_tuning_context_sample_count") + 1], "7")
+        for command in locked_commands:
+            self.assertNotIn("--context_sample_count", command)
+            self.assertNotIn("--train_tuning_context_sample_count", command)
+            self.assertNotIn("--eval_windows_test", command)
+        gipo_commands = [" ".join(command) for command in by_stage["gipo_ablation_students"]]
+        self.assertTrue(all("--context_sample_count 7" in command for command in gipo_commands))
+        report_commands = [" ".join(command) for command in by_stage["gipo_ablation_locked_test_reports"]]
+        self.assertTrue(all("--context_sample_count" not in command for command in report_commands))
+
+    def test_full_pipeline_maps_explicit_locked_test_eval_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(Path(tmpdir) / "run"),
+                    "--ablation_first",
+                    "--context_sample_count",
+                    "7",
+                    "--validation_tuning_eval_windows",
+                    "11",
+                    "--locked_test_eval_windows",
+                    "19",
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+        by_stage = {stage["stage"]: stage["commands"] for stage in summary["stages"]}
+        schedule_commands = by_stage["schedule_rows_seen"] + by_stage["schedule_rows_unseen"]
+        validation_commands = [command for command in schedule_commands if command[command.index("--split_phase") + 1] == "validation_tuning"]
+        locked_commands = [command for command in schedule_commands if command[command.index("--split_phase") + 1] == "locked_test"]
+        self.assertTrue(all(command[command.index("--eval_windows_val") + 1] == "11" for command in validation_commands))
+        self.assertTrue(all(command[command.index("--eval_windows_test") + 1] == "19" for command in locked_commands))
+        self.assertTrue(all("--context_sample_count" not in command for command in validation_commands + locked_commands))
+        protocol = full_pipeline._protocol_payload(args)
+        self.assertEqual(protocol["validation_tuning_eval_windows"], 11)
+        self.assertEqual(protocol["locked_test_eval_windows"], 19)
 
     def test_full_pipeline_ablation_first_routes_arm_knobs_and_locked_reports(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
