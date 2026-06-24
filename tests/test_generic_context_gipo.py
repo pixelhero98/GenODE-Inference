@@ -1347,6 +1347,7 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(protocol["ser_train_tuning_effective_max_examples"], 17)
         self.assertEqual(protocol["ser_example_selection_protocol"], "ser_ptg_reference_global_context_capped_v3")
         self.assertEqual(protocol["ser_local_defect_proxy_protocol"], "otflow_midpoint_local_defect_proxy_v1")
+        self.assertEqual(protocol["schedule_context_selection_protocol"], "schedule_evaluation_phase_context_capped_v3")
 
     def test_full_pipeline_default_ser_train_tuning_cap_tracks_context_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

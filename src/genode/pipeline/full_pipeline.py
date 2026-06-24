@@ -42,6 +42,7 @@ from genode.backbone_packages import (
     backbone_package_protocol_payload,
     validate_provided_backbone_manifest,
 )
+from genode.evaluation.diffusion_flow_time_reparameterization import SCHEDULE_CONTEXT_SELECTION_PROTOCOL
 from genode.gipo.objectives import teacher_metric_profile_for_scenario, teacher_objective_specs_for_scenario
 from genode.gipo.ser_ptg_reference import SER_PTG_EXAMPLE_SELECTION_PROTOCOL, SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL
 from genode.gipo.ablation_plan import (
@@ -297,6 +298,7 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "ser_train_tuning_effective_max_examples": _effective_ser_train_tuning_max_examples(args),
         "ser_example_selection_protocol": SER_PTG_EXAMPLE_SELECTION_PROTOCOL,
         "ser_local_defect_proxy_protocol": SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL,
+        "schedule_context_selection_protocol": SCHEDULE_CONTEXT_SELECTION_PROTOCOL,
         "gipo_teacher_steps": int(args.gipo_teacher_steps),
         "gipo_student_steps": int(args.gipo_student_steps),
         "student_teacher_score_weight": float(args.student_teacher_score_weight),
