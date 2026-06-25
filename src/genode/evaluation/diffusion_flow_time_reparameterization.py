@@ -113,13 +113,13 @@ from genode.runtime import resolve_torch_device
 from genode.gipo.policy import GIPO_PROTOCOL, load_context_embedding_table, save_context_embedding_table
 from genode.gipo.schedule_hash import schedule_grid_hash
 
-RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen_phase_context_v3"
+RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen_phase_context_v4"
 CONTEXT_REWARD_PROTOCOL_VERSION = "conditional_primary_metric_context_rewards_v2"
 DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
 DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
 DEFAULT_SCHEDULES: Tuple[str, ...] = BASELINE_SCHEDULE_KEYS
-SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_evaluation_phase_context_capped_v3"
+SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_evaluation_phase_context_capped_v4"
 SUPPORTED_SPLIT_PHASES: Tuple[str, ...] = (LOCKED_TEST_PHASE, VALIDATION_PHASE, TRAIN_TUNING_PHASE)
 
 ROW_RECORD_FIELDS: Tuple[str, ...] = (
@@ -677,6 +677,58 @@ def _selection_cap_for_groups(groups: Sequence[Mapping[str, Any]], requested_cap
     return int(total)
 
 
+def _choose_stratified_train_tuning_positions(
+    total: int,
+    *,
+    fraction: float,
+    seed: int,
+    strata: int,
+    dataset: str,
+    salt: str,
+    max_examples: int | None = None,
+) -> Tuple[List[int], int]:
+    target_examples = train_tuning_target_example_count(
+        int(total),
+        fraction=float(fraction),
+        sampling_mode=TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
+        strata=int(strata),
+    )
+    selected = choose_forecast_train_tuning_indices(
+        range(int(total)),
+        fraction=float(fraction),
+        seed=int(seed),
+        strata=int(strata),
+        dataset=str(dataset),
+        salt=str(salt),
+        sampling_mode=TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
+        max_examples=None if max_examples is None or int(max_examples) <= 0 else int(max_examples),
+    )
+    return [int(idx) for idx in selected.tolist()], int(target_examples)
+
+
+def _train_tuning_metadata(
+    cli_args: argparse.Namespace,
+    *,
+    tuning_seed: int,
+    target_examples: int,
+    uncapped_candidate_examples: int,
+    sampling_mode: str = TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
+    reference_examples: Any = "",
+) -> Dict[str, Any]:
+    return {
+        "train_tuning_fraction": float(cli_args.eval_train_fraction),
+        "train_tuning_seed": int(tuning_seed),
+        "train_tuning_strata": int(cli_args.train_tuning_strata),
+        "train_tuning_sampler": train_tuning_sampler_key(str(sampling_mode)),
+        "train_tuning_sampling_mode": str(sampling_mode),
+        "train_tuning_reference_examples": reference_examples,
+        "train_tuning_target_examples": int(target_examples),
+        "train_tuning_uncapped_candidate_examples": int(uncapped_candidate_examples),
+        "train_tuning_train_split_fraction": float(cli_args.train_tuning_train_split_fraction),
+        "train_tuning_val_split_fraction": float(cli_args.train_tuning_val_split_fraction),
+    }
+
+
 def _cap_context_indices(
     indices: Sequence[int],
     *,
@@ -1137,6 +1189,7 @@ def _conditional_context_records(
     uniform_metric_row: Mapping[str, Any] | None = None,
     evaluation_protocol_hash: str = "",
     chosen_t0s_hash: str = "",
+    train_tuning_context_metadata: Mapping[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
     from genode.gipo.policy import schedule_grid_hash, stable_context_id
 
@@ -1283,6 +1336,7 @@ def _conditional_context_records(
                 "chosen_examples_hash": str(chosen_t0s_hash),
                 "evaluation_protocol_hash": str(evaluation_protocol_hash),
                 "row_signature": str(row_signature),
+                **dict(train_tuning_context_metadata or {}),
             }
         )
     return rows
@@ -1376,6 +1430,7 @@ def _molecule_context_records(
     per_context_metrics: Sequence[Mapping[str, Any]],
     uniform_by_context_id: Mapping[str, Mapping[str, Any]] | None,
     rollout_steps: int,
+    train_tuning_context_metadata: Mapping[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     uniform_by_context = dict(uniform_by_context_id or {})
@@ -1471,6 +1526,7 @@ def _molecule_context_records(
                 "sample_seed_start": int(evaluation_seed),
                 "sample_seed_values_json": json.dumps([int(evaluation_seed)], separators=(",", ":")),
                 "row_signature": str(row_signature),
+                **dict(train_tuning_context_metadata or {}),
             }
         )
     return rows
@@ -1737,7 +1793,6 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                         reference_examples=int(train_tuning_reference_examples),
                         train_split_fraction=float(cli_args.train_tuning_train_split_fraction),
                         val_split_fraction=float(cli_args.train_tuning_val_split_fraction),
-                        max_examples=int(selected_examples_cap),
                     )
                 else:
                     tuning_seed = int(seed) + 1_000 * dataset_idx
@@ -1861,7 +1916,7 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                         "train_tuning_sampler": train_tuning_sampler_key(str(cli_args.train_tuning_sampling_mode)),
                                         "train_tuning_sampling_mode": str(cli_args.train_tuning_sampling_mode),
                                         "train_tuning_reference_examples": int(train_tuning_reference_examples),
-                                        "train_tuning_target_examples": int(len(chosen_examples)),
+                                        "train_tuning_target_examples": int(selection_meta["uncapped_candidate_examples"]),
                                         "train_tuning_uncapped_candidate_examples": int(selection_meta["uncapped_candidate_examples"]),
                                         "train_tuning_train_split_fraction": float(cli_args.train_tuning_train_split_fraction),
                                         "train_tuning_val_split_fraction": float(cli_args.train_tuning_val_split_fraction),
@@ -1962,9 +2017,11 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
             available_windows = int(len(getattr(eval_ds, "start_indices", [])))
             if str(split_phase) == TRAIN_TUNING_PHASE:
                 assert selected_examples_cap is not None
-                eval_windows = min(
-                    int(max(1, selected_examples_cap)),
-                    int(max(1, available_windows)),
+                eval_windows = train_tuning_target_example_count(
+                    available_windows,
+                    fraction=float(cli_args.eval_train_fraction),
+                    sampling_mode=TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
+                    strata=int(cli_args.train_tuning_strata),
                 )
             else:
                 requested_attr = "eval_windows_val" if str(split_phase) == VALIDATION_PHASE else "eval_windows_test"
@@ -1978,17 +2035,32 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                 )
             selection_groups: List[Dict[str, Any]] = []
             for seed in seeds:
-                selection_seed = int(seed) + 1_000 * dataset_idx
-                candidate_eval_t0s = _choose_valid_windows(
-                    eval_ds,
-                    horizon=int(eval_horizon),
-                    n_windows=int(eval_windows),
-                    seed=int(selection_seed),
-                )
+                if str(split_phase) == TRAIN_TUNING_PHASE:
+                    selection_seed = int(cli_args.train_tuning_seed) + int(seed) + 1_000 * dataset_idx
+                    train_starts = [int(value) for value in getattr(eval_ds, "start_indices", [])]
+                    selected_positions, target_examples = _choose_stratified_train_tuning_positions(
+                        len(train_starts),
+                        fraction=float(cli_args.eval_train_fraction),
+                        seed=int(selection_seed),
+                        strata=int(cli_args.train_tuning_strata),
+                        dataset=str(dataset),
+                        salt=f"conditional_train_tuning|{dataset}",
+                    )
+                    candidate_eval_t0s = [int(train_starts[pos]) for pos in selected_positions]
+                    uncapped_candidate_examples = int(target_examples)
+                else:
+                    selection_seed = int(seed) + 1_000 * dataset_idx
+                    candidate_eval_t0s = _choose_valid_windows(
+                        eval_ds,
+                        horizon=int(eval_horizon),
+                        n_windows=int(eval_windows),
+                        seed=int(selection_seed),
+                    )
+                    uncapped_candidate_examples = max(int(available_windows), len(candidate_eval_t0s))
                 selection_groups.append(
                     {
                         "candidate_indices": [int(t0) for t0 in candidate_eval_t0s],
-                        "uncapped_candidate_examples": max(int(available_windows), len(candidate_eval_t0s)),
+                        "uncapped_candidate_examples": int(uncapped_candidate_examples),
                         "selection_record": {
                             "seed": int(seed),
                             "selection_seed": int(selection_seed),
@@ -2127,6 +2199,15 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                     context_sample_count=_context_sample_cap(cli_args),
                                 )
                             )
+                            if str(split_phase) == TRAIN_TUNING_PHASE:
+                                row.update(
+                                    _train_tuning_metadata(
+                                        cli_args,
+                                        tuning_seed=int(selection_seed),
+                                        target_examples=int(selection_meta["uncapped_candidate_examples"]),
+                                        uncapped_candidate_examples=int(selection_meta["uncapped_candidate_examples"]),
+                                    )
+                                )
                             _append_row_record(row_recorder, row)
                             if _write_context_rows_enabled(cli_args):
                                 uniform_score = row.get("score_main") if scheduler_key == UNIFORM_SCHEDULER_KEY else (
@@ -2163,6 +2244,16 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                     uniform_metric_row=row if scheduler_key == UNIFORM_SCHEDULER_KEY else cell_uniform_metrics,
                                     evaluation_protocol_hash=str(row.get("evaluation_protocol_hash", "")),
                                     chosen_t0s_hash=str(row.get("chosen_t0s_hash", "")),
+                                    train_tuning_context_metadata=(
+                                        {
+                                            "train_tuning_fraction": float(cli_args.eval_train_fraction),
+                                            "train_tuning_seed": int(selection_seed),
+                                            "train_tuning_strata": int(cli_args.train_tuning_strata),
+                                            "train_tuning_sampler": train_tuning_sampler_key(TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION),
+                                        }
+                                        if str(split_phase) == TRAIN_TUNING_PHASE
+                                        else None
+                                    ),
                                 )
                                 context_embeddings: Dict[str, List[float]] = {}
                                 for context_row in context_rows:
@@ -2257,17 +2348,31 @@ def _run_molecule_phase(
                 cfg = loaded["cfg"]
                 ds = loaded["splits"][split_key]
                 for seed in seeds:
-                    selection_seed = int(seed) + 10_000 * dataset_idx + 1_000 * member_idx
-                    eval_count = int(selected_examples_cap) if selected_examples_cap is not None else int(len(ds))
-                    candidate_indices = _choose_molecule_indices(
-                        ds,
-                        count=int(eval_count),
-                        seed=int(selection_seed),
-                    )
+                    if str(split_phase) == TRAIN_TUNING_PHASE:
+                        assert selected_examples_cap is not None
+                        selection_seed = int(cli_args.train_tuning_seed) + int(seed) + 10_000 * dataset_idx + 1_000 * member_idx
+                        candidate_indices, target_examples = _choose_stratified_train_tuning_positions(
+                            len(ds),
+                            fraction=float(cli_args.eval_train_fraction),
+                            seed=int(selection_seed),
+                            strata=int(cli_args.train_tuning_strata),
+                            dataset=f"{dataset}|{member_key}|{stratum}",
+                            salt=f"molecule_train_tuning|{dataset}|{member_key}|{stratum}",
+                        )
+                        uncapped_candidate_examples = int(target_examples)
+                    else:
+                        selection_seed = int(seed) + 10_000 * dataset_idx + 1_000 * member_idx
+                        eval_count = int(selected_examples_cap) if selected_examples_cap is not None else int(len(ds))
+                        candidate_indices = _choose_molecule_indices(
+                            ds,
+                            count=int(eval_count),
+                            seed=int(selection_seed),
+                        )
+                        uncapped_candidate_examples = max(int(len(ds)), len(candidate_indices))
                     selection_groups.append(
                         {
                             "candidate_indices": [int(idx) for idx in candidate_indices],
-                            "uncapped_candidate_examples": max(int(len(ds)), len(candidate_indices)),
+                            "uncapped_candidate_examples": int(uncapped_candidate_examples),
                             "selection_record": {
                                 "seed": int(seed),
                                 "selection_seed": int(selection_seed),
@@ -2432,6 +2537,15 @@ def _run_molecule_phase(
                                     context_sample_count=_context_sample_cap(cli_args),
                                 )
                             )
+                            if str(split_phase) == TRAIN_TUNING_PHASE:
+                                row.update(
+                                    _train_tuning_metadata(
+                                        cli_args,
+                                        tuning_seed=int(selection_meta["selection_seed"]),
+                                        target_examples=int(selection_meta["uncapped_candidate_examples"]),
+                                        uncapped_candidate_examples=int(selection_meta["uncapped_candidate_examples"]),
+                                    )
+                                )
                             _append_row_record(row_recorder, row)
                             if scheduler_key == UNIFORM_SCHEDULER_KEY:
                                 uniform_row = row
@@ -2461,6 +2575,16 @@ def _run_molecule_phase(
                                         for ctx in list(metrics.get("per_context_rows", []) or [])
                                     },
                                     rollout_steps=int(getattr(cli_args, "molecule_rollout_steps", 16)),
+                                    train_tuning_context_metadata=(
+                                        {
+                                            "train_tuning_fraction": float(cli_args.eval_train_fraction),
+                                            "train_tuning_seed": int(selection_meta["selection_seed"]),
+                                            "train_tuning_strata": int(cli_args.train_tuning_strata),
+                                            "train_tuning_sampler": train_tuning_sampler_key(TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION),
+                                        }
+                                        if str(split_phase) == TRAIN_TUNING_PHASE
+                                        else None
+                                    ),
                                 )
                                 _append_context_records(
                                     row_recorder,

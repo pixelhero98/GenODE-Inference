@@ -87,6 +87,7 @@ DEFAULT_ABLATION_FIRST_STAGES = (
 PIPELINE_STAGE_ORDER = (*DEFAULT_STAGES, GIPO_ABLATION_STUDENT_STAGE, GIPO_ABLATION_LOCKED_TEST_STAGE)
 DEFAULT_GIPO_TEACHER_STEPS = 500
 DEFAULT_GIPO_STUDENT_STEPS = 500
+SCHEDULE_ROW_SPLIT_PHASES = ("train_tuning", "locked_test")
 
 
 @dataclass(frozen=True)
@@ -215,6 +216,8 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("--ser_val_windows must be nonnegative.")
     if int(args.ser_train_tuning_max_examples) < 0:
         raise ValueError("--ser_train_tuning_max_examples must be nonnegative.")
+    if int(args.locked_test_eval_windows) < 0:
+        raise ValueError("--locked_test_eval_windows must be nonnegative.")
     effective_stages = set(_effective_stage_names(args))
     includes_backbone_training = "backbone_training" in effective_stages
     provided_validation: Dict[str, Any] | None = None
@@ -290,7 +293,7 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "schedules": _parse_csv(str(args.schedule_keys)) or list(CANONICAL_SUPERVISION_SCHEDULE_KEYS),
         "context_sample_count": int(args.context_sample_count),
         "gipo_supervision_context_sample_count": int(args.context_sample_count),
-        "validation_tuning_eval_windows": int(args.validation_tuning_eval_windows),
+        "schedule_row_split_phases": list(SCHEDULE_ROW_SPLIT_PHASES),
         "locked_test_eval_windows": int(args.locked_test_eval_windows),
         "ser_calibration_batch_size": int(args.ser_calibration_batch_size),
         "ser_val_windows": int(args.ser_val_windows),
@@ -579,7 +582,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
     ablation_preset = str(getattr(args, "gipo_ablation_preset", DEFAULT_GIPO_ABLATION_PRESET))
     gipo_ablation_root = _ablation_root(run_root, ablation_preset)
     ablation_arms = gipo_ablation_arms(ablation_preset)
-    split_phases = ("train_tuning", "validation_tuning", "locked_test")
+    split_phases = SCHEDULE_ROW_SPLIT_PHASES
     role_nfes = {"seen": seen_nfes, "unseen": unseen_nfes}
 
     def _rows_dir(role: str, phase: str, checkpoint_step: int) -> Path:
@@ -599,11 +602,6 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
     def _schedule_row_phase_budget_args(phase: str) -> List[Any]:
         if str(phase) == "train_tuning":
             return ["--train_tuning_context_sample_count", int(args.context_sample_count)]
-        if str(phase) == "validation_tuning":
-            windows = int(args.validation_tuning_eval_windows)
-            if windows < 0:
-                raise ValueError(f"--validation_tuning_eval_windows must be nonnegative, got {windows!r}.")
-            return ["--eval_windows_val", windows] if windows > 0 else []
         if str(phase) == "locked_test":
             windows = int(args.locked_test_eval_windows)
             if windows < 0:
@@ -1033,7 +1031,6 @@ def build_argparser() -> argparse.ArgumentParser:
         default=CANONICAL_CONTEXT_SAMPLE_COUNT,
         help="Train-tuning context budget for GIPO teacher/student supervision. Locked-test evaluation is controlled separately.",
     )
-    parser.add_argument("--validation_tuning_eval_windows", type=int, default=0)
     parser.add_argument("--locked_test_eval_windows", type=int, default=0)
     parser.add_argument("--ser_calibration_batch_size", type=int, default=64)
     parser.add_argument("--ser_val_windows", type=int, default=0)

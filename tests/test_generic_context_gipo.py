@@ -1347,7 +1347,7 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(protocol["ser_train_tuning_effective_max_examples"], 17)
         self.assertEqual(protocol["ser_example_selection_protocol"], "ser_ptg_reference_global_context_capped_v3")
         self.assertEqual(protocol["ser_local_defect_proxy_protocol"], "otflow_midpoint_local_defect_proxy_v1")
-        self.assertEqual(protocol["schedule_context_selection_protocol"], "schedule_evaluation_phase_context_capped_v3")
+        self.assertEqual(protocol["schedule_context_selection_protocol"], "schedule_evaluation_phase_context_capped_v4")
 
     def test_full_pipeline_default_ser_train_tuning_cap_tracks_context_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1400,6 +1400,10 @@ class GenericContextGipoTests(unittest.TestCase):
             self.assertNotIn("--context_sample_count", command)
             self.assertNotIn("--train_tuning_context_sample_count", command)
             self.assertNotIn("--eval_windows_test", command)
+            self.assertNotIn("--eval_windows_val", command)
+        self.assertFalse(any(command[command.index("--split_phase") + 1] == "validation_tuning" for command in schedule_commands))
+        protocol = full_pipeline._protocol_payload(args)
+        self.assertEqual(protocol["schedule_row_split_phases"], ["train_tuning", "locked_test"])
         gipo_commands = [" ".join(command) for command in by_stage["gipo_ablation_students"]]
         self.assertTrue(all("--context_sample_count 7" in command for command in gipo_commands))
         report_commands = [" ".join(command) for command in by_stage["gipo_ablation_locked_test_reports"]]
@@ -1416,8 +1420,6 @@ class GenericContextGipoTests(unittest.TestCase):
                     "--ablation_first",
                     "--context_sample_count",
                     "7",
-                    "--validation_tuning_eval_windows",
-                    "11",
                     "--locked_test_eval_windows",
                     "19",
                     "--dry_run",
@@ -1426,14 +1428,65 @@ class GenericContextGipoTests(unittest.TestCase):
             summary = full_pipeline.run_full_pipeline(args)
         by_stage = {stage["stage"]: stage["commands"] for stage in summary["stages"]}
         schedule_commands = by_stage["schedule_rows_seen"] + by_stage["schedule_rows_unseen"]
-        validation_commands = [command for command in schedule_commands if command[command.index("--split_phase") + 1] == "validation_tuning"]
         locked_commands = [command for command in schedule_commands if command[command.index("--split_phase") + 1] == "locked_test"]
-        self.assertTrue(all(command[command.index("--eval_windows_val") + 1] == "11" for command in validation_commands))
+        validation_commands = [command for command in schedule_commands if command[command.index("--split_phase") + 1] == "validation_tuning"]
+        self.assertEqual(validation_commands, [])
+        self.assertFalse(any("--eval_windows_val" in command for command in schedule_commands))
         self.assertTrue(all(command[command.index("--eval_windows_test") + 1] == "19" for command in locked_commands))
-        self.assertTrue(all("--context_sample_count" not in command for command in validation_commands + locked_commands))
+        self.assertTrue(all("--context_sample_count" not in command for command in locked_commands))
         protocol = full_pipeline._protocol_payload(args)
-        self.assertEqual(protocol["validation_tuning_eval_windows"], 11)
+        self.assertEqual(protocol["schedule_row_split_phases"], ["train_tuning", "locked_test"])
         self.assertEqual(protocol["locked_test_eval_windows"], 19)
+
+    def test_full_pipeline_no_ser_fixed_support_skips_validation_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(Path(tmpdir) / "run"),
+                    "--stages",
+                    "data_prep,schedule_rows_seen,schedule_rows_unseen,gipo_ablation_students,gipo_ablation_locked_test_reports",
+                    "--schedule_keys",
+                    "uniform,late_power_3",
+                    "--checkpoint_steps",
+                    "4000",
+                    "--ablation_first",
+                    "--gipo_supervision_context_sample_count",
+                    "256",
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+        by_stage = {stage["stage"]: stage["commands"] for stage in summary["stages"]}
+        self.assertNotIn("ser_summaries", by_stage)
+        schedule_commands = by_stage["schedule_rows_seen"] + by_stage["schedule_rows_unseen"]
+        split_phases = [command[command.index("--split_phase") + 1] for command in schedule_commands]
+        self.assertEqual(set(split_phases), {"train_tuning", "locked_test"})
+        self.assertEqual(len(by_stage["schedule_rows_seen"]), 2)
+        self.assertEqual(len(by_stage["schedule_rows_unseen"]), 2)
+        self.assertFalse(any("ser_ptg" in " ".join(command) for command in schedule_commands))
+        self.assertFalse(any("--eval_windows_val" in command for command in schedule_commands))
+        self.assertFalse(any(phase == "validation_tuning" for phase in split_phases))
+        for command in schedule_commands:
+            if command[command.index("--split_phase") + 1] == "train_tuning":
+                self.assertEqual(command[command.index("--train_tuning_context_sample_count") + 1], "256")
+            else:
+                self.assertNotIn("--context_sample_count", command)
+                self.assertNotIn("--train_tuning_context_sample_count", command)
+        gipo_commands = [" ".join(command) for command in by_stage["gipo_ablation_students"]]
+        self.assertTrue(
+            all(
+                "--rows_csv" in command
+                and "/train_tuning/" in command.replace("\\", "/")
+                and "context_rows.csv" in command
+                for command in gipo_commands
+            )
+        )
+        self.assertTrue(all("--support_schedule_keys uniform,late_power_3" in command for command in gipo_commands))
+        report_commands = [" ".join(command).replace("\\", "/") for command in by_stage["gipo_ablation_locked_test_reports"]]
+        self.assertTrue(all("/locked_test/" in command and "context_rows.csv" in command for command in report_commands))
 
     def test_full_pipeline_ablation_first_routes_arm_knobs_and_locked_reports(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
