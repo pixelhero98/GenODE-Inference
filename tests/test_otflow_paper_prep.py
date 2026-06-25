@@ -1290,7 +1290,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertTrue(all(row["selected_examples_cap_source"] == "train_tuning_context_sample_count" for row in rows))
         self.assertTrue(all(row["train_tuning_sampler"] == "temporal_stratified_hash" for row in rows))
 
-    def test_conditional_generation_locked_test_defaults_to_eval_plan_not_context_cap(self) -> None:
+    def test_conditional_generation_locked_test_defaults_to_full_valid_test_not_context_cap(self) -> None:
         class FakeDataset:
             start_indices = list(range(1000))
 
@@ -1335,33 +1335,37 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 ]
             )
             recorder = runner._init_row_recorder(Path(tmpdir), args)
-            requested_windows = []
 
-            def fake_choose_valid_windows(ds, *, horizon: int, n_windows: int, seed: int):
-                del ds, horizon, seed
-                requested_windows.append(int(n_windows))
-                return [10, 20, 30][: int(n_windows)]
+            captured_windows = []
+
+            def fake_run_fixed_schedule_variant(**kwargs):
+                captured_windows.append(len(kwargs["chosen_t0s"]))
+                return {
+                    "score_main": 1.0,
+                    "temporal_uw1": 0.1,
+                    "temporal_cw1": 0.2,
+                    "temporal_tstr_f1": None,
+                    "temporal_tstr_f1_applicable": False,
+                    "evaluation_protocol": {"chosen_t0s_hash": "hash"},
+                }
 
             try:
                 with mock.patch.object(
                     runner,
                     "load_conditional_generation_checkpoint_splits",
                     return_value=fake_checkpoint,
-                ), mock.patch.object(runner, "resolved_eval_windows", return_value=999), mock.patch.object(
+                ), mock.patch.object(
+                    runner,
+                    "resolved_eval_windows",
+                    side_effect=AssertionError("locked-test default should use every valid test window"),
+                ), mock.patch.object(
                     runner,
                     "_choose_valid_windows",
-                    side_effect=fake_choose_valid_windows,
+                    side_effect=AssertionError("locked-test default should not sample/cap test windows"),
                 ), mock.patch.object(
                     runner,
                     "run_fixed_schedule_variant",
-                    return_value={
-                        "score_main": 1.0,
-                        "temporal_uw1": 0.1,
-                        "temporal_cw1": 0.2,
-                        "temporal_tstr_f1": None,
-                        "temporal_tstr_f1_applicable": False,
-                        "evaluation_protocol": {"chosen_t0s_hash": "hash"},
-                    },
+                    side_effect=fake_run_fixed_schedule_variant,
                 ):
                     rows = runner._run_conditional_generation_phase(
                         args,
@@ -1373,13 +1377,14 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             finally:
                 recorder["fh"].close()
 
-        self.assertEqual(requested_windows, [999])
-        self.assertEqual(rows[0]["eval_windows"], 3)
-        self.assertEqual(rows[0]["selected_examples"], 3)
-        self.assertEqual(rows[0]["selected_examples_cap"], 3)
+        self.assertEqual(captured_windows, [1000])
+        self.assertEqual(rows[0]["eval_windows"], 1000)
+        self.assertEqual(rows[0]["context_sample_count"], 3)
+        self.assertEqual(rows[0]["selected_examples"], 1000)
+        self.assertEqual(rows[0]["selected_examples_cap"], 1000)
         self.assertEqual(rows[0]["selected_examples_cap_source"], "locked_test_default")
         self.assertEqual(rows[0]["uncapped_candidate_examples"], 1000)
-        self.assertTrue(rows[0]["selection_was_capped"])
+        self.assertFalse(rows[0]["selection_was_capped"])
 
     def test_conditional_generation_context_cap_is_global_across_seeds(self) -> None:
         class FakeDataset:

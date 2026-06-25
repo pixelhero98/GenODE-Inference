@@ -665,6 +665,19 @@ def _split_example_cap(cli_args: argparse.Namespace, split_phase: str) -> Tuple[
     return None, f"{split_phase}_default"
 
 
+def _all_valid_conditional_window_starts(ds: Any, *, horizon: int) -> np.ndarray:
+    starts = np.asarray(getattr(ds, "start_indices", []), dtype=np.int64)
+    if starts.size == 0:
+        raise ValueError(f"No valid windows for horizon={horizon}.")
+    segment_end_for_t = getattr(ds, "segment_end_for_t", None)
+    if callable(segment_end_for_t):
+        segment_ends = np.asarray(segment_end_for_t(starts), dtype=np.int64)
+        starts = starts[starts + int(horizon) <= segment_ends]
+    if starts.size == 0:
+        raise ValueError(f"No valid windows for horizon={horizon}.")
+    return starts
+
+
 def _selection_group_candidate_count(groups: Sequence[Mapping[str, Any]]) -> int:
     return int(sum(len(group.get("candidate_indices", []) or []) for group in groups))
 
@@ -2032,7 +2045,11 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                 eval_windows = (
                     int(requested_windows)
                     if requested_windows > 0
-                    else int(resolved_eval_windows(step_args, str(dataset), split_key))
+                    else (
+                        0
+                        if str(split_phase) == LOCKED_TEST_PHASE
+                        else int(resolved_eval_windows(step_args, str(dataset), split_key))
+                    )
                 )
             selection_groups: List[Dict[str, Any]] = []
             for seed in seeds:
@@ -2051,13 +2068,17 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                     uncapped_candidate_examples = int(target_examples)
                 else:
                     selection_seed = int(seed) + 1_000 * dataset_idx
-                    candidate_eval_t0s = _choose_valid_windows(
-                        eval_ds,
-                        horizon=int(eval_horizon),
-                        n_windows=int(eval_windows),
-                        seed=int(selection_seed),
-                    )
-                    uncapped_candidate_examples = max(int(available_windows), len(candidate_eval_t0s))
+                    if selected_examples_cap is None and str(split_phase) == LOCKED_TEST_PHASE:
+                        candidate_eval_t0s = _all_valid_conditional_window_starts(eval_ds, horizon=int(eval_horizon))
+                        uncapped_candidate_examples = int(len(candidate_eval_t0s))
+                    else:
+                        candidate_eval_t0s = _choose_valid_windows(
+                            eval_ds,
+                            horizon=int(eval_horizon),
+                            n_windows=int(eval_windows),
+                            seed=int(selection_seed),
+                        )
+                        uncapped_candidate_examples = max(int(available_windows), len(candidate_eval_t0s))
                 selection_groups.append(
                     {
                         "candidate_indices": [int(t0) for t0 in candidate_eval_t0s],
