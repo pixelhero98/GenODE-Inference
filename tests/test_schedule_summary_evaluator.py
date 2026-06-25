@@ -813,6 +813,106 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             self.assertEqual(rows[0]["selected_examples"], "9")
             self.assertEqual(rows[0]["selected_examples_cap_source"], "context_sample_count")
 
+    def test_evaluate_schedule_summary_locked_test_defaults_to_full_split(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            schedule_path = root / "student_summary.json"
+            schedule_path.write_text(
+                json.dumps(
+                    {
+                        "dataset": "traffic_hourly",
+                        "schedules": [
+                            {
+                                "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                                "predictions": [
+                                    {
+                                        "solver_key": "euler",
+                                        "target_nfe": 4,
+                                        "macro_steps": 4,
+                                        "time_grid": _uniform_grid(4),
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class FakeDataset:
+                def __len__(self) -> int:
+                    return 1000
+
+            fake_checkpoint = {
+                "model": object(),
+                "cfg": object(),
+                "splits": {"train": FakeDataset(), "val": FakeDataset(), "test": FakeDataset()},
+                "checkpoint_path": root / "model.pt",
+                "checkpoint_id": "ck",
+                "backbone_name": "otflow",
+                "train_steps": 20000,
+                "train_budget_label": "20k",
+            }
+            captured_lengths = []
+
+            def fake_eval(*args, **kwargs):
+                del args
+                captured_lengths.append(len(kwargs["example_indices"]))
+                return {
+                    "crps": 1.0,
+                    "mse": 1.5,
+                    "mase": 2.0,
+                    "latency_ms_per_sample": 0.25,
+                    "num_eval_samples": 1,
+                    "eval_examples": len(kwargs["example_indices"]),
+                    "eval_horizon": 168,
+                    "evaluation_protocol_hash": "protocol",
+                    "chosen_examples_hash": "examples",
+                    "realized_nfe": 4,
+                }
+
+            args = build_argparser().parse_args(
+                [
+                    "--dataset",
+                    "traffic_hourly",
+                    "--schedule_summary",
+                    str(schedule_path),
+                    "--split_phase",
+                    "locked_test",
+                    "--out_dir",
+                    str(root / "out"),
+                    "--solver_names",
+                    "euler",
+                    "--target_nfe_values",
+                    "4",
+                    "--seeds",
+                    "0",
+                    "--num_eval_samples",
+                    "1",
+                    "--context_sample_count",
+                    "9",
+                    "--device",
+                    "cpu",
+                ]
+            )
+            with mock.patch(
+                "genode.gipo.evaluate_schedule_summary.load_forecast_checkpoint_splits",
+                return_value=fake_checkpoint,
+            ), mock.patch(
+                "genode.gipo.evaluate_schedule_summary.evaluate_forecast_schedule",
+                side_effect=fake_eval,
+            ):
+                evaluate_schedule_summary(args)
+
+            self.assertEqual(captured_lengths, [1000])
+            with (root / "out" / "test_rows.csv").open("r", newline="", encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(rows[0]["selected_examples"], "1000")
+            self.assertEqual(rows[0]["selected_examples_cap"], "1000")
+            self.assertEqual(rows[0]["uncapped_candidate_examples"], "1000")
+            self.assertEqual(rows[0]["selected_examples_cap_source"], "locked_test_default")
+            self.assertEqual(rows[0]["selection_was_capped"], "False")
+
     def test_evaluate_schedule_summary_writes_train_tuning_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

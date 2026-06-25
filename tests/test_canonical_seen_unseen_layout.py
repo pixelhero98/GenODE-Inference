@@ -25,6 +25,7 @@ class CanonicalSeenUnseenLayoutTests(unittest.TestCase):
         self.assertEqual(CANONICAL_SEEN_NFES, (4, 8, 12, 16))
         self.assertEqual(CANONICAL_UNSEEN_NFES, (6, 10, 14, 20))
         self.assertEqual(CANONICAL_CHECKPOINT_STEPS, (4000, 8000, 12000, 16000, 20000))
+        self.assertEqual(CANONICAL_CONTEXT_SAMPLE_COUNT, 188)
         self.assertEqual(CANONICAL_SOLVER_KEYS, ("euler", "dpmpp2m", "heun", "midpoint_rk2"))
         self.assertEqual(len(CANONICAL_SCENARIO_KEYS), 9)
         self.assertEqual(len(PHYSICAL_SCHEDULE_KEYS), 7)

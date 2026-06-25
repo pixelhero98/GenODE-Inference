@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+from genode.canonical_experiment_layout import CANONICAL_CONTEXT_SAMPLE_COUNT
 from genode.gipo import ser_ptg_reference as ser
 from genode.gipo.ser_ptg_reference import build_argparser, build_ser_ptg_reference, collect_batched_local_defect_trace
 from genode.evaluation.otflow_evaluation_support import build_conditional_generation_dataset_args_from_cfg
@@ -148,7 +149,7 @@ class SerPtgReferenceTests(unittest.TestCase):
                     "--seeds",
                     "0",
                     "--context_sample_count",
-                    "256",
+                    str(CANONICAL_CONTEXT_SAMPLE_COUNT),
                     "--out_dir",
                     tmpdir,
                     "--device",
@@ -158,15 +159,15 @@ class SerPtgReferenceTests(unittest.TestCase):
             summary = build_ser_ptg_reference(args)
 
         self.assertEqual(len(captured), 1)
-        self.assertEqual(len(captured[0]), 256)
+        self.assertEqual(len(captured[0]), CANONICAL_CONTEXT_SAMPLE_COUNT)
         prediction = summary["predictions"][0]
         self.assertEqual(prediction["example_selection_protocol"], ser.SER_PTG_EXAMPLE_SELECTION_PROTOCOL)
-        self.assertEqual(prediction["selected_examples"], 256)
-        self.assertEqual(prediction["selected_examples_cap"], 256)
+        self.assertEqual(prediction["selected_examples"], CANONICAL_CONTEXT_SAMPLE_COUNT)
+        self.assertEqual(prediction["selected_examples_cap"], CANONICAL_CONTEXT_SAMPLE_COUNT)
         self.assertEqual(prediction["selected_examples_cap_source"], "context_sample_count")
         self.assertTrue(prediction["selection_was_capped"])
-        self.assertGreater(prediction["uncapped_candidate_examples"], 256)
-        self.assertEqual(summary["selected_examples_cap"], 256)
+        self.assertGreater(prediction["uncapped_candidate_examples"], CANONICAL_CONTEXT_SAMPLE_COUNT)
+        self.assertEqual(summary["selected_examples_cap"], CANONICAL_CONTEXT_SAMPLE_COUNT)
         self.assertEqual(summary["selected_examples_cap_source"], "context_sample_count")
         self.assertEqual(summary["local_defect_trace_protocol"], "otflow_midpoint_local_defect_proxy_v1")
         self.assertEqual(summary["oracle_local_error_semantics"], "local_defect_proxy_not_teacher_oracle")
@@ -217,7 +218,7 @@ class SerPtgReferenceTests(unittest.TestCase):
                     "--seeds",
                     "0",
                     "--context_sample_count",
-                    "256",
+                    str(CANONICAL_CONTEXT_SAMPLE_COUNT),
                     "--val_windows",
                     "0",
                     "--out_dir",
@@ -229,10 +230,10 @@ class SerPtgReferenceTests(unittest.TestCase):
             summary = build_ser_ptg_reference(args)
 
         self.assertEqual(len(captured), 1)
-        self.assertEqual(len(captured[0]), 256)
+        self.assertEqual(len(captured[0]), CANONICAL_CONTEXT_SAMPLE_COUNT)
         prediction = summary["predictions"][0]
-        self.assertEqual(prediction["selected_examples"], 256)
-        self.assertEqual(prediction["selected_examples_cap"], 256)
+        self.assertEqual(prediction["selected_examples"], CANONICAL_CONTEXT_SAMPLE_COUNT)
+        self.assertEqual(prediction["selected_examples_cap"], CANONICAL_CONTEXT_SAMPLE_COUNT)
         self.assertEqual(prediction["selected_examples_cap_source"], "context_sample_count")
         self.assertTrue(prediction["selection_was_capped"])
         self.assertEqual(prediction["uncapped_candidate_examples"], 2000)
@@ -290,7 +291,7 @@ class SerPtgReferenceTests(unittest.TestCase):
                     "--seeds",
                     "0",
                     "--context_sample_count",
-                    "256",
+                    str(CANONICAL_CONTEXT_SAMPLE_COUNT),
                     "--out_dir",
                     tmpdir,
                     "--device",
@@ -299,15 +300,18 @@ class SerPtgReferenceTests(unittest.TestCase):
             )
             summary = build_ser_ptg_reference(args)
 
-        self.assertEqual(requested_windows, [256])
-        self.assertEqual(len(captured[0]), 256)
+        self.assertEqual(requested_windows, [CANONICAL_CONTEXT_SAMPLE_COUNT])
+        self.assertEqual(len(captured[0]), CANONICAL_CONTEXT_SAMPLE_COUNT)
         prediction = summary["predictions"][0]
-        self.assertEqual(prediction["selected_examples"], 256)
-        self.assertEqual(prediction["selected_examples_cap"], 256)
+        self.assertEqual(prediction["selected_examples"], CANONICAL_CONTEXT_SAMPLE_COUNT)
+        self.assertEqual(prediction["selected_examples_cap"], CANONICAL_CONTEXT_SAMPLE_COUNT)
         self.assertEqual(prediction["selected_examples_cap_source"], "context_sample_count")
         self.assertTrue(prediction["selection_was_capped"])
         self.assertEqual(prediction["uncapped_candidate_examples"], 1000)
-        self.assertEqual(prediction["selection_records"][0]["candidate_examples_after_initial_selection"], 320)
+        self.assertEqual(
+            prediction["selection_records"][0]["candidate_examples_after_initial_selection"],
+            CANONICAL_CONTEXT_SAMPLE_COUNT + 64,
+        )
         self.assertEqual(prediction["selection_records"][0]["reference_available_examples"], 1000)
 
     def test_molecule_over_selection_is_capped(self) -> None:
@@ -366,7 +370,7 @@ class SerPtgReferenceTests(unittest.TestCase):
                     "--seeds",
                     "0",
                     "--context_sample_count",
-                    "256",
+                    str(CANONICAL_CONTEXT_SAMPLE_COUNT),
                     "--out_dir",
                     tmpdir,
                     "--molecule_group_root",
@@ -380,10 +384,10 @@ class SerPtgReferenceTests(unittest.TestCase):
             summary = build_ser_ptg_reference(args)
 
         self.assertEqual(len(captured), 1)
-        self.assertEqual(len(captured[0]), 256)
+        self.assertEqual(len(captured[0]), CANONICAL_CONTEXT_SAMPLE_COUNT)
         prediction = summary["predictions"][0]
-        self.assertEqual(prediction["selected_examples"], 256)
-        self.assertEqual(prediction["selected_examples_cap"], 256)
+        self.assertEqual(prediction["selected_examples"], CANONICAL_CONTEXT_SAMPLE_COUNT)
+        self.assertEqual(prediction["selected_examples_cap"], CANONICAL_CONTEXT_SAMPLE_COUNT)
         self.assertEqual(prediction["selected_examples_cap_source"], "context_sample_count")
         self.assertTrue(prediction["selection_was_capped"])
         self.assertEqual(prediction["uncapped_candidate_examples"], 1000)

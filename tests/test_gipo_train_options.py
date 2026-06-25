@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from genode.canonical_experiment_layout import (
+    CANONICAL_CONTEXT_SAMPLE_COUNT,
     CANONICAL_SEEN_NFES,
     CANONICAL_UNSEEN_NFES,
     SCENARIO_FAMILY_CONDITIONAL_GENERATION,
@@ -19,6 +21,15 @@ from genode.gipo.train_gipo import _resolve_teacher_metric_target_keys, build_ar
 
 
 SUPPORT_SCHEDULES = ("uniform", "late_power_3")
+VALID_REWARD_METADATA = {
+    "gipo_reward_protocol": GIPO_PROTOCOL,
+    "reward_anchor_schedule_key": "uniform",
+    "reward_utility_transform": "directional_log_uniform_anchor",
+    "reward_metric_weights_json": json.dumps({"u_comp_uniform": 1.0}, separators=(",", ":"), sort_keys=True),
+    "train_tuning_fraction": 0.20,
+    "train_tuning_sampler": "temporal_stratified_hash",
+    "selected_examples_cap": 3,
+}
 ROW_FIELDS = (
     "benchmark_family",
     "dataset",
@@ -33,6 +44,12 @@ ROW_FIELDS = (
     "series_id",
     "target_t",
     "gipo_reward_protocol",
+    "reward_anchor_schedule_key",
+    "reward_utility_transform",
+    "reward_metric_weights_json",
+    "train_tuning_fraction",
+    "train_tuning_sampler",
+    "selected_examples_cap",
     "u_comp_uniform",
     "u_alt_uniform",
 )
@@ -44,6 +61,7 @@ def _write_rows(
     target_nfes: tuple[int, ...],
     schedules: tuple[str, ...] = SUPPORT_SCHEDULES,
     contexts: tuple[str, ...] = ("ctx_0", "ctx_1", "ctx_2"),
+    row_overrides: dict[str, object] | None = None,
 ) -> None:
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=ROW_FIELDS)
@@ -51,25 +69,25 @@ def _write_rows(
         for ctx_idx, context_id in enumerate(contexts):
             for target_nfe in target_nfes:
                 for schedule_idx, scheduler_key in enumerate(schedules):
-                    writer.writerow(
-                        {
-                            "benchmark_family": SCENARIO_FAMILY_FORECAST,
-                            "dataset": "private_forecast_dataset",
-                            "split_phase": "train_tuning",
-                            "seed": 0,
-                            "solver_key": "euler",
-                            "target_nfe": target_nfe,
-                            "scheduler_key": scheduler_key,
-                            "context_id": context_id,
-                            "context_embedding_id": context_id,
-                            "checkpoint_id": "",
-                            "series_id": f"series_{ctx_idx}",
-                            "target_t": 100 + ctx_idx,
-                            "gipo_reward_protocol": GIPO_PROTOCOL,
-                            "u_comp_uniform": float(schedule_idx),
-                            "u_alt_uniform": "",
-                        }
-                    )
+                    row = {
+                        "benchmark_family": SCENARIO_FAMILY_FORECAST,
+                        "dataset": "private_forecast_dataset",
+                        "split_phase": "train_tuning",
+                        "seed": 0,
+                        "solver_key": "euler",
+                        "target_nfe": target_nfe,
+                        "scheduler_key": scheduler_key,
+                        "context_id": context_id,
+                        "context_embedding_id": context_id,
+                        "checkpoint_id": "",
+                        "series_id": f"series_{ctx_idx}",
+                        "target_t": 100 + ctx_idx,
+                        **VALID_REWARD_METADATA,
+                        "u_comp_uniform": float(schedule_idx),
+                        "u_alt_uniform": "",
+                    }
+                    row.update(dict(row_overrides or {}))
+                    writer.writerow(row)
 
 
 def _write_embeddings(path: Path, contexts: tuple[str, ...] = ("ctx_0", "ctx_1", "ctx_2")) -> None:
@@ -249,7 +267,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
                                         "checkpoint_id": checkpoint_id,
                                         "series_id": f"series_{ctx_idx}",
                                         "target_t": 100 + ctx_idx,
-                                        "gipo_reward_protocol": GIPO_PROTOCOL,
+                                        **VALID_REWARD_METADATA,
                                         "u_comp_uniform": float(schedule_idx),
                                         "u_alt_uniform": "",
                                     }
@@ -313,7 +331,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
                                         "checkpoint_id": checkpoint_id,
                                         "series_id": f"series_{ctx_idx}",
                                         "target_t": 100 + ctx_idx,
-                                        "gipo_reward_protocol": GIPO_PROTOCOL,
+                                        **VALID_REWARD_METADATA,
                                         "u_comp_uniform": float(schedule_idx),
                                         "u_alt_uniform": "",
                                     }
@@ -398,6 +416,70 @@ class GipoTrainOptionsTests(unittest.TestCase):
         self.assertEqual(coverage["scopes"]["rows_csv"]["metrics"]["u_comp_uniform"]["valid_row_count"], 24)
         self.assertEqual(coverage["scopes"]["rows_csv"]["metrics"]["u_alt_uniform"]["valid_row_count"], 0)
 
+    def test_train_gipo_rejects_utility_rows_with_invalid_reward_metadata(self) -> None:
+        cases = [
+            ({"gipo_reward_protocol": "legacy"}, "gipo_reward_protocol"),
+            ({"reward_anchor_schedule_key": "late_power_3"}, "reward_anchor_schedule_key"),
+            ({"reward_utility_transform": "raw_ratio"}, "reward_utility_transform"),
+            ({"reward_metric_weights_json": ""}, "missing reward_metric_weights_json"),
+            ({"reward_metric_weights_json": "{bad-json"}, "invalid reward_metric_weights_json"),
+            (
+                {"reward_metric_weights_json": json.dumps({"u_alt_uniform": 1.0}, separators=(",", ":"), sort_keys=True)},
+                r"missing=\['u_comp_uniform'\].*unexpected=\['u_alt_uniform'\]",
+            ),
+        ]
+        for overrides, pattern in cases:
+            with self.subTest(overrides=overrides):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    root = Path(tmpdir)
+                    rows_csv = root / "seen.csv"
+                    embeddings_npz = root / "ctx.npz"
+                    _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES, row_overrides=overrides)
+                    _write_embeddings(embeddings_npz)
+
+                    with self.assertRaisesRegex(ValueError, pattern):
+                        train_gipo(_trainer_args(root, rows_csv, embeddings_npz))
+
+    def test_train_gipo_rejects_invalid_generated_train_tuning_provenance(self) -> None:
+        cases = [
+            ({"train_tuning_fraction": 0.30}, r"train_tuning_fraction must be 0\.20"),
+            ({"train_tuning_sampler": "temporal_random"}, "train_tuning_sampler"),
+            (
+                {"selected_examples_cap": CANONICAL_CONTEXT_SAMPLE_COUNT + 1},
+                f"selected_examples_cap must not exceed canonical context cap {CANONICAL_CONTEXT_SAMPLE_COUNT}",
+            ),
+        ]
+        for overrides, pattern in cases:
+            with self.subTest(overrides=overrides):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    root = Path(tmpdir)
+                    rows_csv = root / "seen.csv"
+                    embeddings_npz = root / "ctx.npz"
+                    _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES, row_overrides=overrides)
+                    _write_embeddings(embeddings_npz)
+
+                    with self.assertRaisesRegex(ValueError, pattern):
+                        train_gipo(_trainer_args(root, rows_csv, embeddings_npz))
+
+    def test_train_gipo_rejects_context_sample_count_above_canonical_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            rows_csv = root / "seen.csv"
+            embeddings_npz = root / "ctx.npz"
+            _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES, row_overrides={"selected_examples_cap": ""})
+            _write_embeddings(embeddings_npz)
+
+            with self.assertRaisesRegex(ValueError, "must not exceed canonical GIPO supervision cap"):
+                train_gipo(
+                    _trainer_args(
+                        root,
+                        rows_csv,
+                        embeddings_npz,
+                        "--context_sample_count",
+                        str(CANONICAL_CONTEXT_SAMPLE_COUNT + 1),
+                    )
+                )
+
     def test_train_gipo_rejects_zero_rank_pairs_before_teacher_training(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -423,7 +505,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
                                     "checkpoint_id": "",
                                     "series_id": f"series_{ctx_idx}",
                                     "target_t": 100 + ctx_idx,
-                                    "gipo_reward_protocol": GIPO_PROTOCOL,
+                                    **VALID_REWARD_METADATA,
                                     "u_comp_uniform": 1.0,
                                     "u_alt_uniform": "",
                                 }

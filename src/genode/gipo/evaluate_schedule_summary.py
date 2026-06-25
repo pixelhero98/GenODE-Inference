@@ -298,7 +298,7 @@ def _context_sample_cap(args: argparse.Namespace) -> int:
     return int(cap)
 
 
-def _split_example_cap(args: argparse.Namespace, split_phase: str) -> Tuple[int, str]:
+def _split_example_cap(args: argparse.Namespace, split_phase: str) -> Tuple[int | None, str]:
     context_cap = _context_sample_cap(args)
     if str(split_phase) == TRAIN_TUNING_PHASE:
         return int(context_cap), "context_sample_count"
@@ -308,6 +308,8 @@ def _split_example_cap(args: argparse.Namespace, split_phase: str) -> Tuple[int,
         raise ValueError(f"--{attr} must be nonnegative, got {explicit!r}.")
     if explicit > 0:
         return int(explicit), attr
+    if str(split_phase) == LOCKED_TEST_PHASE:
+        return None, f"{split_phase}_default"
     return int(context_cap), "context_sample_count"
 
 
@@ -1399,10 +1401,11 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                     uncapped_candidate_examples=int(uncapped_candidate_examples),
                 )
             else:
-                chosen = choose_forecast_example_indices(eval_ds, n_examples=int(selected_examples_cap), seed=int(seed))
+                effective_cap = int(selected_examples_cap) if selected_examples_cap is not None else int(len(eval_ds))
+                chosen = choose_forecast_example_indices(eval_ds, n_examples=effective_cap, seed=int(seed))
                 chosen_examples, selection_meta = _cap_context_indices(
                     chosen,
-                    cap=int(selected_examples_cap),
+                    cap=int(effective_cap),
                     seed=int(seed),
                     salt=f"forecast_summary|{args.dataset}|{split_phase}",
                     uncapped_candidate_examples=int(len(eval_ds)),

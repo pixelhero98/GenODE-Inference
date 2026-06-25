@@ -114,7 +114,7 @@ seed)` cells. `context_id` denotes the physical/logical example window, while
 `context_embedding_id` remains checkpoint-scoped because backbone embeddings
 change with checkpoint maturity. Context holdout splits are physical-context
 disjoint across checkpoint maturities, and default context calibration samples
-are capped at 256 unique contexts per scenario, checkpoint maturity, and split.
+are capped at 188 unique contexts per scenario, checkpoint maturity, and split.
 
 SER-PTG summary generation uses the same context cap. With `--val_windows 0`,
 forecast train-tuning, conditional-generation windows, and molecule examples

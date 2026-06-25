@@ -13,6 +13,7 @@ import torch
 
 from genode.canonical_experiment_layout import (
     CANONICAL_CHECKPOINT_STEPS,
+    CANONICAL_CONTEXT_SAMPLE_COUNT,
     CANONICAL_LAYOUT_VERSION,
     CANONICAL_SEEN_NFES,
     NFE_ROLE_SEEN,
@@ -645,7 +646,7 @@ def _context_reward_protocol_payload(cli_args: argparse.Namespace) -> Dict[str, 
 
 
 def _context_sample_cap(cli_args: argparse.Namespace) -> int:
-    cap = int(getattr(cli_args, "context_sample_count", 256))
+    cap = int(getattr(cli_args, "context_sample_count", CANONICAL_CONTEXT_SAMPLE_COUNT))
     if cap <= 0:
         raise ValueError(f"--context_sample_count must be positive, got {cap!r}.")
     return int(cap)
@@ -2804,7 +2805,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--context_sample_count",
         dest="context_sample_count",
         type=int,
-        default=256,
+        default=CANONICAL_CONTEXT_SAMPLE_COUNT,
         help="Train-tuning context budget for GIPO supervision rows; validation/locked-test use eval-window options.",
     )
     ap.add_argument("--write_forecast_context_rows", action="store_true", default=False)

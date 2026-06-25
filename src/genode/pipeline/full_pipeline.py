@@ -210,6 +210,11 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
     family = scenario_family_for_key(dataset)
     if int(args.synthetic_length) <= 0:
         raise ValueError("--synthetic_length must be positive.")
+    if int(args.context_sample_count) <= 0 or int(args.context_sample_count) > CANONICAL_CONTEXT_SAMPLE_COUNT:
+        raise ValueError(
+            "--gipo_supervision_context_sample_count must be in "
+            f"[1, {CANONICAL_CONTEXT_SAMPLE_COUNT}], got {int(args.context_sample_count)!r}."
+        )
     if int(args.ser_calibration_batch_size) <= 0:
         raise ValueError("--ser_calibration_batch_size must be positive.")
     if int(args.ser_val_windows) < 0:

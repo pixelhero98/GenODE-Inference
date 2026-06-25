@@ -1453,8 +1453,6 @@ class GenericContextGipoTests(unittest.TestCase):
                     "--checkpoint_steps",
                     "4000",
                     "--ablation_first",
-                    "--gipo_supervision_context_sample_count",
-                    "256",
                     "--dry_run",
                 ]
             )
@@ -1471,7 +1469,7 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertFalse(any(phase == "validation_tuning" for phase in split_phases))
         for command in schedule_commands:
             if command[command.index("--split_phase") + 1] == "train_tuning":
-                self.assertEqual(command[command.index("--train_tuning_context_sample_count") + 1], "256")
+                self.assertEqual(command[command.index("--train_tuning_context_sample_count") + 1], "188")
             else:
                 self.assertNotIn("--context_sample_count", command)
                 self.assertNotIn("--train_tuning_context_sample_count", command)

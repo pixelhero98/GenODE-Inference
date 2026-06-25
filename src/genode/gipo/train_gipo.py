@@ -22,6 +22,7 @@ from genode.canonical_experiment_layout import (
     scenario_family_for_key,
 )
 from genode.gipo.objectives import (
+    UNIFORM_SCHEDULE_KEY,
     objective_utility_keys_for_family,
     teacher_objective_utility_keys_for_family,
     teacher_objective_utility_keys_for_scenario,
@@ -100,7 +101,7 @@ from genode.gipo.models import (
     validate_setting_feature_mode,
 )
 from genode.data.otflow_paths import resolve_project_path
-from genode.evaluation.otflow_evaluation_support import FORECAST_FAMILY
+from genode.evaluation.otflow_evaluation_support import FORECAST_FAMILY, TRAIN_TUNING_SAMPLER_WINDOW_FRACTION
 from genode.models.otflow_train_val import seed_all
 from genode.runtime import resolve_torch_device
 from genode.solver_protocol import normalize_solver_key
@@ -118,6 +119,8 @@ GIPO_TEACHER_SELECTION_WEIGHT_PROTOCOL = "nominal_effective_axis_weights_v1"
 CANONICAL_TEACHER_RANK_TEMPERATURE = 0.5
 CANONICAL_TEACHER_REGRESSION_WEIGHT = 0.25
 CANONICAL_TEACHER_PAIR_MARGIN = 0.0
+CANONICAL_TRAIN_TUNING_FRACTION = 0.20
+CANONICAL_REWARD_UTILITY_TRANSFORM = "directional_log_uniform_anchor"
 
 
 def _parse_csv(text: str) -> List[str]:
@@ -790,6 +793,106 @@ def _validate_train_tuning_rows(rows: Sequence[Mapping[str, Any]], *, label: str
         raise ValueError(f"{label} requires train_tuning source rows; found {bad_source_phases}.")
 
 
+def _validate_train_tuning_reward_provenance_metadata(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    target_keys: Sequence[str],
+    label: str,
+) -> None:
+    active_target_keys = tuple(str(key) for key in target_keys)
+    active_target_set = set(active_target_keys)
+    for row_idx, row in enumerate(rows):
+        if _source_split_phase(row) == "locked_test" or _raw_split_phase(row) == "locked_test":
+            continue
+        if _source_split_phase(row) and _source_split_phase(row) != "train_tuning":
+            continue
+
+        present_target_keys = [key for key in active_target_keys if _has_nonempty_value(row, key)]
+        if present_target_keys:
+            protocol = str(row.get("gipo_reward_protocol", "")).strip()
+            if protocol != GIPO_PROTOCOL:
+                raise ValueError(
+                    f"{label} row {row_idx} has utility targets but gipo_reward_protocol={protocol!r}; "
+                    f"expected {GIPO_PROTOCOL!r}."
+                )
+            anchor = str(row.get("reward_anchor_schedule_key", "")).strip()
+            if anchor != UNIFORM_SCHEDULE_KEY:
+                raise ValueError(
+                    f"{label} row {row_idx} has utility targets but reward_anchor_schedule_key={anchor!r}; "
+                    f"expected {UNIFORM_SCHEDULE_KEY!r}."
+                )
+            transform = str(row.get("reward_utility_transform", "")).strip()
+            if transform != CANONICAL_REWARD_UTILITY_TRANSFORM:
+                raise ValueError(
+                    f"{label} row {row_idx} has utility targets but reward_utility_transform={transform!r}; "
+                    f"expected {CANONICAL_REWARD_UTILITY_TRANSFORM!r}."
+                )
+            raw_weights = row.get("reward_metric_weights_json", "")
+            if not _has_nonempty_value(row, "reward_metric_weights_json"):
+                raise ValueError(f"{label} row {row_idx} has utility targets but missing reward_metric_weights_json.")
+            try:
+                weight_payload = json.loads(str(raw_weights))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{label} row {row_idx} has invalid reward_metric_weights_json.") from exc
+            if not isinstance(weight_payload, Mapping) or not weight_payload:
+                raise ValueError(f"{label} row {row_idx} reward_metric_weights_json must decode to a non-empty object.")
+            weight_keys = {str(key) for key in weight_payload}
+            present_target_set = set(present_target_keys)
+            missing = sorted(present_target_set - weight_keys)
+            unexpected = sorted(weight_keys - active_target_set)
+            if missing or unexpected:
+                raise ValueError(
+                    f"{label} row {row_idx} reward_metric_weights_json must match active teacher metric targets; "
+                    f"missing={missing}, unexpected={unexpected}."
+                )
+            positive_weight_sum = 0.0
+            for key, value in weight_payload.items():
+                try:
+                    weight = float(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{label} row {row_idx} reward_metric_weights_json values must be numeric.") from exc
+                if not math.isfinite(weight) or weight < 0.0:
+                    raise ValueError(
+                        f"{label} row {row_idx} reward_metric_weights_json values must be finite and nonnegative."
+                    )
+                if str(key) in present_target_set:
+                    positive_weight_sum += float(weight)
+            if positive_weight_sum <= 0.0:
+                raise ValueError(
+                    f"{label} row {row_idx} reward_metric_weights_json must assign positive mass to present targets."
+                )
+
+        if _has_nonempty_value(row, "train_tuning_fraction"):
+            try:
+                fraction = float(row["train_tuning_fraction"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{label} row {row_idx} train_tuning_fraction must be numeric.") from exc
+            if not math.isfinite(fraction) or abs(fraction - CANONICAL_TRAIN_TUNING_FRACTION) > 1e-12:
+                raise ValueError(
+                    f"{label} row {row_idx} train_tuning_fraction must be {CANONICAL_TRAIN_TUNING_FRACTION:.2f}; "
+                    f"found {fraction!r}."
+                )
+        if _has_nonempty_value(row, "train_tuning_sampler"):
+            sampler = str(row.get("train_tuning_sampler", "")).strip()
+            if sampler != TRAIN_TUNING_SAMPLER_WINDOW_FRACTION:
+                raise ValueError(
+                    f"{label} row {row_idx} train_tuning_sampler must be {TRAIN_TUNING_SAMPLER_WINDOW_FRACTION!r}; "
+                    f"found {sampler!r}."
+                )
+        if _has_nonempty_value(row, "selected_examples_cap"):
+            try:
+                cap_value = float(row["selected_examples_cap"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{label} row {row_idx} selected_examples_cap must be numeric.") from exc
+            if not math.isfinite(cap_value) or not cap_value.is_integer() or int(cap_value) <= 0:
+                raise ValueError(f"{label} row {row_idx} selected_examples_cap must be a positive integer.")
+            if int(cap_value) > CANONICAL_CONTEXT_SAMPLE_COUNT:
+                raise ValueError(
+                    f"{label} row {row_idx} selected_examples_cap must not exceed canonical context cap "
+                    f"{CANONICAL_CONTEXT_SAMPLE_COUNT}; found {int(cap_value)}."
+                )
+
+
 def _validate_positive_training_args(args: argparse.Namespace) -> None:
     for name in ("teacher_steps", "student_steps", "teacher_checkpoint_every", "student_checkpoint_every"):
         value = int(getattr(args, name))
@@ -991,6 +1094,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     teacher_metric_target_keys = _resolve_teacher_metric_target_keys(args, rows)
+    _validate_train_tuning_reward_provenance_metadata(
+        rows,
+        target_keys=teacher_metric_target_keys,
+        label="GIPO training rows_csv",
+    )
     explicit_teacher_weights = _parse_float_mapping(str(args.teacher_utility_weights)) if str(args.teacher_utility_weights).strip() else None
     if explicit_teacher_weights is None and teacher_metric_target_keys == ("u_crps_uniform", "u_mase_uniform"):
         explicit_teacher_weights = {
@@ -1043,6 +1151,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     sample_count = int(args.context_sample_count)
     if sample_count <= 0:
         sample_count = recommended_context_calibration_count(len(available_context_ids))
+    if sample_count > CANONICAL_CONTEXT_SAMPLE_COUNT:
+        raise ValueError(
+            "--context_sample_count must not exceed canonical GIPO supervision cap "
+            f"{CANONICAL_CONTEXT_SAMPLE_COUNT}; got {sample_count}."
+        )
     selected_context_keys = _sample_context_keys_by_checkpoint(
         rewarded_rows,
         sample_count=sample_count,
@@ -1111,6 +1224,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
                 "teacher_unseen_selection_rows_csv has no rows after filtering to "
                 f"teacher_unseen_selection_target_nfe_values={unseen_selection_target_nfes}."
             )
+        _validate_train_tuning_reward_provenance_metadata(
+            unseen_filtered_rows,
+            target_keys=teacher_metric_target_keys,
+            label="Teacher unseen selection rows",
+        )
         if _needs_forecast_uniform_rewards(unseen_filtered_rows, teacher_metric_target_keys):
             unseen_rewarded_rows = attach_uniform_gipo_rewards(
                 unseen_filtered_rows,
@@ -1335,6 +1453,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
                 "student_pseudo_rows_csv has no rows after filtering to pseudo_target_nfe_values "
                 f"{pseudo_target_nfes}."
             )
+        _validate_train_tuning_reward_provenance_metadata(
+            pseudo_filtered_rows,
+            target_keys=teacher_metric_target_keys,
+            label="Student pseudo distillation",
+        )
         pseudo_support_keys = _observed_support(pseudo_filtered_rows)
         missing_pseudo_support = sorted(set(support_keys) - set(pseudo_support_keys))
         extra_pseudo_support = sorted(set(pseudo_support_keys) - set(support_keys))
