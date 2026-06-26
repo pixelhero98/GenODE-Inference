@@ -5,8 +5,11 @@ import json
 import re
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
+
+import torch
 
 import genode.evaluation.diffusion_flow_time_reparameterization as runner
 from genode.schedule_transfer.diffusion_flow_schedules import (
@@ -1385,6 +1388,74 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertEqual(rows[0]["selected_examples_cap_source"], "locked_test_default")
         self.assertEqual(rows[0]["uncapped_candidate_examples"], 1000)
         self.assertFalse(rows[0]["selection_was_capped"])
+
+    def test_conditional_context_embedding_export_batches_full_locked_test_windows(self) -> None:
+        class FakeDataset:
+            start_indices = [50, 10, 30, 20, 40]
+
+            def __getitem__(self, idx):
+                t0 = int(self.start_indices[int(idx)])
+                return torch.full((2, 3), float(t0)), torch.zeros(3), {"target_t": t0}
+
+        class FakeCache:
+            def __init__(self, ctx_summary: torch.Tensor) -> None:
+                self.ctx_summary = ctx_summary
+
+        class FakeBackbone(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.batch_shapes = []
+                self.grad_enabled = []
+
+            def precompute(self, hist_batch: torch.Tensor) -> FakeCache:
+                self.batch_shapes.append(tuple(int(dim) for dim in hist_batch.shape))
+                self.grad_enabled.append(bool(torch.is_grad_enabled()))
+                if int(hist_batch.shape[0]) > 2:
+                    raise AssertionError("context embedding export must not precompute the full locked-test set at once")
+                first_value = hist_batch[:, 0, 0].float()
+                return FakeCache(torch.stack([first_value, first_value + 0.5], dim=1))
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.backbone = FakeBackbone()
+
+        model = FakeModel()
+        model.train(True)
+        embeddings = runner._extract_conditional_context_embeddings(
+            model=model,
+            ds=FakeDataset(),
+            chosen_t0s=[50, 10, 30, 20, 40],
+            device=torch.device("cpu"),
+            context_embedding_kind="ctx_summary",
+            batch_size=2,
+        )
+
+        self.assertEqual(model.backbone.batch_shapes, [(2, 2, 3), (2, 2, 3), (1, 2, 3)])
+        self.assertEqual(model.backbone.grad_enabled, [False, False, False])
+        self.assertTrue(model.training)
+        self.assertTrue(model.backbone.training)
+        self.assertEqual(list(embeddings), [50, 10, 30, 20, 40])
+        self.assertEqual(embeddings[50], [50.0, 50.5])
+        self.assertEqual(embeddings[40], [40.0, 40.5])
+
+    def test_conditional_context_embedding_export_batch_size_tracks_physical_batch(self) -> None:
+        self.assertEqual(
+            runner._context_embedding_export_batch_size(SimpleNamespace(batch_size=8)),
+            8,
+        )
+        self.assertEqual(
+            runner._context_embedding_export_batch_size(SimpleNamespace(train=SimpleNamespace(batch_size=2))),
+            2,
+        )
+        self.assertEqual(
+            runner._context_embedding_export_batch_size(SimpleNamespace(batch_size=128)),
+            runner.CONTEXT_EMBEDDING_EXPORT_MAX_BATCH_SIZE,
+        )
+        self.assertEqual(
+            runner._context_embedding_export_batch_size(SimpleNamespace(batch_size=0)),
+            runner.CONTEXT_EMBEDDING_EXPORT_FALLBACK_BATCH_SIZE,
+        )
 
     def test_conditional_generation_context_cap_is_global_across_seeds(self) -> None:
         class FakeDataset:

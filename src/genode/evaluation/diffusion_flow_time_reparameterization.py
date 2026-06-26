@@ -119,6 +119,8 @@ CONTEXT_REWARD_PROTOCOL_VERSION = "conditional_primary_metric_context_rewards_v2
 DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
 DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
+CONTEXT_EMBEDDING_EXPORT_MAX_BATCH_SIZE = 64
+CONTEXT_EMBEDDING_EXPORT_FALLBACK_BATCH_SIZE = 2
 DEFAULT_SCHEDULES: Tuple[str, ...] = BASELINE_SCHEDULE_KEYS
 SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_evaluation_phase_context_capped_v4"
 SUPPORTED_SPLIT_PHASES: Tuple[str, ...] = (LOCKED_TEST_PHASE, VALIDATION_PHASE, TRAIN_TUNING_PHASE)
@@ -1147,6 +1149,32 @@ def _time_bin_for_target(t0: int, chosen_t0s: Sequence[int]) -> str:
     return str(min(9, int(np.floor(10.0 * rank / max(1, values.size)))))
 
 
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _context_embedding_export_batch_size(cfg: Any | None = None) -> int:
+    max_batch_size = _positive_int_or_none(CONTEXT_EMBEDDING_EXPORT_MAX_BATCH_SIZE)
+    fallback_batch_size = _positive_int_or_none(CONTEXT_EMBEDDING_EXPORT_FALLBACK_BATCH_SIZE)
+    if max_batch_size is None or fallback_batch_size is None:
+        raise ValueError(
+            "CONTEXT_EMBEDDING_EXPORT_MAX_BATCH_SIZE and "
+            "CONTEXT_EMBEDDING_EXPORT_FALLBACK_BATCH_SIZE must be positive."
+        )
+    configured_batch_size: Optional[int] = None
+    if cfg is not None:
+        configured_batch_size = _positive_int_or_none(getattr(cfg, "batch_size", None))
+        train_cfg = getattr(cfg, "train", None)
+        if configured_batch_size is None and train_cfg is not None:
+            configured_batch_size = _positive_int_or_none(getattr(train_cfg, "batch_size", None))
+    requested_batch_size = configured_batch_size if configured_batch_size is not None else fallback_batch_size
+    return max(1, min(int(max_batch_size), int(requested_batch_size)))
+
+
 def _extract_conditional_context_embeddings(
     *,
     model: Any,
@@ -1154,25 +1182,50 @@ def _extract_conditional_context_embeddings(
     chosen_t0s: Sequence[int],
     device: torch.device,
     context_embedding_kind: str,
+    batch_size: int | None = None,
 ) -> Dict[int, List[float]]:
     if not chosen_t0s:
         return {}
     backbone = getattr(model, "backbone", None)
     if backbone is None or not hasattr(backbone, "precompute"):
         raise ValueError("context row export requires model.backbone.precompute(hist).")
-    hist_rows = []
-    for t0 in chosen_t0s:
-        hist, _tgt, _fut, _cond, _meta = _parse_batch(_get_dataset_item_by_t(ds, int(t0)))
-        hist_rows.append(hist.float())
-    hist_batch = torch.stack(hist_rows, dim=0).to(device).float()
-    cache = backbone.precompute(hist_batch)
-    if not hasattr(cache, str(context_embedding_kind)):
-        raise ValueError(f"Unknown context_embedding_kind={context_embedding_kind!r}.")
-    embedding_tensor = getattr(cache, str(context_embedding_kind))
-    if not torch.is_tensor(embedding_tensor) or embedding_tensor.ndim != 2:
-        raise ValueError(f"Context embedding {context_embedding_kind!r} must be a rank-2 tensor.")
-    arr = embedding_tensor.detach().cpu().numpy().astype(np.float32)
-    return {int(t0): [float(x) for x in arr[idx].tolist()] for idx, t0 in enumerate(chosen_t0s)}
+    effective_batch_size = int(batch_size) if batch_size is not None else _context_embedding_export_batch_size()
+    if effective_batch_size <= 0:
+        raise ValueError(f"context embedding export batch_size must be positive, got {effective_batch_size!r}.")
+    model_was_training = bool(getattr(model, "training", False))
+    model_eval = getattr(model, "eval", None)
+    model_train = getattr(model, "train", None)
+    if callable(model_eval):
+        model_eval()
+    out: Dict[int, List[float]] = {}
+    try:
+        with torch.no_grad():
+            chosen = [int(t0) for t0 in chosen_t0s]
+            for start in range(0, len(chosen), effective_batch_size):
+                batch_t0s = chosen[start : start + effective_batch_size]
+                hist_rows = []
+                for t0 in batch_t0s:
+                    hist, _tgt, _fut, _cond, _meta = _parse_batch(_get_dataset_item_by_t(ds, int(t0)))
+                    hist_rows.append(hist.float())
+                hist_batch = torch.stack(hist_rows, dim=0).to(device).float()
+                cache = backbone.precompute(hist_batch)
+                if not hasattr(cache, str(context_embedding_kind)):
+                    raise ValueError(f"Unknown context_embedding_kind={context_embedding_kind!r}.")
+                embedding_tensor = getattr(cache, str(context_embedding_kind))
+                if not torch.is_tensor(embedding_tensor) or embedding_tensor.ndim != 2:
+                    raise ValueError(f"Context embedding {context_embedding_kind!r} must be a rank-2 tensor.")
+                if int(embedding_tensor.shape[0]) != len(batch_t0s):
+                    raise ValueError(
+                        f"Context embedding {context_embedding_kind!r} returned {int(embedding_tensor.shape[0])} "
+                        f"rows for {len(batch_t0s)} requested windows."
+                    )
+                arr = embedding_tensor.detach().cpu().numpy().astype(np.float32)
+                for idx, t0 in enumerate(batch_t0s):
+                    out[int(t0)] = [float(x) for x in arr[idx].tolist()]
+    finally:
+        if callable(model_train):
+            model_train(model_was_training)
+    return out
 
 
 def _conditional_context_records(
@@ -2145,6 +2198,7 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 chosen_t0s=[int(x) for x in chosen_eval_t0s.tolist()],
                                 device=device,
                                 context_embedding_kind=str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
+                                batch_size=_context_embedding_export_batch_size(cfg),
                             )
                         for case in pending_cases:
                             scheduler_key = str(case["scheduler_key"])
