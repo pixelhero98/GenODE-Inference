@@ -42,6 +42,7 @@ from genode.backbone_packages import (
     backbone_package_protocol_payload,
     validate_provided_backbone_manifest,
 )
+from genode.evaluation import diffusion_flow_time_reparameterization as schedule_runner
 from genode.evaluation.diffusion_flow_time_reparameterization import SCHEDULE_CONTEXT_SELECTION_PROTOCOL
 from genode.gipo.objectives import teacher_metric_profile_for_scenario, teacher_objective_specs_for_scenario
 from genode.gipo.ser_ptg_reference import SER_PTG_EXAMPLE_SELECTION_PROTOCOL, SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL
@@ -441,7 +442,9 @@ def _validate_run_root(run_root: Path, protocol_hash: str, *, resume: bool, over
         return
     existing_hash = str(existing.get("protocol_hash", "") or "")
     if existing_hash == str(protocol_hash):
-        return
+        if bool(resume) or bool(overwrite):
+            return
+        raise ValueError(f"Run root {run_root} already has status.json; pass --resume or --overwrite explicitly.")
     if bool(overwrite):
         return
     if bool(resume):
@@ -453,6 +456,171 @@ def _validate_run_root(run_root: Path, protocol_hash: str, *, resume: bool, over
 
 def _python_module_command(module: str, args: Iterable[str]) -> List[str]:
     return [sys.executable, "-m", module, *[str(value) for value in args]]
+
+
+def _command_hash(command: Sequence[str]) -> str:
+    encoded = json.dumps([str(part) for part in command], sort_keys=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _command_module_args(command: Sequence[str], module: str) -> List[str] | None:
+    parts = [str(part) for part in command]
+    if module not in parts:
+        return None
+    idx = parts.index(module)
+    if idx < 1 or parts[idx - 1] != "-m":
+        return None
+    return parts[idx + 1 :]
+
+
+def _command_arg_value(command: Sequence[str], name: str) -> str:
+    parts = [str(part) for part in command]
+    if str(name) not in parts:
+        return ""
+    idx = parts.index(str(name))
+    if idx + 1 >= len(parts):
+        raise ValueError(f"{name} is missing a value in command: {' '.join(parts)}")
+    return parts[idx + 1]
+
+
+def _schedule_row_command_status(command: Sequence[str]) -> Dict[str, Any] | None:
+    runner_args = _command_module_args(command, "genode.evaluation.diffusion_flow_time_reparameterization")
+    if runner_args is None:
+        return None
+    parsed = schedule_runner.build_argparser().parse_args(runner_args)
+    return schedule_runner.schedule_row_output_status(resolve_project_path(str(parsed.out_root)), parsed)
+
+
+def _command_json_output_exists(command: Sequence[str], *, module: str, out_arg: str, relative_path: str) -> Tuple[bool, str]:
+    if _command_module_args(command, module) is None:
+        return True, ""
+    out_dir = _command_arg_value(command, out_arg)
+    if not out_dir:
+        return False, f"missing {out_arg} in {module} command"
+    path = resolve_project_path(out_dir) / relative_path
+    if not path.exists():
+        return False, f"missing expected artifact: {path}"
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return False, f"invalid JSON artifact {path}: {exc}"
+    return True, ""
+
+
+def _command_path_exists(command: Sequence[str], *, module: str, out_arg: str, relative_path: str) -> Tuple[bool, str]:
+    if _command_module_args(command, module) is None:
+        return True, ""
+    out_dir = _command_arg_value(command, out_arg)
+    if not out_dir:
+        return False, f"missing {out_arg} in {module} command"
+    path = resolve_project_path(out_dir) / relative_path
+    if not path.exists():
+        return False, f"missing expected artifact: {path}"
+    return True, ""
+
+
+def _stage_outputs_complete(entry: StageCommand) -> Tuple[bool, str]:
+    for command in entry.commands:
+        schedule_status = _schedule_row_command_status(command)
+        if schedule_status is not None and not bool(schedule_status.get("complete", False)):
+            return False, str(schedule_status.get("reason", "schedule-row output is incomplete"))
+        ok, reason = _command_json_output_exists(
+            command,
+            module="genode.gipo.ser_ptg_reference",
+            out_arg="--out_dir",
+            relative_path="ser_ptg_schedule_summary.json",
+        )
+        if not ok:
+            return False, reason
+        ok, reason = _command_json_output_exists(
+            command,
+            module="genode.gipo.train_gipo",
+            out_arg="--out_dir",
+            relative_path="gipo_training_summary.json",
+        )
+        if not ok:
+            return False, reason
+        ok, reason = _command_path_exists(
+            command,
+            module="genode.gipo.train_gipo",
+            out_arg="--out_dir",
+            relative_path="gipo_student.pt",
+        )
+        if not ok:
+            return False, reason
+        ok, reason = _command_json_output_exists(
+            command,
+            module="genode.gipo.report_locked_test",
+            out_arg="--out_dir",
+            relative_path="locked_test_gipo_policy_summary.json",
+        )
+        if not ok:
+            return False, reason
+        for relative_path in (
+            "locked_test_gipo_rows.csv",
+            "locked_test_gipo_aggregate_rows.csv",
+            "locked_test_gipo_decisions.csv",
+        ):
+            ok, reason = _command_path_exists(
+                command,
+                module="genode.gipo.report_locked_test",
+                out_arg="--out_dir",
+                relative_path=relative_path,
+            )
+            if not ok:
+                return False, reason
+    return True, ""
+
+
+def _stage_manifest_complete(run_root: Path, entry: StageCommand, *, protocol_hash: str) -> Tuple[bool, str]:
+    path = run_root / entry.manifest_name
+    if not path.exists():
+        return False, f"missing stage manifest: {path}"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return False, f"invalid stage manifest {path}: {exc}"
+    if str(manifest.get("status", "")) != "complete":
+        return False, f"stage manifest status is {manifest.get('status')!r}"
+    if str(manifest.get("stage", "")) != str(entry.stage):
+        return False, f"stage manifest is for {manifest.get('stage')!r}, expected {entry.stage!r}"
+    if str(manifest.get("protocol_hash", "")) != str(protocol_hash):
+        return False, "stage manifest protocol hash does not match"
+    expected_hashes = [_command_hash(command) for command in entry.commands]
+    manifest_hashes = manifest.get("command_hashes")
+    if manifest_hashes is not None and list(manifest_hashes) != expected_hashes:
+        return False, "stage command hashes do not match"
+    manifest_commands = manifest.get("commands")
+    if manifest_hashes is None and isinstance(manifest_commands, list):
+        if len(manifest_commands) != len(entry.commands):
+            return False, "stage command count does not match"
+        displayed = [_display_command(command) for command in entry.commands]
+        if manifest_commands and manifest_commands != displayed:
+            # Older manifests did not record raw command hashes. A matching protocol hash plus
+            # command count is enough to support legacy resume across equivalent displayed paths.
+            pass
+    results = list(manifest.get("command_results", []))
+    if len(results) != len(entry.commands):
+        return False, "stage command_results are incomplete"
+    for idx, result in enumerate(results):
+        if int(result.get("command_index", -1)) != int(idx):
+            return False, f"stage command_result index mismatch at {idx}"
+        if int(result.get("returncode", -1)) != 0:
+            return False, f"stage command {idx} did not complete successfully"
+    outputs_complete, reason = _stage_outputs_complete(entry)
+    if not outputs_complete:
+        return False, reason
+    return True, ""
+
+
+def _resume_completed_prefix(run_root: Path, commands: Sequence[StageCommand], *, protocol_hash: str) -> List[StageCommand]:
+    completed: List[StageCommand] = []
+    for entry in commands:
+        is_complete, _reason = _stage_manifest_complete(run_root, entry, protocol_hash=protocol_hash)
+        if not is_complete:
+            break
+        completed.append(entry)
+    return completed
 
 
 def _fixed_schedule_keys_for_runner(schedule_keys: Sequence[str]) -> List[str]:
@@ -905,7 +1073,15 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     _validate_run_root(run_root, protocol_hash, resume=bool(args.resume), overwrite=bool(args.overwrite))
     commands = _build_stage_commands(args, run_root)
     has_ablation_stage = _has_ablation_stage(commands)
-    if has_ablation_stage:
+    skipped_entries = _resume_completed_prefix(run_root, commands, protocol_hash=protocol_hash) if bool(args.resume) and not bool(args.overwrite) else []
+    skipped_stage_names = [entry.stage for entry in skipped_entries]
+    commands_to_run = list(commands[len(skipped_entries) :])
+    should_write_ablation_manifest = has_ablation_stage and (
+        not (bool(args.resume) and not bool(args.overwrite))
+        or _has_ablation_stage(commands_to_run)
+        or bool(args.dry_run)
+    )
+    if should_write_ablation_manifest:
         ablation_manifest = _build_ablation_manifest(
             args,
             run_root,
@@ -922,17 +1098,19 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             "protocol_hash": protocol_hash,
             "run_root": _display_path(run_root),
             "stages": [entry.stage for entry in commands],
-            "completed_stages": [],
+            "completed_stages": list(skipped_stage_names),
+            "skipped_stages": list(skipped_stage_names),
             "dry_run": bool(args.dry_run),
             "preflight": preflight,
         },
     )
-    completed: List[str] = []
-    for entry in commands:
+    completed: List[str] = list(skipped_stage_names)
+    for entry in commands_to_run:
         manifest = {
             "stage": entry.stage,
             "protocol_hash": protocol_hash,
             "commands": [_display_command(command) for command in entry.commands],
+            "command_hashes": [_command_hash(command) for command in entry.commands],
             "dry_run": bool(args.dry_run),
             "command_results": [],
         }
@@ -942,6 +1120,45 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                     raise RuntimeError(f"Unresolved internal pipeline command in non-dry-run: {_display_command(command)}")
                 log_path = run_root / "logs" / f"{entry.stage}_{command_idx}.log"
                 log_path.parent.mkdir(parents=True, exist_ok=True)
+                schedule_status = _schedule_row_command_status(command)
+                if schedule_status is not None and bool(schedule_status.get("complete", False)):
+                    command_result = {
+                        "command_index": int(command_idx),
+                        "returncode": 0,
+                        "log_path": str(log_path.relative_to(run_root)),
+                        "skipped": True,
+                        "skip_reason": "schedule-row output already complete",
+                    }
+                    manifest["command_results"].append(command_result)
+                    continue
+                if schedule_status is not None and bool(schedule_status.get("protocol_mismatch", False)) and bool(args.resume):
+                    manifest["command_results"].append(
+                        {
+                            "command_index": int(command_idx),
+                            "returncode": 2,
+                            "log_path": str(log_path.relative_to(run_root)),
+                            "error": str(schedule_status.get("reason", "protocol mismatch")),
+                        }
+                    )
+                    manifest["status"] = "failed"
+                    _write_json(run_root / entry.manifest_name, manifest)
+                    _write_json(
+                        _status_path(run_root),
+                        {
+                            "version": PIPELINE_VERSION,
+                            "status": "failed",
+                            "failed_stage": entry.stage,
+                            "failed_command_index": int(command_idx),
+                            "protocol_hash": protocol_hash,
+                            "completed_stages": completed,
+                            "skipped_stages": list(skipped_stage_names),
+                            "failure_reason": str(schedule_status.get("reason", "protocol mismatch")),
+                        },
+                    )
+                    raise RuntimeError(
+                        "Cannot resume schedule-row command with incompatible row-level protocol; "
+                        f"{schedule_status.get('reason', 'protocol mismatch')}"
+                    )
                 with log_path.open("w", encoding="utf-8") as log_fh:
                     result = subprocess.run(command, stdout=log_fh, stderr=subprocess.STDOUT, check=False)
                 command_result = {
@@ -978,6 +1195,7 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                             "failed_command_index": int(command_idx),
                             "protocol_hash": protocol_hash,
                             "completed_stages": completed,
+                            "skipped_stages": list(skipped_stage_names),
                         },
                     )
                     raise RuntimeError(f"Pipeline stage {entry.stage!r} failed; see {log_path}.")
@@ -991,6 +1209,7 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 "status": "dry_run" if bool(args.dry_run) else "running",
                 "protocol_hash": protocol_hash,
                 "completed_stages": completed,
+                "skipped_stages": list(skipped_stage_names),
                 "remaining_stages": [cmd.stage for cmd in commands if cmd.stage not in set(completed)],
             },
         )
@@ -1000,12 +1219,15 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         "protocol_hash": protocol_hash,
         "stage_count": int(len(commands)),
         "stages": [_display_stage(entry) for entry in commands],
+        "completed_stages": [entry.stage for entry in commands],
+        "skipped_stages": list(skipped_stage_names),
+        "executed_stages": [entry.stage for entry in commands_to_run],
         "run_root": _display_path(run_root),
         "preflight": preflight,
     }
     _write_json(run_root / "pipeline_summary.json", summary)
     _write_json(_status_path(run_root), summary)
-    if has_ablation_stage:
+    if should_write_ablation_manifest:
         final_ablation_manifest = _build_ablation_manifest(
             args,
             run_root,

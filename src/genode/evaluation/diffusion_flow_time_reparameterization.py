@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -1042,6 +1043,16 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
         _write_row_csv(csv_path, list(rows_by_key.values()))
     context_rows_by_signature = _load_context_rows(context_csv_path) if can_resume else {}
     existing_context_embeddings = load_context_embedding_table(context_embeddings_path) if can_resume and context_embeddings_path.exists() else {}
+    if can_resume and _write_context_rows_enabled(cli_args):
+        rows_by_key = {
+            key: row
+            for key, row in rows_by_key.items()
+            if _row_has_complete_context_artifacts(
+                row,
+                context_rows_by_signature=context_rows_by_signature,
+                context_embeddings=existing_context_embeddings,
+            )
+        }
     if context_rows_by_signature:
         _write_context_row_csv(context_csv_path, list(context_rows_by_signature.values()))
     return {
@@ -1058,6 +1069,57 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
         "context_embedding_coverage": {},
         "protocol_hash": protocol_hash,
     }
+
+
+def _context_row_compatible(existing: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
+    for field in (
+        "protocol_hash",
+        "parent_row_signature",
+        "context_id",
+        "context_embedding_id",
+        "dataset",
+        "split_phase",
+        "seed",
+        "solver_key",
+        "target_nfe",
+        "scheduler_key",
+        "checkpoint_id",
+    ):
+        old_value = existing.get(field, "")
+        new_value = new.get(field, "")
+        if old_value in (None, "") or new_value in (None, ""):
+            continue
+        if str(old_value) != str(new_value):
+            return False
+    return True
+
+
+def _row_has_complete_context_artifacts(
+    row: Mapping[str, Any],
+    *,
+    context_rows_by_signature: Mapping[str, Mapping[str, Any]],
+    context_embeddings: Mapping[str, Any],
+) -> bool:
+    if str(row.get("row_status", "")) != "complete":
+        return False
+    parent = str(row.get("row_signature", "") or "").strip()
+    if not parent:
+        return False
+    protocol_hash = str(row.get("protocol_hash", "") or "")
+    rows_for_parent = [
+        context_row
+        for context_row in context_rows_by_signature.values()
+        if str(context_row.get("parent_row_signature", "") or "").strip() == parent
+        and str(context_row.get("protocol_hash", "") or "") == protocol_hash
+    ]
+    expected = _expected_context_rows_for_parent(row)
+    if expected is None or len(rows_for_parent) < expected:
+        return False
+    return all(
+        not str(context_row.get("context_embedding_id", "") or "").strip()
+        or str(context_row.get("context_embedding_id", "") or "").strip() in context_embeddings
+        for context_row in rows_for_parent
+    )
 
 
 def _append_row_record(row_recorder: Mapping[str, Any], row: Mapping[str, Any]) -> None:
@@ -1079,14 +1141,19 @@ def _append_context_records(
     if not rows and not context_embeddings:
         return
     rows_by_signature = row_recorder["context_rows_by_signature"]
+    added_row_count = 0
     for row in rows:
         signature = str(row.get("row_signature", "")).strip()
         if not signature:
             continue
         if signature in rows_by_signature:
-            raise ValueError(f"Duplicate context row signature while appending context artifacts: {signature}")
+            if not _context_row_compatible(rows_by_signature[signature], row):
+                raise ValueError(f"Context row collision for {signature!r} with different values/protocol.")
+            continue
         rows_by_signature[signature] = dict(row)
+        added_row_count += 1
     existing_embeddings = row_recorder["context_embeddings"]
+    added_embedding_count = 0
     for key, value in context_embeddings.items():
         key_text = str(key)
         new_vec = np.asarray(value, dtype=np.float32)
@@ -1096,6 +1163,7 @@ def _append_context_records(
                 raise ValueError(f"Context embedding collision for {key_text!r} with different vector/protocol.")
             continue
         existing_embeddings[key_text] = new_vec.astype(float).tolist()
+        added_embedding_count += 1
     missing_embeddings = sorted(
         {
             str(row.get("context_embedding_id", "") or "").strip()
@@ -1123,8 +1191,8 @@ def _append_context_records(
             "embedding_count": 0,
         },
     )
-    coverage["row_count"] = int(coverage.get("row_count", 0)) + int(len(rows))
-    coverage["embedding_count"] = int(coverage.get("embedding_count", 0)) + int(len(context_embeddings))
+    coverage["row_count"] = int(coverage.get("row_count", 0)) + int(added_row_count)
+    coverage["embedding_count"] = int(coverage.get("embedding_count", 0)) + int(added_embedding_count)
     row_recorder["context_embedding_metadata"] = {
         "coverage": sorted(row_recorder["context_embedding_coverage"].values(), key=lambda item: tuple(str(item.get(field, "")) for field in ("benchmark_family", "dataset", "checkpoint_id", "split_phase", "context_schema"))),
     }
@@ -1450,6 +1518,306 @@ def _pending_scheduler_cases(
         else:
             existing.append(row)
     return existing, pending
+
+
+def _scheduler_case_matches_command(
+    case: Mapping[str, Any],
+    *,
+    solver_key: str,
+    target_nfe: int,
+    checkpoint_step: int,
+) -> bool:
+    case_solver = str(case.get("solver_key", "") or "")
+    if case_solver and case_solver != str(solver_key):
+        return False
+    case_target_nfe = case.get("target_nfe", "")
+    if case_target_nfe not in ("", None) and int(case_target_nfe) != int(target_nfe):
+        return False
+    case_checkpoint_step = case.get("checkpoint_step", "")
+    if case_checkpoint_step not in ("", None) and int(case_checkpoint_step) != int(checkpoint_step):
+        return False
+    return True
+
+
+def _schedule_row_resume_identity(
+    *,
+    benchmark_family: str,
+    dataset: str,
+    split_phase: str,
+    seed: int,
+    checkpoint_step: int,
+    target_nfe: int,
+    solver_key: str,
+    scheduler_key: str,
+    member_key: str = "",
+    stratum: str = "",
+) -> Tuple[Any, ...]:
+    return (
+        str(benchmark_family),
+        str(dataset),
+        str(member_key),
+        str(stratum),
+        str(split_phase),
+        int(seed),
+        int(checkpoint_step),
+        int(target_nfe),
+        str(solver_key),
+        str(scheduler_key),
+    )
+
+
+def _schedule_row_resume_identity_from_row(row: Mapping[str, Any]) -> Tuple[Any, ...]:
+    return _schedule_row_resume_identity(
+        benchmark_family=str(row.get("benchmark_family", "")),
+        dataset=str(row.get("dataset", row.get("scenario_key", ""))),
+        member_key=str(row.get("member_key", "") or ""),
+        stratum=str(row.get("stratum", "") or ""),
+        split_phase=str(row.get("split_phase", "")),
+        seed=int(row.get("seed", -1)),
+        checkpoint_step=int(row.get("checkpoint_step", -1)),
+        target_nfe=int(row.get("target_nfe", -1)),
+        solver_key=str(row.get("solver_key", "")),
+        scheduler_key=str(row.get("scheduler_key", "")),
+    )
+
+
+def _expected_schedule_row_identities(cli_args: argparse.Namespace) -> Tuple[Tuple[Any, ...], ...]:
+    split_phase = str(cli_args.split_phase)
+    selected_seeds = parse_int_csv(str(cli_args.seeds))
+    target_nfes = _target_nfe_values_for_args(cli_args)
+    checkpoint_steps = _checkpoint_steps_for_args(cli_args)
+    solver_keys = list(normalize_solver_keys(str(cli_args.solver_names)))
+    summary_requested = bool(str(getattr(cli_args, "schedule_summary_json", "")).strip() or str(getattr(cli_args, "summary_scheduler_names", "")).strip())
+    identities: set[Tuple[Any, ...]] = set()
+
+    def add_identities_for_dataset(
+        *,
+        benchmark_family: str,
+        dataset: str,
+        scheduler_cases: Sequence[Mapping[str, Any]],
+        member_key: str = "",
+        stratum: str = "",
+    ) -> None:
+        for checkpoint_step in checkpoint_steps:
+            for seed in selected_seeds:
+                for target_nfe in target_nfes:
+                    for solver_key in solver_keys:
+                        for case in scheduler_cases:
+                            if not _scheduler_case_matches_command(
+                                case,
+                                solver_key=str(solver_key),
+                                target_nfe=int(target_nfe),
+                                checkpoint_step=int(checkpoint_step),
+                            ):
+                                continue
+                            identities.add(
+                                _schedule_row_resume_identity(
+                                    benchmark_family=benchmark_family,
+                                    dataset=str(dataset),
+                                    member_key=member_key,
+                                    stratum=stratum,
+                                    split_phase=split_phase,
+                                    seed=int(seed),
+                                    checkpoint_step=int(checkpoint_step),
+                                    target_nfe=int(target_nfe),
+                                    solver_key=str(solver_key),
+                                    scheduler_key=str(case["scheduler_key"]),
+                                )
+                            )
+
+    forecast_datasets = parse_forecast_datasets(str(cli_args.forecast_datasets))
+    if forecast_datasets:
+        cases_by_dataset = _scheduler_cases_for_datasets(cli_args, list(forecast_datasets), include_summary_cases=True)
+        for dataset in forecast_datasets:
+            add_identities_for_dataset(
+                benchmark_family=FORECAST_FAMILY,
+                dataset=str(dataset),
+                scheduler_cases=cases_by_dataset[str(dataset)],
+            )
+
+    conditional_generation_datasets = parse_conditional_generation_datasets(str(cli_args.conditional_generation_datasets))
+    if conditional_generation_datasets:
+        cases_by_dataset = _scheduler_cases_for_datasets(
+            cli_args,
+            list(conditional_generation_datasets),
+            include_summary_cases=summary_requested,
+        )
+        for dataset in conditional_generation_datasets:
+            add_identities_for_dataset(
+                benchmark_family=CONDITIONAL_GENERATION_FAMILY,
+                dataset=str(dataset),
+                scheduler_cases=cases_by_dataset[str(dataset)],
+            )
+
+    molecule_datasets = parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", "")))
+    if molecule_datasets:
+        cases_by_dataset = _scheduler_cases_for_datasets(
+            cli_args,
+            list(molecule_datasets),
+            include_summary_cases=summary_requested,
+        )
+        group_root = resolve_project_path(str(getattr(cli_args, "molecule_group_root", default_molecule_group_root())))
+        for dataset in molecule_datasets:
+            group_manifest = load_molecule_group_manifest(str(dataset), group_root)
+            members = [dict(member) for member in trainable_molecule_group_members(group_manifest)]
+            if not members:
+                raise ValueError(f"Molecule group {dataset!r} has no trainable fixed-shape members.")
+            for member in members:
+                add_identities_for_dataset(
+                    benchmark_family=SCENARIO_FAMILY_MOLECULE,
+                    dataset=str(dataset),
+                    member_key=str(member["member_key"]),
+                    stratum=str(member["stratum"]),
+                    scheduler_cases=cases_by_dataset[str(dataset)],
+                )
+    return tuple(sorted(identities, key=lambda item: tuple(str(part) for part in item)))
+
+
+def _positive_int_field(row: Mapping[str, Any], field: str) -> Optional[int]:
+    value = row.get(field)
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _expected_context_rows_for_parent(row: Mapping[str, Any]) -> Optional[int]:
+    for field in ("selected_examples", "eval_examples", "eval_windows", "num_eval_samples"):
+        parsed = _positive_int_field(row, field)
+        if parsed is not None:
+            return int(parsed)
+    return None
+
+
+def _schedule_context_outputs_complete(
+    *,
+    out_root: Path,
+    cli_args: argparse.Namespace,
+    complete_rows: Sequence[Mapping[str, Any]],
+    protocol_hash: str,
+) -> Tuple[bool, str]:
+    if not _write_context_rows_enabled(cli_args):
+        return True, ""
+    context_csv_path = out_root / _context_row_csv_name(cli_args)
+    context_embeddings_path = out_root / _context_embeddings_npz_name(cli_args)
+    if not context_csv_path.exists():
+        return False, f"missing context row CSV: {context_csv_path}"
+    if not context_embeddings_path.exists():
+        return False, f"missing context embedding table: {context_embeddings_path}"
+    context_rows = [
+        row
+        for row in _load_context_rows(context_csv_path).values()
+        if str(row.get("protocol_hash", "")) == str(protocol_hash)
+    ]
+    context_rows_by_parent: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for row in context_rows:
+        parent = str(row.get("parent_row_signature", "") or "").strip()
+        if parent:
+            context_rows_by_parent[parent].append(row)
+    missing_parent_contexts: List[str] = []
+    short_parent_contexts: List[str] = []
+    for row in complete_rows:
+        parent = str(row.get("row_signature", "") or "").strip()
+        if not parent:
+            return False, "complete row is missing row_signature"
+        rows_for_parent = context_rows_by_parent.get(parent, [])
+        if not rows_for_parent:
+            missing_parent_contexts.append(parent)
+            continue
+        expected = _expected_context_rows_for_parent(row)
+        if expected is None:
+            return False, f"cannot prove expected context row count for parent {parent}"
+        if len(rows_for_parent) < expected:
+            short_parent_contexts.append(f"{parent}:{len(rows_for_parent)}/{expected}")
+    if missing_parent_contexts:
+        return False, f"missing context rows for parents: {missing_parent_contexts[:8]}"
+    if short_parent_contexts:
+        return False, f"incomplete context rows for parents: {short_parent_contexts[:8]}"
+    embeddings = load_context_embedding_table(context_embeddings_path)
+    missing_embeddings = sorted(
+        {
+            str(row.get("context_embedding_id", "") or "").strip()
+            for row in context_rows
+            if str(row.get("context_embedding_id", "") or "").strip()
+            and str(row.get("context_embedding_id", "") or "").strip() not in embeddings
+        }
+    )
+    if missing_embeddings:
+        return False, f"missing context embeddings: {missing_embeddings[:8]}"
+    return True, ""
+
+
+def schedule_row_output_status(out_root: Path, cli_args: argparse.Namespace) -> Dict[str, Any]:
+    out_root = resolve_project_path(str(out_root))
+    protocol_hash = _protocol_config_fingerprint(cli_args)
+    run_config_path = out_root / "run_config.json"
+    if not run_config_path.exists():
+        return {"complete": False, "reason": f"missing run_config.json: {run_config_path}"}
+    previous_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+    previous_hash = str(previous_config.get("protocol_hash", "") or "")
+    if previous_hash != str(protocol_hash):
+        return {
+            "complete": False,
+            "protocol_mismatch": True,
+            "reason": f"protocol hash mismatch: previous={previous_hash}, current={protocol_hash}",
+        }
+    try:
+        expected_ids = set(_expected_schedule_row_identities(cli_args))
+    except Exception as exc:
+        return {"complete": False, "reason": f"cannot compute expected schedule rows: {exc}"}
+    if not expected_ids:
+        return {"complete": False, "reason": "no expected schedule rows"}
+    rows_by_key = _load_rows(out_root / str(getattr(cli_args, "row_jsonl_name", "rows.jsonl")), protocol_hash=str(protocol_hash))
+    complete_rows = [row for row in rows_by_key.values() if str(row.get("row_status")) == "complete"]
+    actual_ids = {_schedule_row_resume_identity_from_row(row) for row in complete_rows}
+    missing_ids = sorted(expected_ids - actual_ids, key=lambda item: tuple(str(part) for part in item))
+    if missing_ids:
+        return {
+            "complete": False,
+            "reason": f"missing complete rows: {len(missing_ids)}/{len(expected_ids)}",
+            "expected_row_count": int(len(expected_ids)),
+            "complete_row_count": int(len(actual_ids & expected_ids)),
+            "missing_examples": [list(item) for item in missing_ids[:8]],
+        }
+    combined_summary_path = out_root / "combined_summary.json"
+    if not combined_summary_path.exists():
+        return {"complete": False, "reason": f"missing combined_summary.json: {combined_summary_path}"}
+    try:
+        combined = json.loads(combined_summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {"complete": False, "reason": f"invalid combined_summary.json: {exc}"}
+    summary_count = combined.get("main_table_summary", {}).get("row_count")
+    if summary_count is None:
+        summary_count = combined.get("row_count")
+    if summary_count is None or int(summary_count) < len(expected_ids):
+        return {
+            "complete": False,
+            "reason": f"combined_summary row_count is incomplete: {summary_count}/{len(expected_ids)}",
+            "expected_row_count": int(len(expected_ids)),
+            "complete_row_count": int(len(actual_ids & expected_ids)),
+        }
+    context_complete, context_reason = _schedule_context_outputs_complete(
+        out_root=out_root,
+        cli_args=cli_args,
+        complete_rows=[row for row in complete_rows if _schedule_row_resume_identity_from_row(row) in expected_ids],
+        protocol_hash=str(protocol_hash),
+    )
+    if not context_complete:
+        return {
+            "complete": False,
+            "reason": context_reason,
+            "expected_row_count": int(len(expected_ids)),
+            "complete_row_count": int(len(actual_ids & expected_ids)),
+        }
+    return {
+        "complete": True,
+        "reason": "complete",
+        "expected_row_count": int(len(expected_ids)),
+        "complete_row_count": int(len(actual_ids & expected_ids)),
+    }
 
 
 def _choose_molecule_indices(ds: Any, *, count: int, seed: int) -> List[int]:

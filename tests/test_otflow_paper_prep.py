@@ -368,6 +368,157 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             recorder_changed["fh"].close()
             self.assertEqual(row_path.read_text(encoding="utf-8"), "")
 
+    def test_row_recorder_same_protocol_resume_preserves_rows_jsonl(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--target_nfe_values",
+                    "4",
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            protocol_hash = recorder["protocol_hash"]
+            first = {
+                "protocol_hash": protocol_hash,
+                "benchmark_family": "temporal_extrapolation",
+                "split_phase": "locked_test",
+                "seed": 0,
+                "dataset": "traffic_hourly",
+                "target_nfe": 4,
+                "solver_key": "euler",
+                "scheduler_key": "uniform",
+                "row_signature": "sig-a",
+                "row_status": "complete",
+            }
+            runner._append_row_record(recorder, first)
+            recorder["fh"].close()
+
+            resumed = runner._init_row_recorder(Path(tmpdir), args)
+            self.assertIn(runner._row_key(first), resumed["rows_by_key"])
+            second = dict(first, scheduler_key="late_power_3", row_signature="sig-b")
+            runner._append_row_record(resumed, second)
+            resumed["fh"].close()
+
+            lines = [line for line in (Path(tmpdir) / "rows.jsonl").read_text(encoding="utf-8").splitlines() if line]
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(json.loads(lines[0])["row_signature"], "sig-a")
+            self.assertEqual(json.loads(lines[1])["row_signature"], "sig-b")
+
+    def test_row_recorder_resume_does_not_skip_parent_with_incomplete_context_artifacts(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "traffic_hourly",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--target_nfe_values",
+                    "4",
+                    "--solver_names",
+                    "euler",
+                    "--seeds",
+                    "0",
+                    "--checkpoint_steps",
+                    "4000",
+                    "--split_phase",
+                    "locked_test",
+                    "--write_context_rows",
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            protocol_hash = recorder["protocol_hash"]
+            parent = {
+                "protocol_hash": protocol_hash,
+                "benchmark_family": "temporal_extrapolation",
+                "split_phase": "locked_test",
+                "seed": 0,
+                "dataset": "traffic_hourly",
+                "checkpoint_step": 4000,
+                "target_nfe": 4,
+                "solver_key": "euler",
+                "scheduler_key": "uniform",
+                "row_signature": "parent-a",
+                "row_status": "complete",
+                "selected_examples": 2,
+            }
+            runner._append_row_record(recorder, parent)
+            runner._write_context_row_csv(
+                Path(tmpdir) / "context_rows.csv",
+                [
+                    {
+                        "protocol_hash": protocol_hash,
+                        "parent_row_signature": "parent-a",
+                        "row_signature": "ctx-a",
+                        "context_id": "ctx-a",
+                        "context_embedding_id": "emb-a",
+                        "dataset": "traffic_hourly",
+                        "split_phase": "locked_test",
+                        "seed": 0,
+                        "solver_key": "euler",
+                        "target_nfe": 4,
+                        "scheduler_key": "uniform",
+                        "checkpoint_id": "ck",
+                    }
+                ],
+            )
+            runner.save_context_embedding_table(Path(tmpdir) / "context_embeddings.npz", {"emb-a": [1.0, 0.0]})
+            recorder["fh"].close()
+
+            resumed = runner._init_row_recorder(Path(tmpdir), args)
+            resumed["fh"].close()
+        self.assertNotIn(runner._row_key(parent), resumed["rows_by_key"])
+
+    def test_schedule_row_output_status_rejects_stale_combined_summary_with_missing_rows(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "traffic_hourly",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--target_nfe_values",
+                    "4",
+                    "--solver_names",
+                    "euler",
+                    "--seeds",
+                    "0",
+                    "--checkpoint_steps",
+                    "4000",
+                    "--split_phase",
+                    "locked_test",
+                    "--write_context_rows",
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            recorder["fh"].close()
+            (Path(tmpdir) / "combined_summary.json").write_text(json.dumps({"main_table_summary": {"row_count": 1}}), encoding="utf-8")
+            status = runner.schedule_row_output_status(Path(tmpdir), args)
+        self.assertFalse(status["complete"])
+        self.assertIn("missing complete rows", status["reason"])
+
     def test_protocol_hash_tracks_data_path_identity(self) -> None:
         manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
         with tempfile.TemporaryDirectory() as tmpdir:

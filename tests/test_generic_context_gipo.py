@@ -1019,6 +1019,103 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertFalse(any("report_locked_test" in command for command in commands if command[:1] == ["internal"]))
         self.assertEqual(summary["status"], "dry_run")
 
+    def test_full_pipeline_resume_skips_completed_prefix_and_runs_next_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            run_root.mkdir(parents=True)
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                    "--resume",
+                ]
+            )
+            protocol_hash = full_pipeline._json_hash(full_pipeline._protocol_payload(args))
+            first_command = [full_pipeline.sys.executable, "-c", "print('first')"]
+            second_command = [full_pipeline.sys.executable, "-c", "print('second')"]
+            first_stage = full_pipeline.StageCommand("data_prep", [first_command], "data_prep_manifest.json")
+            second_stage = full_pipeline.StageCommand("ser_summaries", [second_command], "ser_summaries_manifest.json")
+            (run_root / "status.json").write_text(
+                json.dumps({"protocol_hash": protocol_hash, "status": "failed"}),
+                encoding="utf-8",
+            )
+            (run_root / first_stage.manifest_name).write_text(
+                json.dumps(
+                    {
+                        "stage": first_stage.stage,
+                        "status": "complete",
+                        "protocol_hash": protocol_hash,
+                        "commands": [full_pipeline._display_command(first_command)],
+                        "command_hashes": [full_pipeline._command_hash(first_command)],
+                        "command_results": [{"command_index": 0, "returncode": 0, "log_path": "logs/data_prep_0.log"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
+                mock.patch.object(full_pipeline, "_build_stage_commands", return_value=[first_stage, second_stage]),
+                mock.patch.object(full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run_mock,
+            ):
+                summary = full_pipeline.run_full_pipeline(args)
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertEqual(run_mock.call_args.args[0], second_command)
+        self.assertEqual(summary["skipped_stages"], ["data_prep"])
+        self.assertEqual(summary["executed_stages"], ["ser_summaries"])
+
+    def test_full_pipeline_resume_reruns_partial_schedule_stage_despite_combined_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            partial_out = run_root / "schedule_rows" / "seen" / "train_tuning" / "4000_steps"
+            partial_out.mkdir(parents=True)
+            (partial_out / "combined_summary.json").write_text(json.dumps({"main_table_summary": {"row_count": 1}}), encoding="utf-8")
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                    "--resume",
+                ]
+            )
+            protocol_hash = full_pipeline._json_hash(full_pipeline._protocol_payload(args))
+            complete_command = [full_pipeline.sys.executable, "-c", "print('complete')"]
+            schedule_command = [full_pipeline.sys.executable, "-c", "print('schedule')"]
+            complete_stage = full_pipeline.StageCommand("data_prep", [complete_command], "data_prep_manifest.json")
+            schedule_stage = full_pipeline.StageCommand("schedule_rows_seen", [schedule_command], "schedule_rows_seen_manifest.json")
+            (run_root / "status.json").write_text(json.dumps({"protocol_hash": protocol_hash, "status": "failed"}), encoding="utf-8")
+            (run_root / complete_stage.manifest_name).write_text(
+                json.dumps(
+                    {
+                        "stage": complete_stage.stage,
+                        "status": "complete",
+                        "protocol_hash": protocol_hash,
+                        "commands": [full_pipeline._display_command(complete_command)],
+                        "command_hashes": [full_pipeline._command_hash(complete_command)],
+                        "command_results": [{"command_index": 0, "returncode": 0, "log_path": "logs/data_prep_0.log"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            def schedule_status(command):
+                if list(command) == schedule_command:
+                    return {"complete": False, "reason": "missing rows"}
+                return None
+
+            with (
+                mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
+                mock.patch.object(full_pipeline, "_build_stage_commands", return_value=[complete_stage, schedule_stage]),
+                mock.patch.object(full_pipeline, "_schedule_row_command_status", side_effect=schedule_status),
+                mock.patch.object(full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run_mock,
+            ):
+                summary = full_pipeline.run_full_pipeline(args)
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertEqual(run_mock.call_args.args[0], schedule_command)
+        self.assertEqual(summary["skipped_stages"], ["data_prep"])
+        self.assertEqual(summary["executed_stages"], ["schedule_rows_seen"])
+
     def test_full_pipeline_requests_exact_budget_temporal_backbones(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             args = full_pipeline.build_argparser().parse_args(
