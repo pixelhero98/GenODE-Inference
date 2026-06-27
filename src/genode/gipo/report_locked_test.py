@@ -178,6 +178,23 @@ def _evaluation_seed_from_row(row: Mapping[str, Any]) -> int:
     return int(row["seed"])
 
 
+def _logical_seed_from_row(row: Mapping[str, Any]) -> int:
+    explicit = row.get("logical_seed", "")
+    if explicit not in (None, "") and str(explicit).strip():
+        return int(explicit)
+    parent = str(row.get("parent_row_signature", "") or "")
+    parts = parent.split("|")
+    if len(parts) >= 3:
+        try:
+            return int(parts[2])
+        except (TypeError, ValueError):
+            pass
+    seed = row.get("seed", "")
+    if seed not in (None, "") and str(seed).strip():
+        return int(seed)
+    raise ValueError("context rows require logical_seed or seed for logical seed identity.")
+
+
 def _checkpoint_step_from_row(row: Mapping[str, Any]) -> int:
     raw = row.get("checkpoint_step", row.get("train_steps", row.get("otflow_train_steps", "")))
     if raw in (None, ""):
@@ -189,7 +206,7 @@ def _row_group_key(row: Mapping[str, Any]) -> Tuple[str, str, int, str, int, int
     return (
         _source_split_phase(row),
         str(row.get("dataset", row.get("dataset_key", ""))),
-        _evaluation_seed_from_row(row),
+        _logical_seed_from_row(row),
         str(row["solver_key"]),
         int(row["target_nfe"]),
         _checkpoint_step_from_row(row),
@@ -204,6 +221,8 @@ def _representative_context_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict
         if key not in grouped:
             copied = dict(row)
             copied["context_id"] = context_id_from_row(row)
+            copied["seed"] = _logical_seed_from_row(row)
+            copied["logical_seed"] = _logical_seed_from_row(row)
             copied["evaluation_seed"] = _evaluation_seed_from_row(row)
             copied["source_split_phase"] = _source_split_phase(row)
             copied["selection_split"] = _selection_split(row)
@@ -215,7 +234,7 @@ def _context_match_key(row: Mapping[str, Any]) -> Tuple[str, str, int, str, int,
     return (
         _source_split_phase(row),
         str(row.get("dataset", row.get("dataset_key", ""))),
-        _evaluation_seed_from_row(row),
+        _logical_seed_from_row(row),
         str(row["solver_key"]),
         int(row["target_nfe"]),
         _checkpoint_step_from_row(row),
@@ -619,7 +638,7 @@ def _filter_representatives_to_matrix(
         dict(row)
         for row in rows
         if str(row.get("dataset", row.get("dataset_key", ""))) == str(dataset)
-        and int(row["evaluation_seed"]) in seed_set
+        and _logical_seed_from_row(row) in seed_set
         and normalize_solver_key(str(row["solver_key"])) in solver_set
         and int(row["target_nfe"]) in nfe_set
     ]
@@ -709,7 +728,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     )
     seeds = _infer_int_values_from_rows(
         representatives,
-        field="evaluation_seed",
+        field="seed",
         requested=str(getattr(args, "seeds", "") or ""),
         arg_name="seeds",
     )
@@ -743,7 +762,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 str(row.get("dataset", row.get("dataset_key", ""))),
                 str(row.get("member_key") or row.get("axis_member") or ""),
                 str(row.get("stratum") or row.get("axis_stratum") or ""),
-                int(row["evaluation_seed"]),
+                _logical_seed_from_row(row),
                 str(row["solver_key"]),
                 int(row["target_nfe"]),
             )
@@ -752,7 +771,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     else:
         expected_cells = {(dataset, seed, solver, target_nfe) for seed in seeds for solver in solvers for target_nfe in target_nfes}
         observed_cells = {
-            (str(row.get("dataset", row.get("dataset_key", ""))), int(row["evaluation_seed"]), str(row["solver_key"]), int(row["target_nfe"]))
+            (str(row.get("dataset", row.get("dataset_key", ""))), _logical_seed_from_row(row), str(row["solver_key"]), int(row["target_nfe"]))
             for row in representatives
         }
     missing_cells = sorted(expected_cells - observed_cells)
@@ -843,6 +862,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
             solver = str(row["solver_key"])
             target_nfe = int(row["target_nfe"])
             eval_seed = int(row["evaluation_seed"]) + 10_000 * int(row_idx)
+            logical_seed = _logical_seed_from_row(row)
             runtime_nfe = int(solver_macro_steps(solver, target_nfe))
             if benchmark_family == FORECAST_FAMILY:
                 eval_ds = _forecast_dataset_for_source_phase(splits, source_phase)
@@ -948,7 +968,10 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 "source_split_phase": source_phase,
                 "selection_mode": selection_mode,
                 "selection_split": _selection_split(row),
-                "seed": int(row["evaluation_seed"]),
+                "seed": int(logical_seed),
+                "logical_seed": int(logical_seed),
+                "evaluation_seed": int(row["evaluation_seed"]),
+                "gipo_evaluation_seed": int(eval_seed),
                 "checkpoint_step": _checkpoint_step_from_row(row),
                 "checkpoint_id": str(row.get("checkpoint_id", "")),
                 "checkpoint_maturity_label": str(row.get("checkpoint_maturity_label", "")),
@@ -1158,7 +1181,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--fu_net_layers", type=int, default=3)
     parser.add_argument("--fu_net_heads", type=int, default=4)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--seeds", default="", help="Comma-separated evaluation seeds. Defaults to seeds inferred from --context_rows.")
+    parser.add_argument("--seeds", default="", help="Comma-separated logical seeds. Defaults to seeds inferred from --context_rows.")
     parser.add_argument("--solver_names", default="", help="Comma-separated solver keys. Defaults to solvers inferred from --context_rows.")
     parser.add_argument("--target_nfe_values", default="", help="Comma-separated target NFEs. Defaults to NFEs inferred from --context_rows.")
     parser.add_argument("--num_eval_samples", type=int, default=5)

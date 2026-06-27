@@ -841,11 +841,12 @@ class GenericContextGipoTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not present"):
             report_locked_test._single_value_from_rows(rows, field="dataset", requested="traffic_hourly", arg_name="dataset")
 
-    def test_locked_reporter_representatives_preserve_explicit_evaluation_seed_and_filter_matrix(self) -> None:
+    def test_locked_reporter_representatives_filter_matrix_by_logical_seed(self) -> None:
         rows = [
             {
                 "dataset": "lobster_synthetic",
                 "seed": "0",
+                "logical_seed": "0",
                 "evaluation_seed": "11",
                 "solver_key": "euler",
                 "target_nfe": "4",
@@ -856,6 +857,7 @@ class GenericContextGipoTests(unittest.TestCase):
             {
                 "dataset": "lobster_synthetic",
                 "seed": "0",
+                "logical_seed": "0",
                 "evaluation_seed": "22",
                 "solver_key": "euler",
                 "target_nfe": "8",
@@ -869,14 +871,251 @@ class GenericContextGipoTests(unittest.TestCase):
         filtered = report_locked_test._filter_representatives_to_matrix(
             representatives,
             dataset="lobster_synthetic",
-            seeds=[11],
+            seeds=[0],
             solvers=["euler"],
             target_nfes=[4],
         )
 
         self.assertEqual([row["evaluation_seed"] for row in representatives], [11, 22])
+        self.assertEqual([row["seed"] for row in representatives], [0, 0])
+        self.assertEqual([row["logical_seed"] for row in representatives], [0, 0])
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0]["context_id"], "ctx_a")
+
+    def test_locked_reporter_context_match_uses_logical_seed_not_evaluation_seed(self) -> None:
+        representative = {
+            "dataset": "solar_energy_10m",
+            "seed": "0",
+            "logical_seed": "0",
+            "evaluation_seed": "1000",
+            "solver_key": "dpmpp2m",
+            "target_nfe": "4",
+            "checkpoint_step": "4000",
+            "context_id": "ctx",
+            "source_split_phase": "locked_test",
+        }
+        uniform = {
+            **representative,
+            "evaluation_seed": "2000",
+            "scheduler_key": "uniform",
+        }
+
+        self.assertEqual(
+            report_locked_test._context_match_key(representative),
+            report_locked_test._context_match_key(uniform),
+        )
+
+    def test_locked_reporter_logical_seed_identity_does_not_fall_back_to_evaluation_seed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "logical_seed or seed"):
+            report_locked_test._context_match_key(
+                {
+                    "dataset": "solar_energy_10m",
+                    "evaluation_seed": "1000",
+                    "solver_key": "dpmpp2m",
+                    "target_nfe": "4",
+                    "checkpoint_step": "4000",
+                    "context_id": "ctx",
+                    "source_split_phase": "locked_test",
+                }
+            )
+
+    def test_locked_reporter_coverage_uses_logical_seed_when_sampling_seed_is_offset(self) -> None:
+        rows = [
+            {
+                "benchmark_family": FORECAST_FAMILY,
+                "dataset": "solar_energy_10m",
+                "split_phase": "locked_test",
+                "source_split_phase": "locked_test",
+                "seed": "0",
+                "logical_seed": "0",
+                "evaluation_seed": str(evaluation_seed),
+                "solver_key": "dpmpp2m",
+                "target_nfe": str(target_nfe),
+                "checkpoint_step": "4000",
+                "scheduler_key": "uniform",
+                "context_id": f"ctx-{target_nfe}",
+                "context_embedding_id": f"ckpt:ctx-{target_nfe}",
+                "checkpoint_id": "ckpt",
+                "example_idx": "0",
+                "series_id": "solar_energy_10m",
+                "target_t": str(target_nfe),
+            }
+            for target_nfe, evaluation_seed in ((4, 1000), (8, 2000))
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            context_csv = tmp / "context_rows.csv"
+            with context_csv.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+            training_summary = tmp / "gipo_training_summary.json"
+            training_summary.write_text(
+                json.dumps({"protocol": GIPO_PROTOCOL, "locked_test_used_for_selection": False}),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                gipo_student_checkpoint=str(tmp / "gipo_student.pt"),
+                training_summary=str(training_summary),
+                require_teacher_checkpoint_selection_mode="",
+                selection_mode=report_locked_test.SELECTION_MODE_REPORTING,
+                split_phase="locked_test",
+                context_rows=str(context_csv),
+                context_embeddings_npz=str(tmp / "context_embeddings.npz"),
+                benchmark_family=FORECAST_FAMILY,
+                dataset="solar_energy_10m",
+                seeds="",
+                solver_names="",
+                target_nfe_values="",
+                molecule_group_root="",
+                baseline_rows="",
+            )
+            with mock.patch(
+                "genode.gipo.report_locked_test._load_student_checkpoint",
+                return_value=(mock.Mock(), {}, mock.Mock(), [], {}),
+            ):
+                with self.assertRaisesRegex(ValueError, "requires --baseline_rows") as cm:
+                    report_locked_test.report_gipo_locked_test(args)
+            self.assertNotIn("missing seed/solver/NFE", str(cm.exception))
+
+    def test_locked_reporter_output_uses_logical_seed_with_offset_uniform_context_match(self) -> None:
+        context_rows = [
+            {
+                "benchmark_family": FORECAST_FAMILY,
+                "dataset": "solar_energy_10m",
+                "split_phase": "locked_test",
+                "source_split_phase": "locked_test",
+                "seed": "0",
+                "logical_seed": "0",
+                "evaluation_seed": "1000",
+                "solver_key": "dpmpp2m",
+                "target_nfe": "4",
+                "checkpoint_step": "4000",
+                "scheduler_key": "ser_ptg_local_defect_eta005",
+                "context_id": "ctx-4",
+                "context_embedding_id": "ckpt:ctx-4",
+                "checkpoint_id": "ckpt",
+                "example_idx": "0",
+                "series_id": "solar_energy_10m",
+                "target_t": "4",
+                "crps": "1.50",
+                "mase": "1.25",
+            },
+            {
+                "benchmark_family": FORECAST_FAMILY,
+                "dataset": "solar_energy_10m",
+                "split_phase": "locked_test",
+                "source_split_phase": "locked_test",
+                "seed": "0",
+                "logical_seed": "0",
+                "evaluation_seed": "2000",
+                "solver_key": "dpmpp2m",
+                "target_nfe": "4",
+                "checkpoint_step": "4000",
+                "scheduler_key": "uniform",
+                "context_id": "ctx-4",
+                "context_embedding_id": "ckpt:ctx-4",
+                "checkpoint_id": "ckpt",
+                "example_idx": "0",
+                "series_id": "solar_energy_10m",
+                "target_t": "4",
+                "crps": "2.00",
+                "mase": "2.00",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            context_csv = tmp / "context_rows.csv"
+            with context_csv.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=list(context_rows[0]))
+                writer.writeheader()
+                writer.writerows(context_rows)
+            training_summary = tmp / "gipo_training_summary.json"
+            training_summary.write_text(
+                json.dumps({"protocol": GIPO_PROTOCOL, "locked_test_used_for_selection": False}),
+                encoding="utf-8",
+            )
+            out_dir = tmp / "report"
+            student = mock.Mock()
+            normalizer = mock.Mock()
+            normalizer.transform_table.side_effect = lambda table: table
+            args = SimpleNamespace(
+                gipo_student_checkpoint=str(tmp / "gipo_student.pt"),
+                training_summary=str(training_summary),
+                require_teacher_checkpoint_selection_mode="",
+                selection_mode=report_locked_test.SELECTION_MODE_REPORTING,
+                split_phase="locked_test",
+                context_rows=str(context_csv),
+                context_embeddings_npz=str(tmp / "context_embeddings.npz"),
+                benchmark_family=FORECAST_FAMILY,
+                dataset="solar_energy_10m",
+                seeds="0",
+                solver_names="dpmpp2m",
+                target_nfe_values="4",
+                molecule_group_root="",
+                baseline_rows=str(context_csv),
+                comparator_rows="",
+                dataset_root=str(tmp),
+                shared_backbone_root=str(tmp),
+                device="cpu",
+                num_eval_samples=1,
+                forecast_eval_batch_size=1,
+                out_dir=str(out_dir),
+            )
+            with (
+                mock.patch(
+                    "genode.gipo.report_locked_test._load_student_checkpoint",
+                    return_value=(student, {}, normalizer, [0.0, 1.0], {}),
+                ),
+                mock.patch(
+                    "genode.gipo.report_locked_test.load_context_embedding_table",
+                    return_value={"ckpt:ctx-4": [0.0, 1.0]},
+                ),
+                mock.patch(
+                    "genode.gipo.report_locked_test.load_forecast_checkpoint_splits",
+                    return_value={
+                        "model": mock.Mock(),
+                        "cfg": SimpleNamespace(),
+                        "splits": {"train": object(), "val": object(), "test": object()},
+                        "checkpoint_id": "ckpt",
+                    },
+                ),
+                mock.patch(
+                    "genode.gipo.report_locked_test.predict_gipo_density_many",
+                    return_value=[
+                        {
+                            "time_grid": [0.0, 1.0],
+                            "density_mass": [1.0],
+                            "density_mass_hash": "density",
+                            "schedule_grid_hash": "grid",
+                            "density_protocol": "protocol",
+                            "reference_grid_hash": "reference",
+                            "setting_feature_mode": "continuous_v3",
+                            "setting_encoder_mode": "continuous_v3",
+                            "macro_steps": 4,
+                        }
+                    ],
+                ),
+                mock.patch(
+                    "genode.gipo.report_locked_test.evaluate_forecast_schedule",
+                    return_value={"forecast_crps": 1.0, "forecast_mase": 1.0, "forecast_mse": 1.0},
+                ),
+            ):
+                summary = report_locked_test.report_gipo_locked_test(args)
+
+            self.assertEqual(summary["artifact"], "gipo_locked_test_report")
+            self.assertEqual(summary["context_row_count"], 1)
+            self.assertEqual(summary["aggregate_row_count"], 1)
+            rows = list(csv.DictReader((out_dir / "locked_test_gipo_rows.csv").open(newline="", encoding="utf-8")))
+            aggregate_rows = list(csv.DictReader((out_dir / "locked_test_gipo_aggregate_rows.csv").open(newline="", encoding="utf-8")))
+            comparison = json.loads((out_dir / "locked_test_gipo_comparison_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["seed"], "0")
+            self.assertEqual(rows[0]["logical_seed"], "0")
+            self.assertEqual(rows[0]["evaluation_seed"], "1000")
+            self.assertEqual(aggregate_rows[0]["seed"], "0")
+            self.assertEqual(comparison["seeds"], [0])
+            self.assertEqual(comparison["missing_student_cells"], [])
 
     def test_reporter_aggregates_molecule_metrics(self) -> None:
         rows = [
