@@ -413,6 +413,48 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             self.assertEqual(json.loads(lines[0])["row_signature"], "sig-a")
             self.assertEqual(json.loads(lines[1])["row_signature"], "sig-b")
 
+    def test_row_recorder_resume_compacts_duplicate_rows_jsonl(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--target_nfe_values",
+                    "4",
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            protocol_hash = recorder["protocol_hash"]
+            row = {
+                "protocol_hash": protocol_hash,
+                "benchmark_family": "temporal_extrapolation",
+                "split_phase": "locked_test",
+                "seed": 0,
+                "dataset": "traffic_hourly",
+                "target_nfe": 4,
+                "solver_key": "euler",
+                "scheduler_key": "uniform",
+                "row_signature": "sig-a",
+                "row_status": "complete",
+            }
+            runner._append_row_record(recorder, row)
+            recorder["fh"].write(json.dumps(row, sort_keys=True) + "\n")
+            recorder["fh"].close()
+
+            resumed = runner._init_row_recorder(Path(tmpdir), args)
+            resumed["fh"].close()
+
+            lines = [line for line in (Path(tmpdir) / "rows.jsonl").read_text(encoding="utf-8").splitlines() if line]
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(json.loads(lines[0])["row_signature"], "sig-a")
+
     def test_row_recorder_resume_does_not_skip_parent_with_incomplete_context_artifacts(self) -> None:
         manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -481,8 +523,11 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             recorder["fh"].close()
 
             resumed = runner._init_row_recorder(Path(tmpdir), args)
+            self.assertNotIn(runner._row_key(parent), resumed["rows_by_key"])
+            runner._append_row_record(resumed, parent)
             resumed["fh"].close()
-        self.assertNotIn(runner._row_key(parent), resumed["rows_by_key"])
+            lines = [line for line in (Path(tmpdir) / "rows.jsonl").read_text(encoding="utf-8").splitlines() if line]
+        self.assertEqual(len(lines), 1)
 
     def test_schedule_row_output_status_rejects_stale_combined_summary_with_missing_rows(self) -> None:
         manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"

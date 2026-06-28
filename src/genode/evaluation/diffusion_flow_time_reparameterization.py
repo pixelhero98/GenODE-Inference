@@ -977,6 +977,15 @@ def _write_row_csv(csv_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             writer.writerow({field: row.get(field) for field in ROW_RECORD_FIELDS})
 
 
+def _write_row_jsonl(jsonl_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = jsonl_path.with_name(f"{jsonl_path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(dict(row), sort_keys=True) + "\n")
+    tmp_path.replace(jsonl_path)
+
+
 def _write_context_row_csv(csv_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
@@ -1027,7 +1036,6 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
     previous_config = json.loads(run_config_path.read_text(encoding="utf-8")) if run_config_path.exists() else {}
     can_resume = bool(getattr(cli_args, "resume", True)) and str(previous_config.get("protocol_hash", "")) == protocol_hash
     rows_by_key = _load_rows(jsonl_path, protocol_hash=str(protocol_hash)) if can_resume else {}
-    fh = jsonl_path.open("a" if can_resume else "w", encoding="utf-8")
     save_json(
         {
             "runner_signature": RUNNER_SIGNATURE_VERSION,
@@ -1039,8 +1047,6 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
         },
         str(run_config_path),
     )
-    if rows_by_key:
-        _write_row_csv(csv_path, list(rows_by_key.values()))
     context_rows_by_signature = _load_context_rows(context_csv_path) if can_resume else {}
     existing_context_embeddings = load_context_embedding_table(context_embeddings_path) if can_resume and context_embeddings_path.exists() else {}
     if can_resume and _write_context_rows_enabled(cli_args):
@@ -1053,6 +1059,11 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
                 context_embeddings=existing_context_embeddings,
             )
         }
+    if can_resume:
+        compact_rows = list(rows_by_key.values())
+        _write_row_jsonl(jsonl_path, compact_rows)
+        _write_row_csv(csv_path, compact_rows)
+    fh = jsonl_path.open("a" if can_resume else "w", encoding="utf-8")
     if context_rows_by_signature:
         _write_context_row_csv(context_csv_path, list(context_rows_by_signature.values()))
     return {
