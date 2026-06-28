@@ -1010,9 +1010,21 @@ def _load_context_rows(csv_path: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def _load_rows(jsonl_path: Path, *, protocol_hash: str) -> Dict[Tuple[Any, ...], Dict[str, Any]]:
+    rows, _ = _load_rows_with_duplicate_report(jsonl_path, protocol_hash=protocol_hash)
+    return rows
+
+
+def _load_rows_with_duplicate_report(
+    jsonl_path: Path,
+    *,
+    protocol_hash: str,
+) -> Tuple[Dict[Tuple[Any, ...], Dict[str, Any]], Dict[str, Any]]:
     rows: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    duplicate_keys: set[Tuple[Any, ...]] = set()
+    duplicate_examples: List[List[Any]] = []
+    duplicate_extra_count = 0
     if not jsonl_path.exists():
-        return rows
+        return rows, {"duplicate_key_count": 0, "duplicate_extra_count": 0, "duplicate_examples": []}
     with jsonl_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -1021,8 +1033,19 @@ def _load_rows(jsonl_path: Path, *, protocol_hash: str) -> Dict[Tuple[Any, ...],
             row = json.loads(line)
             if str(row.get("protocol_hash", "")) != str(protocol_hash):
                 continue
-            rows[_row_key(row)] = row
-    return rows
+            key = _row_key(row)
+            if key in rows:
+                duplicate_extra_count += 1
+                if key not in duplicate_keys:
+                    duplicate_keys.add(key)
+                    if len(duplicate_examples) < 8:
+                        duplicate_examples.append(list(key))
+            rows[key] = row
+    return rows, {
+        "duplicate_key_count": int(len(duplicate_keys)),
+        "duplicate_extra_count": int(duplicate_extra_count),
+        "duplicate_examples": duplicate_examples,
+    }
 
 
 def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str, Any]:
@@ -1136,6 +1159,11 @@ def _row_has_complete_context_artifacts(
 def _append_row_record(row_recorder: Mapping[str, Any], row: Mapping[str, Any]) -> None:
     row_dict = dict(row)
     key = _row_key(row_dict)
+    existing = row_recorder["rows_by_key"].get(key)
+    if existing is not None:
+        if dict(existing) == row_dict:
+            return
+        raise ValueError(f"Schedule row key collision for {key!r}; refusing to append duplicate rows.jsonl record.")
     row_recorder["rows_by_key"][key] = row_dict
     row_recorder["fh"].write(json.dumps(row_dict, sort_keys=True) + "\n")
     row_recorder["fh"].flush()
@@ -1781,7 +1809,19 @@ def schedule_row_output_status(out_root: Path, cli_args: argparse.Namespace) -> 
         return {"complete": False, "reason": f"cannot compute expected schedule rows: {exc}"}
     if not expected_ids:
         return {"complete": False, "reason": "no expected schedule rows"}
-    rows_by_key = _load_rows(out_root / str(getattr(cli_args, "row_jsonl_name", "rows.jsonl")), protocol_hash=str(protocol_hash))
+    rows_by_key, duplicate_report = _load_rows_with_duplicate_report(out_root / str(getattr(cli_args, "row_jsonl_name", "rows.jsonl")), protocol_hash=str(protocol_hash))
+    if int(duplicate_report.get("duplicate_extra_count", 0)) > 0:
+        return {
+            "complete": False,
+            "reason": (
+                "duplicate rows.jsonl row keys: "
+                f"{duplicate_report['duplicate_extra_count']} extra rows across "
+                f"{duplicate_report['duplicate_key_count']} keys"
+            ),
+            "duplicate_key_count": int(duplicate_report["duplicate_key_count"]),
+            "duplicate_extra_count": int(duplicate_report["duplicate_extra_count"]),
+            "duplicate_examples": duplicate_report["duplicate_examples"],
+        }
     complete_rows = [row for row in rows_by_key.values() if str(row.get("row_status")) == "complete"]
     actual_ids = {_schedule_row_resume_identity_from_row(row) for row in complete_rows}
     missing_ids = sorted(expected_ids - actual_ids, key=lambda item: tuple(str(part) for part in item))

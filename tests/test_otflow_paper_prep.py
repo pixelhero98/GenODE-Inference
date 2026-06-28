@@ -455,6 +455,49 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             self.assertEqual(len(lines), 1)
             self.assertEqual(json.loads(lines[0])["row_signature"], "sig-a")
 
+    def test_append_row_record_rejects_key_collision(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--target_nfe_values",
+                    "4",
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            protocol_hash = recorder["protocol_hash"]
+            row = {
+                "protocol_hash": protocol_hash,
+                "benchmark_family": "temporal_extrapolation",
+                "split_phase": "locked_test",
+                "seed": 0,
+                "dataset": "traffic_hourly",
+                "target_nfe": 4,
+                "solver_key": "euler",
+                "scheduler_key": "uniform",
+                "row_signature": "sig-a",
+                "row_status": "complete",
+                "score_main": 1.0,
+            }
+            runner._append_row_record(recorder, row)
+            runner._append_row_record(recorder, row)
+            collision = dict(row, score_main=2.0)
+            with self.assertRaisesRegex(ValueError, "Schedule row key collision"):
+                runner._append_row_record(recorder, collision)
+            recorder["fh"].close()
+
+            lines = [line for line in (Path(tmpdir) / "rows.jsonl").read_text(encoding="utf-8").splitlines() if line]
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(json.loads(lines[0])["score_main"], 1.0)
+
     def test_row_recorder_resume_does_not_skip_parent_with_incomplete_context_artifacts(self) -> None:
         manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -528,6 +571,58 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             resumed["fh"].close()
             lines = [line for line in (Path(tmpdir) / "rows.jsonl").read_text(encoding="utf-8").splitlines() if line]
         self.assertEqual(len(lines), 1)
+
+    def test_schedule_row_output_status_rejects_duplicate_rows_jsonl_keys(self) -> None:
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "traffic_hourly",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--target_nfe_values",
+                    "4",
+                    "--solver_names",
+                    "euler",
+                    "--seeds",
+                    "0",
+                    "--checkpoint_steps",
+                    "4000",
+                    "--split_phase",
+                    "locked_test",
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            protocol_hash = recorder["protocol_hash"]
+            row = {
+                "protocol_hash": protocol_hash,
+                "benchmark_family": "temporal_extrapolation",
+                "split_phase": "locked_test",
+                "seed": 0,
+                "dataset": "traffic_hourly",
+                "checkpoint_step": 4000,
+                "target_nfe": 4,
+                "solver_key": "euler",
+                "scheduler_key": "uniform",
+                "row_signature": "traffic_hourly|locked_test|0|4|euler|uniform|traffic_hourly_otflow_temporal_extrapolation_4k_seed0",
+                "row_status": "complete",
+            }
+            runner._append_row_record(recorder, row)
+            recorder["fh"].write(json.dumps(dict(row, score_main=2.0), sort_keys=True) + "\n")
+            recorder["fh"].close()
+
+            status = runner.schedule_row_output_status(Path(tmpdir), args)
+            self.assertFalse(status["complete"])
+            self.assertIn("duplicate rows.jsonl row keys", status["reason"])
+            self.assertEqual(status["duplicate_key_count"], 1)
+            self.assertEqual(status["duplicate_extra_count"], 1)
 
     def test_schedule_row_output_status_rejects_stale_combined_summary_with_missing_rows(self) -> None:
         manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
