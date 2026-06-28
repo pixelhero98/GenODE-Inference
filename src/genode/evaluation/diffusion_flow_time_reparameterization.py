@@ -449,6 +449,25 @@ def _parse_summary_schedule_names(text: str) -> List[str]:
     return names
 
 
+def _duplicate_values(values: Sequence[str]) -> List[str]:
+    seen: set[str] = set()
+    duplicates: List[str] = []
+    duplicate_seen: set[str] = set()
+    for value in values:
+        text = str(value)
+        if text in seen and text not in duplicate_seen:
+            duplicates.append(text)
+            duplicate_seen.add(text)
+        seen.add(text)
+    return duplicates
+
+
+def _raise_if_duplicate_values(values: Sequence[str], *, label: str) -> None:
+    duplicates = _duplicate_values(values)
+    if duplicates:
+        raise ValueError(f"Duplicate {label}: {duplicates}")
+
+
 def _load_schedule_summary_cases(path_text: str) -> List[Dict[str, Any]]:
     cases: List[Dict[str, Any]] = []
     if not str(path_text).strip():
@@ -2205,17 +2224,37 @@ def _scheduler_cases_for_datasets(
     include_summary_cases: bool = True,
 ) -> Dict[str, List[Dict[str, Any]]]:
     schedule_names = _parse_schedule_names(str(cli_args.baseline_scheduler_names))
+    _raise_if_duplicate_values(schedule_names, label="fixed diffusion-flow schedules")
     if UNIFORM_SCHEDULER_KEY in schedule_names:
         schedule_names = [UNIFORM_SCHEDULER_KEY] + [key for key in schedule_names if key != UNIFORM_SCHEDULER_KEY]
     summary_cases = _load_schedule_summary_cases(str(getattr(cli_args, "schedule_summary_json", ""))) if include_summary_cases else []
     requested_summary_names = _parse_summary_schedule_names(str(getattr(cli_args, "summary_scheduler_names", "")))
+    _raise_if_duplicate_values(requested_summary_names, label="summary diffusion-flow schedules")
     if requested_summary_names and include_summary_cases:
         summary_cases = [case for case in summary_cases if str(case.get("scheduler_key")) in set(requested_summary_names)]
         observed_summary_names = {str(case.get("scheduler_key")) for case in summary_cases}
         missing = sorted(set(requested_summary_names) - observed_summary_names)
         if missing:
             raise ValueError(f"Schedule summary is missing requested schedules: {missing}")
+    summary_names = [str(case.get("scheduler_key", "")) for case in summary_cases]
+    overlap = sorted(set(schedule_names) & set(summary_names))
+    if overlap:
+        raise ValueError(f"Summary-derived schedules duplicate fixed schedules: {overlap}")
     cases = [{"scheduler_key": key} for key in schedule_names] + summary_cases
+    case_keys: set[Tuple[str, str, str, str]] = set()
+    duplicate_case_keys: List[List[str]] = []
+    for case in cases:
+        case_key = (
+            str(case.get("scheduler_key", "")),
+            str(case.get("solver_key", "") or ""),
+            str(case.get("target_nfe", "") or ""),
+            str(case.get("checkpoint_step", "") or ""),
+        )
+        if case_key in case_keys:
+            duplicate_case_keys.append(list(case_key))
+        case_keys.add(case_key)
+    if duplicate_case_keys:
+        raise ValueError(f"Duplicate scheduler cases: {duplicate_case_keys[:8]}")
     if not cases:
         raise ValueError("At least one fixed or summary-derived schedule is required.")
     return {str(dataset): [dict(case) for case in cases] for dataset in datasets}

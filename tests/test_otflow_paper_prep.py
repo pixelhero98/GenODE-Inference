@@ -124,6 +124,109 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         default_args = runner.build_argparser().parse_args([])
         self.assertNotIn("ays_reversed", runner._parse_schedule_names(default_args.baseline_scheduler_names))
 
+    def test_scheduler_cases_reject_duplicate_fixed_schedule_names(self) -> None:
+        args = runner.build_argparser().parse_args(["--baseline_scheduler_names", "uniform,ays,uniform"])
+        with self.assertRaisesRegex(ValueError, "Duplicate fixed diffusion-flow schedules"):
+            runner._scheduler_cases_for_datasets(args, ["traffic_hourly"])
+
+    def test_scheduler_cases_reject_duplicate_requested_summary_schedule_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_path = Path(tmpdir) / "summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "schedules": [
+                            {
+                                "scheduler_key": "gipo",
+                                "predictions": [
+                                    {
+                                        "solver_key": "euler",
+                                        "target_nfe": 4,
+                                        "macro_steps": 4,
+                                        "time_grid": [0.0, 0.25, 0.5, 0.75, 1.0],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = runner.build_argparser().parse_args(
+                [
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--schedule_summary_json",
+                    str(summary_path),
+                    "--summary_scheduler_names",
+                    "gipo,gipo",
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "Duplicate summary diffusion-flow schedules"):
+                runner._scheduler_cases_for_datasets(args, ["traffic_hourly"])
+
+    def test_scheduler_cases_reject_duplicate_summary_case_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_path = Path(tmpdir) / "summary.json"
+            prediction = {
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "macro_steps": 4,
+                "time_grid": [0.0, 0.25, 0.5, 0.75, 1.0],
+            }
+            summary_path.write_text(
+                json.dumps({"schedules": [{"scheduler_key": "gipo", "predictions": [prediction, prediction]}]}),
+                encoding="utf-8",
+            )
+            args = runner.build_argparser().parse_args(
+                [
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--schedule_summary_json",
+                    str(summary_path),
+                    "--summary_scheduler_names",
+                    "gipo",
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "Duplicate scheduler cases"):
+                runner._scheduler_cases_for_datasets(args, ["traffic_hourly"])
+
+    def test_scheduler_cases_reject_summary_schedule_that_duplicates_fixed_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_path = Path(tmpdir) / "summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "schedules": [
+                            {
+                                "scheduler_key": "uniform",
+                                "predictions": [
+                                    {
+                                        "solver_key": "euler",
+                                        "target_nfe": 4,
+                                        "macro_steps": 4,
+                                        "time_grid": [0.0, 0.25, 0.5, 0.75, 1.0],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = runner.build_argparser().parse_args(
+                [
+                    "--baseline_scheduler_names",
+                    "uniform",
+                    "--schedule_summary_json",
+                    str(summary_path),
+                    "--summary_scheduler_names",
+                    "uniform",
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "Summary-derived schedules duplicate fixed schedules"):
+                runner._scheduler_cases_for_datasets(args, ["traffic_hourly"])
+
     def test_schedule_summary_cases_normalize_rk2_nfe_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "summary.json"
