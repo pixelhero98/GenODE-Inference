@@ -665,6 +665,18 @@ def _embedding_ids(rows: Sequence[Mapping[str, Any]]) -> set[str]:
     return {context_embedding_id_from_row(row) for row in rows}
 
 
+def _required_embedding_table(
+    embeddings: Mapping[str, np.ndarray],
+    required_ids: set[str],
+    *,
+    label: str,
+) -> Dict[str, np.ndarray]:
+    missing = sorted(required_ids - set(embeddings))
+    if missing:
+        raise KeyError(f"{label} context embeddings are missing contexts: {missing[:8]}")
+    return {key: np.asarray(embeddings[key], dtype=np.float32) for key in sorted(required_ids)}
+
+
 def _checkpoint_id_from_row(row: Mapping[str, Any]) -> str:
     return _checkpoint_scope_from_row(row)
 
@@ -739,18 +751,26 @@ def _assert_embedding_overlap_compatible(
     extra: Mapping[str, Sequence[float]],
     *,
     label: str,
-    atol: float = 1e-6,
+    atol: float = 1e-5,
 ) -> None:
     overlap = sorted(set(base) & set(extra))
-    bad: List[str] = []
+    bad: List[Tuple[str, float | None]] = []
     for key in overlap:
         left = np.asarray(base[key], dtype=np.float32)
         right = np.asarray(extra[key], dtype=np.float32)
-        if left.shape != right.shape or not np.allclose(left, right, rtol=1e-5, atol=float(atol)):
-            bad.append(str(key))
+        if left.shape != right.shape:
+            bad.append((str(key), None))
+            continue
+        max_abs_diff = float(np.max(np.abs(left - right))) if left.size else 0.0
+        if not np.allclose(left, right, rtol=1e-5, atol=float(atol)):
+            bad.append((str(key), max_abs_diff))
     if bad:
+        examples = [
+            f"{key} (shape mismatch)" if diff is None else f"{key} (max_abs_diff={diff:.3g})"
+            for key, diff in bad[:8]
+        ]
         raise ValueError(
-            f"{label} context embeddings collide with different vectors; first incompatible IDs: {bad[:8]}"
+            f"{label} context embeddings collide with different vectors; first incompatible IDs: {examples}"
         )
 
 
@@ -1341,14 +1361,19 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     if unseen_selection_rows:
         unseen_embeddings_path = str(args.teacher_unseen_selection_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
         unseen_raw_embeddings = _load_context_embedding_tables(unseen_embeddings_path)
-        missing_unseen_embeddings = sorted(_embedding_ids(unseen_selection_rows) - set(unseen_raw_embeddings))
-        if missing_unseen_embeddings:
-            raise KeyError(f"Unseen selection context embeddings are missing contexts: {missing_unseen_embeddings[:8]}")
-        _merge_embedding_tables_guarded(
-            selector_normalized_embeddings,
-            selector_embedding_normalizer.transform_table(unseen_raw_embeddings),
+        unseen_required_embeddings = _required_embedding_table(
+            unseen_raw_embeddings,
+            _embedding_ids(unseen_selection_rows),
+            label="Unseen selection",
+        )
+        _assert_embedding_overlap_compatible(
+            context_embeddings,
+            unseen_required_embeddings,
             label="teacher_unseen_selection",
         )
+        for key, value in selector_embedding_normalizer.transform_table(unseen_required_embeddings).items():
+            if key not in selector_normalized_embeddings:
+                selector_normalized_embeddings[key] = value
     embedding_normalizer = final_embedding_normalizer
     normalized_embeddings = final_normalized_embeddings
 
@@ -1506,11 +1531,13 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         )
         pseudo_embeddings_path = str(args.student_pseudo_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
         raw_pseudo_embeddings = _load_context_embedding_tables(pseudo_embeddings_path)
-        missing_pseudo_embeddings = sorted(_embedding_ids(pseudo_rows) - set(raw_pseudo_embeddings))
-        if missing_pseudo_embeddings:
-            raise KeyError(f"Pseudo distillation context embeddings are missing contexts: {missing_pseudo_embeddings[:8]}")
-        _assert_embedding_overlap_compatible(context_embeddings, raw_pseudo_embeddings, label="student_pseudo")
-        pseudo_embeddings = embedding_normalizer.transform_table(raw_pseudo_embeddings)
+        pseudo_required_embeddings = _required_embedding_table(
+            raw_pseudo_embeddings,
+            _embedding_ids(pseudo_rows),
+            label="Pseudo distillation",
+        )
+        _assert_embedding_overlap_compatible(context_embeddings, pseudo_required_embeddings, label="student_pseudo")
+        pseudo_embeddings = embedding_normalizer.transform_table(pseudo_required_embeddings)
         pseudo_schedule_grids = dict(schedule_grids)
         pseudo_schedule_summary_paths = _parse_csv(str(args.student_pseudo_schedule_summary_json))
         if pseudo_schedule_summary_paths:

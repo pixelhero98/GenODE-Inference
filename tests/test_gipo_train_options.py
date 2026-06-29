@@ -17,7 +17,12 @@ from genode.canonical_experiment_layout import (
 )
 from genode.gipo.objectives import CONDITIONAL_PRIMARY_LOB_METRIC_SPECS, FORECAST_METRIC_SPECS
 from genode.gipo.policy import GIPO_PROTOCOL, save_context_embedding_table
-from genode.gipo.train_gipo import _resolve_teacher_metric_target_keys, build_argparser, train_gipo
+from genode.gipo.train_gipo import (
+    _assert_embedding_overlap_compatible,
+    _resolve_teacher_metric_target_keys,
+    build_argparser,
+    train_gipo,
+)
 
 
 SUPPORT_SCHEDULES = ("uniform", "late_power_3")
@@ -341,6 +346,21 @@ class GipoTrainOptionsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "physical context_id values without checkpoint prefixes"):
                 train_gipo(_trainer_args(root, rows_csv, embeddings_npz, "--seen_target_nfe_values", "5,7"))
 
+    def test_embedding_overlap_allows_float32_export_noise(self) -> None:
+        _assert_embedding_overlap_compatible(
+            {"ckpt:ctx": [0.0, -0.42962583899497986, 3.586855173110962]},
+            {"ckpt:ctx": [2.5e-6, -0.42962586879730225, 3.586855173110962]},
+            label="student_pseudo",
+        )
+
+    def test_embedding_overlap_rejects_material_difference(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"student_pseudo context embeddings collide.*max_abs_diff"):
+            _assert_embedding_overlap_compatible(
+                {"ckpt:ctx": [0.0, 1.0]},
+                {"ckpt:ctx": [1.0e-3, 1.0]},
+                label="student_pseudo",
+            )
+
     def test_dry_run_reports_split_normalizer_scopes_and_effective_selection_weights(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -557,6 +577,73 @@ class GipoTrainOptionsTests(unittest.TestCase):
         self.assertEqual(summary["canonical_unseen_nfes"], list(CANONICAL_UNSEEN_NFES))
         self.assertEqual(summary["student_pseudo_distillation"]["target_nfes"], [5, 7])
         self.assertEqual(summary["split_counts"]["student_pseudo"]["row_count"], 12)
+
+    def test_unused_pseudo_embedding_overlap_does_not_block_training(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            seen_csv = root / "seen.csv"
+            pseudo_csv = root / "pseudo.csv"
+            seen_embeddings_npz = root / "seen_ctx.npz"
+            pseudo_embeddings_npz = root / "pseudo_ctx.npz"
+            _write_rows(seen_csv, target_nfes=CANONICAL_SEEN_NFES)
+            _write_rows(
+                pseudo_csv,
+                target_nfes=CANONICAL_UNSEEN_NFES,
+                contexts=("pseudo_ctx_0", "pseudo_ctx_1", "pseudo_ctx_2"),
+            )
+            _write_embeddings(seen_embeddings_npz)
+            save_context_embedding_table(
+                pseudo_embeddings_npz,
+                {
+                    "pseudo_ctx_0": [0.0, 1.0],
+                    "pseudo_ctx_1": [1.0, 0.0],
+                    "pseudo_ctx_2": [2.0, -1.0],
+                    "ctx_0": [99.0, 99.0],
+                },
+            )
+
+            summary = train_gipo(
+                _trainer_args(
+                    root,
+                    seen_csv,
+                    seen_embeddings_npz,
+                    "--student_pseudo_rows_csv",
+                    str(pseudo_csv),
+                    "--student_pseudo_context_embeddings_npz",
+                    str(pseudo_embeddings_npz),
+                )
+            )
+
+        self.assertEqual(summary["status"], "dry_run")
+        self.assertEqual(summary["student_pseudo_distillation"]["selected_context_count"], 3)
+
+    def test_selected_pseudo_embedding_overlap_still_rejects_material_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            seen_csv = root / "seen.csv"
+            pseudo_csv = root / "pseudo.csv"
+            seen_embeddings_npz = root / "seen_ctx.npz"
+            pseudo_embeddings_npz = root / "pseudo_ctx.npz"
+            _write_rows(seen_csv, target_nfes=CANONICAL_SEEN_NFES)
+            _write_rows(pseudo_csv, target_nfes=CANONICAL_UNSEEN_NFES)
+            _write_embeddings(seen_embeddings_npz)
+            save_context_embedding_table(
+                pseudo_embeddings_npz,
+                {"ctx_0": [0.5, 1.0], "ctx_1": [1.0, 0.0], "ctx_2": [2.0, -1.0]},
+            )
+
+            with self.assertRaisesRegex(ValueError, r"student_pseudo context embeddings collide.*ctx_0"):
+                train_gipo(
+                    _trainer_args(
+                        root,
+                        seen_csv,
+                        seen_embeddings_npz,
+                        "--student_pseudo_rows_csv",
+                        str(pseudo_csv),
+                        "--student_pseudo_context_embeddings_npz",
+                        str(pseudo_embeddings_npz),
+                    )
+                )
 
     def test_pseudo_target_nfe_values_are_named_in_empty_filter_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
