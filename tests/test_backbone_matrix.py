@@ -124,6 +124,35 @@ class BackboneMatrixTests(unittest.TestCase):
         self.assertEqual(Path(artifact["checkpoint_path"]), root / "outputs" / "backbone_matrix" / "example" / "model.pt")
         self.assertEqual(Path(artifact["summary_path"]), root / "outputs" / "backbone_matrix" / "example" / "artifact_summary.json")
 
+    def test_manifest_loader_infers_project_base_for_outputs_manifest_without_path_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "genode"
+            manifest_path = root / "outputs" / "backbone_matrix" / "backbone_manifest.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": "fm_backbone_manifest",
+                "matrix_root": "outputs/backbone_matrix",
+                "artifact_count": 1,
+                "ready_count": 1,
+                "artifacts": [
+                    {
+                        "checkpoint_path": "outputs/backbone_matrix/otflow/temporal_extrapolation/4k/traffic_hourly/model.pt",
+                        "summary_path": "genode/outputs/backbone_matrix/otflow/temporal_extrapolation/4k/traffic_hourly/artifact_summary.json",
+                        "metadata_path": "outputs/backbone_matrix/otflow/temporal_extrapolation/4k/traffic_hourly/checkpoint_metadata.json",
+                    }
+                ],
+            }
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            loaded = load_backbone_manifest(manifest_path)
+
+        artifact = loaded["artifacts"][0]
+        expected_root = root / "outputs" / "backbone_matrix" / "otflow" / "temporal_extrapolation" / "4k" / "traffic_hourly"
+        self.assertEqual(Path(loaded["matrix_root"]), root / "outputs" / "backbone_matrix")
+        self.assertEqual(Path(artifact["checkpoint_path"]), expected_root / "model.pt")
+        self.assertEqual(Path(artifact["summary_path"]), expected_root / "artifact_summary.json")
+        self.assertEqual(Path(artifact["metadata_path"]), expected_root / "checkpoint_metadata.json")
+
     def test_display_path_uses_logical_outputs_root_for_symlink_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "repo"

@@ -47,6 +47,15 @@ STANDARD_ARTIFACT_SUMMARY_NAME = "artifact_summary.json"
 MANIFEST_VERSION = "fm_backbone_manifest"
 AUDIT_VERSION = "fm_backbone_manifest_check"
 IMPORTED_EXTERNAL_SOURCE_KIND = "imported_external"
+_LOGICAL_PROJECT_ROOT_NAMES = {"outputs", "data", "paper_datasets"}
+_MANIFEST_ARTIFACT_PATH_FIELDS = ("checkpoint_path", "summary_path", "metadata_path")
+_MANIFEST_ROOT_PATH_FIELDS = (
+    "matrix_root",
+    "otflow_reuse_root",
+    "imported_backbone_root",
+    "molecule_group_root",
+    "molecule_backbone_root",
+)
 
 ACTIVE_FORECAST_BACKBONE_BUDGETS: Mapping[str, Tuple[int, ...]] = {
     "solar_energy_10m": (4000, 8000, 12000, 16000, 20000),
@@ -1150,6 +1159,42 @@ def _resolve_manifest_relative_path(manifest_path: Path, value: Any, *, path_bas
     return str((base / raw).resolve())
 
 
+def _is_logical_project_relative_path(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    raw = normalize_project_relative_path(value)
+    return not raw.is_absolute() and bool(raw.parts) and str(raw.parts[0]) in _LOGICAL_PROJECT_ROOT_NAMES
+
+
+def _manifest_has_logical_project_paths(payload: Mapping[str, Any]) -> bool:
+    for field in _MANIFEST_ROOT_PATH_FIELDS:
+        if _is_logical_project_relative_path(payload.get(field)):
+            return True
+    for artifact in payload.get("artifacts", []):
+        if not isinstance(artifact, Mapping):
+            continue
+        if any(_is_logical_project_relative_path(artifact.get(field)) for field in _MANIFEST_ARTIFACT_PATH_FIELDS):
+            return True
+    return False
+
+
+def _infer_manifest_project_base(manifest_path: Path, payload: Mapping[str, Any]) -> Optional[Path]:
+    if not _manifest_has_logical_project_paths(payload):
+        return None
+    parent = manifest_path.parent.resolve()
+    for candidate in (parent, *parent.parents):
+        if candidate.name in _LOGICAL_PROJECT_ROOT_NAMES:
+            return candidate.parent.resolve()
+    return None
+
+
+def _resolve_manifest_logical_project_path(project_base: Path, value: Any) -> Any:
+    if not _is_logical_project_relative_path(value):
+        return value
+    raw = normalize_project_relative_path(value)
+    return str((project_base / raw).resolve())
+
+
 def load_backbone_manifest(path: str | Path) -> Dict[str, Any]:
     resolved = Path(path).resolve()
     payload = json.loads(resolved.read_text(encoding="utf-8"))
@@ -1158,12 +1203,24 @@ def load_backbone_manifest(path: str | Path) -> Dict[str, Any]:
         for artifact in payload.get("artifacts", []):
             if not isinstance(artifact, dict):
                 continue
-            for field in ("checkpoint_path", "summary_path", "metadata_path"):
+            for field in _MANIFEST_ARTIFACT_PATH_FIELDS:
                 if field in artifact:
                     artifact[field] = _resolve_manifest_relative_path(resolved, artifact[field], path_base=path_base)
-        for field in ("matrix_root", "otflow_reuse_root", "imported_backbone_root", "molecule_group_root", "molecule_backbone_root"):
+        for field in _MANIFEST_ROOT_PATH_FIELDS:
             if field in payload:
                 payload[field] = _resolve_manifest_relative_path(resolved, payload[field], path_base=path_base)
+    else:
+        project_base = _infer_manifest_project_base(resolved, payload)
+        if project_base is not None:
+            for artifact in payload.get("artifacts", []):
+                if not isinstance(artifact, dict):
+                    continue
+                for field in _MANIFEST_ARTIFACT_PATH_FIELDS:
+                    if field in artifact:
+                        artifact[field] = _resolve_manifest_logical_project_path(project_base, artifact[field])
+            for field in _MANIFEST_ROOT_PATH_FIELDS:
+                if field in payload:
+                    payload[field] = _resolve_manifest_logical_project_path(project_base, payload[field])
     return payload
 
 
