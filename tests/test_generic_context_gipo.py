@@ -39,7 +39,9 @@ from genode.gipo.policy import (
 from genode.gipo import report_locked_test
 from genode.gipo.ablation_plan import (
     GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX,
+    GIPO_PAPER_STUDENT_ARM_ID,
     gipo_ablation_arms,
+    gipo_paper_student_arm,
 )
 from genode.pipeline import full_pipeline
 from genode.gipo.train_gipo import (
@@ -1355,6 +1357,98 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(summary["skipped_stages"], ["data_prep"])
         self.assertEqual(summary["executed_stages"], ["schedule_rows_seen"])
 
+    def test_full_pipeline_does_not_skip_existing_gipo_outputs_without_resume_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            train_out = run_root / "paper_first" / GIPO_PAPER_STUDENT_ARM_ID / "gipo" / "seen_only_zero_shot"
+            report_out = run_root / "paper_first" / GIPO_PAPER_STUDENT_ARM_ID / "locked_test_reports" / "seen_only_zero_shot" / "seen" / "4000_steps"
+            train_out.mkdir(parents=True)
+            report_out.mkdir(parents=True)
+            (train_out / "gipo_training_summary.json").write_text(json.dumps({"status": "complete"}), encoding="utf-8")
+            (train_out / "gipo_student.pt").write_bytes(b"checkpoint")
+            for name in ("locked_test_gipo_policy_summary.json", "locked_test_gipo_comparison_summary.json"):
+                (report_out / name).write_text(json.dumps({"status": "complete"}), encoding="utf-8")
+            for name in ("locked_test_gipo_rows.csv", "locked_test_gipo_aggregate_rows.csv", "locked_test_gipo_decisions.csv"):
+                (report_out / name).write_text("dataset\nlobster_synthetic\n", encoding="utf-8")
+
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                ]
+            )
+            train_command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.gipo.train_gipo",
+                "--out_dir",
+                str(train_out),
+            ]
+            report_command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.gipo.report_locked_test",
+                "--out_dir",
+                str(report_out),
+            ]
+            stages = [
+                full_pipeline.StageCommand("gipo_student_seen_only_zero_shot", [train_command], "gipo_seen_only_manifest.json"),
+                full_pipeline.StageCommand("locked_test_reports", [report_command], "locked_test_reports_manifest.json"),
+            ]
+            with (
+                mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
+                mock.patch.object(full_pipeline, "_build_stage_commands", return_value=stages),
+                mock.patch.object(full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run_mock,
+            ):
+                summary = full_pipeline.run_full_pipeline(args)
+
+            train_manifest = json.loads((run_root / "gipo_seen_only_manifest.json").read_text(encoding="utf-8"))
+            report_manifest = json.loads((run_root / "locked_test_reports_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertEqual(summary["status"], "complete")
+        self.assertNotIn("skipped", train_manifest["command_results"][0])
+        self.assertNotIn("skipped", report_manifest["command_results"][0])
+
+    def test_full_pipeline_overwrite_reruns_existing_gipo_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            train_out = run_root / "paper_first" / GIPO_PAPER_STUDENT_ARM_ID / "gipo" / "seen_only_zero_shot"
+            train_out.mkdir(parents=True)
+            (train_out / "gipo_training_summary.json").write_text(json.dumps({"status": "old"}), encoding="utf-8")
+            (train_out / "gipo_student.pt").write_bytes(b"old")
+
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                    "--overwrite",
+                ]
+            )
+            train_command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.gipo.train_gipo",
+                "--out_dir",
+                str(train_out),
+            ]
+            stage = full_pipeline.StageCommand("gipo_student_seen_only_zero_shot", [train_command], "gipo_seen_only_manifest.json")
+            with (
+                mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
+                mock.patch.object(full_pipeline, "_build_stage_commands", return_value=[stage]),
+                mock.patch.object(full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run_mock,
+            ):
+                summary = full_pipeline.run_full_pipeline(args)
+            manifest = json.loads((run_root / "gipo_seen_only_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertEqual(summary["status"], "complete")
+        self.assertNotIn("skipped", manifest["command_results"][0])
+
     def test_full_pipeline_requests_exact_budget_temporal_backbones(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             args = full_pipeline.build_argparser().parse_args(
@@ -1416,15 +1510,20 @@ class GenericContextGipoTests(unittest.TestCase):
         by_stage = {stage["stage"]: [" ".join(command) for command in stage["commands"]] for stage in summary["stages"]}
         zero_shot = " ".join(by_stage["gipo_student_seen_only_zero_shot"])
         pseudo = " ".join(by_stage["gipo_student_seen_plus_unseen_pseudo"])
+        paper_arm = gipo_paper_student_arm()
         self.assertNotIn("--teacher_unseen_selection_rows_csv", zero_shot)
         self.assertNotIn("--teacher_unseen_selection_context_embeddings_npz", zero_shot)
+        self.assertIn(f"paper_first/{GIPO_PAPER_STUDENT_ARM_ID}", zero_shot.replace("\\", "/"))
+        self.assertIn(f"--student_teacher_score_weight {float(paper_arm.student_teacher_score_weight)}", zero_shot)
+        self.assertIn(f"--student_target_mixture_mode {paper_arm.student_target_mixture_mode}", zero_shot)
+        self.assertNotIn("--student_pseudo_rows_csv", zero_shot)
         for command in (zero_shot, pseudo):
             self.assertIn("--teacher_metric_target_keys u_temporal_uw1_uniform,u_temporal_cw1_uniform,u_temporal_tstr_f1_uniform", command)
             self.assertIn("--teacher_steps 500", command)
             self.assertIn("--student_steps 500", command)
             self.assertIn("--seen_target_nfe_values 4,8,12,16", command)
             self.assertIn("--pseudo_target_nfe_values 6,10,14,20", command)
-            self.assertIn("--student_teacher_score_weight 0.05", command)
+            self.assertIn("--student_teacher_score_weight 0.01", command)
             self.assertIn("--student_teacher_score_warmup_fraction 0.6", command)
             self.assertIn("--student_target_mixture_mode full", command)
             self.assertIn("--student_target_elite_fraction 0.3", command)
@@ -1437,10 +1536,77 @@ class GenericContextGipoTests(unittest.TestCase):
         protocol = full_pipeline._protocol_payload(args)
         self.assertEqual(protocol["gipo_teacher_steps"], 500)
         self.assertEqual(protocol["gipo_student_steps"], 500)
-        self.assertEqual(protocol["student_teacher_score_weight"], 0.05)
+        self.assertEqual(protocol["paper_student_arm_id"], GIPO_PAPER_STUDENT_ARM_ID)
+        self.assertEqual(protocol["student_teacher_score_weight"], 0.01)
         self.assertEqual(protocol["student_teacher_score_clip"], 5.0)
         self.assertEqual(protocol["student_teacher_score_protocol"], "late_ramped_per_cell_teacher_utility_z_score")
         self.assertEqual(protocol["student_target_mixture_mode"], "full")
+
+    def test_full_pipeline_default_is_paper_first_s0_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                    "--dry_run",
+                ]
+            )
+            summary = full_pipeline.run_full_pipeline(args)
+            protocol = json.loads((run_root / "protocol.json").read_text(encoding="utf-8"))
+
+        stage_names = [stage["stage"] for stage in summary["stages"]]
+        self.assertIn("gipo_student_seen_only_zero_shot", stage_names)
+        self.assertIn("locked_test_reports", stage_names)
+        self.assertNotIn("gipo_student_seen_plus_unseen_pseudo", stage_names)
+        self.assertFalse(any(stage.startswith("gipo_ablation_") for stage in stage_names))
+
+        by_stage = {stage["stage"]: stage["commands"] for stage in summary["stages"]}
+        train_command = " ".join(by_stage["gipo_student_seen_only_zero_shot"][0])
+        self.assertIn(f"paper_first/{GIPO_PAPER_STUDENT_ARM_ID}", train_command.replace("\\", "/"))
+        self.assertIn("--student_teacher_score_weight 0.01", train_command)
+        self.assertIn("--student_target_mixture_mode full", train_command)
+        self.assertNotIn("--student_pseudo_rows_csv", train_command)
+
+        report_commands = by_stage["locked_test_reports"]
+        self.assertEqual(len(report_commands), 10)
+        report_text = [" ".join(command) for command in report_commands]
+        self.assertTrue(all(f"paper_first/{GIPO_PAPER_STUDENT_ARM_ID}" in command.replace("\\", "/") for command in report_text))
+        self.assertTrue(all("gipo_ablations" not in command for command in report_text))
+        self.assertEqual(
+            {command[command.index("--target_nfe_values") + 1] for command in report_commands},
+            {"4,8,12,16", "6,10,14,20"},
+        )
+        self.assertEqual(
+            {command[command.index("--out_dir") + 1].replace("\\", "/").split("/locked_test_reports/")[1].split("/")[1] for command in report_commands},
+            {"seen", "unseen"},
+        )
+        self.assertEqual(protocol["paper_student_arm_id"], GIPO_PAPER_STUDENT_ARM_ID)
+        self.assertEqual(protocol["paper_student_arm"]["student_objective_settings"]["student_teacher_score_weight"], 0.01)
+
+    def test_full_pipeline_rejects_student_objective_overrides_without_explicit_pseudo_stage(self) -> None:
+        cases = (
+            (),
+            ("--ablation_first",),
+        )
+        for extra_args in cases:
+            with self.subTest(extra_args=extra_args), tempfile.TemporaryDirectory() as tmpdir:
+                args = full_pipeline.build_argparser().parse_args(
+                    [
+                        "--scenario_key",
+                        "lobster_synthetic",
+                        "--run_root",
+                        str(Path(tmpdir) / "run"),
+                        "--student_teacher_score_weight",
+                        "0.07",
+                        "--dry_run",
+                        *extra_args,
+                    ]
+                )
+                with self.assertRaisesRegex(ValueError, "only apply to the explicit gipo_student_seen_plus_unseen_pseudo stage"):
+                    full_pipeline.run_full_pipeline(args)
 
     def test_full_pipeline_gipo_step_budgets_are_protocolized(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1477,6 +1643,41 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(base_protocol["gipo_student_steps"], 500)
         self.assertEqual(changed_protocol["gipo_teacher_steps"], 501)
         self.assertEqual(changed_protocol["gipo_student_steps"], 503)
+        self.assertNotEqual(full_pipeline._json_hash(base_protocol), full_pipeline._json_hash(changed_protocol))
+
+    def test_full_pipeline_pseudo_stage_objective_knobs_are_protocolized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(Path(tmpdir) / "run_a"),
+                    "--stages",
+                    "gipo_student_seen_only_zero_shot,gipo_student_seen_plus_unseen_pseudo",
+                    "--dry_run",
+                ]
+            )
+            changed_args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(Path(tmpdir) / "run_b"),
+                    "--stages",
+                    "gipo_student_seen_only_zero_shot,gipo_student_seen_plus_unseen_pseudo",
+                    "--student_teacher_score_weight",
+                    "0.07",
+                    "--dry_run",
+                ]
+            )
+
+        base_protocol = full_pipeline._protocol_payload(base_args)
+        changed_protocol = full_pipeline._protocol_payload(changed_args)
+        self.assertEqual(base_protocol["student_teacher_score_weight"], 0.01)
+        self.assertEqual(changed_protocol["student_teacher_score_weight"], 0.01)
+        self.assertEqual(base_protocol["student_seen_plus_unseen_pseudo_objective_settings"]["student_teacher_score_weight"], 0.01)
+        self.assertEqual(changed_protocol["student_seen_plus_unseen_pseudo_objective_settings"]["student_teacher_score_weight"], 0.07)
         self.assertNotEqual(full_pipeline._json_hash(base_protocol), full_pipeline._json_hash(changed_protocol))
 
     def _dry_run_gipo_commands_for_scenario(self, scenario_key: str) -> str:
@@ -1530,6 +1731,12 @@ class GenericContextGipoTests(unittest.TestCase):
         arms = gipo_ablation_arms(GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX)
         self.assertEqual(len(arms), 16)
         self.assertEqual(len({arm.arm_id for arm in arms}), 16)
+        paper_arm = gipo_paper_student_arm()
+        self.assertEqual(paper_arm.arm_id, GIPO_PAPER_STUDENT_ARM_ID)
+        self.assertEqual(paper_arm.student_training_mode, "seen_only_zero_shot")
+        self.assertEqual(paper_arm.student_target_mixture_mode, "full")
+        self.assertEqual(float(paper_arm.student_teacher_score_weight), 0.01)
+        self.assertIn(GIPO_PAPER_STUDENT_ARM_ID, {arm.arm_id for arm in arms})
         self.assertEqual([arm.paper_group for arm in arms[:6]], ["main"] * 6)
         self.assertNotIn("elite-bend", " ".join(arm.arm_id for arm in arms))
         full_scores_by_mode = {}

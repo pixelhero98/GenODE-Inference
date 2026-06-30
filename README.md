@@ -236,6 +236,18 @@ genode-prepare-molecule-xyz \
 
 ## Train GIPO
 
+The restartable full pipeline is paper-first by default. It trains and reports
+the paper-facing `S0_full_score001_seen_only` student, which uses full-density
+targets with teacher-score exploitation weight `0.01`, for both seen and unseen
+locked-test NFEs. Run `genode-full-pipeline --ablation_first` only when you want
+the broader ablation grid.
+
+```bash
+genode-full-pipeline \
+  --scenario_key <dataset-key> \
+  --device auto
+```
+
 Generate reusable fixed/SER rows and context embeddings with the schedule
 runner. Defaults are seen NFEs `4,8,12,16`, checkpoint maturities
 `4000,8000,12000,16000,20000`, and the canonical fixed schedule set.

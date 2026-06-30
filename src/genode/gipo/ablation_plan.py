@@ -19,6 +19,7 @@ from genode.gipo.policy import (
 GIPO_ABLATION_PRESET_PAPER_MAIN = "paper_main"
 GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX = "paper_main_plus_appendix"
 DEFAULT_GIPO_ABLATION_PRESET = GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX
+GIPO_PAPER_STUDENT_ARM_ID = "S0_full_score001_seen_only"
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,7 @@ _PRESETS: Mapping[str, Tuple[GipoAblationArm, ...]] = {
     GIPO_ABLATION_PRESET_PAPER_MAIN: tuple(arm for arm in _ALL_ARMS if arm.paper_group == "main"),
     GIPO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX: _ALL_ARMS,
 }
+_ARMS_BY_ID: Mapping[str, GipoAblationArm] = {arm.arm_id: arm for arm in _ALL_ARMS}
 
 
 def gipo_ablation_preset_choices() -> Sequence[str]:
@@ -97,3 +99,7 @@ def gipo_ablation_arms(preset: str = DEFAULT_GIPO_ABLATION_PRESET) -> Tuple[Gipo
         return _PRESETS[str(preset)]
     except KeyError as exc:
         raise ValueError(f"Unknown GIPO ablation preset {preset!r}; expected one of {tuple(_PRESETS)}.") from exc
+
+
+def gipo_paper_student_arm() -> GipoAblationArm:
+    return _ARMS_BY_ID[GIPO_PAPER_STUDENT_ARM_ID]

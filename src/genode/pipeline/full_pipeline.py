@@ -20,7 +20,6 @@ from genode.canonical_experiment_layout import (
     SCENARIO_FAMILY_CONDITIONAL_GENERATION,
     SCENARIO_FAMILY_FORECAST,
     SCENARIO_FAMILY_MOLECULE,
-    STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
     STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO,
     scenario_family_for_key,
 )
@@ -48,19 +47,14 @@ from genode.gipo.objectives import teacher_metric_profile_for_scenario, teacher_
 from genode.gipo.ser_ptg_reference import SER_PTG_EXAMPLE_SELECTION_PROTOCOL, SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL
 from genode.gipo.ablation_plan import (
     DEFAULT_GIPO_ABLATION_PRESET,
+    GIPO_PAPER_STUDENT_ARM_ID,
     GipoAblationArm,
     gipo_ablation_arms,
     gipo_ablation_preset_choices,
+    gipo_paper_student_arm,
 )
 from genode.gipo.policy import (
-    DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
-    DEFAULT_STUDENT_TARGET_ELITE_FRACTION,
-    DEFAULT_STUDENT_TARGET_ELITE_K,
-    DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT,
-    DEFAULT_STUDENT_TARGET_MIXTURE_MODE,
     DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
-    DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT,
-    DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION,
     STUDENT_TARGET_MIXTURE_MODES,
 )
 
@@ -72,7 +66,6 @@ DEFAULT_STAGES = (
     "schedule_rows_seen",
     "schedule_rows_unseen",
     "gipo_student_seen_only_zero_shot",
-    "gipo_student_seen_plus_unseen_pseudo",
     "locked_test_reports",
 )
 GIPO_ABLATION_STUDENT_STAGE = "gipo_ablation_students"
@@ -85,10 +78,26 @@ DEFAULT_ABLATION_FIRST_STAGES = (
     GIPO_ABLATION_STUDENT_STAGE,
     GIPO_ABLATION_LOCKED_TEST_STAGE,
 )
-PIPELINE_STAGE_ORDER = (*DEFAULT_STAGES, GIPO_ABLATION_STUDENT_STAGE, GIPO_ABLATION_LOCKED_TEST_STAGE)
+PIPELINE_STAGE_ORDER = (
+    *DEFAULT_STAGES,
+    "gipo_student_seen_plus_unseen_pseudo",
+    GIPO_ABLATION_STUDENT_STAGE,
+    GIPO_ABLATION_LOCKED_TEST_STAGE,
+)
 DEFAULT_GIPO_TEACHER_STEPS = 500
 DEFAULT_GIPO_STUDENT_STEPS = 500
 SCHEDULE_ROW_SPLIT_PHASES = ("train_tuning", "locked_test")
+PAPER_FIRST_ROOT_NAME = "paper_first"
+STUDENT_OBJECTIVE_CLI_FIELDS = (
+    "student_teacher_score_weight",
+    "student_teacher_score_warmup_fraction",
+    "student_teacher_score_include_pseudo",
+    "student_target_mixture_mode",
+    "student_target_elite_fraction",
+    "student_target_elite_k",
+    "student_target_elite_min_count",
+    "student_target_elite_blend_all_weight",
+)
 
 
 @dataclass(frozen=True)
@@ -184,31 +193,62 @@ def _teacher_target_args_for_scenario(dataset: str) -> List[str]:
 
 
 def _student_objective_args(args: argparse.Namespace, override: GipoAblationArm | None = None) -> List[Any]:
-    source: Any = override if override is not None else args
+    settings = _student_objective_settings_payload(override if override is not None else args)
     values: List[Any] = [
         "--student_teacher_score_weight",
-        float(source.student_teacher_score_weight),
+        float(settings["student_teacher_score_weight"]),
         "--student_teacher_score_warmup_fraction",
-        float(source.student_teacher_score_warmup_fraction),
+        float(settings["student_teacher_score_warmup_fraction"]),
         "--student_target_mixture_mode",
-        str(source.student_target_mixture_mode),
+        str(settings["student_target_mixture_mode"]),
         "--student_target_elite_fraction",
-        float(source.student_target_elite_fraction),
+        float(settings["student_target_elite_fraction"]),
         "--student_target_elite_k",
-        int(source.student_target_elite_k),
+        int(settings["student_target_elite_k"]),
         "--student_target_elite_min_count",
-        int(source.student_target_elite_min_count),
+        int(settings["student_target_elite_min_count"]),
         "--student_target_elite_blend_all_weight",
-        float(source.student_target_elite_blend_all_weight),
+        float(settings["student_target_elite_blend_all_weight"]),
     ]
-    if bool(source.student_teacher_score_include_pseudo):
+    if bool(settings["student_teacher_score_include_pseudo"]):
         values.append("--student_teacher_score_include_pseudo")
     return values
+
+
+def _student_objective_settings_payload(source: Any) -> Dict[str, Any]:
+    defaults = gipo_paper_student_arm()
+    raw = {}
+    for field in STUDENT_OBJECTIVE_CLI_FIELDS:
+        value = getattr(source, field, None)
+        raw[field] = getattr(defaults, field) if value is None else value
+    return {
+        "student_teacher_score_weight": float(raw["student_teacher_score_weight"]),
+        "student_teacher_score_warmup_fraction": float(raw["student_teacher_score_warmup_fraction"]),
+        "student_teacher_score_include_pseudo": bool(raw["student_teacher_score_include_pseudo"]),
+        "student_target_mixture_mode": str(raw["student_target_mixture_mode"]),
+        "student_target_elite_fraction": float(raw["student_target_elite_fraction"]),
+        "student_target_elite_k": int(raw["student_target_elite_k"]),
+        "student_target_elite_min_count": int(raw["student_target_elite_min_count"]),
+        "student_target_elite_blend_all_weight": float(raw["student_target_elite_blend_all_weight"]),
+    }
+
+
+def _student_objective_cli_overrides(args: argparse.Namespace) -> List[str]:
+    return [field for field in STUDENT_OBJECTIVE_CLI_FIELDS if getattr(args, field) is not None]
 
 
 def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
     dataset = _resolved_scenario_key(args)
     family = scenario_family_for_key(dataset)
+    effective_stages = _effective_stage_names(args)
+    objective_overrides = _student_objective_cli_overrides(args)
+    if objective_overrides and "gipo_student_seen_plus_unseen_pseudo" not in effective_stages:
+        raise ValueError(
+            "Full-pipeline student objective flags only apply to the explicit "
+            "gipo_student_seen_plus_unseen_pseudo stage. The paper-first S0 student "
+            "and ablation arms use fixed objective recipes; add that stage to --stages "
+            f"or remove: {', '.join('--' + name for name in objective_overrides)}."
+        )
     if int(args.synthetic_length) <= 0:
         raise ValueError("--synthetic_length must be positive.")
     if int(args.context_sample_count) <= 0 or int(args.context_sample_count) > CANONICAL_CONTEXT_SAMPLE_COUNT:
@@ -283,13 +323,22 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
     plan = experiment_plan_by_key().get(dataset)
     effective_stages = _effective_stage_names(args)
     includes_ablations = any(stage in {GIPO_ABLATION_STUDENT_STAGE, GIPO_ABLATION_LOCKED_TEST_STAGE} for stage in effective_stages)
+    paper_student_active = any(stage in {"gipo_student_seen_only_zero_shot", "locked_test_reports"} for stage in effective_stages)
+    pseudo_student_active = "gipo_student_seen_plus_unseen_pseudo" in effective_stages
     ablation_preset = str(getattr(args, "gipo_ablation_preset", DEFAULT_GIPO_ABLATION_PRESET))
+    paper_student_arm = gipo_paper_student_arm()
+    student_source: Any = paper_student_arm if paper_student_active else args
+    student_settings = _student_objective_settings_payload(student_source)
     return {
         "version": PIPELINE_VERSION,
         "scenario_key": dataset,
         "benchmark_family": "" if plan is None else str(plan.benchmark_family),
         "stages": effective_stages,
         "ablation_first": bool(getattr(args, "ablation_first", False)),
+        "paper_first_root": PAPER_FIRST_ROOT_NAME if paper_student_active else "",
+        "paper_student_arm_id": GIPO_PAPER_STUDENT_ARM_ID if paper_student_active else "",
+        "paper_student_arm": paper_student_arm.manifest_record() if paper_student_active else {},
+        "student_seen_plus_unseen_pseudo_objective_settings": _student_objective_settings_payload(args) if pseudo_student_active else {},
         "gipo_ablation_preset": ablation_preset if includes_ablations else "",
         "gipo_ablation_arms": [arm.manifest_record() for arm in gipo_ablation_arms(ablation_preset)] if includes_ablations else [],
         "backbone_steps": int(args.backbone_steps),
@@ -310,16 +359,16 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "schedule_context_selection_protocol": SCHEDULE_CONTEXT_SELECTION_PROTOCOL,
         "gipo_teacher_steps": int(args.gipo_teacher_steps),
         "gipo_student_steps": int(args.gipo_student_steps),
-        "student_teacher_score_weight": float(args.student_teacher_score_weight),
-        "student_teacher_score_warmup_fraction": float(args.student_teacher_score_warmup_fraction),
+        "student_teacher_score_weight": float(student_settings["student_teacher_score_weight"]),
+        "student_teacher_score_warmup_fraction": float(student_settings["student_teacher_score_warmup_fraction"]),
         "student_teacher_score_clip": float(DEFAULT_STUDENT_TEACHER_SCORE_CLIP),
         "student_teacher_score_protocol": "late_ramped_per_cell_teacher_utility_z_score",
-        "student_teacher_score_include_pseudo": bool(args.student_teacher_score_include_pseudo),
-        "student_target_mixture_mode": str(args.student_target_mixture_mode),
-        "student_target_elite_fraction": float(args.student_target_elite_fraction),
-        "student_target_elite_k": int(args.student_target_elite_k),
-        "student_target_elite_min_count": int(args.student_target_elite_min_count),
-        "student_target_elite_blend_all_weight": float(args.student_target_elite_blend_all_weight),
+        "student_teacher_score_include_pseudo": bool(student_settings["student_teacher_score_include_pseudo"]),
+        "student_target_mixture_mode": str(student_settings["student_target_mixture_mode"]),
+        "student_target_elite_fraction": float(student_settings["student_target_elite_fraction"]),
+        "student_target_elite_k": int(student_settings["student_target_elite_k"]),
+        "student_target_elite_min_count": int(student_settings["student_target_elite_min_count"]),
+        "student_target_elite_blend_all_weight": float(student_settings["student_target_elite_blend_all_weight"]),
         "teacher_metric_profile": teacher_metric_profile_for_scenario(dataset),
         "synthetic_length": int(args.synthetic_length),
         "locked_test_rows": str(args.locked_test_rows),
@@ -556,6 +605,14 @@ def _stage_outputs_complete(entry: StageCommand) -> Tuple[bool, str]:
         )
         if not ok:
             return False, reason
+        ok, reason = _command_json_output_exists(
+            command,
+            module="genode.gipo.report_locked_test",
+            out_arg="--out_dir",
+            relative_path="locked_test_gipo_comparison_summary.json",
+        )
+        if not ok:
+            return False, reason
         for relative_path in (
             "locked_test_gipo_rows.csv",
             "locked_test_gipo_aggregate_rows.csv",
@@ -755,6 +812,10 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
     ablation_preset = str(getattr(args, "gipo_ablation_preset", DEFAULT_GIPO_ABLATION_PRESET))
     gipo_ablation_root = _ablation_root(run_root, ablation_preset)
     ablation_arms = gipo_ablation_arms(ablation_preset)
+    paper_student_arm = gipo_paper_student_arm()
+    paper_student_root = run_root / PAPER_FIRST_ROOT_NAME / paper_student_arm.arm_id
+    paper_gipo_root = paper_student_root / "gipo" / paper_student_arm.student_training_mode
+    paper_report_root = paper_student_root / "locked_test_reports" / paper_student_arm.student_training_mode
     split_phases = SCHEDULE_ROW_SPLIT_PHASES
     role_nfes = {"seen": seen_nfes, "unseen": unseen_nfes}
 
@@ -928,15 +989,10 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
         return commands
 
     def _locked_test_report_commands() -> List[List[str]]:
-        commands: List[List[str]] = []
-        for mode in (STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO):
-            commands.extend(
-                _locked_test_report_commands_for_student(
-                    student_root=gipo_root / mode,
-                    report_root=run_root / "locked_test_reports" / mode,
-                )
-            )
-        return commands
+        return _locked_test_report_commands_for_student(
+            student_root=paper_gipo_root,
+            report_root=paper_report_root,
+        )
 
     def _gipo_ablation_student_commands() -> List[List[str]]:
         return [
@@ -1035,7 +1091,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
         ),
         StageCommand(
             "gipo_student_seen_only_zero_shot",
-            [_gipo_train_command(STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, gipo_root / STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT)],
+            [_gipo_train_command(paper_student_arm.student_training_mode, paper_gipo_root, paper_student_arm)],
             "gipo_seen_only_manifest.json",
         ),
         StageCommand(
@@ -1239,11 +1295,17 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the canonical multi-family GIPO pipeline with restartable status.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the canonical multi-family GIPO pipeline. By default this is the "
+            f"paper-first {GIPO_PAPER_STUDENT_ARM_ID} path; use --ablation_first "
+            "to run the ablation grid instead."
+        )
+    )
     parser.add_argument("--scenario_key", default="")
     parser.add_argument("--dataset", default="")
     parser.add_argument("--run_root", default="")
-    parser.add_argument("--stages", default="")
+    parser.add_argument("--stages", default="", help="Comma-separated explicit stage list; omitted uses the paper-first default.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--backbone_steps", type=int, default=20_000)
     parser.add_argument("--checkpoint_steps", default=",".join(str(value) for value in CANONICAL_CHECKPOINT_STEPS))
@@ -1264,14 +1326,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--ser_train_tuning_max_examples", type=int, default=0)
     parser.add_argument("--gipo_teacher_steps", type=int, default=DEFAULT_GIPO_TEACHER_STEPS)
     parser.add_argument("--gipo_student_steps", type=int, default=DEFAULT_GIPO_STUDENT_STEPS)
-    parser.add_argument("--student_teacher_score_weight", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT)
-    parser.add_argument("--student_teacher_score_warmup_fraction", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION)
-    parser.add_argument("--student_teacher_score_include_pseudo", action="store_true", default=False)
-    parser.add_argument("--student_target_mixture_mode", choices=STUDENT_TARGET_MIXTURE_MODES, default=DEFAULT_STUDENT_TARGET_MIXTURE_MODE)
-    parser.add_argument("--student_target_elite_fraction", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_FRACTION)
-    parser.add_argument("--student_target_elite_k", type=int, default=DEFAULT_STUDENT_TARGET_ELITE_K)
-    parser.add_argument("--student_target_elite_min_count", type=int, default=DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT)
-    parser.add_argument("--student_target_elite_blend_all_weight", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT)
+    pseudo_help = "Override only the explicit gipo_student_seen_plus_unseen_pseudo stage; paper-first and ablation recipes are fixed."
+    parser.add_argument("--student_teacher_score_weight", type=float, default=None, help=pseudo_help)
+    parser.add_argument("--student_teacher_score_warmup_fraction", type=float, default=None, help=pseudo_help)
+    parser.add_argument("--student_teacher_score_include_pseudo", action="store_true", default=None, help=pseudo_help)
+    parser.add_argument("--student_target_mixture_mode", choices=STUDENT_TARGET_MIXTURE_MODES, default=None, help=pseudo_help)
+    parser.add_argument("--student_target_elite_fraction", type=float, default=None, help=pseudo_help)
+    parser.add_argument("--student_target_elite_k", type=int, default=None, help=pseudo_help)
+    parser.add_argument("--student_target_elite_min_count", type=int, default=None, help=pseudo_help)
+    parser.add_argument("--student_target_elite_blend_all_weight", type=float, default=None, help=pseudo_help)
     parser.add_argument("--synthetic_length", type=int, default=2_000_000)
     parser.add_argument("--locked_test_rows", default="")
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
@@ -1284,7 +1347,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--molecule_backbone_root", default=str(project_outputs_root() / "molecule_3d_backbones"))
     parser.add_argument("--backbone_package_root", default="", help="Portable backbone package root to use for downstream-only GIPO stages.")
     parser.add_argument("--use_provided_backbones", action="store_true", default=False, help="Require existing packaged/provided backbones and refuse backbone_training stages.")
-    parser.add_argument("--ablation_first", action="store_true", default=False, help="Run prerequisite artifacts plus GIPO ablations before stock GIPO stages.")
+    parser.add_argument(
+        "--ablation_first",
+        action="store_true",
+        default=False,
+        help="Run prerequisite artifacts plus the GIPO ablation grid instead of the paper-first student path.",
+    )
     parser.add_argument("--gipo_ablation_preset", choices=gipo_ablation_preset_choices(), default=DEFAULT_GIPO_ABLATION_PRESET)
     parser.add_argument("--dry_run", action="store_true", default=False)
     parser.add_argument("--resume", action="store_true", default=False)

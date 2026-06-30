@@ -150,12 +150,16 @@ class GenODEInterfaceTests(unittest.TestCase):
 
         parser = build_argparser()
         options = {option for action in parser._actions for option in action.option_strings}
+        help_text = parser.format_help()
 
         self.assertIn("--ablation_first", options)
         self.assertIn("--gipo_ablation_preset", options)
         self.assertIn("--ser_calibration_batch_size", options)
         self.assertIn("--ser_val_windows", options)
         self.assertIn("--ser_train_tuning_max_examples", options)
+        self.assertIn("paper-first", help_text)
+        self.assertIn("S0_full_score001_seen_only", help_text)
+        self.assertIn("ablation grid instead", help_text)
 
     def test_project_path_resolver_accepts_legacy_package_prefixes(self) -> None:
         from genode.data import otflow_paths
