@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genode"
+version = "0.1.0"
+description = "Paper-first GIPO schedule optimization on frozen OT flow-matching backbones."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "GenODE contributors"}]
+keywords = [
+  "flow-matching",
+  "generative-modeling",
+  "GIPO",
+  "ordinary-differential-equations",
+  "schedule-optimization",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "matplotlib>=3.8,<4",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+medical = ["wfdb>=4.1"]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/pixelhero98/GenODE-Inference"
+Repository = "https://github.com/pixelhero98/GenODE-Inference"
+Issues = "https://github.com/pixelhero98/GenODE-Inference/issues"
+
+[project.scripts]
+genode-run-schedules = "genode.evaluation.diffusion_flow_time_reparameterization:main"
+genode-run-full-pipeline = "genode.pipeline.full_pipeline:main"
+genode-train-backbone = "genode.training.train_backbone:main"
+genode-prepare-molecule-xyz = "genode.data.prepare_molecule_xyz:main"
+genode-train-molecule-backbone = "genode.training.train_molecule_backbone:main"
+genode-eval-molecule-backbone = "genode.evaluation.molecule_metrics:main"
+genode-train-gipo = "genode.gipo.train_gipo:main"
+genode-preflight-gipo-rows = "genode.gipo.preflight:main"
+genode-report-gipo-locked-test = "genode.gipo.report_locked_test:main"
+genode-build-ser-ptg-reference = "genode.gipo.ser_ptg_reference:main"
+genode-evaluate-schedule-summary = "genode.gipo.evaluate_schedule_summary:main"
+genode-build-hardness-figure = "genode.visualization.build_hardness_mismatch_figure:main"
+genode-build-ptg-figure = "genode.visualization.build_ptg_observed_gain_figure:main"
+genode-package-backbone-family = "genode.backbone_packages:package_main"
+genode-validate-backbone-package = "genode.backbone_packages:validate_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"genode.schedule_transfer" = ["otflow_external_schedule_catalog.json"]

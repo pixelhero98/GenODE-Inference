@@ -1,0 +1,61 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q
+      - run: python -m pip check
+      - run: git diff --check
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --upgrade pip build
+      - run: python -m build
+      - run: python -m pip install --force-reinstall dist/*.whl
+      - run: |
+          for command in \
+            genode-run-schedules \
+            genode-run-full-pipeline \
+            genode-train-backbone \
+            genode-prepare-molecule-xyz \
+            genode-train-molecule-backbone \
+            genode-eval-molecule-backbone \
+            genode-train-gipo \
+            genode-preflight-gipo-rows \
+            genode-report-gipo-locked-test \
+            genode-build-ser-ptg-reference \
+            genode-evaluate-schedule-summary \
+            genode-build-hardness-figure \
+            genode-build-ptg-figure \
+            genode-package-backbone-family \
+            genode-validate-backbone-package
+          do
+            "$command" --help
+          done
+      - run: python -m pip check
