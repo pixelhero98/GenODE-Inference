@@ -1,15 +1,11 @@
-# GenODE
+# GIPO
 
-GenODE is a paper-first implementation of GIPO, a continuous-density student
-policy for schedule optimization on frozen optimal-transport flow-matching
-backbones. The default workflow trains `paper_gipo` from measured fixed and SER
-schedules, then compares that frozen student with the required fixed-schedule
-and SER baselines on the locked test. Ablation students are excluded unless
-they are explicitly requested.
+GIPO is a continuous-density conditional policy for inference-time optimization on frozen optimal-transport flow-matching
+backbones. 
 
 ## Installation
 
-GenODE requires Python 3.11 or newer.
+GIPO requires Python 3.11 or newer.
 
 ```bash
 python -m pip install -e .
