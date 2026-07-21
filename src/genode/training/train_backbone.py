@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
-from genode.data.experiment_common import DATASET_PLANS, build_dataset_splits, get_otflow_paper_backbone_preset
+from genode.data.experiment_common import DATASET_PLANS, build_dataset_splits, get_otflow_reference_backbone_preset
 from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY, experiment_plan_by_key
 from genode.data.otflow_forecast_data import build_monash_forecast_splits
 from genode.data.otflow_monash_datasets import download_monash_dataset, monash_manifest_path
@@ -21,7 +21,7 @@ from genode.data.otflow_paths import (
     long_term_st_data_path,
     project_backbone_matrix_root,
     display_project_path,
-    project_paper_dataset_root,
+    project_dataset_root,
     resolve_project_path,
 )
 from genode.evaluation.fm_backbone_registry import (
@@ -99,7 +99,6 @@ def build_forecast_cfg(args: argparse.Namespace) -> OTFlowConfig:
         fu_net_layers=int(args.fu_net_layers),
         fu_net_heads=int(args.fu_net_heads),
         use_minibatch_ot=True,
-        solver="euler",
         use_amp=bool(args.use_amp),
         grad_accum_steps=int(args.grad_accum_steps),
     )
@@ -109,7 +108,7 @@ def build_forecast_cfg(args: argparse.Namespace) -> OTFlowConfig:
 def build_conditional_cfg(args: argparse.Namespace) -> OTFlowConfig:
     spec = _conditional_scenario_spec(str(args.scenario_key))
     plan = DATASET_PLANS[str(args.scenario_key)]
-    preset = get_otflow_paper_backbone_preset(str(args.scenario_key))
+    preset = get_otflow_reference_backbone_preset(str(args.scenario_key))
     cfg = OTFlowConfig()
     cfg.apply_overrides(
         device=resolve_torch_device(str(args.device)),
@@ -141,7 +140,6 @@ def build_conditional_cfg(args: argparse.Namespace) -> OTFlowConfig:
         fu_net_layers=int(args.fu_net_layers),
         fu_net_heads=int(args.fu_net_heads),
         use_minibatch_ot=True,
-        solver="euler",
         use_amp=bool(args.use_amp),
         grad_accum_steps=int(args.grad_accum_steps),
     )
@@ -740,7 +738,7 @@ def build_argparser() -> argparse.ArgumentParser:
         allow_abbrev=False,
     )
     parser.add_argument("--scenario_key", default=DEFAULT_SCENARIO_KEY)
-    parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
+    parser.add_argument("--dataset_root", default=str(project_dataset_root()))
     parser.add_argument("--data_path", default="")
     parser.add_argument("--cryptos_path", default="")
     parser.add_argument("--lobster_synthetic_profile_path", default="")

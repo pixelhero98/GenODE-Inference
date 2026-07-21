@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+pytest-of-*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -16,6 +17,7 @@ htmlcov/
 
 # Local datasets, checkpoints, and experiment outputs.
 /data/
+/datasets/
 /paper_datasets/
 /outputs/
 /reports/

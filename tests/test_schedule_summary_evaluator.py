@@ -452,8 +452,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 json.dumps(
                     {
                         "scenario_key": "traffic_hourly",
-                        "method_key": "paper_gipo",
-                        "mode": "paper_first",
+                        "method_key": "gipo",
+                        "mode": "reference_first",
                         "teacher_final_retrain": teacher_final_retrain,
                         "checkpoint_step": 20000,
                         "checkpoint_id": "forecast-ckpt",
@@ -494,9 +494,9 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
 
         prediction = reloaded[(SELECTED_STUDENT_SCHEDULE_KEY, "euler", 4)]
         expected_metadata = {
-            "method_key": "paper_gipo",
+            "method_key": "gipo",
             "gipo_step_budget": 25,
-            "mode": "paper_first",
+            "mode": "reference_first",
             "teacher_final_retrain": teacher_final_retrain,
             "checkpoint_step": 20000,
             "checkpoint_id": "forecast-ckpt",

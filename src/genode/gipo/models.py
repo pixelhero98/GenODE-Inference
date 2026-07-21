@@ -3,11 +3,11 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence, Tuple
+from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import torch
 
-from genode.experiment_layout import PAPER_SEEN_NFES
+from genode.experiment_layout import REFERENCE_SEEN_NFES
 from genode.solver_protocol import (
     normalize_solver_key,
     solver_effective_order,
@@ -15,10 +15,9 @@ from genode.solver_protocol import (
     solver_macro_steps,
 )
 
-TARGET_NFES: Tuple[int, ...] = PAPER_SEEN_NFES
+TARGET_NFES: Tuple[int, ...] = REFERENCE_SEEN_NFES
 DEFAULT_NFE_REFERENCE = 16
 SETTING_ENCODER_MODE_CONTINUOUS = "continuous"
-SERIES_ENCODING_NONE_CONTEXT_ONLY = "none_context_only"
 SOLVER_METADATA_VERSION = "solver_metadata"
 
 
@@ -56,16 +55,6 @@ def _fourier_phase_features(phase: float, frequencies: Sequence[float]) -> Tuple
     )
 
 
-def validate_series_encoding(value: str | None = None) -> str:
-    encoding = str(value or SERIES_ENCODING_NONE_CONTEXT_ONLY).strip()
-    if encoding != SERIES_ENCODING_NONE_CONTEXT_ONLY:
-        raise ValueError(
-            f"GIPO setting encoder requires series_encoding={SERIES_ENCODING_NONE_CONTEXT_ONLY!r}; "
-            f"got {encoding!r}."
-        )
-    return encoding
-
-
 def _positive_sorted_ints(values: Sequence[Any], *, label: str) -> Tuple[int, ...]:
     out = tuple(sorted({int(value) for value in values}))
     if not out or any(value <= 0 for value in out):
@@ -80,7 +69,6 @@ class SettingEncoderConfig:
     nfe_reference: int = DEFAULT_NFE_REFERENCE
     rope_frequencies: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
     solver_metadata_version: str = SOLVER_METADATA_VERSION
-    series_encoding: str = SERIES_ENCODING_NONE_CONTEXT_ONLY
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -89,7 +77,6 @@ class SettingEncoderConfig:
             "nfe_reference": int(self.nfe_reference),
             "rope_frequencies": [float(value) for value in self.rope_frequencies],
             "solver_metadata_version": str(self.solver_metadata_version),
-            "series_encoding": str(self.series_encoding),
         }
 
 
@@ -99,11 +86,13 @@ def build_setting_encoder_config(
     observed_target_nfes: Sequence[int] | None = None,
     nfe_reference: int | None = None,
     rope_frequencies: Sequence[float] | None = None,
-    series_encoding: str = SERIES_ENCODING_NONE_CONTEXT_ONLY,
     solver_metadata_version: str = SOLVER_METADATA_VERSION,
 ) -> SettingEncoderConfig:
     encoder_mode = validate_setting_mode(mode)
-    observed = _positive_sorted_ints(TARGET_NFES if observed_target_nfes is None else observed_target_nfes, label="observed_target_nfes")
+    observed = _positive_sorted_ints(
+        TARGET_NFES if observed_target_nfes is None else observed_target_nfes,
+        label="observed_target_nfes",
+    )
     reference = int(max(observed + (DEFAULT_NFE_REFERENCE,)) if nfe_reference is None else nfe_reference)
     if reference <= 0:
         raise ValueError("nfe_reference must be positive.")
@@ -119,15 +108,18 @@ def build_setting_encoder_config(
         nfe_reference=reference,
         rope_frequencies=rope,
         solver_metadata_version=version,
-        series_encoding=validate_series_encoding(series_encoding),
     )
 
 
-def setting_encoder_config_from_payload(payload: Mapping[str, Any] | SettingEncoderConfig | None) -> SettingEncoderConfig:
+def setting_encoder_config_from_payload(
+    payload: Mapping[str, Any] | SettingEncoderConfig | None,
+) -> SettingEncoderConfig:
     if isinstance(payload, SettingEncoderConfig):
-        validate_series_encoding(payload.series_encoding)
         return payload
     data = dict(payload or {})
+    retired_keys = sorted(set(data) & {"series_encoding"})
+    if retired_keys:
+        raise ValueError(f"Setting encoder configuration uses retired keys: {retired_keys}.")
     if "setting_feature_mode" in data:
         raise ValueError("Setting encoder configuration must use 'mode'; 'setting_feature_mode' is not supported.")
     mode = str(data.get("mode", SETTING_ENCODER_MODE_CONTINUOUS))
@@ -136,7 +128,6 @@ def setting_encoder_config_from_payload(payload: Mapping[str, Any] | SettingEnco
         observed_target_nfes=data.get("observed_target_nfes", TARGET_NFES),
         nfe_reference=data.get("nfe_reference", DEFAULT_NFE_REFERENCE),
         rope_frequencies=data.get("rope_frequencies", None),
-        series_encoding=str(data.get("series_encoding", SERIES_ENCODING_NONE_CONTEXT_ONLY)),
         solver_metadata_version=str(data.get("solver_metadata_version", SOLVER_METADATA_VERSION)),
     )
 
@@ -145,10 +136,9 @@ def setting_encoder_config_for_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
     mode: str,
-    series_encoding: str = SERIES_ENCODING_NONE_CONTEXT_ONLY,
 ) -> SettingEncoderConfig:
     observed = sorted({int(row["target_nfe"]) for row in rows})
-    return build_setting_encoder_config(mode, observed_target_nfes=observed or TARGET_NFES, series_encoding=series_encoding)
+    return build_setting_encoder_config(mode, observed_target_nfes=observed or TARGET_NFES)
 
 
 def setting_feature_dim(

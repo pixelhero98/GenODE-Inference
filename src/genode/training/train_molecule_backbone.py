@@ -105,7 +105,6 @@ def build_molecule_cfg(args: argparse.Namespace, *, atom_count: int, context_fea
         fu_net_layers=int(args.fu_net_layers),
         fu_net_heads=int(args.fu_net_heads),
         use_minibatch_ot=bool(args.use_minibatch_ot),
-        solver=str(args.solver),
         use_amp=bool(args.use_amp),
         grad_accum_steps=int(args.grad_accum_steps),
         ema_decay=float(args.ema_decay),
@@ -523,7 +522,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--budget_steps", default=",".join(str(value) for value in DEFAULT_BUDGET_STEPS))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
-    parser.add_argument("--solver", default="euler")
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--use_swa", action="store_true", default=False)
     parser.add_argument("--use_minibatch_ot", action="store_true", default=True)

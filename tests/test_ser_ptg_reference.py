@@ -13,6 +13,7 @@ from genode.gipo import ser_ptg_reference as ser
 from genode.gipo.ser_ptg_reference import build_argparser, build_ser_ptg_reference, collect_batched_local_defect_trace
 from genode.evaluation.otflow_evaluation_support import build_conditional_generation_dataset_args_from_cfg
 from genode.models.config import OTFlowConfig
+from genode.solver_protocol import FlowDiagnostics, FlowTrajectory
 
 
 class SerPtgReferenceTests(unittest.TestCase):
@@ -85,17 +86,52 @@ class SerPtgReferenceTests(unittest.TestCase):
                 return torch.zeros(2, 1), torch.ones(1), {"target_t": 2}
 
         class DummyModel:
-            def sample_future_trace(self, hist, steps=None, solver=None, oracle_local_error=False):
-                del solver, oracle_local_error
-                width = int(steps) + 1
-                trace = {
-                    "time_grid": torch.linspace(0.0, 1.0, width, device=hist.device),
-                    "oracle_local_error": torch.ones(hist.shape[0], int(steps), device=hist.device),
+            def sample_future_with_diagnostics(
+                self,
+                hist,
+                *,
+                solver_key,
+                target_nfe,
+                time_grid,
+                include_local_error=False,
+            ):
+                self.last_call = {
+                    "solver_key": solver_key,
+                    "target_nfe": target_nfe,
+                    "time_grid": tuple(float(value) for value in time_grid),
+                    "include_local_error": include_local_error,
                 }
-                return torch.zeros(hist.shape[0], 1, 1, device=hist.device), trace
+                grid = torch.as_tensor(time_grid, dtype=hist.dtype, device=hist.device)
+                macro_steps = int(grid.numel()) - 1
+                initial_state = torch.zeros(hist.shape[0], 1, dtype=hist.dtype, device=hist.device)
+                states = initial_state[:, None, :].expand(-1, macro_steps + 1, -1).clone()
+                trajectory = FlowTrajectory(
+                    initial_state=initial_state,
+                    time_grid=grid,
+                    states=states,
+                    final_state=states[:, -1],
+                    solver_key=str(solver_key),
+                    target_nfe=int(target_nfe),
+                    macro_steps=macro_steps,
+                    realized_nfe=int(target_nfe),
+                )
+                values = torch.ones(hist.shape[0], macro_steps, dtype=hist.dtype, device=hist.device)
+                diagnostics = FlowDiagnostics(
+                    trajectory=trajectory,
+                    disagreement=values,
+                    velocity_norm=values,
+                    ema_velocity_norm=values,
+                    residual_norm=values,
+                    local_error=values if include_local_error else torch.zeros_like(values),
+                    field_evals_by_step=values,
+                    mean_field_evals_per_step=1.0,
+                    mean_total_field_evals_per_rollout=float(macro_steps),
+                )
+                return torch.zeros(hist.shape[0], 1, 1, device=hist.device), diagnostics
 
+        model = DummyModel()
         result = collect_batched_local_defect_trace(
-            DummyModel(),
+            model,
             DummyDataset(),
             cfg,
             solver_name="euler",
@@ -106,6 +142,15 @@ class SerPtgReferenceTests(unittest.TestCase):
             calibration_trace_samples=2,
         )
         self.assertEqual(result["trace_count"], 2)
+        self.assertEqual(
+            model.last_call,
+            {
+                "solver_key": "euler",
+                "target_nfe": 1,
+                "time_grid": (0.0, 1.0),
+                "include_local_error": True,
+            },
+        )
 
     def test_forecast_train_tuning_is_capped_by_context_sample_count(self) -> None:
         captured = []

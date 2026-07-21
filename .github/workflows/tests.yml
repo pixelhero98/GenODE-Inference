@@ -23,6 +23,21 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[test]"
+      - run: python -m ruff check .
+      - run: python -m pytest -q
+      - run: python -m pip check
+      - run: git diff --check
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
       - run: python -m pytest -q
       - run: python -m pip check
       - run: git diff --check
@@ -54,7 +69,10 @@ jobs:
             genode-build-hardness-figure \
             genode-build-ptg-figure \
             genode-package-backbone-family \
-            genode-validate-backbone-package
+            genode-validate-backbone-package \
+            genode-collect-flow-map-demonstrations \
+            genode-train-flow-map \
+            genode-evaluate-flow-map
           do
             "$command" --help
           done

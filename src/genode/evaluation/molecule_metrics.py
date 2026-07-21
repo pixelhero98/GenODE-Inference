@@ -21,7 +21,6 @@ from genode.data.molecule_xyz import (
 from genode.experiment_layout import NFE_ROLE_SEEN, SCENARIO_FAMILY_MOLECULE, target_nfes_for_role
 from genode.data.otflow_paths import display_project_path, resolve_project_path
 from genode.evaluation.otflow_evaluation_support import load_checkpoint_model, load_otflow_checkpoint_payload
-from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _restore_sample_overrides
 from genode.gipo.models import validate_time_grid
 from genode.models.otflow_train_val import _temporary_eval_seed, evaluate_average_loss, save_json
 from genode.runtime import resolve_torch_device
@@ -31,6 +30,7 @@ from genode.solver_protocol import (
     normalize_solver_key,
     normalize_solver_keys,
     solver_macro_steps,
+    uniform_time_grid,
 )
 
 MOLECULE_CONTEXT_SCHEMA = "molecule_3d_window"
@@ -252,8 +252,9 @@ def _sample_molecule_ar_rollout(
     ds,
     history_coords: np.ndarray,
     rollout_steps: int,
-    nfe: int,
+    target_nfe: int,
     solver: str,
+    time_grid: Sequence[float],
     device: torch.device,
     seed: int,
 ) -> np.ndarray:
@@ -266,8 +267,9 @@ def _sample_molecule_ar_rollout(
         with _temporary_eval_seed(int(seed) + int(step_idx)):
             pred_norm = model.sample_future(
                 hist_t,
-                steps=int(nfe),
-                solver=str(solver),
+                solver_key=str(solver),
+                target_nfe=int(target_nfe),
+                time_grid=time_grid,
             )
         residual = ds.denormalize_target(pred_norm.detach().cpu().numpy()[0])[0]
         next_coords = history[-1] + residual.reshape(ds.data.atom_count, 3)
@@ -449,8 +451,9 @@ def _molecule_window_metrics(
     bond_pairs: np.ndarray,
     rollout_steps: int,
     sample_count: int,
-    macro_steps: int,
+    target_nfe: int,
     solver_key: str,
+    time_grid: Sequence[float],
     device: torch.device,
     seed: int,
 ) -> Dict[str, Any]:
@@ -467,8 +470,9 @@ def _molecule_window_metrics(
             ds=ds,
             history_coords=history_coords,
             rollout_steps=int(rollout_steps),
-            nfe=int(macro_steps),
+            target_nfe=int(target_nfe),
             solver=str(solver_key),
+            time_grid=time_grid,
             device=device,
             seed=int(seed) + 1_000_000 * int(sample_idx),
         )
@@ -537,75 +541,72 @@ def evaluate_molecule_rollout_schedule(
     grid = validate_time_grid(time_grid, macro_steps=int(macro_steps))
     atom_symbols = ds.data.atom_symbols
     bond_pairs = _bond_pairs(ds.stats.reference_coords, atom_symbols)
-    backup = _apply_sample_overrides(model, cfg, time_grid=tuple(float(x) for x in grid))
     per_context: List[Dict[str, Any]] = []
-    try:
-        for context_index, example_idx in enumerate(indices):
-            context_seed = int(seed) + int(context_index)
-            item = ds.eval_item(int(example_idx))
-            metrics = _molecule_window_metrics(
-                model=model,
-                ds=ds,
-                item=item,
-                atom_symbols=atom_symbols,
-                bond_pairs=bond_pairs,
-                rollout_steps=int(rollout_steps),
-                sample_count=int(sample_count),
-                macro_steps=int(macro_steps),
-                solver_key=str(solver_key),
-                device=dev,
-                seed=int(context_seed),
-            )
-            target_idx = int(item.get("target_idx", example_idx))
-            flags = {
-                "transition": bool(item.get("transition", False)),
-                "transition_window": bool(item.get("transition_window", False)),
-                "discontinuity": bool(item.get("discontinuity", False)),
-                "discontinuity_window": bool(item.get("discontinuity_window", False)),
-                "duplicate": bool(item.get("duplicate", False)),
+    for context_index, example_idx in enumerate(indices):
+        context_seed = int(seed) + int(context_index)
+        item = ds.eval_item(int(example_idx))
+        metrics = _molecule_window_metrics(
+            model=model,
+            ds=ds,
+            item=item,
+            atom_symbols=atom_symbols,
+            bond_pairs=bond_pairs,
+            rollout_steps=int(rollout_steps),
+            sample_count=int(sample_count),
+            target_nfe=int(target_nfe),
+            solver_key=str(solver_key),
+            time_grid=grid,
+            device=dev,
+            seed=int(context_seed),
+        )
+        target_idx = int(item.get("target_idx", example_idx))
+        flags = {
+            "transition": bool(item.get("transition", False)),
+            "transition_window": bool(item.get("transition_window", False)),
+            "discontinuity": bool(item.get("discontinuity", False)),
+            "discontinuity_window": bool(item.get("discontinuity_window", False)),
+            "duplicate": bool(item.get("duplicate", False)),
+        }
+        context_id = molecule_context_id(
+            dataset_key=str(dataset_key),
+            member_key=str(member_key),
+            stratum=str(stratum),
+            split_phase=str(split_phase),
+            item=item,
+            example_idx=int(example_idx),
+        )
+        per_context.append(
+            {
+                **metrics,
+                "context_schema": MOLECULE_CONTEXT_SCHEMA,
+                "context_id": context_id,
+                "context_embedding_id": molecule_context_embedding_id(str(checkpoint_id), context_id),
+                "example_idx": int(example_idx),
+                "target_t": int(target_idx),
+                "history_start": int(target_idx) - int(getattr(ds, "H", 0)),
+                "history_stop": int(target_idx),
+                "target_stop": int(target_idx) + int(rollout_steps),
+                "axis_member": str(member_key),
+                "axis_stratum": str(stratum),
+                "axis_formula": str(formula),
+                "axis_atom_count": int(ds.data.atom_count),
+                "axis_trajectory": str(item.get("trajectory_key", item.get("trajectory_id", ""))),
+                "axis_iso_id": str(item.get("iso_id", "")),
+                "axis_window": str(target_idx),
+                "axis_flags": json.dumps(flags, sort_keys=True, separators=(",", ":")),
+                "member_key": str(member_key),
+                "stratum": str(stratum),
+                "formula": str(formula),
+                "source_zip_name": str(source_zip_name),
+                "num_eval_samples": int(sample_count),
+                "evaluation_seed": int(context_seed),
+                "sample_seed_start": int(context_seed),
+                "sample_seed_values_json": json.dumps(
+                    [int(context_seed) + 1_000_000 * int(sample_idx) for sample_idx in range(int(sample_count))],
+                    separators=(",", ":"),
+                ),
             }
-            context_id = molecule_context_id(
-                dataset_key=str(dataset_key),
-                member_key=str(member_key),
-                stratum=str(stratum),
-                split_phase=str(split_phase),
-                item=item,
-                example_idx=int(example_idx),
-            )
-            per_context.append(
-                {
-                    **metrics,
-                    "context_schema": MOLECULE_CONTEXT_SCHEMA,
-                    "context_id": context_id,
-                    "context_embedding_id": molecule_context_embedding_id(str(checkpoint_id), context_id),
-                    "example_idx": int(example_idx),
-                    "target_t": int(target_idx),
-                    "history_start": int(target_idx) - int(getattr(ds, "H", 0)),
-                    "history_stop": int(target_idx),
-                    "target_stop": int(target_idx) + int(rollout_steps),
-                    "axis_member": str(member_key),
-                    "axis_stratum": str(stratum),
-                    "axis_formula": str(formula),
-                    "axis_atom_count": int(ds.data.atom_count),
-                    "axis_trajectory": str(item.get("trajectory_key", item.get("trajectory_id", ""))),
-                    "axis_iso_id": str(item.get("iso_id", "")),
-                    "axis_window": str(target_idx),
-                    "axis_flags": json.dumps(flags, sort_keys=True, separators=(",", ":")),
-                    "member_key": str(member_key),
-                    "stratum": str(stratum),
-                    "formula": str(formula),
-                    "source_zip_name": str(source_zip_name),
-                    "num_eval_samples": int(sample_count),
-                    "evaluation_seed": int(context_seed),
-                    "sample_seed_start": int(context_seed),
-                    "sample_seed_values_json": json.dumps(
-                        [int(context_seed) + 1_000_000 * int(sample_idx) for sample_idx in range(int(sample_count))],
-                        separators=(",", ":"),
-                    ),
-                }
-            )
-    finally:
-        _restore_sample_overrides(model, cfg, backup)
+        )
     summary: Dict[str, Any] = {
         "benchmark_family": SCENARIO_FAMILY_MOLECULE,
         "scenario_key": str(dataset_key),
@@ -852,8 +853,9 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
                 ds=ds,
                 history_coords=history_coords,
                 rollout_steps=rollout_steps,
-                nfe=int(macro_steps),
+                target_nfe=int(target_nfe),
                 solver=str(solver_key),
+                time_grid=uniform_time_grid(solver_key, target_nfe),
                 device=device,
                 seed=int(args.seed) + 10_000 * int(dataset_idx) + int(sample_idx),
             )

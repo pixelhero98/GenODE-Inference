@@ -18,8 +18,8 @@ from genode.data.otflow_medical_datasets import (
     _validate_long_term_st_manifest,
     prepare_long_term_st_dataset,
 )
-from genode.data.experiment_common import OTFLOW_PAPER_DATASET_CHOICES, get_otflow_paper_backbone_preset
-from genode.data.otflow_experiment_plan import PAPER_CONDITIONAL_GENERATION_DATASETS
+from genode.data.experiment_common import OTFLOW_REFERENCE_DATASET_CHOICES, get_otflow_reference_backbone_preset
+from genode.data.otflow_experiment_plan import REFERENCE_CONDITIONAL_GENERATION_DATASETS
 from genode.evaluation.otflow_evaluation_support import (
     parse_conditional_generation_datasets,
 )
@@ -65,10 +65,10 @@ class LongTermSTTests(unittest.TestCase):
         return manifest_path
 
     def test_long_term_st_is_default_conditional_generation(self) -> None:
-        self.assertIn(LONG_TERM_ST_DATASET_KEY, PAPER_CONDITIONAL_GENERATION_DATASETS)
-        self.assertIn(LONG_TERM_ST_DATASET_KEY, OTFLOW_PAPER_DATASET_CHOICES)
+        self.assertIn(LONG_TERM_ST_DATASET_KEY, REFERENCE_CONDITIONAL_GENERATION_DATASETS)
+        self.assertIn(LONG_TERM_ST_DATASET_KEY, OTFLOW_REFERENCE_DATASET_CHOICES)
         self.assertEqual(parse_conditional_generation_datasets(LONG_TERM_ST_DATASET_KEY), [LONG_TERM_ST_DATASET_KEY])
-        self.assertEqual(get_otflow_paper_backbone_preset(LONG_TERM_ST_DATASET_KEY)["future_block_len"], 3000)
+        self.assertEqual(get_otflow_reference_backbone_preset(LONG_TERM_ST_DATASET_KEY)["future_block_len"], 3000)
 
     def test_lazy_long_term_st_dataset_shapes_and_segment_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

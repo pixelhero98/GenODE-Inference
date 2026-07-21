@@ -5,12 +5,12 @@ from typing import Mapping, Tuple
 
 EXPERIMENT_LAYOUT_ID = "seen_unseen_nfe_layout"
 
-PAPER_SEEN_NFES: Tuple[int, ...] = (4, 8, 12, 16)
-PAPER_UNSEEN_NFES: Tuple[int, ...] = (6, 10, 14, 20)
-PAPER_CHECKPOINT_STEPS: Tuple[int, ...] = (4000, 8000, 12000, 16000, 20000)
+REFERENCE_SEEN_NFES: Tuple[int, ...] = (4, 8, 12, 16)
+REFERENCE_UNSEEN_NFES: Tuple[int, ...] = (6, 10, 14, 20)
+REFERENCE_CHECKPOINT_STEPS: Tuple[int, ...] = (4000, 8000, 12000, 16000, 20000)
 TRAIN_TUNING_CONTEXT_SAMPLE_COUNT = 188
 LOCKED_TEST_PREVIEW_CONTEXTS = 512
-PAPER_PSEUDO_TARGET_WEIGHT = 0.25
+REFERENCE_UNSEEN_TARGET_WEIGHT = 0.25
 
 NFE_ROLE_SEEN = "seen"
 NFE_ROLE_UNSEEN = "unseen"
@@ -35,7 +35,7 @@ MOLECULE_SCENARIO_KEYS: Tuple[str, ...] = (
     "molecule_3d_set2",
     "molecule_3d_set3",
 )
-PAPER_SCENARIO_KEYS: Tuple[str, ...] = (
+REFERENCE_SCENARIO_KEYS: Tuple[str, ...] = (
     *FORECAST_SCENARIO_KEYS,
     *CONDITIONAL_GENERATION_SCENARIO_KEYS,
     *MOLECULE_SCENARIO_KEYS,
@@ -66,7 +66,7 @@ AVERAGED_REVERSED_SCHEDULE_KEYS: Tuple[str, ...] = (
     "ots_avg_reversed",
     "ser_ptg_local_defect_eta005_avg_reversed",
 )
-PAPER_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = (
+REFERENCE_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = (
     *PHYSICAL_SCHEDULE_KEYS,
     *REVERSED_SCHEDULE_KEYS,
     *AVERAGED_REVERSED_SCHEDULE_KEYS,
@@ -97,10 +97,10 @@ SCHEDULE_FAMILY_REVERSED = "reversed"
 SCHEDULE_FAMILY_AVERAGED_REVERSED = "averaged_reversed"
 
 STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT = "seen_only_zero_shot"
-STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO = "seen_plus_unseen_pseudo"
+STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET = "seen_plus_unseen_target"
 STUDENT_TRAINING_MODES: Tuple[str, ...] = (
     STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
-    STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO,
+    STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
 )
 
 
@@ -113,12 +113,18 @@ class ScenarioSpec:
 
 def scenario_specs() -> Tuple[ScenarioSpec, ...]:
     return tuple(
-        [ScenarioSpec(key=key, family=SCENARIO_FAMILY_FORECAST, public_dataset_key=key) for key in FORECAST_SCENARIO_KEYS]
+        [
+            ScenarioSpec(key=key, family=SCENARIO_FAMILY_FORECAST, public_dataset_key=key)
+            for key in FORECAST_SCENARIO_KEYS
+        ]
         + [
             ScenarioSpec(key=key, family=SCENARIO_FAMILY_CONDITIONAL_GENERATION, public_dataset_key=key)
             for key in CONDITIONAL_GENERATION_SCENARIO_KEYS
         ]
-        + [ScenarioSpec(key=key, family=SCENARIO_FAMILY_MOLECULE, public_dataset_key=key) for key in MOLECULE_SCENARIO_KEYS]
+        + [
+            ScenarioSpec(key=key, family=SCENARIO_FAMILY_MOLECULE, public_dataset_key=key)
+            for key in MOLECULE_SCENARIO_KEYS
+        ]
     )
 
 
@@ -127,15 +133,15 @@ def scenario_family_for_key(scenario_key: str) -> str:
     for spec in scenario_specs():
         if spec.key == key:
             return spec.family
-    raise KeyError(f"Unknown paper scenario key: {scenario_key!r}")
+    raise KeyError(f"Unknown reference scenario key: {scenario_key!r}")
 
 
 def target_nfes_for_role(nfe_role: str) -> Tuple[int, ...]:
     role = str(nfe_role).strip().lower()
     if role == NFE_ROLE_SEEN:
-        return PAPER_SEEN_NFES
+        return REFERENCE_SEEN_NFES
     if role == NFE_ROLE_UNSEEN:
-        return PAPER_UNSEEN_NFES
+        return REFERENCE_UNSEEN_NFES
     raise ValueError(f"Unknown nfe_role={nfe_role!r}; expected one of {NFE_ROLES}.")
 
 
@@ -163,14 +169,14 @@ def density_source_key_for_schedule(schedule_key: str) -> str:
 __all__ = [
     "AVERAGED_REVERSED_SCHEDULE_KEYS",
     "AVERAGED_SCHEDULE_COMPONENTS",
-    "PAPER_CHECKPOINT_STEPS",
+    "REFERENCE_CHECKPOINT_STEPS",
     "TRAIN_TUNING_CONTEXT_SAMPLE_COUNT",
     "EXPERIMENT_LAYOUT_ID",
-    "PAPER_PSEUDO_TARGET_WEIGHT",
-    "PAPER_SCENARIO_KEYS",
-    "PAPER_SEEN_NFES",
-    "PAPER_SUPERVISION_SCHEDULE_KEYS",
-    "PAPER_UNSEEN_NFES",
+    "REFERENCE_UNSEEN_TARGET_WEIGHT",
+    "REFERENCE_SCENARIO_KEYS",
+    "REFERENCE_SEEN_NFES",
+    "REFERENCE_SUPERVISION_SCHEDULE_KEYS",
+    "REFERENCE_UNSEEN_NFES",
     "CONDITIONAL_GENERATION_SCENARIO_KEYS",
     "LOCKED_TEST_PREVIEW_CONTEXTS",
     "FORECAST_SCENARIO_KEYS",
@@ -188,7 +194,7 @@ __all__ = [
     "SCHEDULE_FAMILY_PHYSICAL",
     "SCHEDULE_FAMILY_REVERSED",
     "STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT",
-    "STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO",
+    "STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET",
     "STUDENT_TRAINING_MODES",
     "ScenarioSpec",
     "scenario_specs",

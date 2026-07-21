@@ -1,4 +1,4 @@
-"""Level-2 limit-order-book representations and paper dataset builders.
+"""Level-2 limit-order-book representations and reference dataset builders.
 
 The module provides valid-by-construction L2 encoding, chronological train-only
 normalization, prepared crypto loading, and LOBSTER-calibrated synthetic data.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import tempfile
 import unittest
@@ -9,7 +10,7 @@ from unittest import mock
 import numpy as np
 import torch
 
-from genode.experiment_layout import PAPER_SEEN_NFES
+from genode.experiment_layout import REFERENCE_SEEN_NFES
 from genode.gipo.density_representation import (
     DENSITY_PROTOCOL,
     density_mass_to_time_grid,
@@ -17,7 +18,13 @@ from genode.gipo.density_representation import (
     grid_to_density_mass,
     uniform_reference_grid,
 )
-from genode.gipo.models import SETTING_ENCODER_MODE_CONTINUOUS, build_setting_encoder_config, setting_feature_dim, setting_features
+from genode.gipo.models import (
+    SETTING_ENCODER_MODE_CONTINUOUS,
+    build_setting_encoder_config,
+    setting_encoder_config_from_payload,
+    setting_feature_dim,
+    setting_features,
+)
 from genode.gipo.policy import (
     ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
     ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
@@ -27,7 +34,6 @@ from genode.gipo.policy import (
     GIPODensityFormTeacherTransformer,
     GIPODensityQueryStudentTransformer,
     MODEL_PAYLOAD_VERSION,
-    SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
     TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
     TEACHER_METRIC_TARGET_KEYS,
     TEACHER_METRIC_MASK_PROTOCOL,
@@ -72,21 +78,35 @@ def _teacher_training_payload() -> dict:
     }
 
 
-class _RowScoreTeacher(torch.nn.Module):
+class _FixedScoreTeacher(torch.nn.Module):
     architecture = ARCHITECTURE_DENSITY_FORM_TRANSFORMER
     teacher_metric_targets = ("u_comp_uniform",)
 
-    def forward(self, setting_feature_batch, density_feature_batch, series_index_batch, context_embedding_batch, *, rows=None):
-        values = [float(row["teacher_score"]) for row in rows]
+    def __init__(self, scores=()):
+        super().__init__()
+        self.scores = tuple(float(score) for score in scores)
+
+    def forward(self, setting_feature_batch, density_feature_batch, context_embedding_batch):
+        batch = int(setting_feature_batch.shape[0])
+        if batch > len(self.scores):
+            raise ValueError("Test teacher does not have enough scores for the input batch.")
+        values = self.scores[:batch]
         return torch.tensor(values, dtype=density_feature_batch.dtype, device=density_feature_batch.device).unsqueeze(-1)
 
 
-class _TwoMetricRowScoreTeacher(torch.nn.Module):
+class _TwoMetricFixedScoreTeacher(torch.nn.Module):
     architecture = ARCHITECTURE_DENSITY_FORM_TRANSFORMER
     teacher_metric_targets = ("u_comp_uniform", "u_alt_uniform")
 
-    def forward(self, setting_feature_batch, density_feature_batch, series_index_batch, context_embedding_batch, *, rows=None):
-        values = [[float(row["teacher_score"]), float(row["teacher_score"])] for row in rows]
+    def __init__(self, scores):
+        super().__init__()
+        self.scores = tuple(float(score) for score in scores)
+
+    def forward(self, setting_feature_batch, density_feature_batch, context_embedding_batch):
+        batch = int(setting_feature_batch.shape[0])
+        if batch > len(self.scores):
+            raise ValueError("Test teacher does not have enough scores for the input batch.")
+        values = [[score, score] for score in self.scores[:batch]]
         return torch.tensor(values, dtype=density_feature_batch.dtype, device=density_feature_batch.device)
 
 
@@ -94,11 +114,11 @@ class _DensityDependentTeacher(torch.nn.Module):
     architecture = ARCHITECTURE_DENSITY_FORM_TRANSFORMER
     teacher_metric_targets = ("u_comp_uniform",)
 
-    def forward(self, setting_feature_batch, density_feature_batch, series_index_batch, context_embedding_batch, *, rows=None):
+    def forward(self, setting_feature_batch, density_feature_batch, context_embedding_batch):
         return density_feature_batch.sum(dim=1, keepdim=True)
 
 
-class GIPOCanonicalTests(unittest.TestCase):
+class GIPOTests(unittest.TestCase):
     def test_density_grid_roundtrip_uses_required_64_bins(self) -> None:
         reference = uniform_reference_grid(64)
         source_grid = (0.0, 0.25, 0.5, 1.0)
@@ -116,7 +136,7 @@ class GIPOCanonicalTests(unittest.TestCase):
     def test_setting_features_use_fixed_reference_above_seen_nfes(self) -> None:
         config = build_setting_encoder_config(
             SETTING_ENCODER_MODE_CONTINUOUS,
-            observed_target_nfes=PAPER_SEEN_NFES,
+            observed_target_nfes=REFERENCE_SEEN_NFES,
             nfe_reference=16,
         )
 
@@ -133,7 +153,7 @@ class GIPOCanonicalTests(unittest.TestCase):
     def test_setting_features_are_invariant_to_query_batch_composition(self) -> None:
         config = build_setting_encoder_config(
             SETTING_ENCODER_MODE_CONTINUOUS,
-            observed_target_nfes=PAPER_SEEN_NFES,
+            observed_target_nfes=REFERENCE_SEEN_NFES,
             nfe_reference=16,
         )
         isolated = setting_features("euler", 20, config=config)
@@ -149,10 +169,9 @@ class GIPOCanonicalTests(unittest.TestCase):
 
     def test_teacher_diagnostics_candidate_schema_uses_checkpoint_scope(self) -> None:
         diagnostics = gipo_teacher_diagnostics(
-            _RowScoreTeacher(),
+            _FixedScoreTeacher(),
             [],
             context_embeddings={},
-            series_index_map={},
             schedule_grids=None,
             reference_time_grid=uniform_reference_grid(64),
             density_normalizer=None,
@@ -259,7 +278,6 @@ class GIPOCanonicalTests(unittest.TestCase):
         normalizer = DensityFeatureNormalizer(mean=np.zeros(4, dtype=np.float32), std=np.ones(4, dtype=np.float32))
         logits = torch.tensor([[0.4, -0.2, 0.1, -0.3]], dtype=torch.float32, requires_grad=True)
         setting = torch.zeros(1, int(setting_features("euler", 4).numel()), dtype=torch.float32)
-        series = torch.zeros(1, dtype=torch.long)
         context = torch.zeros(1, 2, dtype=torch.float32)
         rows = [{"solver_key": "euler", "target_nfe": 4, "u_comp_uniform": 1.0}]
         teacher = _DensityDependentTeacher()
@@ -270,7 +288,6 @@ class GIPOCanonicalTests(unittest.TestCase):
             teacher,
             logits,
             setting,
-            series,
             context,
             rows,
             reference_time_grid=reference,
@@ -307,7 +324,6 @@ class GIPOCanonicalTests(unittest.TestCase):
                 "series_id": "series_0",
                 "target_t": 0,
                 "u_comp_uniform": scores[schedule],
-                "teacher_score": scores[schedule],
             }
             for schedule in schedules
         ]
@@ -317,7 +333,6 @@ class GIPOCanonicalTests(unittest.TestCase):
         )
         kwargs = {
             "context_embeddings": {"ctx_0": [0.0, 0.0]},
-            "series_index_map": {"series_0": 0},
             "schedule_grids": None,
             "reference_time_grid": reference,
             "density_normalizer": normalizer,
@@ -325,10 +340,10 @@ class GIPOCanonicalTests(unittest.TestCase):
             "temperature": 1.0,
             "device": "cpu",
         }
-        teacher = _RowScoreTeacher()
+        teacher = _FixedScoreTeacher(scores[schedule] for schedule in schedules)
 
-        _, _, _, full_mass, full_summary = build_teacher_weighted_density_targets(teacher, rows, **kwargs)
-        _, _, _, elite_mass, elite_summary = build_teacher_weighted_density_targets(
+        _, _, full_mass, full_summary = build_teacher_weighted_density_targets(teacher, rows, **kwargs)
+        _, _, elite_mass, elite_summary = build_teacher_weighted_density_targets(
             teacher,
             rows,
             student_target_mixture_mode="elite",
@@ -336,7 +351,7 @@ class GIPOCanonicalTests(unittest.TestCase):
             student_target_elite_min_count=1,
             **kwargs,
         )
-        _, _, _, blend_mass, blend_summary = build_teacher_weighted_density_targets(
+        _, _, blend_mass, blend_summary = build_teacher_weighted_density_targets(
             teacher,
             rows,
             student_target_mixture_mode="elite_blend",
@@ -373,7 +388,6 @@ class GIPOCanonicalTests(unittest.TestCase):
                 "target_t": 0,
                 "u_comp_uniform": 1.0,
                 "u_alt_uniform": 1.0,
-                "teacher_score": 1.0,
                 "reward_metric_weights_json": json.dumps({"u_comp_uniform": 1.0, "u_alt_uniform": 0.0}),
             },
             {
@@ -388,7 +402,6 @@ class GIPOCanonicalTests(unittest.TestCase):
                 "target_t": 0,
                 "u_comp_uniform": 2.0,
                 "u_alt_uniform": 2.0,
-                "teacher_score": 2.0,
                 "reward_metric_weights_json": json.dumps({"u_comp_uniform": 0.0, "u_alt_uniform": 1.0}),
             },
         ]
@@ -399,10 +412,9 @@ class GIPOCanonicalTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "identical teacher metric masks"):
             build_teacher_weighted_density_targets(
-                _TwoMetricRowScoreTeacher(),
+                _TwoMetricFixedScoreTeacher([1.0, 2.0]),
                 rows,
                 context_embeddings={"ctx_0": [0.0, 0.0]},
-                series_index_map={"series_0": 0},
                 schedule_grids=None,
                 reference_time_grid=reference,
                 density_normalizer=normalizer,
@@ -471,15 +483,13 @@ class GIPOCanonicalTests(unittest.TestCase):
             setting_dim=int(setting_features("euler", 4).numel()),
             density_dim=64,
             context_dim=2,
-            num_series=1,
-            model_config={"hidden_dim": 16, "hidden_layers": 1, "attention_heads": 4, "dropout": 0.0},
+            model_config={"hidden_dim": 16, "num_layers": 1, "attention_heads": 4, "dropout": 0.0},
         )
 
         summary = train_gipo_teacher(
             teacher,
             rows,
             context_embeddings={f"ctx_{idx}": [0.0, 0.0] for idx in range(70)},
-            series_index_map={f"series_{idx}": 0 for idx in range(70)},
             schedule_grids=None,
             reference_time_grid=reference,
             density_normalizer=normalizer,
@@ -493,28 +503,21 @@ class GIPOCanonicalTests(unittest.TestCase):
         self.assertEqual(summary["losses"][0]["teacher_pair_count"], 70)
         self.assertLess(summary["losses"][0]["teacher_batch_pair_count"], summary["teacher_pair_count"])
 
-    def test_additive_models_are_context_only_for_series_identity(self) -> None:
+    def test_models_do_not_expose_series_conditioning(self) -> None:
         setting_batch = torch.stack(
             [
                 setting_features("euler", 4, mode=SETTING_ENCODER_MODE_CONTINUOUS),
                 setting_features("euler", 4, mode=SETTING_ENCODER_MODE_CONTINUOUS),
             ]
         )
-        series_index = torch.tensor([0, 1], dtype=torch.long)
         context = torch.tensor([[0.1, 0.2], [0.1, 0.2]], dtype=torch.float32)
         density = torch.zeros(2, 64, dtype=torch.float32)
-        rows = [
-            {"series_id": "series_a", "target_t": 1},
-            {"series_id": "series_b", "target_t": 1},
-        ]
-
         student = GIPODensityQueryStudentTransformer(
             setting_dim=int(setting_batch.shape[1]),
             density_dim=64,
             context_dim=2,
-            num_series=2,
             hidden_dim=16,
-            hidden_layers=1,
+            num_layers=1,
             attention_heads=4,
             dropout=0.0,
         )
@@ -522,9 +525,8 @@ class GIPOCanonicalTests(unittest.TestCase):
             setting_dim=int(setting_batch.shape[1]),
             density_dim=64,
             context_dim=2,
-            num_series=2,
             hidden_dim=16,
-            hidden_layers=1,
+            num_layers=1,
             attention_heads=4,
             dropout=0.0,
         )
@@ -532,34 +534,61 @@ class GIPOCanonicalTests(unittest.TestCase):
         teacher.eval()
 
         with torch.no_grad():
-            student_logits = student.logits(setting_batch, series_index, context, rows=rows)
-            teacher_scores = teacher(setting_batch, density, series_index, context, rows=rows)
+            student_logits = student.logits(setting_batch, context)
+            teacher_scores = teacher(setting_batch, density, context)
 
         self.assertTrue(torch.allclose(student_logits[0], student_logits[1], atol=1e-6))
         self.assertTrue(torch.allclose(teacher_scores[0], teacher_scores[1], atol=1e-6))
         self.assertEqual(student.model_config()["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP)
         self.assertEqual(teacher.model_config()["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP)
-        self.assertEqual(student.model_config()["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
-        self.assertEqual(teacher.model_config()["series_conditioning"], SERIES_CONDITIONING_NONE_CONTEXT_ONLY)
+        self.assertNotIn("series_conditioning", student.model_config())
+        self.assertNotIn("series_conditioning", teacher.model_config())
+        self.assertNotIn("rows", inspect.signature(student.logits).parameters)
+        self.assertNotIn("rows", inspect.signature(teacher.forward).parameters)
+        self.assertEqual(student.model_config()["num_layers"], 1)
+        self.assertEqual(teacher.model_config()["num_layers"], 1)
         self.assertEqual(student.model_config()["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE)
         self.assertEqual(teacher.model_config()["density_token_attention"], DENSITY_TOKEN_ATTENTION_ROPE)
 
+    def test_retired_model_configuration_keys_are_rejected(self) -> None:
+        dimensions = {
+            "setting_dim": int(setting_features("euler", 4).numel()),
+            "density_dim": 64,
+            "context_dim": 2,
+        }
+        retired_keys = (
+            "hidden_layers",
+            "transformer_layers",
+            "num_series",
+            "series_feature_dim",
+            "series_conditioning",
+        )
+        for builder in (build_gipo_teacher_model, build_gipo_student_model):
+            for key in retired_keys:
+                with self.subTest(builder=builder.__name__, key=key):
+                    with self.assertRaisesRegex(ValueError, "retired keys"):
+                        builder(**dimensions, model_config={key: 1})
+
+        with self.assertRaisesRegex(ValueError, "retired keys"):
+            setting_encoder_config_from_payload(
+                {"mode": SETTING_ENCODER_MODE_CONTINUOUS, "series_encoding": "unused"}
+            )
+
     def test_non_additive_conditioning_style_is_rejected(self) -> None:
-        legacy_style = "ada" + "adaptive_layer_norm_zero"
+        retired_style = "ada" + "adaptive_layer_norm_zero"
         model_kwargs = {
             "setting_dim": 2,
             "density_dim": 64,
             "context_dim": 2,
-            "num_series": 1,
             "hidden_dim": 16,
-            "hidden_layers": 1,
+            "num_layers": 1,
             "attention_heads": 4,
             "dropout": 0.0,
-            "conditioning_style": legacy_style,
+            "conditioning_style": retired_style,
         }
 
         with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp"):
-            validate_conditioning_style({"conditioning_style": legacy_style})
+            validate_conditioning_style({"conditioning_style": retired_style})
         with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp"):
             GIPODensityQueryStudentTransformer(**model_kwargs)
         with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp"):
@@ -570,8 +599,7 @@ class GIPOCanonicalTests(unittest.TestCase):
                 setting_dim=2,
                 density_dim=64,
                 context_dim=2,
-                num_series=1,
-                model_config={"conditioning_style": legacy_style},
+                model_config={"conditioning_style": retired_style},
             )
         with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp"):
             build_gipo_teacher_model(
@@ -579,8 +607,7 @@ class GIPOCanonicalTests(unittest.TestCase):
                 setting_dim=2,
                 density_dim=64,
                 context_dim=2,
-                num_series=1,
-                model_config={"conditioning_style": legacy_style},
+                model_config={"conditioning_style": retired_style},
             )
 
     def test_trainer_argparser_exposes_only_supported_conditioning(self) -> None:
@@ -591,16 +618,16 @@ class GIPOCanonicalTests(unittest.TestCase):
         self.assertNotIn("--gipo_" + "conditioning_style", options)
         self.assertNotIn("--gipo_teacher_" + "conditioning_style", options)
         self.assertNotIn("--gipo_student_" + "conditioning_style", options)
-        self.assertNotIn("--allow_noncanonical_conditioning", options)
+        self.assertNotIn("--allow_nonstandard_conditioning", options)
 
-    def test_student_checkpoint_loader_accepts_only_paper_additive_student(self) -> None:
+    def test_student_checkpoint_loader_accepts_only_reference_additive_student(self) -> None:
         from genode.gipo.report_locked_test import _load_student_checkpoint
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             config = build_setting_encoder_config(
                 SETTING_ENCODER_MODE_CONTINUOUS,
-                observed_target_nfes=PAPER_SEEN_NFES,
+                observed_target_nfes=REFERENCE_SEEN_NFES,
                 nfe_reference=16,
                 rope_frequencies=(1.0, 2.0),
             )
@@ -610,8 +637,7 @@ class GIPOCanonicalTests(unittest.TestCase):
                 setting_dim=setting_dim,
                 density_dim=64,
                 context_dim=2,
-                num_series=1,
-                model_config={"hidden_dim": 16, "hidden_layers": 1, "attention_heads": 4, "dropout": 0.0},
+                model_config={"hidden_dim": 16, "num_layers": 1, "attention_heads": 4, "dropout": 0.0},
             )
             checkpoint_path = root / "gipo_student.pt"
             payload = {
@@ -626,7 +652,6 @@ class GIPOCanonicalTests(unittest.TestCase):
                 "setting_encoder_config": config.to_payload(),
                 "density_dim": 64,
                 "context_dim": 2,
-                "series_index_map": {"series_0": 0},
                 "embedding_normalizer": {"mean": [0.0, 0.0], "std": [1.0, 1.0]},
                 "density_representation": density_metadata(uniform_reference_grid(64)),
                 "teacher_training": _teacher_training_payload(),
@@ -636,21 +661,28 @@ class GIPOCanonicalTests(unittest.TestCase):
             torch.save(payload, checkpoint_path)
 
             with mock.patch("genode.gipo.report_locked_test.torch.load", return_value=payload) as mocked_load:
-                loaded_student, _, _, _, loaded_payload = _load_student_checkpoint(checkpoint_path)
+                loaded_student, _, _, loaded_payload = _load_student_checkpoint(checkpoint_path)
             self.assertTrue(mocked_load.call_args.kwargs["weights_only"])
             self.assertEqual(loaded_student.setting_dim, setting_dim)
             self.assertEqual(loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP)
-            loaded_student, _, _, _, loaded_payload = _load_student_checkpoint(checkpoint_path)
+            loaded_student, _, _, loaded_payload = _load_student_checkpoint(checkpoint_path)
             self.assertEqual(loaded_student.setting_dim, setting_dim)
             self.assertEqual(loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP)
 
-            legacy_path = root / "legacy_student.pt"
-            legacy_payload = dict(payload)
-            legacy_payload["student_model_config"] = dict(payload["student_model_config"])
-            legacy_payload["student_model_config"]["conditioning_style"] = "ada" + "adaptive_layer_norm_zero"
-            torch.save(legacy_payload, legacy_path)
+            retired_path = root / "retired_student.pt"
+            retired_payload = dict(payload)
+            retired_payload["student_model_config"] = dict(payload["student_model_config"])
+            retired_payload["student_model_config"]["conditioning_style"] = "ada" + "adaptive_layer_norm_zero"
+            torch.save(retired_payload, retired_path)
             with self.assertRaisesRegex(ValueError, "conditioning_style|additive_mlp"):
-                _load_student_checkpoint(legacy_path)
+                _load_student_checkpoint(retired_path)
+
+            retired_series_path = root / "retired_series_student.pt"
+            retired_series_payload = dict(payload)
+            retired_series_payload["series_index_map"] = {"series": 0}
+            torch.save(retired_series_payload, retired_series_path)
+            with self.assertRaisesRegex(ValueError, "retired series-conditioning keys"):
+                _load_student_checkpoint(retired_series_path)
 
             scalar_policy_path = root / "categorical_student.pt"
             scalar_policy_payload = dict(payload)
@@ -659,7 +691,7 @@ class GIPOCanonicalTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "continuous_density"):
                 _load_student_checkpoint(scalar_policy_path)
 
-    def test_locked_report_conditioning_metadata_matches_paper_policy(self) -> None:
+    def test_locked_report_conditioning_metadata_matches_reference_policy(self) -> None:
         from genode.gipo.report_locked_test import _conditioning_metadata_for_summary
 
         metadata = _conditioning_metadata_for_summary(
@@ -682,8 +714,7 @@ class GIPOCanonicalTests(unittest.TestCase):
             setting_dim=setting_dim,
             density_dim=64,
             context_dim=2,
-            num_series=1,
-            model_config={"hidden_dim": 16, "hidden_layers": 1, "attention_heads": 4, "dropout": 0.0},
+            model_config={"hidden_dim": 16, "num_layers": 1, "attention_heads": 4, "dropout": 0.0},
         )
 
         config = teacher.model_config()

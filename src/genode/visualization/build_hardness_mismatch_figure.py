@@ -26,7 +26,7 @@ DATASET_ORDER = (
 )
 SCHEDULE_ORDER = BASELINE_SCHEDULE_KEYS
 NATIVE_HARDNESS_TRACE_KEY = NATIVE_INFO_GROWTH_TRACE_KEY
-PAPER_FACING_TRACE_NAME = "native_info_growth"
+REPORT_TRACE_NAME = "native_info_growth"
 
 
 def parse_csv(text: str) -> List[str]:
@@ -83,7 +83,7 @@ def synthetic_payload(*, macro_steps: int = 10) -> Dict[str, Any]:
     return {
         "artifact": "native_info_growth_hardness_payload",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "paper_facing_trace": PAPER_FACING_TRACE_NAME,
+        "report_trace": REPORT_TRACE_NAME,
         "native_trace_key": NATIVE_HARDNESS_TRACE_KEY,
         "reference_time_grid": [float(x) for x in reference_grid.tolist()],
         "native_info_growth_trace": normalize_trace(trace),

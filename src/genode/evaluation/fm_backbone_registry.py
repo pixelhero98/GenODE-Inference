@@ -8,8 +8,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from genode.data.otflow_experiment_plan import (
-    PAPER_CONDITIONAL_GENERATION_DATASETS,
-    PAPER_FORECAST_DATASETS,
+    REFERENCE_CONDITIONAL_GENERATION_DATASETS,
+    REFERENCE_FORECAST_DATASETS,
     CONDITIONAL_GENERATION_FAMILY,
     FORECAST_FAMILY,
     experiment_plan_by_key,
@@ -30,8 +30,7 @@ from genode.data.otflow_paths import (
     project_backbone_matrix_root,
     project_data_root,
     project_outputs_root,
-    project_paper_dataset_root,
-    project_root,
+    project_dataset_root,
 )
 from genode.path_safety import (
     MANIFEST_PARENT_PATH_BASE,
@@ -1064,7 +1063,7 @@ def _iter_target_specs(
     path_base: Path | None = None,
 ) -> Iterable[BackboneArtifactSpec]:
     requested_steps = {int(value) for value in budget_steps}
-    for dataset_key in tuple(PAPER_FORECAST_DATASETS):
+    for dataset_key in tuple(REFERENCE_FORECAST_DATASETS):
         for train_steps in ACTIVE_FORECAST_BACKBONE_BUDGETS.get(str(dataset_key), ()):
             if int(train_steps) not in requested_steps:
                 continue
@@ -1077,7 +1076,7 @@ def _iter_target_specs(
                 seed=int(seed),
                 path_base=path_base,
             )
-    for dataset_key in tuple(PAPER_CONDITIONAL_GENERATION_DATASETS):
+    for dataset_key in tuple(REFERENCE_CONDITIONAL_GENERATION_DATASETS):
         for train_steps in ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS.get(str(dataset_key), ()):
             if int(train_steps) not in requested_steps:
                 continue
@@ -1115,28 +1114,28 @@ def materialize_backbone_manifest(
     seed: int = DEFAULT_SEED,
     write_path: str | Path | None = None,
 ) -> Dict[str, Any]:
-    target_path = Path(write_path or backbone_manifest_path()).resolve()
-    target_is_external = not target_path.is_relative_to(project_root().resolve())
-    external_root = target_path.parent
+    explicit_write_path = str(write_path or "").strip()
+    target_path = Path(explicit_write_path or backbone_manifest_path()).resolve()
+    manifest_root = target_path.parent if explicit_write_path else None
     resolved_matrix_root = Path(
         matrix_root
-        or (external_root / "matrix" if target_is_external else project_backbone_matrix_root())
+        or (manifest_root / "matrix" if manifest_root is not None else project_backbone_matrix_root())
     ).resolve()
     resolved_reuse_root = Path(
         otflow_reuse_root
-        or (external_root / "shared_backbones" if target_is_external else project_otflow_reuse_root())
+        or (manifest_root / "shared_backbones" if manifest_root is not None else project_otflow_reuse_root())
     ).resolve()
     resolved_import_root = Path(
         imported_backbone_root
-        or (external_root / "imported_backbones" if target_is_external else project_imported_otflow_backbone_root())
+        or (manifest_root / "imported_backbones" if manifest_root is not None else project_imported_otflow_backbone_root())
     ).resolve()
     resolved_molecule_backbone_root = Path(
         molecule_backbone_root
-        or (external_root / "molecule_3d_backbones" if target_is_external else project_molecule_backbone_root())
+        or (manifest_root / "molecule_3d_backbones" if manifest_root is not None else project_molecule_backbone_root())
     ).resolve()
     resolved_molecule_group_root = Path(
         molecule_group_root
-        or (external_root / "molecule_3d" if target_is_external else project_molecule_group_root())
+        or (manifest_root / "molecule_3d" if manifest_root is not None else project_molecule_group_root())
     ).resolve()
     manifest_path_base = _manifest_path_base(
         target_path,
@@ -1301,7 +1300,7 @@ def build_runtime_probe(
     long_term_st_path: str | Path | None = None,
     molecule_group_root: str | Path | None = None,
 ) -> Dict[str, Any]:
-    resolved_dataset_root = Path(dataset_root or project_paper_dataset_root()).resolve()
+    resolved_dataset_root = Path(dataset_root or project_dataset_root()).resolve()
     resolved_lobster_profile_path = Path(lobster_profile_path or lobster_synthetic_profile_path()).resolve()
     resolved_long_term_st_path = Path(long_term_st_path or long_term_st_manifest_path().parent).resolve()
     resolved_molecule_group_root = Path(molecule_group_root or project_molecule_group_root()).resolve()
@@ -1313,7 +1312,7 @@ def build_runtime_probe(
     }
     forecast_dataset_presence = {
         str(dataset_key): bool((monash_root / str(dataset_key) / "manifest.json").exists())
-        for dataset_key in PAPER_FORECAST_DATASETS
+        for dataset_key in REFERENCE_FORECAST_DATASETS
     }
     dataset_presence = {
         "monash_manifests": forecast_dataset_presence,

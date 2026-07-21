@@ -44,16 +44,20 @@ class RectifiedFlow(nn.Module):
         parts = [cond_state.ctx, cond_state.ctx_summary, cond_state.t_emb]
         if cond_state.cond_emb is not None:
             parts.append(cond_state.cond_emb)
+        elif int(self.cfg.model.cond_dim) > 0:
+            parts.append(torch.zeros_like(cond_state.ctx_summary))
         return parts
 
     def _field_forward(
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
-        hist: torch.Tensor,
+        hist: Optional[torch.Tensor],
         cond: Optional[torch.Tensor] = None,
         conditioning_cache: Optional[ConditioningCache] = None,
     ) -> torch.Tensor:
+        if hist is None and conditioning_cache is None:
+            raise ValueError("hist is required when conditioning_cache is not provided.")
         cond_state = self.backbone.build_conditioning(hist=hist, x_ref=x_t, t=t, cond=cond, cache=conditioning_cache)
         if self.fu_net_type == "transformer":
             adaln_cond = self.v_cond_proj(torch.cat(self._conditioning_parts(cond_state), dim=-1))
@@ -66,7 +70,7 @@ class RectifiedFlow(nn.Module):
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
-        hist: torch.Tensor,
+        hist: Optional[torch.Tensor],
         cond: Optional[torch.Tensor] = None,
         conditioning_cache: Optional[ConditioningCache] = None,
     ) -> torch.Tensor:
@@ -80,18 +84,5 @@ class RectifiedFlow(nn.Module):
         v_target = x - z
         v_hat = self.v_forward(x_t, t, hist, cond=cond)
         return F.mse_loss(v_hat, v_target)
-
-    @torch.no_grad()
-    def sample(self, hist: torch.Tensor, cond: Optional[torch.Tensor] = None, steps: Optional[int] = None) -> torch.Tensor:
-        state_dim = self.cfg.sample_state_dim
-        batch_size = hist.shape[0]
-        x = torch.randn(batch_size, state_dim, device=hist.device)
-        n_steps = int(max(1, self.cfg.sample.steps if steps is None else steps))
-        dt = 1.0 / float(n_steps)
-        for i in range(n_steps):
-            t = torch.full((batch_size, 1), float(i) / float(n_steps), device=hist.device)
-            x = x + dt * self._field_forward(x, t, hist, cond=cond)
-        return x
-
 
 __all__ = ["RectifiedFlow"]

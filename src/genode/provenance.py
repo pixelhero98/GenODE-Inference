@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
 from genode.data.otflow_paths import display_project_path
 
 
-@lru_cache(maxsize=None)
 def _file_sha256(resolved_path: str) -> str:
     digest = hashlib.sha256()
     with Path(resolved_path).open("rb") as handle:
@@ -18,7 +16,11 @@ def _file_sha256(resolved_path: str) -> str:
 
 
 def file_sha256(path: str | Path) -> str:
-    """Return a stable content digest, hashing each resolved file once per process."""
+    """Return the SHA-256 digest of the file's current bytes.
+
+    Integrity checks intentionally do not memoize by pathname: callers may
+    validate artifacts after an atomic replacement in the same process.
+    """
 
     resolved = Path(path).expanduser().resolve()
     if not resolved.is_file():
@@ -94,14 +96,7 @@ def fingerprint_identity(record: Mapping[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in record.items() if key != "logical_path"}
 
 
-def clear_provenance_cache() -> None:
-    """Clear memoized hashes for tests that intentionally mutate input files."""
-
-    _file_sha256.cache_clear()
-
-
 __all__ = [
-    "clear_provenance_cache",
     "file_sha256",
     "fingerprint_identity",
     "path_fingerprint",

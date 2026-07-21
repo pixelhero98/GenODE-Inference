@@ -83,34 +83,7 @@ class TrainConfig:
 
 @dataclass
 class SampleConfig:
-    steps: int = 2
     cfg_scale: float = 1.0
-    solver: str = "euler"
-    time_grid: Tuple[float, ...] = ()
-    adaptive_beta: float = 0.9
-    adaptive_tau: float = 0.15
-    adaptive_kappa: float = 12.0
-    adaptive_gamma_max: float = 0.05
-    adaptive_cooldown_steps: int = 0
-    adaptive_noise_mode: str = "orthogonal"
-    adaptive_trigger_mode: str = "adaptive"
-    adaptive_disable_noise_frac: float = 0.1
-    adaptive_rtol: float = 1e-3
-    adaptive_atol: float = 1e-6
-    adaptive_safety: float = 0.9
-    adaptive_min_step: float = 1e-5
-    adaptive_max_nfe: int = 512
-    refine_beta: float = 0.9
-    refine_trigger_mode: str = "zscore"
-    refine_threshold_z: float = 1.5
-    refine_threshold_raw: float = 0.0
-    refine_step_mu: Tuple[float, ...] = ()
-    refine_step_sigma: Tuple[float, ...] = ()
-    refine_step_threshold: Tuple[float, ...] = ()
-    refine_selected_steps: Tuple[int, ...] = ()
-    refine_fixed_last_k: int = 0
-    refine_sigma_eps: float = 1e-6
-    refine_disallow_final_step: bool = True
 
 
 @dataclass(init=False)

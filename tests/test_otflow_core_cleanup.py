@@ -11,9 +11,11 @@ import numpy as np
 import torch
 
 from genode.models.config import OTFlowConfig
+from genode.data.otflow_paths import display_project_path
 from genode.evaluation.otflow_evaluation_support import load_checkpoint_model
 from genode.models.otflow_model import OTFlow
 from genode.models.otflow_train_val import _temporary_eval_seed, save_json, seed_all
+from genode.solver_protocol import FlowTrajectory
 
 
 class OTFlowCoreCleanupTest(unittest.TestCase):
@@ -25,7 +27,10 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
                 save_json({"ok": True}, str(output_path))
 
             self.assertEqual(output_path.read_text(encoding="utf-8"), '{\n  "ok": true\n}')
-            self.assertEqual(captured.getvalue().strip(), "Saved JSON -> external/private-output.json")
+            self.assertEqual(
+                captured.getvalue().strip(),
+                f"Saved JSON -> {display_project_path(output_path)}",
+            )
 
     def test_seed_all_normalizes_generated_seed_above_numpy_limit(self) -> None:
         seed_all(2**32 + 123)
@@ -124,18 +129,206 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(set(logs), {"mean", "ot_cost", "ot_used", "loss"})
 
-    def test_dpmpp2m_sampler_runs_with_one_eval_per_macro_step(self) -> None:
-        torch.manual_seed(4)
-        cfg = self._cfg(use_minibatch_ot=True)
+    def test_solve_supports_exactly_the_registered_solvers(self) -> None:
+        cfg = self._cfg(use_minibatch_ot=False)
         model = OTFlow(cfg)
+        hist = torch.zeros(2, cfg.history_len, cfg.context_dim)
+        initial_state = torch.zeros(2, cfg.sample_state_dim)
+
+        for solver_key, target_nfe, time_grid in (
+            ("euler", 4, torch.linspace(0.0, 1.0, 5)),
+            ("dpmpp2m", 4, torch.linspace(0.0, 1.0, 5)),
+            ("heun", 4, torch.linspace(0.0, 1.0, 3)),
+            ("midpoint_rk2", 4, torch.linspace(0.0, 1.0, 3)),
+        ):
+            field_evaluations = 0
+
+            def constant_field(x, t, hist_arg, cond=None, conditioning_cache=None):
+                nonlocal field_evaluations
+                del t, hist_arg, cond, conditioning_cache
+                field_evaluations += 1
+                return torch.ones_like(x)
+
+            model.v_forward = constant_field  # type: ignore[method-assign]
+            with self.subTest(solver_key=solver_key):
+                result = model.solve(
+                    initial_state,
+                    hist,
+                    solver_key=solver_key,
+                    target_nfe=target_nfe,
+                    time_grid=time_grid,
+                    return_trajectory=True,
+                )
+                self.assertIsInstance(result, FlowTrajectory)
+                assert isinstance(result, FlowTrajectory)
+                self.assertEqual(result.solver_key, solver_key)
+                self.assertEqual(result.target_nfe, target_nfe)
+                self.assertEqual(result.realized_nfe, target_nfe)
+                self.assertEqual(result.macro_steps, len(time_grid) - 1)
+                self.assertEqual(
+                    tuple(result.states.shape),
+                    (2, len(time_grid), cfg.sample_state_dim),
+                )
+                self.assertTrue(torch.equal(result.initial_state, initial_state))
+                self.assertTrue(torch.allclose(result.final_state, initial_state + 1.0))
+                self.assertTrue(torch.equal(result.final_state, result.states[:, -1]))
+                self.assertEqual(field_evaluations, target_nfe)
+
+    def test_solve_matches_linear_field_updates(self) -> None:
+        cfg = self._cfg(use_minibatch_ot=False)
+        model = OTFlow(cfg)
+        hist = torch.zeros(1, cfg.history_len, cfg.context_dim)
+        initial_state = torch.ones(1, cfg.sample_state_dim)
+
+        def linear_field(x, t, hist_arg, cond=None, conditioning_cache=None):
+            del t, hist_arg, cond, conditioning_cache
+            return x
+
+        model.v_forward = linear_field  # type: ignore[method-assign]
+        expected = {
+            "euler": 2.44140625,
+            "dpmpp2m": 2.59912109375,
+            "heun": 2.640625,
+            "midpoint_rk2": 2.640625,
+        }
+        for solver_key, expected_value in expected.items():
+            target_nfe = 4
+            macro_steps = 2 if solver_key in {"heun", "midpoint_rk2"} else 4
+            result = model.solve(
+                initial_state,
+                hist,
+                solver_key=solver_key,
+                target_nfe=target_nfe,
+                time_grid=torch.linspace(0.0, 1.0, macro_steps + 1),
+            )
+            assert isinstance(result, torch.Tensor)
+            self.assertTrue(
+                torch.allclose(result, torch.full_like(result, expected_value), atol=1e-7),
+                msg=solver_key,
+            )
+
+    def test_sample_draws_noise_then_delegates_to_solve(self) -> None:
+        cfg = self._cfg(use_minibatch_ot=False)
+        model = OTFlow(cfg).eval()
         hist = torch.randn(2, cfg.history_len, cfg.context_dim)
+        time_grid = torch.linspace(0.0, 1.0, 5)
 
-        sample, trace = model.sample_trace(hist, steps=4, solver="dpm++2m")
+        torch.manual_seed(41)
+        initial_state = torch.randn(2, cfg.sample_state_dim)
+        expected = model.solve(
+            initial_state,
+            hist,
+            solver_key="euler",
+            target_nfe=4,
+            time_grid=time_grid,
+        )
+        torch.manual_seed(41)
+        actual = model.sample(
+            hist,
+            solver_key="euler",
+            target_nfe=4,
+            time_grid=time_grid,
+        )
 
-        self.assertEqual(tuple(sample.shape), (2, cfg.snapshot_dim))
-        self.assertEqual(trace["solver"], "dpmpp2m")
-        self.assertEqual(trace["steps"], 4)
-        self.assertTrue(torch.allclose(trace["field_evals_by_step"], torch.ones_like(trace["field_evals_by_step"])))
+        assert isinstance(expected, torch.Tensor)
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_solve_accepts_precomputed_conditioning_without_history(self) -> None:
+        cfg = self._cfg(use_minibatch_ot=False)
+        model = OTFlow(cfg).eval()
+        hist = torch.randn(2, cfg.history_len, cfg.context_dim)
+        initial_state = torch.randn(2, cfg.sample_state_dim)
+        cache = model.backbone.precompute(hist)
+        kwargs = {
+            "solver_key": "midpoint_rk2",
+            "target_nfe": 4,
+            "time_grid": (0.0, 0.5, 1.0),
+        }
+
+        with_history = model.solve(initial_state, hist, **kwargs)
+        with_cache = model.solve(initial_state, conditioning_cache=cache, **kwargs)
+
+        assert isinstance(with_history, torch.Tensor)
+        assert isinstance(with_cache, torch.Tensor)
+        self.assertTrue(torch.allclose(with_history, with_cache, atol=1e-6, rtol=1e-6))
+
+    def test_solve_applies_guidance_with_cache_only_conditioning(self) -> None:
+        cfg = self._cfg(use_minibatch_ot=False)
+        cfg.model.cond_dim = 3
+        cfg.sample.cfg_scale = 2.0
+        model = OTFlow(cfg).eval()
+        hist = torch.randn(2, cfg.history_len, cfg.context_dim)
+        condition = torch.randn(2, cfg.model.cond_dim)
+        cache = model.backbone.precompute(hist, cond=condition)
+        initial_state = torch.zeros(2, cfg.sample_state_dim)
+
+        actual = model.solve(
+            initial_state,
+            conditioning_cache=cache,
+            solver_key="euler",
+            target_nfe=2,
+            time_grid=(0.0, 0.5, 1.0),
+        )
+        assert isinstance(actual, torch.Tensor)
+        self.assertTrue(torch.isfinite(actual).all())
+
+        def cache_sensitive_field(x, t, hist_arg, cond=None, conditioning_cache=None):
+            del t, hist_arg, cond
+            assert conditioning_cache is not None
+            value = 1.0 if conditioning_cache.cond_emb is not None else 0.0
+            return torch.full_like(x, value)
+
+        model.v_forward = cache_sensitive_field  # type: ignore[method-assign]
+        result = model.solve(
+            initial_state,
+            conditioning_cache=cache,
+            solver_key="euler",
+            target_nfe=2,
+            time_grid=(0.0, 0.5, 1.0),
+        )
+
+        assert isinstance(result, torch.Tensor)
+        self.assertTrue(torch.equal(result, torch.full_like(result, 2.0)))
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            model.solve(
+                initial_state,
+                hist,
+                conditioning_cache=cache,
+                solver_key="euler",
+                target_nfe=2,
+                time_grid=(0.0, 0.5, 1.0),
+            )
+
+    def test_solve_rejects_aliases_and_inconsistent_grids(self) -> None:
+        cfg = self._cfg(use_minibatch_ot=False)
+        model = OTFlow(cfg)
+        hist = torch.zeros(1, cfg.history_len, cfg.context_dim)
+        initial_state = torch.zeros(1, cfg.sample_state_dim)
+
+        with self.assertRaisesRegex(ValueError, "Unknown solver_key"):
+            model.solve(
+                initial_state,
+                hist,
+                solver_key="dpm++2m",
+                target_nfe=4,
+                time_grid=torch.linspace(0.0, 1.0, 5),
+            )
+        with self.assertRaisesRegex(ValueError, r"macro_steps \+ 1"):
+            model.solve(
+                initial_state,
+                hist,
+                solver_key="heun",
+                target_nfe=4,
+                time_grid=torch.linspace(0.0, 1.0, 5),
+            )
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            model.solve(
+                initial_state,
+                hist,
+                solver_key="euler",
+                target_nfe=2,
+                time_grid=(0.0, 1.0, 1.0),
+            )
 
     def test_checkpoint_loader_rejects_removed_otflow_keys(self) -> None:
         torch.manual_seed(3)
@@ -180,6 +373,51 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Unexpected key"):
                 load_checkpoint_model(ckpt_path, torch.device("cpu"))
 
+    def test_checkpoint_loader_migrates_retired_inference_only_sample_fields(self) -> None:
+        torch.manual_seed(4)
+        cfg = self._cfg(use_minibatch_ot=True)
+        model = OTFlow(cfg)
+        cfg_dict = cfg.to_dict()
+        cfg_dict["sample"].update(
+            {
+                "steps": 8,
+                "solver": "heun",
+                "time_grid": (0.0, 0.5, 1.0),
+                "adaptive_beta": 0.9,
+                "adaptive_tau": 0.15,
+                "adaptive_kappa": 12.0,
+                "adaptive_gamma_max": 0.05,
+                "adaptive_cooldown_steps": 0,
+                "adaptive_noise_mode": "orthogonal",
+                "adaptive_trigger_mode": "adaptive",
+                "adaptive_disable_noise_frac": 0.1,
+                "adaptive_rtol": 1e-3,
+                "adaptive_atol": 1e-6,
+                "adaptive_safety": 0.9,
+                "adaptive_min_step": 1e-5,
+                "adaptive_max_nfe": 512,
+                "refine_beta": 0.9,
+                "refine_trigger_mode": "zscore",
+                "refine_threshold_z": 1.5,
+                "refine_threshold_raw": 0.0,
+                "refine_step_mu": (),
+                "refine_step_sigma": (),
+                "refine_step_threshold": (),
+                "refine_selected_steps": (),
+                "refine_fixed_last_k": 0,
+                "refine_sigma_eps": 1e-6,
+                "refine_disallow_final_step": True,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ckpt_path = Path(tmp_dir) / "model.pt"
+            torch.save({"cfg": cfg_dict, "model_state": model.state_dict()}, ckpt_path)
+            loaded, loaded_cfg = load_checkpoint_model(ckpt_path, torch.device("cpu"))
+
+        self.assertIsInstance(loaded, OTFlow)
+        self.assertEqual(loaded_cfg.sample.cfg_scale, cfg.sample.cfg_scale)
+
     def test_checkpoint_loader_rejects_removed_baseline_config_keys(self) -> None:
         torch.manual_seed(5)
         cfg = self._cfg(use_minibatch_ot=True)
@@ -204,58 +442,6 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
             torch.save({"cfg": cfg_dict, "model_state": model.state_dict()}, ckpt_path)
             with self.assertRaisesRegex(ValueError, "retired baseline keys"):
                 load_checkpoint_model(ckpt_path, torch.device("cpu"))
-
-    def test_adaptive_rk_trace_time_grid_uses_accepted_steps_only(self) -> None:
-        torch.manual_seed(6)
-        cfg = self._cfg(use_minibatch_ot=False)
-        cfg.sample.adaptive_rtol = 1e-3
-        cfg.sample.adaptive_atol = 1e-6
-        model = OTFlow(cfg)
-        hist = torch.randn(1, cfg.history_len, cfg.context_dim)
-        errors = iter((2.0, 0.5, 0.5))
-
-        def fake_step(x, t_cur, dt, field_fn, first_eval=None):
-            del t_cur, field_fn, first_eval
-            return x + float(dt), x, 1
-
-        def fake_error(*args, **kwargs):
-            del args, kwargs
-            return next(errors)
-
-        model._rk45_embedded_step = fake_step  # type: ignore[method-assign]
-        model._adaptive_error_norm = fake_error  # type: ignore[method-assign]
-
-        _, trace = model.sample_trace(hist, steps=1, solver="rk45_adaptive")
-
-        self.assertEqual(trace["accepted_steps"], 2)
-        self.assertEqual(trace["rejected_steps"], 1)
-        self.assertEqual(trace["steps"], trace["accepted_steps"])
-        self.assertEqual(len(trace["time_grid"]), trace["accepted_steps"] + 1)
-        self.assertAlmostEqual(float(trace["time_grid"][0]), 0.0)
-        self.assertAlmostEqual(float(trace["time_grid"][-1]), 1.0)
-        self.assertTrue(torch.all(torch.diff(trace["time_grid"]) > 0))
-        self.assertIn("trial_accepted", trace)
-        self.assertEqual(len(trace["trial_accepted"]), 3)
-        self.assertGreaterEqual(len(trace["trial_accepted"]), trace["steps"])
-        self.assertFalse(bool(trace["trial_accepted"][0]))
-
-    def test_adaptive_trigger_mode_none_disables_noise_fields(self) -> None:
-        torch.manual_seed(7)
-        cfg = self._cfg(use_minibatch_ot=False)
-        cfg.sample.adaptive_trigger_mode = "none"
-        cfg.sample.adaptive_gamma_max = 1.0
-        cfg.sample.adaptive_disable_noise_frac = 0.0
-        model = OTFlow(cfg)
-        hist = torch.randn(2, cfg.history_len, cfg.context_dim)
-
-        _, trace = model.sample_trace(hist, steps=3, solver="euler_adaptive")
-
-        self.assertFalse(torch.any(trace["fired"]))
-        self.assertTrue(torch.all(trace["trigger_strength"] == 0))
-        self.assertTrue(torch.all(trace["gamma"] == 0))
-        self.assertTrue(torch.all(trace["noise_norm"] == 0))
-        self.assertTrue(torch.all(trace["trigger_eligible"] == 0))
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,10 +16,14 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 from scipy.stats import spearmanr
 
-from genode.experiment_layout import PAPER_SEEN_NFES
+from genode.experiment_layout import REFERENCE_SEEN_NFES
 from genode.data.otflow_paths import display_project_path, project_root
 from genode.gipo.schema import reject_retired_evaluation_keys
-from genode.solver_protocol import SOLVER_RUNTIME_NAMES, solver_macro_steps
+from genode.solver_protocol import (
+    SOLVER_RUNTIME_NAMES,
+    solver_macro_steps,
+    target_nfe_for_macro_steps,
+)
 
 PROJECT_ROOT = project_root()
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs"
@@ -65,7 +69,7 @@ SOLVER_LABELS: Dict[str, str] = {
     "midpoint_rk2": "Midpoint RK2",
     "dpmpp2m": "DPM++2M",
 }
-TARGET_NFES: Tuple[int, ...] = PAPER_SEEN_NFES
+TARGET_NFES: Tuple[int, ...] = REFERENCE_SEEN_NFES
 TRANSFER_SCHEDULES: Tuple[str, ...] = ("ays", "gits", "ots")
 INTEGRATION_SCHEDULES: Tuple[str, ...] = ("uniform", *TRANSFER_SCHEDULES)
 SCHEDULE_LABELS: Dict[str, str] = {
@@ -388,7 +392,7 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
         load_forecast_checkpoint_splits,
         resolve_reference_macro_steps,
     )
-    from genode.data.otflow_paths import project_paper_dataset_root
+    from genode.data.otflow_paths import project_dataset_root
     from genode.runtime import resolve_torch_device
 
     datasets = parse_csv(str(args.datasets))
@@ -414,7 +418,7 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
     cli_args = _runner_cli_args(args)
     device = resolve_torch_device(str(args.device))
     cells: List[Dict[str, Any]] = []
-    dataset_root = project_paper_dataset_root()
+    dataset_root = project_dataset_root()
     for dataset in datasets:
         dataset_idx = DATASET_ORDER.index(str(dataset))
         checkpoint = load_forecast_checkpoint_splits(
@@ -547,7 +551,7 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "reference_macro_factor": float(args.reference_macro_factor),
         "calibration_trace_samples": int(args.calibration_trace_samples),
         "signal_trace_key": NATIVE_TRACE_KEY,
-        "paper_facing_trace_key": LOCAL_DEFECT_TRACE_KEY,
+        "report_trace_key": LOCAL_DEFECT_TRACE_KEY,
         "oracle_local_error_trace_key": ORACLE_LOCAL_ERROR_TRACE_KEY,
         "density_floor_eta": float(DEFAULT_DENSITY_FLOOR_ETA),
         "main_ptg_key": DEFAULT_MAIN_PTG_KEY,
@@ -579,36 +583,37 @@ def _sample_forecast_endpoints_norm(
     batch_size: int = 64,
 ) -> Tuple[List[np.ndarray], float]:
     import torch
-    from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _restore_sample_overrides
     from genode.models.otflow_train_val import seed_all
 
     device = cfg.train.device
     endpoints: List[np.ndarray] = []
     elapsed = 0.0
     effective_batch_size = max(1, int(batch_size))
-    backup = _apply_sample_overrides(model, cfg, solver=str(solver_name), time_grid=tuple(float(x) for x in time_grid))
-    try:
-        for batch_start in range(0, int(len(ds)), effective_batch_size):
-            batch_end = min(int(len(ds)), int(batch_start) + effective_batch_size)
-            hist_rows = []
-            for example_idx in range(batch_start, batch_end):
-                hist_t, _, _, _ = ds[int(example_idx)]
-                hist_rows.append(hist_t)
-            hist = torch.stack(hist_rows, dim=0).to(device).float()
-            draw_seed = int(seed) + 1000 * int(batch_start)
-            seed_all(draw_seed)
-            if device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.synchronize(device)
-            start = time.perf_counter()
-            pred_norm = model.sample_future(hist, steps=int(macro_steps), solver=str(solver_name))
-            if device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.synchronize(device)
-            elapsed += float(time.perf_counter() - start)
-            pred_arr = pred_norm.detach().cpu().numpy().astype(np.float64)
-            for batch_idx in range(int(pred_arr.shape[0])):
-                endpoints.append(pred_arr[batch_idx].reshape(-1))
-    finally:
-        _restore_sample_overrides(model, cfg, backup)
+    target_nfe = target_nfe_for_macro_steps(str(solver_name), int(macro_steps))
+    for batch_start in range(0, int(len(ds)), effective_batch_size):
+        batch_end = min(int(len(ds)), int(batch_start) + effective_batch_size)
+        hist_rows = []
+        for example_idx in range(batch_start, batch_end):
+            hist_t, _, _, _ = ds[int(example_idx)]
+            hist_rows.append(hist_t)
+        hist = torch.stack(hist_rows, dim=0).to(device).float()
+        draw_seed = int(seed) + 1000 * int(batch_start)
+        seed_all(draw_seed)
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        pred_norm = model.sample_future(
+            hist,
+            solver_key=str(solver_name),
+            target_nfe=target_nfe,
+            time_grid=time_grid,
+        )
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+        elapsed += float(time.perf_counter() - start)
+        pred_arr = pred_norm.detach().cpu().numpy().astype(np.float64)
+        for batch_idx in range(int(pred_arr.shape[0])):
+            endpoints.append(pred_arr[batch_idx].reshape(-1))
     return endpoints, elapsed
 
 
@@ -640,7 +645,7 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
         load_forecast_checkpoint_splits,
         resolve_reference_macro_steps,
     )
-    from genode.data.otflow_paths import project_paper_dataset_root
+    from genode.data.otflow_paths import project_dataset_root
     from genode.runtime import resolve_torch_device
 
     datasets = parse_csv(str(args.datasets))
@@ -672,7 +677,7 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
 
     cli_args = _runner_cli_args(args)
     device = resolve_torch_device(str(args.device))
-    dataset_root = project_paper_dataset_root()
+    dataset_root = project_dataset_root()
     rows: List[Dict[str, Any]] = []
     completed_seed_keys = set()
     rows_csv = Path(args.rows_csv) if getattr(args, "rows_csv", None) is not None else None
@@ -1381,16 +1386,16 @@ def plot_points_with_diagnostics(
         dpi=int(dpi),
         x_key=str(main_ptg_key),
     )
-    diagnostics["paper_facing_written"] = True
-    diagnostics["figure_mode"] = "paper_facing"
+    diagnostics["report_written"] = True
+    diagnostics["figure_mode"] = "report"
     diagnostics["figure_outputs"] = dict(outputs)
-    diagnostics["paper_facing_outputs"] = dict(outputs)
+    diagnostics["report_outputs"] = dict(outputs)
     diagnostics_json_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(diagnostics, diagnostics_json_path)
     return {
         **outputs,
         "diagnostics_json": display_project_path(diagnostics_json_path),
-        "paper_facing_written": True,
+        "report_written": True,
     }
 
 
@@ -1451,7 +1456,7 @@ def synthetic_payload() -> Dict[str, Any]:
         "reference_macro_factor": DEFAULT_REFERENCE_MACRO_FACTOR,
         "calibration_trace_samples": DEFAULT_CALIBRATION_TRACE_SAMPLES,
         "signal_trace_key": NATIVE_TRACE_KEY,
-        "paper_facing_trace_key": LOCAL_DEFECT_TRACE_KEY,
+        "report_trace_key": LOCAL_DEFECT_TRACE_KEY,
         "oracle_local_error_trace_key": ORACLE_LOCAL_ERROR_TRACE_KEY,
         "density_floor_eta": DEFAULT_DENSITY_FLOOR_ETA,
         "main_ptg_key": DEFAULT_MAIN_PTG_KEY,

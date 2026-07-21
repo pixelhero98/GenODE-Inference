@@ -1,1 +1,1 @@
-"""Pipeline orchestration CLIs for the genODE paper experiments."""
+"""Pipeline orchestration CLIs for GenODE reference experiments."""

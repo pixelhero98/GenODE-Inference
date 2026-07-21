@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Locked paper experiment horizons and non-AR rollout chunk sizes."""
+"""Locked reference experiment horizons and non-AR rollout chunk sizes."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ class DatasetExperimentSpec:
     rationale: str
 
 
-PAPER_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
+REFERENCE_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
     DatasetExperimentSpec(
         dataset_key="solar_energy_10m",
         benchmark_family=FORECAST_FAMILY,
@@ -90,14 +90,14 @@ PAPER_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
 EXPERIMENTAL_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = ()
 
 SUPPORTED_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
-    PAPER_EXPERIMENT_SPECS + EXPERIMENTAL_EXPERIMENT_SPECS
+    REFERENCE_EXPERIMENT_SPECS + EXPERIMENTAL_EXPERIMENT_SPECS
 )
 
-PAPER_FORECAST_DATASETS: tuple[str, ...] = tuple(
-    spec.dataset_key for spec in PAPER_EXPERIMENT_SPECS if spec.benchmark_family == FORECAST_FAMILY
+REFERENCE_FORECAST_DATASETS: tuple[str, ...] = tuple(
+    spec.dataset_key for spec in REFERENCE_EXPERIMENT_SPECS if spec.benchmark_family == FORECAST_FAMILY
 )
-PAPER_CONDITIONAL_GENERATION_DATASETS: tuple[str, ...] = tuple(
-    spec.dataset_key for spec in PAPER_EXPERIMENT_SPECS if spec.benchmark_family == CONDITIONAL_GENERATION_FAMILY
+REFERENCE_CONDITIONAL_GENERATION_DATASETS: tuple[str, ...] = tuple(
+    spec.dataset_key for spec in REFERENCE_EXPERIMENT_SPECS if spec.benchmark_family == CONDITIONAL_GENERATION_FAMILY
 )
 SUPPORTED_CONDITIONAL_GENERATION_DATASETS: tuple[str, ...] = tuple(
     spec.dataset_key for spec in SUPPORTED_EXPERIMENT_SPECS if spec.benchmark_family == CONDITIONAL_GENERATION_FAMILY
@@ -109,23 +109,23 @@ def experiment_plan_by_key() -> Dict[str, DatasetExperimentSpec]:
 
 
 def forecast_dataset_keys() -> tuple[str, ...]:
-    return tuple(PAPER_FORECAST_DATASETS)
+    return tuple(REFERENCE_FORECAST_DATASETS)
 
 
 def conditional_generation_dataset_keys() -> tuple[str, ...]:
-    return tuple(PAPER_CONDITIONAL_GENERATION_DATASETS)
+    return tuple(REFERENCE_CONDITIONAL_GENERATION_DATASETS)
 
 
 __all__ = [
     "CONDITIONAL_GENERATION_FAMILY",
-    "PAPER_FORECAST_DATASETS",
-    "PAPER_CONDITIONAL_GENERATION_DATASETS",
+    "REFERENCE_FORECAST_DATASETS",
+    "REFERENCE_CONDITIONAL_GENERATION_DATASETS",
     "EXPERIMENTAL_EXPERIMENT_SPECS",
     "SUPPORTED_CONDITIONAL_GENERATION_DATASETS",
     "SUPPORTED_EXPERIMENT_SPECS",
     "DatasetExperimentSpec",
     "FORECAST_FAMILY",
-    "PAPER_EXPERIMENT_SPECS",
+    "REFERENCE_EXPERIMENT_SPECS",
     "forecast_dataset_keys",
     "conditional_generation_dataset_keys",
     "experiment_plan_by_key",

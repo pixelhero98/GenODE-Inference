@@ -174,7 +174,7 @@ class VerifiedDownloadTests(unittest.TestCase):
     def test_monash_specs_pin_published_size_and_md5(self) -> None:
         observed = {
             spec.key: (int(spec.archive_size_bytes), str(spec.archive_md5))
-            for spec in otflow_monash_datasets.MONASH_PAPER_DATASETS
+            for spec in otflow_monash_datasets.MONASH_REFERENCE_DATASETS
         }
         self.assertEqual(
             observed,

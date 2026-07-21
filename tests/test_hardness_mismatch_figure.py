@@ -36,7 +36,7 @@ class NativeInfoGrowthFigureTests(unittest.TestCase):
     def test_synthetic_payload_uses_native_info_growth_trace(self) -> None:
         payload = figure_builder.synthetic_payload(macro_steps=4)
         self.assertEqual(payload["native_trace_key"], "info_growth_hardness_by_step")
-        self.assertEqual(payload["paper_facing_trace"], "native_info_growth")
+        self.assertEqual(payload["report_trace"], "native_info_growth")
         self.assertEqual(len(payload["schedule_nodes"]), len(BASELINE_SCHEDULE_KEYS))
         self.assertNotIn("selected_tvd_deltas", payload)
 

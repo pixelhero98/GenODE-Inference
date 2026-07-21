@@ -44,7 +44,7 @@ class PackagingHygieneTests(unittest.TestCase):
         self.assertNotIn("wfdb>=4.1", dependencies)
         self.assertFalse(any(str(dep).startswith("pyedflib") for dep in dependencies))
         self.assertEqual(medical, ["wfdb>=4.1"])
-        self.assertEqual(test, ["pytest>=8"])
+        self.assertEqual(test, ["pytest>=8", "ruff>=0.12"])
 
     def test_project_uses_current_spdx_license_metadata(self) -> None:
         pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))

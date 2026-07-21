@@ -19,7 +19,6 @@ RETIRED_EVALUATION_KEYS = frozenset(
         "gipo_steps",
         "mase",
         "mse",
-        "paper_method",
         "baseline_schedule_keys",
         "fixed_reference_schedule_keys",
         "fixed_schedule_keys",
@@ -108,7 +107,7 @@ def cap_context_indices(
     selection_protocol: str,
     uncapped_candidate_examples: int | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Apply a deterministic cap and return canonical selection metadata."""
+    """Apply a deterministic cap and return standard selection metadata."""
 
     candidate = [int(index) for index in indices]
     selected_cap = int(cap)

@@ -28,7 +28,7 @@ def display_project_path(path: str | Path) -> str:
     for root_name, root in (
         ("outputs", project_outputs_root()),
         ("data", project_data_root()),
-        ("paper_datasets", project_paper_dataset_root()),
+        ("datasets", project_dataset_root()),
     ):
         try:
             rel = resolved.relative_to(Path(root).expanduser().resolve())
@@ -45,8 +45,8 @@ def project_data_root() -> Path:
     return project_root() / "data"
 
 
-def project_paper_dataset_root() -> Path:
-    return project_root() / "paper_datasets"
+def project_dataset_root() -> Path:
+    return project_root() / "datasets"
 
 
 def project_outputs_root() -> Path:

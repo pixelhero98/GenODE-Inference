@@ -57,7 +57,7 @@ class TsfHeader:
     data_start_line: int
 
 
-MONASH_PAPER_DATASETS: Tuple[MonashDatasetSpec, ...] = (
+MONASH_REFERENCE_DATASETS: Tuple[MonashDatasetSpec, ...] = (
     MonashDatasetSpec(
         key="solar_energy_10m",
         display_name="Solar Energy (Monash, 10m)",
@@ -100,16 +100,16 @@ MONASH_PAPER_DATASETS: Tuple[MonashDatasetSpec, ...] = (
 )
 
 
-def monash_paper_dataset_keys() -> Tuple[str, ...]:
-    return tuple(spec.key for spec in MONASH_PAPER_DATASETS)
+def monash_reference_dataset_keys() -> Tuple[str, ...]:
+    return tuple(spec.key for spec in MONASH_REFERENCE_DATASETS)
 
 
 def get_monash_dataset_spec(dataset_key: str) -> MonashDatasetSpec:
     key = str(dataset_key).strip().lower()
-    for spec in MONASH_PAPER_DATASETS:
+    for spec in MONASH_REFERENCE_DATASETS:
         if spec.key == key:
             return spec
-    raise KeyError(f"Unknown Monash paper dataset: {dataset_key}")
+    raise KeyError(f"Unknown Monash reference dataset: {dataset_key}")
 
 
 def monash_manifest_path(dataset_root: str | Path, dataset_key: str) -> Path:
@@ -387,8 +387,8 @@ def download_monash_dataset(dataset_root: str | Path, dataset_key: str) -> Dict[
     return manifest_payload
 
 
-def download_monash_paper_datasets(dataset_root: str | Path, dataset_keys: Optional[Tuple[str, ...]] = None) -> List[Dict[str, Any]]:
-    keys = monash_paper_dataset_keys() if dataset_keys is None else tuple(str(key) for key in dataset_keys)
+def download_monash_reference_datasets(dataset_root: str | Path, dataset_keys: Optional[Tuple[str, ...]] = None) -> List[Dict[str, Any]]:
+    keys = monash_reference_dataset_keys() if dataset_keys is None else tuple(str(key) for key in dataset_keys)
     return [download_monash_dataset(dataset_root, key) for key in keys]
 
 
@@ -408,7 +408,7 @@ def load_monash_manifest(path: str | Path) -> MonashDatasetManifest:
 
 __all__ = [
     "MONASH_ARCHIVE_URL",
-    "MONASH_PAPER_DATASETS",
+    "MONASH_REFERENCE_DATASETS",
     "MonashDatasetManifest",
     "MonashDatasetSpec",
     "TsfHeader",
@@ -418,11 +418,11 @@ __all__ = [
     "monash_raw_dir",
     "monash_source_dir",
     "download_monash_dataset",
-    "download_monash_paper_datasets",
+    "download_monash_reference_datasets",
     "find_tsf_file",
     "get_monash_dataset_spec",
     "iter_tsf_series",
     "load_monash_manifest",
-    "monash_paper_dataset_keys",
+    "monash_reference_dataset_keys",
     "parse_tsf_header",
 ]

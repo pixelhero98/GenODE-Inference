@@ -13,7 +13,7 @@ from genode.solver_protocol import normalize_solver_key, normalize_solver_nfe_fi
 ScheduleGridKey = Tuple[Any, ...]
 
 
-def _reject_legacy_keys(payload: Mapping[str, Any], *, source: str) -> None:
+def _reject_retired_keys(payload: Mapping[str, Any], *, source: str) -> None:
     reject_retired_evaluation_keys(payload, source=source)
 
 
@@ -50,7 +50,7 @@ def load_schedule_summary_grids(paths: Sequence[str]) -> Dict[ScheduleGridKey, T
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, Mapping):
             raise ValueError(f"Schedule summary {path} must contain a mapping payload.")
-        _reject_legacy_keys(payload, source=f"Schedule summary {path}")
+        _reject_retired_keys(payload, source=f"Schedule summary {path}")
         if not str(payload.get("scenario_key", "")).strip():
             raise ValueError(f"Schedule summary {path} requires scenario_key.")
         schedules = payload.get("schedules")
@@ -66,7 +66,7 @@ def load_schedule_summary_grids(paths: Sequence[str]) -> Dict[ScheduleGridKey, T
         for schedule_index, schedule in enumerate(schedule_items):
             if not isinstance(schedule, Mapping):
                 raise ValueError(f"Schedule summary {path} schedule {schedule_index} must be a mapping.")
-            _reject_legacy_keys(schedule, source=f"Schedule summary {path} schedule {schedule_index}")
+            _reject_retired_keys(schedule, source=f"Schedule summary {path} schedule {schedule_index}")
             schedule_key = str(schedule.get("scheduler_key", "")).strip()
             if not schedule_key:
                 raise ValueError(f"Schedule summary {path} schedule {schedule_index} requires scheduler_key.")
@@ -75,7 +75,7 @@ def load_schedule_summary_grids(paths: Sequence[str]) -> Dict[ScheduleGridKey, T
                     raise ValueError(
                         f"Schedule summary {path} schedule {schedule_index} prediction {item_index} must be a mapping."
                     )
-                _reject_legacy_keys(
+                _reject_retired_keys(
                     item,
                     source=f"Schedule summary {path} schedule {schedule_index} prediction {item_index}",
                 )

@@ -25,7 +25,7 @@ from genode.evaluation.fm_backbone_registry import (
     materialize_backbone_manifest,
 )
 from genode.data.otflow_paths import display_project_path
-from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
+from genode.schedule_transfer.otflow_reference_tables import augment_rows_with_relative_metrics
 
 
 FORECAST_KEYS = ("solar_energy_10m", "traffic_hourly", "weather_daily")
@@ -76,7 +76,7 @@ def _fake_checkpoint_signature(checkpoint_path: Path):
 
 
 class BackboneMatrixTests(unittest.TestCase):
-    def test_paper_temporal_matrix_is_exactly_six_datasets(self) -> None:
+    def test_reference_temporal_matrix_is_exactly_six_datasets(self) -> None:
         self.assertEqual(forecast_dataset_keys(), FORECAST_KEYS)
         self.assertEqual(conditional_generation_dataset_keys(), CONDITIONAL_KEYS)
         self.assertEqual(tuple(ACTIVE_FORECAST_BACKBONE_BUDGETS), FORECAST_KEYS)
@@ -97,6 +97,27 @@ class BackboneMatrixTests(unittest.TestCase):
         self.assertTrue(all(artifact["backbone_name"] == BACKBONE_NAME_OTFLOW for artifact in payload["artifacts"]))
         active = {(row["benchmark_family"], row["dataset_key"]) for row in payload["artifacts"]}
         self.assertEqual(active, {(FORECAST_FAMILY, key) for key in FORECAST_KEYS} | {(CONDITIONAL_GENERATION_FAMILY, key) for key in CONDITIONAL_KEYS})
+
+    def test_manifest_omitted_roots_follow_explicit_write_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repository_root = root / "repo"
+            manifest_path = repository_root / "portable" / "backbone_manifest.json"
+            repository_root.mkdir()
+
+            payload = materialize_backbone_manifest(
+                budget_steps=(4000,),
+                write_path=manifest_path,
+            )
+
+            self.assertEqual(payload["matrix_root"], "matrix")
+            self.assertEqual(payload["otflow_reuse_root"], "shared_backbones")
+            self.assertEqual(payload["imported_backbone_root"], "imported_backbones")
+            self.assertEqual(payload["molecule_group_root"], "molecule_3d")
+            self.assertEqual(payload["molecule_backbone_root"], "molecule_3d_backbones")
+            loaded = load_backbone_manifest(manifest_path)
+            self.assertEqual(Path(loaded["matrix_root"]), manifest_path.parent / "matrix")
+            self.assertEqual(Path(loaded["molecule_group_root"]), manifest_path.parent / "molecule_3d")
 
     def test_manifest_loader_resolves_paths_from_explicit_base(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -195,21 +216,20 @@ class BackboneMatrixTests(unittest.TestCase):
 
         self.assertEqual(display, "external/artifact.pt")
 
-    def test_manifest_rejects_roots_outside_project_and_manifest_directory(self) -> None:
+    def test_manifest_rejects_roots_outside_manifest_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             repo = root / "repo"
             repo.mkdir()
-            with patch("genode.evaluation.fm_backbone_registry.project_root", return_value=repo):
-                with self.assertRaisesRegex(ValueError, "must be contained"):
-                    materialize_backbone_manifest(
-                        matrix_root=root / "private" / "matrix",
-                        otflow_reuse_root=root / "private" / "reuse",
-                        imported_backbone_root=root / "private" / "imported",
-                        molecule_group_root=root / "private" / "groups",
-                        molecule_backbone_root=root / "private" / "molecule_backbones",
-                        write_path=repo / "backbone_manifest.json",
-                    )
+            with self.assertRaisesRegex(ValueError, "must be contained"):
+                materialize_backbone_manifest(
+                    matrix_root=root / "private" / "matrix",
+                    otflow_reuse_root=root / "private" / "reuse",
+                    imported_backbone_root=root / "private" / "imported",
+                    molecule_group_root=root / "private" / "groups",
+                    molecule_backbone_root=root / "private" / "molecule_backbones",
+                    write_path=repo / "backbone_manifest.json",
+                )
 
     def test_manifest_extends_temporal_grid_with_trainable_molecule_strata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

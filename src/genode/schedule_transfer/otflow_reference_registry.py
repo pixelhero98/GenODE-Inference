@@ -4,17 +4,17 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from genode.experiment_layout import (
-    PAPER_SEEN_NFES,
-    PAPER_UNSEEN_NFES,
+    REFERENCE_SEEN_NFES,
+    REFERENCE_UNSEEN_NFES,
     PHYSICAL_SCHEDULE_KEYS,
     REVERSED_SCHEDULE_KEYS,
 )
 from genode.schedule_transfer import diffusion_flow_schedules
 
-MAIN_NFE_VALUES: Tuple[int, ...] = PAPER_SEEN_NFES
-APPENDIX_NFE_VALUES: Tuple[int, ...] = PAPER_UNSEEN_NFES
+MAIN_NFE_VALUES: Tuple[int, ...] = REFERENCE_SEEN_NFES
+APPENDIX_NFE_VALUES: Tuple[int, ...] = REFERENCE_UNSEEN_NFES
 METHOD_KEY = "diffusion_flow_time_reparameterization"
-PAPER_MAIN_SIGNAL_FAMILY = "native_info_growth"
+REFERENCE_MAIN_SIGNAL_FAMILY = "native_info_growth"
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,7 @@ class SolverSpec:
     otflow_runtime_name: Optional[str] = None
 
 
-def paper_schedule_specs() -> List[ScheduleSpec]:
+def reference_schedule_specs() -> List[ScheduleSpec]:
     external_catalog = diffusion_flow_schedules.load_external_schedule_catalog()
     return [
         ScheduleSpec(
@@ -108,7 +108,7 @@ def paper_schedule_specs() -> List[ScheduleSpec]:
     ]
 
 
-def paper_solver_specs() -> List[SolverSpec]:
+def reference_solver_specs() -> List[SolverSpec]:
     return [
         SolverSpec("euler", "Euler", 1, "deterministic_ode", "available", "all_schedules", "euler"),
         SolverSpec("heun", "Heun / RK2", 2, "deterministic_ode", "available", "all_schedules", "heun"),
@@ -117,18 +117,18 @@ def paper_solver_specs() -> List[SolverSpec]:
     ]
 
 
-def paper_registry_snapshot() -> Dict[str, Any]:
+def reference_registry_snapshot() -> Dict[str, Any]:
     return {
         "method_key": METHOD_KEY,
         "main_nfe_values": list(MAIN_NFE_VALUES),
         "appendix_nfe_values": list(APPENDIX_NFE_VALUES),
-        "paper_main_signal_family": PAPER_MAIN_SIGNAL_FAMILY,
+        "reference_main_signal_family": REFERENCE_MAIN_SIGNAL_FAMILY,
         "baseline_scheduler_keys": list(diffusion_flow_schedules.BASELINE_SCHEDULE_KEYS),
         "physical_schedule_keys": list(PHYSICAL_SCHEDULE_KEYS),
         "reversed_schedule_keys": list(REVERSED_SCHEDULE_KEYS),
         "transfer_schedule_keys": list(diffusion_flow_schedules.TRANSFER_SCHEDULE_KEYS),
-        "schedules": [asdict(spec) for spec in paper_schedule_specs()],
-        "solvers": [asdict(spec) for spec in paper_solver_specs()],
+        "schedules": [asdict(spec) for spec in reference_schedule_specs()],
+        "solvers": [asdict(spec) for spec in reference_solver_specs()],
     }
 
 
@@ -136,10 +136,10 @@ __all__ = [
     "APPENDIX_NFE_VALUES",
     "MAIN_NFE_VALUES",
     "METHOD_KEY",
-    "PAPER_MAIN_SIGNAL_FAMILY",
+    "REFERENCE_MAIN_SIGNAL_FAMILY",
     "ScheduleSpec",
     "SolverSpec",
-    "paper_registry_snapshot",
-    "paper_schedule_specs",
-    "paper_solver_specs",
+    "reference_registry_snapshot",
+    "reference_schedule_specs",
+    "reference_solver_specs",
 ]

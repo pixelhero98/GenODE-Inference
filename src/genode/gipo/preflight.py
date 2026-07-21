@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 from genode.experiment_layout import (
-    PAPER_SUPERVISION_SCHEDULE_KEYS,
+    REFERENCE_SUPERVISION_SCHEDULE_KEYS,
     SCENARIO_FAMILY_CONDITIONAL_GENERATION,
     SCENARIO_FAMILY_FORECAST,
     SCENARIO_FAMILY_MOLECULE,
@@ -21,7 +21,6 @@ from genode.gipo.objectives import (
     CONDITIONAL_METRIC_SPECS,
     FORECAST_METRIC_SPECS,
     MOLECULE_METRIC_SPECS,
-    objective_utility_keys_for_family,
     teacher_objective_utility_keys_for_family,
     teacher_objective_utility_keys_for_scenario,
 )
@@ -183,7 +182,7 @@ def _context_pair_key(row: Mapping[str, Any], *, pair_on_seed: bool = True) -> T
 def _validate_gipo_support_schedule_keys(
     support_schedule_keys: Sequence[str],
     *,
-    allowed_schedule_keys: Sequence[str] = PAPER_SUPERVISION_SCHEDULE_KEYS,
+    allowed_schedule_keys: Sequence[str] = REFERENCE_SUPERVISION_SCHEDULE_KEYS,
 ) -> Tuple[str, ...]:
     keys = tuple(str(key) for key in support_schedule_keys)
     if not keys:
@@ -248,35 +247,19 @@ def _target_component_applicable(row: Mapping[str, Any], target_key: str) -> boo
     return _truthy_row_value(value)
 
 
-def _rows_have_forecast_metrics(rows: Sequence[Mapping[str, Any]]) -> bool:
-    return any(
-        _has_nonempty_value(row, "forecast_crps")
-        or _has_nonempty_value(row, "forecast_mase")
-        for row in rows
-    )
-
-
 def _infer_single_benchmark_family(rows: Sequence[Mapping[str, Any]]) -> str:
     families = {str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()}
     if not families:
-        dataset_families = set()
-        for row in rows:
-            scenario_key = str(row.get("scenario_key", "")).strip()
-            if not scenario_key:
-                continue
-            try:
-                dataset_families.add(scenario_family_for_key(scenario_key))
-            except (KeyError, ValueError):
-                pass
-        families = dataset_families
-    if not families:
-        if _rows_have_forecast_metrics(rows):
-            return SCENARIO_FAMILY_FORECAST
-        if any(_has_nonempty_value(row, key) for row in rows for key in objective_utility_keys_for_family(SCENARIO_FAMILY_CONDITIONAL_GENERATION)):
-            return SCENARIO_FAMILY_CONDITIONAL_GENERATION
-        if any(_has_nonempty_value(row, key) for row in rows for key in objective_utility_keys_for_family(SCENARIO_FAMILY_MOLECULE)):
-            return SCENARIO_FAMILY_MOLECULE
-        raise ValueError("Cannot infer benchmark_family for automatic GIPO teacher target selection.")
+        scenario_keys = {
+            str(row.get("scenario_key", "")).strip()
+            for row in rows
+            if str(row.get("scenario_key", "")).strip()
+        }
+        if not scenario_keys:
+            raise ValueError(
+                "Automatic GIPO teacher target selection requires scenario_key or an explicit benchmark_family."
+            )
+        families = {scenario_family_for_key(scenario_key) for scenario_key in scenario_keys}
     if len(families) != 1:
         raise ValueError(f"GIPO training rows must contain exactly one benchmark_family; found {sorted(families)}.")
     family = next(iter(families))
@@ -306,7 +289,8 @@ def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence
             try:
                 return teacher_objective_utility_keys_for_scenario(scenario_key)
             except (KeyError, ValueError):
-                pass
+                if not any(str(row.get("benchmark_family", "")).strip() for row in rows):
+                    raise
         return teacher_objective_utility_keys_for_family(_infer_single_benchmark_family(rows))
     return _validate_teacher_metric_target_keys(raw)
 
@@ -350,7 +334,7 @@ def _read_rows_csvs(paths_text: str) -> Tuple[List[_RowRecord], List[str], List[
 
 def _observed_support(rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
     observed = tuple(sorted({str(row["scheduler_key"]) for row in rows if str(row.get("scheduler_key", "")).strip()}))
-    protocol_order = tuple(key for key in PAPER_SUPERVISION_SCHEDULE_KEYS if key in observed)
+    protocol_order = tuple(key for key in REFERENCE_SUPERVISION_SCHEDULE_KEYS if key in observed)
     extras = tuple(key for key in observed if key not in protocol_order)
     return _validate_gipo_support_schedule_keys(protocol_order + extras)
 

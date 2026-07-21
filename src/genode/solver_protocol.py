@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Sequence, Tuple
 
+from torch import Tensor
+
 SUPPORTED_SOLVER_KEYS: Tuple[str, ...] = ("euler", "dpmpp2m", "heun", "midpoint_rk2")
 SOLVER_DISPLAY_NAMES: Dict[str, str] = {
     "euler": "Euler",
@@ -66,6 +68,19 @@ def solver_macro_steps(solver_key: str, target_nfe: int) -> int:
     return target
 
 
+def target_nfe_for_macro_steps(solver_key: str, macro_steps: int) -> int:
+    key = normalize_solver_key(solver_key)
+    steps = int(macro_steps)
+    if steps <= 0:
+        raise ValueError(f"macro_steps must be positive, got {macro_steps!r}.")
+    return int(steps * solver_eval_multiplier(key))
+
+
+def uniform_time_grid(solver_key: str, target_nfe: int) -> Tuple[float, ...]:
+    macro_steps = solver_macro_steps(solver_key, target_nfe)
+    return tuple(float(index) / float(macro_steps) for index in range(macro_steps + 1))
+
+
 def solver_effective_order(solver_key: str) -> int:
     return 1 if normalize_solver_key(solver_key) == "euler" else 2
 
@@ -85,6 +100,39 @@ class SolverNFEFields:
     target_nfe: int
     macro_steps: int
     realized_nfe: int
+
+
+@dataclass(frozen=True)
+class FlowTrajectory:
+    """A batch-major trajectory produced by a deterministic ODE solve.
+
+    ``states`` includes the initial state and every accepted macro-step state,
+    so its second dimension is ``macro_steps + 1``.
+    """
+
+    initial_state: Tensor
+    time_grid: Tensor
+    states: Tensor
+    final_state: Tensor
+    solver_key: str
+    target_nfe: int
+    macro_steps: int
+    realized_nfe: int
+
+
+@dataclass(frozen=True)
+class FlowDiagnostics:
+    """Per-step diagnostics for a fixed-schedule flow trajectory."""
+
+    trajectory: FlowTrajectory
+    disagreement: Tensor
+    velocity_norm: Tensor
+    ema_velocity_norm: Tensor
+    residual_norm: Tensor
+    local_error: Tensor
+    field_evals_by_step: Tensor
+    mean_field_evals_per_step: float
+    mean_total_field_evals_per_rollout: float
 
 
 def _optional_positive_int(value: object, *, field: str, source: str) -> int | None:
@@ -137,6 +185,8 @@ __all__ = [
     "SOLVER_DISPLAY_NAMES",
     "SUPPORTED_SOLVER_KEYS",
     "SOLVER_RUNTIME_NAMES",
+    "FlowTrajectory",
+    "FlowDiagnostics",
     "SolverNFEFields",
     "expected_realized_nfe",
     "normalize_solver_key",
@@ -148,4 +198,6 @@ __all__ = [
     "solver_macro_steps",
     "solver_order_p",
     "solver_runtime_name",
+    "target_nfe_for_macro_steps",
+    "uniform_time_grid",
 ]

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "genode"
 version = "0.1.0"
-description = "Paper-first GIPO schedule optimization on frozen OT flow-matching backbones."
+description = "GIPO schedule optimization and endpoint flow-map distillation for frozen OT flow-matching backbones."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -36,7 +36,7 @@ dependencies = [
 
 [project.optional-dependencies]
 medical = ["wfdb>=4.1"]
-test = ["pytest>=8"]
+test = ["pytest>=8", "ruff>=0.12"]
 
 [project.urls]
 Homepage = "https://github.com/pixelhero98/GenODE-Inference"
@@ -59,9 +59,19 @@ genode-build-hardness-figure = "genode.visualization.build_hardness_mismatch_fig
 genode-build-ptg-figure = "genode.visualization.build_ptg_observed_gain_figure:main"
 genode-package-backbone-family = "genode.backbone_packages:package_main"
 genode-validate-backbone-package = "genode.backbone_packages:validate_main"
+genode-collect-flow-map-demonstrations = "genode.distillation.demonstrations:main"
+genode-train-flow-map = "genode.distillation.training:main"
+genode-evaluate-flow-map = "genode.distillation.evaluation:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 "genode.schedule_transfer" = ["otflow_external_schedule_catalog.json"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

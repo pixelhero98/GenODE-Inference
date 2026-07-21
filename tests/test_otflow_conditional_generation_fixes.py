@@ -69,7 +69,7 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
                 manifest_artifact={**metadata, "effective_train_steps": 7600},
             )
 
-    def test_forecast_manifest_checkpoint_branch_returns_canonical_checkpoint_step(self) -> None:
+    def test_forecast_manifest_checkpoint_branch_returns_resolved_checkpoint_step(self) -> None:
         cfg = _tiny_cfg(cond_dim=0)
         cfg.apply_overrides(steps=8000)
         with tempfile.TemporaryDirectory() as tmpdir:

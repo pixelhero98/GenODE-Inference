@@ -21,7 +21,7 @@ from genode.gipo.density_representation import (
     grid_to_density_mass,
     uniform_reference_grid,
 )
-from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _metric_bundle, _restore_sample_overrides
+from genode.evaluation.otflow_sampling_support import _metric_bundle
 from genode.schedule_transfer.otflow_schedule_diagnostics import _collect_rollout_diagnostics
 from genode.models.otflow_train_val import eval_many_windows
 
@@ -459,38 +459,37 @@ def run_fixed_schedule_variant(
 ) -> Dict[str, Any]:
     solver_name = str(grid_spec["solver_name"])
     time_grid = tuple(float(x) for x in grid_spec["time_grid"])
-    backup = _apply_sample_overrides(model, cfg, solver=solver_name, time_grid=time_grid)
-    try:
-        t0 = time.time()
-        result = eval_many_windows(
-            ds,
-            model,
-            cfg,
-            horizon=int(eval_horizon),
-            nfe=int(grid_spec["nfe"]),
-            n_windows=int(eval_windows),
-            seed=int(metrics_seed),
-            horizons_eval=[int(eval_horizon)],
-            chosen_t0s=chosen_t0s,
-            generation_seed_base=int(generation_seed_base),
-            metrics_seed=int(metrics_seed),
-            main_metrics_only=bool(score_main_only),
-        )
-        eval_seconds = float(time.time() - t0)
-        diag = _collect_rollout_diagnostics(
-            model,
-            ds,
-            cfg,
-            horizon=int(eval_horizon),
-            macro_steps=int(grid_spec["nfe"]),
-            n_windows=int(eval_windows),
-            seed=int(metrics_seed),
-            solver=solver_name,
-            chosen_t0s=chosen_t0s,
-            generation_seed_base=int(generation_seed_base),
-        )
-    finally:
-        _restore_sample_overrides(model, cfg, backup)
+    t0 = time.time()
+    result = eval_many_windows(
+        ds,
+        model,
+        cfg,
+        horizon=int(eval_horizon),
+        nfe=int(grid_spec["nfe"]),
+        n_windows=int(eval_windows),
+        seed=int(metrics_seed),
+        horizons_eval=[int(eval_horizon)],
+        chosen_t0s=chosen_t0s,
+        generation_seed_base=int(generation_seed_base),
+        metrics_seed=int(metrics_seed),
+        main_metrics_only=bool(score_main_only),
+        solver_key=solver_name,
+        time_grid=time_grid,
+    )
+    eval_seconds = float(time.time() - t0)
+    diag = _collect_rollout_diagnostics(
+        model,
+        ds,
+        cfg,
+        horizon=int(eval_horizon),
+        macro_steps=int(grid_spec["nfe"]),
+        n_windows=int(eval_windows),
+        seed=int(metrics_seed),
+        solver=solver_name,
+        time_grid=time_grid,
+        chosen_t0s=chosen_t0s,
+        generation_seed_base=int(generation_seed_base),
+    )
 
     row = {
         "grid_name": str(grid_spec["grid_name"]),
@@ -512,7 +511,6 @@ def run_fixed_schedule_variant(
         "eval_seconds": eval_seconds,
         "mean_field_evals_per_step": float(diag["mean_field_evals_per_step"]),
         "mean_total_field_evals_per_rollout": float(diag["mean_total_field_evals_per_rollout"]),
-        "trigger_rate": float(diag["trigger_rate"]),
         "diag": diag,
         "evaluation_protocol": {
             "chosen_t0s": [int(t0) for t0 in result["meta"]["chosen_t0s"]],

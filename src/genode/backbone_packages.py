@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 from genode.experiment_layout import (
-    PAPER_CHECKPOINT_STEPS,
+    REFERENCE_CHECKPOINT_STEPS,
     CONDITIONAL_GENERATION_SCENARIO_KEYS,
     FORECAST_SCENARIO_KEYS,
     MOLECULE_SCENARIO_KEYS,
@@ -37,7 +38,7 @@ PACKAGE_MANIFEST_NAME = "package_manifest.json"
 PACKAGED_BACKBONE_MANIFEST = "backbone_manifest.json"
 MANIFEST_VERSION = "fm_backbone_manifest"
 MOLECULE_FAMILY = SCENARIO_FAMILY_MOLECULE
-TRAIN_BUDGET_STEPS = PAPER_CHECKPOINT_STEPS
+TRAIN_BUDGET_STEPS = REFERENCE_CHECKPOINT_STEPS
 
 PATH_FIELDS = ("checkpoint_path", "summary_path", "metadata_path")
 ROOT_FIELDS = (
@@ -75,7 +76,7 @@ FAMILY_SPECS: Mapping[str, BackbonePackageFamily] = {
         benchmark_family=FORECAST_FAMILY,
         scenarios=FORECAST_SCENARIO_KEYS,
         zip_name="genode_temporal_extrapolation_backbones_datasets.zip",
-        data_roots=tuple(f"paper_datasets/monash/{scenario}" for scenario in FORECAST_SCENARIO_KEYS),
+        data_roots=tuple(f"datasets/monash/{scenario}" for scenario in FORECAST_SCENARIO_KEYS),
         expected_artifact_count=len(FORECAST_SCENARIO_KEYS) * len(TRAIN_BUDGET_STEPS),
     ),
     "temporal-generation": BackbonePackageFamily(
@@ -113,9 +114,9 @@ def _safe_rel(path: str | Path) -> PurePosixPath:
 def _strip_known_prefix(path_text: str) -> str:
     text = _as_posix(path_text)
     parts = PurePosixPath(text).parts
-    if len(parts) >= 2 and parts[0] == "genode" and parts[1] in {"outputs", "data", "paper_datasets"}:
+    if len(parts) >= 2 and parts[0] == "genode" and parts[1] in {"outputs", "data", "datasets"}:
         return PurePosixPath(*parts[1:]).as_posix()
-    for marker in ("outputs", "data", "paper_datasets"):
+    for marker in ("outputs", "data", "datasets"):
         if marker in parts:
             return PurePosixPath(*parts[parts.index(marker) :]).as_posix()
     return text
@@ -213,7 +214,7 @@ def _rewrite_json_paths(value: Any, *, key: str = "") -> Any:
         if not _is_json_path_field(key):
             return value
         text = _as_posix(value)
-        if any(marker in text for marker in ("outputs/", "data/", "paper_datasets/", "genode/outputs/")):
+        if any(marker in text for marker in ("outputs/", "data/", "datasets/", "genode/outputs/")):
             stripped = _strip_known_prefix(text)
             try:
                 _safe_rel(stripped)
@@ -443,7 +444,7 @@ def _commit_package_outputs(
                 raise ValueError(f"Refusing to replace package output outside output_dir: {final_path}")
             if is_link_or_reparse_point(final_path):
                 raise ValueError(f"Refusing to replace linked or reparse-point package output: {final_path}")
-            backup = output_dir / f".{final_path.name}.{token}.backup"
+            backup = output_dir / f".backup-{token}-{len(backups)}"
             os.replace(final_path, backup)
             backups.append((backup, final_path))
         for temporary, final_path in replacements:
@@ -481,12 +482,11 @@ def package_backbone_family(
             raise FileExistsError(f"Package output already exists: {existing[0]}")
 
     token = uuid.uuid4().hex
-    build_root = resolved_output / f".{package_root.name}.{token}.staging"
-    temporary_zip = resolved_output / f".{zip_path.name}.{token}.tmp"
-    temporary_zip_manifest = resolved_output / f".{zip_manifest_path.name}.{token}.tmp"
+    build_root = Path(tempfile.mkdtemp(prefix=".pkg-", dir=resolved_output))
+    temporary_zip = resolved_output / f".archive-{token}.tmp"
+    temporary_zip_manifest = resolved_output / f".archive-manifest-{token}.tmp"
     package_manifest: Dict[str, Any] = {}
     try:
-        build_root.mkdir()
         source_manifest_path = _source_path(resolved_source, PACKAGED_BACKBONE_MANIFEST)
         source_manifest = load_portable_backbone_manifest(source_manifest_path)
         if int(source_manifest.get("ready_count", -1)) != int(source_manifest.get("artifact_count", -2)):
@@ -783,11 +783,11 @@ def validate_backbone_package(
     else:
         spec = FAMILY_SPECS[family]
         if list(package_manifest.get("scenarios", [])) != list(spec.scenarios):
-            errors.append("Package scenarios do not match the paper family scenarios.")
+            errors.append("Package scenarios do not match the reference family scenarios.")
         if int(package_manifest.get("expected_artifact_count", -1)) != int(spec.expected_artifact_count):
-            errors.append("Package expected artifact count does not match the paper family.")
+            errors.append("Package expected artifact count does not match the reference family.")
         if list(package_manifest.get("data_roots", [])) != list(spec.data_roots):
-            errors.append("Package data roots do not match the paper family data roots.")
+            errors.append("Package data roots do not match the reference family data roots.")
         file_paths = [str(record.get("path", "")) for record in file_records]
         if len(set(file_paths)) != len(file_paths):
             errors.append("Package manifest contains duplicate file records.")
@@ -1037,7 +1037,7 @@ def apply_backbone_package_to_args(args: argparse.Namespace) -> argparse.Namespa
         raise ValueError(f"Scenario {scenario!r} is not included in backbone package family {family!r}.")
     args.backbone_manifest = str(package_root / PACKAGED_BACKBONE_MANIFEST)
     args.shared_backbone_root = str(package_root / "outputs" / "shared_backbones" / "otflow_fullhorizon_seed0")
-    args.dataset_root = str(package_root / "paper_datasets")
+    args.dataset_root = str(package_root / "datasets")
     args.cryptos_path = str(package_root / "data" / "cryptos_binance_spot_monthly_1s_l10.npz")
     args.lobster_synthetic_profile_path = str(package_root / "data" / "lobster_synthetic" / "lobster_free_sample_profile_10.json")
     args.long_term_st_path = str(package_root / "data" / "long_term_st_100hz_context_only")

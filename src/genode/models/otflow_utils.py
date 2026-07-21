@@ -2,7 +2,7 @@
 
 Shared utility functions for OTFlow.
 
-Consolidates helpers used across the OTFlow runtime and paper tooling.
+Consolidates helpers used across the OTFlow runtime and reference tooling.
 """
 
 from __future__ import annotations

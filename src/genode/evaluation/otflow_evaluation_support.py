@@ -15,9 +15,13 @@ import numpy as np
 import torch
 from scipy.stats import spearmanr
 
-from genode.experiment_layout import PAPER_CHECKPOINT_STEPS, SCENARIO_FAMILY_MOLECULE
-from genode.solver_protocol import solver_eval_multiplier
-from genode.data.experiment_common import DATASET_PLANS, build_dataset_splits, get_otflow_paper_backbone_preset
+from genode.experiment_layout import REFERENCE_CHECKPOINT_STEPS, SCENARIO_FAMILY_MOLECULE
+from genode.solver_protocol import (
+    solver_eval_multiplier,
+    target_nfe_for_macro_steps,
+    uniform_time_grid,
+)
+from genode.data.experiment_common import DATASET_PLANS, build_dataset_splits, get_otflow_reference_backbone_preset
 from genode.evaluation.fm_backbone_registry import (
     BACKBONE_NAME_OTFLOW,
     build_backbone_checkpoint_id,
@@ -26,7 +30,7 @@ from genode.evaluation.fm_backbone_registry import (
     train_budget_label,
 )
 from genode.data.otflow_experiment_plan import (
-    PAPER_FORECAST_DATASETS,
+    REFERENCE_FORECAST_DATASETS,
     CONDITIONAL_GENERATION_FAMILY,
     FORECAST_FAMILY,
     SUPPORTED_CONDITIONAL_GENERATION_DATASETS,
@@ -43,7 +47,6 @@ from genode.data.otflow_paths import (
     project_results_root,
     resolve_project_path,
 )
-from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _restore_sample_overrides
 from genode.runtime import ProgressBar
 from genode.schedule_transfer.otflow_signal_traces import (
     NATIVE_INFO_GROWTH_TRACE_KEY,
@@ -68,9 +71,7 @@ DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION = 0.70
 DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION = 0.10
 
 UNIFORM_SCHEDULER_KEY = "uniform"
-DEFAULT_SHARED_BACKBONE_ROOT = (
-    project_results_root() / "shared_backbones" / "otflow_fullhorizon_seed0"
-)
+DEFAULT_SHARED_BACKBONE_ROOT = project_results_root() / "shared_backbones" / "otflow_fullhorizon_seed0"
 DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE = "transformer"
 DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS = 20_000
 TEMPORAL_ROLLOUT_MODE = "non_ar"
@@ -89,6 +90,36 @@ RETIRED_BASELINE_MODEL_CONFIG_KEYS = {
     "gan_noise_dim",
     "cgan_recon_weight",
 }
+RETIRED_INFERENCE_SAMPLE_CONFIG_KEYS = {
+    "steps",
+    "solver",
+    "time_grid",
+    "adaptive_beta",
+    "adaptive_tau",
+    "adaptive_kappa",
+    "adaptive_gamma_max",
+    "adaptive_cooldown_steps",
+    "adaptive_noise_mode",
+    "adaptive_trigger_mode",
+    "adaptive_disable_noise_frac",
+    "adaptive_rtol",
+    "adaptive_atol",
+    "adaptive_safety",
+    "adaptive_min_step",
+    "adaptive_max_nfe",
+    "refine_beta",
+    "refine_trigger_mode",
+    "refine_threshold_z",
+    "refine_threshold_raw",
+    "refine_step_mu",
+    "refine_step_sigma",
+    "refine_step_threshold",
+    "refine_selected_steps",
+    "refine_fixed_last_k",
+    "refine_sigma_eps",
+    "refine_disallow_final_step",
+}
+
 
 def _empirical_crps(samples: np.ndarray, target: np.ndarray) -> float:
     samples = np.asarray(samples, dtype=np.float64)
@@ -116,7 +147,7 @@ def parse_int_csv(text: str) -> List[int]:
 
 def parse_forecast_datasets(text: str) -> List[str]:
     names = parse_csv(text)
-    unknown = [name for name in names if name not in PAPER_FORECAST_DATASETS]
+    unknown = [name for name in names if name not in REFERENCE_FORECAST_DATASETS]
     if unknown:
         raise ValueError(f"Unknown forecast datasets: {unknown}")
     return names
@@ -360,19 +391,12 @@ def _forecast_example_detail_metadata(
     if hasattr(ds, "example_metadata"):
         loaded = ds.example_metadata(int(example_idx))
         if not isinstance(loaded, Mapping):
-            raise TypeError(
-                f"example_metadata({int(example_idx)}) must return a mapping, got {type(loaded).__name__}."
-            )
+            raise TypeError(f"example_metadata({int(example_idx)}) must return a mapping, got {type(loaded).__name__}.")
         metadata.update(dict(loaded))
     if isinstance(meta, Mapping):
         metadata.update(dict(meta))
     scenario = str(scenario_key or getattr(ds, "dataset_key", ""))
-    split = str(
-        split_phase
-        or metadata.get("split_phase")
-        or metadata.get("split")
-        or getattr(ds, "split_name", "")
-    )
+    split = str(split_phase or metadata.get("split_phase") or metadata.get("split") or getattr(ds, "split_name", ""))
     series_idx = int(metadata.get("series_idx", example_idx))
     return {
         "scenario_key": scenario,
@@ -494,7 +518,7 @@ def _requested_checkpoint_steps(cli_args: argparse.Namespace) -> List[int]:
     checkpoint_step = int(getattr(cli_args, "checkpoint_step", 0) or 0)
     if checkpoint_step > 0:
         return [int(checkpoint_step)]
-    return [int(step) for step in PAPER_CHECKPOINT_STEPS]
+    return [int(step) for step in REFERENCE_CHECKPOINT_STEPS]
 
 
 def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
@@ -556,8 +580,7 @@ def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
         if missing_manifest_checkpoints:
             missing_lines = ", ".join(str(path) for path in missing_manifest_checkpoints)
             errors.append(
-                "Backbone manifest contains ready OTFlow artifacts whose checkpoint files are missing: "
-                f"{missing_lines}"
+                f"Backbone manifest contains ready OTFlow artifacts whose checkpoint files are missing: {missing_lines}"
             )
     else:
         missing_checkpoints = _missing_shared_checkpoint_paths(
@@ -615,9 +638,7 @@ def _dataset_data_path(cli_args: argparse.Namespace, dataset: str) -> str:
 
 def resolved_checkpoint_step(cli_args: argparse.Namespace, dataset: str) -> int:
     del dataset
-    checkpoint_step = int(
-        getattr(cli_args, "checkpoint_step", DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS)
-    )
+    checkpoint_step = int(getattr(cli_args, "checkpoint_step", DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS))
     if checkpoint_step <= 0:
         raise ValueError(f"checkpoint_step must be positive, got {checkpoint_step!r}.")
     return checkpoint_step
@@ -631,8 +652,7 @@ def resolved_eval_horizon(cli_args: argparse.Namespace, dataset: str) -> int:
         return int(expected)
     if override != expected:
         raise ValueError(
-            f"Non-paper --eval_horizon={override} for {dataset}; use 0 or the locked "
-            f"experiment horizon {expected}."
+            f"Non-reference --eval_horizon={override} for {dataset}; use 0 or the locked experiment horizon {expected}."
         )
     return int(expected)
 
@@ -645,8 +665,7 @@ def resolved_future_block_len(cli_args: argparse.Namespace, dataset: str) -> int
         return int(expected)
     if override != expected:
         raise ValueError(
-            f"Non-paper --future_block_len={override} for {dataset}; use 0 or the locked "
-            f"future_block_len {expected}."
+            f"Non-reference --future_block_len={override} for {dataset}; use 0 or the locked future_block_len {expected}."
         )
     return int(expected)
 
@@ -656,7 +675,7 @@ def resolved_rollout_mode(cli_args: argparse.Namespace, dataset: str) -> str:
     value = raw.strip().lower()
     if value != TEMPORAL_ROLLOUT_MODE:
         raise ValueError(
-            f"Non-paper --rollout_mode={raw!r} for {dataset}; active temporal paper-matrix "
+            f"Non-reference --rollout_mode={raw!r} for {dataset}; active temporal reference matrix "
             f"datasets require {TEMPORAL_ROLLOUT_MODE!r}."
         )
     return TEMPORAL_ROLLOUT_MODE
@@ -678,7 +697,7 @@ def build_conditional_generation_dataset_args_from_cfg(
 ) -> argparse.Namespace:
     plan = DATASET_PLANS[str(dataset)]
     experiment_spec = experiment_plan_by_key()[str(dataset)]
-    preset = get_otflow_paper_backbone_preset(str(dataset))
+    preset = get_otflow_reference_backbone_preset(str(dataset))
     batch_size = int(_resolved_conditional_generation_physical_batch_size(str(dataset)))
     grad_accum_steps = max(1, int(math.ceil(32.0 / float(max(1, batch_size)))))
     locked_future_block_len = int(resolved_future_block_len(cli_args, str(dataset)))
@@ -798,15 +817,13 @@ def load_otflow_checkpoint_payload(
     size_bytes = int(path.stat().st_size)
     if size_bytes < 1024:
         raise RuntimeError(
-            f"Invalid OTFlow checkpoint at {path}: file is only {size_bytes} bytes; "
-            f"expected {expected_identity}."
+            f"Invalid OTFlow checkpoint at {path}: file is only {size_bytes} bytes; expected {expected_identity}."
         )
     with path.open("rb") as fh:
         header = fh.read(256)
     if _checkpoint_header_is_known_text_placeholder(header):
         raise RuntimeError(
-            f"Invalid OTFlow checkpoint at {path}: file looks like text or a pointer, "
-            f"not {expected_identity}."
+            f"Invalid OTFlow checkpoint at {path}: file looks like text or a pointer, not {expected_identity}."
         )
     try:
         payload = torch.load(str(path), map_location="cpu", weights_only=True)
@@ -823,14 +840,11 @@ def load_otflow_checkpoint_payload(
     missing_keys = sorted({"cfg", "model_state"} - set(payload.keys()))
     if missing_keys:
         raise RuntimeError(
-            f"Invalid OTFlow checkpoint at {path}: missing required keys {missing_keys} "
-            f"for {expected_identity}."
+            f"Invalid OTFlow checkpoint at {path}: missing required keys {missing_keys} for {expected_identity}."
         )
     for key in ("cfg", "model_state"):
         if not isinstance(payload.get(key), MappingABC):
-            raise RuntimeError(
-                f"Invalid OTFlow checkpoint at {path}: {key} must be a mapping for {expected_identity}."
-            )
+            raise RuntimeError(f"Invalid OTFlow checkpoint at {path}: {key} must be a mapping for {expected_identity}.")
     return payload
 
 
@@ -847,9 +861,16 @@ def load_checkpoint_model(ckpt_path: Path, device: torch.device) -> Tuple[OTFlow
         "train": type(cfg.train),
         "sample": type(cfg.sample),
     }
+    unknown_sections = sorted(set(cfg_dict) - set(section_types))
     for section_name, cls in section_types.items():
         section_values = {field.name: getattr(getattr(cfg, section_name), field.name) for field in fields(cls)}
         checkpoint_values = dict(cfg_dict.get(section_name, {}))
+        if section_name == "sample":
+            checkpoint_values = {
+                key: value
+                for key, value in checkpoint_values.items()
+                if key not in RETIRED_INFERENCE_SAMPLE_CONFIG_KEYS
+            }
         if section_name == "model":
             retired_keys = sorted(set(checkpoint_values) & RETIRED_BASELINE_MODEL_CONFIG_KEYS)
             if retired_keys:
@@ -867,6 +888,10 @@ def load_checkpoint_model(ckpt_path: Path, device: torch.device) -> Tuple[OTFlow
                 f"Checkpoint config section {section_name!r} contains unsupported keys: {sorted(unknown_keys)}"
             )
         setattr(cfg, section_name, cls(**section_values))
+    if unknown_sections:
+        raise TypeError(
+            f"Checkpoint config contains unsupported sections: {unknown_sections}"
+        )
     cfg.train.device = device
 
     model = OTFlow(cfg).to(device)
@@ -897,10 +922,7 @@ def _validate_exact_budget_export(
     expected = int(expected_step)
     integer_fields = ("train_steps", "checkpoint_budget_steps", "effective_train_steps")
     try:
-        metadata_steps = {
-            key: int(_required_metadata_value(metadata, key))
-            for key in integer_fields
-        }
+        metadata_steps = {key: int(_required_metadata_value(metadata, key)) for key in integer_fields}
         metadata_protocol = str(_required_metadata_value(metadata, "checkpoint_export_protocol"))
     except (TypeError, ValueError) as exc:
         raise RuntimeError(
@@ -925,8 +947,7 @@ def _validate_exact_budget_export(
                 observed_value: Any = int(manifest_value) if key in integer_fields else str(manifest_value)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError(
-                    f"Backbone manifest has invalid {key!r} for "
-                    f"{display_project_path(checkpoint_path)}."
+                    f"Backbone manifest has invalid {key!r} for {display_project_path(checkpoint_path)}."
                 ) from exc
             if observed_value != expected_value:
                 raise RuntimeError(
@@ -979,8 +1000,7 @@ def _validate_metadata_identity(
         observed = caster(_required_metadata_value(metadata, key))
         if observed != expected:
             raise RuntimeError(
-                f"Checkpoint {ckpt_path} metadata mismatch for {dataset}: "
-                f"{key}={observed!r}, expected {expected!r}."
+                f"Checkpoint {ckpt_path} metadata mismatch for {dataset}: {key}={observed!r}, expected {expected!r}."
             )
     if expected_field_network_type is not None:
         observed_field = str(_required_metadata_value(metadata, "field_network_type"))
@@ -1121,7 +1141,9 @@ def load_forecast_checkpoint_splits(
     resolved_eval_horizon(cli_args, str(dataset))
     resolved_future_block_len(cli_args, str(dataset))
     resolved_rollout_mode(cli_args, str(dataset))
-    manifest_artifact = _resolved_manifest_artifact(cli_args, benchmark_family=FORECAST_FAMILY, dataset_key=str(dataset))
+    manifest_artifact = _resolved_manifest_artifact(
+        cli_args, benchmark_family=FORECAST_FAMILY, dataset_key=str(dataset)
+    )
     if manifest_artifact is not None:
         ckpt_path = _resolve_checkpoint_path(str(manifest_artifact["checkpoint_path"]))
         checkpoint_id = str(manifest_artifact["checkpoint_id"])
@@ -1310,32 +1332,99 @@ def load_conditional_generation_checkpoint_splits(
     }
 
 
-
-def collect_forecast_calibration(model: OTFlow, ds_val, cfg, *, macro_steps: int, solver_name: str, seed: int, calibration_trace_samples: int = 1, info_growth_scale_multiplier: float = 1.0) -> Dict[str, Any]:
-    trace_samples=int(calibration_trace_samples)
-    if trace_samples<=0: raise ValueError(f"calibration_trace_samples must be positive, got {calibration_trace_samples}")
-    reference_time_grid: Optional[np.ndarray]=None; disagreement_rows=[]; residual_rows=[]; oracle_rows=[]; trace_rows=[]; device=cfg.train.device
+def collect_forecast_calibration(
+    model: OTFlow,
+    ds_val,
+    cfg,
+    *,
+    macro_steps: int,
+    solver_name: str,
+    seed: int,
+    calibration_trace_samples: int = 1,
+    info_growth_scale_multiplier: float = 1.0,
+) -> Dict[str, Any]:
+    trace_samples = int(calibration_trace_samples)
+    if trace_samples <= 0:
+        raise ValueError(f"calibration_trace_samples must be positive, got {calibration_trace_samples}")
+    reference_time_grid: Optional[np.ndarray] = None
+    disagreement_rows = []
+    residual_rows = []
+    oracle_rows = []
+    trace_rows = []
+    device = cfg.train.device
     for example_idx in range(len(ds_val)):
         hist_t, _, _, _ = _parse_forecast_batch(ds_val[int(example_idx)])
-        hist=hist_t[None].to(device).float(); dsamps=[]; rsamps=[]; osamps=[]
+        hist = hist_t[None].to(device).float()
+        dsamps = []
+        rsamps = []
+        osamps = []
         for sample_idx in range(trace_samples):
-            seed_all(int(seed)+int(example_idx)+1_000_000*int(sample_idx))
-            _,trace=model.sample_future_trace(hist,steps=int(macro_steps),solver=str(solver_name),oracle_local_error=True)
-            grid=trace["time_grid"].detach().cpu().numpy().astype(np.float64)
-            if reference_time_grid is None: reference_time_grid=grid
-            elif not np.allclose(reference_time_grid,grid,atol=1e-8,rtol=1e-8): raise ValueError("Forecast calibration trace time grids must match across validation examples.")
-            dsamps.append(trace["disagreement"][0].detach().cpu().numpy().astype(np.float64)); rsamps.append(trace["residual_norm"][0].detach().cpu().numpy().astype(np.float64)); osamps.append(trace["oracle_local_error"][0].detach().cpu().numpy().astype(np.float64))
-        d=np.stack(dsamps,axis=0).mean(axis=0); r=np.stack(rsamps,axis=0).mean(axis=0); o=np.stack(osamps,axis=0).mean(axis=0)
-        disagreement_rows.append(d); residual_rows.append(r); oracle_rows.append(o)
-        for step_idx,(dv,rv,ov) in enumerate(zip(d.tolist(),r.tolist(),o.tolist())): trace_rows.append({"example_index":int(example_idx),"step_index":int(step_idx),"disagreement":float(dv),"residual_norm":float(rv),"oracle_local_error":float(ov)})
-    if not disagreement_rows: raise ValueError("Forecast validation split is empty; cannot calibrate native info-growth trace.")
-    disagreement_arr=np.stack(disagreement_rows,axis=0); residual_arr=np.stack(residual_rows,axis=0); oracle_arr=np.stack(oracle_rows,axis=0)
-    base_scale=resolved_info_growth_scale(residual_arr.reshape(-1)); effective_scale=float(base_scale)*float(info_growth_scale_multiplier)
-    if effective_scale<=0.0: raise ValueError(f"info_growth_scale_multiplier must keep scale positive, got {info_growth_scale_multiplier}")
-    info_growth_arr=compute_info_growth_hardness_numpy(residual_arr,disagreement_arr,scale=float(effective_scale))
-    if reference_time_grid is None: reference_time_grid=np.linspace(0.0,1.0,int(macro_steps)+1,dtype=np.float64)
-    corr_signal=info_growth_arr[:,1:].reshape(-1); corr_oracle=oracle_arr[:,1:].reshape(-1)
-    return {"macro_steps":int(macro_steps),"solver":str(solver_name),"n_windows":int(info_growth_arr.shape[0]),"calibration_trace_samples":int(trace_samples),"reference_time_grid":[float(x) for x in reference_time_grid.tolist()],"reference_time_alignment":"left_endpoint","base_info_growth_scale":float(base_scale),"info_growth_scale":float(effective_scale),"info_growth_scale_multiplier":float(info_growth_scale_multiplier),"rows":trace_rows,"disagreement_by_step":[float(x) for x in disagreement_arr.mean(axis=0).tolist()],"residual_norm_by_step":[float(x) for x in residual_arr.mean(axis=0).tolist()],"oracle_local_error_by_step":[float(x) for x in oracle_arr.mean(axis=0).tolist()],NATIVE_INFO_GROWTH_TRACE_KEY:[float(x) for x in info_growth_arr.mean(axis=0).tolist()],"signal_correlations_vs_oracle":{NATIVE_INFO_GROWTH_TRACE_KEY:{"spearman":safe_spearman(corr_signal,corr_oracle)}}}
+            seed_all(int(seed) + int(example_idx) + 1_000_000 * int(sample_idx))
+            target_nfe = target_nfe_for_macro_steps(str(solver_name), int(macro_steps))
+            _, diagnostics = model.sample_future_with_diagnostics(
+                hist,
+                solver_key=str(solver_name),
+                target_nfe=target_nfe,
+                time_grid=uniform_time_grid(str(solver_name), target_nfe),
+                include_local_error=True,
+            )
+            grid = diagnostics.trajectory.time_grid.detach().cpu().numpy().astype(np.float64)
+            if reference_time_grid is None:
+                reference_time_grid = grid
+            elif not np.allclose(reference_time_grid, grid, atol=1e-8, rtol=1e-8):
+                raise ValueError("Forecast calibration trace time grids must match across validation examples.")
+            dsamps.append(diagnostics.disagreement[0].detach().cpu().numpy().astype(np.float64))
+            rsamps.append(diagnostics.residual_norm[0].detach().cpu().numpy().astype(np.float64))
+            osamps.append(diagnostics.local_error[0].detach().cpu().numpy().astype(np.float64))
+        d = np.stack(dsamps, axis=0).mean(axis=0)
+        r = np.stack(rsamps, axis=0).mean(axis=0)
+        o = np.stack(osamps, axis=0).mean(axis=0)
+        disagreement_rows.append(d)
+        residual_rows.append(r)
+        oracle_rows.append(o)
+        for step_idx, (dv, rv, ov) in enumerate(zip(d.tolist(), r.tolist(), o.tolist())):
+            trace_rows.append(
+                {
+                    "example_index": int(example_idx),
+                    "step_index": int(step_idx),
+                    "disagreement": float(dv),
+                    "residual_norm": float(rv),
+                    "oracle_local_error": float(ov),
+                }
+            )
+    if not disagreement_rows:
+        raise ValueError("Forecast validation split is empty; cannot calibrate native info-growth trace.")
+    disagreement_arr = np.stack(disagreement_rows, axis=0)
+    residual_arr = np.stack(residual_rows, axis=0)
+    oracle_arr = np.stack(oracle_rows, axis=0)
+    base_scale = resolved_info_growth_scale(residual_arr.reshape(-1))
+    effective_scale = float(base_scale) * float(info_growth_scale_multiplier)
+    if effective_scale <= 0.0:
+        raise ValueError(f"info_growth_scale_multiplier must keep scale positive, got {info_growth_scale_multiplier}")
+    info_growth_arr = compute_info_growth_hardness_numpy(residual_arr, disagreement_arr, scale=float(effective_scale))
+    if reference_time_grid is None:
+        reference_time_grid = np.linspace(0.0, 1.0, int(macro_steps) + 1, dtype=np.float64)
+    corr_signal = info_growth_arr[:, 1:].reshape(-1)
+    corr_oracle = oracle_arr[:, 1:].reshape(-1)
+    return {
+        "macro_steps": int(macro_steps),
+        "solver": str(solver_name),
+        "n_windows": int(info_growth_arr.shape[0]),
+        "calibration_trace_samples": int(trace_samples),
+        "reference_time_grid": [float(x) for x in reference_time_grid.tolist()],
+        "reference_time_alignment": "left_endpoint",
+        "base_info_growth_scale": float(base_scale),
+        "info_growth_scale": float(effective_scale),
+        "info_growth_scale_multiplier": float(info_growth_scale_multiplier),
+        "rows": trace_rows,
+        "disagreement_by_step": [float(x) for x in disagreement_arr.mean(axis=0).tolist()],
+        "residual_norm_by_step": [float(x) for x in residual_arr.mean(axis=0).tolist()],
+        "oracle_local_error_by_step": [float(x) for x in oracle_arr.mean(axis=0).tolist()],
+        NATIVE_INFO_GROWTH_TRACE_KEY: [float(x) for x in info_growth_arr.mean(axis=0).tolist()],
+        "signal_correlations_vs_oracle": {
+            NATIVE_INFO_GROWTH_TRACE_KEY: {"spearman": safe_spearman(corr_signal, corr_oracle)}
+        },
+    }
 
 
 @torch.no_grad()
@@ -1374,8 +1463,7 @@ def evaluate_forecast_schedule(
     logical_panel_seed = int(evaluation_seed if logical_seed is None else logical_seed)
     if return_context_embeddings and hasattr(model, "eval"):
         model.eval()
-    backup = _apply_sample_overrides(model, cfg, solver=str(solver_name), time_grid=tuple(float(x) for x in time_grid))
-    try:
+    with torch.inference_mode():
         selected_examples = (
             choose_forecast_example_indices(ds, 0, int(logical_panel_seed))
             if example_indices is None
@@ -1404,7 +1492,9 @@ def evaluate_forecast_schedule(
             separators=(",", ":"),
         )
         evaluation_protocol_hash = hashlib.sha256(encoded_protocol.encode("utf-8")).hexdigest()
-        chosen_examples_hash = hashlib.sha256(json.dumps(example_payload, separators=(",", ":")).encode("utf-8")).hexdigest()
+        chosen_examples_hash = hashlib.sha256(
+            json.dumps(example_payload, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         realized_nfe = int(macro_steps) * int(solver_eval_multiplier(str(solver_name)))
         resolved_target_nfe = int(realized_nfe if target_nfe is None else target_nfe)
         chunk_starts = list(range(0, len(example_list), effective_batch_size))
@@ -1468,33 +1558,35 @@ def evaluate_forecast_schedule(
                         for context_idx, context_id in enumerate(chunk_context_ids):
                             context_embedding_id = f"{checkpoint_id}:{context_id}"
                             context_embeddings[context_embedding_id] = [
-                                float(value) for value in chunk_context_embeddings[context_idx].astype(np.float32).tolist()
+                                float(value)
+                                for value in chunk_context_embeddings[context_idx].astype(np.float32).tolist()
                             ]
                 draws_by_example: List[List[np.ndarray]] = [[] for _ in chunk_indices]
                 for sample_idx in range(int(num_eval_samples)):
                     for row_idx, example_idx in enumerate(chunk_indices):
                         context_index = int(chunk_start) + int(row_idx)
-                        sample_seed = (
-                            int(evaluation_seed)
-                            + int(context_index)
-                            + 1_000_000 * int(sample_idx)
-                        )
+                        sample_seed = int(evaluation_seed) + int(context_index) + 1_000_000 * int(sample_idx)
                         seed_all(sample_seed)
                         if device.type == "cuda" and torch.cuda.is_available():
                             torch.cuda.synchronize(device)
                         start = time.perf_counter()
                         pred_norm = model.sample_future(
                             hist[row_idx : row_idx + 1],
-                            steps=int(macro_steps),
-                            solver=str(solver_name),
+                            solver_key=str(solver_name),
+                            target_nfe=int(resolved_target_nfe),
+                            time_grid=time_grid,
                         )
                         if device.type == "cuda" and torch.cuda.is_available():
                             torch.cuda.synchronize(device)
                         latencies.append(float(time.perf_counter() - start))
-                        pred_row = ds.denormalize_block(
-                            pred_norm.detach().cpu().numpy()[0],
-                            int(example_idx),
-                        ).reshape(-1).astype(np.float32)
+                        pred_row = (
+                            ds.denormalize_block(
+                                pred_norm.detach().cpu().numpy()[0],
+                                int(example_idx),
+                            )
+                            .reshape(-1)
+                            .astype(np.float32)
+                        )
                         draws_by_example[row_idx].append(pred_row)
                 samples_by_example = [np.stack(draws, axis=0) for draws in draws_by_example]
                 for row_idx, true_block_raw in enumerate(true_blocks):
@@ -1572,11 +1664,15 @@ def evaluate_forecast_schedule(
                                 "forecast_mase_scale_kind": "seasonal"
                                 if int(getattr(ds, "mase_seasonal_period", 1) or 1) > 1
                                 else "nonseasonal",
-                                "forecast_mase_scale_period": int(max(1, int(getattr(ds, "mase_seasonal_period", 1) or 1))),
+                                "forecast_mase_scale_period": int(
+                                    max(1, int(getattr(ds, "mase_seasonal_period", 1) or 1))
+                                ),
                                 "num_eval_samples": int(num_eval_samples),
                                 "eval_horizon": int(getattr(ds, "horizon", 1)),
                                 "batch_size": int(effective_batch_size),
-                                "sample_seed_start": int(sample_seed_values[0]) if sample_seed_values else int(context_evaluation_seed),
+                                "sample_seed_start": int(sample_seed_values[0])
+                                if sample_seed_values
+                                else int(context_evaluation_seed),
                                 "sample_seed_values_json": json.dumps(sample_seed_values, separators=(",", ":")),
                                 "chosen_examples_hash": str(chosen_examples_hash),
                                 "evaluation_protocol_hash": str(evaluation_protocol_hash),
@@ -1584,8 +1680,6 @@ def evaluate_forecast_schedule(
                             }
                         )
                 progress.update()
-    finally:
-        _restore_sample_overrides(model, cfg, backup)
     latency_arr = np.asarray(latencies, dtype=np.float64)
     mase_scale_period = int(max(1, int(getattr(ds, "mase_seasonal_period", 1) or 1)))
     mase_scale_kind = "seasonal" if mase_scale_period > 1 else "nonseasonal"

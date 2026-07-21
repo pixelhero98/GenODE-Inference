@@ -13,6 +13,7 @@ import torch
 
 from genode.data import molecule_xyz
 from genode.data import prepare_molecule_xyz as prepare_molecule_module
+from genode.data.otflow_paths import display_project_path
 from genode.evaluation import molecule_metrics
 from genode.models.config import OTFlowConfig
 from genode.models.otflow_train_val import generate_continuation
@@ -402,7 +403,6 @@ class MoleculeBackboneTests(unittest.TestCase):
                 val_max_batches=None,
                 seed=0,
                 grad_accum_steps=1,
-                solver="euler",
                 ema_decay=0.0,
                 use_swa=False,
                 use_minibatch_ot=False,
@@ -471,7 +471,10 @@ class MoleculeBackboneTests(unittest.TestCase):
             self.assertEqual(metadata["selection"]["selected_step"], 2)
             self.assertNotIn(str(root), json.dumps(metadata))
             self.assertEqual(sentinel_manifest.read_text(encoding="utf-8"), "sentinel")
-            self.assertEqual(Path(summary["manifest_path"]), Path("external/backbone_manifest.json"))
+            self.assertEqual(
+                summary["manifest_path"],
+                display_project_path(root / "outputs" / "backbone_manifest.json"),
+            )
             self.assertTrue((root / "outputs" / "backbone_manifest.json").exists())
 
     def test_molecule_evaluation_reuses_checkpoint_stats_and_resolves_default_processed_dir(self) -> None:
@@ -646,8 +649,8 @@ class MoleculeBackboneTests(unittest.TestCase):
                 return context_from_positions(history[-2], history[-1])
 
         class FakeModel:
-            def sample_future(self, hist_t, *, steps: int, solver: str):
-                del hist_t, steps, solver
+            def sample_future(self, hist_t, *, solver_key: str, target_nfe: int, time_grid):
+                del hist_t, solver_key, target_nfe, time_grid
                 return torch.full((1, 1, 6), 0.05, dtype=torch.float32)
 
         calls = []
@@ -870,9 +873,9 @@ class MoleculeBackboneTests(unittest.TestCase):
                 self.cfg = cfg
                 self.grids = []
 
-            def sample_future(self, hist_t, *, steps: int, solver: str):
-                del hist_t, steps, solver
-                self.grids.append(tuple(float(x) for x in self.cfg.sample.time_grid))
+            def sample_future(self, hist_t, *, solver_key: str, target_nfe: int, time_grid):
+                del hist_t, solver_key, target_nfe
+                self.grids.append(tuple(float(x) for x in time_grid))
                 return torch.full((1, 1, 6), 0.05, dtype=torch.float32)
 
         model = FakeModel(cfg)
@@ -899,7 +902,6 @@ class MoleculeBackboneTests(unittest.TestCase):
         )
 
         self.assertEqual(model.grids, [(0.0, 0.25, 1.0)])
-        self.assertEqual(tuple(cfg.sample.time_grid), ())
         self.assertEqual(result["per_context_rows"][0]["context_schema"], molecule_metrics.MOLECULE_CONTEXT_SCHEMA)
         self.assertAlmostEqual(float(result["molecule_kabsch_rmsd_3d"]), 0.0, places=6)
 

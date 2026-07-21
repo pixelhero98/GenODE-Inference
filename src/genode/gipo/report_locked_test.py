@@ -24,7 +24,7 @@ from genode.gipo.objectives import (
     teacher_objective_specs_for_scenario,
     uniform_anchored_objective_columns,
 )
-from genode.gipo.ablation_plan import PAPER_STUDENT_POLICY_KEY
+from genode.gipo.ablation_plan import GIPO_POLICY_KEY
 from genode.gipo.policy import (
     ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
     GIPO_PROTOCOL,
@@ -35,6 +35,7 @@ from genode.gipo.policy import (
     context_embedding_id_from_row,
     context_id_from_row,
     load_context_embedding_table,
+    normalize_gipo_checkpoint_payload,
     normalize_teacher_utility_weights,
     predict_gipo_density_many,
     read_metric_rows_csv,
@@ -53,7 +54,7 @@ from genode.gipo.models import setting_encoder_config_from_payload, setting_feat
 from genode.gipo.schema import reject_retired_evaluation_keys
 from genode.data.otflow_paths import (
     backbone_manifest_path,
-    project_paper_dataset_root,
+    project_dataset_root,
     resolve_project_path,
 )
 from genode.evaluation.otflow_evaluation_support import (
@@ -451,17 +452,23 @@ def _report_artifact_name(
 
 def _load_student_checkpoint(
     path: str | Path,
-) -> Tuple[Any, Dict[str, int], EmbeddingNormalizer, Tuple[float, ...], Dict[str, Any]]:
+) -> Tuple[Any, EmbeddingNormalizer, Tuple[float, ...], Dict[str, Any]]:
     checkpoint_path = resolve_project_path(str(path))
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(payload, Mapping):
         raise ValueError(f"GIPO student checkpoint {checkpoint_path} must contain a mapping payload.")
+    payload = normalize_gipo_checkpoint_payload(payload)
     if str(payload.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError(f"Unsupported GIPO student protocol {payload.get('protocol')!r}; expected {GIPO_PROTOCOL!r}.")
     if int(payload.get("model_payload_version", 0)) != MODEL_PAYLOAD_VERSION:
         raise ValueError(
             f"GIPO student checkpoint model_payload_version must be {MODEL_PAYLOAD_VERSION}; "
             f"got {payload.get('model_payload_version')!r}."
+        )
+    retired_checkpoint_keys = sorted(set(payload) & {"series_index_map", "series_conditioning"})
+    if retired_checkpoint_keys:
+        raise ValueError(
+            f"GIPO student checkpoint uses retired series-conditioning keys: {retired_checkpoint_keys}."
         )
     if str(payload.get("student_policy_type", "")) != "continuous_density":
         raise ValueError("GIPO locked reporter only accepts continuous_density student checkpoints.")
@@ -493,7 +500,6 @@ def _load_student_checkpoint(
             f"GIPO student checkpoint setting_dim={payload['setting_dim']} does not match "
             f"setting encoder dim {expected_setting_dim} for {setting_encoder_config.mode}."
         )
-    series_index_map = {str(key): int(value) for key, value in dict(payload["series_index_map"]).items()}
     normalizer = EmbeddingNormalizer.from_payload(payload["embedding_normalizer"])
     student_architecture = str(payload.get("student_architecture", ""))
     if student_architecture != ARCHITECTURE_DENSITY_QUERY_TRANSFORMER:
@@ -512,7 +518,6 @@ def _load_student_checkpoint(
         setting_dim=int(payload["setting_dim"]),
         density_dim=int(payload["density_dim"]),
         context_dim=int(payload["context_dim"]),
-        num_series=len(series_index_map),
         model_config=student_model_config,
     )
     student.load_state_dict(payload["student_state"])
@@ -521,7 +526,7 @@ def _load_student_checkpoint(
     payload["setting_encoder_config"] = setting_encoder_config.to_payload()
     payload["student_architecture"] = student_architecture
     payload["student_model_config"] = student.model_config()
-    return student, series_index_map, normalizer, reference_time_grid, payload
+    return student, normalizer, reference_time_grid, payload
 
 
 def _teacher_final_retrain_metadata(
@@ -960,10 +965,14 @@ def _attach_uniform_rewards_to_gipo_row(
 
 
 def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
-    student, series_index_map, normalizer, reference_time_grid, checkpoint_payload = _load_student_checkpoint(
+    student, normalizer, reference_time_grid, checkpoint_payload = _load_student_checkpoint(
         str(args.gipo_student_checkpoint),
     )
-    training_summary = json.loads(resolve_project_path(str(args.training_summary)).read_text(encoding="utf-8"))
+    training_summary = json.loads(
+        resolve_project_path(str(args.training_summary)).read_text(encoding="utf-8")
+    )
+    if "model_payload_version" in training_summary:
+        training_summary = normalize_gipo_checkpoint_payload(training_summary)
     if str(training_summary.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError("training_summary protocol does not match continuous-density GIPO.")
     if bool(training_summary.get("locked_test_used_for_selection", False)):
@@ -1099,7 +1108,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         split_phase == LOCKED_TEST_PHASE
         and selection_mode == SELECTION_MODE_REPORTING
         and (
-            student_policy_key == PAPER_STUDENT_POLICY_KEY
+            student_policy_key == GIPO_POLICY_KEY
             or not bool(getattr(args, "allow_incomplete_comparison", False))
         )
     )
@@ -1180,7 +1189,6 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         student,
         rows=representatives,
         context_embeddings=embeddings,
-        series_index_map=series_index_map,
         reference_time_grid=reference_time_grid,
         mode=mode,
         setting_encoder_config=checkpoint_payload.get("setting_encoder_config"),
@@ -1483,7 +1491,10 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "student_training_mode": training_summary.get("student_training_mode", checkpoint_payload.get("student_training_mode", "")),
         "student_objective_settings": training_summary.get("student_objective_settings", checkpoint_payload.get("student_objective_settings", {})),
         "student_target_summary": training_summary.get("student_target_summary", checkpoint_payload.get("student_target_summary", {})),
-        "student_pseudo_distillation": training_summary.get("student_pseudo_distillation", checkpoint_payload.get("student_pseudo_distillation", {})),
+        "student_unseen_target_distillation": training_summary.get(
+            "student_unseen_target_distillation",
+            checkpoint_payload.get("student_unseen_target_distillation", {}),
+        ),
         "teacher_checkpoint_selection_mode": checkpoint_payload.get("teacher_checkpoint_selection_mode", training_summary.get("teacher_checkpoint_selection_mode", "")),
         "teacher_final_retrain": teacher_final_retrain,
         "locked_test_used_for_selection": False,
@@ -1510,11 +1521,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow_incomplete_comparison",
         action="store_true",
-        help="Allow a partial baseline/SER matrix for exploratory reports. Paper locked-test reports require completeness.",
+        help="Allow a partial baseline/SER matrix for exploratory reports. Reference locked-test reports require completeness.",
     )
     parser.add_argument("--benchmark_family", default="")
     parser.add_argument("--scenario_key", default="", help="Scenario key. Defaults to the single scenario inferred from --context_rows.")
-    parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
+    parser.add_argument("--dataset_root", default=str(project_dataset_root()))
     parser.add_argument("--shared_backbone_root", default=str(DEFAULT_SHARED_BACKBONE_ROOT))
     parser.add_argument("--backbone_manifest", default=str(backbone_manifest_path()))
     parser.add_argument("--molecule_group_root", default=str(molecule_group_root()))

@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from genode.experiment_layout import (
-    PAPER_CHECKPOINT_STEPS,
+    REFERENCE_CHECKPOINT_STEPS,
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
     EXPERIMENT_LAYOUT_ID,
     LOCKED_TEST_PREVIEW_CONTEXTS,
@@ -100,12 +100,12 @@ from genode.solver_protocol import (
 from genode.data.otflow_experiment_plan import (
     CONDITIONAL_GENERATION_FAMILY,
     FORECAST_FAMILY,
-    PAPER_CONDITIONAL_GENERATION_DATASETS,
-    PAPER_FORECAST_DATASETS,
+    REFERENCE_CONDITIONAL_GENERATION_DATASETS,
+    REFERENCE_FORECAST_DATASETS,
 )
 from genode.data.otflow_monash_datasets import monash_manifest_path
-from genode.schedule_transfer.otflow_paper_registry import METHOD_KEY
-from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
+from genode.schedule_transfer.otflow_reference_registry import METHOD_KEY
+from genode.schedule_transfer.otflow_reference_tables import augment_rows_with_relative_metrics
 from genode.data.otflow_paths import (
     display_project_path,
     backbone_manifest_path,
@@ -113,7 +113,7 @@ from genode.data.otflow_paths import (
     lobster_synthetic_profile_path,
     long_term_st_data_path,
     project_outputs_root,
-    project_paper_dataset_root,
+    project_dataset_root,
     resolve_project_path,
 )
 from genode.provenance import fingerprint_identity, path_fingerprint
@@ -131,7 +131,7 @@ from genode.gipo.schema import (
 RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen_phase_context"
 CONTEXT_REWARD_PROTOCOL_VERSION = "conditional_primary_metric_context_rewards"
 SCHEDULE_OUTPUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
-PAPER_EVALUATION_SEEDS: Tuple[int, ...] = (0, 1, 2)
+REFERENCE_EVALUATION_SEEDS: Tuple[int, ...] = (0, 1, 2)
 CONTEXT_EMBEDDING_EXPORT_MAX_BATCH_SIZE = 64
 CONTEXT_EMBEDDING_EXPORT_FALLBACK_BATCH_SIZE = 2
 CONTEXT_RECORD_FLUSH_WINDOW_COUNT = 16_384
@@ -183,7 +183,7 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "signal_validation_spearman",
     "info_growth_scale",
     "reference_macro_factor",
-    "paper_duplicate_count",
+    "source_duplicate_count",
     "experiment_scope",
     "selection_metric",
     "selection_metric_value",
@@ -584,7 +584,7 @@ def _load_schedule_summary_cases(path_text: str) -> List[Dict[str, Any]]:
                     "reference_time_alignment": str(
                         item.get("reference_time_alignment", schedule.get("reference_time_alignment", "summary_density_time_grid"))
                     ),
-                    "paper_duplicate_count": int(item.get("paper_duplicate_count", 0) or 0),
+                    "source_duplicate_count": int(item.get("source_duplicate_count", 0) or 0),
                     "reference_macro_steps": int(item.get("reference_macro_steps", nfe.macro_steps) or nfe.macro_steps),
                     "schedule_summary_path": _logical_artifact_path(path),
                 }
@@ -611,7 +611,7 @@ def _target_nfe_values_for_args(cli_args: argparse.Namespace) -> List[int]:
     unknown = [int(value) for value in values if int(value) not in set(expected)]
     if unknown:
         raise ValueError(
-            f"target_nfe_values {unknown} are outside the paper protocol for nfe_role={role!r}; "
+            f"target_nfe_values {unknown} are outside the reference protocol for nfe_role={role!r}; "
             f"allowed values are {list(expected)}."
         )
     if not values:
@@ -621,12 +621,12 @@ def _target_nfe_values_for_args(cli_args: argparse.Namespace) -> List[int]:
 
 def _checkpoint_steps_for_args(cli_args: argparse.Namespace) -> List[int]:
     raw = str(getattr(cli_args, "checkpoint_steps", "") or "").strip()
-    values = parse_int_csv(raw) if raw else list(PAPER_CHECKPOINT_STEPS)
-    allowed = set(int(value) for value in PAPER_CHECKPOINT_STEPS)
+    values = parse_int_csv(raw) if raw else list(REFERENCE_CHECKPOINT_STEPS)
+    allowed = set(int(value) for value in REFERENCE_CHECKPOINT_STEPS)
     unknown = [int(value) for value in values if int(value) not in allowed]
     if unknown:
         raise ValueError(
-            f"checkpoint_steps {unknown} are outside the paper protocol; allowed values are {list(PAPER_CHECKPOINT_STEPS)}."
+            f"checkpoint_steps {unknown} are outside the reference protocol; allowed values are {list(REFERENCE_CHECKPOINT_STEPS)}."
         )
     if not values:
         raise ValueError("At least one checkpoint step is required.")
@@ -638,9 +638,9 @@ def _checkpoint_maturity_label(step: int) -> str:
 
 
 def _checkpoint_maturity_index(step: int) -> int:
-    steps = tuple(int(value) for value in PAPER_CHECKPOINT_STEPS)
+    steps = tuple(int(value) for value in REFERENCE_CHECKPOINT_STEPS)
     if int(step) not in steps:
-        raise ValueError(f"Unknown paper checkpoint step: {step}")
+        raise ValueError(f"Unknown reference checkpoint step: {step}")
     return int(steps.index(int(step)))
 
 
@@ -2316,7 +2316,7 @@ def _fixed_schedule_details(scheduler_key: str, macro_steps: int) -> Dict[str, A
         "time_grid": [float(x) for x in fixed_grid],
         "schedule_grid_hash": str(grid_hash),
         "reference_time_alignment": schedule_time_alignment(str(scheduler_key)),
-        "paper_duplicate_count": 0,
+        "source_duplicate_count": 0,
         "reference_macro_steps": int(macro_steps),
     }
     details.update(fixed_schedule_shape_statistics(fixed_grid))
@@ -2331,7 +2331,7 @@ def _schedule_details_from_case(case: Mapping[str, Any], macro_steps: int) -> Di
         "time_grid": [float(x) for x in grid],
         "schedule_grid_hash": str(case.get("schedule_grid_hash") or schedule_grid_hash(grid)),
         "reference_time_alignment": str(case.get("reference_time_alignment", "summary_density_time_grid")),
-        "paper_duplicate_count": int(case.get("paper_duplicate_count", 0) or 0),
+        "source_duplicate_count": int(case.get("source_duplicate_count", 0) or 0),
         "macro_steps": int(case.get("macro_steps", macro_steps) or macro_steps),
         "realized_nfe": int(case.get("realized_nfe", _realized_nfe_for_solver(str(case.get("solver_key", "euler")), int(macro_steps)))),
         "reference_macro_steps": int(case.get("reference_macro_steps", macro_steps) or macro_steps),
@@ -2410,7 +2410,7 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "signal_validation_spearman": None,
         "info_growth_scale": None,
         "reference_macro_factor": None,
-        "paper_duplicate_count": int(details.get("paper_duplicate_count", 0) or 0),
+        "source_duplicate_count": int(details.get("source_duplicate_count", 0) or 0),
         "experiment_scope": solver_experiment_scope(str(solver_key)),
         "selection_metric": str(selection_metric),
         "selection_metric_value": metrics.get(selection_metric),
@@ -2880,13 +2880,10 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
             splits = checkpoint["splits"]
             if str(split_phase) == TRAIN_TUNING_PHASE:
                 eval_ds = splits["train"]
-                split_key = "train"
             elif str(split_phase) == VALIDATION_PHASE:
                 eval_ds = splits["val"]
-                split_key = "val"
             else:
                 eval_ds = splits["test"]
-                split_key = "test"
             eval_horizon = resolved_eval_horizon(step_args, str(dataset))
             selected_examples_cap, selected_examples_cap_source = _split_example_cap(cli_args, str(split_phase))
             available_windows = int(len(getattr(eval_ds, "start_indices", [])))
@@ -3353,10 +3350,6 @@ def _run_molecule_phase(
                             scheduler_cases=list(scheduler_cases_by_dataset[str(dataset)]),
                         )
                         rows.extend(existing_rows)
-                        uniform_row: Optional[Mapping[str, Any]] = next(
-                            (row for row in existing_rows if str(row.get("scheduler_key")) == UNIFORM_SCHEDULER_KEY),
-                            None,
-                        )
                         uniform_context_by_id: Dict[str, Mapping[str, Any]] = _existing_uniform_context_rows(
                             row_recorder,
                             dataset=str(dataset),
@@ -3456,7 +3449,6 @@ def _run_molecule_phase(
                                 )
                             _append_row_record(row_recorder, row)
                             if scheduler_key == UNIFORM_SCHEDULER_KEY:
-                                uniform_row = row
                                 uniform_context_by_id = {
                                     str(ctx["context_id"]): dict(ctx, scheduler_key=UNIFORM_SCHEDULER_KEY)
                                     for ctx in list(metrics.get("per_context_rows", []) or [])
@@ -3700,15 +3692,15 @@ def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Run diffusion-flow time reparameterization fixed-schedule evaluations.")
     ap.add_argument("--out_root", type=str, default=str(SCHEDULE_OUTPUT_ROOT))
-    ap.add_argument("--dataset_root", type=str, default=str(project_paper_dataset_root()))
+    ap.add_argument("--dataset_root", type=str, default=str(project_dataset_root()))
     ap.add_argument("--shared_backbone_root", type=str, default=str(DEFAULT_SHARED_BACKBONE_ROOT))
     ap.add_argument("--backbone_manifest", type=str, default=str(backbone_manifest_path()))
-    ap.add_argument("--checkpoint_steps", type=str, default=",".join(str(x) for x in PAPER_CHECKPOINT_STEPS))
-    ap.add_argument("--forecast_datasets", type=str, default=",".join(PAPER_FORECAST_DATASETS))
+    ap.add_argument("--checkpoint_steps", type=str, default=",".join(str(x) for x in REFERENCE_CHECKPOINT_STEPS))
+    ap.add_argument("--forecast_datasets", type=str, default=",".join(REFERENCE_FORECAST_DATASETS))
     ap.add_argument(
         "--conditional_generation_datasets",
         type=str,
-        default=",".join(PAPER_CONDITIONAL_GENERATION_DATASETS),
+        default=",".join(REFERENCE_CONDITIONAL_GENERATION_DATASETS),
     )
     ap.add_argument("--molecule_datasets", type=str, default="")
     ap.add_argument("--molecule_group_root", type=str, default=str(molecule_group_root()))
@@ -3721,7 +3713,7 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--baseline_scheduler_names", type=str, default=",".join(BASELINE_SCHEDULE_KEYS))
     ap.add_argument("--schedule_summary_json", type=str, default="")
     ap.add_argument("--summary_scheduler_names", type=str, default="")
-    ap.add_argument("--seeds", type=str, default=",".join(str(x) for x in PAPER_EVALUATION_SEEDS))
+    ap.add_argument("--seeds", type=str, default=",".join(str(x) for x in REFERENCE_EVALUATION_SEEDS))
     ap.add_argument("--split_phase", type=str, choices=SUPPORTED_SPLIT_PHASES, default=LOCKED_TEST_PHASE)
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--dataset_seed", type=int, default=0)

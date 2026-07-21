@@ -16,7 +16,7 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
     schedule_time_alignment,
 )
 from genode.schedule_transfer.otflow_schedule_diagnostics import _collect_rollout_diagnostics
-from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
+from genode.schedule_transfer.otflow_reference_tables import augment_rows_with_relative_metrics
 
 
 class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):

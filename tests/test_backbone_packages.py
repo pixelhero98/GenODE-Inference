@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -23,10 +24,11 @@ from genode.backbone_packages import (
     validate_provided_backbone_manifest,
 )
 from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
-from genode.experiment_layout import PAPER_CHECKPOINT_STEPS, SCENARIO_FAMILY_MOLECULE
+from genode.data.otflow_paths import display_project_path
+from genode.experiment_layout import REFERENCE_CHECKPOINT_STEPS, SCENARIO_FAMILY_MOLECULE
 
 MOLECULE_FAMILY = SCENARIO_FAMILY_MOLECULE
-TRAIN_BUDGET_STEPS = PAPER_CHECKPOINT_STEPS
+TRAIN_BUDGET_STEPS = REFERENCE_CHECKPOINT_STEPS
 
 
 def _write(path: Path, content: bytes | str = b"x") -> None:
@@ -106,7 +108,7 @@ class BackbonePackageTests(unittest.TestCase):
                         "seed": 0,
                     }
                 )
-            _write(root / f"paper_datasets/monash/{scenario}/manifest.json", "{}")
+            _write(root / f"datasets/monash/{scenario}/manifest.json", "{}")
         for scenario in ("cryptos", "lobster_synthetic", "long_term_st"):
             for train_steps in TRAIN_BUDGET_STEPS:
                 label = f"{int(train_steps) // 1000}k"
@@ -172,7 +174,7 @@ class BackbonePackageTests(unittest.TestCase):
                 )
 
             package_root = output_dir / "genode_temporal_extrapolation_backbones_datasets"
-            self.assertEqual(summary["package_root"], f"external/{package_root.name}")
+            self.assertEqual(summary["package_root"], display_project_path(package_root))
             with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
                 validation = validate_backbone_package(package_root, expected_family="temporal-extrapolation")
             self.assertEqual(validation["status"], "complete", validation.get("errors"))
@@ -182,6 +184,29 @@ class BackbonePackageTests(unittest.TestCase):
             self.assertEqual(raw_manifest["path_base"], "manifest_parent")
             loaded = load_portable_backbone_manifest(package_root / PACKAGED_BACKBONE_MANIFEST)
             self.assertTrue(Path(loaded["artifacts"][0]["checkpoint_path"]).exists())
+
+    def test_package_family_writes_zip_and_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_root = Path(tmpdir) / "source"
+            output_dir = Path(tmpdir) / "packages"
+            self._source_tree(source_root)
+
+            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
+                summary = package_backbone_family(
+                    family="temporal-extrapolation",
+                    source_root=source_root,
+                    output_dir=output_dir,
+                    overwrite=True,
+                    make_zip=True,
+                )
+
+            zip_path = output_dir / "genode_temporal_extrapolation_backbones_datasets.zip"
+            attestation_path = zip_path.with_suffix(".zip.manifest.json")
+            self.assertTrue(zip_path.is_file())
+            self.assertTrue(attestation_path.is_file())
+            self.assertEqual(summary["manifest"]["zip_name"], zip_path.name)
+            with zipfile.ZipFile(zip_path) as archive:
+                self.assertIn(PACKAGED_BACKBONE_MANIFEST, archive.namelist())
 
     def test_package_overwrite_allows_only_intended_in_output_stage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -211,7 +236,7 @@ class BackbonePackageTests(unittest.TestCase):
                     make_zip=False,
                 )
 
-            self.assertEqual(second["package_root"], f"external/{package_root.name}")
+            self.assertEqual(second["package_root"], display_project_path(package_root))
             self.assertFalse(stale_file.exists())
             self.assertTrue((package_root / PACKAGED_BACKBONE_MANIFEST).exists())
 
@@ -247,7 +272,7 @@ class BackbonePackageTests(unittest.TestCase):
                     make_zip=False,
                 )
             package_root = output_dir / "genode_temporal_extrapolation_backbones_datasets"
-            linked_file = package_root / "paper_datasets/monash/solar_energy_10m/manifest.json"
+            linked_file = package_root / "datasets/monash/solar_energy_10m/manifest.json"
             external_file = root / "external_manifest.json"
             external_file.write_bytes(linked_file.read_bytes())
             linked_file.unlink()
@@ -320,9 +345,9 @@ class BackbonePackageTests(unittest.TestCase):
                 "scenarios": ["solar_energy_10m", "traffic_hourly", "weather_daily"],
                 "expected_artifact_count": 15,
                 "data_roots": [
-                    "paper_datasets/monash/solar_energy_10m",
-                    "paper_datasets/monash/traffic_hourly",
-                    "paper_datasets/monash/weather_daily",
+                    "datasets/monash/solar_energy_10m",
+                    "datasets/monash/traffic_hourly",
+                    "datasets/monash/weather_daily",
                 ],
                 "files": [],
                 "artifact_count": 0,

@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 
 import genode.evaluation.diffusion_flow_time_reparameterization as runner
-from genode.experiment_layout import PAPER_SEEN_NFES
+from genode.experiment_layout import REFERENCE_SEEN_NFES
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
     EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
@@ -21,26 +21,26 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
     build_schedule_grid,
 )
 from genode.evaluation.fm_backbone_registry import materialize_backbone_manifest
-from genode.schedule_transfer.otflow_paper_registry import (
+from genode.schedule_transfer.otflow_reference_registry import (
     MAIN_NFE_VALUES,
     METHOD_KEY,
-    paper_registry_snapshot,
-    paper_schedule_specs,
-    paper_solver_specs,
+    reference_registry_snapshot,
+    reference_schedule_specs,
+    reference_solver_specs,
 )
 from genode.schedule_transfer.otflow_signal_traces import NATIVE_INFO_GROWTH_TRACE_KEY, NATIVE_SIGNAL_TRACE_KEYS
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-class DiffusionFlowPaperPrepTests(unittest.TestCase):
+class DiffusionFlowReferencePrepTests(unittest.TestCase):
     def test_registry_exposes_diffusion_flow_method_not_tvd(self) -> None:
-        snapshot = paper_registry_snapshot()
+        snapshot = reference_registry_snapshot()
         self.assertEqual(METHOD_KEY, "diffusion_flow_time_reparameterization")
         self.assertEqual(snapshot["method_key"], "diffusion_flow_time_reparameterization")
-        self.assertNotIn("tvd", {spec.key for spec in paper_schedule_specs()})
-        self.assertIn("flowts_power_sampling", {spec.key for spec in paper_schedule_specs()})
-        self.assertNotIn("atss", {spec.key for spec in paper_schedule_specs()})
+        self.assertNotIn("tvd", {spec.key for spec in reference_schedule_specs()})
+        self.assertIn("flowts_power_sampling", {spec.key for spec in reference_schedule_specs()})
+        self.assertNotIn("atss", {spec.key for spec in reference_schedule_specs()})
 
     def test_schedule_sets_are_exact(self) -> None:
         self.assertEqual(BASELINE_SCHEDULE_KEYS, ("uniform", "late_power_3", "flowts_power_sampling", "ays", "gits", "ots"))
@@ -49,13 +49,13 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertEqual(EXPERIMENTAL_FIXED_SCHEDULE_KEYS[: len(BASELINE_SCHEDULE_KEYS)], BASELINE_SCHEDULE_KEYS)
 
     def test_registry_exposes_active_baseline_matrix(self) -> None:
-        snapshot = paper_registry_snapshot()
+        snapshot = reference_registry_snapshot()
         self.assertEqual(MAIN_NFE_VALUES, (4, 8, 12, 16))
         self.assertEqual(snapshot["main_nfe_values"], [4, 8, 12, 16])
-        self.assertEqual(PAPER_SEEN_NFES, (4, 8, 12, 16))
+        self.assertEqual(REFERENCE_SEEN_NFES, (4, 8, 12, 16))
         self.assertEqual(snapshot["baseline_scheduler_keys"], ["uniform", "late_power_3", "flowts_power_sampling", "ays", "gits", "ots"])
 
-        solver_names = {spec.display_name for spec in paper_solver_specs()}
+        solver_names = {spec.display_name for spec in reference_solver_specs()}
         self.assertIn("Euler", solver_names)
         self.assertIn("Heun / RK2", solver_names)
         self.assertIn("Midpoint RK2", solver_names)

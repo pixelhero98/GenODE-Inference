@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from genode.experiment_layout import (
     AVERAGED_SCHEDULE_COMPONENTS,
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
-    PAPER_SUPERVISION_SCHEDULE_KEYS,
+    REFERENCE_SUPERVISION_SCHEDULE_KEYS,
     REVERSED_SCHEDULE_BASE,
 )
 from genode.gipo.density_representation import (
@@ -87,13 +87,14 @@ DEFAULT_STUDENT_TARGET_ELITE_FRACTION = 0.30
 DEFAULT_STUDENT_TARGET_ELITE_K = 0
 DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT = 2
 DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT = 0.20
-PAPER_STUDENT_TEACHER_SCORE_WEIGHT = 0.01
+REFERENCE_STUDENT_TEACHER_SCORE_WEIGHT = 0.01
 DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION = 0.60
 DEFAULT_STUDENT_TEACHER_SCORE_CLIP = 5.0
 DEFAULT_GIPO_TEACHER_GROUP_BATCH_SIZE = 64
 DEFAULT_GIPO_TEACHER_SCORE_BATCH_SIZE = 2048
 DEFAULT_GIPO_STUDENT_BATCH_SIZE = 512
-MODEL_PAYLOAD_VERSION = 6
+MODEL_PAYLOAD_VERSION = 7
+COMPATIBLE_GIPO_MODEL_PAYLOAD_VERSIONS = (6, MODEL_PAYLOAD_VERSION)
 ARCHITECTURE_DENSITY_FORM_TRANSFORMER = "density_form_transformer"
 ARCHITECTURE_DENSITY_QUERY_TRANSFORMER = "density_query_transformer"
 CONDITIONING_STYLE_ADDITIVE_MLP = "additive_mlp"
@@ -119,11 +120,276 @@ DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS: Tuple[str, ...] = (
     "flowts_power_sampling_avg_reversed",
 )
 DEFAULT_TRANSFORMER_HIDDEN_DIM = 64
-DEFAULT_TRANSFORMER_LAYERS = 2
+DEFAULT_TRANSFORMER_NUM_LAYERS = 2
 DEFAULT_TRANSFORMER_HEADS = 4
 DEFAULT_TRANSFORMER_DROPOUT = 0.05
-SERIES_CONDITIONING_NONE_CONTEXT_ONLY = "none_context_only"
-SERIES_CONDITIONING_DIM = 0
+
+
+def normalize_gipo_checkpoint_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize the immediately preceding checkpoint schema without weakening validation."""
+
+    normalized = dict(payload)
+
+    def rename_key(
+        mapping: Dict[str, Any],
+        old: str,
+        new: str,
+        *,
+        path: str,
+    ) -> None:
+        if old in mapping and new in mapping:
+            raise ValueError(
+                f"GIPO v6 metadata {path} contains both {old!r} and {new!r}."
+            )
+        if old in mapping:
+            mapping[new] = mapping.pop(old)
+
+    def child_mapping(
+        mapping: Dict[str, Any],
+        key: str,
+        *,
+        path: str,
+    ) -> Dict[str, Any] | None:
+        if key not in mapping:
+            return None
+        value = mapping[key]
+        if not isinstance(value, Mapping):
+            raise ValueError(f"GIPO v6 metadata {path}.{key} must be an object.")
+        child = dict(value)
+        mapping[key] = child
+        return child
+
+    def drop_series_conditioning(mapping: Dict[str, Any], *, path: str) -> None:
+        if "series_conditioning" not in mapping:
+            return
+        value = mapping.pop("series_conditioning")
+        if str(value) != "none_context_only":
+            raise ValueError(
+                f"GIPO v6 metadata {path}.series_conditioning is unsupported."
+            )
+
+    try:
+        version = int(normalized.get("model_payload_version", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("GIPO model_payload_version must be an integer.") from exc
+    if version == MODEL_PAYLOAD_VERSION:
+        return normalized
+    if version != 6:
+        raise ValueError(
+            f"Unsupported GIPO model_payload_version {version!r}; expected one of "
+            f"{COMPATIBLE_GIPO_MODEL_PAYLOAD_VERSIONS}."
+        )
+    raw_config = normalized.get("student_model_config")
+    if not isinstance(raw_config, Mapping):
+        raise ValueError("GIPO v6 checkpoint is missing student_model_config.")
+    model_config = dict(raw_config)
+    if "num_layers" in model_config:
+        raise ValueError("GIPO v6 student_model_config may not already contain num_layers.")
+    layer_keys = [key for key in ("hidden_layers", "transformer_layers") if key in model_config]
+    if len(layer_keys) != 1:
+        raise ValueError(
+            "GIPO v6 student_model_config must contain exactly one retired layer-count field."
+        )
+    raw_num_layers = model_config.pop(layer_keys[0])
+    if isinstance(raw_num_layers, bool) or not isinstance(raw_num_layers, (int, np.integer)):
+        raise ValueError("GIPO v6 layer count must be an integer.")
+    num_layers = int(raw_num_layers)
+    if num_layers <= 0:
+        raise ValueError("GIPO v6 layer count must be positive.")
+    if int(model_config.pop("num_series", 0)) != 0:
+        raise ValueError("GIPO v6 checkpoint has nonzero retired series-conditioning state.")
+    if int(model_config.pop("series_feature_dim", 0)) != 0:
+        raise ValueError("GIPO v6 checkpoint has nonzero retired series feature width.")
+    if str(model_config.pop("series_conditioning", "none_context_only")) != "none_context_only":
+        raise ValueError("GIPO v6 checkpoint uses unsupported series conditioning.")
+    top_level_conditioning = normalized.pop("series_conditioning", "none_context_only")
+    if str(top_level_conditioning) != "none_context_only":
+        raise ValueError("GIPO v6 checkpoint uses unsupported top-level series conditioning.")
+    series_index_map = normalized.pop("series_index_map", {})
+    if not isinstance(series_index_map, Mapping):
+        raise ValueError("GIPO v6 series_index_map must be an object when present.")
+    model_config["num_layers"] = num_layers
+    normalized["student_model_config"] = model_config
+
+    rename_key(
+        normalized,
+        "pseudo_target_nfe_values",
+        "unseen_target_nfe_values",
+        path="root",
+    )
+    rename_key(
+        normalized,
+        "student_pseudo_distillation",
+        "student_unseen_target_distillation",
+        path="root",
+    )
+    rename_key(
+        normalized,
+        "student_teacher_score_include_pseudo",
+        "student_teacher_score_include_unseen_targets",
+        path="root",
+    )
+    if normalized.get("student_training_mode") == "seen_plus_unseen_pseudo":
+        normalized["student_training_mode"] = "seen_plus_unseen_target"
+
+    objective_settings = child_mapping(
+        normalized,
+        "student_objective_settings",
+        path="root",
+    )
+    if objective_settings is not None:
+        rename_key(
+            objective_settings,
+            "student_teacher_score_include_pseudo",
+            "student_teacher_score_include_unseen_targets",
+            path="student_objective_settings",
+        )
+        drop_series_conditioning(objective_settings, path="student_objective_settings")
+
+    unseen_distillation = child_mapping(
+        normalized,
+        "student_unseen_target_distillation",
+        path="root",
+    )
+    if unseen_distillation is not None:
+        for old, new in (
+            ("pseudo_target_weight", "unseen_target_weight"),
+            (
+                "student_teacher_score_include_pseudo",
+                "student_teacher_score_include_unseen_targets",
+            ),
+            ("locked_test_used_for_pseudo", "locked_test_used_for_unseen_targets"),
+        ):
+            rename_key(
+                unseen_distillation,
+                old,
+                new,
+                path="student_unseen_target_distillation",
+            )
+        drop_series_conditioning(
+            unseen_distillation,
+            path="student_unseen_target_distillation",
+        )
+
+    nfe_diagnostics = child_mapping(
+        normalized,
+        "nfe_sequence_diagnostics",
+        path="root",
+    )
+    if nfe_diagnostics is not None:
+        rename_key(
+            nfe_diagnostics,
+            "student_pseudo_rows",
+            "student_unseen_target_rows",
+            path="nfe_sequence_diagnostics",
+        )
+
+    student_training = child_mapping(normalized, "student_training", path="root")
+    if student_training is not None:
+        for old, new in (
+            ("student_pseudo_target_summary", "student_unseen_target_summary"),
+            ("pseudo_distillation_used", "unseen_target_distillation_used"),
+            ("pseudo_target_weight", "unseen_target_weight"),
+            (
+                "student_teacher_score_include_pseudo",
+                "student_teacher_score_include_unseen_targets",
+            ),
+        ):
+            rename_key(student_training, old, new, path="student_training")
+        drop_series_conditioning(student_training, path="student_training")
+
+        unseen_summary = child_mapping(
+            student_training,
+            "student_unseen_target_summary",
+            path="student_training",
+        )
+        if unseen_summary is not None:
+            for old, new in (
+                ("pseudo_distillation_used", "unseen_target_distillation_used"),
+                ("pseudo_target_weight", "unseen_target_weight"),
+                ("pseudo_context_setting_count", "unseen_context_setting_count"),
+                ("pseudo_target_nfes", "unseen_target_nfes"),
+                ("pseudo_split_phases", "unseen_split_phases"),
+            ):
+                rename_key(
+                    unseen_summary,
+                    old,
+                    new,
+                    path="student_training.student_unseen_target_summary",
+                )
+            drop_series_conditioning(
+                unseen_summary,
+                path="student_training.student_unseen_target_summary",
+            )
+
+        for summary_key in (
+            "student_target_summary",
+            "student_validation_target_summary",
+        ):
+            summary = child_mapping(
+                student_training,
+                summary_key,
+                path="student_training",
+            )
+            if summary is not None:
+                drop_series_conditioning(
+                    summary,
+                    path=f"student_training.{summary_key}",
+                )
+
+        optimizer = child_mapping(
+            student_training,
+            "student_optimizer",
+            path="student_training",
+        )
+        if optimizer is not None:
+            rename_key(
+                optimizer,
+                "student_teacher_score_include_pseudo",
+                "student_teacher_score_include_unseen_targets",
+                path="student_training.student_optimizer",
+            )
+
+        if "losses" in student_training:
+            losses = student_training["losses"]
+            if not isinstance(losses, Sequence) or isinstance(losses, (str, bytes)):
+                raise ValueError("GIPO v6 metadata student_training.losses must be a list.")
+            migrated_losses: list[Dict[str, Any]] = []
+            for index, item in enumerate(losses):
+                if not isinstance(item, Mapping):
+                    raise ValueError(
+                        f"GIPO v6 metadata student_training.losses[{index}] must be an object."
+                    )
+                migrated = dict(item)
+                for old, new in (
+                    ("student_pseudo_kl_ce_loss", "student_unseen_target_kl_ce_loss"),
+                    ("student_pseudo_weighted_loss", "student_unseen_target_weighted_loss"),
+                    (
+                        "student_pseudo_teacher_score_z_mean",
+                        "student_unseen_target_teacher_score_z_mean",
+                    ),
+                    (
+                        "student_pseudo_teacher_score_mean",
+                        "student_unseen_target_teacher_score_mean",
+                    ),
+                ):
+                    rename_key(
+                        migrated,
+                        old,
+                        new,
+                        path=f"student_training.losses[{index}]",
+                    )
+                migrated_losses.append(migrated)
+            student_training["losses"] = migrated_losses
+
+    for metadata_key in ("teacher_training", "student_target_summary"):
+        metadata = child_mapping(normalized, metadata_key, path="root")
+        if metadata is not None:
+            drop_series_conditioning(metadata, path=metadata_key)
+
+    normalized["model_payload_version"] = MODEL_PAYLOAD_VERSION
+    normalized["source_model_payload_version"] = version
+    return normalized
 
 
 def validate_gipo_architecture(value: str, *, role: str | None = None) -> str:
@@ -243,16 +509,6 @@ def validate_gipo_attention_heads(attention_heads: int) -> int:
     if heads != DEFAULT_TRANSFORMER_HEADS:
         raise ValueError(f"GIPO density transformers require attention_heads={DEFAULT_TRANSFORMER_HEADS}; got {heads}.")
     return heads
-
-
-def validate_series_conditioning(value: str | None = None) -> str:
-    conditioning = str(value or SERIES_CONDITIONING_NONE_CONTEXT_ONLY).strip()
-    if conditioning != SERIES_CONDITIONING_NONE_CONTEXT_ONLY:
-        raise ValueError(
-            f"GIPO density transformers require series_conditioning={SERIES_CONDITIONING_NONE_CONTEXT_ONLY!r}; "
-            f"got {conditioning!r}."
-        )
-    return conditioning
 
 
 def _normalized_metric_weights(crps_weight: float, mase_weight: float) -> Tuple[float, float]:
@@ -987,7 +1243,7 @@ def nfe_sequence_diagnostic_summary(rows: Sequence[MetricRow]) -> Dict[str, Any]
 def validate_gipo_support_schedule_keys(
     support_schedule_keys: Sequence[str],
     *,
-    allowed_schedule_keys: Sequence[str] = PAPER_SUPERVISION_SCHEDULE_KEYS,
+    allowed_schedule_keys: Sequence[str] = REFERENCE_SUPERVISION_SCHEDULE_KEYS,
 ) -> Tuple[str, ...]:
     keys = tuple(str(key) for key in support_schedule_keys)
     if not keys:
@@ -1101,7 +1357,7 @@ def attach_uniform_gipo_rewards(
     materialized = [dict(row) for row in rows]
     crps_weight, mase_weight = _normalized_metric_weights(utility_crps_weight, utility_mase_weight)
     support_keys = validate_gipo_support_schedule_keys(
-        PAPER_SUPERVISION_SCHEDULE_KEYS if support_schedule_keys is None else support_schedule_keys
+        REFERENCE_SUPERVISION_SCHEDULE_KEYS if support_schedule_keys is None else support_schedule_keys
     )
     support = {str(key) for key in support_keys}
     uniform_key = str(uniform_scheduler_key)
@@ -1417,11 +1673,6 @@ def load_context_embedding_table(path: str | Path) -> Dict[str, np.ndarray]:
     return {context_id: embeddings[idx].astype(np.float32, copy=True) for idx, context_id in enumerate(context_ids)}
 
 
-def build_series_index_map(rows: Iterable[MetricRow]) -> Dict[str, int]:
-    keys = sorted({series_key_from_row(row) for row in rows})
-    return {key: idx for idx, key in enumerate(keys)}
-
-
 def _student_target_representative_rows(rows: Sequence[MetricRow]) -> List[MetricRow]:
     return [group[0] for _, group in _student_target_groups(rows) if group]
 
@@ -1610,10 +1861,7 @@ class _DensityConditioningMixin:
     def _condition_embedding(
         self,
         setting_feature_batch: torch.Tensor,
-        series_index_batch: torch.Tensor,
         context_embedding_batch: torch.Tensor,
-        *,
-        rows: Sequence[MetricRow] | None,
     ) -> torch.Tensor:
         batch = int(setting_feature_batch.shape[0])
         if setting_feature_batch.ndim != 2 or setting_feature_batch.shape[-1] != self.setting_dim:
@@ -1646,11 +1894,8 @@ class _DensityConditioningMixin:
             "setting_dim": int(self.setting_dim),
             "density_dim": int(self.density_dim),
             "context_dim": int(self.context_dim),
-            "num_series": int(self.num_series),
-            "series_feature_dim": int(self.series_feature_dim),
-            "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
             "hidden_dim": int(self.hidden_dim),
-            "hidden_layers": int(self.hidden_layers),
+            "num_layers": int(self.num_layers),
             "attention_heads": int(self.attention_heads),
             "dropout": float(self.dropout_probability),
             "conditioning_style": self.conditioning_style,
@@ -1686,10 +1931,8 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
         setting_dim: int,
         density_dim: int,
         context_dim: int,
-        num_series: int,
-        series_feature_dim: int = SERIES_CONDITIONING_DIM,
         hidden_dim: int = DEFAULT_TRANSFORMER_HIDDEN_DIM,
-        hidden_layers: int = DEFAULT_TRANSFORMER_LAYERS,
+        num_layers: int = DEFAULT_TRANSFORMER_NUM_LAYERS,
         attention_heads: int = DEFAULT_TRANSFORMER_HEADS,
         dropout: float = DEFAULT_TRANSFORMER_DROPOUT,
         conditioning_style: str = CONDITIONING_STYLE_ADDITIVE_MLP,
@@ -1701,11 +1944,8 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
         self.setting_dim = int(setting_dim)
         self.density_dim = int(density_dim)
         self.context_dim = int(context_dim)
-        self.num_series = 0
-        self.unknown_series_index = 0
-        self.series_feature_dim = SERIES_CONDITIONING_DIM
         self.hidden_dim = int(hidden_dim)
-        self.hidden_layers = int(hidden_layers)
+        self.num_layers = int(num_layers)
         self.attention_heads = validate_gipo_attention_heads(int(attention_heads))
         self.dropout_probability = float(dropout)
         self.conditioning_style = validate_conditioning_style(
@@ -1734,7 +1974,7 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
                     heads=int(self.attention_heads),
                     dropout=float(dropout),
                 )
-                for _ in range(int(hidden_layers))
+                for _ in range(int(num_layers))
             ]
         )
         self.final_norm = nn.LayerNorm(int(hidden_dim))
@@ -1744,10 +1984,7 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
         self,
         setting_feature_batch: torch.Tensor,
         density_feature_batch: torch.Tensor,
-        series_index_batch: torch.Tensor,
         context_embedding_batch: torch.Tensor,
-        *,
-        rows: Sequence[MetricRow] | None = None,
     ) -> torch.Tensor:
         batch = int(setting_feature_batch.shape[0])
         if density_feature_batch.ndim != 2 or density_feature_batch.shape[-1] != self.density_dim:
@@ -1756,9 +1993,7 @@ class GIPODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
             raise ValueError("Teacher feature batches must share the same batch dimension.")
         z = self._condition_embedding(
             setting_feature_batch,
-            series_index_batch,
             context_embedding_batch,
-            rows=rows,
         )
         normalized_log_density = density_feature_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype)
         log_density = normalized_log_density * self.density_feature_std.to(
@@ -1789,10 +2024,8 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
         setting_dim: int,
         density_dim: int,
         context_dim: int,
-        num_series: int,
-        series_feature_dim: int = SERIES_CONDITIONING_DIM,
         hidden_dim: int = DEFAULT_TRANSFORMER_HIDDEN_DIM,
-        hidden_layers: int = DEFAULT_TRANSFORMER_LAYERS,
+        num_layers: int = DEFAULT_TRANSFORMER_NUM_LAYERS,
         attention_heads: int = DEFAULT_TRANSFORMER_HEADS,
         dropout: float = DEFAULT_TRANSFORMER_DROPOUT,
         conditioning_style: str = CONDITIONING_STYLE_ADDITIVE_MLP,
@@ -1801,11 +2034,8 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
         self.setting_dim = int(setting_dim)
         self.density_dim = int(density_dim)
         self.context_dim = int(context_dim)
-        self.num_series = 0
-        self.unknown_series_index = 0
-        self.series_feature_dim = SERIES_CONDITIONING_DIM
         self.hidden_dim = int(hidden_dim)
-        self.hidden_layers = int(hidden_layers)
+        self.num_layers = int(num_layers)
         self.attention_heads = validate_gipo_attention_heads(int(attention_heads))
         self.dropout_probability = float(dropout)
         self.conditioning_style = validate_conditioning_style(
@@ -1825,7 +2055,7 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
                     heads=int(self.attention_heads),
                     dropout=float(dropout),
                 )
-                for _ in range(int(hidden_layers))
+                for _ in range(int(num_layers))
             ]
         )
         self.final_norm = nn.LayerNorm(int(hidden_dim))
@@ -1834,17 +2064,12 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
     def logits(
         self,
         setting_feature_batch: torch.Tensor,
-        series_index_batch: torch.Tensor,
         context_embedding_batch: torch.Tensor,
-        *,
-        rows: Sequence[MetricRow] | None = None,
     ) -> torch.Tensor:
         batch = int(setting_feature_batch.shape[0])
         z = self._condition_embedding(
             setting_feature_batch,
-            series_index_batch,
             context_embedding_batch,
-            rows=rows,
         )
         geometry = _density_bin_geometry(
             self.density_dim,
@@ -1859,17 +2084,12 @@ class GIPODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
     def density_mass(
         self,
         setting_feature_batch: torch.Tensor,
-        series_index_batch: torch.Tensor,
         context_embedding_batch: torch.Tensor,
-        *,
-        rows: Sequence[MetricRow] | None = None,
     ) -> torch.Tensor:
         return torch.softmax(
             self.logits(
                 setting_feature_batch,
-                series_index_batch,
                 context_embedding_batch,
-                rows=rows,
             ),
             dim=-1,
         )
@@ -1881,7 +2101,6 @@ def build_gipo_teacher_model(
     setting_dim: int,
     density_dim: int,
     context_dim: int,
-    num_series: int,
     model_config: Mapping[str, Any] | None = None,
 ) -> nn.Module:
     validate_gipo_architecture(architecture, role="teacher")
@@ -1889,17 +2108,26 @@ def build_gipo_teacher_model(
     conditioning_style = validate_conditioning_style(
         cfg,
     )
-    validate_series_conditioning(cfg.get("series_conditioning"))
+    retired_keys = sorted(
+        set(cfg)
+        & {
+            "hidden_layers",
+            "transformer_layers",
+            "num_series",
+            "series_feature_dim",
+            "series_conditioning",
+        }
+    )
+    if retired_keys:
+        raise ValueError(f"GIPO teacher model_config uses retired keys: {retired_keys}; use num_layers.")
     validate_gipo_density_token_attention(cfg)
     validate_gipo_teacher_output(cfg, require_present=False)
     return GIPODensityFormTeacherTransformer(
         setting_dim=int(setting_dim),
         density_dim=int(density_dim),
         context_dim=int(context_dim),
-        num_series=int(num_series),
-        series_feature_dim=SERIES_CONDITIONING_DIM,
         hidden_dim=int(cfg.get("hidden_dim", DEFAULT_TRANSFORMER_HIDDEN_DIM)),
-        hidden_layers=int(cfg.get("hidden_layers", cfg.get("transformer_layers", DEFAULT_TRANSFORMER_LAYERS))),
+        num_layers=int(cfg.get("num_layers", DEFAULT_TRANSFORMER_NUM_LAYERS)),
         attention_heads=validate_gipo_attention_heads(int(cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS))),
         dropout=float(cfg.get("dropout", DEFAULT_TRANSFORMER_DROPOUT)),
         conditioning_style=conditioning_style,
@@ -1915,7 +2143,6 @@ def build_gipo_student_model(
     setting_dim: int,
     density_dim: int,
     context_dim: int,
-    num_series: int,
     model_config: Mapping[str, Any] | None = None,
 ) -> nn.Module:
     validate_gipo_architecture(architecture, role="student")
@@ -1923,16 +2150,25 @@ def build_gipo_student_model(
     conditioning_style = validate_conditioning_style(
         cfg,
     )
-    validate_series_conditioning(cfg.get("series_conditioning"))
+    retired_keys = sorted(
+        set(cfg)
+        & {
+            "hidden_layers",
+            "transformer_layers",
+            "num_series",
+            "series_feature_dim",
+            "series_conditioning",
+        }
+    )
+    if retired_keys:
+        raise ValueError(f"GIPO student model_config uses retired keys: {retired_keys}; use num_layers.")
     validate_gipo_density_token_attention(cfg)
     return GIPODensityQueryStudentTransformer(
         setting_dim=int(setting_dim),
         density_dim=int(density_dim),
         context_dim=int(context_dim),
-        num_series=int(num_series),
-        series_feature_dim=SERIES_CONDITIONING_DIM,
         hidden_dim=int(cfg.get("hidden_dim", DEFAULT_TRANSFORMER_HIDDEN_DIM)),
-        hidden_layers=int(cfg.get("hidden_layers", cfg.get("transformer_layers", DEFAULT_TRANSFORMER_LAYERS))),
+        num_layers=int(cfg.get("num_layers", DEFAULT_TRANSFORMER_NUM_LAYERS)),
         attention_heads=validate_gipo_attention_heads(int(cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS))),
         dropout=float(cfg.get("dropout", DEFAULT_TRANSFORMER_DROPOUT)),
         conditioning_style=conditioning_style,
@@ -2140,19 +2376,14 @@ def _teacher_metric_scores(
     teacher: nn.Module,
     setting_features_batch: torch.Tensor,
     density_features_batch: torch.Tensor,
-    series_index_batch: torch.Tensor,
     context_embedding_batch: torch.Tensor,
-    *,
-    rows: Sequence[MetricRow] | None = None,
 ) -> torch.Tensor:
     _teacher_architecture(teacher)
     target_keys = teacher_metric_target_keys_for_model(teacher)
     scores = teacher(
         setting_features_batch,
         density_features_batch,
-        series_index_batch,
         context_embedding_batch,
-        rows=rows,
     )
     if scores.ndim != 2 or scores.shape[-1] != len(target_keys):
         raise ValueError(
@@ -2165,28 +2396,28 @@ def _teacher_metric_scores_batched(
     teacher: nn.Module,
     setting_features_batch: torch.Tensor,
     density_features_batch: torch.Tensor,
-    series_index_batch: torch.Tensor,
     context_embedding_batch: torch.Tensor,
     *,
-    rows: Sequence[MetricRow],
     device: torch.device | str,
     batch_size: int = DEFAULT_GIPO_TEACHER_SCORE_BATCH_SIZE,
 ) -> torch.Tensor:
-    if int(setting_features_batch.shape[0]) != len(rows):
-        raise ValueError("Batched teacher scoring rows must match feature batch length.")
+    batch_lengths = {
+        int(setting_features_batch.shape[0]),
+        int(density_features_batch.shape[0]),
+        int(context_embedding_batch.shape[0]),
+    }
+    if len(batch_lengths) != 1:
+        raise ValueError("Batched teacher scoring tensors must share the same batch length.")
     chunks: List[torch.Tensor] = []
     total = int(setting_features_batch.shape[0])
     step = max(1, int(batch_size))
     for start in range(0, total, step):
         end = min(total, start + step)
-        batch_rows = list(rows[start:end])
         metric_scores = _teacher_metric_scores(
             teacher,
             setting_features_batch[start:end].to(device=device),
             density_features_batch[start:end].to(device=device),
-            series_index_batch[start:end].to(device=device),
             context_embedding_batch[start:end].to(device=device),
-            rows=batch_rows,
         )
         chunks.append(metric_scores.detach().cpu())
     if not chunks:
@@ -2199,7 +2430,6 @@ def _teacher_scores(
     teacher: nn.Module,
     setting_features_batch: torch.Tensor,
     density_features_batch: torch.Tensor,
-    series_index_batch: torch.Tensor,
     context_embedding_batch: torch.Tensor,
     *,
     rows: Sequence[MetricRow] | None = None,
@@ -2210,9 +2440,7 @@ def _teacher_scores(
         teacher,
         setting_features_batch,
         density_features_batch,
-        series_index_batch,
         context_embedding_batch,
-        rows=rows,
     )
     target_mask = None
     if rows is not None:
@@ -2232,35 +2460,25 @@ def _teacher_scores(
 def _student_logits(
     student: nn.Module,
     setting_features_batch: torch.Tensor,
-    series_index_batch: torch.Tensor,
     context_embedding_batch: torch.Tensor,
-    *,
-    rows: Sequence[MetricRow] | None = None,
 ) -> torch.Tensor:
     _student_architecture(student)
     return student.logits(
         setting_features_batch,
-        series_index_batch,
         context_embedding_batch,
-        rows=rows,
     )
 
 
 def _student_density_mass(
     student: nn.Module,
     setting_features_batch: torch.Tensor,
-    series_index_batch: torch.Tensor,
     context_embedding_batch: torch.Tensor,
-    *,
-    rows: Sequence[MetricRow] | None = None,
 ) -> torch.Tensor:
     return torch.softmax(
         _student_logits(
             student,
             setting_features_batch,
-            series_index_batch,
             context_embedding_batch,
-            rows=rows,
         ),
         dim=-1,
     )
@@ -2288,7 +2506,6 @@ def _student_teacher_score_objective(
     teacher: nn.Module,
     logits: torch.Tensor,
     setting_features_batch: torch.Tensor,
-    series_index_batch: torch.Tensor,
     context_embedding_batch: torch.Tensor,
     rows: Sequence[MetricRow],
     *,
@@ -2309,7 +2526,6 @@ def _student_teacher_score_objective(
         teacher,
         setting_features_batch,
         density_features,
-        series_index_batch,
         context_embedding_batch,
         rows=rows,
         teacher_utility_weights=teacher_utility_weights,
@@ -2395,7 +2611,6 @@ def _teacher_training_tensors(
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
-    series_index_map: Mapping[str, int],
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
     reference_time_grid: Sequence[float],
     density_normalizer: DensityFeatureNormalizer,
@@ -2404,12 +2619,11 @@ def _teacher_training_tensors(
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     teacher_metric_target_keys: Sequence[str] = TEACHER_METRIC_TARGET_KEYS,
     seed: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[ContextPairKey], List[str], List[Tuple[float, ...]]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[ContextPairKey], List[str], List[Tuple[float, ...]]]:
     feature_mode = validate_setting_mode(mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     setting_rows: List[torch.Tensor] = []
     density_rows: List[np.ndarray] = []
-    series_rows: List[int] = []
     context_rows: List[np.ndarray] = []
     pair_keys: List[ContextPairKey] = []
     schedule_keys: List[str] = []
@@ -2423,7 +2637,6 @@ def _teacher_training_tensors(
         mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
         setting_rows.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
         density_rows.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
-        series_rows.append(0)
         context_rows.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
         pair_keys.append(context_pair_key(row, pair_on_seed=True))
         schedule_keys.append(str(row["scheduler_key"]))
@@ -2432,7 +2645,6 @@ def _teacher_training_tensors(
     return (
         torch.stack(setting_rows, dim=0).to(device=device),
         torch.tensor(np.stack(density_rows, axis=0), dtype=torch.float32, device=device),
-        torch.tensor(series_rows, dtype=torch.long, device=device),
         torch.tensor(np.stack(context_rows, axis=0), dtype=torch.float32, device=device),
         metric_targets,
         metric_target_mask,
@@ -2447,7 +2659,6 @@ def gipo_teacher_diagnostics(
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
-    series_index_map: Mapping[str, int],
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
     reference_time_grid: Sequence[float],
     density_normalizer: DensityFeatureNormalizer,
@@ -2489,7 +2700,6 @@ def gipo_teacher_diagnostics(
         "series_count": int(len(series_keys)),
         "schedule_count": int(len(schedules)),
         "scheduler_keys": sorted(schedules),
-        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "split_phases": sorted({str(row.get("split_phase", row.get("split", ""))) for row in rows}),
         "fit_context_overlap_count": int(len(contexts & fit_context_set)),
         "fit_series_overlap_count": int(len(series_keys & fit_series_set)),
@@ -2532,10 +2742,9 @@ def gipo_teacher_diagnostics(
     teacher.to(device)
     teacher.eval()
     with torch.no_grad():
-        sx, dx, series_idx, cx, metric_targets, metric_target_mask, pair_keys, schedule_keys, _ = _teacher_training_tensors(
+        sx, dx, cx, metric_targets, metric_target_mask, pair_keys, schedule_keys, _ = _teacher_training_tensors(
             rows,
             context_embeddings=context_embeddings,
-            series_index_map=series_index_map,
             schedule_grids=schedule_grids,
             reference_time_grid=reference_time_grid,
             density_normalizer=density_normalizer,
@@ -2566,9 +2775,7 @@ def gipo_teacher_diagnostics(
             teacher,
             sx,
             dx,
-            series_idx,
             cx,
-            rows=rows,
             device=device,
         )
         pred = _scalarize_teacher_metric_values(
@@ -2973,7 +3180,6 @@ def train_gipo_teacher(
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
-    series_index_map: Mapping[str, int],
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
     reference_time_grid: Sequence[float],
     density_normalizer: DensityFeatureNormalizer,
@@ -2991,7 +3197,7 @@ def train_gipo_teacher(
     teacher_selection_axis_weights: Mapping[str, float] | None = None,
     final_retrain_mode: bool = False,
     seed: int = 0,
-    allowed_schedule_keys: Sequence[str] = PAPER_SUPERVISION_SCHEDULE_KEYS,
+    allowed_schedule_keys: Sequence[str] = REFERENCE_SUPERVISION_SCHEDULE_KEYS,
     mode: str = SETTING_ENCODER_MODE_CONTINUOUS,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     teacher_utility_weights: Mapping[str, float] | None = None,
@@ -3015,12 +3221,10 @@ def train_gipo_teacher(
     )
     teacher_metric_target_keys = teacher_metric_target_keys_for_model(teacher)
     selection_mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
-    selection_temperature = DEFAULT_TEACHER_TARGET_TEMPERATURE
     teacher.to(device)
-    sx, dx, series_idx, cx, metric_targets, metric_target_mask, pair_keys, _, _ = _teacher_training_tensors(
+    sx, dx, cx, metric_targets, metric_target_mask, pair_keys, _, _ = _teacher_training_tensors(
         rows,
         context_embeddings=context_embeddings,
-        series_index_map=series_index_map,
         schedule_grids=schedule_grids,
         reference_time_grid=reference_time_grid,
         density_normalizer=density_normalizer,
@@ -3079,18 +3283,16 @@ def train_gipo_teacher(
     for step in range(int(steps)):
         batch_indices = next_teacher_batch()
         batch_cpu_idx = _index_tensor(batch_indices, device="cpu")
-        batch_rows = [rows[int(idx)] for idx in batch_indices]
         batch_pair_keys = [pair_keys[int(idx)] for idx in batch_indices]
         batch_sx = sx.index_select(0, batch_cpu_idx).to(device=device)
         batch_dx = dx.index_select(0, batch_cpu_idx).to(device=device)
-        batch_series_idx = series_idx.index_select(0, batch_cpu_idx).to(device=device)
         batch_cx = cx.index_select(0, batch_cpu_idx).to(device=device)
         batch_metric_targets = metric_targets.index_select(0, batch_cpu_idx).to(device=device)
         batch_metric_target_mask = metric_target_mask.index_select(0, batch_cpu_idx).to(device=device)
         batch_target_weights = target_weights.index_select(0, batch_cpu_idx).to(device=device)
         batch_targets = targets.index_select(0, batch_cpu_idx).to(device=device)
         left, right, sign = _pair_indices(batch_targets, batch_pair_keys, margin=float(pair_margin), device=batch_targets.device)
-        metric_pred = _teacher_metric_scores(teacher, batch_sx, batch_dx, batch_series_idx, batch_cx, rows=batch_rows)
+        metric_pred = _teacher_metric_scores(teacher, batch_sx, batch_dx, batch_cx)
         pred = _scalarize_teacher_metric_values(
             metric_pred,
             batch_target_weights,
@@ -3127,7 +3329,6 @@ def train_gipo_teacher(
                     teacher,
                     split_rows,
                     context_embeddings=context_embeddings,
-                    series_index_map=series_index_map,
                     schedule_grids=schedule_grids,
                     reference_time_grid=reference_time_grid,
                     density_normalizer=density_normalizer,
@@ -3197,7 +3398,6 @@ def train_gipo_teacher(
             {key: float(value) for key, value in zip(teacher_metric_target_keys, target_weights[0].detach().cpu().tolist())},
         ),
         "teacher_density_feature": "train_normalized_log_density",
-        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "mode": feature_mode,
         "setting_encoder_config": encoder_config.to_payload(),
         "teacher_pair_count": int(global_pair_count),
@@ -3231,7 +3431,6 @@ def build_teacher_weighted_density_targets(
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
-    series_index_map: Mapping[str, int],
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
     reference_time_grid: Sequence[float],
     density_normalizer: DensityFeatureNormalizer,
@@ -3246,7 +3445,7 @@ def build_teacher_weighted_density_targets(
     student_target_elite_min_count: int = DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT,
     student_target_elite_blend_all_weight: float = DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
     device: torch.device | str = "cpu",
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     feature_mode = validate_setting_mode(mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     fixed_temperature = _finite_positive(temperature, label="teacher_temperature")
@@ -3271,7 +3470,6 @@ def build_teacher_weighted_density_targets(
         raise ValueError("Student target construction requires at least one context group.")
     teacher_metric_target_keys = teacher_metric_target_keys_for_model(teacher)
     setting_rows: List[torch.Tensor] = []
-    series_rows: List[int] = []
     context_rows: List[np.ndarray] = []
     target_masses: List[np.ndarray] = []
     entropy_values: List[float] = []
@@ -3292,7 +3490,6 @@ def build_teacher_weighted_density_targets(
     teacher.eval()
     score_settings: List[torch.Tensor] = []
     score_density: List[np.ndarray] = []
-    score_series: List[int] = []
     score_context: List[np.ndarray] = []
     score_masses: Dict[int, Tuple[float, ...]] = {}
     for row in rows:
@@ -3305,7 +3502,6 @@ def build_teacher_weighted_density_targets(
         score_masses[id(row)] = mass
         score_settings.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
         score_density.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
-        score_series.append(0)
         score_context.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
     with torch.no_grad():
         _, metric_score_mask = _teacher_metric_targets(rows, target_keys=teacher_metric_target_keys, device="cpu")
@@ -3313,9 +3509,7 @@ def build_teacher_weighted_density_targets(
             teacher,
             torch.stack(score_settings, dim=0),
             torch.tensor(np.stack(score_density, axis=0), dtype=torch.float32),
-            torch.tensor(score_series, dtype=torch.long),
             torch.tensor(np.stack(score_context, axis=0), dtype=torch.float32),
-            rows=rows,
             device=device,
         )
         score_weights = _teacher_metric_weights(
@@ -3399,7 +3593,6 @@ def build_teacher_weighted_density_targets(
         if score_std < 1e-6 or not math.isfinite(score_std):
             score_std = 1.0
         setting_rows.append(setting_row)
-        series_rows.append(0)
         context_rows.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
         target_masses.append(mixture.astype(np.float32))
         entropy_values.append(float(-np.sum(active_weights * np.log(np.maximum(active_weights, 1e-12)))))
@@ -3448,7 +3641,6 @@ def build_teacher_weighted_density_targets(
         "teacher_temperature": float(fixed_temperature),
         "mode": feature_mode,
         "setting_encoder_config": encoder_config.to_payload(),
-        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "context_setting_count": int(len(target_masses)),
         "mean_teacher_candidate_entropy": entropy_stats["mean"],
         "teacher_candidate_entropy_mean": entropy_stats["mean"],
@@ -3502,7 +3694,6 @@ def build_teacher_weighted_density_targets(
     }
     return (
         torch.stack(setting_rows, dim=0).to(device=device),
-        torch.tensor(series_rows, dtype=torch.long, device=device),
         torch.tensor(np.stack(context_rows, axis=0), dtype=torch.float32, device=device),
         torch.tensor(np.stack(target_masses, axis=0), dtype=torch.float32, device=device),
         summary,
@@ -3515,7 +3706,6 @@ def train_gipo_student(
     rows: Sequence[MetricRow],
     *,
     context_embeddings: Mapping[str, Sequence[float]],
-    series_index_map: Mapping[str, int],
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
     reference_time_grid: Sequence[float],
     density_normalizer: DensityFeatureNormalizer,
@@ -3526,14 +3716,14 @@ def train_gipo_student(
     mode: str = SETTING_ENCODER_MODE_CONTINUOUS,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     student_weight_decay: float = 1e-4,
-    pseudo_rows: Sequence[MetricRow] | None = None,
-    pseudo_context_embeddings: Mapping[str, Sequence[float]] | None = None,
-    pseudo_schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None = None,
-    pseudo_target_weight: float = 0.0,
-    student_teacher_score_weight: float = PAPER_STUDENT_TEACHER_SCORE_WEIGHT,
+    unseen_target_rows: Sequence[MetricRow] | None = None,
+    unseen_target_context_embeddings: Mapping[str, Sequence[float]] | None = None,
+    unseen_target_schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None = None,
+    unseen_target_weight: float = 0.0,
+    student_teacher_score_weight: float = REFERENCE_STUDENT_TEACHER_SCORE_WEIGHT,
     student_teacher_score_warmup_fraction: float = DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION,
     student_teacher_score_schedule_steps: int | None = None,
-    student_teacher_score_include_pseudo: bool = False,
+    student_teacher_score_include_unseen_targets: bool = False,
     student_target_mixture_mode: str = DEFAULT_STUDENT_TARGET_MIXTURE_MODE,
     student_target_elite_fraction: float = DEFAULT_STUDENT_TARGET_ELITE_FRACTION,
     student_target_elite_k: int = DEFAULT_STUDENT_TARGET_ELITE_K,
@@ -3559,9 +3749,9 @@ def train_gipo_student(
     weight_decay = float(student_weight_decay)
     if not math.isfinite(weight_decay) or weight_decay < 0.0:
         raise ValueError("student_weight_decay must be finite and nonnegative.")
-    pseudo_weight = float(pseudo_target_weight)
-    if not math.isfinite(pseudo_weight) or pseudo_weight < 0.0:
-        raise ValueError("student_pseudo_target_weight must be finite and nonnegative.")
+    unseen_weight = float(unseen_target_weight)
+    if not math.isfinite(unseen_weight) or unseen_weight < 0.0:
+        raise ValueError("unseen_target_weight must be finite and nonnegative.")
     teacher_score_weight = float(student_teacher_score_weight)
     if not math.isfinite(teacher_score_weight) or teacher_score_weight < 0.0:
         raise ValueError("student_teacher_score_weight must be finite and nonnegative.")
@@ -3595,11 +3785,10 @@ def train_gipo_student(
     teacher.eval()
     for param in teacher.parameters():
         param.requires_grad_(False)
-    sx, base_series_idx, cx, target_mass, target_summary = build_teacher_weighted_density_targets(
+    sx, cx, target_mass, target_summary = build_teacher_weighted_density_targets(
         teacher,
         rows,
         context_embeddings=context_embeddings,
-        series_index_map=series_index_map,
         schedule_grids=schedule_grids,
         reference_time_grid=reference_time_grid,
         density_normalizer=density_normalizer,
@@ -3623,30 +3812,32 @@ def train_gipo_student(
     )
     sequence_pairs = student_nfe_sequence_pairs(rows)
     target_rows = _student_target_representative_rows(rows)
-    pseudo_enabled = bool(pseudo_rows) and pseudo_weight > 0.0
-    pseudo_sx: torch.Tensor | None = None
-    pseudo_base_series_idx: torch.Tensor | None = None
-    pseudo_cx: torch.Tensor | None = None
-    pseudo_target_mass: torch.Tensor | None = None
-    pseudo_score_mean: torch.Tensor | None = None
-    pseudo_score_std: torch.Tensor | None = None
-    pseudo_target_rows: List[MetricRow] = []
-    pseudo_summary: Dict[str, Any] = {
-        "pseudo_distillation_used": False,
-        "pseudo_target_weight": float(pseudo_weight),
-        "pseudo_context_setting_count": 0,
+    unseen_targets_enabled = bool(unseen_target_rows) and unseen_weight > 0.0
+    unseen_sx: torch.Tensor | None = None
+    unseen_cx: torch.Tensor | None = None
+    unseen_target_mass: torch.Tensor | None = None
+    unseen_score_mean: torch.Tensor | None = None
+    unseen_score_std: torch.Tensor | None = None
+    unseen_representative_rows: List[MetricRow] = []
+    unseen_target_summary: Dict[str, Any] = {
+        "unseen_target_distillation_used": False,
+        "unseen_target_weight": float(unseen_weight),
+        "unseen_context_setting_count": 0,
     }
-    if pseudo_enabled:
-        pseudo_embeddings = pseudo_context_embeddings if pseudo_context_embeddings is not None else context_embeddings
-        pseudo_sx, pseudo_base_series_idx, pseudo_cx, pseudo_target_mass, built_pseudo_summary = build_teacher_weighted_density_targets(
+    if unseen_targets_enabled:
+        unseen_embeddings = (
+            unseen_target_context_embeddings
+            if unseen_target_context_embeddings is not None
+            else context_embeddings
+        )
+        unseen_sx, unseen_cx, unseen_target_mass, built_unseen_summary = build_teacher_weighted_density_targets(
             teacher,
-            list(pseudo_rows or []),
-            context_embeddings=pseudo_embeddings,
-            series_index_map=series_index_map,
-            schedule_grids=pseudo_schedule_grids if pseudo_schedule_grids is not None else schedule_grids,
+            list(unseen_target_rows or []),
+            context_embeddings=unseen_embeddings,
+            schedule_grids=unseen_target_schedule_grids if unseen_target_schedule_grids is not None else schedule_grids,
             reference_time_grid=reference_time_grid,
             density_normalizer=density_normalizer,
-            supervision_schedule_keys=sorted({str(row["scheduler_key"]) for row in (pseudo_rows or [])}),
+            supervision_schedule_keys=sorted({str(row["scheduler_key"]) for row in (unseen_target_rows or [])}),
             temperature=float(teacher_temperature),
             teacher_utility_weights=teacher_utility_weights,
             mode=feature_mode,
@@ -3658,37 +3849,39 @@ def train_gipo_student(
             student_target_elite_blend_all_weight=elite_blend_all_weight,
             device=device,
         )
-        pseudo_score_mean, pseudo_score_std = _teacher_score_normalization_tensors(
-            built_pseudo_summary,
-            batch=int(pseudo_target_mass.shape[0]),
-            device=pseudo_target_mass.device,
-            dtype=pseudo_target_mass.dtype,
+        unseen_score_mean, unseen_score_std = _teacher_score_normalization_tensors(
+            built_unseen_summary,
+            batch=int(unseen_target_mass.shape[0]),
+            device=unseen_target_mass.device,
+            dtype=unseen_target_mass.dtype,
         )
-        pseudo_target_rows = _student_target_representative_rows(list(pseudo_rows or []))
-        pseudo_summary = {
-            **built_pseudo_summary,
-            "pseudo_distillation_used": True,
-            "pseudo_target_weight": float(pseudo_weight),
-            "pseudo_context_setting_count": int(pseudo_target_mass.shape[0]),
-            "pseudo_target_nfes": sorted({int(row["target_nfe"]) for row in pseudo_target_rows}),
-            "pseudo_split_phases": sorted({str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) for row in (pseudo_rows or [])}),
+        unseen_representative_rows = _student_target_representative_rows(list(unseen_target_rows or []))
+        unseen_target_summary = {
+            **built_unseen_summary,
+            "unseen_target_distillation_used": True,
+            "unseen_target_weight": float(unseen_weight),
+            "unseen_context_setting_count": int(unseen_target_mass.shape[0]),
+            "unseen_target_nfes": sorted({int(row["target_nfe"]) for row in unseen_representative_rows}),
+            "unseen_split_phases": sorted(
+                {
+                    str(row.get("source_split_phase") or row.get("split_phase", row.get("split", "")))
+                    for row in (unseen_target_rows or [])
+                }
+            ),
         }
     validation_sx: torch.Tensor | None = None
-    validation_base_series_idx: torch.Tensor | None = None
     validation_cx: torch.Tensor | None = None
     validation_target_mass: torch.Tensor | None = None
-    validation_target_rows: List[MetricRow] = []
     validation_target_summary: Dict[str, Any] = {
         "student_validation_context_setting_count": 0,
         "student_validation_context_count": 0,
     }
     if validation_fit_rows:
         validation_embeddings = validation_context_embeddings if validation_context_embeddings is not None else context_embeddings
-        validation_sx, validation_base_series_idx, validation_cx, validation_target_mass, built_validation_summary = build_teacher_weighted_density_targets(
+        validation_sx, validation_cx, validation_target_mass, built_validation_summary = build_teacher_weighted_density_targets(
             teacher,
             validation_fit_rows,
             context_embeddings=validation_embeddings,
-            series_index_map=series_index_map,
             schedule_grids=schedule_grids,
             reference_time_grid=reference_time_grid,
             density_normalizer=density_normalizer,
@@ -3704,7 +3897,6 @@ def train_gipo_student(
             student_target_elite_blend_all_weight=elite_blend_all_weight,
             device=device,
         )
-        validation_target_rows = _student_target_representative_rows(validation_fit_rows)
         validation_target_summary = {
             **built_validation_summary,
             "student_validation_context_setting_count": int(validation_target_mass.shape[0]),
@@ -3723,22 +3915,20 @@ def train_gipo_student(
         batch_size=DEFAULT_GIPO_STUDENT_BATCH_SIZE,
         seed=int(17 + len(rows)),
     )
-    next_pseudo_batch = (
+    next_unseen_batch = (
         _make_index_minibatch_sampler(
-            int(pseudo_target_mass.shape[0]),
+            int(unseen_target_mass.shape[0]),
             batch_size=DEFAULT_GIPO_STUDENT_BATCH_SIZE,
-            seed=int(31 + len(pseudo_rows or [])),
+            seed=int(31 + len(unseen_target_rows or [])),
         )
-        if pseudo_enabled and pseudo_target_mass is not None
+        if unseen_targets_enabled and unseen_target_mass is not None
         else None
     )
 
     def _evaluate_student_ce(
         eval_sx: torch.Tensor,
-        eval_series_idx: torch.Tensor,
         eval_cx: torch.Tensor,
         eval_target_mass: torch.Tensor,
-        eval_rows: Sequence[MetricRow],
     ) -> Tuple[float, float]:
         was_training = bool(student.training)
         student.eval()
@@ -3750,13 +3940,10 @@ def train_gipo_student(
             step_size = max(1, int(DEFAULT_GIPO_STUDENT_BATCH_SIZE))
             for start in range(0, total, step_size):
                 end = min(total, start + step_size)
-                batch_rows = list(eval_rows[start:end])
                 eval_logits = _student_logits(
                     student,
                     eval_sx[start:end],
-                    eval_series_idx[start:end],
                     eval_cx[start:end],
-                    rows=batch_rows,
                 )
                 eval_log_probs = torch.log_softmax(eval_logits, dim=-1)
                 row_ce = -(eval_target_mass[start:end] * eval_log_probs).sum(dim=-1)
@@ -3776,7 +3963,6 @@ def train_gipo_student(
         batch_idx = _index_tensor(batch_indices, device=target_mass.device)
         batch_rows = [target_rows[int(idx)] for idx in batch_indices]
         batch_sx = sx.index_select(0, batch_idx)
-        batch_series_idx = base_series_idx.index_select(0, batch_idx)
         batch_cx = cx.index_select(0, batch_idx)
         batch_target_mass = target_mass.index_select(0, batch_idx)
         batch_score_mean = score_mean.index_select(0, batch_idx)
@@ -3784,17 +3970,15 @@ def train_gipo_student(
         logits = _student_logits(
             student,
             batch_sx,
-            batch_series_idx,
             batch_cx,
-            rows=batch_rows,
         )
         log_probs = torch.log_softmax(logits, dim=-1)
         ce_loss = -(batch_target_mass * log_probs).sum(dim=-1).mean()
-        pseudo_ce_loss = logits.new_zeros(())
+        unseen_ce_loss = logits.new_zeros(())
         teacher_score_z = logits.new_zeros(())
         teacher_score_mean = logits.new_zeros(())
-        pseudo_teacher_score_z = logits.new_zeros(())
-        pseudo_teacher_score_mean = logits.new_zeros(())
+        unseen_teacher_score_z = logits.new_zeros(())
+        unseen_teacher_score_mean = logits.new_zeros(())
         eta = _student_teacher_score_eta(
             step=step,
             steps=int(teacher_score_schedule_steps),
@@ -3806,7 +3990,6 @@ def train_gipo_student(
                 teacher,
                 logits,
                 batch_sx,
-                batch_series_idx,
                 batch_cx,
                 batch_rows,
                 reference_time_grid=reference_time_grid,
@@ -3816,52 +3999,47 @@ def train_gipo_student(
                 teacher_utility_weights=teacher_utility_weights,
                 clip=DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
             )
-        if pseudo_enabled:
-            assert pseudo_sx is not None
-            assert pseudo_base_series_idx is not None
-            assert pseudo_cx is not None
-            assert pseudo_target_mass is not None
-            assert next_pseudo_batch is not None
-            pseudo_batch_indices = next_pseudo_batch()
-            pseudo_batch_idx = _index_tensor(pseudo_batch_indices, device=pseudo_target_mass.device)
-            pseudo_batch_rows = [pseudo_target_rows[int(idx)] for idx in pseudo_batch_indices]
-            pseudo_batch_sx = pseudo_sx.index_select(0, pseudo_batch_idx)
-            pseudo_series_idx = pseudo_base_series_idx.index_select(0, pseudo_batch_idx)
-            pseudo_batch_cx = pseudo_cx.index_select(0, pseudo_batch_idx)
-            pseudo_batch_target_mass = pseudo_target_mass.index_select(0, pseudo_batch_idx)
-            pseudo_logits = _student_logits(
+        if unseen_targets_enabled:
+            assert unseen_sx is not None
+            assert unseen_cx is not None
+            assert unseen_target_mass is not None
+            assert next_unseen_batch is not None
+            unseen_batch_indices = next_unseen_batch()
+            unseen_batch_idx = _index_tensor(unseen_batch_indices, device=unseen_target_mass.device)
+            unseen_batch_rows = [unseen_representative_rows[int(idx)] for idx in unseen_batch_indices]
+            unseen_batch_sx = unseen_sx.index_select(0, unseen_batch_idx)
+            unseen_batch_cx = unseen_cx.index_select(0, unseen_batch_idx)
+            unseen_batch_target_mass = unseen_target_mass.index_select(0, unseen_batch_idx)
+            unseen_logits = _student_logits(
                 student,
-                pseudo_batch_sx,
-                pseudo_series_idx,
-                pseudo_batch_cx,
-                rows=pseudo_batch_rows,
+                unseen_batch_sx,
+                unseen_batch_cx,
             )
-            pseudo_log_probs = torch.log_softmax(pseudo_logits, dim=-1)
-            pseudo_ce_loss = -(pseudo_batch_target_mass * pseudo_log_probs).sum(dim=-1).mean()
-            if eta > 0.0 and bool(student_teacher_score_include_pseudo):
-                assert pseudo_score_mean is not None
-                assert pseudo_score_std is not None
-                pseudo_batch_score_mean = pseudo_score_mean.index_select(0, pseudo_batch_idx)
-                pseudo_batch_score_std = pseudo_score_std.index_select(0, pseudo_batch_idx)
-                pseudo_teacher_score_z, pseudo_teacher_score_mean = _student_teacher_score_objective(
+            unseen_log_probs = torch.log_softmax(unseen_logits, dim=-1)
+            unseen_ce_loss = -(unseen_batch_target_mass * unseen_log_probs).sum(dim=-1).mean()
+            if eta > 0.0 and bool(student_teacher_score_include_unseen_targets):
+                assert unseen_score_mean is not None
+                assert unseen_score_std is not None
+                unseen_batch_score_mean = unseen_score_mean.index_select(0, unseen_batch_idx)
+                unseen_batch_score_std = unseen_score_std.index_select(0, unseen_batch_idx)
+                unseen_teacher_score_z, unseen_teacher_score_mean = _student_teacher_score_objective(
                     teacher,
-                    pseudo_logits,
-                    pseudo_batch_sx,
-                    pseudo_series_idx,
-                    pseudo_batch_cx,
-                    pseudo_batch_rows,
+                    unseen_logits,
+                    unseen_batch_sx,
+                    unseen_batch_cx,
+                    unseen_batch_rows,
                     reference_time_grid=reference_time_grid,
                     density_normalizer=density_normalizer,
-                    score_mean=pseudo_batch_score_mean,
-                    score_std=pseudo_batch_score_std,
+                    score_mean=unseen_batch_score_mean,
+                    score_std=unseen_batch_score_std,
                     teacher_utility_weights=teacher_utility_weights,
                     clip=DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
                 )
         teacher_score_objective = teacher_score_z
-        if bool(student_teacher_score_include_pseudo):
-            teacher_score_objective = teacher_score_objective + float(pseudo_weight) * pseudo_teacher_score_z
+        if bool(student_teacher_score_include_unseen_targets):
+            teacher_score_objective = teacher_score_objective + float(unseen_weight) * unseen_teacher_score_z
         teacher_score_loss = -float(eta) * teacher_score_objective
-        loss = ce_loss + float(pseudo_weight) * pseudo_ce_loss + teacher_score_loss
+        loss = ce_loss + float(unseen_weight) * unseen_ce_loss + teacher_score_loss
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -3872,10 +4050,8 @@ def train_gipo_student(
         if should_log or should_checkpoint:
             train_ce_for_checkpoint, train_entropy_for_checkpoint = _evaluate_student_ce(
                 sx,
-                base_series_idx,
                 cx,
                 target_mass,
-                target_rows,
             )
         if should_log:
             losses.append(
@@ -3884,28 +4060,31 @@ def train_gipo_student(
                     "student_total_loss": float(loss.detach().cpu().item()),
                     "student_kl_ce_loss": float(ce_loss.detach().cpu().item()),
                     "student_eval_kl_ce_loss": float(train_ce_for_checkpoint),
-                    "student_pseudo_kl_ce_loss": float(pseudo_ce_loss.detach().cpu().item()),
-                    "student_pseudo_weighted_loss": float((float(pseudo_weight) * pseudo_ce_loss).detach().cpu().item()),
+                    "student_unseen_target_kl_ce_loss": float(unseen_ce_loss.detach().cpu().item()),
+                    "student_unseen_target_weighted_loss": float(
+                        (float(unseen_weight) * unseen_ce_loss).detach().cpu().item()
+                    ),
                     "student_teacher_score_eta": float(eta),
                     "student_teacher_score_z_mean": float(teacher_score_z.detach().cpu().item()),
                     "student_teacher_score_mean": float(teacher_score_mean.detach().cpu().item()),
                     "student_teacher_score_loss": float(teacher_score_loss.detach().cpu().item()),
-                    "student_pseudo_teacher_score_z_mean": float(pseudo_teacher_score_z.detach().cpu().item()),
-                    "student_pseudo_teacher_score_mean": float(pseudo_teacher_score_mean.detach().cpu().item()),
+                    "student_unseen_target_teacher_score_z_mean": float(
+                        unseen_teacher_score_z.detach().cpu().item()
+                    ),
+                    "student_unseen_target_teacher_score_mean": float(
+                        unseen_teacher_score_mean.detach().cpu().item()
+                    ),
                     "student_entropy": float(train_entropy_for_checkpoint),
                 }
             )
         if should_checkpoint:
             assert validation_sx is not None
-            assert validation_base_series_idx is not None
             assert validation_cx is not None
             assert validation_target_mass is not None
             validation_ce, validation_entropy = _evaluate_student_ce(
                 validation_sx,
-                validation_base_series_idx,
                 validation_cx,
                 validation_target_mass,
-                validation_target_rows,
             )
             step_value = int(step + 1)
             checkpoint_history.append(
@@ -3986,22 +4165,21 @@ def train_gipo_student(
         "density_protocol": DENSITY_PROTOCOL,
         "student_target_summary": target_summary,
         "student_validation_target_summary": validation_target_summary,
-        "student_pseudo_target_summary": pseudo_summary,
+        "student_unseen_target_summary": unseen_target_summary,
         "teacher_utility_weights": dict(target_summary.get("teacher_utility_weights", {})),
-        "pseudo_distillation_used": bool(pseudo_enabled),
-        "pseudo_target_weight": float(pseudo_weight),
+        "unseen_target_distillation_used": bool(unseen_targets_enabled),
+        "unseen_target_weight": float(unseen_weight),
         "student_teacher_score_enabled": bool(teacher_score_weight > 0.0),
         "student_teacher_score_weight": float(teacher_score_weight),
         "student_teacher_score_warmup_fraction": float(teacher_score_warmup_fraction),
         "student_teacher_score_schedule_steps": int(teacher_score_schedule_steps),
         "student_teacher_score_clip": float(DEFAULT_STUDENT_TEACHER_SCORE_CLIP),
-        "student_teacher_score_include_pseudo": bool(student_teacher_score_include_pseudo),
+        "student_teacher_score_include_unseen_targets": bool(student_teacher_score_include_unseen_targets),
         "student_teacher_score_protocol": "late_ramped_per_cell_teacher_utility_z_score",
         "student_regularizers": {
             "smooth": False,
             "guard": False,
         },
-        "series_conditioning": SERIES_CONDITIONING_NONE_CONTEXT_ONLY,
         "student_weight_decay": float(weight_decay),
         "mode": feature_mode,
         "setting_encoder_config": encoder_config.to_payload(),
@@ -4021,7 +4199,7 @@ def train_gipo_student(
             "student_teacher_score_weight": float(teacher_score_weight),
             "student_teacher_score_warmup_fraction": float(teacher_score_warmup_fraction),
             "student_teacher_score_schedule_steps": int(teacher_score_schedule_steps),
-            "student_teacher_score_include_pseudo": bool(student_teacher_score_include_pseudo),
+            "student_teacher_score_include_unseen_targets": bool(student_teacher_score_include_unseen_targets),
             "student_target_mixture_mode": target_mode,
         },
         "student_log_every": int(student_log_every),
@@ -4051,7 +4229,6 @@ def predict_gipo_density_many(
     *,
     rows: Sequence[MetricRow],
     context_embeddings: Mapping[str, Sequence[float]],
-    series_index_map: Mapping[str, int],
     reference_time_grid: Sequence[float],
     mode: str = SETTING_ENCODER_MODE_CONTINUOUS,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
@@ -4062,14 +4239,12 @@ def predict_gipo_density_many(
     feature_mode = validate_setting_mode(mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     setting_rows: List[torch.Tensor] = []
-    series_rows: List[int] = []
     context_rows: List[np.ndarray] = []
     for row in rows:
         context_embedding_id = context_embedding_id_from_row(row)
         if context_embedding_id not in context_embeddings:
             raise KeyError(f"Missing context embedding for {context_embedding_id}.")
         setting_rows.append(setting_features(str(row["solver_key"]), int(row["target_nfe"]), mode=feature_mode, config=encoder_config))
-        series_rows.append(0)
         context_rows.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
     student.to(device)
     student.eval()
@@ -4077,9 +4252,7 @@ def predict_gipo_density_many(
         masses_t = _student_density_mass(
             student,
             torch.stack(setting_rows, dim=0).to(device=device),
-            torch.tensor(series_rows, dtype=torch.long, device=device),
             torch.tensor(np.stack(context_rows, axis=0), dtype=torch.float32, device=device),
-            rows=rows,
         )
     outputs: List[Dict[str, Any]] = []
     for row, mass_t in zip(rows, masses_t):
@@ -4130,7 +4303,7 @@ __all__ = [
     "DEFAULT_STUDENT_TARGET_ELITE_K",
     "DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT",
     "DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT",
-    "PAPER_STUDENT_TEACHER_SCORE_WEIGHT",
+    "REFERENCE_STUDENT_TEACHER_SCORE_WEIGHT",
     "DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION",
     "DEFAULT_STUDENT_TEACHER_SCORE_CLIP",
     "DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS",
@@ -4144,12 +4317,11 @@ __all__ = [
     "DEFAULT_TRANSFORMER_DROPOUT",
     "DEFAULT_TRANSFORMER_HEADS",
     "DEFAULT_TRANSFORMER_HIDDEN_DIM",
-    "DEFAULT_TRANSFORMER_LAYERS",
+    "DEFAULT_TRANSFORMER_NUM_LAYERS",
     "MODEL_PAYLOAD_VERSION",
+    "COMPATIBLE_GIPO_MODEL_PAYLOAD_VERSIONS",
     "MAX_CONTEXT_CALIBRATION_TOTAL",
     "MIN_CONTEXT_CALIBRATION_TOTAL",
-    "SERIES_CONDITIONING_DIM",
-    "SERIES_CONDITIONING_NONE_CONTEXT_ONLY",
     "STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE",
     "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET",
     "TEACHER_METRIC_MASK_PROTOCOL",
@@ -4159,7 +4331,6 @@ __all__ = [
     "DensityFeatureNormalizer",
     "EmbeddingNormalizer",
     "attach_uniform_gipo_rewards",
-    "build_series_index_map",
     "build_gipo_student_model",
     "build_gipo_teacher_model",
     "build_teacher_weighted_density_targets",
@@ -4172,6 +4343,7 @@ __all__ = [
     "grid_for_schedule",
     "load_context_embedding_table",
     "nfe_sequence_diagnostic_summary",
+    "normalize_gipo_checkpoint_payload",
     "pairwise_rank_loss",
     "predict_gipo_density_many",
     "read_metric_rows_csv",
@@ -4195,6 +4367,5 @@ __all__ = [
     "validate_gipo_support_schedule_keys",
     "validate_student_target_mixture_mode",
     "validate_density_family_holdout_schedule_keys",
-    "validate_series_conditioning",
     "validate_teacher_objective_hyperparameters",
 ]

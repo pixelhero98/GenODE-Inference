@@ -1,418 +1,316 @@
 # GIPO
 
-GIPO is a continuous-density conditional policy for inference-time optimization on frozen optimal-transport flow-matching
-backbones. 
+GIPO is a research-oriented Python package for optimizing numerical ODE
+schedules on frozen optimal-transport flow-matching backbones. It provides:
+
+- GIPO, a context-conditioned continuous-density scheduling policy;
+- fixed and SER schedule evaluation across several solver/NFE settings;
+- restartable reference workflows for temporal and molecular scenarios;
+- portable backbone packaging and integrity validation; and
+- opt-in consistency distillation from GIPO-guided trajectories into a
+  one-evaluation endpoint flow map.
+
+The repository contains code, schemas, tests, and command-line interfaces. It
+does not include datasets, trained checkpoints, benchmark outputs, or private
+infrastructure configuration.
+
+## Project status
+
+The package is alpha research software. The flow-map implementation and quality
+gate are available, but no benchmark campaign is included in this repository.
+New flow-map checkpoints therefore default to
+`quality_gate.status="not_evaluated"`; the pipeline also records
+`quality_status="not_evaluated"` until paired benchmark rows are supplied.
+There is currently no claim that a distilled flow map matches or exceeds GIPO
+or the best fixed schedule.
+
+"One evaluation" refers to one endpoint-map forward pass for each generated
+transition or block. GIPO policy selection and context encoding are reported as
+separate work, and autoregressive consumers still perform their outer rollout.
 
 ## Installation
 
 GIPO requires Python 3.11 or newer.
 
 ```bash
-python -m pip install -e .
-```
-
-Long-Term ST preparation additionally needs WFDB:
-
-```bash
-python -m pip install -e ".[medical]"
-```
-
-Install the test extra before running the development checks:
-
-```bash
+python -m venv .venv
+python -m pip install --upgrade pip
 python -m pip install -e ".[test]"
 ```
 
-Install the PyTorch build appropriate for the target accelerator before
-installing GenODE. Keep generated datasets, checkpoints, reports, and packages
-in ignored project-local directories such as `data/`, `paper_datasets/`,
-`outputs/`, `reports/`, and `dist/`.
+For Long-Term ST preparation, install the medical extra as well:
 
-Commands resolve paths from the current working directory. When running from
-another directory, point GenODE at the workspace explicitly:
-
-```sh
-# POSIX shells
-export GENODE_PROJECT_ROOT=/path/to/genode-workspace
+```bash
+python -m pip install -e ".[medical,test]"
 ```
 
-```powershell
-# PowerShell
-$env:GENODE_PROJECT_ROOT = "C:\path\to\genode-workspace"
-```
+The runtime supports `auto`, `cpu`, `cuda`, and `mps` device selection. Commands
+fail clearly when a requested accelerator is unavailable; they do not silently
+change devices.
 
-The multi-line command examples below use POSIX `\` continuations. In
-PowerShell, enter each command on one line without the continuation characters.
+## Supported solvers and reference profile
 
-## Paper protocol
+The public solver keys are `euler`, `dpmpp2m`, `heun`, and `midpoint_rk2`.
+Target NFE is validated centrally, including the even-NFE requirement for Heun
+and midpoint RK2.
 
-The active policy protocol is `gipo_density`. Each measured fixed or SER
-schedule is represented as a 64-bin probability mass over normalized model time
-`[0, 1]`:
+The bundled reference profile uses five backbone maturities (4000, 8000, 12000,
+16000, and 20000 steps), seen NFEs `(4, 8, 12, 16)`, and unseen NFEs
+`(6, 10, 14, 20)` across nine scenarios:
 
-```text
-reference_edges = linspace(0, 1, 65)
-density_mass[j] = integral of the equal-step schedule density over bin j
-sum(density_mass) = 1
-```
-
-Both teacher and student use strict context-only conditioning: solver/NFE
-features are combined with a frozen backbone context embedding through the
-canonical `additive_mlp` conditioning style. The
-`density_form_transformer` teacher ranks measured candidate densities and
-predicts their metric utilities with rank and Huber objectives. The
-`density_query_transformer` student emits one logit per density bin and is
-trained against a teacher-weighted mixture of measured densities.
-
-Teacher checkpoint selection uses `weighted_normalized_regret` on
-context-disjoint and density-family calibration diagnostics. Student checkpoint
-selection uses `validation_ce` on a context-disjoint calibration split.
-Locked-test rows are reporting-only: they never select teacher or student
-weights. Temporal backbone artifacts are exported at the exact requested
-training budget only, and only after finite validation succeeds.
-
-The paper route is intentionally strict:
-
-- `paper_gipo` is the default and is evaluated alongside the complete required
-  fixed-schedule and SER comparison matrix.
-- `--allow_incomplete_comparison` permits partial exploratory reports for
-  non-paper policies; it cannot relax paper comparison coverage.
-- The full locked test is the default. `--locked_test_preview` explicitly
-  enables a deterministic preview capped at 512 contexts per logical seed;
-  `--locked_test_preview_contexts N` changes that cap and is invalid without
-  preview mode.
-- Ablation students are off by default. `--include_ablations` is required to
-  add them to the full pipeline.
-
-Locked-test context rows and summaries record `checkpoint_step`,
-`locked_test_mode`, `locked_test_context_limit`,
-`locked_test_context_limit_scope`, `selected_examples_cap_source`,
-`selection_was_capped`, and `global_selection_was_capped`, so full and preview
-runs remain distinguishable after serialization.
-
-## Evaluation schema
-
-Public evaluation rows use `scenario_key` for the benchmark scenario and
-`scheduler_key` for the evaluated schedule. The canonical policy and metric
-fields are:
-
-| Field | Meaning |
+| Family | Scenario keys |
 | --- | --- |
-| `scenario_key` | Public evaluation scenario |
-| `scheduler_key` | Fixed, SER, or learned schedule identity |
-| `gipo_step_budget` | GIPO optimization/training budget |
-| `checkpoint_step` | Frozen backbone training step |
-| `teacher_final_retrain` | Final teacher retraining metadata |
-| `method_key` | Policy or baseline identity |
-| `mode` | Canonical policy conditioning mode |
-| `forecast_crps` | Forecast CRPS metric |
-| `forecast_mase` | Forecast MASE metric |
+| Forecast extrapolation | `solar_energy_10m`, `traffic_hourly`, `weather_daily` |
+| Temporal conditional generation | `cryptos`, `lobster_synthetic`, `long_term_st` |
+| Molecule coordinate generation | `molecule_3d_set1`, `molecule_3d_set2`, `molecule_3d_set3` |
 
-Rows also carry the family-appropriate context, solver, NFE, seed, and metric
-metadata. Retired aliases such as `dataset`, `dataset_key`, `schedule_key`,
-`student_gipo_steps`, `selected_gipo_step_budget`, `final_teacher_retrain`,
-`paper_method`, `setting_feature_mode`, `crps`, and `mase` are rejected rather
-than silently translated. Locked-test inputs must agree on checkpoint identity,
-checkpoint step, and context metadata before prediction starts.
+Scenario registration is strict. Custom scenarios must declare their benchmark
+family explicitly instead of relying on name or metric inference.
 
-Training requires:
+## Reference GIPO workflow
 
-- a CSV of fixed/SER per-context rows with stable `scenario_key`, `context_id`,
-  `series_id`, `target_t`, `solver_key`, `target_nfe`, `seed`,
-  `scheduler_key`, `checkpoint_step`, and metric/utility values;
-- a checkpoint-scoped context-embedding NPZ created from the frozen backbone in
-  evaluation/no-grad mode;
-- schedule-summary JSON for any non-fixed supervision schedules, including SER;
-- optionally, unseen-NFE pseudo rows for an explicitly requested pseudo-student
-  ablation. Pseudo rows are never used to fit or select the teacher.
-
-Contexts are paired within the same scenario, solver, NFE, checkpoint, context,
-and logical seed. The physical `context_id` remains stable across checkpoint
-maturities, while the embedding identity remains checkpoint-scoped.
-
-## Evaluation scenarios
-
-The paper matrix contains nine scenarios across three benchmark families:
-
-- Forecast extrapolation: `solar_energy_10m`, `traffic_hourly`,
-  `weather_daily`.
-- Temporal conditional generation: `cryptos`, `lobster_synthetic`,
-  `long_term_st`.
-- Molecule 3D coordinate generation: `molecule_3d_set1`,
-  `molecule_3d_set2`, `molecule_3d_set3`.
-
-Temporal scenarios use checkpoints at 4000, 8000, 12000, 16000, and 20000
-steps: `(3 forecast + 3 conditional generation) x 5 = 30` artifacts. Molecule
-artifacts are counted per trainable fixed-shape stratum, giving `30 + 5N`
-artifacts when `N` molecule strata are present.
-
-Family metrics are:
-
-- forecast: `forecast_crps` and `forecast_mase`;
-- temporal conditional generation: `temporal_cw1`, `temporal_uw1`, and
-  `temporal_tstr_f1` where labels exist;
-- molecule generation: Kabsch RMSD, ensemble velocity/acceleration norm W1,
-  and 16-step autoregressive velocity/acceleration stability errors.
-
-Paper temporal lengths are fixed:
-
-| Scenario | Task | History | Future block | Rollout |
-| --- | --- | ---: | ---: | --- |
-| `solar_energy_10m` | forecast | 1008 | 1008 | `non_ar` |
-| `traffic_hourly` | forecast | 336 | 168 | `non_ar` |
-| `weather_daily` | forecast | 120 | 30 | `non_ar` |
-| `cryptos` | conditional generation | 256 | 128 | `non_ar` |
-| `lobster_synthetic` | conditional generation | 256 | 128 | `non_ar` |
-| `long_term_st` | conditional generation | 12000 | 3000 | `non_ar` |
-
-## External data and licenses
-
-The repository's MIT license covers GenODE software only. It does not relicense
-third-party data or user-supplied molecule trajectories. Review and comply with
-each upstream dataset's terms before downloading, preparing, redistributing, or
-publishing derived data.
-
-Downloads performed by GenODE are pinned and accepted only when both the exact
-published byte size and checksum match:
-
-| Input | Pinned source | Size (bytes) | Checksum | Upstream license |
-| --- | --- | ---: | --- | --- |
-| Solar 10-minute archive | [Zenodo 4656144](https://zenodo.org/records/4656144) | 4,559,353 | MD5 `84c0de18383c911091a3cd274661b029` | CC BY 4.0 |
-| Traffic hourly archive | [Zenodo 4656132](https://zenodo.org/records/4656132) | 22,868,806 | MD5 `1cf694f99f95700217845078b467fb24` | CC BY 4.0 |
-| Weather daily archive | [Zenodo 4654822](https://zenodo.org/records/4654822) | 38,820,451 | MD5 `57155594af0883ccd5e63a5948976796` | CC BY 4.0 |
-| Crypto NPZ | [LoBiFlow revision `2d33cfd6b5e27d2483e2095b22d340813389cd0c`](https://huggingface.co/datasets/mpstoryfans/lobiflow/tree/2d33cfd6b5e27d2483e2095b22d340813389cd0c) | 1,962,160,259 | SHA-256 `124fff5767387373323fcb0ec17cc8b8030fe945d037909786127de6d3942e67` | No license declared in the pinned dataset card |
-| LOBSTER synthetic profile | [same LoBiFlow revision](https://huggingface.co/datasets/mpstoryfans/lobiflow/tree/2d33cfd6b5e27d2483e2095b22d340813389cd0c) | 7,220 | SHA-256 `f92d3ffa3ef3bdbb67d8d45a337328b032727580a89177f967353dccbb40d50f` | No license declared in the pinned dataset card |
-
-The LoBiFlow sizes and digests come from its [pinned checksum
-manifest](https://huggingface.co/datasets/mpstoryfans/lobiflow/blob/2d33cfd6b5e27d2483e2095b22d340813389cd0c/checksums.sha256).
-
-Long-Term ST is obtained separately from [PhysioNet Long-Term ST Database
-v1.0.0](https://physionet.org/content/ltstdb/1.0.0/) under the Open Data Commons
-Attribution License v1.0; cite its version DOI
-[`10.13026/C2G01T`](https://doi.org/10.13026/C2G01T). Molecule trajectory
-archives are user-supplied and retain their original terms.
-
-### Prepare public temporal data
-
-Download and prepare the three pinned Monash/Zenodo forecast scenarios:
-
-```bash
-python -c "from genode.data.otflow_monash_datasets import download_monash_paper_datasets; download_monash_paper_datasets('paper_datasets')"
-```
-
-Download the two pinned LoBiFlow inputs:
-
-```bash
-python -c "from genode.data.otflow_datasets import download_cryptos_npz, download_lobster_synthetic_profile; download_cryptos_npz(); download_lobster_synthetic_profile()"
-```
-
-For Long-Term ST, place the three source archives outside the repository and
-prepare the sanitized 100 Hz context-only data:
-
-```sh
-# POSIX shells
-export OTFLOW_MEDICAL_STAGING_ROOT=/path/to/medical-staging
-```
-
-```powershell
-# PowerShell
-$env:OTFLOW_MEDICAL_STAGING_ROOT = "C:\path\to\medical-staging"
-```
-
-```bash
-python -m pip install -e ".[medical]"
-python -c "from genode.data.otflow_medical_datasets import prepare_long_term_st_dataset; prepare_long_term_st_dataset()"
-```
-
-The preparer extracts only declared WFDB inputs, validates readable signal
-tails, omits header comments and sparse annotations, creates deterministic
-portable channel filenames, and writes a sanitized manifest.
-
-Prepare fixed-shape molecule groups from user-supplied trajectory archives:
-
-```bash
-genode-prepare-molecule-xyz \
-  --balanced_groups \
-  --zip_paths trajectory.zip,additional_trajectory.zip \
-  --group_root data/molecule_3d
-```
-
-## Run the paper workflow
-
-The restartable full pipeline trains and reports `paper_gipo` plus its required
-baselines. Use the canonical scenario key:
+Preview a complete scenario workflow without launching training or evaluation:
 
 ```bash
 genode-run-full-pipeline \
-  --scenario_key traffic_hourly \
-  --device auto
+  --scenario_key solar_energy_10m \
+  --run_root outputs/example \
+  --dry_run
 ```
 
-Add `--locked_test_preview` only for a 512-context-per-seed result preview. Add
-`--include_ablations` only when the paper ablation grid is required.
+The default stages prepare inputs, train or resolve backbones, build fixed/SER
+rows, train `gipo`, and create locked-test reports. `--include_ablations` adds
+the explicit ablation grid. `--stages` accepts a comma-separated subset when a
+smaller workflow is needed; stage-selection flags cannot be combined with an
+explicit stage list.
 
-Generate reusable fixed/SER rows and context embeddings with the schedule
-runner. This example selects one forecast scenario and disables the other
-families:
+GIPO learns a context-conditioned continuous-density policy named
+`gipo_density`. A metric-vector teacher uses pairwise rank plus Huber objectives;
+the student fits teacher-weighted `density_mass` targets on a uniform reference
+grid with context-disjoint validation. The reference candidate set includes
+`uniform`, `late_power_3`, `flowts_power_sampling`, `ays`, `gits`, `ots`, and
+SER schedules. Locked-test labels never participate in policy or checkpoint
+selection.
+
+Use `--backbone_package_root` with `--use_provided_backbones` for downstream
+workflows that must consume validated prebuilt artifacts. Provided-backbone mode
+refuses the `backbone_training` stage.
+
+All paths are configurable. Generated datasets, outputs, reports, and
+checkpoints belong in ignored project-local directories or an explicitly chosen
+external directory; no workstation path is embedded in tracked files.
+
+## Endpoint flow-map distillation
+
+Consistency distillation is opt-in. Demonstrations are generated only from
+training/tuning contexts. Locked-test trajectories are rejected by both the
+collector and manifest loader.
+
+The context input is an NPZ file loaded with `allow_pickle=False` and contains:
+
+- `context_ids`: a one-dimensional Unicode or byte-string array;
+- `histories`: finite floating-point data shaped
+  `[contexts, history_steps, features]`; and
+- optional `conditions`: finite floating-point data shaped
+  `[contexts, condition_features]`.
+
+The default demonstration grid is the four supported solvers crossed with NFEs
+`4, 6, 8, 10, 12, 14, 16, 20`. To choose a subset, pass comma-separated
+`solver_key:target_nfe` pairs.
+
+### Collect demonstrations
 
 ```bash
-genode-run-schedules \
-  --forecast_datasets traffic_hourly \
-  --conditional_generation_datasets '' \
-  --molecule_datasets '' \
-  --split_phase train_tuning \
-  --nfe_role seen \
-  --checkpoint_steps 4000,8000,12000,16000,20000 \
-  --baseline_scheduler_names uniform,late_power_3,flowts_power_sampling,ays,gits,ots \
-  --write_context_rows \
-  --allow_execute \
-  --device auto
+genode-collect-flow-map-demonstrations \
+  --backbone-checkpoint <backbone.pt> \
+  --gipo-checkpoint <gipo_student.pt> \
+  --contexts-npz <train_tuning_contexts.npz> \
+  --output-dir <demonstration-dir> \
+  --split-phase train_tuning \
+  --scenario-key solar_energy_10m \
+  --benchmark-family temporal_extrapolation
 ```
 
-Build and evaluate a SER summary for the same scenario:
+The collector stores checksummed NPZ shards plus
+`flow_map_demonstrations.json`. Manifests use paths relative to their own
+directory and reject traversal, object arrays, corrupt hashes, incompatible
+checkpoint identities, and test-split demonstrations.
+
+### Train the endpoint map
 
 ```bash
-genode-build-ser-ptg-reference \
-  --scenario_key traffic_hourly \
-  --reference_split train_tuning \
-  --device auto
-
-genode-evaluate-schedule-summary \
-  --scenario_key traffic_hourly \
-  --schedule_summary <ser-schedule-summary.json> \
-  --split_phase train_tuning \
-  --write_context_rows \
-  --device auto
+genode-train-flow-map \
+  --demonstration-manifest <demonstration-dir>/flow_map_demonstrations.json \
+  --backbone-checkpoint <backbone.pt> \
+  --gipo-checkpoint <gipo_student.pt> \
+  --output-checkpoint <flow-map.pt> \
+  --summary-json <flow-map-training.json>
 ```
 
-Train the paper density student directly when the prepared inputs already
-exist:
+Training is context-disjoint and validation-selected. The frozen backbone
+conditioner and GIPO policy provide conditioning; the endpoint map is trained
+against teacher endpoints. Its residual parameterization enforces exact terminal
+identity. Source paths are not serialized into the checkpoint—only content
+hashes and portable configuration are stored.
+
+Load the verified one-step sampler with the same source checkpoints used for
+distillation:
+
+```python
+from genode.distillation.checkpoint import load_flow_map_sampler
+
+sampler, metadata = load_flow_map_sampler(
+    "flow-map.pt",
+    backbone_checkpoint="backbone.pt",
+    gipo_checkpoint="gipo_student.pt",
+    device="cpu",
+)
+
+# The bound GIPO policy produces the 64-bin density for this context and setting.
+future = sampler.sample_future(
+    history,
+    solver_key="heun",
+    target_nfe=8,
+)
+```
+
+Advanced callers may pass `density_mass=` explicitly to evaluate a fixed or
+externally supplied schedule. The default path composes the verified GIPO
+policy with the one-evaluation flow map automatically.
+
+### Evaluate quality
+
+Without benchmark rows, create an explicit code-only report:
 
 ```bash
-genode-train-gipo \
-  --rows_csv <context-rows.csv> \
-  --context_embeddings_npz <context-embeddings.npz> \
-  --schedule_summary_json <ser-schedule-summary.json> \
-  --out_dir <gipo-output-dir>
+genode-evaluate-flow-map \
+  --scenario-key solar_energy_10m \
+  --flow-map-checkpoint <flow-map.pt> \
+  --backbone-checkpoint <backbone.pt> \
+  --gipo-checkpoint <gipo_student.pt> \
+  --output-json <flow-map-quality.json> \
+  --not-evaluated-reason "Benchmark rows have not been generated."
 ```
 
-Pseudo-distilled and alternate target-mixture students are ablations, not the
-paper default. To invoke the pseudo student explicitly, provide unseen-NFE rows
-and set its policy key:
+For an evaluated gate, provide paired `validation_tuning` and `locked_test` rows
+for the `flow_map`, `gipo`, and `fixed` methods:
 
 ```bash
-genode-train-gipo \
-  --rows_csv <seen-context-rows.csv> \
-  --context_embeddings_npz <seen-context-embeddings.npz> \
-  --schedule_summary_json <seen-ser-summary.json> \
-  --student_pseudo_rows_csv <unseen-pseudo-rows.csv> \
-  --student_pseudo_context_embeddings_npz <unseen-context-embeddings.npz> \
-  --student_pseudo_schedule_summary_json <unseen-ser-summary.json> \
-  --student_policy_key pseudo_gipo \
-  --out_dir <ablation-output-dir>
+genode-evaluate-flow-map \
+  --rows-csv <paired-quality-rows.csv> \
+  --scenario-key solar_energy_10m \
+  --flow-map-checkpoint <flow-map.pt> \
+  --backbone-checkpoint <backbone.pt> \
+  --gipo-checkpoint <gipo_student.pt> \
+  --output-json <flow-map-quality.json>
 ```
 
-Report a frozen paper student on complete locked-test inputs:
+Each row requires `split_phase`, `method`, `candidate_key`, `solver_key`,
+`target_nfe`, `context_id`, a prespecified `selection_utility`, the scenario's
+primary metrics, and the scenario/backbone/GIPO/flow-map content hashes.
+Conditional metric applicability columns are required where declared by the
+scenario. Candidate settings are selected on validation only and then frozen.
+Validation and locked-test panels must be disjoint, rows must be unique, and at
+least 20 paired locked-test contexts are required. The gate applies a
+zero-margin, one-sided paired bootstrap comparison against both GIPO and fixed
+comparators with Holm familywise correction. A passing report is evidence for
+the exact hash-bound rows and checkpoint only; it is not inferred from training
+loss.
+
+### Pipeline integration
+
+The three distillation stages can be appended to the reference workflow:
 
 ```bash
-genode-report-gipo-locked-test \
-  --gipo_student_checkpoint <gipo-output-dir>/gipo_student.pt \
-  --training_summary <gipo-output-dir>/gipo_training_summary.json \
-  --scenario_key traffic_hourly \
-  --checkpoint_step 20000 \
-  --context_rows <locked-fixed-rows.csv>,<locked-ser-rows.csv> \
-  --baseline_rows <locked-fixed-rows.csv> \
-  --comparator_rows <locked-ser-rows.csv> \
-  --context_embeddings_npz <locked-context-embeddings.npz> \
-  --out_dir <locked-report-dir> \
-  --device auto
+genode-run-full-pipeline \
+  --scenario_key solar_energy_10m \
+  --run_root outputs/example \
+  --include_flow_map \
+  --flow_map_backbone_checkpoint <backbone.pt> \
+  --flow_map_contexts_npz <train_tuning_contexts.npz> \
+  --dry_run
 ```
+
+The pipeline reuses the checkpoint produced by `train_gipo` unless
+`--flow_map_gipo_checkpoint` is supplied. If
+`--flow_map_quality_rows_csv` is omitted, `evaluate_flow_map` writes a
+`not_evaluated` report and makes no performance claim. The stages are also
+available explicitly as `collect_flow_map_demonstrations`, `train_flow_map`, and
+`evaluate_flow_map`.
 
 ## Portable backbone packages
 
-Backbone packages contain a single family, its ready artifacts, the relevant
-processed data, a POSIX-relative manifest, and a checksum inventory. Packaging
-rejects links, junctions, reparse points, escaping paths, and local workstation
-paths, then self-validates the staging tree before publishing it or its zip.
-
-Create each supported family package from a complete workspace:
+Build and validate a self-contained family package:
 
 ```bash
 genode-package-backbone-family \
   --family temporal-extrapolation \
-  --source_root . \
-  --output_dir dist/backbone-packages
+  --output_dir <package-output>
 
-genode-package-backbone-family \
-  --family temporal-generation \
-  --source_root . \
-  --output_dir dist/backbone-packages
-
-genode-package-backbone-family \
-  --family molecule-coord-generation \
-  --source_root . \
-  --output_dir dist/backbone-packages
-```
-
-Validate an extracted package before use:
-
-```bash
 genode-validate-backbone-package \
-  dist/backbone-packages/genode_temporal_extrapolation_backbones_datasets \
+  <package-output>/genode_temporal_extrapolation_backbones_datasets \
   --expected_family temporal-extrapolation
 ```
 
-For downstream-only pipeline stages, pass the validated extracted directory via
-`--backbone_package_root` together with `--use_provided_backbones`.
+Package creation is staged atomically using short temporary paths for Windows
+compatibility. Validation checks relative paths, checksums, file sizes, artifact
+grids, checkpoint loadability, and symlink/reparse-point safety.
+
+## Data and licensing
+
+The MIT license covers GenODE software only. It does not relicense third-party
+datasets or user-supplied molecule trajectories. Review upstream terms before
+downloading, redistributing, or publishing derived data.
+
+The temporal reference inputs are pinned by size and checksum in the data
+modules. Forecast archives come from the Monash forecasting collection on
+Zenodo ([solar](https://zenodo.org/records/4656144),
+[traffic](https://zenodo.org/records/4656132), and
+[weather](https://zenodo.org/records/4654822)). Crypto and LOBSTER inputs use a
+pinned [LoBiFlow revision](https://huggingface.co/datasets/mpstoryfans/lobiflow/tree/2d33cfd6b5e27d2483e2095b22d340813389cd0c),
+whose dataset card does not declare a license. Long-Term ST comes from
+[PhysioNet](https://physionet.org/content/ltstdb/1.0.0/) under the Open Data
+Commons Attribution License; molecule archives remain user supplied.
+
+Data preparation is explicit and never runs during import or tests. See each
+preparation command's `--help` and keep source archives outside version control.
 
 ## Command-line interfaces
 
-The package installs 15 console entry points:
-
 | Command | Purpose |
 | --- | --- |
-| `genode-run-schedules` | Evaluate fixed or supplied schedules and write context rows |
-| `genode-run-full-pipeline` | Run the paper-first multi-stage GIPO workflow |
-| `genode-train-backbone` | Train a temporal OT flow-matching backbone |
-| `genode-prepare-molecule-xyz` | Prepare fixed-shape molecule scenario groups |
-| `genode-train-molecule-backbone` | Train molecule backbones by fixed-shape stratum |
-| `genode-eval-molecule-backbone` | Evaluate molecule backbone metrics and rollouts |
-| `genode-train-gipo` | Train a GIPO teacher and student |
-| `genode-preflight-gipo-rows` | Validate GIPO rows and schedule support before training |
-| `genode-report-gipo-locked-test` | Report a frozen student against locked-test baselines |
-| `genode-build-ser-ptg-reference` | Build SER-PTG reference schedules |
-| `genode-evaluate-schedule-summary` | Evaluate a supplied schedule-summary artifact |
-| `genode-build-hardness-figure` | Build the hardness-mismatch figure |
-| `genode-build-ptg-figure` | Build the PTG observed-gain figure |
-| `genode-package-backbone-family` | Build a portable, self-validated family package |
-| `genode-validate-backbone-package` | Validate an extracted family package |
+| `genode-run-schedules` | Evaluate fixed and transferred schedules |
+| `genode-run-full-pipeline` | Run the restartable multi-stage workflow |
+| `genode-train-backbone` | Train a temporal OTFlow backbone |
+| `genode-prepare-molecule-xyz` | Prepare molecule trajectory groups |
+| `genode-train-molecule-backbone` | Train a molecule backbone |
+| `genode-eval-molecule-backbone` | Evaluate a molecule backbone |
+| `genode-train-gipo` | Train the GIPO teacher and student |
+| `genode-preflight-gipo-rows` | Validate GIPO rows and schedule coverage |
+| `genode-report-gipo-locked-test` | Report a frozen GIPO policy |
+| `genode-build-ser-ptg-reference` | Build SER/PTG schedule summaries |
+| `genode-evaluate-schedule-summary` | Validate schedule-summary results |
+| `genode-package-backbone-family` | Create a portable backbone/data package |
+| `genode-validate-backbone-package` | Validate a portable package |
+| `genode-collect-flow-map-demonstrations` | Collect GIPO-guided trajectories |
+| `genode-train-flow-map` | Train an endpoint flow map |
+| `genode-evaluate-flow-map` | Apply the validation-frozen quality gate |
 
-Run `<command> --help` for the authoritative interface.
+Every console command supports `--help`.
 
-## Source layout
+## Development checks
 
-- `src/genode/data/`: scenario definitions, secure preparation, split builders,
-  experiment plans, and project-relative paths.
-- `src/genode/models/`: OT flow-matching configuration, conditioning,
-  backbones, and model utilities.
-- `src/genode/schedule_transfer/`: schedule construction, registries, signal
-  traces, and protocol diagnostics.
-- `src/genode/evaluation/`: checkpoint loading, schedule evaluation, solver
-  mappings, and sampling.
-- `src/genode/gipo/`: density representation, teacher/student models,
-  training, SER-PTG references, schema validation, and locked-test reporting.
-- `tests/`: protocol, interface, portability, and regression tests.
-
-## Development Checks
+The local verification suite uses synthetic/unit inputs only; it does not run
+training or benchmark experiments.
 
 ```bash
-python -m pip install -e ".[test]"
 python -m pytest -q
-python -m compileall -q src tests
+python -m ruff check .
+python -m compileall -q src
 python -m pip check
 git diff --check
+python -m build
 ```
 
-These cross-platform commands do not run real training, locked-test evaluation,
-or large dataset downloads. Python bytecode and coverage outputs are ignored by
-default.
+Continuous integration runs the unit suite on Linux and Windows, checks package
+installation, and invokes `--help` for every registered console command.

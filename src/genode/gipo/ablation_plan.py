@@ -4,9 +4,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Sequence, Tuple
 
 from genode.experiment_layout import (
-    PAPER_PSEUDO_TARGET_WEIGHT,
+    REFERENCE_UNSEEN_TARGET_WEIGHT,
     STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
-    STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO,
+    STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
 )
 from genode.gipo.policy import (
     DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
@@ -14,12 +14,12 @@ from genode.gipo.policy import (
     DEFAULT_STUDENT_TARGET_ELITE_K,
     DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT,
     DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION,
-    PAPER_STUDENT_TEACHER_SCORE_WEIGHT,
+    REFERENCE_STUDENT_TEACHER_SCORE_WEIGHT,
 )
 
 ABLATION_PRESET_MAIN = "main"
 ABLATION_PRESET_ALL = "main_and_appendix"
-PAPER_STUDENT_POLICY_KEY = "paper_gipo"
+GIPO_POLICY_KEY = "gipo"
 
 
 @dataclass(frozen=True)
@@ -31,15 +31,15 @@ class GipoStudentPolicy:
     comparison_group: str
     student_target_elite_blend_all_weight: float = DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT
     student_teacher_score_warmup_fraction: float = DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION
-    student_teacher_score_include_pseudo: bool = False
+    student_teacher_score_include_unseen_targets: bool = False
     student_target_elite_fraction: float = DEFAULT_STUDENT_TARGET_ELITE_FRACTION
     student_target_elite_k: int = DEFAULT_STUDENT_TARGET_ELITE_K
     student_target_elite_min_count: int = DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT
-    student_pseudo_target_weight: float = PAPER_PSEUDO_TARGET_WEIGHT
+    student_unseen_target_weight: float = REFERENCE_UNSEEN_TARGET_WEIGHT
 
     @property
-    def uses_unseen_pseudo_targets(self) -> bool:
-        return self.student_training_mode == STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO
+    def uses_unseen_targets(self) -> bool:
+        return self.student_training_mode == STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET
 
     def objective_settings(self) -> Dict[str, Any]:
         return {
@@ -50,7 +50,9 @@ class GipoStudentPolicy:
             "student_target_elite_blend_all_weight": float(self.student_target_elite_blend_all_weight),
             "student_teacher_score_weight": float(self.student_teacher_score_weight),
             "student_teacher_score_warmup_fraction": float(self.student_teacher_score_warmup_fraction),
-            "student_teacher_score_include_pseudo": bool(self.student_teacher_score_include_pseudo),
+            "student_teacher_score_include_unseen_targets": bool(
+                self.student_teacher_score_include_unseen_targets
+            ),
         }
 
     def manifest_record(self) -> Dict[str, Any]:
@@ -58,36 +60,132 @@ class GipoStudentPolicy:
             "student_policy_key": self.policy_key,
             "comparison_group": self.comparison_group,
             "student_training_mode": self.student_training_mode,
-            "uses_unseen_pseudo_targets": bool(self.uses_unseen_pseudo_targets),
-            "student_pseudo_target_weight": float(self.student_pseudo_target_weight),
+            "uses_unseen_targets": bool(self.uses_unseen_targets),
+            "student_unseen_target_weight": float(self.student_unseen_target_weight),
             "student_objective_settings": self.objective_settings(),
         }
 
 
-_PAPER_STUDENT_POLICY = GipoStudentPolicy(
-    PAPER_STUDENT_POLICY_KEY,
+_GIPO_POLICY = GipoStudentPolicy(
+    GIPO_POLICY_KEY,
     STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
     "full",
-    PAPER_STUDENT_TEACHER_SCORE_WEIGHT,
-    "paper",
+    REFERENCE_STUDENT_TEACHER_SCORE_WEIGHT,
+    "reference",
 )
 
 _ABLATION_POLICIES: Tuple[GipoStudentPolicy, ...] = (
-    GipoStudentPolicy("full_seen_only_score_000", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "full", 0.00, "main"),
-    GipoStudentPolicy("full_seen_only_score_005", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "full", 0.05, "main"),
-    GipoStudentPolicy("full_seen_plus_pseudo_score_005", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO, "full", 0.05, "main"),
-    GipoStudentPolicy("elite_seen_only_score_005", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "elite", 0.05, "main"),
-    GipoStudentPolicy("blend_020_seen_only_score_005", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "elite_blend", 0.05, "main", 0.20),
-    GipoStudentPolicy("blend_020_seen_plus_pseudo_score_005", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO, "elite_blend", 0.05, "main", 0.20),
-    GipoStudentPolicy("full_seen_only_score_010", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "full", 0.10, "appendix"),
-    GipoStudentPolicy("full_seen_plus_pseudo_score_000", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO, "full", 0.00, "appendix"),
-    GipoStudentPolicy("full_seen_plus_pseudo_score_001", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO, "full", 0.01, "appendix"),
-    GipoStudentPolicy("full_seen_plus_pseudo_score_010", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO, "full", 0.10, "appendix"),
-    GipoStudentPolicy("elite_seen_plus_pseudo_score_005", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO, "elite", 0.05, "appendix"),
-    GipoStudentPolicy("blend_010_seen_only_score_005", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "elite_blend", 0.05, "appendix", 0.10),
-    GipoStudentPolicy("blend_040_seen_only_score_005", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "elite_blend", 0.05, "appendix", 0.40),
-    GipoStudentPolicy("blend_010_seen_plus_pseudo_score_005", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO, "elite_blend", 0.05, "appendix", 0.10),
-    GipoStudentPolicy("blend_040_seen_plus_pseudo_score_005", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_PSEUDO, "elite_blend", 0.05, "appendix", 0.40),
+    GipoStudentPolicy(
+        "full_seen_only_score_000",
+        STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
+        "full",
+        0.00,
+        "main",
+    ),
+    GipoStudentPolicy(
+        "full_seen_only_score_005",
+        STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
+        "full",
+        0.05,
+        "main",
+    ),
+    GipoStudentPolicy(
+        "full_seen_plus_unseen_target_score_005",
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
+        "full",
+        0.05,
+        "main",
+    ),
+    GipoStudentPolicy(
+        "elite_seen_only_score_005",
+        STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
+        "elite",
+        0.05,
+        "main",
+    ),
+    GipoStudentPolicy(
+        "blend_020_seen_only_score_005",
+        STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
+        "elite_blend",
+        0.05,
+        "main",
+        0.20,
+    ),
+    GipoStudentPolicy(
+        "blend_020_seen_plus_unseen_target_score_005",
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
+        "elite_blend",
+        0.05,
+        "main",
+        0.20,
+    ),
+    GipoStudentPolicy(
+        "full_seen_only_score_010",
+        STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
+        "full",
+        0.10,
+        "appendix",
+    ),
+    GipoStudentPolicy(
+        "full_seen_plus_unseen_target_score_000",
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
+        "full",
+        0.00,
+        "appendix",
+    ),
+    GipoStudentPolicy(
+        "full_seen_plus_unseen_target_score_001",
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
+        "full",
+        0.01,
+        "appendix",
+    ),
+    GipoStudentPolicy(
+        "full_seen_plus_unseen_target_score_010",
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
+        "full",
+        0.10,
+        "appendix",
+    ),
+    GipoStudentPolicy(
+        "elite_seen_plus_unseen_target_score_005",
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
+        "elite",
+        0.05,
+        "appendix",
+    ),
+    GipoStudentPolicy(
+        "blend_010_seen_only_score_005",
+        STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
+        "elite_blend",
+        0.05,
+        "appendix",
+        0.10,
+    ),
+    GipoStudentPolicy(
+        "blend_040_seen_only_score_005",
+        STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
+        "elite_blend",
+        0.05,
+        "appendix",
+        0.40,
+    ),
+    GipoStudentPolicy(
+        "blend_010_seen_plus_unseen_target_score_005",
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
+        "elite_blend",
+        0.05,
+        "appendix",
+        0.10,
+    ),
+    GipoStudentPolicy(
+        "blend_040_seen_plus_unseen_target_score_005",
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
+        "elite_blend",
+        0.05,
+        "appendix",
+        0.40,
+    ),
 )
 
 _PRESETS: Mapping[str, Tuple[GipoStudentPolicy, ...]] = {
@@ -107,16 +205,16 @@ def ablation_student_policies(preset: str = ABLATION_PRESET_ALL) -> Tuple[GipoSt
         raise ValueError(f"Unknown GIPO ablation preset {preset!r}; expected one of {tuple(_PRESETS)}.") from exc
 
 
-def paper_student_policy() -> GipoStudentPolicy:
-    return _PAPER_STUDENT_POLICY
+def gipo_policy() -> GipoStudentPolicy:
+    return _GIPO_POLICY
 
 
 __all__ = [
     "ABLATION_PRESET_ALL",
     "ABLATION_PRESET_MAIN",
     "GipoStudentPolicy",
-    "PAPER_STUDENT_POLICY_KEY",
+    "GIPO_POLICY_KEY",
     "ablation_preset_keys",
     "ablation_student_policies",
-    "paper_student_policy",
+    "gipo_policy",
 ]

@@ -10,8 +10,8 @@ from unittest import mock
 
 from genode.experiment_layout import (
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
-    PAPER_SEEN_NFES,
-    PAPER_UNSEEN_NFES,
+    REFERENCE_SEEN_NFES,
+    REFERENCE_UNSEEN_NFES,
     SCENARIO_FAMILY_CONDITIONAL_GENERATION,
     SCENARIO_FAMILY_FORECAST,
 )
@@ -125,7 +125,7 @@ def _trainer_args(root: Path, rows_csv: Path, embeddings_npz: Path, *extra: str)
             "u_comp_uniform",
             "--transformer_hidden_dim",
             "16",
-            "--transformer_layers",
+            "--num_layers",
             "1",
             "--transformer_heads",
             "4",
@@ -138,7 +138,7 @@ def _trainer_args(root: Path, rows_csv: Path, embeddings_npz: Path, *extra: str)
 
 
 class GipoTrainOptionsTests(unittest.TestCase):
-    def test_parser_defaults_keep_paper_seen_and_pseudo_nfes(self) -> None:
+    def test_parser_defaults_keep_reference_seen_and_unseen_target_nfes(self) -> None:
         args = build_argparser().parse_args(
             [
                 "--rows_csv",
@@ -151,7 +151,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
         )
 
         self.assertEqual(args.seen_target_nfe_values, "4,8,12,16")
-        self.assertEqual(args.pseudo_target_nfe_values, "6,10,14,20")
+        self.assertEqual(args.unseen_target_nfe_values, "6,10,14,20")
         self.assertEqual(args.teacher_metric_min_coverage_fraction, 1.0)
         self.assertEqual(args.teacher_metric_min_valid_rows, 1)
 
@@ -177,7 +177,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             root = Path(tmpdir)
             rows_csv = root / "seen.csv"
             embeddings_npz = root / "ctx.npz"
-            _write_rows(rows_csv, target_nfes=PAPER_SEEN_NFES)
+            _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES)
             _write_embeddings(embeddings_npz)
             args = build_argparser().parse_args(
                 [
@@ -200,7 +200,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Default teacher_density_holdout_schedule_keys"):
                 train_gipo(args)
 
-    def test_auto_teacher_targets_fall_back_for_unknown_scenario_keys(self) -> None:
+    def test_auto_teacher_targets_require_family_for_custom_scenarios(self) -> None:
         args = argparse.Namespace(teacher_metric_target_keys="auto")
         expected = tuple(spec.utility_key for spec in FORECAST_METRIC_SPECS)
 
@@ -211,13 +211,11 @@ class GipoTrainOptionsTests(unittest.TestCase):
             ),
             expected,
         )
-        self.assertEqual(
+        with self.assertRaisesRegex(KeyError, "Unknown reference scenario key"):
             _resolve_teacher_metric_target_keys(
                 args,
                 [{"scenario_key": "private_forecast_dataset", "forecast_crps": "1.0", "forecast_mase": "1.0"}],
-            ),
-            expected,
-        )
+            )
         self.assertEqual(
             _resolve_teacher_metric_target_keys(
                 args,
@@ -243,7 +241,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
 
         self.assertEqual(summary["status"], "dry_run")
         self.assertEqual(summary["seen_target_nfe_values"], [5, 7])
-        self.assertEqual(summary["paper_seen_nfes"], list(PAPER_SEEN_NFES))
+        self.assertEqual(summary["reference_seen_nfes"], list(REFERENCE_SEEN_NFES))
 
     def test_context_sample_count_is_per_checkpoint_maturity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -306,7 +304,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
         self.assertEqual(summary["context_sampling"]["per_checkpoint"]["ckpt_b"]["selected_contexts"], 3)
         self.assertEqual(summary["context_sampling"]["checkpoint_count"], 2)
 
-    def test_legacy_checkpoint_prefixed_context_ids_are_rejected(self) -> None:
+    def test_retired_checkpoint_prefixed_context_ids_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             rows_csv = root / "seen.csv"
@@ -318,8 +316,8 @@ class GipoTrainOptionsTests(unittest.TestCase):
                 writer.writeheader()
                 for checkpoint_idx, checkpoint_id in enumerate(("ckpt_a", "ckpt_b")):
                     for ctx_idx, physical_context_id in enumerate(contexts):
-                        legacy_context_id = f"{checkpoint_id}:{physical_context_id}"
-                        embeddings[legacy_context_id] = [float(ctx_idx), float(checkpoint_idx)]
+                        retired_context_id = f"{checkpoint_id}:{physical_context_id}"
+                        embeddings[retired_context_id] = [float(ctx_idx), float(checkpoint_idx)]
                         for target_nfe in (5, 7):
                             for schedule_idx, scheduler_key in enumerate(SUPPORT_SCHEDULES):
                                 writer.writerow(
@@ -331,8 +329,8 @@ class GipoTrainOptionsTests(unittest.TestCase):
                                         "solver_key": "euler",
                                         "target_nfe": target_nfe,
                                         "scheduler_key": scheduler_key,
-                                        "context_id": legacy_context_id,
-                                        "context_embedding_id": legacy_context_id,
+                                        "context_id": retired_context_id,
+                                        "context_embedding_id": retired_context_id,
                                         "checkpoint_id": checkpoint_id,
                                         "series_id": f"series_{ctx_idx}",
                                         "target_t": 100 + ctx_idx,
@@ -350,15 +348,15 @@ class GipoTrainOptionsTests(unittest.TestCase):
         _assert_embedding_overlap_compatible(
             {"ckpt:ctx": [0.0, -0.42962583899497986, 3.586855173110962]},
             {"ckpt:ctx": [2.5e-6, -0.42962586879730225, 3.586855173110962]},
-            label="student_pseudo",
+            label="student_unseen_target",
         )
 
     def test_embedding_overlap_rejects_material_difference(self) -> None:
-        with self.assertRaisesRegex(ValueError, r"student_pseudo context embeddings collide.*max_abs_diff"):
+        with self.assertRaisesRegex(ValueError, r"student_unseen_target context embeddings collide.*max_abs_diff"):
             _assert_embedding_overlap_compatible(
                 {"ckpt:ctx": [0.0, 1.0]},
                 {"ckpt:ctx": [1.0e-3, 1.0]},
-                label="student_pseudo",
+                label="student_unseen_target",
             )
 
     def test_dry_run_reports_split_normalizer_scopes_and_effective_selection_weights(self) -> None:
@@ -366,7 +364,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             root = Path(tmpdir)
             rows_csv = root / "seen.csv"
             embeddings_npz = root / "ctx.npz"
-            _write_rows(rows_csv, target_nfes=PAPER_SEEN_NFES, schedules=("uniform", "late_power_3", "flowts_power_sampling"))
+            _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES, schedules=("uniform", "late_power_3", "flowts_power_sampling"))
             _write_embeddings(embeddings_npz)
 
             summary = train_gipo(
@@ -403,7 +401,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             root = Path(tmpdir)
             rows_csv = root / "seen.csv"
             embeddings_npz = root / "ctx.npz"
-            _write_rows(rows_csv, target_nfes=PAPER_SEEN_NFES)
+            _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES)
             _write_embeddings(embeddings_npz)
 
             with self.assertRaisesRegex(ValueError, r"Teacher metric target coverage failed.*u_alt_uniform"):
@@ -438,7 +436,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
 
     def test_train_gipo_rejects_utility_rows_with_invalid_reward_metadata(self) -> None:
         cases = [
-            ({"gipo_reward_protocol": "legacy"}, "gipo_reward_protocol"),
+            ({"gipo_reward_protocol": "retired"}, "gipo_reward_protocol"),
             ({"reward_anchor_scheduler_key": "late_power_3"}, "reward_anchor_scheduler_key"),
             ({"reward_utility_transform": "raw_ratio"}, "reward_utility_transform"),
             ({"reward_metric_weights_json": ""}, "missing reward_metric_weights_json"),
@@ -454,7 +452,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
                     root = Path(tmpdir)
                     rows_csv = root / "seen.csv"
                     embeddings_npz = root / "ctx.npz"
-                    _write_rows(rows_csv, target_nfes=PAPER_SEEN_NFES, row_overrides=overrides)
+                    _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES, row_overrides=overrides)
                     _write_embeddings(embeddings_npz)
 
                     with self.assertRaisesRegex(ValueError, pattern):
@@ -466,7 +464,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             ({"train_tuning_sampler": "temporal_random"}, "train_tuning_sampler"),
             (
                 {"selected_examples_cap": TRAIN_TUNING_CONTEXT_SAMPLE_COUNT + 1},
-                f"selected_examples_cap must not exceed the paper context cap {TRAIN_TUNING_CONTEXT_SAMPLE_COUNT}",
+                f"selected_examples_cap must not exceed the reference context cap {TRAIN_TUNING_CONTEXT_SAMPLE_COUNT}",
             ),
         ]
         for overrides, pattern in cases:
@@ -475,21 +473,21 @@ class GipoTrainOptionsTests(unittest.TestCase):
                     root = Path(tmpdir)
                     rows_csv = root / "seen.csv"
                     embeddings_npz = root / "ctx.npz"
-                    _write_rows(rows_csv, target_nfes=PAPER_SEEN_NFES, row_overrides=overrides)
+                    _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES, row_overrides=overrides)
                     _write_embeddings(embeddings_npz)
 
                     with self.assertRaisesRegex(ValueError, pattern):
                         train_gipo(_trainer_args(root, rows_csv, embeddings_npz))
 
-    def test_train_gipo_rejects_context_sample_count_above_paper_cap(self) -> None:
+    def test_train_gipo_rejects_context_sample_count_above_reference_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             rows_csv = root / "seen.csv"
             embeddings_npz = root / "ctx.npz"
-            _write_rows(rows_csv, target_nfes=PAPER_SEEN_NFES, row_overrides={"selected_examples_cap": ""})
+            _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES, row_overrides={"selected_examples_cap": ""})
             _write_embeddings(embeddings_npz)
 
-            with self.assertRaisesRegex(ValueError, "must not exceed the paper GIPO supervision cap"):
+            with self.assertRaisesRegex(ValueError, "must not exceed the reference GIPO supervision cap"):
                 train_gipo(
                     _trainer_args(
                         root,
@@ -548,14 +546,14 @@ class GipoTrainOptionsTests(unittest.TestCase):
 
         teacher_train.assert_not_called()
 
-    def test_pseudo_target_nfe_values_filter_rows_and_summary(self) -> None:
+    def test_unseen_target_nfe_values_filter_rows_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             seen_csv = root / "seen.csv"
-            pseudo_csv = root / "pseudo.csv"
+            unseen_csv = root / "unseen.csv"
             embeddings_npz = root / "ctx.npz"
-            _write_rows(seen_csv, target_nfes=PAPER_SEEN_NFES)
-            _write_rows(pseudo_csv, target_nfes=(5, 6, 7))
+            _write_rows(seen_csv, target_nfes=REFERENCE_SEEN_NFES)
+            _write_rows(unseen_csv, target_nfes=(5, 6, 7))
             _write_embeddings(embeddings_npz)
 
             summary = train_gipo(
@@ -563,41 +561,41 @@ class GipoTrainOptionsTests(unittest.TestCase):
                     root,
                     seen_csv,
                     embeddings_npz,
-                    "--student_pseudo_rows_csv",
-                    str(pseudo_csv),
-                    "--student_pseudo_context_embeddings_npz",
+                    "--student_unseen_target_rows_csv",
+                    str(unseen_csv),
+                    "--student_unseen_target_context_embeddings_npz",
                     str(embeddings_npz),
-                    "--pseudo_target_nfe_values",
+                    "--unseen_target_nfe_values",
                     "5,7",
                 )
             )
 
         self.assertEqual(summary["status"], "dry_run")
-        self.assertEqual(summary["pseudo_target_nfe_values"], [5, 7])
-        self.assertEqual(summary["paper_unseen_nfes"], list(PAPER_UNSEEN_NFES))
-        self.assertEqual(summary["student_pseudo_distillation"]["target_nfes"], [5, 7])
-        self.assertEqual(summary["split_counts"]["student_pseudo"]["row_count"], 12)
+        self.assertEqual(summary["unseen_target_nfe_values"], [5, 7])
+        self.assertEqual(summary["reference_unseen_nfes"], list(REFERENCE_UNSEEN_NFES))
+        self.assertEqual(summary["student_unseen_target_distillation"]["target_nfes"], [5, 7])
+        self.assertEqual(summary["split_counts"]["student_unseen_target"]["row_count"], 12)
 
-    def test_unused_pseudo_embedding_overlap_does_not_block_training(self) -> None:
+    def test_unused_unseen_embedding_overlap_does_not_block_training(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             seen_csv = root / "seen.csv"
-            pseudo_csv = root / "pseudo.csv"
+            unseen_csv = root / "unseen.csv"
             seen_embeddings_npz = root / "seen_ctx.npz"
-            pseudo_embeddings_npz = root / "pseudo_ctx.npz"
-            _write_rows(seen_csv, target_nfes=PAPER_SEEN_NFES)
+            unseen_embeddings_npz = root / "unseen_ctx.npz"
+            _write_rows(seen_csv, target_nfes=REFERENCE_SEEN_NFES)
             _write_rows(
-                pseudo_csv,
-                target_nfes=PAPER_UNSEEN_NFES,
-                contexts=("pseudo_ctx_0", "pseudo_ctx_1", "pseudo_ctx_2"),
+                unseen_csv,
+                target_nfes=REFERENCE_UNSEEN_NFES,
+                contexts=("unseen_ctx_0", "unseen_ctx_1", "unseen_ctx_2"),
             )
             _write_embeddings(seen_embeddings_npz)
             save_context_embedding_table(
-                pseudo_embeddings_npz,
+                unseen_embeddings_npz,
                 {
-                    "pseudo_ctx_0": [0.0, 1.0],
-                    "pseudo_ctx_1": [1.0, 0.0],
-                    "pseudo_ctx_2": [2.0, -1.0],
+                    "unseen_ctx_0": [0.0, 1.0],
+                    "unseen_ctx_1": [1.0, 0.0],
+                    "unseen_ctx_2": [2.0, -1.0],
                     "ctx_0": [99.0, 99.0],
                 },
             )
@@ -607,77 +605,77 @@ class GipoTrainOptionsTests(unittest.TestCase):
                     root,
                     seen_csv,
                     seen_embeddings_npz,
-                    "--student_pseudo_rows_csv",
-                    str(pseudo_csv),
-                    "--student_pseudo_context_embeddings_npz",
-                    str(pseudo_embeddings_npz),
+                    "--student_unseen_target_rows_csv",
+                    str(unseen_csv),
+                    "--student_unseen_target_context_embeddings_npz",
+                    str(unseen_embeddings_npz),
                 )
             )
 
         self.assertEqual(summary["status"], "dry_run")
-        self.assertEqual(summary["student_pseudo_distillation"]["selected_context_count"], 3)
+        self.assertEqual(summary["student_unseen_target_distillation"]["selected_context_count"], 3)
 
-    def test_selected_pseudo_embedding_overlap_still_rejects_material_difference(self) -> None:
+    def test_selected_unseen_embedding_overlap_still_rejects_material_difference(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             seen_csv = root / "seen.csv"
-            pseudo_csv = root / "pseudo.csv"
+            unseen_csv = root / "unseen.csv"
             seen_embeddings_npz = root / "seen_ctx.npz"
-            pseudo_embeddings_npz = root / "pseudo_ctx.npz"
-            _write_rows(seen_csv, target_nfes=PAPER_SEEN_NFES)
-            _write_rows(pseudo_csv, target_nfes=PAPER_UNSEEN_NFES)
+            unseen_embeddings_npz = root / "unseen_ctx.npz"
+            _write_rows(seen_csv, target_nfes=REFERENCE_SEEN_NFES)
+            _write_rows(unseen_csv, target_nfes=REFERENCE_UNSEEN_NFES)
             _write_embeddings(seen_embeddings_npz)
             save_context_embedding_table(
-                pseudo_embeddings_npz,
+                unseen_embeddings_npz,
                 {"ctx_0": [0.5, 1.0], "ctx_1": [1.0, 0.0], "ctx_2": [2.0, -1.0]},
             )
 
-            with self.assertRaisesRegex(ValueError, r"student_pseudo context embeddings collide.*ctx_0"):
+            with self.assertRaisesRegex(ValueError, r"student_unseen_target context embeddings collide.*ctx_0"):
                 train_gipo(
                     _trainer_args(
                         root,
                         seen_csv,
                         seen_embeddings_npz,
-                        "--student_pseudo_rows_csv",
-                        str(pseudo_csv),
-                        "--student_pseudo_context_embeddings_npz",
-                        str(pseudo_embeddings_npz),
+                        "--student_unseen_target_rows_csv",
+                        str(unseen_csv),
+                        "--student_unseen_target_context_embeddings_npz",
+                        str(unseen_embeddings_npz),
                     )
                 )
 
-    def test_pseudo_target_nfe_values_are_named_in_empty_filter_error(self) -> None:
+    def test_unseen_target_nfe_values_are_named_in_empty_filter_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             seen_csv = root / "seen.csv"
-            pseudo_csv = root / "pseudo.csv"
+            unseen_csv = root / "unseen.csv"
             embeddings_npz = root / "ctx.npz"
-            _write_rows(seen_csv, target_nfes=PAPER_SEEN_NFES)
-            _write_rows(pseudo_csv, target_nfes=(6,))
+            _write_rows(seen_csv, target_nfes=REFERENCE_SEEN_NFES)
+            _write_rows(unseen_csv, target_nfes=(6,))
             _write_embeddings(embeddings_npz)
 
-            with self.assertRaisesRegex(ValueError, r"pseudo_target_nfe_values \[5, 7\]"):
+            with self.assertRaisesRegex(ValueError, r"unseen_target_nfe_values \[5, 7\]"):
                 train_gipo(
                     _trainer_args(
                         root,
                         seen_csv,
                         embeddings_npz,
-                        "--student_pseudo_rows_csv",
-                        str(pseudo_csv),
-                        "--student_pseudo_context_embeddings_npz",
+                        "--student_unseen_target_rows_csv",
+                        str(unseen_csv),
+                        "--student_unseen_target_context_embeddings_npz",
                         str(embeddings_npz),
-                        "--pseudo_target_nfe_values",
+                        "--unseen_target_nfe_values",
                         "5,7",
                     )
                 )
 
-    def test_pseudo_support_schedules_must_match_seen_support_schedules(self) -> None:
+    def test_unseen_support_schedules_must_match_seen_support_schedules(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             seen_csv = root / "seen.csv"
-            pseudo_csv = root / "pseudo.csv"
+            unseen_csv = root / "unseen.csv"
             embeddings_npz = root / "ctx.npz"
-            _write_rows(seen_csv, target_nfes=PAPER_SEEN_NFES)
-            _write_rows(pseudo_csv, target_nfes=PAPER_UNSEEN_NFES, schedules=("uniform", "ays"))
+            _write_rows(seen_csv, target_nfes=REFERENCE_SEEN_NFES)
+            _write_rows(unseen_csv, target_nfes=REFERENCE_UNSEEN_NFES, schedules=("uniform", "ays"))
             _write_embeddings(embeddings_npz)
 
             with self.assertRaisesRegex(ValueError, r"missing=\['late_power_3'\], extra=\['ays'\]"):
@@ -686,9 +684,9 @@ class GipoTrainOptionsTests(unittest.TestCase):
                         root,
                         seen_csv,
                         embeddings_npz,
-                        "--student_pseudo_rows_csv",
-                        str(pseudo_csv),
-                        "--student_pseudo_context_embeddings_npz",
+                        "--student_unseen_target_rows_csv",
+                        str(unseen_csv),
+                        "--student_unseen_target_context_embeddings_npz",
                         str(embeddings_npz),
                     )
                 )

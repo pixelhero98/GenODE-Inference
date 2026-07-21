@@ -18,8 +18,8 @@ from genode.data.otflow_medical_constants import (
 )
 from genode.data.otflow_paths import cryptos_data_path, lobster_synthetic_profile_path, long_term_st_data_path
 
-OTFLOW_PAPER_DATASET_CHOICES = ("cryptos", LOBSTER_SYNTHETIC_DATASET_KEY, LONG_TERM_ST_DATASET_KEY)
-OTFLOW_PAPER_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
+OTFLOW_REFERENCE_DATASET_CHOICES = ("cryptos", LOBSTER_SYNTHETIC_DATASET_KEY, LONG_TERM_ST_DATASET_KEY)
+OTFLOW_REFERENCE_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
     "cryptos": {
         "levels": 10,
         "token_dim": 4,
@@ -130,11 +130,11 @@ DATASET_PLANS: Mapping[str, DatasetPlan] = {
     ),
 }
 
-def get_otflow_paper_backbone_preset(dataset: str) -> Dict[str, object]:
+def get_otflow_reference_backbone_preset(dataset: str) -> Dict[str, object]:
     dataset_key = str(dataset).strip()
-    if dataset_key not in OTFLOW_PAPER_BACKBONE_PRESETS:
-        raise ValueError(f"No OTFlow paper preset defined for dataset={dataset!r}")
-    return copy.deepcopy(dict(OTFLOW_PAPER_BACKBONE_PRESETS[dataset_key]))
+    if dataset_key not in OTFLOW_REFERENCE_BACKBONE_PRESETS:
+        raise ValueError(f"No OTFlow reference preset defined for dataset={dataset!r}")
+    return copy.deepcopy(dict(OTFLOW_REFERENCE_BACKBONE_PRESETS[dataset_key]))
 
 
 def build_dataset_splits(args, cfg: OTFlowConfig):
@@ -177,10 +177,10 @@ def build_dataset_splits(args, cfg: OTFlowConfig):
 
 
 __all__ = [
-    "OTFLOW_PAPER_DATASET_CHOICES",
-    "OTFLOW_PAPER_BACKBONE_PRESETS",
+    "OTFLOW_REFERENCE_DATASET_CHOICES",
+    "OTFLOW_REFERENCE_BACKBONE_PRESETS",
     "DATASET_PLANS",
     "DatasetPlan",
-    "get_otflow_paper_backbone_preset",
+    "get_otflow_reference_backbone_preset",
     "build_dataset_splits",
 ]

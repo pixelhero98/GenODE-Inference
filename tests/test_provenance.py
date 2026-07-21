@@ -5,14 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from genode.provenance import clear_provenance_cache, fingerprint_identity, path_fingerprint
+from genode.provenance import fingerprint_identity, path_fingerprint
 from genode.gipo.train_gipo import _artifact_input_summary
 
 
 class ProvenanceTests(unittest.TestCase):
-    def tearDown(self) -> None:
-        clear_provenance_cache()
-
     def test_file_identity_ignores_location_and_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
             first = Path(first_dir) / "input.json"
@@ -31,7 +28,6 @@ class ProvenanceTests(unittest.TestCase):
             path = Path(temp_dir) / "input.json"
             path.write_text('{"value": 1}\n', encoding="utf-8")
             before = fingerprint_identity(path_fingerprint(path))
-            clear_provenance_cache()
             path.write_text('{"value": 2}\n', encoding="utf-8")
             after = fingerprint_identity(path_fingerprint(path))
             self.assertNotEqual(before, after)
@@ -63,7 +59,6 @@ class ProvenanceTests(unittest.TestCase):
             self.assertNotIn("mtime_ns", first_summary)
             self.assertNotIn(str(Path(first_dir).resolve()), first_summary["logical_path"])
 
-            clear_provenance_cache()
             second.write_text("scenario_key\nweather_daily\n", encoding="utf-8")
             changed_summary = _artifact_input_summary(str(second))[0]
             self.assertNotEqual(first_summary["sha256"], changed_summary["sha256"])

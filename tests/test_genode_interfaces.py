@@ -12,46 +12,20 @@ from genode.runtime import resolve_torch_device
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-GENERATED_ROOTS = {
-    ".git",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".venv",
-    "__pycache__",
-    "build",
-    "data",
-    "dist",
-    "outputs",
-    "paper_datasets",
-    "reports",
-}
 
 
-def _is_generated_path(path: Path) -> bool:
-    parts = path.relative_to(PROJECT_ROOT).parts
-    return bool(GENERATED_ROOTS & set(parts)) or any(part.endswith(".egg-info") for part in parts)
-
-
-def _source_release_files() -> list[Path]:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(PROJECT_ROOT), "ls-files", "--cached", "--others", "--exclude-standard"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return [
-            path
-            for path in PROJECT_ROOT.rglob("*")
-            if path.is_file() and not _is_generated_path(path)
-        ]
+def _tracked_release_files() -> list[Path]:
+    result = subprocess.run(
+        ["git", "-C", str(PROJECT_ROOT), "ls-files", "--cached", "-z"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     return [
         path
-        for line in result.stdout.splitlines()
-        if line.strip()
-        for path in [PROJECT_ROOT / line.strip()]
+        for relative_path in result.stdout.split("\0")
+        if relative_path
+        for path in [PROJECT_ROOT / relative_path]
         if path.is_file()
     ]
 
@@ -83,37 +57,26 @@ class GenODEInterfaceTests(unittest.TestCase):
             "genode-build-ptg-figure",
             "genode-package-backbone-family",
             "genode-validate-backbone-package",
+            "genode-collect-flow-map-demonstrations",
+            "genode-train-flow-map",
+            "genode-evaluate-flow-map",
         }
         self.assertEqual(set(scripts), expected)
         for target in scripts.values():
             module_name, func_name = str(target).split(":", 1)
             self.assertTrue(callable(getattr(importlib.import_module(module_name), func_name)))
 
-    def test_readme_locked_test_command_includes_uniform_baseline_rows(self) -> None:
-        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-        marker = "genode-report-gipo-locked-test"
-        command_block = readme[readme.index(marker) : readme.index("## Development Checks")]
-        self.assertIn("--baseline_rows", command_block)
-
-    def test_single_markdown_file_is_readme(self) -> None:
-        markdown_files = sorted(
-            path.relative_to(PROJECT_ROOT).as_posix()
-            for path in _source_release_files()
-            if path.suffix == ".md"
-        )
-        self.assertEqual(markdown_files, ["README.md"])
+    def test_readme_documents_current_interfaces(self) -> None:
         text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("gipo_density", text)
-        self.assertIn("additive_mlp", text)
-        self.assertIn("context-only", text.lower())
+        self.assertIn("--include_flow_map", text)
         self.assertIn("genode-train-gipo", text)
-        self.assertIn("genode-report-gipo-locked-test", text)
-        self.assertNotIn("allow_noncanonical", text)
-        self.assertNotIn("teacher-oracle", text.lower())
-
-    def test_no_tracked_scripts_or_legacy_docs_tree(self) -> None:
-        self.assertFalse((PROJECT_ROOT / "scripts").exists())
-        self.assertFalse((PROJECT_ROOT / "docs").exists())
+        self.assertIn("genode-collect-flow-map-demonstrations", text)
+        self.assertIn("genode-train-flow-map", text)
+        self.assertIn("genode-evaluate-flow-map", text)
+        self.assertIn('quality_gate.status="not_evaluated"', text)
+        self.assertIn("no claim", text.lower())
+        self.assertNotIn("paper_gipo", text)
+        self.assertNotIn("pseudo_gipo", text)
 
     def test_gipo_trainer_public_contract_matches_required_api(self) -> None:
         from genode.gipo.train_gipo import build_argparser
@@ -122,11 +85,11 @@ class GenODEInterfaceTests(unittest.TestCase):
         options = {option for action in parser._actions for option in action.option_strings}
 
         self.assertIn("--teacher_unseen_selection_rows_csv", options)
-        self.assertIn("--student_pseudo_rows_csv", options)
-        self.assertIn("--student_pseudo_target_" + "weight", options)
+        self.assertIn("--student_unseen_target_rows_csv", options)
+        self.assertIn("--student_unseen_target_" + "weight", options)
         self.assertIn("--student_teacher_score_" + "weight", options)
         self.assertIn("--student_teacher_score_warmup_" + "fraction", options)
-        self.assertIn("--student_teacher_score_include_" + "pseudo", options)
+        self.assertIn("--student_teacher_score_include_" + "unseen_targets", options)
         self.assertIn("--student_target_mixture_" + "mode", options)
         self.assertIn("--student_target_elite_" + "fraction", options)
         self.assertIn("--student_target_elite_" + "k", options)
@@ -149,6 +112,9 @@ class GenODEInterfaceTests(unittest.TestCase):
             "--setting_encoder_mode",
             "--setting_feature_mode",
             "--series_unknown_" + "dropout",
+            "--student_pseudo_rows_csv",
+            "--student_pseudo_target_weight",
+            "--student_teacher_score_include_pseudo",
         }
         self.assertFalse(removed_options & options)
 
@@ -160,16 +126,103 @@ class GenODEInterfaceTests(unittest.TestCase):
         help_text = parser.format_help()
 
         self.assertIn("--include_ablations", options)
+        self.assertIn("--include_flow_map", options)
         self.assertIn("--ablation_preset", options)
         self.assertIn("--locked_test_preview", options)
         self.assertIn("--locked_test_preview_contexts", options)
         self.assertIn("--ser_calibration_batch_size", options)
         self.assertIn("--ser_val_windows", options)
         self.assertIn("--ser_train_tuning_max_examples", options)
-        self.assertIn("paper_gipo", help_text)
-        self.assertIn("adds the opt-in ablation grid", help_text)
+        self.assertIn("--flow_map_backbone_checkpoint", options)
+        self.assertIn("--flow_map_checkpoint", options)
+        self.assertIn("--flow_map_contexts_npz", options)
+        self.assertIn("--flow_map_quality_rows_csv", options)
+        self.assertIn("GIPO reference workflow", help_text)
+        self.assertIn("opt-in ablation grid", help_text)
 
-    def test_project_path_resolver_does_not_rewrite_legacy_package_prefixes(self) -> None:
+    def test_flow_map_pipeline_is_opt_in_and_code_only_by_default(self) -> None:
+        from genode.pipeline import full_pipeline
+
+        parser = full_pipeline.build_argparser()
+        default_args = parser.parse_args(["--scenario_key", "solar_energy_10m", "--dry_run"])
+        self.assertFalse(
+            set(full_pipeline._selected_stage_names(default_args))
+            & set(full_pipeline.FLOW_MAP_PIPELINE_STAGES)
+        )
+
+        args = parser.parse_args(
+            [
+                "--scenario_key",
+                "solar_energy_10m",
+                "--include_flow_map",
+                "--flow_map_backbone_checkpoint",
+                "backbone.pt",
+                "--flow_map_contexts_npz",
+                "contexts.npz",
+                "--dry_run",
+            ]
+        )
+        self.assertEqual(
+            full_pipeline._selected_stage_names(args)[-3:],
+            list(full_pipeline.FLOW_MAP_PIPELINE_STAGES),
+        )
+        protocol = full_pipeline._protocol_payload(args)
+        self.assertEqual(protocol["flow_map"]["quality_status"], "not_evaluated")
+        self.assertFalse(protocol["flow_map"]["performance_claim"])
+
+        commands = full_pipeline._build_stage_commands(args, PROJECT_ROOT / "outputs" / "dry_run")
+        by_stage = {entry.stage: entry for entry in commands}
+        collection = by_stage[full_pipeline.FLOW_MAP_COLLECTION_STAGE].commands[0]
+        evaluation = by_stage[full_pipeline.FLOW_MAP_EVALUATION_STAGE].commands[0]
+        self.assertIn("genode.distillation.demonstrations", collection)
+        self.assertEqual(collection[collection.index("--split-phase") + 1], "train_tuning")
+        self.assertIn("--not-evaluated-reason", evaluation)
+
+    def test_flow_map_evaluation_only_requires_and_uses_explicit_checkpoint(self) -> None:
+        from genode.pipeline import full_pipeline
+
+        parser = full_pipeline.build_argparser()
+        missing = parser.parse_args(
+            [
+                "--scenario_key",
+                "solar_energy_10m",
+                "--stages",
+                full_pipeline.FLOW_MAP_EVALUATION_STAGE,
+                "--flow_map_backbone_checkpoint",
+                "backbone.pt",
+                "--flow_map_gipo_checkpoint",
+                "gipo.pt",
+                "--dry_run",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "--flow_map_checkpoint"):
+            full_pipeline._validate_inputs_preflight(missing)
+
+        args = parser.parse_args(
+            [
+                "--scenario_key",
+                "solar_energy_10m",
+                "--stages",
+                full_pipeline.FLOW_MAP_EVALUATION_STAGE,
+                "--flow_map_backbone_checkpoint",
+                "backbone.pt",
+                "--flow_map_gipo_checkpoint",
+                "gipo.pt",
+                "--flow_map_checkpoint",
+                "endpoint-map.pt",
+                "--dry_run",
+            ]
+        )
+        full_pipeline._validate_inputs_preflight(args)
+        command = full_pipeline._build_stage_commands(
+            args,
+            PROJECT_ROOT / "outputs" / "dry_run",
+        )[0].commands[0]
+        assert command[command.index("--flow-map-checkpoint") + 1].endswith(
+            "endpoint-map.pt"
+        )
+
+    def test_project_path_resolver_does_not_rewrite_package_prefixes(self) -> None:
         from genode.data import otflow_paths
 
         with mock.patch.object(otflow_paths, "project_root", return_value=PROJECT_ROOT):
@@ -194,7 +247,7 @@ class GenODEInterfaceTests(unittest.TestCase):
             "path.home()",
         )
         offenders: list[str] = []
-        for path in _source_release_files():
+        for path in _tracked_release_files():
             if path == Path(__file__):
                 continue
             if path.is_relative_to(PROJECT_ROOT / "tests"):

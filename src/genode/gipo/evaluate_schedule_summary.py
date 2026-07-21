@@ -14,7 +14,7 @@ from genode.data.otflow_experiment_plan import FORECAST_FAMILY
 from genode.data.otflow_monash_datasets import monash_manifest_path
 from genode.experiment_layout import (
     LOCKED_TEST_PREVIEW_CONTEXTS,
-    PAPER_SEEN_NFES,
+    REFERENCE_SEEN_NFES,
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
 )
 from genode.solver_protocol import (
@@ -50,7 +50,7 @@ from genode.data.otflow_paths import (
     backbone_manifest_path,
     display_project_path,
     project_outputs_root,
-    project_paper_dataset_root,
+    project_dataset_root,
     resolve_project_path,
 )
 from genode.evaluation.otflow_evaluation_support import (
@@ -291,7 +291,7 @@ def _schedule_grid_hash(grid: Sequence[float]) -> str:
     return schedule_grid_hash(grid)
 
 
-def _reject_legacy_schema_keys(payload: Mapping[str, Any], *, source: str) -> None:
+def _reject_retired_schema_keys(payload: Mapping[str, Any], *, source: str) -> None:
     reject_retired_evaluation_keys(payload, source=source)
 
 
@@ -488,14 +488,14 @@ def load_schedule_predictions(
     *,
     scenario_key: str,
     solver_names: Sequence[str] = SUPPORTED_SOLVER_KEYS,
-    target_nfe_values: Sequence[int] = PAPER_SEEN_NFES,
+    target_nfe_values: Sequence[int] = REFERENCE_SEEN_NFES,
     require_complete: bool = True,
 ) -> Dict[Tuple[str, str, int], Dict[str, Any]]:
     path = resolve_project_path(str(schedule_summary_path))
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ValueError(f"Schedule summary {path} must contain a mapping payload.")
-    _reject_legacy_schema_keys(payload, source=f"Schedule summary {path}")
+    _reject_retired_schema_keys(payload, source=f"Schedule summary {path}")
     payload_scenario = str(payload.get("scenario_key", "")).strip()
     if not payload_scenario:
         raise ValueError(f"Schedule summary {path} requires scenario_key.")
@@ -522,7 +522,7 @@ def load_schedule_predictions(
     for schedule_index, schedule in enumerate(schedule_items):
         if not isinstance(schedule, Mapping):
             raise ValueError(f"Schedule summary {path} schedule {schedule_index} must be a mapping.")
-        _reject_legacy_schema_keys(schedule, source=f"Schedule summary {path} schedule {schedule_index}")
+        _reject_retired_schema_keys(schedule, source=f"Schedule summary {path} schedule {schedule_index}")
         scheduler_key = str(schedule.get("scheduler_key", "")).strip()
         if not scheduler_key:
             raise ValueError("Schedule summary contains a schedule without scheduler_key.")
@@ -533,7 +533,7 @@ def load_schedule_predictions(
                 raise ValueError(
                     f"Schedule summary {path} schedule {schedule_index} prediction {item_index} must be a mapping."
                 )
-            _reject_legacy_schema_keys(
+            _reject_retired_schema_keys(
                 item,
                 source=f"Schedule summary {path} schedule {schedule_index} prediction {item_index}",
             )
@@ -651,7 +651,7 @@ def _load_existing_rows(jsonl_path: Path, *, protocol_hash: str) -> Dict[Tuple[A
             if not line:
                 continue
             row = json.loads(line)
-            _reject_legacy_schema_keys(row, source=f"Evaluation row in {jsonl_path}")
+            _reject_retired_schema_keys(row, source=f"Evaluation row in {jsonl_path}")
             if str(row.get("protocol_hash")) != str(protocol_hash):
                 continue
             if str(row.get("row_status")) != "complete":
@@ -684,7 +684,7 @@ def _load_context_rows(path: Path) -> Dict[str, Dict[str, Any]]:
         return rows
     with path.open("r", newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            _reject_legacy_schema_keys(row, source=f"Context evaluation row in {path}")
+            _reject_retired_schema_keys(row, source=f"Context evaluation row in {path}")
             signature = str(row.get("row_signature", "")).strip()
             if signature:
                 if signature in rows:
@@ -833,7 +833,7 @@ def _load_forecast_rows_csv(
         return rows
     with resolved.open("r", newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            _reject_legacy_schema_keys(row, source=f"Evaluation row in {resolved}")
+            _reject_retired_schema_keys(row, source=f"Evaluation row in {resolved}")
             if str(row.get("benchmark_family", FORECAST_FAMILY)) != FORECAST_FAMILY:
                 continue
             if split_phase is not None and str(row.get("split_phase")) != str(split_phase):
@@ -1133,8 +1133,8 @@ def write_selected_schedule_summary(source_summary_path: str | Path, selection: 
     payload = json.loads(source_path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ValueError(f"Schedule summary {source_path} must contain a mapping payload.")
-    _reject_legacy_schema_keys(payload, source=f"Schedule summary {source_path}")
-    _reject_legacy_schema_keys(selection, source="Validation schedule selection")
+    _reject_retired_schema_keys(payload, source=f"Schedule summary {source_path}")
+    _reject_retired_schema_keys(selection, source="Validation schedule selection")
     selected_key = str(selection["selected_scheduler_key"])
     selected_schedule = None
     for schedule in list(payload.get("schedules", []) or []):
@@ -1890,7 +1890,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--selection_reference_rows", default="")
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--solver_names", default=",".join(SUPPORTED_SOLVER_KEYS))
-    parser.add_argument("--target_nfe_values", default=",".join(str(x) for x in PAPER_SEEN_NFES))
+    parser.add_argument("--target_nfe_values", default=",".join(str(x) for x in REFERENCE_SEEN_NFES))
     parser.add_argument("--num_eval_samples", type=int, default=5)
     parser.add_argument("--forecast_eval_batch_size", type=int, default=64)
     parser.add_argument("--context_sample_count", type=int, default=TRAIN_TUNING_CONTEXT_SAMPLE_COUNT)
@@ -1916,7 +1916,7 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Per-seed preview limit; requires --locked_test_preview and defaults to 512.",
     )
-    parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
+    parser.add_argument("--dataset_root", default=str(project_dataset_root()))
     parser.add_argument("--shared_backbone_root", default=str(DEFAULT_SHARED_BACKBONE_ROOT))
     parser.add_argument("--backbone_manifest", default=str(backbone_manifest_path()))
     parser.add_argument("--checkpoint_step", type=int, default=20000)

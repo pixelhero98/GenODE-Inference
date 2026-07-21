@@ -1,4 +1,4 @@
-"""Training, sampling, and paper-metric evaluation for OTFlow backbones."""
+"""Training, sampling, and reference-metric evaluation for OTFlow backbones."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from genode.data.otflow_datasets import L2FeatureMap, WindowedParamSequenceDatas
 from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 from genode.data.otflow_paths import display_project_path
 from genode.models.otflow_utils import flatten_dict, unflatten_to_nested, microstructure_series
+from genode.solver_protocol import uniform_time_grid
 
 
 SUPPORTED_MODEL_NAMES = ("otflow",)
@@ -630,6 +631,9 @@ def generate_continuation(
     steps: int,
     nfe: int,
     future_context_seq: Optional[torch.Tensor] = None,
+    *,
+    solver_key: str = "euler",
+    time_grid: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
     """Continuation in normalized param space.
 
@@ -674,6 +678,11 @@ def generate_continuation(
         return torch.cat([block, extra], dim=-1)
 
     prediction_horizon = _model_prediction_horizon(model)
+    resolved_grid = (
+        uniform_time_grid(solver_key, int(nfe))
+        if time_grid is None
+        else tuple(float(value) for value in time_grid)
+    )
     if prediction_horizon > 1:
         cursor = 0
         while cursor < int(steps):
@@ -681,7 +690,13 @@ def generate_continuation(
             if isinstance(model, OTFlow):
                 if not hasattr(model, "sample_future"):
                     raise RuntimeError("Non-autoregressive OTFlow requires sample_future(...).")
-                x_block = model.sample_future(x_hist, cond=cond_t, steps=nfe)
+                x_block = model.sample_future(
+                    x_hist,
+                    cond=cond_t,
+                    solver_key=solver_key,
+                    target_nfe=int(nfe),
+                    time_grid=resolved_grid,
+                )
             else:
                 raise RuntimeError("Non-autoregressive continuation is currently implemented for OTFlow only.")
 
@@ -698,7 +713,13 @@ def generate_continuation(
         cond_t = cond_seq[:, k, :] if cond_seq is not None else None
 
         if isinstance(model, OTFlow):
-            x_next = model.sample(x_hist, cond=cond_t, steps=nfe)
+            x_next = model.sample(
+                x_hist,
+                cond=cond_t,
+                solver_key=solver_key,
+                target_nfe=int(nfe),
+                time_grid=resolved_grid,
+            )
         else:
             raise RuntimeError("Generation is implemented for OTFlow only.")
 
@@ -1774,6 +1795,8 @@ def eval_one_window(
     horizons_eval: Sequence[int] = (1, 10, 50, 100, 200),
     return_sequences: bool = False,
     main_metrics_only: bool = False,
+    solver_key: str = "euler",
+    time_grid: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     horizon = int(horizon)
     dataset_kind = str(getattr(ds, "dataset_kind", "l2"))
@@ -1811,6 +1834,8 @@ def eval_one_window(
             steps=horizon,
             nfe=nfe,
             future_context_seq=future_context_seq,
+            solver_key=solver_key,
+            time_grid=time_grid,
         )
     _torch_sync(cfg.device)
     latency_s = time.perf_counter() - t_start
@@ -2049,6 +2074,8 @@ def eval_many_windows(
     generation_seed_base: Optional[int] = None,
     metrics_seed: Optional[int] = None,
     main_metrics_only: bool = False,
+    solver_key: str = "euler",
+    time_grid: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     dataset_kind = str(getattr(ds, "dataset_kind", "l2"))
     dataset_metadata = dict(getattr(ds, "dataset_metadata", {}) or {})
@@ -2086,6 +2113,8 @@ def eval_many_windows(
                 horizons_eval=horizons_eval,
                 return_sequences=True,
                 main_metrics_only=bool(main_metrics_only),
+                solver_key=solver_key,
+                time_grid=time_grid,
             )
         )
 

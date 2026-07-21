@@ -4,12 +4,12 @@ import unittest
 
 from genode.experiment_layout import (
     AVERAGED_REVERSED_SCHEDULE_KEYS,
-    PAPER_CHECKPOINT_STEPS,
+    REFERENCE_CHECKPOINT_STEPS,
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
-    PAPER_SCENARIO_KEYS,
-    PAPER_SEEN_NFES,
-    PAPER_SUPERVISION_SCHEDULE_KEYS,
-    PAPER_UNSEEN_NFES,
+    REFERENCE_SCENARIO_KEYS,
+    REFERENCE_SEEN_NFES,
+    REFERENCE_SUPERVISION_SCHEDULE_KEYS,
+    REFERENCE_UNSEEN_NFES,
     PHYSICAL_SCHEDULE_KEYS,
     REVERSED_SCHEDULE_KEYS,
     target_nfes_for_role,
@@ -27,17 +27,17 @@ from genode.gipo.train_gipo import build_argparser as build_gipo_argparser
 
 
 class ExperimentLayoutTests(unittest.TestCase):
-    def test_paper_layout_constants(self) -> None:
-        self.assertEqual(PAPER_SEEN_NFES, (4, 8, 12, 16))
-        self.assertEqual(PAPER_UNSEEN_NFES, (6, 10, 14, 20))
-        self.assertEqual(PAPER_CHECKPOINT_STEPS, (4000, 8000, 12000, 16000, 20000))
+    def test_reference_layout_constants(self) -> None:
+        self.assertEqual(REFERENCE_SEEN_NFES, (4, 8, 12, 16))
+        self.assertEqual(REFERENCE_UNSEEN_NFES, (6, 10, 14, 20))
+        self.assertEqual(REFERENCE_CHECKPOINT_STEPS, (4000, 8000, 12000, 16000, 20000))
         self.assertEqual(TRAIN_TUNING_CONTEXT_SAMPLE_COUNT, 188)
         self.assertEqual(SUPPORTED_SOLVER_KEYS, ("euler", "dpmpp2m", "heun", "midpoint_rk2"))
-        self.assertEqual(len(PAPER_SCENARIO_KEYS), 9)
+        self.assertEqual(len(REFERENCE_SCENARIO_KEYS), 9)
         self.assertEqual(len(PHYSICAL_SCHEDULE_KEYS), 7)
         self.assertEqual(len(REVERSED_SCHEDULE_KEYS), 6)
         self.assertEqual(len(AVERAGED_REVERSED_SCHEDULE_KEYS), 6)
-        self.assertEqual(len(PAPER_SUPERVISION_SCHEDULE_KEYS), 19)
+        self.assertEqual(len(REFERENCE_SUPERVISION_SCHEDULE_KEYS), 19)
 
     def test_role_and_runner_defaults(self) -> None:
         seen_args = runner.build_argparser().parse_args([])
@@ -45,15 +45,15 @@ class ExperimentLayoutTests(unittest.TestCase):
         self.assertEqual(runner._checkpoint_steps_for_args(seen_args), [4000, 8000, 12000, 16000, 20000])
         unseen_args = runner.build_argparser().parse_args(["--nfe_role", "unseen"])
         self.assertEqual(runner._target_nfe_values_for_args(unseen_args), [6, 10, 14, 20])
-        self.assertEqual(target_nfes_for_role("seen"), PAPER_SEEN_NFES)
-        self.assertEqual(target_nfes_for_role("unseen"), PAPER_UNSEEN_NFES)
+        self.assertEqual(target_nfes_for_role("seen"), REFERENCE_SEEN_NFES)
+        self.assertEqual(target_nfes_for_role("unseen"), REFERENCE_UNSEEN_NFES)
 
-    def test_runner_rejects_values_outside_paper_protocol(self) -> None:
+    def test_runner_rejects_values_outside_reference_protocol(self) -> None:
         bad_nfe = runner.build_argparser().parse_args(["--target_nfe_values", "5"])
-        with self.assertRaisesRegex(ValueError, "outside the paper protocol"):
+        with self.assertRaisesRegex(ValueError, "outside the reference protocol"):
             runner._target_nfe_values_for_args(bad_nfe)
         bad_step = runner.build_argparser().parse_args(["--checkpoint_steps", "123"])
-        with self.assertRaisesRegex(ValueError, "outside the paper protocol"):
+        with self.assertRaisesRegex(ValueError, "outside the reference protocol"):
             runner._checkpoint_steps_for_args(bad_step)
 
     def test_gipo_parser_defaults(self) -> None:
@@ -69,10 +69,10 @@ class ExperimentLayoutTests(unittest.TestCase):
         )
         self.assertEqual(args.context_sample_count, TRAIN_TUNING_CONTEXT_SAMPLE_COUNT)
         self.assertEqual(args.teacher_unseen_selection_target_nfe_values, "6,10,14,20")
-        self.assertAlmostEqual(float(args.student_pseudo_target_weight), 0.25)
+        self.assertAlmostEqual(float(args.student_unseen_target_weight), 0.25)
         self.assertAlmostEqual(float(args.student_teacher_score_weight), 0.01)
         self.assertAlmostEqual(float(args.student_teacher_score_warmup_fraction), 0.6)
-        self.assertFalse(args.student_teacher_score_include_pseudo)
+        self.assertFalse(args.student_teacher_score_include_unseen_targets)
         self.assertEqual(args.student_target_mixture_mode, "full")
         self.assertAlmostEqual(float(args.student_target_elite_fraction), 0.3)
         self.assertEqual(int(args.student_target_elite_k), 0)

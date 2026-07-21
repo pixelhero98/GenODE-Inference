@@ -10,7 +10,7 @@ import torch
 
 from genode.experiment_layout import (
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
-    PAPER_SEEN_NFES,
+    REFERENCE_SEEN_NFES,
     SCENARIO_FAMILY_CONDITIONAL_GENERATION,
     SCENARIO_FAMILY_FORECAST,
     SCENARIO_FAMILY_MOLECULE,
@@ -24,6 +24,8 @@ from genode.solver_protocol import (
     solver_eval_multiplier,
     solver_macro_steps,
     solver_order_p,
+    target_nfe_for_macro_steps,
+    uniform_time_grid,
 )
 from genode.gipo.density_representation import (
     average_density_masses,
@@ -41,7 +43,7 @@ from genode.data.otflow_paths import (
     lobster_synthetic_profile_path,
     long_term_st_data_path,
     project_outputs_root,
-    project_paper_dataset_root,
+    project_dataset_root,
     resolve_project_path,
 )
 from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW_MOLECULE, MOLECULE_FAMILY, find_backbone_artifact, load_backbone_manifest
@@ -414,20 +416,22 @@ def collect_batched_local_defect_trace(
             hist = torch.stack(hist_rows, dim=0).to(device).float()
             cond = torch.stack(cond_rows, dim=0).to(device).float() if saw_cond else None
             seed_all(int(seed) + 1_000_000 * int(sample_idx) + int(chunk_start))
+            target_nfe = target_nfe_for_macro_steps(str(solver_name), int(reference_macro_steps))
             trace_kwargs = {
-                "steps": int(reference_macro_steps),
-                "solver": str(solver_name),
-                "oracle_local_error": True,
+                "solver_key": str(solver_name),
+                "target_nfe": target_nfe,
+                "time_grid": uniform_time_grid(str(solver_name), target_nfe),
+                "include_local_error": True,
             }
             if cond is not None:
                 trace_kwargs["cond"] = cond
-            _pred, trace = model.sample_future_trace(hist, **trace_kwargs)
-            grid = [float(x) for x in trace["time_grid"].detach().cpu().numpy().astype(np.float64).tolist()]
+            _pred, diagnostics = model.sample_future_with_diagnostics(hist, **trace_kwargs)
+            grid = [float(x) for x in diagnostics.trajectory.time_grid.detach().cpu().numpy().astype(np.float64).tolist()]
             if reference_time_grid is None:
                 reference_time_grid = grid
             elif not np.allclose(np.asarray(reference_time_grid), np.asarray(grid), atol=1e-8, rtol=1e-8):
                 raise ValueError("Reference time grids changed during SER-PTG trace collection.")
-            oracle = trace["oracle_local_error"].detach().cpu().numpy().astype(np.float64)
+            oracle = diagnostics.local_error.detach().cpu().numpy().astype(np.float64)
             for row in oracle:
                 oracle_rows.append(row)
                 trace_rows.append(_local_defect_trace_from_oracle(row, grid, solver_order_p=float(solver_order_p)))
@@ -476,18 +480,20 @@ def collect_molecule_local_defect_trace(
                 hist_rows.append(torch.from_numpy(hist.astype(np.float32)))
             hist_t = torch.stack(hist_rows, dim=0).to(device).float()
             seed_all(int(seed) + 1_000_000 * int(sample_idx) + int(chunk_start))
-            _pred, trace = model.sample_future_trace(
+            target_nfe = target_nfe_for_macro_steps(str(solver_name), int(reference_macro_steps))
+            _pred, diagnostics = model.sample_future_with_diagnostics(
                 hist_t,
-                steps=int(reference_macro_steps),
-                solver=str(solver_name),
-                oracle_local_error=True,
+                solver_key=str(solver_name),
+                target_nfe=target_nfe,
+                time_grid=uniform_time_grid(str(solver_name), target_nfe),
+                include_local_error=True,
             )
-            grid = [float(x) for x in trace["time_grid"].detach().cpu().numpy().astype(np.float64).tolist()]
+            grid = [float(x) for x in diagnostics.trajectory.time_grid.detach().cpu().numpy().astype(np.float64).tolist()]
             if reference_time_grid is None:
                 reference_time_grid = grid
             elif not np.allclose(np.asarray(reference_time_grid), np.asarray(grid), atol=1e-8, rtol=1e-8):
                 raise ValueError("Reference time grids changed during molecule SER-PTG trace collection.")
-            oracle = trace["oracle_local_error"].detach().cpu().numpy().astype(np.float64)
+            oracle = diagnostics.local_error.detach().cpu().numpy().astype(np.float64)
             for row in oracle:
                 oracle_rows.append(row)
                 trace_rows.append(_local_defect_trace_from_oracle(row, grid, solver_order_p=float(solver_order_p)))
@@ -661,7 +667,10 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                             n_windows=min(max(1, int(window_count)), max(1, int(available))),
                             seed=selection_seed,
                         )
-                        item_getter = lambda ds, t0: _get_dataset_item_by_t(ds, int(t0))
+                        def conditional_item_getter(ds, t0):
+                            return _get_dataset_item_by_t(ds, int(t0))
+
+                        item_getter = conditional_item_getter
                         collector = collect_batched_local_defect_trace
                         available_examples = int(available)
                         uncapped_candidate_examples = int(available_examples)
@@ -894,7 +903,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--density_floor_eta", type=float, default=0.05)
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--solver_names", default=",".join(SUPPORTED_SOLVER_KEYS))
-    parser.add_argument("--target_nfe_values", default=",".join(str(x) for x in PAPER_SEEN_NFES))
+    parser.add_argument("--target_nfe_values", default=",".join(str(x) for x in REFERENCE_SEEN_NFES))
     parser.add_argument("--reference_split", choices=(TRAIN_TUNING_PHASE, VALIDATION_PHASE), default=TRAIN_TUNING_PHASE)
     parser.add_argument("--val_windows", type=int, default=0)
     parser.add_argument("--context_sample_count", type=int, default=TRAIN_TUNING_CONTEXT_SAMPLE_COUNT)
@@ -913,7 +922,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--out_dir",
         default=str(project_outputs_root() / "ser_ptg_reference"),
     )
-    parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
+    parser.add_argument("--dataset_root", default=str(project_dataset_root()))
     parser.add_argument("--shared_backbone_root", default=str(DEFAULT_SHARED_BACKBONE_ROOT))
     parser.add_argument("--backbone_manifest", default=str(backbone_manifest_path()))
     parser.add_argument("--cryptos_path", default=str(cryptos_data_path()))

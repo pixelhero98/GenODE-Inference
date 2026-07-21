@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import tempfile
 import unittest
 
 import numpy as np
 import torch
 
 from genode.models.config import OTFlowConfig
+from genode.solver_protocol import FlowDiagnostics, FlowTrajectory
 from genode.models.otflow_train_val import _get_dataset_item_by_t
 from genode.data.otflow_datasets import WindowedParamSequenceDataset
 from genode.evaluation.otflow_evaluation_support import (
@@ -125,8 +125,8 @@ class ExtrapolationFixesTest(unittest.TestCase):
             def __init__(self, cfg):
                 self.cfg = cfg
 
-            def sample_future(self, hist, steps=None, solver=None):
-                del steps, solver
+            def sample_future(self, hist, *, solver_key, target_nfe, time_grid):
+                del solver_key, target_nfe, time_grid
                 return torch.zeros(hist.shape[0], 1, 1, device=hist.device)
 
         metrics = evaluate_forecast_schedule(
@@ -176,8 +176,8 @@ class ExtrapolationFixesTest(unittest.TestCase):
             def __init__(self, cfg):
                 self.cfg = cfg
 
-            def sample_future(self, hist, steps=None, solver=None):
-                del steps, solver
+            def sample_future(self, hist, *, solver_key, target_nfe, time_grid):
+                del solver_key, target_nfe, time_grid
                 return torch.zeros(hist.shape[0], 1, 1, device=hist.device)
 
         chosen = choose_forecast_example_indices(DummyDataset(), n_examples=2, seed=7)
@@ -229,8 +229,8 @@ class ExtrapolationFixesTest(unittest.TestCase):
             def __init__(self, cfg):
                 self.cfg = cfg
 
-            def sample_future(self, hist, steps=None, solver=None):
-                del steps, solver
+            def sample_future(self, hist, *, solver_key, target_nfe, time_grid):
+                del solver_key, target_nfe, time_grid
                 return torch.zeros(hist.shape[0], 1, 1, device=hist.device)
 
         metrics = evaluate_forecast_schedule(
@@ -294,8 +294,8 @@ class ExtrapolationFixesTest(unittest.TestCase):
             def __init__(self, cfg):
                 self.cfg = cfg
 
-            def sample_future(self, hist, steps=None, solver=None):
-                del steps, solver
+            def sample_future(self, hist, *, solver_key, target_nfe, time_grid):
+                del solver_key, target_nfe, time_grid
                 return torch.zeros(hist.shape[0], 1, 1, device=hist.device)
 
         context_rows = []
@@ -398,8 +398,8 @@ class ExtrapolationFixesTest(unittest.TestCase):
             def __init__(self, config):
                 self.cfg = config
 
-            def sample_future(self, hist, steps=None, solver=None):
-                del steps, solver
+            def sample_future(self, hist, *, solver_key, target_nfe, time_grid):
+                del solver_key, target_nfe, time_grid
                 return torch.zeros(hist.shape[0], 1, 1, device=hist.device)
 
         def seeds_by_schedule(schedule_order):
@@ -453,19 +453,52 @@ class ExtrapolationFixesTest(unittest.TestCase):
                 return torch.zeros(2, 1), torch.ones(1), {"target_t": 2}
 
         class DummyModel:
-            def sample_future_trace(self, hist, steps=None, solver=None, oracle_local_error=False):
-                del solver, oracle_local_error
-                width = int(steps) + 1
-                trace = {
-                    "time_grid": torch.linspace(0.0, 1.0, width),
-                    "disagreement": torch.ones(hist.shape[0], width, device=hist.device),
-                    "residual_norm": torch.ones(hist.shape[0], width, device=hist.device),
-                    "oracle_local_error": torch.ones(hist.shape[0], width, device=hist.device),
+            def sample_future_with_diagnostics(
+                self,
+                hist,
+                *,
+                solver_key,
+                target_nfe,
+                time_grid,
+                include_local_error=False,
+            ):
+                self.last_call = {
+                    "solver_key": solver_key,
+                    "target_nfe": target_nfe,
+                    "time_grid": tuple(float(value) for value in time_grid),
+                    "include_local_error": include_local_error,
                 }
-                return torch.zeros(hist.shape[0], 1, 1, device=hist.device), trace
+                grid = torch.as_tensor(time_grid, dtype=hist.dtype, device=hist.device)
+                macro_steps = int(grid.numel()) - 1
+                initial_state = torch.zeros(hist.shape[0], 1, dtype=hist.dtype, device=hist.device)
+                states = initial_state[:, None, :].expand(-1, macro_steps + 1, -1).clone()
+                trajectory = FlowTrajectory(
+                    initial_state=initial_state,
+                    time_grid=grid,
+                    states=states,
+                    final_state=states[:, -1],
+                    solver_key=str(solver_key),
+                    target_nfe=int(target_nfe),
+                    macro_steps=macro_steps,
+                    realized_nfe=int(target_nfe),
+                )
+                values = torch.ones(hist.shape[0], macro_steps, dtype=hist.dtype, device=hist.device)
+                diagnostics = FlowDiagnostics(
+                    trajectory=trajectory,
+                    disagreement=values,
+                    velocity_norm=values,
+                    ema_velocity_norm=values,
+                    residual_norm=values,
+                    local_error=values if include_local_error else torch.zeros_like(values),
+                    field_evals_by_step=values,
+                    mean_field_evals_per_step=1.0,
+                    mean_total_field_evals_per_rollout=float(macro_steps),
+                )
+                return torch.zeros(hist.shape[0], 1, 1, device=hist.device), diagnostics
 
+        model = DummyModel()
         result = collect_forecast_calibration(
-            DummyModel(),
+            model,
             DummyDataset(),
             cfg,
             macro_steps=1,
@@ -474,6 +507,15 @@ class ExtrapolationFixesTest(unittest.TestCase):
             calibration_trace_samples=2,
         )
         self.assertEqual(result["calibration_trace_samples"], 2)
+        self.assertEqual(
+            model.last_call,
+            {
+                "solver_key": "euler",
+                "target_nfe": 1,
+                "time_grid": (0.0, 1.0),
+                "include_local_error": True,
+            },
+        )
 
 
 if __name__ == "__main__":
