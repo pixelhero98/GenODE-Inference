@@ -13,6 +13,7 @@ import zipfile
 
 from genode.data.otflow_experiment_plan import FORECAST_FAMILY
 from genode.path_safety import is_link_or_reparse_point, resolve_portable_relative_path
+from genode.provenance import file_sha256
 
 
 MONASH_ARCHIVE_URL = "https://forecastingdata.org/"
@@ -133,17 +134,6 @@ def monash_source_dir(dataset_root: str | Path, dataset_key: str) -> Path:
 def monash_archive_path(dataset_root: str | Path, dataset_key: str) -> Path:
     spec = get_monash_dataset_spec(dataset_key)
     return monash_raw_dir(dataset_root, dataset_key) / spec.archive_name
-
-
-def _sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as fh:
-        while True:
-            chunk = fh.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _md5_file(path: str | Path) -> str:
@@ -372,7 +362,7 @@ def download_monash_dataset(dataset_root: str | Path, dataset_key: str) -> Dict[
         "archive_name": str(spec.archive_name),
         "archive_size_bytes": int(archive_path.stat().st_size),
         "archive_md5": _md5_file(archive_path),
-        "archive_sha256": _sha256_file(archive_path),
+        "archive_sha256": file_sha256(archive_path),
         "source_tsf_name": str(tsf_path.name),
         "header_horizon": int(header.horizon),
         "horizon_source": str(spec.horizon_source),

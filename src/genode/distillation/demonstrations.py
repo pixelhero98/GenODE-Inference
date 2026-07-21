@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from genode.distillation.artifacts import (
+    DEMONSTRATION_ARTIFACT_VERSION,
     DEMONSTRATION_MANIFEST_NAME,
     DEMONSTRATION_TRAINING_SPLITS,
     load_demonstration_manifest,
@@ -77,6 +78,15 @@ class DistillationContexts:
             if not self.conditions.is_floating_point() or not torch.isfinite(self.conditions).all():
                 raise ValueError("conditions must contain finite floating-point values.")
         return self
+
+
+@dataclass(frozen=True)
+class _CommonContextRollout:
+    context_index: int
+    seeds: tuple[int, ...]
+    initial_state: torch.Tensor
+    conditioning_cache: ConditioningCache
+    context_summary: torch.Tensor
 
 
 def default_distillation_settings() -> tuple[DistillationSetting, ...]:
@@ -154,6 +164,32 @@ def _slice_cache(
         ctx_summary=ctx_summary,
         summary=summary,
         cond_emb=repeated("cond_emb"),
+    )
+
+
+def _repeat_cache(
+    cache: ConditioningCache,
+    *,
+    repeats: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> ConditioningCache:
+    def repeated(value: torch.Tensor | None) -> torch.Tensor | None:
+        if value is None:
+            return None
+        selected = value.to(device=device, dtype=dtype)
+        return selected.expand(repeats, *selected.shape[1:]).contiguous()
+
+    ctx_tokens = repeated(cache.ctx_tokens)
+    ctx_summary = repeated(cache.ctx_summary)
+    summary = repeated(cache.summary)
+    if ctx_tokens is None or ctx_summary is None or summary is None:
+        raise ValueError("Context cache is missing required backbone fields.")
+    return ConditioningCache(
+        ctx_tokens=ctx_tokens,
+        ctx_summary=ctx_summary,
+        summary=summary,
+        cond_emb=repeated(cache.cond_emb),
     )
 
 
@@ -330,6 +366,40 @@ def _collect_flow_map_demonstrations_into(
         )
         context_shards.append(record)
 
+        common_rollouts: list[_CommonContextRollout] = []
+        for local_index, context_index in enumerate(range(shard_start, shard_stop)):
+            seeds = tuple(
+                _noise_seed(
+                    seed,
+                    context_id=contexts.context_ids[context_index],
+                    rollout_index=rollout_index,
+                )
+                for rollout_index in range(rollout_count)
+            )
+            common_rollouts.append(
+                _CommonContextRollout(
+                    context_index=context_index,
+                    seeds=seeds,
+                    initial_state=_initial_states(
+                        state_dim=state_dim,
+                        seeds=seeds,
+                        device=torch.device("cpu"),
+                        dtype=dtype,
+                    ),
+                    conditioning_cache=_slice_cache(
+                        shard_cache,
+                        local_index,
+                        repeats=1,
+                        device=torch.device("cpu"),
+                        dtype=dtype,
+                    ),
+                    context_summary=ctx_summary[local_index : local_index + 1].to(
+                        device=torch.device("cpu"),
+                        dtype=dtype,
+                    ),
+                )
+            )
+
         for setting in requested_settings:
             context_index_rows: list[np.ndarray] = []
             seed_rows: list[np.ndarray] = []
@@ -337,40 +407,21 @@ def _collect_flow_map_demonstrations_into(
             grid_rows: list[np.ndarray] = []
             state_rows: list[np.ndarray] = []
             density_rows: list[np.ndarray] = []
-            for local_index, context_index in enumerate(range(shard_start, shard_stop)):
-                context_summary = ctx_summary[local_index : local_index + 1].to(
-                    device=device,
-                    dtype=dtype,
-                )
+            for common in common_rollouts:
                 schedule = gipo_policy.predict(
-                    context_summary,
+                    common.context_summary.to(device=device, dtype=dtype),
                     solver_key=setting.solver_key,
                     target_nfe=setting.target_nfe,
                 )
-                seeds = [
-                    _noise_seed(
-                        seed,
-                        context_id=contexts.context_ids[context_index],
-                        rollout_index=rollout_index,
-                    )
-                    for rollout_index in range(rollout_count)
-                ]
-                initial = _initial_states(
-                    state_dim=state_dim,
-                    seeds=seeds,
-                    device=device,
-                    dtype=dtype,
-                )
-                conditioning_cache = _slice_cache(
-                    shard_cache,
-                    local_index,
-                    repeats=rollout_count,
-                    device=device,
-                    dtype=dtype,
-                )
+                initial_state = common.initial_state.to(device=device, dtype=dtype)
                 trajectory = backbone_model.solve(
-                    initial,
-                    conditioning_cache=conditioning_cache,
+                    initial_state.clone(),
+                    conditioning_cache=_repeat_cache(
+                        common.conditioning_cache,
+                        repeats=rollout_count,
+                        device=device,
+                        dtype=dtype,
+                    ),
                     solver_key=setting.solver_key,
                     target_nfe=setting.target_nfe,
                     time_grid=schedule.time_grid[0],
@@ -378,9 +429,11 @@ def _collect_flow_map_demonstrations_into(
                 )
                 if not isinstance(trajectory, FlowTrajectory):
                     raise RuntimeError("OTFlow.solve did not return a trajectory.")
-                context_index_rows.append(np.full((rollout_count,), context_index, dtype=np.int64))
-                seed_rows.append(np.asarray(seeds, dtype=np.int64))
-                initial_rows.append(initial.detach().cpu().numpy())
+                context_index_rows.append(
+                    np.full((rollout_count,), common.context_index, dtype=np.int64)
+                )
+                seed_rows.append(np.asarray(common.seeds, dtype=np.int64))
+                initial_rows.append(initial_state.detach().cpu().numpy())
                 grid_rows.append(
                     schedule.time_grid.expand(rollout_count, -1).detach().cpu().numpy()
                 )
@@ -415,7 +468,7 @@ def _collect_flow_map_demonstrations_into(
             trajectory_shards.append(record)
 
     metadata = {
-        "artifact_version": 1,
+        "artifact_version": DEMONSTRATION_ARTIFACT_VERSION,
         "split_phase": phase,
         "scenario_key": str(scenario_key),
         "benchmark_family": str(benchmark_family),

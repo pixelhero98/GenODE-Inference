@@ -185,10 +185,8 @@ def setting_features(
         if config is not None
         else build_setting_encoder_config(feature_mode)
     )
-    requested_encoder_mode = validate_setting_mode(feature_mode)
-    if requested_encoder_mode != encoder_config.mode:
+    if feature_mode != encoder_config.mode:
         raise ValueError(
-            f"mode {feature_mode!r} resolves to {requested_encoder_mode!r}, "
-            f"but setting_encoder_config uses {encoder_config.mode!r}."
+            f"mode {feature_mode!r} does not match setting_encoder_config mode {encoder_config.mode!r}."
         )
     return _continuous_features(str(solver_key), int(target_nfe), encoder_config)

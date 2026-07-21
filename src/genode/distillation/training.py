@@ -81,8 +81,6 @@ class DemonstrationStore:
     ):
         self.manifest = load_demonstration_manifest(manifest_path)
         self.metadata = dict(self.manifest["metadata"])
-        if bool(self.metadata.get("locked_test_used", False)):
-            raise ValueError("Locked-test demonstrations may not be used for flow-map training.")
         self.setting_encoder_config = setting_encoder_config_from_payload(
             self.metadata.get("setting_encoder_config")
         )
@@ -174,7 +172,40 @@ class DemonstrationStore:
         )
         self.trajectory_records = [dict(record) for record in self.manifest["trajectory_shards"]]
         self._eligible_rows: dict[tuple[int, SplitName], np.ndarray] = {}
+        self._setting_by_record: dict[int, tuple[str, int]] = {}
         self._validate_trajectory_shards()
+        self._setting_features = {
+            setting: setting_features(
+                setting[0],
+                setting[1],
+                mode=self.setting_encoder_config.mode,
+                config=self.setting_encoder_config,
+            )
+            for setting in self.expected_settings
+        }
+        self._candidate_records: dict[
+            tuple[SplitName, tuple[str, int] | None],
+            tuple[int, ...],
+        ] = {}
+        self._candidate_probabilities: dict[
+            tuple[SplitName, tuple[str, int] | None],
+            np.ndarray,
+        ] = {}
+        for split in ("train", "validation"):
+            for setting in (None, *sorted(self.expected_settings)):
+                records = tuple(
+                    index
+                    for index in range(len(self.trajectory_records))
+                    if self._eligible_rows[(index, split)].size > 0
+                    and (setting is None or self._setting_by_record[index] == setting)
+                )
+                self._candidate_records[(split, setting)] = records
+                if records:
+                    counts = np.asarray(
+                        [self._eligible_rows[(index, split)].size for index in records],
+                        dtype=np.float64,
+                    )
+                    self._candidate_probabilities[(split, setting)] = counts / counts.sum()
 
     def _read_context(self, record_index: int) -> dict[str, np.ndarray]:
         path = Path(self.context_records[record_index]["resolved_path"])
@@ -308,6 +339,7 @@ class DemonstrationStore:
             setting = (nfe.solver_key, nfe.target_nfe)
             if setting not in self.expected_settings:
                 raise ValueError("Trajectory shard uses a setting not declared in metadata.")
+            self._setting_by_record[record_index] = setting
             try:
                 context_start = int(record["context_start"])
                 context_stop = int(record["context_stop"])
@@ -414,28 +446,15 @@ class DemonstrationStore:
                 source="demonstration batch setting",
             )
             requested_setting = (normalized.solver_key, normalized.target_nfe)
-        candidates = [
-            record_index
-            for record_index in range(len(self.trajectory_records))
-            if self._eligible_rows[(record_index, split)].size > 0
-            and (
-                requested_setting is None
-                or (
-                    str(self.trajectory_records[record_index]["solver_key"]),
-                    int(self.trajectory_records[record_index]["target_nfe"]),
-                )
-                == requested_setting
-            )
-        ]
+        candidates = self._candidate_records.get((split, requested_setting), ())
         if not candidates:
             raise ValueError(f"No {split} rows are available.")
         if record_index is None:
-            candidate_counts = np.asarray(
-                [self._eligible_rows[(candidate, split)].size for candidate in candidates],
-                dtype=np.float64,
-            )
             selected_record = int(
-                generator.choice(candidates, p=candidate_counts / candidate_counts.sum())
+                generator.choice(
+                    candidates,
+                    p=self._candidate_probabilities[(split, requested_setting)],
+                )
             )
         else:
             selected_record = int(record_index)
@@ -460,13 +479,7 @@ class DemonstrationStore:
             )
         rows = np.arange(size, dtype=np.int64)
         context_indices = arrays["context_index"][selected].astype(np.int64)
-        record = self.trajectory_records[record_index]
-        features = setting_features(
-            str(record["solver_key"]),
-            int(record["target_nfe"]),
-            mode=self.setting_encoder_config.mode,
-            config=self.setting_encoder_config,
-        )
+        features = self._setting_features[self._setting_by_record[record_index]]
 
         def tensor(value: np.ndarray) -> torch.Tensor:
             return torch.as_tensor(value, dtype=torch.float32, device=device)

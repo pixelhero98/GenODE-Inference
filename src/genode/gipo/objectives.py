@@ -75,6 +75,11 @@ OBJECTIVE_SPECS_BY_FAMILY: Dict[str, Tuple[MetricObjectiveSpec, ...]] = {
     SCENARIO_FAMILY_CONDITIONAL_GENERATION: CONDITIONAL_METRIC_SPECS,
     SCENARIO_FAMILY_MOLECULE: MOLECULE_METRIC_SPECS,
 }
+_METRIC_SPEC_BY_UTILITY = {
+    spec.utility_key: spec
+    for specs in OBJECTIVE_SPECS_BY_FAMILY.values()
+    for spec in specs
+}
 
 
 def objective_specs_for_family(benchmark_family: str) -> Tuple[MetricObjectiveSpec, ...]:
@@ -103,10 +108,6 @@ def teacher_objective_specs_for_scenario(scenario_key: str) -> Tuple[MetricObjec
     return objective_specs_for_family(family)
 
 
-def objective_utility_keys_for_family(benchmark_family: str) -> Tuple[str, ...]:
-    return tuple(spec.utility_key for spec in objective_specs_for_family(benchmark_family))
-
-
 def teacher_objective_utility_keys_for_family(benchmark_family: str) -> Tuple[str, ...]:
     return tuple(spec.utility_key for spec in teacher_objective_specs_for_family(benchmark_family))
 
@@ -132,12 +133,11 @@ def teacher_metric_profile_for_scenario(scenario_key: str) -> Dict[str, object]:
 
 
 def objective_weight_map_for_keys(target_keys: Sequence[str]) -> Dict[str, float]:
-    spec_by_utility = {
-        spec.utility_key: spec
-        for specs in OBJECTIVE_SPECS_BY_FAMILY.values()
-        for spec in specs
+    return {
+        str(key): float(_METRIC_SPEC_BY_UTILITY[str(key)].weight)
+        for key in target_keys
+        if str(key) in _METRIC_SPEC_BY_UTILITY
     }
-    return {str(key): float(spec_by_utility[str(key)].weight) for key in target_keys if str(key) in spec_by_utility}
 
 
 def _finite_positive(value: object) -> float:
@@ -154,7 +154,7 @@ def _finite_nonnegative(value: object) -> float:
     return val
 
 
-def _optional_finite(value: object) -> float | None:
+def finite_metric_value(value: object) -> float | None:
     if value in (None, ""):
         return None
     try:
@@ -173,7 +173,7 @@ def _truthy(value: object) -> bool:
 
 
 def _metric_value(row: Mapping[str, object], spec: MetricObjectiveSpec) -> float | None:
-    return _optional_finite(row.get(spec.metric_key))
+    return finite_metric_value(row.get(spec.metric_key))
 
 
 def _metric_applicable(row: Mapping[str, object], spec: MetricObjectiveSpec) -> bool:
@@ -183,6 +183,13 @@ def _metric_applicable(row: Mapping[str, object], spec: MetricObjectiveSpec) -> 
     if value in (None, ""):
         return False
     return _truthy(value)
+
+
+def teacher_metric_component_applicable(row: Mapping[str, object], utility_key: str) -> bool:
+    """Return whether a teacher utility component applies to a metric row."""
+
+    spec = _METRIC_SPEC_BY_UTILITY.get(str(utility_key))
+    return True if spec is None else _metric_applicable(row, spec)
 
 
 def directional_uniform_utility(

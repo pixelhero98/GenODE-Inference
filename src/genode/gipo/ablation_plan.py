@@ -23,7 +23,7 @@ GIPO_POLICY_KEY = "gipo"
 
 
 @dataclass(frozen=True)
-class GipoStudentPolicy:
+class GIPOStudentPolicy:
     policy_key: str
     student_training_mode: str
     student_target_mixture_mode: str
@@ -66,7 +66,7 @@ class GipoStudentPolicy:
         }
 
 
-_GIPO_POLICY = GipoStudentPolicy(
+_GIPO_POLICY = GIPOStudentPolicy(
     GIPO_POLICY_KEY,
     STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
     "full",
@@ -74,36 +74,36 @@ _GIPO_POLICY = GipoStudentPolicy(
     "reference",
 )
 
-_ABLATION_POLICIES: Tuple[GipoStudentPolicy, ...] = (
-    GipoStudentPolicy(
+_ABLATION_POLICIES: Tuple[GIPOStudentPolicy, ...] = (
+    GIPOStudentPolicy(
         "full_seen_only_score_000",
         STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
         "full",
         0.00,
         "main",
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "full_seen_only_score_005",
         STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
         "full",
         0.05,
         "main",
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "full_seen_plus_unseen_target_score_005",
         STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
         "full",
         0.05,
         "main",
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "elite_seen_only_score_005",
         STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
         "elite",
         0.05,
         "main",
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "blend_020_seen_only_score_005",
         STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
         "elite_blend",
@@ -111,7 +111,7 @@ _ABLATION_POLICIES: Tuple[GipoStudentPolicy, ...] = (
         "main",
         0.20,
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "blend_020_seen_plus_unseen_target_score_005",
         STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
         "elite_blend",
@@ -119,42 +119,42 @@ _ABLATION_POLICIES: Tuple[GipoStudentPolicy, ...] = (
         "main",
         0.20,
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "full_seen_only_score_010",
         STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
         "full",
         0.10,
         "appendix",
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "full_seen_plus_unseen_target_score_000",
         STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
         "full",
         0.00,
         "appendix",
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "full_seen_plus_unseen_target_score_001",
         STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
         "full",
         0.01,
         "appendix",
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "full_seen_plus_unseen_target_score_010",
         STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
         "full",
         0.10,
         "appendix",
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "elite_seen_plus_unseen_target_score_005",
         STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
         "elite",
         0.05,
         "appendix",
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "blend_010_seen_only_score_005",
         STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
         "elite_blend",
@@ -162,7 +162,7 @@ _ABLATION_POLICIES: Tuple[GipoStudentPolicy, ...] = (
         "appendix",
         0.10,
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "blend_040_seen_only_score_005",
         STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
         "elite_blend",
@@ -170,7 +170,7 @@ _ABLATION_POLICIES: Tuple[GipoStudentPolicy, ...] = (
         "appendix",
         0.40,
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "blend_010_seen_plus_unseen_target_score_005",
         STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
         "elite_blend",
@@ -178,7 +178,7 @@ _ABLATION_POLICIES: Tuple[GipoStudentPolicy, ...] = (
         "appendix",
         0.10,
     ),
-    GipoStudentPolicy(
+    GIPOStudentPolicy(
         "blend_040_seen_plus_unseen_target_score_005",
         STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
         "elite_blend",
@@ -188,7 +188,7 @@ _ABLATION_POLICIES: Tuple[GipoStudentPolicy, ...] = (
     ),
 )
 
-_PRESETS: Mapping[str, Tuple[GipoStudentPolicy, ...]] = {
+_PRESETS: Mapping[str, Tuple[GIPOStudentPolicy, ...]] = {
     ABLATION_PRESET_MAIN: tuple(policy for policy in _ABLATION_POLICIES if policy.comparison_group == "main"),
     ABLATION_PRESET_ALL: _ABLATION_POLICIES,
 }
@@ -198,21 +198,21 @@ def ablation_preset_keys() -> Sequence[str]:
     return tuple(_PRESETS)
 
 
-def ablation_student_policies(preset: str = ABLATION_PRESET_ALL) -> Tuple[GipoStudentPolicy, ...]:
+def ablation_student_policies(preset: str = ABLATION_PRESET_ALL) -> Tuple[GIPOStudentPolicy, ...]:
     try:
         return _PRESETS[str(preset)]
     except KeyError as exc:
         raise ValueError(f"Unknown GIPO ablation preset {preset!r}; expected one of {tuple(_PRESETS)}.") from exc
 
 
-def gipo_policy() -> GipoStudentPolicy:
+def gipo_policy() -> GIPOStudentPolicy:
     return _GIPO_POLICY
 
 
 __all__ = [
     "ABLATION_PRESET_ALL",
     "ABLATION_PRESET_MAIN",
-    "GipoStudentPolicy",
+    "GIPOStudentPolicy",
     "GIPO_POLICY_KEY",
     "ablation_preset_keys",
     "ablation_student_policies",

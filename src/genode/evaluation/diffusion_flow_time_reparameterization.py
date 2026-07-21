@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.cli import parse_csv, parse_int_csv
 from genode.experiment_layout import (
     REFERENCE_CHECKPOINT_STEPS,
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
@@ -71,9 +72,7 @@ from genode.evaluation.otflow_evaluation_support import (
     load_conditional_generation_checkpoint_splits,
     load_forecast_checkpoint_splits,
     parse_conditional_generation_datasets,
-    parse_csv,
     parse_forecast_datasets,
-    parse_int_csv,
     resolved_eval_horizon,
     resolved_validation_windows,
     selection_metric_for_family,
@@ -89,13 +88,13 @@ from genode.gipo.objectives import (
 )
 from genode.gipo.models import validate_time_grid
 from genode.solver_protocol import (
-    SOLVER_RUNTIME_NAMES,
     SUPPORTED_SOLVER_KEYS,
     normalize_solver_keys,
     normalize_solver_nfe_fields,
     solver_eval_multiplier,
     solver_experiment_scope,
     solver_macro_steps,
+    solver_runtime_name,
 )
 from genode.data.otflow_experiment_plan import (
     CONDITIONAL_GENERATION_FAMILY,
@@ -2399,7 +2398,7 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "target_nfe": int(target_nfe),
         "macro_steps": int(nfe.macro_steps),
         "solver_key": str(solver_key),
-        "solver_name": str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
+        "solver_name": solver_runtime_name(solver_key),
         "scheduler_key": str(scheduler_key),
         "scheduler_name": schedule_display_name(str(scheduler_key)),
         "schedule_family": schedule_family_for_key(str(scheduler_key)),
@@ -2713,7 +2712,7 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                 model,
                                 eval_ds,
                                 cfg,
-                                solver_name=str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
+                                solver_name=solver_runtime_name(solver_key),
                                 macro_steps=int(macro_steps),
                                 target_nfe=int(target_nfe),
                                 time_grid=details["time_grid"],
@@ -3007,7 +3006,7 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 "grid_kind": "fixed_diffusion_flow_time_grid",
                                 "selection_group": scheduler_key,
                                 "comparison_role": "transferred" if scheduler_key in TRANSFER_SCHEDULE_KEYS else "baseline",
-                                "solver_name": str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
+                                "solver_name": solver_runtime_name(solver_key),
                                 "nfe": int(macro_steps),
                                 "time_grid": details["time_grid"],
                             }
@@ -3762,14 +3761,8 @@ def build_argparser() -> argparse.ArgumentParser:
             f"Omitting the count while enabling preview uses {LOCKED_TEST_PREVIEW_CONTEXTS}."
         ),
     )
-    ap.add_argument("--hidden_dim", type=int, default=160)
-    ap.add_argument("--fu_net_layers", type=int, default=3)
-    ap.add_argument("--fu_net_heads", type=int, default=4)
     ap.add_argument("--rollout_mode", type=str, default="non_ar")
     ap.add_argument("--future_block_len", type=int, default=0)
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--weight_decay", type=float, default=1e-4)
-    ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--row_jsonl_name", type=str, default="rows.jsonl")
     ap.add_argument("--row_csv_name", type=str, default="rows.csv")
     ap.add_argument("--resume", action="store_true", default=True)

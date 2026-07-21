@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.cli import parse_int_csv
 from genode.experiment_layout import (
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
     REFERENCE_SEEN_NFES,
@@ -18,12 +19,12 @@ from genode.experiment_layout import (
 )
 from genode.data.molecule_xyz import load_molecule_group_manifest, molecule_group_root, trainable_molecule_group_members
 from genode.solver_protocol import (
-    SOLVER_RUNTIME_NAMES,
     SUPPORTED_SOLVER_KEYS,
     normalize_solver_keys,
     solver_eval_multiplier,
     solver_macro_steps,
     solver_order_p,
+    solver_runtime_name,
     target_nfe_for_macro_steps,
     uniform_time_grid,
 )
@@ -75,14 +76,6 @@ SER_PTG_REVERSED_SCHEDULE_KEY = "ser_ptg_local_defect_eta005_reversed"
 SER_PTG_AVG_REVERSED_SCHEDULE_KEY = "ser_ptg_local_defect_eta005_avg_reversed"
 SER_PTG_EXAMPLE_SELECTION_PROTOCOL = "ser_ptg_reference_global_context_selection"
 SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL = "otflow_midpoint_local_defect_proxy"
-
-
-def _parse_csv(text: str) -> List[str]:
-    return [part.strip() for part in str(text).split(",") if part.strip()]
-
-
-def _parse_int_csv(text: str) -> List[int]:
-    return [int(part) for part in _parse_csv(text)]
 
 
 def _positive_int(value: Any, *, name: str) -> int:
@@ -215,10 +208,6 @@ def _sum_int_records_by(records: Sequence[Mapping[str, Any]], key: str, value_ke
     return totals
 
 
-def _hash_grid(grid: Sequence[float]) -> str:
-    return schedule_grid_hash(grid)
-
-
 def solver_order_for_ptg(solver_key: str) -> float:
     return solver_order_p(str(solver_key))
 
@@ -247,7 +236,7 @@ def _prediction_with_density_metadata(prediction: Mapping[str, Any], *, schedule
             "scheduler_key": str(scheduler_key),
             "schedule_name": str(schedule_name),
             "time_grid": list(grid),
-            "schedule_grid_hash": _hash_grid(grid),
+            "schedule_grid_hash": schedule_grid_hash(grid),
             "density_protocol": "density_mass",
             "density_reference_grid_hash": reference_grid_hash(density_reference),
             "density_mass": [float(x) for x in mass],
@@ -524,8 +513,8 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
     scenario_key = str(args.scenario_key)
     family = scenario_family_for_key(scenario_key)
     solvers = list(normalize_solver_keys(str(args.solver_names)))
-    target_nfes = _parse_int_csv(str(args.target_nfe_values))
-    seeds = _parse_int_csv(str(args.seeds))
+    target_nfes = parse_int_csv(args.target_nfe_values)
+    seeds = parse_int_csv(args.seeds)
     reference_split = str(args.reference_split)
     if reference_split not in {TRAIN_TUNING_PHASE, VALIDATION_PHASE}:
         raise ValueError(f"reference_split must be {TRAIN_TUNING_PHASE!r} or {VALIDATION_PHASE!r}.")
@@ -594,7 +583,7 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
     train_tuning_reference_examples = int(max(len(ref["checkpoint"]["splits"].get("val", [])) for ref in member_refs))
     predictions: List[Dict[str, Any]] = []
     for solver_idx, solver_key in enumerate(solvers):
-        solver_name = str(SOLVER_RUNTIME_NAMES[str(solver_key)])
+        solver_name = solver_runtime_name(solver_key)
         solver_p = solver_order_for_ptg(str(solver_key))
         for target_idx, target_nfe in enumerate(target_nfes):
             macro_steps = solver_macro_steps(str(solver_key), int(target_nfe))
@@ -770,7 +759,7 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                     "macro_steps": int(macro_steps),
                     "realized_nfe": int(macro_steps) * int(solver_eval_multiplier(str(solver_key))),
                     "time_grid": list(time_grid),
-                    "schedule_grid_hash": _hash_grid(time_grid),
+                    "schedule_grid_hash": schedule_grid_hash(time_grid),
                     "reference_macro_steps": int(reference_macro_steps),
                     "reference_time_grid": reference_grid,
                     "local_defect_trace": [float(x) for x in mean_trace.tolist()],
@@ -931,12 +920,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--molecule_group_root", default=str(molecule_group_root()))
     parser.add_argument("--checkpoint_step", type=int, default=20000)
     parser.add_argument("--dataset_seed", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--hidden_dim", type=int, default=160)
-    parser.add_argument("--fu_net_layers", type=int, default=3)
-    parser.add_argument("--fu_net_heads", type=int, default=4)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--smoke", action="store_true", default=False)
     return parser

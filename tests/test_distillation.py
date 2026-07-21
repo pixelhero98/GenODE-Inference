@@ -976,6 +976,15 @@ def test_demonstration_store_uses_context_disjoint_splits_and_samples_trajectory
     assert set(batch.source_time.flatten().tolist()) <= {0.0, 0.5}
     assert torch.allclose(batch.density_mass.sum(dim=-1), torch.ones(16))
 
+    with pytest.raises(ValueError, match="No train rows"):
+        store.sample_batch(
+            1,
+            split="train",
+            generator=np.random.default_rng(31),
+            device=torch.device("cpu"),
+            setting=("heun", 2),
+        )
+
 
 def test_demonstration_store_rejects_duplicate_context_ids_before_splitting(
     tmp_path: Path,

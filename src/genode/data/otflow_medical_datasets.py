@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import hashlib
 import importlib.util
 import re
 import shutil
@@ -33,6 +32,7 @@ from genode.path_safety import (
     portable_relative_path,
     resolve_portable_relative_path,
 )
+from genode.provenance import file_sha256
 
 LONG_TERM_ST_EXPECTED_RECORDS = 86
 LONG_TERM_ST_PATIENT_GROUPS: Tuple[Tuple[str, ...], ...] = (
@@ -202,14 +202,6 @@ def _require_wfdb_for_long_term_st_preparation() -> None:
         )
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _parse_long_term_st_header(record_id: str, text: str) -> LongTermSTHeader:
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     if not lines:
@@ -249,7 +241,7 @@ def _scan_long_term_st_archives(archive_paths: Sequence[Path]) -> Tuple[Dict[str
             {
                 "name": str(archive_path.name),
                 "size_bytes": int(archive_path.stat().st_size),
-                "sha256": _sha256_file(archive_path),
+                "sha256": file_sha256(archive_path),
             }
         )
         with zipfile.ZipFile(archive_path) as zf:

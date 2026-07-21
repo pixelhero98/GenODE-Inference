@@ -28,7 +28,7 @@ from genode.schedule_transfer.otflow_reference_registry import (
     reference_schedule_specs,
     reference_solver_specs,
 )
-from genode.schedule_transfer.otflow_signal_traces import NATIVE_INFO_GROWTH_TRACE_KEY, NATIVE_SIGNAL_TRACE_KEYS
+from genode.schedule_transfer.otflow_signal_traces import NATIVE_INFO_GROWTH_TRACE_KEY
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,27 +61,21 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
         self.assertIn("Midpoint RK2", solver_names)
         self.assertIn("DPM++2M", solver_names)
 
-    def test_gipo_docs_describe_active_density_path(self) -> None:
+    def test_readme_describes_gipo_and_distillation_theory(self) -> None:
         text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
         lower = text.lower()
 
-        self.assertRegex(lower, r"continuous[- ]density")
-        self.assertRegex(lower, r"teacher[- ]weighted")
         for expected in (
-            "gipo",
-            "gipo_density",
-            "density_mass",
-            "rank",
-            "huber",
-            "uniform",
-            "late_power_3",
-            "flowts_power_sampling",
-            "ays",
-            "gits",
-            "ots",
-            "ser",
+            "normalized time density",
+            "inverse cdf",
+            "metric-aware teacher",
+            "teacher-weighted continuous density",
             "context-disjoint",
             "locked-test",
+            "endpoint flow map",
+            "terminal identity",
+            "strict superiority",
+            "transformer otflow",
             "genode-train-gipo",
             "genode-report-gipo-locked-test",
         ):
@@ -343,7 +337,6 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
 
     def test_native_hardness_trace_is_info_growth(self) -> None:
         self.assertEqual(NATIVE_INFO_GROWTH_TRACE_KEY, "info_growth_hardness_by_step")
-        self.assertIn("info_growth_hardness_by_step", NATIVE_SIGNAL_TRACE_KEYS)
 
     def test_runner_dry_run_writes_combined_summary(self) -> None:
         manifest = PROJECT_ROOT / "backbone_manifest.json"

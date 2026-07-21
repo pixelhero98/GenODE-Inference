@@ -80,6 +80,8 @@ class GIPOSchedulePolicy:
             device=self._student_device,
             dtype=self._student_dtype,
         )
+        self._setting_feature_cache: dict[tuple[str, int], torch.Tensor] = {}
+        self._quantile_cache: dict[int, torch.Tensor] = {}
         self.student.eval()
 
     @property
@@ -111,13 +113,16 @@ class GIPOSchedulePolicy:
             dim=-1,
         )
         cdf[:, -1] = 1.0
-        quantiles = torch.linspace(
-            0.0,
-            1.0,
-            int(macro_steps) + 1,
-            device=mass.device,
-            dtype=mass.dtype,
-        ).expand(int(mass.shape[0]), -1)
+        step_count = int(macro_steps)
+        if step_count not in self._quantile_cache:
+            self._quantile_cache[step_count] = torch.linspace(
+                0.0,
+                1.0,
+                step_count + 1,
+                device=mass.device,
+                dtype=mass.dtype,
+            )
+        quantiles = self._quantile_cache[step_count].expand(int(mass.shape[0]), -1)
         bin_index = torch.searchsorted(cdf.contiguous(), quantiles.contiguous(), right=True) - 1
         bin_index = bin_index.clamp(min=0, max=self.density_dim - 1)
         cdf_left = torch.gather(cdf, 1, bin_index)
@@ -161,12 +166,15 @@ class GIPOSchedulePolicy:
                 f"normalizer={tuple(mean.shape)}, context={tuple(student_context.shape[1:])}."
             )
         normalized_context = (student_context - mean) / std.clamp_min(1e-6)
-        features = setting_features(
-            nfe.solver_key,
-            nfe.target_nfe,
-            mode=self.setting_encoder_config.mode,
-            config=self.setting_encoder_config,
-        ).to(device=self._student_device, dtype=self._student_dtype)
+        setting_key = (nfe.solver_key, nfe.target_nfe)
+        if setting_key not in self._setting_feature_cache:
+            self._setting_feature_cache[setting_key] = setting_features(
+                nfe.solver_key,
+                nfe.target_nfe,
+                mode=self.setting_encoder_config.mode,
+                config=self.setting_encoder_config,
+            ).to(device=self._student_device, dtype=self._student_dtype)
+        features = self._setting_feature_cache[setting_key]
         feature_batch = features.unsqueeze(0).expand(int(student_context.shape[0]), -1)
         student_density = self.student.density_mass(feature_batch, normalized_context)
         if student_density.shape != (int(student_context.shape[0]), self.density_dim):

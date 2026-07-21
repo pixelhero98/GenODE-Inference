@@ -42,13 +42,12 @@ from genode.gipo.models import (
     validate_time_grid,
 )
 from genode.gipo.objectives import (
-    CONDITIONAL_METRIC_SPECS,
     DEFAULT_REWARD_EPS,
     FORECAST_METRIC_SPECS,
-    MOLECULE_METRIC_SPECS,
-    MetricObjectiveSpec,
     UNIFORM_SCHEDULE_KEY,
+    finite_metric_value,
     objective_weight_map_for_keys,
+    teacher_metric_component_applicable,
     uniform_anchored_objective_columns,
 )
 from genode.gipo.schedule_hash import json_hash as schedule_json_hash
@@ -1451,7 +1450,6 @@ def recommended_context_calibration_count(
     available_contexts: int,
     *,
     normalized_combined_reference: int | None = None,
-    cells: int = 12,
     reference_total: int = DEFAULT_CONTEXT_CALIBRATION_TOTAL,
     min_total: int = MIN_CONTEXT_CALIBRATION_TOTAL,
     max_total: int = MAX_CONTEXT_CALIBRATION_TOTAL,
@@ -2183,40 +2181,6 @@ def _student_architecture(model: nn.Module) -> str:
     return validate_gipo_architecture(str(getattr(model, "architecture", "")), role="student")
 
 
-def _teacher_target_spec_by_utility() -> Dict[str, MetricObjectiveSpec]:
-    return {
-        spec.utility_key: spec
-        for specs in (FORECAST_METRIC_SPECS, CONDITIONAL_METRIC_SPECS, MOLECULE_METRIC_SPECS)
-        for spec in specs
-    }
-
-
-def _truthy_row_value(value: Any) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y"}
-    return bool(value)
-
-
-def _finite_target_value(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    try:
-        val = float(value)
-    except (TypeError, ValueError):
-        return None
-    return val if math.isfinite(val) else None
-
-
-def _target_component_applicable(row: MetricRow, target_key: str) -> bool:
-    spec = _teacher_target_spec_by_utility().get(str(target_key))
-    if spec is None or not spec.applicable_key:
-        return True
-    value = row.get(spec.applicable_key)
-    if value in (None, ""):
-        return False
-    return _truthy_row_value(value)
-
-
 def _row_reward_metric_weights(row: MetricRow, target_keys: Sequence[str]) -> Dict[str, float]:
     raw = row.get("reward_metric_weights_json", "")
     if raw in (None, ""):
@@ -2307,8 +2271,8 @@ def _teacher_metric_targets(
         row_values: List[float] = []
         row_mask: List[float] = []
         for key in keys:
-            value = _finite_target_value(row.get(key))
-            valid = value is not None and _target_component_applicable(row, key)
+            value = finite_metric_value(row.get(key))
+            valid = value is not None and teacher_metric_component_applicable(row, key)
             row_values.append(float(value) if valid else 0.0)
             row_mask.append(1.0 if valid else 0.0)
         if not any(mask > 0.0 for mask in row_mask):
@@ -2618,7 +2582,6 @@ def _teacher_training_tensors(
     mode: str = SETTING_ENCODER_MODE_CONTINUOUS,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     teacher_metric_target_keys: Sequence[str] = TEACHER_METRIC_TARGET_KEYS,
-    seed: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[ContextPairKey], List[str], List[Tuple[float, ...]]]:
     feature_mode = validate_setting_mode(mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
@@ -2628,14 +2591,23 @@ def _teacher_training_tensors(
     pair_keys: List[ContextPairKey] = []
     schedule_keys: List[str] = []
     density_masses: List[Tuple[float, ...]] = []
+    setting_cache: Dict[Tuple[str, int], torch.Tensor] = {}
     for row in rows:
         context_embedding_id = context_embedding_id_from_row(row)
         if context_embedding_id not in context_embeddings:
             raise KeyError(f"Missing context embedding for {context_embedding_id}.")
         solver = normalize_solver_key(str(row["solver_key"]))
         target_nfe = int(row["target_nfe"])
+        setting_key = (solver, target_nfe)
+        if setting_key not in setting_cache:
+            setting_cache[setting_key] = setting_features(
+                solver,
+                target_nfe,
+                mode=feature_mode,
+                config=encoder_config,
+            )
         mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
-        setting_rows.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
+        setting_rows.append(setting_cache[setting_key])
         density_rows.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
         context_rows.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
         pair_keys.append(context_pair_key(row, pair_on_seed=True))
@@ -3231,7 +3203,6 @@ def train_gipo_teacher(
         mode=feature_mode,
         setting_encoder_config=encoder_config,
         teacher_metric_target_keys=teacher_metric_target_keys,
-        seed=int(seed),
         device="cpu",
     )
     target_weights = _teacher_metric_weights(
@@ -3492,15 +3463,24 @@ def build_teacher_weighted_density_targets(
     score_density: List[np.ndarray] = []
     score_context: List[np.ndarray] = []
     score_masses: Dict[int, Tuple[float, ...]] = {}
+    setting_cache: Dict[Tuple[str, int], torch.Tensor] = {}
     for row in rows:
         context_embedding_id = context_embedding_id_from_row(row)
         if context_embedding_id not in context_embeddings:
             raise KeyError(f"Missing context embedding for {context_embedding_id}.")
-        solver = str(row["solver_key"])
+        solver = normalize_solver_key(str(row["solver_key"]))
         target_nfe = int(row["target_nfe"])
+        setting_key = (solver, target_nfe)
+        if setting_key not in setting_cache:
+            setting_cache[setting_key] = setting_features(
+                solver,
+                target_nfe,
+                mode=feature_mode,
+                config=encoder_config,
+            )
         mass = density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
         score_masses[id(row)] = mass
-        score_settings.append(setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config))
+        score_settings.append(setting_cache[setting_key])
         score_density.append(density_normalizer.transform_one(mass, reference_time_grid=reference_time_grid))
         score_context.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
     with torch.no_grad():
@@ -3551,11 +3531,11 @@ def build_teacher_weighted_density_targets(
         context_embedding_id = context_embedding_id_from_row(first)
         if context_embedding_id not in context_embeddings:
             raise KeyError(f"Missing context embedding for {context_embedding_id}.")
-        solver = str(first["solver_key"])
+        solver = normalize_solver_key(str(first["solver_key"]))
         target_nfe = int(first["target_nfe"])
         masses: List[Tuple[float, ...]] = []
         utilities: List[float] = []
-        setting_row = setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config)
+        setting_row = setting_cache[(solver, target_nfe)]
         reference_weight = score_weights_by_row_id[id(group[0])]
         reference_mask = score_mask_by_row_id[id(group[0])]
         for row in group:
@@ -4240,11 +4220,22 @@ def predict_gipo_density_many(
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     setting_rows: List[torch.Tensor] = []
     context_rows: List[np.ndarray] = []
+    setting_cache: Dict[Tuple[str, int], torch.Tensor] = {}
     for row in rows:
         context_embedding_id = context_embedding_id_from_row(row)
         if context_embedding_id not in context_embeddings:
             raise KeyError(f"Missing context embedding for {context_embedding_id}.")
-        setting_rows.append(setting_features(str(row["solver_key"]), int(row["target_nfe"]), mode=feature_mode, config=encoder_config))
+        solver = normalize_solver_key(str(row["solver_key"]))
+        target_nfe = int(row["target_nfe"])
+        setting_key = (solver, target_nfe)
+        if setting_key not in setting_cache:
+            setting_cache[setting_key] = setting_features(
+                solver,
+                target_nfe,
+                mode=feature_mode,
+                config=encoder_config,
+            )
+        setting_rows.append(setting_cache[setting_key])
         context_rows.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
     student.to(device)
     student.eval()

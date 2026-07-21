@@ -16,14 +16,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 from scipy.stats import spearmanr
 
+from genode.cli import parse_csv, parse_int_csv
 from genode.experiment_layout import REFERENCE_SEEN_NFES
 from genode.data.otflow_paths import display_project_path, project_root
 from genode.gipo.schema import reject_retired_evaluation_keys
-from genode.solver_protocol import (
-    SOLVER_RUNTIME_NAMES,
-    solver_macro_steps,
-    target_nfe_for_macro_steps,
-)
+from genode.solver_protocol import solver_macro_steps, solver_runtime_name, target_nfe_for_macro_steps
 
 PROJECT_ROOT = project_root()
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs"
@@ -104,14 +101,6 @@ class PtgResult:
     ptg_percent: float
     kappa_integral: float
     rho_integral: float
-
-
-def parse_csv(text: str) -> List[str]:
-    return [part.strip() for part in str(text).split(",") if part.strip()]
-
-
-def parse_int_csv(text: str) -> List[int]:
-    return [int(part) for part in parse_csv(text)]
 
 
 def _json_default(value: Any) -> Any:
@@ -354,13 +343,6 @@ def _runner_cli_args(args: argparse.Namespace) -> argparse.Namespace:
     if backbone_manifest.strip():
         argv.extend(["--backbone_manifest", str(_project_relative_path(backbone_manifest))])
     return build_argparser().parse_args(argv)
-
-
-def solver_runtime_name(solver_key: str) -> str:
-    key = str(solver_key)
-    if key not in SOLVER_RUNTIME_NAMES:
-        raise ValueError(f"Unsupported solver key {solver_key!r}.")
-    return str(SOLVER_RUNTIME_NAMES[key])
 
 
 def build_fixed_schedule_grid(schedule_key: str, macro_steps: int) -> List[float]:

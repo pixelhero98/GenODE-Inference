@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
+from genode.cli import parse_csv
 from genode.experiment_layout import (
     REFERENCE_SUPERVISION_SCHEDULE_KEYS,
     SCENARIO_FAMILY_CONDITIONAL_GENERATION,
@@ -18,17 +19,21 @@ from genode.experiment_layout import (
 )
 from genode.data.otflow_paths import display_project_path, resolve_project_path
 from genode.gipo.objectives import (
-    CONDITIONAL_METRIC_SPECS,
-    FORECAST_METRIC_SPECS,
-    MOLECULE_METRIC_SPECS,
+    finite_metric_value,
+    teacher_metric_component_applicable,
     teacher_objective_utility_keys_for_family,
     teacher_objective_utility_keys_for_scenario,
 )
-from genode.gipo.checkpoint_scope import checkpoint_scope_from_row as _checkpoint_scope_from_row
 from genode.gipo.density_representation import uniform_reference_grid
-from genode.gipo.policy import teacher_rank_pair_diagnostics
+from genode.gipo.policy import (
+    context_embedding_id_from_row,
+    context_id_from_row,
+    context_pair_key,
+    teacher_rank_pair_diagnostics,
+    validate_gipo_support_schedule_keys,
+    validate_teacher_metric_target_keys,
+)
 from genode.gipo.schedule_grids import load_schedule_summary_grids, schedule_grid_coverage_report
-from genode.gipo.schedule_hash import json_hash as _json_hash
 from genode.solver_protocol import normalize_solver_key
 
 
@@ -40,10 +45,6 @@ class _RowRecord:
     row: Dict[str, Any]
 
 
-def _parse_csv(text: str) -> List[str]:
-    return [part.strip() for part in str(text).split(",") if part.strip()]
-
-
 def _has_nonempty_value(row: Mapping[str, Any], key: str) -> bool:
     value = row.get(key, None)
     if value is None:
@@ -51,203 +52,7 @@ def _has_nonempty_value(row: Mapping[str, Any], key: str) -> bool:
     return not (isinstance(value, str) and value.strip() == "")
 
 
-def _optional_int(value: Any) -> int | None:
-    if value is None or str(value) == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _stable_context_id(
-    *,
-    scenario_key: str,
-    split_phase: str,
-    example_idx: int,
-    series_id: str,
-    series_idx: int,
-    target_t: int,
-    history_start: int | None = None,
-    history_stop: int | None = None,
-    context_schema: str = "forecast_window",
-) -> str:
-    return _json_hash(
-        {
-            "context_schema": str(context_schema),
-            "scenario_key": str(scenario_key),
-            "split_phase": str(split_phase),
-            "example_idx": int(example_idx),
-            "series_id": str(series_id),
-            "series_idx": int(series_idx),
-            "target_t": int(target_t),
-            "history_start": None if history_start is None else int(history_start),
-            "history_stop": None if history_stop is None else int(history_stop),
-        },
-        prefix="ctx",
-    )
-
-
-def _context_id_from_row(row: Mapping[str, Any]) -> str:
-    existing = str(row.get("context_id", "") or "").strip()
-    if existing:
-        return existing
-    scenario_key = str(row.get("scenario_key", "")).strip()
-    split_phase = str(row.get("split_phase", row.get("split", ""))).strip()
-    example_idx_raw = row.get("example_idx", row.get("example_index", None))
-    target_t_raw = row.get("target_t", None)
-    has_series_identity = str(row.get("series_id", "")).strip() != "" or str(row.get("series_idx", "")).strip() != ""
-    context_schema = str(row.get("context_schema", "") or "").strip()
-    if context_schema and scenario_key:
-        payload = {
-            "context_schema": context_schema,
-            "scenario_key": scenario_key,
-            "split_phase": split_phase,
-            "axis_series": str(row.get("axis_series", row.get("series_id", row.get("series_idx", "")))),
-            "axis_time_bin": str(row.get("axis_time_bin", "")),
-            "axis_record": str(row.get("axis_record", row.get("record_id", ""))),
-            "axis_window": str(row.get("axis_window", "")),
-            "axis_stratum": str(row.get("axis_stratum", row.get("stratum", ""))),
-            "axis_member": str(row.get("axis_member", row.get("member_key", ""))),
-            "axis_formula": str(row.get("axis_formula", row.get("formula", ""))),
-            "axis_atom_count": str(row.get("axis_atom_count", row.get("atom_count", ""))),
-            "axis_trajectory": str(row.get("axis_trajectory", row.get("trajectory_key", row.get("trajectory_id", "")))),
-            "axis_iso_id": str(row.get("axis_iso_id", row.get("iso_id", ""))),
-            "axis_flags": str(row.get("axis_flags", "")),
-            "example_idx": str(row.get("example_idx", row.get("example_index", ""))),
-            "target_t": str(row.get("target_t", "")),
-            "history_start": str(row.get("history_start", "")),
-            "history_stop": str(row.get("history_stop", "")),
-        }
-        return _json_hash(payload, prefix="ctx")
-    missing = []
-    if not scenario_key:
-        missing.append("scenario_key")
-    if not split_phase:
-        missing.append("split_phase")
-    if example_idx_raw is None or str(example_idx_raw) == "":
-        missing.append("example_idx")
-    if not has_series_identity:
-        missing.append("series_id_or_series_idx")
-    if target_t_raw is None or str(target_t_raw) == "":
-        missing.append("target_t")
-    if missing:
-        raise ValueError(f"Context rows require context_id or complete identity fields; missing {missing}.")
-    return _stable_context_id(
-        scenario_key=scenario_key,
-        split_phase=split_phase,
-        example_idx=int(example_idx_raw),
-        series_id=str(row.get("series_id", "")),
-        series_idx=int(row.get("series_idx", 0) or 0),
-        target_t=int(target_t_raw),
-        history_start=_optional_int(row.get("history_start")),
-        history_stop=_optional_int(row.get("history_stop")),
-        context_schema=context_schema or "forecast_window",
-    )
-
-
-def _context_embedding_id_from_row(row: Mapping[str, Any]) -> str:
-    existing = str(row.get("context_embedding_id", "") or "").strip()
-    if existing:
-        return existing
-    return _context_id_from_row(row)
-
-
-def _logical_seed_from_row(row: Mapping[str, Any]) -> int | None:
-    explicit = row.get("logical_seed", "")
-    if explicit is not None and str(explicit).strip() != "":
-        return int(explicit)
-    parent = str(row.get("parent_row_signature", "") or "")
-    parts = parent.split("|")
-    if len(parts) >= 3:
-        try:
-            return int(parts[2])
-        except (TypeError, ValueError):
-            pass
-    return _optional_int(row.get("seed"))
-
-
-def _context_pair_key(row: Mapping[str, Any], *, pair_on_seed: bool = True) -> Tuple[str, str, int, str, int | None, str]:
-    seed = _logical_seed_from_row(row) if pair_on_seed else None
-    return (
-        str(row.get("scenario_key", "")),
-        str(row["solver_key"]),
-        int(row["target_nfe"]),
-        _context_id_from_row(row),
-        seed,
-        _checkpoint_scope_from_row(row),
-    )
-
-
-def _validate_gipo_support_schedule_keys(
-    support_schedule_keys: Sequence[str],
-    *,
-    allowed_schedule_keys: Sequence[str] = REFERENCE_SUPERVISION_SCHEDULE_KEYS,
-) -> Tuple[str, ...]:
-    keys = tuple(str(key) for key in support_schedule_keys)
-    if not keys:
-        raise ValueError("support_schedule_keys must not be empty.")
-    bo_like = sorted(key for key in keys if "bo" in key.lower() or "candidate" in key.lower())
-    if bo_like:
-        raise ValueError(f"GIPO supervision must not include BO/candidate schedules: {bo_like}")
-    allowed = {str(key) for key in allowed_schedule_keys}
-    unsupported = sorted(set(keys) - allowed)
-    if unsupported:
-        raise ValueError(f"GIPO supervision is fixed/SER only; unsupported schedules: {unsupported}")
-    return keys
-
-
-def _validate_teacher_metric_target_keys(keys: Sequence[str] | str | None) -> Tuple[str, ...]:
-    if keys is None:
-        return ("u_comp_uniform",)
-    if isinstance(keys, str):
-        raw = [part.strip() for part in keys.split(",")]
-    else:
-        raw = [str(part).strip() for part in keys]
-    out = tuple(part for part in raw if part)
-    if not out:
-        raise ValueError("teacher_metric_target_keys must contain at least one utility column.")
-    duplicates = sorted({key for key in out if out.count(key) > 1})
-    if duplicates:
-        raise ValueError(f"teacher_metric_target_keys contains duplicates: {duplicates}")
-    return out
-
-
-def _teacher_target_spec_by_utility() -> Dict[str, Any]:
-    return {
-        spec.utility_key: spec
-        for specs in (FORECAST_METRIC_SPECS, CONDITIONAL_METRIC_SPECS, MOLECULE_METRIC_SPECS)
-        for spec in specs
-    }
-
-
-def _truthy_row_value(value: Any) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y"}
-    return bool(value)
-
-
-def _finite_target_value(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    try:
-        val = float(value)
-    except (TypeError, ValueError):
-        return None
-    return val if math.isfinite(val) else None
-
-
-def _target_component_applicable(row: Mapping[str, Any], target_key: str) -> bool:
-    spec = _teacher_target_spec_by_utility().get(str(target_key))
-    if spec is None or not spec.applicable_key:
-        return True
-    value = row.get(spec.applicable_key)
-    if value in (None, ""):
-        return False
-    return _truthy_row_value(value)
-
-
-def _infer_single_benchmark_family(rows: Sequence[Mapping[str, Any]]) -> str:
+def infer_single_benchmark_family(rows: Sequence[Mapping[str, Any]]) -> str:
     families = {str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()}
     if not families:
         scenario_keys = {
@@ -268,7 +73,7 @@ def _infer_single_benchmark_family(rows: Sequence[Mapping[str, Any]]) -> str:
     return family
 
 
-def _infer_single_scenario_key(rows: Sequence[Mapping[str, Any]]) -> str:
+def infer_single_scenario_key(rows: Sequence[Mapping[str, Any]]) -> str:
     if any("dataset" in row or "dataset_key" in row for row in rows):
         raise ValueError("GIPO rows must use 'scenario_key'; 'dataset' and 'dataset_key' are not supported.")
     scenario_keys = {
@@ -281,18 +86,21 @@ def _infer_single_scenario_key(rows: Sequence[Mapping[str, Any]]) -> str:
     return next(iter(scenario_keys)) if scenario_keys else ""
 
 
-def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
+def resolve_teacher_metric_target_keys(
+    args: argparse.Namespace,
+    rows: Sequence[Mapping[str, Any]],
+) -> Tuple[str, ...]:
     raw = str(args.teacher_metric_target_keys).strip()
     if not raw or raw.lower() == "auto":
-        scenario_key = _infer_single_scenario_key(rows)
+        scenario_key = infer_single_scenario_key(rows)
         if scenario_key:
             try:
                 return teacher_objective_utility_keys_for_scenario(scenario_key)
             except (KeyError, ValueError):
                 if not any(str(row.get("benchmark_family", "")).strip() for row in rows):
                     raise
-        return teacher_objective_utility_keys_for_family(_infer_single_benchmark_family(rows))
-    return _validate_teacher_metric_target_keys(raw)
+        return teacher_objective_utility_keys_for_family(infer_single_benchmark_family(rows))
+    return validate_teacher_metric_target_keys(raw)
 
 
 def _read_rows_csvs(paths_text: str) -> Tuple[List[_RowRecord], List[str], List[Dict[str, Any]]]:
@@ -300,7 +108,7 @@ def _read_rows_csvs(paths_text: str) -> Tuple[List[_RowRecord], List[str], List[
     fieldnames: List[str] = []
     inputs: List[Dict[str, Any]] = []
     next_index = 0
-    for path_text in _parse_csv(str(paths_text)):
+    for path_text in parse_csv(paths_text):
         path = resolve_project_path(path_text)
         with path.open("r", newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
@@ -336,7 +144,7 @@ def _observed_support(rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
     observed = tuple(sorted({str(row["scheduler_key"]) for row in rows if str(row.get("scheduler_key", "")).strip()}))
     protocol_order = tuple(key for key in REFERENCE_SUPERVISION_SCHEDULE_KEYS if key in observed)
     extras = tuple(key for key in observed if key not in protocol_order)
-    return _validate_gipo_support_schedule_keys(protocol_order + extras)
+    return validate_gipo_support_schedule_keys(protocol_order + extras)
 
 
 def _location(record: _RowRecord) -> Dict[str, Any]:
@@ -359,7 +167,7 @@ def _cell_payload(key: Tuple[Any, ...]) -> Dict[str, Any]:
 
 
 def _row_cell_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
-    return tuple(_context_pair_key(row, pair_on_seed=True))
+    return tuple(context_pair_key(row, pair_on_seed=True))
 
 
 def _optional_value(row: Mapping[str, Any], *keys: str) -> str:
@@ -416,7 +224,7 @@ def _identity_conflict_report(
     for record in records:
         row = record.row
         try:
-            context_id = _context_id_from_row(row)
+            context_id = context_id_from_row(row)
             row_context_ids[record.input_index] = context_id
         except Exception as exc:  # preflight reports row-level problems instead of aborting.
             dirty_rows.add(record.input_index)
@@ -441,7 +249,7 @@ def _identity_conflict_report(
                         "location": _location(record),
                     }
                 )
-            embedding_id = _context_embedding_id_from_row(row)
+            embedding_id = context_embedding_id_from_row(row)
             if not str(embedding_id).startswith(f"{checkpoint_id}:"):
                 dirty_rows.add(record.input_index)
                 checkpoint_scope_conflicts.append(
@@ -671,7 +479,7 @@ def teacher_metric_target_coverage(
     rows: Sequence[Mapping[str, Any]],
     target_keys: Sequence[str] | str | None,
 ) -> Dict[str, Dict[str, Any]]:
-    keys = _validate_teacher_metric_target_keys(target_keys)
+    keys = validate_teacher_metric_target_keys(target_keys)
     coverage: Dict[str, Dict[str, Any]] = {}
     for key in keys:
         applicable = 0
@@ -680,7 +488,7 @@ def teacher_metric_target_coverage(
         nonfinite = 0
         inapplicable = 0
         for row in rows:
-            if not _target_component_applicable(row, key):
+            if not teacher_metric_component_applicable(row, key):
                 inapplicable += 1
                 continue
             applicable += 1
@@ -688,7 +496,7 @@ def teacher_metric_target_coverage(
             if raw_value in (None, ""):
                 missing += 1
                 continue
-            if _finite_target_value(raw_value) is None:
+            if finite_metric_value(raw_value) is None:
                 nonfinite += 1
                 continue
             valid += 1
@@ -841,7 +649,7 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
     records, fieldnames, inputs = _read_rows_csvs(str(args.rows_csv))
     rows = [record.row for record in records]
     support_keys = (
-        _validate_gipo_support_schedule_keys(_parse_csv(str(args.support_schedule_keys)))
+        validate_gipo_support_schedule_keys(parse_csv(args.support_schedule_keys))
         if str(args.support_schedule_keys).strip()
         else _observed_support(rows)
     )
@@ -851,12 +659,12 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
     support, complete_cell_keys, complete_records = _support_report(records, support_keys, dirty_rows)
     support_rows = [record.row for record in records if str(record.row.get("scheduler_key", "") or "").strip() in support_set]
     complete_clean_rows = [record.row for record in complete_records]
-    complete_clean_contexts = sorted({_context_id_from_row(row) for row in complete_clean_rows})
+    complete_clean_contexts = sorted({context_id_from_row(row) for row in complete_clean_rows})
     observed_context_ids: set[str] = set()
     observed_context_row_errors: List[str] = []
     for record in records:
         try:
-            observed_context_ids.add(_context_id_from_row(record.row))
+            observed_context_ids.add(context_id_from_row(record.row))
         except Exception as exc:
             observed_context_row_errors.append(
                 f"{display_project_path(record.source_path)}:{record.source_row_number}: {exc}"
@@ -885,7 +693,7 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
         "missing_grid_rows": [],
     }
     try:
-        schedule_grids = load_schedule_summary_grids(_parse_csv(str(args.schedule_summary_json)))
+        schedule_grids = load_schedule_summary_grids(parse_csv(args.schedule_summary_json))
         schedule_grid_report = schedule_grid_coverage_report(
             rows,
             schedule_grids=schedule_grids,
@@ -896,7 +704,7 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
 
     target_resolution_error = ""
     try:
-        target_keys = _resolve_teacher_metric_target_keys(
+        target_keys = resolve_teacher_metric_target_keys(
             argparse.Namespace(teacher_metric_target_keys=str(args.teacher_metric_target_keys)),
             rows,
         )

@@ -8,13 +8,13 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 import numpy as np
 
-from genode.data.otflow_paths import project_root
+from genode.data.otflow_paths import project_outputs_root
 from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, TRANSFER_SCHEDULE_KEYS, build_schedule_grid, schedule_display_name
 from genode.schedule_transfer.otflow_signal_traces import NATIVE_INFO_GROWTH_TRACE_KEY
 
-PROJECT_ROOT = project_root()
-DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results" / "native_info_growth_hardness"
-DEFAULT_FIGURE_DIR = PROJECT_ROOT / "figures"
+DEFAULT_OUTPUT_ROOT = project_outputs_root()
+DEFAULT_RESULTS_DIR = DEFAULT_OUTPUT_ROOT / "native_info_growth_hardness"
+DEFAULT_FIGURE_DIR = DEFAULT_OUTPUT_ROOT / "figures"
 DEFAULT_INPUT_JSON = DEFAULT_RESULTS_DIR / "native_info_growth_payload.json"
 DEFAULT_PNG = DEFAULT_FIGURE_DIR / "native_info_growth_schedule_trace.png"
 DEFAULT_PDF = DEFAULT_FIGURE_DIR / "native_info_growth_schedule_trace.pdf"
@@ -27,10 +27,6 @@ DATASET_ORDER = (
 SCHEDULE_ORDER = BASELINE_SCHEDULE_KEYS
 NATIVE_HARDNESS_TRACE_KEY = NATIVE_INFO_GROWTH_TRACE_KEY
 REPORT_TRACE_NAME = "native_info_growth"
-
-
-def parse_csv(text: str) -> List[str]:
-    return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
 def validate_time_grid(grid: Sequence[float], *, name: str = "time_grid") -> np.ndarray:

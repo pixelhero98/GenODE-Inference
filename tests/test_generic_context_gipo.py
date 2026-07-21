@@ -47,7 +47,7 @@ from genode.pipeline import full_pipeline
 from genode.gipo.train_gipo import (
     _context_sampling_summary,
     _merge_embedding_tables_guarded,
-    _resolve_teacher_metric_target_keys,
+    resolve_teacher_metric_target_keys,
     _rows_for_context_keys,
     _sample_context_keys_by_checkpoint,
     _split_membership_summary,
@@ -712,7 +712,7 @@ class GenericContextGipoTests(unittest.TestCase):
                 "u_comp_uniform": "0.0",
             }
         ]
-        self.assertEqual(_resolve_teacher_metric_target_keys(args, rows), ("u_crps_uniform", "u_mase_uniform"))
+        self.assertEqual(resolve_teacher_metric_target_keys(args, rows), ("u_crps_uniform", "u_mase_uniform"))
 
     def test_auto_teacher_target_keys_are_scenario_primary_vectors_after_csv_roundtrip(self) -> None:
         args = argparse.Namespace(teacher_metric_target_keys="auto")
@@ -735,26 +735,26 @@ class GenericContextGipoTests(unittest.TestCase):
             runner._write_context_row_csv(path, [row])
             loaded = read_metric_rows_csv(path)
         self.assertEqual(
-            _resolve_teacher_metric_target_keys(args, loaded),
+            resolve_teacher_metric_target_keys(args, loaded),
             tuple(spec.utility_key for spec in CONDITIONAL_PRIMARY_LOB_METRIC_SPECS),
         )
 
     def test_auto_teacher_target_keys_cover_all_families(self) -> None:
         args = argparse.Namespace(teacher_metric_target_keys="auto")
         self.assertEqual(
-            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": FORECAST_FAMILY, "scenario_key": "solar_energy_10m"}]),
+            resolve_teacher_metric_target_keys(args, [{"benchmark_family": FORECAST_FAMILY, "scenario_key": "solar_energy_10m"}]),
             tuple(spec.utility_key for spec in FORECAST_METRIC_SPECS),
         )
         self.assertEqual(
-            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": CONDITIONAL_GENERATION_FAMILY, "scenario_key": "lobster_synthetic"}]),
+            resolve_teacher_metric_target_keys(args, [{"benchmark_family": CONDITIONAL_GENERATION_FAMILY, "scenario_key": "lobster_synthetic"}]),
             tuple(spec.utility_key for spec in CONDITIONAL_PRIMARY_LOB_METRIC_SPECS),
         )
         self.assertEqual(
-            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": CONDITIONAL_GENERATION_FAMILY, "scenario_key": "long_term_st"}]),
+            resolve_teacher_metric_target_keys(args, [{"benchmark_family": CONDITIONAL_GENERATION_FAMILY, "scenario_key": "long_term_st"}]),
             tuple(spec.utility_key for spec in CONDITIONAL_PRIMARY_ECG_METRIC_SPECS),
         )
         self.assertEqual(
-            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": "molecule_3d_coordinate_generation", "scenario_key": "molecule_3d_set1"}]),
+            resolve_teacher_metric_target_keys(args, [{"benchmark_family": "molecule_3d_coordinate_generation", "scenario_key": "molecule_3d_set1"}]),
             tuple(spec.utility_key for spec in MOLECULE_METRIC_SPECS),
         )
 
@@ -909,8 +909,8 @@ class GenericContextGipoTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            report_locked_test._context_match_key(representative),
-            report_locked_test._context_match_key(uniform),
+            report_locked_test._row_group_key(representative),
+            report_locked_test._row_group_key(uniform),
         )
 
     def test_locked_reporter_rejects_conflicting_duplicate_context_metadata(self) -> None:
@@ -1056,7 +1056,7 @@ class GenericContextGipoTests(unittest.TestCase):
 
     def test_locked_reporter_logical_seed_identity_does_not_fall_back_to_evaluation_seed(self) -> None:
         with self.assertRaisesRegex(ValueError, "logical_seed or seed"):
-            report_locked_test._context_match_key(
+            report_locked_test._row_group_key(
                 {
                     "scenario_key": "solar_energy_10m",
                     "evaluation_seed": "1000",

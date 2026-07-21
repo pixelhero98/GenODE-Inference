@@ -4,7 +4,7 @@ from dataclasses import fields
 import os
 from pathlib import Path
 import re
-import time
+import tempfile
 from typing import Any, Mapping
 
 import torch
@@ -67,9 +67,18 @@ def _cpu_state_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
 
 def _atomic_torch_save(payload: Mapping[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
-    torch.save(dict(payload), temporary)
-    os.replace(temporary, path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        torch.save(dict(payload), temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def save_flow_map_checkpoint(

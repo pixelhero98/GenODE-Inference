@@ -19,7 +19,7 @@ from genode.gipo.objectives import CONDITIONAL_PRIMARY_LOB_METRIC_SPECS, FORECAS
 from genode.gipo.policy import GIPO_PROTOCOL, save_context_embedding_table
 from genode.gipo.train_gipo import (
     _assert_embedding_overlap_compatible,
-    _resolve_teacher_metric_target_keys,
+    resolve_teacher_metric_target_keys,
     build_argparser,
     train_gipo,
 )
@@ -205,19 +205,19 @@ class GipoTrainOptionsTests(unittest.TestCase):
         expected = tuple(spec.utility_key for spec in FORECAST_METRIC_SPECS)
 
         self.assertEqual(
-            _resolve_teacher_metric_target_keys(
+            resolve_teacher_metric_target_keys(
                 args,
                 [{"benchmark_family": SCENARIO_FAMILY_FORECAST, "scenario_key": "private_forecast_dataset"}],
             ),
             expected,
         )
         with self.assertRaisesRegex(KeyError, "Unknown reference scenario key"):
-            _resolve_teacher_metric_target_keys(
+            resolve_teacher_metric_target_keys(
                 args,
                 [{"scenario_key": "private_forecast_dataset", "forecast_crps": "1.0", "forecast_mase": "1.0"}],
             )
         self.assertEqual(
-            _resolve_teacher_metric_target_keys(
+            resolve_teacher_metric_target_keys(
                 args,
                 [{"benchmark_family": SCENARIO_FAMILY_CONDITIONAL_GENERATION, "scenario_key": "custom_lobster_like"}],
             ),

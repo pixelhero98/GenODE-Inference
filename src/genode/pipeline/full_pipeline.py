@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
+from genode.cli import parse_csv, parse_int_csv
 from genode.experiment_layout import (
     REFERENCE_CHECKPOINT_STEPS,
     REFERENCE_SEEN_NFES,
@@ -58,7 +59,7 @@ from genode.gipo.evaluate_schedule_summary import SER_REFERENCE_SCHEDULE_KEYS
 from genode.gipo.ablation_plan import (
     ABLATION_PRESET_ALL,
     GIPO_POLICY_KEY,
-    GipoStudentPolicy,
+    GIPOStudentPolicy,
     ablation_preset_keys,
     ablation_student_policies,
     gipo_policy,
@@ -120,17 +121,8 @@ class StageCommand:
     manifest_name: str
 
 
-def _parse_csv(text: str) -> List[str]:
-    return [part.strip() for part in str(text).split(",") if part.strip()]
-
-
 def _resolved_scenario_key(args: argparse.Namespace) -> str:
     return str(args.scenario_key)
-
-
-def _parse_int_csv(text: str, fallback_values: Sequence[int]) -> List[int]:
-    raw = _parse_csv(text)
-    return [int(part) for part in raw] if raw else [int(value) for value in fallback_values]
 
 
 def _locked_test_settings(args: argparse.Namespace) -> Dict[str, Any]:
@@ -151,7 +143,7 @@ def _locked_test_settings(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def _selected_stage_names(args: argparse.Namespace) -> List[str]:
-    requested = _parse_csv(str(args.stages))
+    requested = parse_csv(args.stages)
     if requested:
         selection_flags = [
             flag
@@ -244,7 +236,7 @@ def _teacher_target_args_for_scenario(dataset: str) -> List[str]:
     ]
 
 
-def _student_objective_args(args: argparse.Namespace, override: GipoStudentPolicy | None = None) -> List[Any]:
+def _student_objective_args(args: argparse.Namespace, override: GIPOStudentPolicy | None = None) -> List[Any]:
     settings = _student_objective_settings_payload(override if override is not None else args)
     values: List[Any] = [
         "--student_teacher_score_weight",
@@ -393,7 +385,7 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
     effective_stages = set(_selected_stage_names(args))
     if "report_gipo_locked_test" in effective_stages:
         requested_schedules = set(
-            _parse_csv(str(args.schedule_keys)) or REFERENCE_SUPERVISION_SCHEDULE_KEYS
+            parse_csv(args.schedule_keys) or REFERENCE_SUPERVISION_SCHEDULE_KEYS
         )
         missing_baselines = sorted(set(BASELINE_SCHEDULE_KEYS) - requested_schedules)
         missing_comparators = sorted(set(SER_REFERENCE_SCHEDULE_KEYS) - requested_schedules)
@@ -466,10 +458,10 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "ablation_preset": ablation_preset if includes_ablations else "",
         "ablation_student_policies": [policy.manifest_record() for policy in ablation_student_policies(ablation_preset)] if includes_ablations else [],
         "backbone_steps": int(args.backbone_steps),
-        "checkpoint_steps": _parse_int_csv(str(args.checkpoint_steps), REFERENCE_CHECKPOINT_STEPS),
-        "seen_nfes": _parse_int_csv(str(args.seen_nfes), REFERENCE_SEEN_NFES),
-        "unseen_nfes": _parse_int_csv(str(args.unseen_nfes), REFERENCE_UNSEEN_NFES),
-        "schedules": _parse_csv(str(args.schedule_keys)) or list(REFERENCE_SUPERVISION_SCHEDULE_KEYS),
+        "checkpoint_steps": parse_int_csv(args.checkpoint_steps, default=REFERENCE_CHECKPOINT_STEPS),
+        "seen_nfes": parse_int_csv(args.seen_nfes, default=REFERENCE_SEEN_NFES),
+        "unseen_nfes": parse_int_csv(args.unseen_nfes, default=REFERENCE_UNSEEN_NFES),
+        "schedules": parse_csv(args.schedule_keys) or list(REFERENCE_SUPERVISION_SCHEDULE_KEYS),
         "context_sample_count": int(args.context_sample_count),
         "schedule_row_split_phases": list(SCHEDULE_ROW_SPLIT_PHASES),
         "locked_test_mode": str(locked_test_settings["mode"]),
@@ -606,12 +598,12 @@ def _build_ablation_manifest(
         "commit_sha": _git_head_commit(),
         "protocol_hash": protocol_hash,
         "ablation_root": _run_relative_path(run_root, root),
-        "checkpoint_steps": _parse_int_csv(str(args.checkpoint_steps), REFERENCE_CHECKPOINT_STEPS),
-        "seen_nfes": _parse_int_csv(str(args.seen_nfes), REFERENCE_SEEN_NFES),
-        "unseen_nfes": _parse_int_csv(str(args.unseen_nfes), REFERENCE_UNSEEN_NFES),
+        "checkpoint_steps": parse_int_csv(args.checkpoint_steps, default=REFERENCE_CHECKPOINT_STEPS),
+        "seen_nfes": parse_int_csv(args.seen_nfes, default=REFERENCE_SEEN_NFES),
+        "unseen_nfes": parse_int_csv(args.unseen_nfes, default=REFERENCE_UNSEEN_NFES),
         "gipo_teacher_steps": int(args.gipo_teacher_steps),
         "gipo_student_steps": int(args.gipo_student_steps),
-        "schedule_keys": _parse_csv(str(args.schedule_keys)) or list(REFERENCE_SUPERVISION_SCHEDULE_KEYS),
+        "schedule_keys": parse_csv(args.schedule_keys) or list(REFERENCE_SUPERVISION_SCHEDULE_KEYS),
         "student_policies": policies,
         "student_policy_count": int(len(policies)),
     }
@@ -858,7 +850,7 @@ def _backbone_training_command_outputs_complete(command: Sequence[str]) -> Tuple
             return False, "backbone training command is missing --scenario_key or --checkpoint_steps"
         try:
             benchmark_family = scenario_family_for_key(scenario_key)
-            checkpoint_steps = _parse_int_csv(checkpoint_values, ())
+            checkpoint_steps = parse_int_csv(checkpoint_values)
         except ValueError as exc:
             return False, f"invalid backbone training command: {exc}"
         if benchmark_family not in {SCENARIO_FAMILY_FORECAST, SCENARIO_FAMILY_CONDITIONAL_GENERATION}:
@@ -882,7 +874,7 @@ def _backbone_training_command_outputs_complete(command: Sequence[str]) -> Tuple
     if not scenario_key or not stratum or not manifest_value or not checkpoint_values:
         return False, "molecule backbone training command is missing required manifest or artifact arguments"
     try:
-        checkpoint_steps = _parse_int_csv(checkpoint_values, ())
+        checkpoint_steps = parse_int_csv(checkpoint_values)
     except ValueError as exc:
         return False, f"invalid molecule backbone training command: {exc}"
     return _backbone_manifest_artifacts_complete(
@@ -1248,15 +1240,15 @@ def _backbone_training_commands(args: argparse.Namespace, dataset: str, checkpoi
 
 def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[StageCommand]:
     dataset = _resolved_scenario_key(args)
-    checkpoint_values = _parse_int_csv(str(args.checkpoint_steps), REFERENCE_CHECKPOINT_STEPS)
+    checkpoint_values = parse_int_csv(args.checkpoint_steps, default=REFERENCE_CHECKPOINT_STEPS)
     checkpoints = ",".join(str(value) for value in checkpoint_values)
     seen_nfes = ",".join(
-        str(value) for value in _parse_int_csv(str(args.seen_nfes), REFERENCE_SEEN_NFES)
+        str(value) for value in parse_int_csv(args.seen_nfes, default=REFERENCE_SEEN_NFES)
     )
     unseen_nfes = ",".join(
-        str(value) for value in _parse_int_csv(str(args.unseen_nfes), REFERENCE_UNSEEN_NFES)
+        str(value) for value in parse_int_csv(args.unseen_nfes, default=REFERENCE_UNSEEN_NFES)
     )
-    schedules = _parse_csv(str(args.schedule_keys)) or list(REFERENCE_SUPERVISION_SCHEDULE_KEYS)
+    schedules = parse_csv(args.schedule_keys) or list(REFERENCE_SUPERVISION_SCHEDULE_KEYS)
     fixed_schedules = ",".join(_fixed_schedule_keys_for_runner(schedules))
     ser_schedules = ",".join(_ser_schedule_keys_for_runner(schedules))
     support_schedules = _schedule_keys_for_gipo(schedules)
@@ -1324,7 +1316,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             return values
         raise ValueError(f"Unsupported split phase {phase!r}.")
 
-    def _gipo_train_command(mode: str, out_dir: Path, policy: GipoStudentPolicy | None = None) -> List[str]:
+    def _gipo_train_command(mode: str, out_dir: Path, policy: GIPOStudentPolicy | None = None) -> List[str]:
         command_args: List[Any] = [
             "--rows_csv",
             _csv_list("seen", "train_tuning", "context_rows.csv"),

@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.cli import parse_int_csv
 from genode.data.molecule_xyz import (
     ATOM_COVALENT_RADIUS,
     DEFAULT_MOLECULE_DATASET_KEY,
@@ -965,20 +966,12 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
     return summary
 
 
-def _parse_csv(text: str) -> List[str]:
-    return [part.strip() for part in str(text).split(",") if part.strip()]
-
-
-def _parse_int_csv(text: str) -> List[int]:
-    return [int(part) for part in _parse_csv(text)]
-
-
 def _molecule_solver_cases(args: argparse.Namespace) -> List[Tuple[str, int, int]]:
     solvers = normalize_solver_keys(str(args.solver_names))
     role = str(getattr(args, "nfe_role", NFE_ROLE_SEEN) or NFE_ROLE_SEEN)
     raw_nfes = str(getattr(args, "target_nfe_values", "") or "").strip()
     if raw_nfes:
-        target_nfes = _parse_int_csv(raw_nfes)
+        target_nfes = parse_int_csv(raw_nfes)
     else:
         target_nfes = list(target_nfes_for_role(role))
     cases: List[Tuple[str, int, int]] = []

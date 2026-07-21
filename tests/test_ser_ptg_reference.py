@@ -11,7 +11,7 @@ import torch
 from genode.experiment_layout import TRAIN_TUNING_CONTEXT_SAMPLE_COUNT
 from genode.gipo import ser_ptg_reference as ser
 from genode.gipo.ser_ptg_reference import build_argparser, build_ser_ptg_reference, collect_batched_local_defect_trace
-from genode.evaluation.otflow_evaluation_support import build_conditional_generation_dataset_args_from_cfg
+from genode.evaluation.otflow_evaluation_support import build_conditional_generation_dataset_args
 from genode.models.config import OTFlowConfig
 from genode.solver_protocol import FlowDiagnostics, FlowTrajectory
 
@@ -21,48 +21,20 @@ class SerPtgReferenceTests(unittest.TestCase):
         args = build_argparser().parse_args([])
         self.assertEqual(args.dataset_seed, 0)
         self.assertEqual(args.train_tuning_max_examples, 0)
-        self.assertEqual(args.lr, 2e-4)
-        self.assertEqual(args.weight_decay, 1e-4)
-        self.assertEqual(args.grad_clip, 1.0)
-        self.assertEqual(args.hidden_dim, 160)
-        self.assertEqual(args.fu_net_layers, 3)
-        self.assertEqual(args.fu_net_heads, 4)
+        for retired in ("lr", "weight_decay", "grad_clip", "hidden_dim", "fu_net_layers", "fu_net_heads"):
+            self.assertFalse(hasattr(args, retired))
         self.assertEqual(args.scenario_key, "traffic_hourly")
         self.assertFalse(hasattr(args, "trace_variant"))
 
-    def test_argparser_defaults_rebuild_conditional_dataset_args(self) -> None:
-        cfg = OTFlowConfig(
-            device=torch.device("cpu"),
-            levels=1,
-            token_dim=4,
-            history_len=12000,
-            hidden_dim=160,
-            dropout=0.0,
-            ctx_heads=4,
-            ctx_layers=1,
-            fu_net_layers=3,
-            fu_net_heads=4,
-            rollout_mode="non_ar",
-            future_block_len=3000,
-            use_cond_features=True,
-            cond_standardize=True,
-            cond_dim=5,
-            use_amp=False,
-        )
-        cfg.apply_overrides(steps=20000)
+    def test_conditional_dataset_args_contain_only_split_inputs(self) -> None:
         args = build_argparser().parse_args(["--scenario_key", "long_term_st", "--device", "cpu"])
 
-        dataset_args = build_conditional_generation_dataset_args_from_cfg(
-            args,
-            "long_term_st",
-            "transformer",
-            cfg,
-        )
+        dataset_args = build_conditional_generation_dataset_args(args, "long_term_st")
 
         self.assertEqual(dataset_args.seed, 0)
-        self.assertEqual(dataset_args.lr, 2e-4)
-        self.assertEqual(dataset_args.fu_net_layers, 3)
-        self.assertEqual(dataset_args.future_block_len, 3000)
+        self.assertEqual(dataset_args.dataset, "long_term_st")
+        self.assertEqual(dataset_args.stride_train, 3000)
+        self.assertFalse(hasattr(dataset_args, "lr"))
 
     def test_collect_batched_local_defect_trace_handles_sample_seed_above_numpy_limit(self) -> None:
         cfg = OTFlowConfig(

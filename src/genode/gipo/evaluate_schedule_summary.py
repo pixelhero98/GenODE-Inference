@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from genode.cli import parse_int_csv
 from genode.data.otflow_experiment_plan import FORECAST_FAMILY
 from genode.data.otflow_monash_datasets import monash_manifest_path
 from genode.experiment_layout import (
@@ -18,11 +19,11 @@ from genode.experiment_layout import (
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
 )
 from genode.solver_protocol import (
-    SOLVER_RUNTIME_NAMES,
     SUPPORTED_SOLVER_KEYS,
     normalize_solver_key,
     normalize_solver_keys,
     normalize_solver_nfe_fields,
+    solver_runtime_name,
 )
 from genode.gipo.density_representation import (
     average_density_masses,
@@ -31,6 +32,7 @@ from genode.gipo.density_representation import (
     uniform_reference_grid,
 )
 from genode.gipo.models import validate_time_grid
+from genode.gipo.ablation_plan import GIPO_POLICY_KEY
 from genode.gipo.policy import load_context_embedding_table, save_context_embedding_table
 from genode.gipo.schedule_hash import schedule_grid_hash
 from genode.gipo.schema import (
@@ -78,7 +80,6 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
     schedule_display_name,
 )
 
-SELECTED_STUDENT_SCHEDULE_KEY = "gipo"
 SELECTED_STUDENT_SCHEDULE_NAME = "GIPO"
 EVALUATOR_SIGNATURE_VERSION = "schedule_summary_evaluator_seen_unseen"
 SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_summary_context_selection"
@@ -237,14 +238,6 @@ CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
 )
 
 
-def _parse_csv(text: str) -> List[str]:
-    return [part.strip() for part in str(text).split(",") if part.strip()]
-
-
-def _parse_int_csv(text: str) -> List[int]:
-    return [int(part) for part in _parse_csv(text)]
-
-
 def _optional_float(value: Any) -> Optional[float]:
     if value is None or value == "":
         return None
@@ -285,14 +278,6 @@ def _safe_high_gain(value: Any, reference: Any) -> Optional[float]:
     if v is None or r is None or abs(float(r)) <= 1e-12:
         return None
     return float(float(v) / float(r) - 1.0)
-
-
-def _schedule_grid_hash(grid: Sequence[float]) -> str:
-    return schedule_grid_hash(grid)
-
-
-def _reject_retired_schema_keys(payload: Mapping[str, Any], *, source: str) -> None:
-    reject_retired_evaluation_keys(payload, source=source)
 
 
 def _protocol_path_fingerprint(path: str | Path) -> Dict[str, Any]:
@@ -367,9 +352,9 @@ def _protocol_hash(args: argparse.Namespace) -> str:
         "signature": EVALUATOR_SIGNATURE_VERSION,
         "scenario_key": str(args.scenario_key),
         "split_phase": str(args.split_phase),
-        "seeds": _parse_int_csv(str(args.seeds)),
+        "seeds": parse_int_csv(args.seeds),
         "solver_names": list(normalize_solver_keys(str(args.solver_names))),
-        "target_nfe_values": _parse_int_csv(str(args.target_nfe_values)),
+        "target_nfe_values": parse_int_csv(args.target_nfe_values),
         "num_eval_samples": int(args.num_eval_samples),
         "forecast_eval_batch_size": int(args.forecast_eval_batch_size),
         "write_context_rows": bool(getattr(args, "write_context_rows", False)),
@@ -413,7 +398,7 @@ def schedule_display_name_for_key(schedule_key: str) -> str:
         return "SER-PTG local defect eta=0.05 reversed"
     if key == SER_PTG_AVG_REVERSED_SCHEDULE_KEY:
         return "SER-PTG local defect eta=0.05 density average"
-    if key == SELECTED_STUDENT_SCHEDULE_KEY:
+    if key == GIPO_POLICY_KEY:
         return SELECTED_STUDENT_SCHEDULE_NAME
     return schedule_display_name(key)
 
@@ -458,7 +443,7 @@ def _register_prediction(
             "macro_steps": int(macro_steps),
             "realized_nfe": int(realized_nfe),
             "time_grid": list(time_grid),
-            "schedule_grid_hash": _schedule_grid_hash(time_grid),
+            "schedule_grid_hash": schedule_grid_hash(time_grid),
             "intervals_json": prediction.get("intervals_json", json.dumps(intervals, separators=(",", ":"))),
         }
     )
@@ -495,7 +480,7 @@ def load_schedule_predictions(
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ValueError(f"Schedule summary {path} must contain a mapping payload.")
-    _reject_retired_schema_keys(payload, source=f"Schedule summary {path}")
+    reject_retired_evaluation_keys(payload, source=f"Schedule summary {path}")
     payload_scenario = str(payload.get("scenario_key", "")).strip()
     if not payload_scenario:
         raise ValueError(f"Schedule summary {path} requires scenario_key.")
@@ -522,7 +507,7 @@ def load_schedule_predictions(
     for schedule_index, schedule in enumerate(schedule_items):
         if not isinstance(schedule, Mapping):
             raise ValueError(f"Schedule summary {path} schedule {schedule_index} must be a mapping.")
-        _reject_retired_schema_keys(schedule, source=f"Schedule summary {path} schedule {schedule_index}")
+        reject_retired_evaluation_keys(schedule, source=f"Schedule summary {path} schedule {schedule_index}")
         scheduler_key = str(schedule.get("scheduler_key", "")).strip()
         if not scheduler_key:
             raise ValueError("Schedule summary contains a schedule without scheduler_key.")
@@ -533,7 +518,7 @@ def load_schedule_predictions(
                 raise ValueError(
                     f"Schedule summary {path} schedule {schedule_index} prediction {item_index} must be a mapping."
                 )
-            _reject_retired_schema_keys(
+            reject_retired_evaluation_keys(
                 item,
                 source=f"Schedule summary {path} schedule {schedule_index} prediction {item_index}",
             )
@@ -651,7 +636,7 @@ def _load_existing_rows(jsonl_path: Path, *, protocol_hash: str) -> Dict[Tuple[A
             if not line:
                 continue
             row = json.loads(line)
-            _reject_retired_schema_keys(row, source=f"Evaluation row in {jsonl_path}")
+            reject_retired_evaluation_keys(row, source=f"Evaluation row in {jsonl_path}")
             if str(row.get("protocol_hash")) != str(protocol_hash):
                 continue
             if str(row.get("row_status")) != "complete":
@@ -684,7 +669,7 @@ def _load_context_rows(path: Path) -> Dict[str, Dict[str, Any]]:
         return rows
     with path.open("r", newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            _reject_retired_schema_keys(row, source=f"Context evaluation row in {path}")
+            reject_retired_evaluation_keys(row, source=f"Context evaluation row in {path}")
             signature = str(row.get("row_signature", "")).strip()
             if signature:
                 if signature in rows:
@@ -745,7 +730,7 @@ def _schedule_row(
         "target_nfe": int(target_nfe),
         "macro_steps": int(nfe.macro_steps),
         "solver_key": solver_key,
-        "solver_name": str(SOLVER_RUNTIME_NAMES[solver_key]),
+        "solver_name": solver_runtime_name(solver_key),
         "scheduler_key": scheduler_key,
         "scheduler_name": str(prediction.get("schedule_name") or schedule_display_name_for_key(scheduler_key)),
         "gipo_step_budget": prediction.get("gipo_step_budget"),
@@ -833,7 +818,7 @@ def _load_forecast_rows_csv(
         return rows
     with resolved.open("r", newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            _reject_retired_schema_keys(row, source=f"Evaluation row in {resolved}")
+            reject_retired_evaluation_keys(row, source=f"Evaluation row in {resolved}")
             if str(row.get("benchmark_family", FORECAST_FAMILY)) != FORECAST_FAMILY:
                 continue
             if split_phase is not None and str(row.get("split_phase")) != str(split_phase):
@@ -1133,8 +1118,8 @@ def write_selected_schedule_summary(source_summary_path: str | Path, selection: 
     payload = json.loads(source_path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ValueError(f"Schedule summary {source_path} must contain a mapping payload.")
-    _reject_retired_schema_keys(payload, source=f"Schedule summary {source_path}")
-    _reject_retired_schema_keys(selection, source="Validation schedule selection")
+    reject_retired_evaluation_keys(payload, source=f"Schedule summary {source_path}")
+    reject_retired_evaluation_keys(selection, source="Validation schedule selection")
     selected_key = str(selection["selected_scheduler_key"])
     selected_schedule = None
     for schedule in list(payload.get("schedules", []) or []):
@@ -1190,7 +1175,7 @@ def write_selected_schedule_summary(source_summary_path: str | Path, selection: 
             copied["gipo_step_budget"] = int(selected_budget)
         predictions.append(copied)
     schedule = {
-        "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+        "scheduler_key": GIPO_POLICY_KEY,
         "schedule_name": SELECTED_STUDENT_SCHEDULE_NAME,
         "comparison_role": "learned_student_selected_by_validation",
         "source_scheduler_key": selected_key,
@@ -1373,7 +1358,7 @@ def build_comparison_summary(
         for target_nfe in target_nfe_values:
             cell_rows = by_cell.get((str(solver), int(target_nfe)), [])
             student_rows_for_cell = [row for row in cell_rows if str(row["scheduler_key"]) in student_scheduler_keys]
-            student = next((row for row in student_rows_for_cell if row["scheduler_key"] == SELECTED_STUDENT_SCHEDULE_KEY), None)
+            student = next((row for row in student_rows_for_cell if row["scheduler_key"] == GIPO_POLICY_KEY), None)
             if student is None and len(student_scheduler_keys) == 1:
                 student = next(iter(student_rows_for_cell), None)
             uniform = next((row for row in cell_rows if row["scheduler_key"] == "uniform"), None)
@@ -1497,9 +1482,9 @@ def build_comparison_summary(
 def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
     out_dir = resolve_project_path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
-    seeds = _parse_int_csv(str(args.seeds))
+    seeds = parse_int_csv(args.seeds)
     solver_names = list(normalize_solver_keys(str(args.solver_names)))
-    target_nfes = _parse_int_csv(str(args.target_nfe_values))
+    target_nfes = parse_int_csv(args.target_nfe_values)
     split_phase = str(args.split_phase)
     if split_phase not in {TRAIN_TUNING_PHASE, VALIDATION_PHASE, LOCKED_TEST_PHASE}:
         raise ValueError(f"split_phase must be {TRAIN_TUNING_PHASE!r}, {VALIDATION_PHASE!r}, or {LOCKED_TEST_PHASE!r}.")
@@ -1655,7 +1640,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                             model,
                             eval_ds,
                             cfg,
-                            solver_name=str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
+                            solver_name=solver_runtime_name(solver_key),
                             macro_steps=int(prediction["macro_steps"]),
                             target_nfe=int(target_nfe),
                             time_grid=prediction["time_grid"],

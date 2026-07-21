@@ -9,8 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from genode.gipo.ablation_plan import GIPO_POLICY_KEY
 from genode.gipo.evaluate_schedule_summary import (
-    SELECTED_STUDENT_SCHEDULE_KEY,
     _protocol_hash,
     _split_example_cap,
     build_argparser,
@@ -492,7 +492,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 target_nfe_values=(4,),
             )
 
-        prediction = reloaded[(SELECTED_STUDENT_SCHEDULE_KEY, "euler", 4)]
+        prediction = reloaded[(GIPO_POLICY_KEY, "euler", 4)]
         expected_metadata = {
             "method_key": "gipo",
             "gipo_step_budget": 25,
@@ -609,7 +609,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         ]
         ser_rows = [{"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": SER_PTG_SCHEDULE_KEY, "forecast_crps": 1.5, "forecast_mase": 2.5}]
         student_rows = [
-            {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY, "forecast_crps": 1.25, "forecast_mase": 2.0}
+            {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": GIPO_POLICY_KEY, "forecast_crps": 1.25, "forecast_mase": 2.0}
         ]
         summary = build_comparison_summary(
             baseline_rows=baseline_rows,
@@ -625,9 +625,9 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         self.assertEqual(summary["observed_ser_ptg_rows"], 1)
         self.assertEqual(summary["observed_student_rows"], 1)
         ranking = summary["cell_rankings"][0]
-        self.assertEqual(ranking["forecast_crps_ranking"][0], SELECTED_STUDENT_SCHEDULE_KEY)
+        self.assertEqual(ranking["forecast_crps_ranking"][0], GIPO_POLICY_KEY)
         self.assertAlmostEqual(ranking["student_relative_forecast_crps_gain_vs_ser_ptg"], 1.0 - 1.25 / 1.5)
-        self.assertEqual(ranking["student_comparisons"][0]["scheduler_key"], SELECTED_STUDENT_SCHEDULE_KEY)
+        self.assertEqual(ranking["student_comparisons"][0]["scheduler_key"], GIPO_POLICY_KEY)
 
     def test_comparison_summary_supports_multiple_student_schedules(self) -> None:
         baseline_rows = [
@@ -673,7 +673,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "scenario_key": "traffic_hourly",
                         "schedules": [
                             {
-                                "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                                "scheduler_key": GIPO_POLICY_KEY,
                                 "schedule_name": "GIPO Student Selected",
                                 "predictions": [
                                     {
@@ -692,7 +692,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             mixed_rows = [
                 {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": BASELINE_SCHEDULE_KEYS[0], "forecast_crps": 2.0, "forecast_mase": 3.0},
                 {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": SER_PTG_SCHEDULE_KEY, "forecast_crps": 1.5, "forecast_mase": 2.5},
-                {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY, "forecast_crps": 1.0, "forecast_mase": 2.0},
+                {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": GIPO_POLICY_KEY, "forecast_crps": 1.0, "forecast_mase": 2.0},
             ]
 
             class FakeDataset:
@@ -778,7 +778,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "scenario_key": "traffic_hourly",
                         "schedules": [
                             {
-                                "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                                "scheduler_key": GIPO_POLICY_KEY,
                                 "predictions": [
                                     {
                                         "solver_key": "euler",
@@ -1047,7 +1047,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "scenario_key": "traffic_hourly",
                         "schedules": [
                             {
-                                "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                                "scheduler_key": GIPO_POLICY_KEY,
                                 "schedule_name": "GIPO Student Selected",
                                 "gipo_step_budget": 25,
                                 "predictions": [
@@ -1126,7 +1126,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             with (root / "out" / "validation_rows.csv").open("r", newline="", encoding="utf-8") as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["scheduler_key"], SELECTED_STUDENT_SCHEDULE_KEY)
+            self.assertEqual(rows[0]["scheduler_key"], GIPO_POLICY_KEY)
             self.assertEqual(int(rows[0]["realized_nfe"]), 4)
             self.assertFalse(Path(summary["row_csv"]).is_absolute())
             self.assertNotIn(str(root), summary["row_csv"])
@@ -1141,7 +1141,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "scenario_key": "traffic_hourly",
                         "schedules": [
                             {
-                                "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                                "scheduler_key": GIPO_POLICY_KEY,
                                 "gipo_step_budget": 25,
                                 "predictions": [
                                     {
@@ -1239,7 +1239,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "scenario_key": "traffic_hourly",
                         "schedules": [
                             {
-                                "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                                "scheduler_key": GIPO_POLICY_KEY,
                                 "gipo_step_budget": 25,
                                 "predictions": [
                                     {
@@ -1297,7 +1297,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                             "solver_key": "euler",
                             "target_nfe": 4,
                             "realized_nfe": 4,
-                            "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                            "scheduler_key": GIPO_POLICY_KEY,
                             "example_idx": 0,
                             "forecast_crps": 1.0,
                             "forecast_mase": 2.0,
@@ -1376,7 +1376,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "scenario_key": "traffic_hourly",
                         "schedules": [
                             {
-                                "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                                "scheduler_key": GIPO_POLICY_KEY,
                                 "predictions": [
                                     {
                                         "solver_key": "euler",

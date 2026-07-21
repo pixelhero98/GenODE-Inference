@@ -10,12 +10,13 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.cli import parse_csv, parse_int_csv
 from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
 from genode.experiment_layout import SCENARIO_FAMILY_MOLECULE
 from genode.data.molecule_xyz import load_molecule_group_manifest, molecule_group_root, trainable_molecule_group_members
 from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW_MOLECULE, MOLECULE_FAMILY, find_backbone_artifact, load_backbone_manifest
 from genode.evaluation.molecule_metrics import evaluate_molecule_rollout_schedule, load_molecule_checkpoint_splits
-from genode.solver_protocol import SOLVER_RUNTIME_NAMES, normalize_solver_key, normalize_solver_keys, solver_macro_steps
+from genode.solver_protocol import normalize_solver_key, normalize_solver_keys, solver_macro_steps, solver_runtime_name
 from genode.gipo.objectives import (
     CONDITIONAL_METRIC_SPECS,
     FORECAST_METRIC_SPECS,
@@ -69,24 +70,15 @@ from genode.evaluation.otflow_evaluation_support import (
 from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, run_fixed_schedule_variant
 from genode.runtime import ProgressBar, resolve_torch_device
 
-GIPO_SCHEDULE_KEY = "gipo"
 SELECTION_MODE_REPORTING = "reporting"
 SELECTION_MODE_CALIBRATION = "calibration"
 CONTEXT_DISJOINT_PHASE = "context_disjoint"
 CALIBRATION_HOLDOUT_PHASES = (CONTEXT_DISJOINT_PHASE,)
 
 
-def _parse_csv(text: str) -> List[str]:
-    return [part.strip() for part in str(text).split(",") if part.strip()]
-
-
-def _parse_int_csv(text: str) -> List[int]:
-    return [int(part) for part in _parse_csv(text)]
-
-
 def _read_csvs(paths_text: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for path_text in _parse_csv(paths_text):
+    for path_text in parse_csv(paths_text):
         rows.extend(read_metric_rows_csv(resolve_project_path(path_text)))
     return rows
 
@@ -276,19 +268,15 @@ def _representative_context_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict
     return [grouped[key] for key in sorted(grouped)]
 
 
-def _context_match_key(row: Mapping[str, Any]) -> ContextMatchKey:
-    return _row_group_key(row)
-
-
 def _filter_rows_to_contexts(
     rows: Sequence[Mapping[str, Any]],
     representatives: Sequence[Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:
-    wanted = {_context_match_key(row) for row in representatives}
+    wanted = {_row_group_key(row) for row in representatives}
     filtered: List[Dict[str, Any]] = []
     for row_index, row in enumerate(rows):
         try:
-            key = _context_match_key(row)
+            key = _row_group_key(row)
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(
                 f"Comparator row {row_index} cannot be matched to a locked-test context: {exc}"
@@ -414,7 +402,7 @@ def _validate_strict_comparison_context_coverage(
     baseline_rows: Sequence[Mapping[str, Any]],
     comparator_rows: Sequence[Mapping[str, Any]],
 ) -> None:
-    expected = {_context_match_key(row) for row in representatives}
+    expected = {_row_group_key(row) for row in representatives}
     problems: List[str] = []
     for label, rows, schedule_keys in (
         ("baseline", baseline_rows, BASELINE_SCHEDULE_KEYS),
@@ -422,7 +410,7 @@ def _validate_strict_comparison_context_coverage(
     ):
         counts: Dict[Tuple[str, ContextMatchKey], int] = defaultdict(int)
         for row in rows:
-            counts[(str(row.get("scheduler_key", "")), _context_match_key(row))] += 1
+            counts[(str(row.get("scheduler_key", "")), _row_group_key(row))] += 1
         for schedule_key in schedule_keys:
             observed = {key for (schedule, key), count in counts.items() if schedule == schedule_key and count > 0}
             missing = sorted(expected - observed)
@@ -896,7 +884,7 @@ def _infer_int_values_from_rows(
     arg_name: str | None = None,
 ) -> Tuple[int, ...]:
     if str(requested or "").strip():
-        return tuple(_parse_int_csv(str(requested)))
+        return tuple(parse_int_csv(requested))
     values = sorted({int(row[field]) for row in rows if str(row.get(field, "")).strip()})
     if not values:
         raise ValueError(f"Could not infer {arg_name or field} from context_rows; pass --{arg_name or field}.")
@@ -951,7 +939,7 @@ def _attach_uniform_rewards_to_gipo_row(
             f"solver={row.get('solver_key')!r} target_nfe={row.get('target_nfe')!r}."
         )
     reward_columns = uniform_anchored_objective_columns(
-        {**out, "scheduler_key": GIPO_SCHEDULE_KEY},
+        {**out, "scheduler_key": GIPO_POLICY_KEY},
         {**dict(uniform_row), "scheduler_key": UNIFORM_SCHEDULE_KEY},
         _metric_specs_for_family(benchmark_family, scenario_key),
         uniform_scheduler_key=UNIFORM_SCHEDULE_KEY,
@@ -1130,16 +1118,19 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                     f"{comparison_provenance!r} != {locked_test_provenance!r}."
                 )
     uniform_context_rows = {
-        _context_match_key(row): dict(row)
+        _row_group_key(row): dict(row)
         for row in baseline_rows
         if str(row.get("scheduler_key", "")) == UNIFORM_SCHEDULE_KEY
     }
 
     raw_embeddings = load_context_embedding_table(resolve_project_path(embeddings_arg))
-    missing_context_embeddings = sorted({context_embedding_id_from_row(row) for row in representatives} - set(raw_embeddings))
+    required_embedding_ids = {context_embedding_id_from_row(row) for row in representatives}
+    missing_context_embeddings = sorted(required_embedding_ids - set(raw_embeddings))
     if missing_context_embeddings:
         raise KeyError(f"context embeddings NPZ is missing contexts: {missing_context_embeddings[:8]}")
-    embeddings = normalizer.transform_table(raw_embeddings)
+    embeddings = normalizer.transform_table(
+        {context_id: raw_embeddings[context_id] for context_id in sorted(required_embedding_ids)}
+    )
 
     device = resolve_torch_device(str(args.device))
     student.to(device)
@@ -1211,13 +1202,13 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                     model,
                     eval_ds,
                     cfg,
-                    solver_name=str(SOLVER_RUNTIME_NAMES[solver]),
+                    solver_name=solver_runtime_name(solver),
                     macro_steps=int(macro_steps),
                     target_nfe=int(target_nfe),
                     time_grid=prediction["time_grid"],
                     num_eval_samples=int(args.num_eval_samples),
                     seed=int(eval_seed),
-                    scheduler_key=GIPO_SCHEDULE_KEY,
+                    scheduler_key=GIPO_POLICY_KEY,
                     scenario_key=scenario_key,
                     split_phase=source_phase,
                     checkpoint_id=str(checkpoint["checkpoint_id"]),
@@ -1237,11 +1228,11 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                     eval_horizon=int(eval_horizon),
                     eval_windows=1,
                     grid_spec={
-                        "grid_name": GIPO_SCHEDULE_KEY,
+                        "grid_name": GIPO_POLICY_KEY,
                         "grid_kind": "gipo_density_time_grid",
-                        "selection_group": GIPO_SCHEDULE_KEY,
+                        "selection_group": GIPO_POLICY_KEY,
                         "comparison_role": "student",
-                        "solver_name": str(SOLVER_RUNTIME_NAMES[solver]),
+                        "solver_name": solver_runtime_name(solver),
                         "nfe": int(macro_steps),
                         "time_grid": prediction["time_grid"],
                     },
@@ -1284,7 +1275,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                     model=loaded["model"],
                     ds=eval_ds,
                     cfg=loaded["cfg"],
-                    scheduler_key=GIPO_SCHEDULE_KEY,
+                    scheduler_key=GIPO_POLICY_KEY,
                     solver_key=solver,
                     target_nfe=int(target_nfe),
                     macro_steps=int(macro_steps),
@@ -1319,7 +1310,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 "checkpoint_maturity_index": row.get("checkpoint_maturity_index", ""),
                 "solver_key": solver,
                 "target_nfe": int(target_nfe),
-                "scheduler_key": GIPO_SCHEDULE_KEY,
+                "scheduler_key": GIPO_POLICY_KEY,
                 "method_key": student_policy_key,
                 "gipo_step_budget": int(gipo_step_budget),
                 "teacher_final_retrain": json.dumps(teacher_final_retrain, separators=(",", ":"), sort_keys=True),
@@ -1379,7 +1370,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 )
             selected_row = _attach_uniform_rewards_to_gipo_row(
                 selected_row,
-                uniform_row=uniform_context_rows.get(_context_match_key(row)),
+                uniform_row=uniform_context_rows.get(_row_group_key(row)),
                 benchmark_family=benchmark_family,
                 scenario_key=scenario_key,
             )
@@ -1466,7 +1457,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "gipo_step_budget": int(gipo_step_budget),
         "checkpoint_step": int(checkpoint_step),
         "student_policy_type": "continuous_density",
-        "scheduler_key": GIPO_SCHEDULE_KEY,
+        "scheduler_key": GIPO_POLICY_KEY,
         "benchmark_family": benchmark_family,
         "scenario_key": scenario_key,
         "split_phase": split_phase,
@@ -1540,12 +1531,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout_mode", default="non_ar")
     parser.add_argument("--rollout_steps", type=int, default=16)
     parser.add_argument("--dataset_seed", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--hidden_dim", type=int, default=160)
-    parser.add_argument("--fu_net_layers", type=int, default=3)
-    parser.add_argument("--fu_net_heads", type=int, default=4)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seeds", default="", help="Comma-separated logical seeds. Defaults to seeds inferred from --context_rows.")
     parser.add_argument("--solver_names", default="", help="Comma-separated solver keys. Defaults to solvers inferred from --context_rows.")

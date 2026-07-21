@@ -68,6 +68,7 @@ class GenODEInterfaceTests(unittest.TestCase):
 
     def test_readme_documents_current_interfaces(self) -> None:
         text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("# GenODE Inference\n"))
         self.assertIn("--include_flow_map", text)
         self.assertIn("genode-train-gipo", text)
         self.assertIn("genode-collect-flow-map-demonstrations", text)
@@ -77,6 +78,13 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertIn("no claim", text.lower())
         self.assertNotIn("paper_gipo", text)
         self.assertNotIn("pseudo_gipo", text)
+
+    def test_shared_csv_parsers_normalize_cli_values(self) -> None:
+        from genode.cli import parse_csv, parse_int_csv
+
+        self.assertEqual(parse_csv(" alpha, , beta "), ["alpha", "beta"])
+        self.assertEqual(parse_int_csv("4, 8,12"), [4, 8, 12])
+        self.assertEqual(parse_int_csv("", default=(6, 10)), [6, 10])
 
     def test_gipo_trainer_public_contract_matches_required_api(self) -> None:
         from genode.gipo.train_gipo import build_argparser

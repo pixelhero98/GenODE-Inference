@@ -1,23 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Sequence, Tuple
+from typing import Sequence, Tuple
 
 from torch import Tensor
 
 SUPPORTED_SOLVER_KEYS: Tuple[str, ...] = ("euler", "dpmpp2m", "heun", "midpoint_rk2")
-SOLVER_DISPLAY_NAMES: Dict[str, str] = {
-    "euler": "Euler",
-    "dpmpp2m": "DPM++2M",
-    "heun": "Heun / RK2",
-    "midpoint_rk2": "Midpoint RK2",
-}
-SOLVER_RUNTIME_NAMES: Dict[str, str] = {
-    "euler": "euler",
-    "dpmpp2m": "dpmpp2m",
-    "heun": "heun",
-    "midpoint_rk2": "midpoint_rk2",
-}
 
 
 def normalize_solver_key(value: str) -> str:
@@ -43,8 +31,7 @@ def normalize_solver_keys(values: Sequence[str] | str, *, reject_duplicates: boo
 
 
 def solver_runtime_name(solver_key: str) -> str:
-    key = normalize_solver_key(solver_key)
-    return SOLVER_RUNTIME_NAMES[key]
+    return normalize_solver_key(solver_key)
 
 
 def solver_eval_multiplier(solver_key: str) -> int:
@@ -182,9 +169,7 @@ def normalize_solver_nfe_fields(
 
 
 __all__ = [
-    "SOLVER_DISPLAY_NAMES",
     "SUPPORTED_SOLVER_KEYS",
-    "SOLVER_RUNTIME_NAMES",
     "FlowTrajectory",
     "FlowDiagnostics",
     "SolverNFEFields",

@@ -1,23 +1,17 @@
 from __future__ import annotations
 
-import hashlib
-import json
-from typing import Any, Mapping, Sequence, Tuple
+from typing import Any, Sequence, Tuple
 
 import numpy as np
 
 from genode.gipo.models import validate_time_grid
+from genode.gipo.schedule_hash import json_hash
 
 DENSITY_PROTOCOL = "density_mass"
 DENSITY_DOMAIN = "normalized_model_time_0_1"
 DENSITY_BIN_COUNT = 64
 DEFAULT_DENSITY_EPS = 1e-12
 DEFAULT_LOG_DENSITY_EPS = 1e-8
-
-
-def _json_hash(payload: Mapping[str, Any], *, prefix: str) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return f"{prefix}_{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:24]}"
 
 
 def uniform_reference_grid(bin_count: int = DENSITY_BIN_COUNT) -> Tuple[float, ...]:
@@ -43,7 +37,7 @@ def validate_reference_grid(reference_time_grid: Sequence[float]) -> Tuple[float
 
 def reference_grid_hash(reference_time_grid: Sequence[float]) -> str:
     grid = [round(float(x), 12) for x in validate_reference_grid(reference_time_grid)]
-    return _json_hash({"density_protocol": DENSITY_PROTOCOL, "reference_time_grid": grid}, prefix="refgrid")
+    return json_hash({"density_protocol": DENSITY_PROTOCOL, "reference_time_grid": grid}, prefix="refgrid")
 
 
 def sanitize_density_mass(
@@ -73,7 +67,7 @@ def sanitize_density_mass(
 def density_mass_hash(density_mass: Sequence[float], *, reference_time_grid: Sequence[float] | None = None) -> str:
     mass = [round(float(x), 12) for x in sanitize_density_mass(density_mass, eps=0.0)]
     grid = uniform_reference_grid(len(mass)) if reference_time_grid is None else validate_reference_grid(reference_time_grid)
-    return _json_hash(
+    return json_hash(
         {
             "density_protocol": DENSITY_PROTOCOL,
             "reference_grid_hash": reference_grid_hash(grid),

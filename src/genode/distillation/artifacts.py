@@ -225,8 +225,6 @@ def load_demonstration_manifest(path: str | Path) -> Dict[str, Any]:
     root = resolve_manifest_path_base(manifest_path, payload.get("path_base"))
     metadata = dict(payload.get("metadata", {}))
     _validate_demonstration_metadata(metadata)
-    if str(metadata.get("split_phase", "")) == "locked_test":
-        raise ValueError("Locked-test trajectories may not be used for flow-map distillation.")
     raw_contexts = payload.get("context_shards", [])
     raw_trajectories = payload.get("trajectory_shards", [])
     if (

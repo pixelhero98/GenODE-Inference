@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -32,6 +31,7 @@ from genode.path_safety import (
     resolve_manifest_path_base,
     resolve_portable_relative_path,
 )
+from genode.provenance import file_sha256
 
 PACKAGE_SCHEMA_VERSION = "genode_backbone_package"
 PACKAGE_MANIFEST_NAME = "package_manifest.json"
@@ -152,14 +152,6 @@ def _package_rel_for_path(path_text: str | Path) -> str:
     return stripped
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _resolve_manifest_relative_path(manifest_path: Path, value: Any, *, path_base: str) -> Any:
     if not isinstance(value, str) or not value.strip():
         return value
@@ -263,7 +255,7 @@ def _file_record(package_root: Path, path: Path, *, role: str) -> Dict[str, Any]
         "path": rel,
         "role": role,
         "size_bytes": int(path.stat().st_size),
-        "sha256": _sha256_file(path),
+        "sha256": file_sha256(path),
     }
 
 
@@ -553,7 +545,7 @@ def package_backbone_family(
                 **package_manifest,
                 "zip_name": zip_path.name,
                 "zip_size_bytes": int(temporary_zip.stat().st_size),
-                "zip_sha256": _sha256_file(temporary_zip),
+                "zip_sha256": file_sha256(temporary_zip),
             }
             temporary_zip_manifest.write_text(
                 json.dumps(package_manifest, indent=2, sort_keys=True),
@@ -636,7 +628,7 @@ def _validate_file_record(package_root: Path, record: Mapping[str, Any]) -> List
     expected_hash = str(record.get("sha256", "") or "")
     if len(expected_hash) != 64 or any(character not in "0123456789abcdef" for character in expected_hash.lower()):
         errors.append(f"Missing or invalid SHA256 for {rel}")
-    elif _sha256_file(path) != expected_hash.lower():
+    elif file_sha256(path) != expected_hash.lower():
         errors.append(f"SHA256 mismatch for {rel}")
     return errors
 
