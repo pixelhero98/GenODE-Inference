@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import copy
 import csv
+import hashlib
 import json
 import math
+import os
 from collections import defaultdict
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import tempfile
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -14,6 +17,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from genode.checkpoint_validation import validate_strict_integer, validate_tensor_state_dict
 from genode.experiment_layout import (
     AVERAGED_SCHEDULE_COMPONENTS,
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
@@ -52,8 +56,13 @@ from genode.gipo.objectives import (
 )
 from genode.gipo.schedule_hash import json_hash as schedule_json_hash
 from genode.gipo.schedule_hash import schedule_grid_hash
-from genode.gipo.schema import reject_retired_evaluation_keys
-from genode.solver_protocol import normalize_solver_key, normalize_solver_nfe_fields, solver_macro_steps
+from genode.gipo.schema import reject_retired_evaluation_keys, validate_declared_split_phase
+from genode.provenance import file_sha256
+from genode.solver_protocol import (
+    SolverNFEFields,
+    normalize_solver_key,
+    normalize_solver_nfe_fields,
+)
 from genode.gipo.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
 from genode.schedule_transfer.diffusion_flow_schedules import (
     EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
@@ -68,6 +77,9 @@ NFECandidateSequenceKey = Tuple[str, int | None, str, str, str, str, str]
 ScheduleGridKey = Tuple[str, str, int] | Tuple[str, str, int, int]
 
 GIPO_PROTOCOL = "gipo_density"
+CONTEXT_EMBEDDING_KINDS: Tuple[str, ...] = ("ctx_summary", "summary")
+DEFAULT_CONTEXT_EMBEDDING_KIND = "ctx_summary"
+CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION = 2
 DEFAULT_CONTEXT_CALIBRATION_TOTAL = TRAIN_TUNING_CONTEXT_SAMPLE_COUNT
 MIN_CONTEXT_CALIBRATION_TOTAL = 72
 MAX_CONTEXT_CALIBRATION_TOTAL = TRAIN_TUNING_CONTEXT_SAMPLE_COUNT
@@ -105,9 +117,7 @@ TEACHER_METRIC_MASK_PROTOCOL = "row_valid_component_mask"
 DEFAULT_TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = ("u_comp_uniform",)
 TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = DEFAULT_TEACHER_METRIC_TARGET_KEYS
 TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET = "weighted_normalized_regret"
-DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
 STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE = "validation_ce"
-DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE
 DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS: Dict[str, float] = {
     "context": 0.25,
     "density_family": 0.25,
@@ -124,6 +134,47 @@ DEFAULT_TRANSFORMER_HEADS = 4
 DEFAULT_TRANSFORMER_DROPOUT = 0.05
 
 
+def validate_context_embedding_kind(value: Any) -> str:
+    """Normalize the backbone cache field used as the GIPO context embedding."""
+
+    key = DEFAULT_CONTEXT_EMBEDDING_KIND if value is None else str(value).strip()
+    if not key:
+        key = DEFAULT_CONTEXT_EMBEDDING_KIND
+    if key not in CONTEXT_EMBEDDING_KINDS:
+        raise ValueError(
+            f"Unknown context_embedding_kind={value!r}; expected one of {CONTEXT_EMBEDDING_KINDS}."
+        )
+    return key
+
+
+def context_embedding_kind_from_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    label: str,
+    require_explicit: bool = False,
+) -> str:
+    if not rows:
+        raise ValueError(f"{label} may not be empty.")
+    if require_explicit:
+        missing = [
+            index
+            for index, row in enumerate(rows)
+            if not str(row.get("context_embedding_kind", "") or "").strip()
+        ]
+        if missing:
+            raise ValueError(
+                f"{label} requires explicit context_embedding_kind values; "
+                f"missing at rows {missing[:8]}."
+            )
+    kinds = {
+        validate_context_embedding_kind(row.get("context_embedding_kind"))
+        for row in rows
+    }
+    if len(kinds) != 1:
+        raise ValueError(f"{label} contains mixed context_embedding_kind values: {sorted(kinds)}")
+    return next(iter(kinds))
+
+
 def normalize_gipo_checkpoint_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     """Normalize the immediately preceding checkpoint schema without weakening validation."""
 
@@ -138,7 +189,7 @@ def normalize_gipo_checkpoint_payload(payload: Mapping[str, Any]) -> Dict[str, A
     ) -> None:
         if old in mapping and new in mapping:
             raise ValueError(
-                f"GIPO v6 metadata {path} contains both {old!r} and {new!r}."
+                f"GIPO compatibility metadata {path} contains both {old!r} and {new!r}."
             )
         if old in mapping:
             mapping[new] = mapping.pop(old)
@@ -153,7 +204,9 @@ def normalize_gipo_checkpoint_payload(payload: Mapping[str, Any]) -> Dict[str, A
             return None
         value = mapping[key]
         if not isinstance(value, Mapping):
-            raise ValueError(f"GIPO v6 metadata {path}.{key} must be an object.")
+            raise ValueError(
+                f"GIPO compatibility metadata {path}.{key} must be an object."
+            )
         child = dict(value)
         mapping[key] = child
         return child
@@ -164,13 +217,14 @@ def normalize_gipo_checkpoint_payload(payload: Mapping[str, Any]) -> Dict[str, A
         value = mapping.pop("series_conditioning")
         if str(value) != "none_context_only":
             raise ValueError(
-                f"GIPO v6 metadata {path}.series_conditioning is unsupported."
+                f"GIPO compatibility metadata {path}.series_conditioning is unsupported."
             )
 
-    try:
-        version = int(normalized.get("model_payload_version", 0))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("GIPO model_payload_version must be an integer.") from exc
+    version = validate_strict_integer(
+        normalized.get("model_payload_version"),
+        label="GIPO model_payload_version",
+        minimum=1,
+    )
     if version == MODEL_PAYLOAD_VERSION:
         return normalized
     if version != 6:
@@ -180,33 +234,54 @@ def normalize_gipo_checkpoint_payload(payload: Mapping[str, Any]) -> Dict[str, A
         )
     raw_config = normalized.get("student_model_config")
     if not isinstance(raw_config, Mapping):
-        raise ValueError("GIPO v6 checkpoint is missing student_model_config.")
+        raise ValueError("GIPO compatibility checkpoint is missing student_model_config.")
     model_config = dict(raw_config)
     if "num_layers" in model_config:
-        raise ValueError("GIPO v6 student_model_config may not already contain num_layers.")
+        raise ValueError(
+            "GIPO compatibility student_model_config may not already contain num_layers."
+        )
     layer_keys = [key for key in ("hidden_layers", "transformer_layers") if key in model_config]
     if len(layer_keys) != 1:
         raise ValueError(
-            "GIPO v6 student_model_config must contain exactly one retired layer-count field."
+            "GIPO compatibility student_model_config must contain exactly one retired "
+            "layer-count field."
         )
     raw_num_layers = model_config.pop(layer_keys[0])
     if isinstance(raw_num_layers, bool) or not isinstance(raw_num_layers, (int, np.integer)):
-        raise ValueError("GIPO v6 layer count must be an integer.")
+        raise ValueError("GIPO compatibility layer count must be an integer.")
     num_layers = int(raw_num_layers)
     if num_layers <= 0:
-        raise ValueError("GIPO v6 layer count must be positive.")
-    if int(model_config.pop("num_series", 0)) != 0:
-        raise ValueError("GIPO v6 checkpoint has nonzero retired series-conditioning state.")
-    if int(model_config.pop("series_feature_dim", 0)) != 0:
-        raise ValueError("GIPO v6 checkpoint has nonzero retired series feature width.")
+        raise ValueError("GIPO compatibility layer count must be positive.")
+    if validate_strict_integer(
+        model_config.pop("num_series", 0),
+        label="GIPO compatibility num_series",
+        minimum=0,
+    ) != 0:
+        raise ValueError(
+            "GIPO compatibility checkpoint has nonzero retired series-conditioning state."
+        )
+    if validate_strict_integer(
+        model_config.pop("series_feature_dim", 0),
+        label="GIPO compatibility series_feature_dim",
+        minimum=0,
+    ) != 0:
+        raise ValueError(
+            "GIPO compatibility checkpoint has nonzero retired series feature width."
+        )
     if str(model_config.pop("series_conditioning", "none_context_only")) != "none_context_only":
-        raise ValueError("GIPO v6 checkpoint uses unsupported series conditioning.")
+        raise ValueError(
+            "GIPO compatibility checkpoint uses unsupported series conditioning."
+        )
     top_level_conditioning = normalized.pop("series_conditioning", "none_context_only")
     if str(top_level_conditioning) != "none_context_only":
-        raise ValueError("GIPO v6 checkpoint uses unsupported top-level series conditioning.")
+        raise ValueError(
+            "GIPO compatibility checkpoint uses unsupported top-level series conditioning."
+        )
     series_index_map = normalized.pop("series_index_map", {})
     if not isinstance(series_index_map, Mapping):
-        raise ValueError("GIPO v6 series_index_map must be an object when present.")
+        raise ValueError(
+            "GIPO compatibility series_index_map must be an object when present."
+        )
     model_config["num_layers"] = num_layers
     normalized["student_model_config"] = model_config
 
@@ -352,12 +427,15 @@ def normalize_gipo_checkpoint_payload(payload: Mapping[str, Any]) -> Dict[str, A
         if "losses" in student_training:
             losses = student_training["losses"]
             if not isinstance(losses, Sequence) or isinstance(losses, (str, bytes)):
-                raise ValueError("GIPO v6 metadata student_training.losses must be a list.")
+                raise ValueError(
+                    "GIPO compatibility metadata student_training.losses must be a list."
+                )
             migrated_losses: list[Dict[str, Any]] = []
             for index, item in enumerate(losses):
                 if not isinstance(item, Mapping):
                     raise ValueError(
-                        f"GIPO v6 metadata student_training.losses[{index}] must be an object."
+                        "GIPO compatibility metadata "
+                        f"student_training.losses[{index}] must be an object."
                     )
                 migrated = dict(item)
                 for old, new in (
@@ -438,23 +516,37 @@ def validate_gipo_teacher_training_metadata(metadata: Mapping[str, Any] | None) 
         raise ValueError(
             f"GIPO checkpoint teacher_scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE!r}."
         )
-    selection = dict(teacher_training.get("teacher_checkpoint_selection", {}) or {})
+    target_protocol = teacher_training.get("teacher_metric_target_protocol")
+    if target_protocol != TEACHER_METRIC_TARGET_PROTOCOL_VECTOR:
+        raise ValueError(
+            "GIPO checkpoint teacher_metric_target_protocol must be explicitly set to "
+            f"{TEACHER_METRIC_TARGET_PROTOCOL_VECTOR!r}."
+        )
+    mask_protocol = teacher_training.get("teacher_metric_mask_protocol")
+    if mask_protocol != TEACHER_METRIC_MASK_PROTOCOL:
+        raise ValueError(
+            "GIPO checkpoint teacher_metric_mask_protocol must be explicitly set to "
+            f"{TEACHER_METRIC_MASK_PROTOCOL!r}."
+        )
+    raw_selection = teacher_training.get("teacher_checkpoint_selection")
+    if not isinstance(raw_selection, Mapping):
+        raise ValueError("GIPO teacher checkpoint selection metadata must be an object.")
+    selection = dict(raw_selection)
     if str(selection.get("selection_protocol", "")) != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET:
         raise ValueError(
             f"GIPO checkpoints must use teacher checkpoint selection "
             f"{TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET!r}."
         )
-    if bool(selection.get("locked_test_used_for_selection", False)):
-        raise ValueError("GIPO teacher checkpoint selection metadata must not use locked-test labels.")
+    if selection.get("locked_test_used_for_selection") is not False:
+        raise ValueError(
+            "GIPO teacher checkpoint selection metadata requires "
+            "locked_test_used_for_selection=false."
+        )
     return {
         "teacher_target": teacher_target,
         "teacher_metric_targets": teacher_metric_targets,
-        "teacher_metric_target_protocol": str(
-            teacher_training.get("teacher_metric_target_protocol", TEACHER_METRIC_TARGET_PROTOCOL_VECTOR)
-        ),
-        "teacher_metric_mask_protocol": str(
-            teacher_training.get("teacher_metric_mask_protocol", TEACHER_METRIC_MASK_PROTOCOL)
-        ),
+        "teacher_metric_target_protocol": TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
+        "teacher_metric_mask_protocol": TEACHER_METRIC_MASK_PROTOCOL,
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_checkpoint_selection": selection,
     }
@@ -504,7 +596,11 @@ def validate_gipo_teacher_output(model_config: Mapping[str, Any] | None, *, requ
 
 
 def validate_gipo_attention_heads(attention_heads: int) -> int:
-    heads = int(attention_heads)
+    heads = validate_strict_integer(
+        attention_heads,
+        label="GIPO attention_heads",
+        minimum=1,
+    )
     if heads != DEFAULT_TRANSFORMER_HEADS:
         raise ValueError(f"GIPO density transformers require attention_heads={DEFAULT_TRANSFORMER_HEADS}; got {heads}.")
     return heads
@@ -971,10 +1067,30 @@ def stable_context_id(
 def _optional_int(value: Any) -> int | None:
     if value is None or str(value) == "":
         return None
+    if isinstance(value, str):
+        text = value.strip()
+        digits = text[1:] if text[:1] in {"+", "-"} else text
+        if not text or not digits.isascii() or not digits.isdecimal():
+            return None
+        return int(text)
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        return validate_strict_integer(value, label="row integer")
+    except ValueError:
         return None
+
+
+def _required_row_integer(
+    value: Any,
+    *,
+    label: str,
+    minimum: int | None = None,
+) -> int:
+    parsed = _optional_int(value)
+    if parsed is None:
+        raise ValueError(f"{label} must be an integer, got {value!r}.")
+    if minimum is not None and parsed < int(minimum):
+        raise ValueError(f"{label} must be at least {int(minimum)}, got {parsed}.")
+    return parsed
 
 
 def context_id_from_row(row: MetricRow) -> str:
@@ -1078,24 +1194,43 @@ def evaluation_seed_from_row(row: MetricRow) -> int | None:
     return _optional_int(row.get("seed"))
 
 
+def _solver_nfe_from_row(
+    row: MetricRow,
+    *,
+    source: str,
+) -> SolverNFEFields:
+    macro_steps = row.get("macro_steps", "")
+    if macro_steps in (None, ""):
+        macro_steps = row.get("reference_macro_steps", "")
+    return normalize_solver_nfe_fields(
+        str(row.get("solver_key", "")),
+        row.get("target_nfe"),
+        macro_steps=macro_steps,
+        realized_nfe=row.get("realized_nfe", ""),
+        source=source,
+    )
+
+
 def realized_nfe_from_row(row: MetricRow) -> int | None:
     solver = row.get("solver_key", "")
     target = row.get("target_nfe", "")
     if str(solver).strip() and str(target).strip():
-        nfe = normalize_solver_nfe_fields(
-            str(solver),
-            int(target),
-            macro_steps=row.get("macro_steps", row.get("reference_macro_steps", "")),
-            realized_nfe=row.get("realized_nfe", ""),
-            source="GIPO row",
-        )
+        nfe = _solver_nfe_from_row(row, source="GIPO row")
         return int(nfe.realized_nfe)
     explicit = row.get("realized_nfe", "")
     if explicit is not None and str(explicit).strip() != "":
-        return int(explicit)
+        return _required_row_integer(
+            explicit,
+            label="GIPO row realized_nfe",
+            minimum=1,
+        )
     target = row.get("target_nfe", "")
     if target is not None and str(target).strip() != "":
-        return int(target)
+        return _required_row_integer(
+            target,
+            label="GIPO row target_nfe",
+            minimum=1,
+        )
     return None
 
 
@@ -1119,10 +1254,11 @@ def series_key_from_row(row: MetricRow) -> str:
 
 def context_pair_key(row: MetricRow, *, pair_on_seed: bool = True) -> ContextPairKey:
     seed = logical_seed_from_row(row) if pair_on_seed else None
+    nfe = _solver_nfe_from_row(row, source="GIPO context row")
     return (
         str(row.get("scenario_key", "")),
-        str(row["solver_key"]),
-        int(row["target_nfe"]),
+        str(nfe.solver_key),
+        int(nfe.target_nfe),
         context_id_from_row(row),
         seed,
         checkpoint_scope_from_row(row),
@@ -1134,11 +1270,12 @@ def _context_pair_key_without_seed(key: ContextPairKey) -> ContextPairKey:
 
 
 def teacher_selection_candidate_group_key(row: MetricRow) -> TeacherSelectionCandidateGroupKey:
+    nfe = _solver_nfe_from_row(row, source="GIPO teacher-selection row")
     return (
         context_id_from_row(row),
-        str(row["solver_key"]),
-        int(row["target_nfe"]),
-        realized_nfe_from_row(row),
+        str(nfe.solver_key),
+        int(nfe.target_nfe),
+        int(nfe.realized_nfe),
         logical_seed_from_row(row),
         evaluation_seed_from_row(row),
         checkpoint_scope_from_row(row),
@@ -1177,11 +1314,11 @@ def _student_target_groups(rows: Sequence[MetricRow]) -> List[Tuple[ContextPairK
 def student_nfe_sequence_pairs(rows: Sequence[MetricRow]) -> List[Tuple[int, int, float]]:
     """Return adjacent target rows plus their positive NFE distance."""
     sequence_items: Dict[NFESequenceKey, List[Tuple[int, int]]] = defaultdict(list)
-    for index, (_, group) in enumerate(_student_target_groups(rows)):
+    for index, (pair_key, group) in enumerate(_student_target_groups(rows)):
         if not group:
             continue
         first = group[0]
-        sequence_items[_nfe_sequence_key(first)].append((int(first["target_nfe"]), int(index)))
+        sequence_items[_nfe_sequence_key(first)].append((int(pair_key[2]), int(index)))
     pairs: List[Tuple[int, int, float]] = []
     for items in sequence_items.values():
         ordered = sorted(items, key=lambda item: (int(item[0]), int(item[1])))
@@ -1194,7 +1331,7 @@ def student_nfe_sequence_pairs(rows: Sequence[MetricRow]) -> List[Tuple[int, int
 def _physical_nfe_sequence_key(row: MetricRow) -> Tuple[Any, ...]:
     return (
         str(row.get("scenario_key", "")),
-        str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))),
+        validate_declared_split_phase(row, source="GIPO NFE sequence row"),
         _optional_int(row.get("seed")),
         str(row["solver_key"]),
         row.get("example_idx", row.get("example_index", "")),
@@ -1209,9 +1346,11 @@ def nfe_sequence_diagnostic_summary(rows: Sequence[MetricRow]) -> Dict[str, Any]
     sequence_groups: Dict[NFESequenceKey, set[int]] = defaultdict(set)
     physical_groups: Dict[Tuple[Any, ...], set[int]] = defaultdict(set)
     for row in rows:
-        nfe = int(row["target_nfe"])
-        sequence_groups[_nfe_sequence_key(row)].add(nfe)
-        physical_groups[_physical_nfe_sequence_key(row)].add(nfe)
+        target_nfe = int(
+            _solver_nfe_from_row(row, source="GIPO NFE diagnostic row").target_nfe
+        )
+        sequence_groups[_nfe_sequence_key(row)].add(target_nfe)
+        physical_groups[_physical_nfe_sequence_key(row)].add(target_nfe)
     sequence_nfe_sets: Dict[Tuple[int, ...], int] = defaultdict(int)
     physical_nfe_sets: Dict[Tuple[int, ...], int] = defaultdict(int)
     for nfes in sequence_groups.values():
@@ -1220,8 +1359,23 @@ def nfe_sequence_diagnostic_summary(rows: Sequence[MetricRow]) -> Dict[str, Any]
         physical_nfe_sets[tuple(sorted(nfes))] += 1
     return {
         "row_count": int(len(rows)),
-        "observed_target_nfes": sorted({int(row["target_nfe"]) for row in rows}),
-        "split_phases": sorted({str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) for row in rows}),
+        "observed_target_nfes": sorted(
+            {
+                int(
+                    _solver_nfe_from_row(
+                        row,
+                        source="GIPO NFE diagnostic row",
+                    ).target_nfe
+                )
+                for row in rows
+            }
+        ),
+        "split_phases": sorted(
+            {
+                validate_declared_split_phase(row, source="GIPO NFE diagnostic row")
+                for row in rows
+            }
+        ),
         "nfe_sequence_pair_count": int(len(student_nfe_sequence_pairs(rows))),
         "sequence_group_count": int(len(sequence_groups)),
         "sequence_multi_nfe_group_count": int(sum(1 for nfes in sequence_groups.values() if len(nfes) > 1)),
@@ -1247,6 +1401,9 @@ def validate_gipo_support_schedule_keys(
     keys = tuple(str(key) for key in support_schedule_keys)
     if not keys:
         raise ValueError("support_schedule_keys must not be empty.")
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicates:
+        raise ValueError(f"support_schedule_keys contains duplicates: {duplicates}")
     bo_like = sorted(key for key in keys if "bo" in key.lower() or "candidate" in key.lower())
     if bo_like:
         raise ValueError(f"GIPO supervision must not include BO/candidate schedules: {bo_like}")
@@ -1537,6 +1694,8 @@ class EmbeddingNormalizer:
         if missing:
             raise KeyError(f"Missing context embeddings for train contexts: {missing[:8]}")
         matrix = np.asarray([embeddings[context_id] for context_id in ids], dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape[1] <= 0 or not np.isfinite(matrix).all():
+            raise ValueError("Context embeddings must form a finite, non-empty rank-2 matrix.")
         mean = matrix.mean(axis=0)
         std = matrix.std(axis=0)
         std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
@@ -1556,7 +1715,23 @@ class EmbeddingNormalizer:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "EmbeddingNormalizer":
-        return cls(mean=np.asarray(payload["mean"], dtype=np.float32), std=np.asarray(payload["std"], dtype=np.float32))
+        try:
+            mean = np.asarray(payload["mean"], dtype=np.float32)
+            std = np.asarray(payload["std"], dtype=np.float32)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid context embedding normalizer payload: {exc}") from exc
+        if (
+            mean.ndim != 1
+            or mean.size == 0
+            or std.shape != mean.shape
+            or not np.isfinite(mean).all()
+            or not np.isfinite(std).all()
+            or np.any(std <= 0.0)
+        ):
+            raise ValueError(
+                "Context embedding normalizer requires finite, same-shaped vectors and positive std."
+            )
+        return cls(mean=mean, std=std)
 
 
 @dataclass(frozen=True)
@@ -1583,11 +1758,6 @@ class DensityFeatureNormalizer:
 
     def to_payload(self) -> Dict[str, Any]:
         return {"mean": self.mean.astype(float).tolist(), "std": self.std.astype(float).tolist()}
-
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "DensityFeatureNormalizer":
-        return cls(mean=np.asarray(payload["mean"], dtype=np.float32), std=np.asarray(payload["std"], dtype=np.float32))
-
 
 def _density_mass_to_normalized_log_features_torch(
     density_mass: torch.Tensor,
@@ -1626,12 +1796,102 @@ def _sanitize_public_manifest_value(value: Any) -> Any:
         return [_sanitize_public_manifest_value(item) for item in value]
     if isinstance(value, str):
         text = str(value)
-        looks_absolute = Path(text).is_absolute() or text.startswith("/") or (
-            len(text) >= 3 and text[1:3] == ":\\"
-        )
-        if looks_absolute:
-            return Path(text).name
+        windows_path = PureWindowsPath(text)
+        posix_path = PurePosixPath(text)
+        if windows_path.is_absolute():
+            return windows_path.name
+        if posix_path.is_absolute():
+            return posix_path.name
     return value
+
+
+_CONTEXT_EMBEDDING_COVERAGE_PROTOCOL = "context_embedding_identity_binding"
+_CONTEXT_EMBEDDING_SCOPE_FIELDS = (
+    "benchmark_family",
+    "scenario_key",
+    "split_phase",
+    "nfe_role",
+    "checkpoint_id",
+    "context_schema",
+    "context_embedding_kind",
+    "protocol_hash",
+)
+
+
+def _context_embedding_coverage(
+    embedding_ids: Sequence[str],
+    context_rows: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    identities_by_embedding: Dict[str, Dict[str, str]] = {}
+    for row_index, row in enumerate(context_rows):
+        embedding_id = context_embedding_id_from_row(row)
+        identity = {
+            "benchmark_family": str(row.get("benchmark_family", "") or "").strip(),
+            "scenario_key": str(row.get("scenario_key", "") or "").strip(),
+            "split_phase": validate_declared_split_phase(
+                row,
+                source=f"Context embedding coverage row {row_index}",
+            ),
+            "nfe_role": str(row.get("nfe_role", "") or "").strip(),
+            "checkpoint_id": str(row.get("checkpoint_id", "") or "").strip(),
+            "context_schema": str(row.get("context_schema", "") or "").strip(),
+            "context_embedding_kind": context_embedding_kind_from_rows(
+                [row],
+                label=f"Context embedding coverage row {row_index}",
+                require_explicit=True,
+            ),
+            "protocol_hash": str(row.get("protocol_hash", "") or "").strip(),
+            "context_id": context_id_from_row(row),
+            "context_embedding_id": embedding_id,
+        }
+        if not identity["benchmark_family"] or not identity["scenario_key"]:
+            raise ValueError(
+                "Context embedding coverage rows require benchmark_family and scenario_key."
+            )
+        previous = identities_by_embedding.setdefault(embedding_id, identity)
+        if previous != identity:
+            raise ValueError(
+                f"Context embedding id {embedding_id!r} maps to conflicting physical identities."
+            )
+    expected_ids = set(identities_by_embedding)
+    observed_ids = {str(value) for value in embedding_ids}
+    if expected_ids != observed_ids:
+        raise ValueError(
+            "Context embedding table ids do not exactly match their bound context rows: "
+            f"missing={sorted(expected_ids - observed_ids)[:8]}, "
+            f"extra={sorted(observed_ids - expected_ids)[:8]}."
+        )
+    identities = [identities_by_embedding[key] for key in sorted(identities_by_embedding)]
+
+    def digest(records: Sequence[Mapping[str, Any]]) -> str:
+        encoded = json.dumps(
+            [dict(record) for record in records],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    grouped: Dict[Tuple[str, ...], List[Dict[str, str]]] = defaultdict(list)
+    for identity in identities:
+        grouped[tuple(identity[field] for field in _CONTEXT_EMBEDDING_SCOPE_FIELDS)].append(
+            identity
+        )
+    scopes = []
+    for scope_key in sorted(grouped):
+        records = grouped[scope_key]
+        scopes.append(
+            {
+                **dict(zip(_CONTEXT_EMBEDDING_SCOPE_FIELDS, scope_key)),
+                "context_count": len(records),
+                "identity_sha256": digest(records),
+            }
+        )
+    return {
+        "protocol": _CONTEXT_EMBEDDING_COVERAGE_PROTOCOL,
+        "context_count": len(identities),
+        "identity_sha256": digest(identities),
+        "scopes": scopes,
+    }
 
 
 def save_context_embedding_table(
@@ -1639,35 +1899,259 @@ def save_context_embedding_table(
     embeddings: Mapping[str, Sequence[float]],
     *,
     metadata: Mapping[str, Any] | None = None,
+    context_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     resolved = Path(path)
+    if resolved.suffix.lower() != ".npz":
+        raise ValueError("Context embedding table paths must use the .npz suffix.")
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    sorted_ids = sorted(str(key) for key in embeddings)
+    if any(
+        not isinstance(key, str) or not key or key != key.strip()
+        for key in embeddings
+    ):
+        raise ValueError("Context embedding ids must be non-empty trimmed strings.")
+    normalized_ids = [str(key) for key in embeddings]
+    if len(set(normalized_ids)) != len(normalized_ids):
+        raise ValueError("Context embedding ids must be unique strings.")
+    sorted_ids = sorted(normalized_ids)
     if not sorted_ids:
         raise ValueError("Cannot save an empty context embedding table.")
     max_id_len = max(1, max(len(context_id) for context_id in sorted_ids))
     context_ids = np.asarray(sorted_ids, dtype=f"<U{max_id_len}")
     matrix = np.asarray([embeddings[str(context_id)] for context_id in context_ids.tolist()], dtype=np.float32)
-    np.savez_compressed(resolved, context_ids=context_ids, embeddings=matrix)
-    manifest = {
-        "artifact": "context_embedding_table",
-        "protocol": GIPO_PROTOCOL,
-        "path": resolved.name,
-        "context_count": int(context_ids.size),
-        "embedding_dim": int(matrix.shape[1]),
-        "metadata": _sanitize_public_manifest_value(dict(metadata or {})),
-    }
-    manifest_path = resolved.with_suffix(resolved.suffix + ".manifest.json")
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    if matrix.ndim != 2 or matrix.shape[1] <= 0:
+        raise ValueError("Context embeddings must form a non-empty rank-2 matrix.")
+    if not np.isfinite(matrix).all():
+        raise ValueError("Context embeddings must contain only finite values.")
+    public_metadata = _sanitize_public_manifest_value(dict(metadata or {}))
+    public_metadata.pop("coverage", None)
+    public_metadata["context_embedding_kind"] = validate_context_embedding_kind(
+        public_metadata.get("context_embedding_kind")
+    )
+    if context_rows is not None:
+        public_metadata["coverage"] = _context_embedding_coverage(
+            sorted_ids,
+            context_rows,
+        )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{resolved.stem}.",
+        suffix=".tmp.npz",
+        dir=resolved.parent,
+    )
+    os.close(descriptor)
+    temporary_npz = Path(temporary_name)
+    manifest_path = context_embedding_table_manifest_path(resolved)
+    manifest_descriptor, temporary_manifest_name = tempfile.mkstemp(
+        prefix=f".{manifest_path.name}.",
+        suffix=".tmp",
+        dir=resolved.parent,
+    )
+    os.close(manifest_descriptor)
+    temporary_manifest = Path(temporary_manifest_name)
+    backups: dict[Path, Path] = {}
+    installed: set[Path] = set()
+    try:
+        np.savez_compressed(
+            temporary_npz,
+            context_ids=context_ids,
+            embeddings=matrix,
+        )
+        manifest = {
+            "artifact": "context_embedding_table",
+            "artifact_version": CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION,
+            "protocol": GIPO_PROTOCOL,
+            "path": resolved.name,
+            "size_bytes": int(temporary_npz.stat().st_size),
+            "sha256": file_sha256(temporary_npz),
+            "context_count": int(context_ids.size),
+            "embedding_dim": int(matrix.shape[1]),
+            "metadata": public_metadata,
+        }
+        temporary_manifest.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        for target in (resolved, manifest_path):
+            if not target.exists():
+                continue
+            backup_descriptor, backup_name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".backup",
+                dir=target.parent,
+            )
+            os.close(backup_descriptor)
+            backup = Path(backup_name)
+            backup.unlink()
+            os.replace(target, backup)
+            backups[target] = backup
+        os.replace(temporary_npz, resolved)
+        installed.add(resolved)
+        os.replace(temporary_manifest, manifest_path)
+        installed.add(manifest_path)
+    except BaseException:
+        for target in installed:
+            target.unlink(missing_ok=True)
+        for target, backup in backups.items():
+            if backup.exists():
+                os.replace(backup, target)
+        raise
+    finally:
+        temporary_npz.unlink(missing_ok=True)
+        temporary_manifest.unlink(missing_ok=True)
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
     return manifest
 
 
-def load_context_embedding_table(path: str | Path) -> Dict[str, np.ndarray]:
-    with np.load(Path(path), allow_pickle=False) as payload:
-        context_ids = [str(value) for value in payload["context_ids"].tolist()]
-        embeddings = np.asarray(payload["embeddings"], dtype=np.float32)
-    if embeddings.ndim != 2 or embeddings.shape[0] != len(context_ids):
+def context_embedding_table_manifest_path(path: str | Path) -> Path:
+    resolved = Path(path)
+    return resolved.with_suffix(resolved.suffix + ".manifest.json")
+
+
+def load_context_embedding_table(
+    path: str | Path,
+    *,
+    expected_context_embedding_kind: str | None = None,
+    require_manifest: bool = False,
+    expected_context_rows: Sequence[Mapping[str, Any]] | None = None,
+) -> Dict[str, np.ndarray]:
+    resolved = Path(path)
+    if resolved.suffix.lower() != ".npz":
+        raise ValueError("Context embedding table paths must use the .npz suffix.")
+    try:
+        with np.load(resolved, allow_pickle=False) as payload:
+            if set(payload.files) != {"context_ids", "embeddings"}:
+                raise ValueError(
+                    "Context embedding tables require exactly context_ids and embeddings arrays."
+                )
+            raw_context_ids = np.asarray(payload["context_ids"])
+            raw_embeddings = np.asarray(payload["embeddings"])
+    except (OSError, ValueError, EOFError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("Context embedding tables"):
+            raise
+        raise ValueError(
+            f"Could not load context embedding table {resolved.name!r}: {exc}"
+        ) from exc
+    if raw_context_ids.ndim != 1 or raw_context_ids.dtype.kind not in {"U", "S"}:
+        raise ValueError("Context embedding ids must be a rank-1 string array.")
+    context_ids = [
+        value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        for value in raw_context_ids.tolist()
+    ]
+    if any(not value or value != value.strip() for value in context_ids):
+        raise ValueError("Context embedding ids must be non-empty trimmed strings.")
+    if len(set(context_ids)) != len(context_ids):
+        raise ValueError("Context embedding ids must be unique.")
+    if raw_embeddings.dtype.kind != "f":
+        raise ValueError("Context embeddings must use a real floating-point dtype.")
+    embeddings = raw_embeddings.astype(np.float32, copy=False)
+    if (
+        embeddings.ndim != 2
+        or embeddings.shape[0] != len(context_ids)
+        or embeddings.shape[1] <= 0
+    ):
         raise ValueError("Context embedding table has inconsistent ids and matrix shape.")
+    if not np.isfinite(embeddings).all():
+        raise ValueError("Context embedding table contains non-finite values.")
+
+    manifest_path = context_embedding_table_manifest_path(resolved)
+    artifact_kind = DEFAULT_CONTEXT_EMBEDDING_KIND
+    manifest_metadata: Mapping[str, Any] = {}
+    claim_manifest_required = bool(require_manifest or expected_context_rows is not None)
+    if manifest_path.exists():
+        try:
+            manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Could not load context embedding manifest {manifest_path.name!r}: {exc}"
+            ) from exc
+        if not isinstance(manifest_payload, Mapping):
+            raise ValueError("Context embedding manifest must contain an object.")
+        manifest = dict(manifest_payload)
+
+        def manifest_integer(name: str, *, default: int | None = None) -> int:
+            if name not in manifest and default is not None:
+                return int(default)
+            value = manifest.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"Context embedding manifest {name!r} must be an integer."
+                )
+            return int(value)
+
+        if (
+            manifest.get("artifact") != "context_embedding_table"
+            or manifest.get("protocol") != GIPO_PROTOCOL
+            or str(manifest.get("path", "")) != resolved.name
+        ):
+            raise ValueError("Context embedding manifest identifies a different artifact.")
+        if manifest_integer("context_count") != len(context_ids) or manifest_integer(
+            "embedding_dim"
+        ) != int(embeddings.shape[1]):
+            raise ValueError("Context embedding manifest dimensions do not match the NPZ.")
+        raw_metadata = manifest.get("metadata", {})
+        if not isinstance(raw_metadata, Mapping):
+            raise ValueError("Context embedding manifest metadata must be an object.")
+        artifact_kind = validate_context_embedding_kind(
+            raw_metadata.get("context_embedding_kind")
+        )
+        manifest_metadata = raw_metadata
+        artifact_version = manifest_integer("artifact_version", default=0)
+        if artifact_version not in {0, 1, CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION}:
+            raise ValueError(
+                f"Unsupported context embedding artifact_version={artifact_version}."
+            )
+        if claim_manifest_required and artifact_version != CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION:
+            raise ValueError(
+                "Claim-bearing context embedding tables require a current, digest-bound manifest."
+            )
+        if artifact_version in {1, CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION}:
+            if "context_embedding_kind" not in raw_metadata:
+                raise ValueError(
+                    "Context embedding manifest metadata is missing context_embedding_kind."
+                )
+            expected_size = manifest_integer("size_bytes")
+            expected_hash = str(manifest.get("sha256", ""))
+            if expected_size != int(resolved.stat().st_size) or (
+                len(expected_hash) != 64
+                or any(character not in "0123456789abcdef" for character in expected_hash)
+                or file_sha256(resolved) != expected_hash
+            ):
+                raise ValueError("Context embedding NPZ does not match its manifest digest.")
+    elif claim_manifest_required:
+        raise ValueError(
+            f"Context embedding table {resolved.name!r} is missing its companion manifest."
+        )
+
+    if expected_context_embedding_kind is not None:
+        expected_kind = validate_context_embedding_kind(expected_context_embedding_kind)
+        if artifact_kind != expected_kind:
+            raise ValueError(
+                "Context embedding table kind does not match the requested policy input: "
+                f"{artifact_kind!r} != {expected_kind!r}."
+            )
+    if expected_context_rows is not None:
+        context_id_set = set(context_ids)
+        expected_coverage = _context_embedding_coverage(
+            context_ids,
+            [
+                row
+                for row in expected_context_rows
+                if context_embedding_id_from_row(row) in context_id_set
+            ],
+        )
+        raw_coverage = manifest_metadata.get("coverage")
+        if not isinstance(raw_coverage, Mapping) or json.dumps(
+            raw_coverage,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) != json.dumps(
+            expected_coverage,
+            sort_keys=True,
+            separators=(",", ":"),
+        ):
+            raise ValueError(
+                "Context embedding manifest coverage does not match the requested context rows."
+            )
     return {context_id: embeddings[idx].astype(np.float32, copy=True) for idx, context_id in enumerate(context_ids)}
 
 
@@ -1684,20 +2168,27 @@ def grid_for_schedule(
     checkpoint_step: int | None = None,
 ) -> Tuple[float, ...]:
     key = str(schedule_key)
-    macro_steps = solver_macro_steps(str(solver_key), int(target_nfe))
+    nfe = normalize_solver_nfe_fields(
+        str(solver_key),
+        target_nfe,
+        source="GIPO schedule grid",
+    )
+    solver = str(nfe.solver_key)
+    target = int(nfe.target_nfe)
+    macro_steps = int(nfe.macro_steps)
     if key in AVERAGED_SCHEDULE_COMPONENTS:
         left_key, right_key = AVERAGED_SCHEDULE_COMPONENTS[key]
         left_grid = grid_for_schedule(
             left_key,
-            solver_key,
-            target_nfe,
+            solver,
+            target,
             schedule_grids=schedule_grids,
             checkpoint_step=checkpoint_step,
         )
         right_grid = grid_for_schedule(
             right_key,
-            solver_key,
-            target_nfe,
+            solver,
+            target,
             schedule_grids=schedule_grids,
             checkpoint_step=checkpoint_step,
         )
@@ -1713,15 +2204,15 @@ def grid_for_schedule(
     if key in REVERSED_SCHEDULE_BASE and key not in EXPERIMENTAL_FIXED_SCHEDULE_KEYS:
         base_grid = grid_for_schedule(
             REVERSED_SCHEDULE_BASE[key],
-            solver_key,
-            target_nfe,
+            solver,
+            target,
             schedule_grids=schedule_grids,
             checkpoint_step=checkpoint_step,
         )
         reversed_grid = [1.0 - float(value) for value in reversed(tuple(base_grid))]
         return validate_time_grid(reversed_grid, macro_steps=macro_steps)
     if schedule_grids is not None:
-        base_key = (key, str(solver_key), int(target_nfe))
+        base_key = (key, solver, target)
         if checkpoint_step is not None:
             checkpoint_key = (*base_key, int(checkpoint_step))
             if checkpoint_key in schedule_grids:
@@ -1733,7 +2224,7 @@ def grid_for_schedule(
         if grid is None:
             raise ValueError(f"No fixed schedule grid for {key}.")
         return validate_time_grid(grid, macro_steps=macro_steps)
-    raise KeyError(f"Missing schedule grid for {(key, str(solver_key), int(target_nfe))}.")
+    raise KeyError(f"Missing schedule grid for {(key, solver, target)}.")
 
 
 def density_mass_for_row(
@@ -1742,8 +2233,9 @@ def density_mass_for_row(
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
     reference_time_grid: Sequence[float],
 ) -> Tuple[float, ...]:
-    solver = str(row["solver_key"])
-    target_nfe = int(row["target_nfe"])
+    nfe = _solver_nfe_from_row(row, source="GIPO density row")
+    solver = str(nfe.solver_key)
+    target_nfe = int(nfe.target_nfe)
     checkpoint_step = (
         None
         if row.get("checkpoint_step", "") in (None, "")
@@ -1756,7 +2248,11 @@ def density_mass_for_row(
         schedule_grids=schedule_grids,
         checkpoint_step=checkpoint_step,
     )
-    return grid_to_density_mass(grid, reference_time_grid=reference_time_grid, macro_steps=solver_macro_steps(solver, target_nfe))
+    return grid_to_density_mass(
+        grid,
+        reference_time_grid=reference_time_grid,
+        macro_steps=int(nfe.macro_steps),
+    )
 
 
 def _density_bin_geometry(density_dim: int, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -1856,6 +2352,19 @@ class _DensityTokenTransformerBlock(nn.Module):
 
 
 class _DensityConditioningMixin:
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        strict: bool = True,
+        assign: bool = False,
+    ):
+        validated = validate_tensor_state_dict(
+            state_dict,
+            label=f"{type(self).__name__} state",
+            target_module=self,
+        )
+        return super().load_state_dict(validated, strict=strict, assign=assign)
+
     def _condition_embedding(
         self,
         setting_feature_batch: torch.Tensor,
@@ -2121,12 +2630,22 @@ def build_gipo_teacher_model(
     validate_gipo_density_token_attention(cfg)
     validate_gipo_teacher_output(cfg, require_present=False)
     return GIPODensityFormTeacherTransformer(
-        setting_dim=int(setting_dim),
-        density_dim=int(density_dim),
-        context_dim=int(context_dim),
-        hidden_dim=int(cfg.get("hidden_dim", DEFAULT_TRANSFORMER_HIDDEN_DIM)),
-        num_layers=int(cfg.get("num_layers", DEFAULT_TRANSFORMER_NUM_LAYERS)),
-        attention_heads=validate_gipo_attention_heads(int(cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS))),
+        setting_dim=validate_strict_integer(setting_dim, label="GIPO teacher setting_dim", minimum=1),
+        density_dim=validate_strict_integer(density_dim, label="GIPO teacher density_dim", minimum=2),
+        context_dim=validate_strict_integer(context_dim, label="GIPO teacher context_dim", minimum=1),
+        hidden_dim=validate_strict_integer(
+            cfg.get("hidden_dim", DEFAULT_TRANSFORMER_HIDDEN_DIM),
+            label="GIPO teacher hidden_dim",
+            minimum=1,
+        ),
+        num_layers=validate_strict_integer(
+            cfg.get("num_layers", DEFAULT_TRANSFORMER_NUM_LAYERS),
+            label="GIPO teacher num_layers",
+            minimum=1,
+        ),
+        attention_heads=validate_gipo_attention_heads(
+            cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS)
+        ),
         dropout=float(cfg.get("dropout", DEFAULT_TRANSFORMER_DROPOUT)),
         conditioning_style=conditioning_style,
         density_feature_mean=cfg.get("density_feature_mean"),
@@ -2162,12 +2681,22 @@ def build_gipo_student_model(
         raise ValueError(f"GIPO student model_config uses retired keys: {retired_keys}; use num_layers.")
     validate_gipo_density_token_attention(cfg)
     return GIPODensityQueryStudentTransformer(
-        setting_dim=int(setting_dim),
-        density_dim=int(density_dim),
-        context_dim=int(context_dim),
-        hidden_dim=int(cfg.get("hidden_dim", DEFAULT_TRANSFORMER_HIDDEN_DIM)),
-        num_layers=int(cfg.get("num_layers", DEFAULT_TRANSFORMER_NUM_LAYERS)),
-        attention_heads=validate_gipo_attention_heads(int(cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS))),
+        setting_dim=validate_strict_integer(setting_dim, label="GIPO student setting_dim", minimum=1),
+        density_dim=validate_strict_integer(density_dim, label="GIPO student density_dim", minimum=2),
+        context_dim=validate_strict_integer(context_dim, label="GIPO student context_dim", minimum=1),
+        hidden_dim=validate_strict_integer(
+            cfg.get("hidden_dim", DEFAULT_TRANSFORMER_HIDDEN_DIM),
+            label="GIPO student hidden_dim",
+            minimum=1,
+        ),
+        num_layers=validate_strict_integer(
+            cfg.get("num_layers", DEFAULT_TRANSFORMER_NUM_LAYERS),
+            label="GIPO student num_layers",
+            minimum=1,
+        ),
+        attention_heads=validate_gipo_attention_heads(
+            cfg.get("attention_heads", DEFAULT_TRANSFORMER_HEADS)
+        ),
         dropout=float(cfg.get("dropout", DEFAULT_TRANSFORMER_DROPOUT)),
         conditioning_style=conditioning_style,
     )
@@ -2596,8 +3125,9 @@ def _teacher_training_tensors(
         context_embedding_id = context_embedding_id_from_row(row)
         if context_embedding_id not in context_embeddings:
             raise KeyError(f"Missing context embedding for {context_embedding_id}.")
-        solver = normalize_solver_key(str(row["solver_key"]))
-        target_nfe = int(row["target_nfe"])
+        nfe = _solver_nfe_from_row(row, source="GIPO teacher-training row")
+        solver = str(nfe.solver_key)
+        target_nfe = int(nfe.target_nfe)
         setting_key = (solver, target_nfe)
         if setting_key not in setting_cache:
             setting_cache[setting_key] = setting_features(
@@ -3104,21 +3634,6 @@ def _selected_gipo_teacher_checkpoint(
     )
 
 
-def select_weighted_normalized_regret_checkpoint(
-    checkpoint_history: Sequence[Dict[str, Any]],
-    *,
-    required_split_names: Sequence[str] = (),
-    component_weights: Mapping[str, float] | None = None,
-) -> Dict[str, Any]:
-    selection, _ = _selected_gipo_teacher_checkpoint(
-        checkpoint_history,
-        {},
-        required_split_names=required_split_names,
-        component_weights=component_weights,
-    )
-    return selection
-
-
 def _should_log_step(step_index: int, steps: int, log_every: int | None) -> bool:
     total_steps = int(steps)
     step_value = int(step_index) + 1
@@ -3468,8 +3983,9 @@ def build_teacher_weighted_density_targets(
         context_embedding_id = context_embedding_id_from_row(row)
         if context_embedding_id not in context_embeddings:
             raise KeyError(f"Missing context embedding for {context_embedding_id}.")
-        solver = normalize_solver_key(str(row["solver_key"]))
-        target_nfe = int(row["target_nfe"])
+        nfe = _solver_nfe_from_row(row, source="GIPO student-target row")
+        solver = str(nfe.solver_key)
+        target_nfe = int(nfe.target_nfe)
         setting_key = (solver, target_nfe)
         if setting_key not in setting_cache:
             setting_cache[setting_key] = setting_features(
@@ -3531,8 +4047,9 @@ def build_teacher_weighted_density_targets(
         context_embedding_id = context_embedding_id_from_row(first)
         if context_embedding_id not in context_embeddings:
             raise KeyError(f"Missing context embedding for {context_embedding_id}.")
-        solver = normalize_solver_key(str(first["solver_key"]))
-        target_nfe = int(first["target_nfe"])
+        nfe = _solver_nfe_from_row(first, source="GIPO student-target row")
+        solver = str(nfe.solver_key)
+        target_nfe = int(nfe.target_nfe)
         masses: List[Tuple[float, ...]] = []
         utilities: List[float] = []
         setting_row = setting_cache[(solver, target_nfe)]
@@ -3756,7 +4273,10 @@ def train_gipo_student(
     locked_validation_rows = [
         row
         for row in validation_fit_rows
-        if str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) == "locked_test"
+        if validate_declared_split_phase(
+            row,
+            source="GIPO student validation row",
+        ) == "locked_test"
     ]
     if locked_validation_rows:
         raise ValueError("student checkpoint selection refuses locked_test validation rows.")
@@ -3844,7 +4364,10 @@ def train_gipo_student(
             "unseen_target_nfes": sorted({int(row["target_nfe"]) for row in unseen_representative_rows}),
             "unseen_split_phases": sorted(
                 {
-                    str(row.get("source_split_phase") or row.get("split_phase", row.get("split", "")))
+                    validate_declared_split_phase(
+                        row,
+                        source="GIPO unseen-target row",
+                    )
                     for row in (unseen_target_rows or [])
                 }
             ),
@@ -3883,7 +4406,13 @@ def train_gipo_student(
             "student_validation_context_count": int(len({context_id_from_row(row) for row in validation_fit_rows})),
             "student_validation_row_count": int(len(validation_fit_rows)),
             "student_validation_split_phases": sorted(
-                {str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) for row in validation_fit_rows}
+                {
+                    validate_declared_split_phase(
+                        row,
+                        source="GIPO student validation row",
+                    )
+                    for row in validation_fit_rows
+                }
             ),
         }
     opt = torch.optim.AdamW(student.parameters(), lr=float(lr), weight_decay=weight_decay)
@@ -4225,8 +4754,9 @@ def predict_gipo_density_many(
         context_embedding_id = context_embedding_id_from_row(row)
         if context_embedding_id not in context_embeddings:
             raise KeyError(f"Missing context embedding for {context_embedding_id}.")
-        solver = normalize_solver_key(str(row["solver_key"]))
-        target_nfe = int(row["target_nfe"])
+        nfe = _solver_nfe_from_row(row, source="GIPO prediction row")
+        solver = str(nfe.solver_key)
+        target_nfe = int(nfe.target_nfe)
         setting_key = (solver, target_nfe)
         if setting_key not in setting_cache:
             setting_cache[setting_key] = setting_features(
@@ -4247,9 +4777,9 @@ def predict_gipo_density_many(
         )
     outputs: List[Dict[str, Any]] = []
     for row, mass_t in zip(rows, masses_t):
-        solver = str(row["solver_key"])
-        target_nfe = int(row["target_nfe"])
-        nfe = normalize_solver_nfe_fields(solver, target_nfe, source="GIPO prediction row")
+        nfe = _solver_nfe_from_row(row, source="GIPO prediction row")
+        solver = str(nfe.solver_key)
+        target_nfe = int(nfe.target_nfe)
         mass = tuple(float(x) for x in mass_t.detach().cpu().numpy().astype(np.float64).tolist())
         grid = density_mass_to_time_grid(mass, macro_steps=nfe.macro_steps, reference_time_grid=reference_time_grid)
         outputs.append(
@@ -4282,6 +4812,9 @@ def read_metric_rows_csv(path: str | Path) -> List[Dict[str, Any]]:
 
 __all__ = [
     "GIPO_PROTOCOL",
+    "CONTEXT_EMBEDDING_KINDS",
+    "CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION",
+    "DEFAULT_CONTEXT_EMBEDDING_KIND",
     "DEFAULT_CONTEXT_CALIBRATION_TOTAL",
     "DEFAULT_TEACHER_TARGET_TEMPERATURE",
     "STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE",
@@ -4298,8 +4831,6 @@ __all__ = [
     "DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION",
     "DEFAULT_STUDENT_TEACHER_SCORE_CLIP",
     "DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS",
-    "DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE",
-    "DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE",
     "DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS",
     "ARCHITECTURE_DENSITY_FORM_TRANSFORMER",
     "ARCHITECTURE_DENSITY_QUERY_TRANSFORMER",
@@ -4326,6 +4857,8 @@ __all__ = [
     "build_gipo_teacher_model",
     "build_teacher_weighted_density_targets",
     "context_embedding_id_from_row",
+    "context_embedding_kind_from_rows",
+    "context_embedding_table_manifest_path",
     "context_id_from_row",
     "context_pair_key",
     "density_family_for_schedule_key",
@@ -4341,7 +4874,6 @@ __all__ = [
     "recommended_context_calibration_count",
     "sample_context_ids_stratified",
     "save_context_embedding_table",
-    "select_weighted_normalized_regret_checkpoint",
     "series_key_from_row",
     "logical_seed_from_row",
     "evaluation_seed_from_row",
@@ -4356,6 +4888,7 @@ __all__ = [
     "validate_gipo_architecture",
     "validate_gipo_teacher_training_metadata",
     "validate_gipo_support_schedule_keys",
+    "validate_context_embedding_kind",
     "validate_student_target_mixture_mode",
     "validate_density_family_holdout_schedule_keys",
     "validate_teacher_objective_hyperparameters",

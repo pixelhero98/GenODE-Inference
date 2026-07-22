@@ -19,7 +19,7 @@ from genode.evaluation.otflow_evaluation_support import (
 from genode.data.otflow_forecast_data import ForecastExampleRef, ForecastSeriesRecord, MonashForecastWindowDataset, _regular_time_features
 
 
-class ExtrapolationFixesTest(unittest.TestCase):
+class ExtrapolationTests(unittest.TestCase):
     def _forecast_record(self, *, time_feature_mode: str) -> ForecastSeriesRecord:
         raw = np.arange(12, dtype=np.float32)
         return ForecastSeriesRecord(

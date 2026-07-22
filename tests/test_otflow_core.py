@@ -18,7 +18,7 @@ from genode.models.otflow_train_val import _temporary_eval_seed, save_json, seed
 from genode.solver_protocol import FlowTrajectory
 
 
-class OTFlowCoreCleanupTest(unittest.TestCase):
+class OTFlowCoreTests(unittest.TestCase):
     def test_save_json_reports_a_sanitized_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_path = Path(tmp_dir) / "private-output.json"

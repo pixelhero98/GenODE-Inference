@@ -22,8 +22,9 @@ from genode.gipo.density_representation import (
     uniform_reference_grid,
 )
 from genode.evaluation.otflow_sampling_support import _metric_bundle
-from genode.schedule_transfer.otflow_schedule_diagnostics import _collect_rollout_diagnostics
 from genode.models.otflow_train_val import eval_many_windows
+from genode.schedule_transfer.otflow_schedule_diagnostics import _collect_rollout_diagnostics
+from genode.solver_protocol import normalize_solver_nfe_fields
 
 BASELINE_SCHEDULE_KEYS: Tuple[str, ...] = ("uniform", "late_power_3", "flowts_power_sampling", "ays", "gits", "ots")
 TRANSFER_SCHEDULE_KEYS: Tuple[str, ...] = ("ays", "gits", "ots")
@@ -229,14 +230,14 @@ class _OtsStepOptim:
         lamb_t = torch.as_tensor(lamb, dtype=torch.float64)
         return self.ns.inverse_lambda(lamb_t).detach().cpu().numpy()
 
-    def H0(self, h: np.ndarray) -> np.ndarray:
+    def h0(self, h: np.ndarray) -> np.ndarray:
         return np.exp(h) - 1.0
 
-    def H1(self, h: np.ndarray) -> np.ndarray:
-        return np.exp(h) * h - self.H0(h)
+    def h1(self, h: np.ndarray) -> np.ndarray:
+        return np.exp(h) * h - self.h0(h)
 
-    def H2(self, h: np.ndarray) -> np.ndarray:
-        return np.exp(h) * h * h - 2.0 * self.H1(h)
+    def h2(self, h: np.ndarray) -> np.ndarray:
+        return np.exp(h) * h * h - 2.0 * self.h1(h)
 
     def sel_lambdas_lof_obj(self, lambda_vec: Sequence[float], eps: float) -> float:
         lambda_eps = float(self.lambda_func([eps])[0])
@@ -257,8 +258,8 @@ class _OtsStepOptim:
                 res += abs(coeff * data_err_vec[s])
             elif s in (1, len(lambda_vec_ext) - 3):
                 n = s - 1
-                j0 = -elv[n + 1] * self.H1(hv[n + 1]) / max(hv[n], 1e-12)
-                j1 = elv[n + 1] * (self.H1(hv[n + 1]) + hv[n] * self.H0(hv[n + 1])) / max(hv[n], 1e-12)
+                j0 = -elv[n + 1] * self.h1(hv[n + 1]) / max(hv[n], 1e-12)
+                j1 = elv[n + 1] * (self.h1(hv[n + 1]) + hv[n] * self.h0(hv[n + 1])) / max(hv[n], 1e-12)
                 if s >= trunc_num:
                     c_vec[n] += data_err_vec[n] * j0
                     c_vec[n + 1] += data_err_vec[n + 1] * j1
@@ -269,14 +270,14 @@ class _OtsStepOptim:
                 denom0 = max(hv[n] * (hv[n] + hv[n + 1]), 1e-12)
                 denom1 = max(hv[n] * hv[n + 1], 1e-12)
                 denom2 = max(hv[n + 1] * (hv[n] + hv[n + 1]), 1e-12)
-                j0 = elv[n + 2] * (self.H2(hv[n + 2]) + hv[n + 1] * self.H1(hv[n + 2])) / denom0
-                j1 = -elv[n + 2] * (self.H2(hv[n + 2]) + (hv[n] + hv[n + 1]) * self.H1(hv[n + 2])) / denom1
+                j0 = elv[n + 2] * (self.h2(hv[n + 2]) + hv[n + 1] * self.h1(hv[n + 2])) / denom0
+                j1 = -elv[n + 2] * (self.h2(hv[n + 2]) + (hv[n] + hv[n + 1]) * self.h1(hv[n + 2])) / denom1
                 j2 = (
                     elv[n + 2]
                     * (
-                        self.H2(hv[n + 2])
-                        + (2.0 * hv[n + 1] + hv[n]) * self.H1(hv[n + 2])
-                        + hv[n + 1] * (hv[n] + hv[n + 1]) * self.H0(hv[n + 2])
+                        self.h2(hv[n + 2])
+                        + (2.0 * hv[n + 1] + hv[n]) * self.h1(hv[n + 2])
+                        + hv[n + 1] * (hv[n] + hv[n + 1]) * self.h0(hv[n + 2])
                     )
                     / denom2
                 )
@@ -458,6 +459,12 @@ def run_fixed_schedule_variant(
     score_main_only: bool,
 ) -> Dict[str, Any]:
     solver_name = str(grid_spec["solver_name"])
+    nfe = normalize_solver_nfe_fields(
+        solver_name,
+        int(grid_spec["target_nfe"]),
+        macro_steps=grid_spec.get("macro_steps"),
+        source="fixed schedule grid",
+    )
     time_grid = tuple(float(x) for x in grid_spec["time_grid"])
     t0 = time.time()
     result = eval_many_windows(
@@ -465,7 +472,7 @@ def run_fixed_schedule_variant(
         model,
         cfg,
         horizon=int(eval_horizon),
-        nfe=int(grid_spec["nfe"]),
+        nfe=nfe.target_nfe,
         n_windows=int(eval_windows),
         seed=int(metrics_seed),
         horizons_eval=[int(eval_horizon)],
@@ -482,7 +489,7 @@ def run_fixed_schedule_variant(
         ds,
         cfg,
         horizon=int(eval_horizon),
-        macro_steps=int(grid_spec["nfe"]),
+        macro_steps=nfe.macro_steps,
         n_windows=int(eval_windows),
         seed=int(metrics_seed),
         solver=solver_name,
@@ -497,7 +504,7 @@ def run_fixed_schedule_variant(
         "selection_group": str(grid_spec["selection_group"]),
         "comparison_role": None if grid_spec.get("comparison_role") is None else str(grid_spec["comparison_role"]),
         "solver_name": str(solver_name),
-        "nfe": int(grid_spec["nfe"]),
+        "nfe": nfe.target_nfe,
         "power": None if grid_spec.get("power") is None else float(grid_spec["power"]),
         "piecewise_early_frac": None
         if grid_spec.get("piecewise_early_frac") is None
@@ -506,7 +513,7 @@ def run_fixed_schedule_variant(
         if grid_spec.get("signal_validation_spearman") is None
         else float(grid_spec["signal_validation_spearman"]),
         "time_grid": [float(x) for x in time_grid],
-        "target_total_field_evals": int(grid_spec["nfe"]),
+        "target_total_field_evals": nfe.target_nfe,
         "solver_override": str(solver_name),
         "eval_seconds": eval_seconds,
         "mean_field_evals_per_step": float(diag["mean_field_evals_per_step"]),

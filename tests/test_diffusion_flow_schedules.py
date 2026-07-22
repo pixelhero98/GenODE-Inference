@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import torch
 
+import genode.schedule_transfer.diffusion_flow_schedules as schedules
+from genode.evaluation.diffusion_flow_time_reparameterization import (
+    _positive_int_field,
+    _row_has_complete_context_artifacts,
+)
 from genode.gipo.density_representation import average_density_masses, grid_to_density_mass, uniform_reference_grid
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
@@ -19,7 +25,76 @@ from genode.schedule_transfer.otflow_schedule_diagnostics import _collect_rollou
 from genode.schedule_transfer.otflow_reference_tables import augment_rows_with_relative_metrics
 
 
-class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
+class DiffusionFlowScheduleTests(unittest.TestCase):
+    def test_resume_context_artifacts_require_exact_identity_and_unique_ids(self) -> None:
+        parent = {
+            "row_status": "complete",
+            "row_signature": "parent",
+            "selected_examples": 1,
+            "benchmark_family": "temporal_extrapolation",
+            "experiment_layout": "layout",
+            "scenario_key": "traffic_hourly",
+            "scenario_family": "forecast",
+            "method_key": "fixed",
+            "nfe_role": "seen",
+            "checkpoint_step": 20000,
+            "checkpoint_id": "checkpoint",
+            "protocol_hash": "protocol",
+            "split_phase": "validation_tuning",
+            "seed": 0,
+            "solver_key": "euler",
+            "target_nfe": 4,
+            "scheduler_key": "uniform",
+            "schedule_grid_hash": "grid",
+            "context_embedding_kind": "ctx_summary",
+        }
+        context = {
+            **parent,
+            "parent_row_signature": "parent",
+            "row_signature": "context-row",
+            "context_id": "context-a",
+            "context_embedding_id": "embedding-a",
+        }
+        self.assertTrue(
+            _row_has_complete_context_artifacts(
+                parent,
+                context_rows_by_signature={"context-row": context},
+                context_embeddings={"embedding-a": [0.0]},
+            )
+        )
+        self.assertFalse(
+            _row_has_complete_context_artifacts(
+                parent,
+                context_rows_by_signature={
+                    "context-row": {**context, "checkpoint_id": "wrong"}
+                },
+                context_embeddings={"embedding-a": [0.0]},
+            )
+        )
+        self.assertFalse(
+            _row_has_complete_context_artifacts(
+                parent,
+                context_rows_by_signature={
+                    "context-row": context,
+                    "extra-row": {
+                        **context,
+                        "row_signature": "extra-row",
+                        "context_id": "context-b",
+                        "context_embedding_id": "embedding-b",
+                    },
+                },
+                context_embeddings={"embedding-a": [0.0], "embedding-b": [1.0]},
+            )
+        )
+
+    def test_expected_context_count_rejects_fractional_values(self) -> None:
+        self.assertEqual(_positive_int_field({"selected_examples": "4"}, "selected_examples"), 4)
+        for value in (4.5, "4.5", "04", True, 0, -1):
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    _positive_int_field({"selected_examples": value}, "selected_examples")
+                )
+
     def test_transfer_schedule_grids_are_valid_for_runtime_steps(self) -> None:
         for schedule_key in ("ays", "gits", "ots"):
             for runtime_steps in (5, 6, 8, 10, 12, 16):
@@ -139,6 +214,73 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
                 seed=0,
                 solver="euler",
                 chosen_t0s=[],
+            )
+
+    def test_heun_variant_uses_target_nfe_and_solver_macro_steps(self) -> None:
+        evaluation = {
+            "meta": {
+                "chosen_t0s": [0],
+                "chosen_t0s_hash": "hash",
+                "horizon": 2,
+                "dataset_kind": "synthetic",
+                "generation_seed_base": 7,
+                "metrics_seed": 11,
+                "main_metrics_only": True,
+                "per_window_metric_rows": [],
+            }
+        }
+        diagnostics = {
+            "mean_field_evals_per_step": 2.0,
+            "mean_total_field_evals_per_rollout": 4.0,
+        }
+        grid_spec = {
+            "grid_name": "uniform",
+            "grid_kind": "fixed",
+            "selection_group": "test",
+            "solver_name": "heun",
+            "target_nfe": 4,
+            "macro_steps": 2,
+            "time_grid": (0.0, 0.5, 1.0),
+        }
+        with (
+            mock.patch.object(schedules, "eval_many_windows", return_value=evaluation) as evaluate,
+            mock.patch.object(
+                schedules,
+                "_collect_rollout_diagnostics",
+                return_value=diagnostics,
+            ) as collect,
+            mock.patch.object(schedules, "_metric_bundle", return_value={}),
+            mock.patch.object(schedules.time, "time", side_effect=(10.0, 11.0)),
+        ):
+            row = schedules.run_fixed_schedule_variant(
+                model=object(),
+                ds=object(),
+                cfg=SimpleNamespace(),
+                eval_horizon=2,
+                eval_windows=1,
+                grid_spec=grid_spec,
+                chosen_t0s=[0],
+                generation_seed_base=7,
+                metrics_seed=11,
+                score_main_only=True,
+            )
+
+        self.assertEqual(evaluate.call_args.kwargs["nfe"], 4)
+        self.assertEqual(collect.call_args.kwargs["macro_steps"], 2)
+        self.assertEqual(row["target_total_field_evals"], 4)
+
+        with self.assertRaisesRegex(ValueError, "macro_steps"):
+            schedules.run_fixed_schedule_variant(
+                model=object(),
+                ds=object(),
+                cfg=SimpleNamespace(),
+                eval_horizon=2,
+                eval_windows=1,
+                grid_spec={**grid_spec, "macro_steps": 4},
+                chosen_t0s=[0],
+                generation_seed_base=7,
+                metrics_seed=11,
+                score_main_only=True,
             )
 
 

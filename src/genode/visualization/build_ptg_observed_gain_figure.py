@@ -20,7 +20,7 @@ from genode.cli import parse_csv, parse_int_csv
 from genode.experiment_layout import REFERENCE_SEEN_NFES
 from genode.data.otflow_paths import display_project_path, project_root
 from genode.gipo.schema import reject_retired_evaluation_keys
-from genode.solver_protocol import solver_macro_steps, solver_runtime_name, target_nfe_for_macro_steps
+from genode.solver_protocol import normalize_solver_key, solver_macro_steps, target_nfe_for_macro_steps
 
 PROJECT_ROOT = project_root()
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs"
@@ -415,7 +415,7 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
         splits = checkpoint["splits"]
         with torch.no_grad():
             for solver_key in solvers:
-                runtime_solver = solver_runtime_name(str(solver_key))
+                runtime_solver = normalize_solver_key(str(solver_key))
                 for target_nfe in target_nfes:
                     macro_steps = int(solver_macro_steps(str(solver_key), int(target_nfe)))
                     reference_macro_steps = int(
@@ -699,7 +699,7 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
         )
         with torch.no_grad():
             for solver_key in solvers:
-                runtime_solver = solver_runtime_name(str(solver_key))
+                runtime_solver = normalize_solver_key(str(solver_key))
                 for target_nfe in target_nfes:
                     macro_steps = int(solver_macro_steps(str(solver_key), int(target_nfe)))
                     dense_reference_steps = int(

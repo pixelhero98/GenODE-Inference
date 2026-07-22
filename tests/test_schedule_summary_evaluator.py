@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import contextlib
+import hashlib
 import io
 import json
 import tempfile
@@ -11,8 +12,15 @@ from unittest import mock
 
 from genode.gipo.ablation_plan import GIPO_POLICY_KEY
 from genode.gipo.evaluate_schedule_summary import (
+    _load_existing_rows,
+    _load_forecast_rows_csv,
+    _output_path,
     _protocol_hash,
+    _row_has_complete_context_artifacts,
     _split_example_cap,
+    _validate_schedule_checkpoint_identity,
+    _validate_distinct_artifact_paths,
+    _write_jsonl,
     build_argparser,
     build_comparison_summary,
     evaluate_schedule_summary,
@@ -31,6 +39,7 @@ from genode.evaluation.otflow_evaluation_support import (
     choose_forecast_train_tuning_indices,
     train_tuning_target_example_count,
 )
+from genode.models.otflow_train_val import save_json as atomic_save_json
 from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS
 
 
@@ -38,7 +47,359 @@ def _uniform_grid(n_steps: int) -> list[float]:
     return [float(idx) / float(n_steps) for idx in range(n_steps + 1)]
 
 
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _panel_fields(
+    seed: int,
+    *,
+    panel: str = "shared",
+    protocol: str = "shared",
+) -> dict[str, object]:
+    return {
+        "chosen_examples_hash": _sha256(f"{panel}-{int(seed)}"),
+        "evaluation_protocol_hash": _sha256(f"{protocol}-{int(seed)}"),
+        "num_eval_samples": 1,
+        "eval_examples": 1,
+        "eval_horizon": 1,
+    }
+
+
 class ScheduleSummaryEvaluatorTests(unittest.TestCase):
+    def test_resume_rejects_existing_rows_from_another_protocol(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rows.jsonl"
+            original = json.dumps(
+                {"protocol_hash": "old", "row_status": "complete"}, sort_keys=True
+            ) + "\n"
+            path.write_text(original, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "different protocol"):
+                _load_existing_rows(path, protocol_hash="new")
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_resume_discards_only_unterminated_final_jsonl_fragment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rows.jsonl"
+            row = {
+                "protocol_hash": "protocol",
+                "row_status": "complete",
+                "split_phase": "validation_tuning",
+                "seed": 0,
+                "scenario_key": "traffic_hourly",
+                "target_nfe": 4,
+                "solver_key": "euler",
+                "scheduler_key": "uniform",
+            }
+            path.write_text(
+                json.dumps(row, sort_keys=True) + "\n" + '{"protocol_hash":',
+                encoding="utf-8",
+            )
+
+            loaded = _load_existing_rows(path, protocol_hash="protocol")
+
+            self.assertEqual(list(loaded.values()), [row])
+
+    def test_resume_rejects_terminated_or_mid_file_jsonl_corruption(self) -> None:
+        valid = json.dumps(
+            {"protocol_hash": "protocol", "row_status": "complete"},
+            sort_keys=True,
+        )
+        malformed = '{"protocol_hash":'
+        for journal in (
+            valid + "\n" + malformed + "\n",
+            valid + "\n" + malformed + "\n" + valid + "\n",
+        ):
+            with self.subTest(journal=journal), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / "rows.jsonl"
+                path.write_text(journal, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "line 2"):
+                    _load_existing_rows(path, protocol_hash="protocol")
+
+    def test_jsonl_compaction_preserves_target_on_serialization_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rows.jsonl"
+            original = '{"existing":true}\n'
+            path.write_text(original, encoding="utf-8")
+
+            with self.assertRaises(TypeError):
+                _write_jsonl(path, [{"not_json": {1}}])
+
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(Path(tmpdir).glob(".rows.jsonl.*.tmp")), [])
+
+    def test_output_paths_reject_traversal_and_wrong_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with self.assertRaisesRegex(ValueError, "may not contain"):
+                _output_path(
+                    root,
+                    "../rows.csv",
+                    fallback="rows.csv",
+                    suffix=".csv",
+                    label="row output",
+                )
+            with self.assertRaisesRegex(ValueError, "must end"):
+                _output_path(
+                    root,
+                    "rows.jsonl",
+                    fallback="rows.csv",
+                    suffix=".csv",
+                    label="row output",
+                )
+
+    def test_output_paths_include_implicit_embedding_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            manifest = root / "context_embeddings.npz.manifest.json"
+            with self.assertRaisesRegex(ValueError, "implicit sidecars"):
+                _validate_distinct_artifact_paths(
+                    {
+                        "context-embedding manifest": manifest,
+                        "summary JSON": manifest,
+                    }
+                )
+
+    def test_evaluator_rejects_input_output_collisions_before_loading(self) -> None:
+        cases = (
+            ("schedule_summary", "validation_tuning_schedule_summary.json"),
+            ("baseline_rows", "validation_rows.csv"),
+            ("comparator_rows", "validation_rows.csv"),
+            ("selection_reference_rows", "validation_rows.csv"),
+        )
+        for argument, output_name in cases:
+            with self.subTest(argument=argument), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                out_dir = root / "out"
+                out_dir.mkdir()
+                collision_path = out_dir / output_name
+                original = b"input artifact must remain unchanged\n"
+                collision_path.write_bytes(original)
+                safe_summary = root / "schedule_summary.json"
+                cli = [
+                    "--scenario_key",
+                    "traffic_hourly",
+                    "--schedule_summary",
+                    str(collision_path if argument == "schedule_summary" else safe_summary),
+                    "--split_phase",
+                    "validation_tuning",
+                    "--out_dir",
+                    str(out_dir),
+                ]
+                if argument != "schedule_summary":
+                    cli.extend([f"--{argument}", str(collision_path)])
+                args = build_argparser().parse_args(cli)
+
+                with mock.patch(
+                    "genode.gipo.evaluate_schedule_summary.load_schedule_predictions"
+                ) as load_mock, self.assertRaisesRegex(
+                    ValueError,
+                    "input/output_collisions",
+                ):
+                    evaluate_schedule_summary(args)
+
+                load_mock.assert_not_called()
+                self.assertEqual(collision_path.read_bytes(), original)
+
+    def test_imported_comparison_rows_validate_solver_nfe_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rows.csv"
+            with path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=(
+                        "benchmark_family",
+                        "split_phase",
+                        "scenario_key",
+                        "seed",
+                        "solver_key",
+                        "target_nfe",
+                        "macro_steps",
+                        "realized_nfe",
+                        "checkpoint_step",
+                        "checkpoint_id",
+                        "scheduler_key",
+                        "forecast_crps",
+                        "forecast_mase",
+                    ),
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "benchmark_family": "temporal_extrapolation",
+                        "split_phase": "validation_tuning",
+                        "scenario_key": "traffic_hourly",
+                        "seed": 0,
+                        "solver_key": "heun",
+                        "target_nfe": 4,
+                        "macro_steps": 2,
+                        "realized_nfe": 8,
+                        "checkpoint_step": 20_000,
+                        "checkpoint_id": "checkpoint",
+                        "scheduler_key": "uniform",
+                        "forecast_crps": 1.0,
+                        "forecast_mase": 1.0,
+                    }
+                )
+
+            with self.assertRaisesRegex(ValueError, "realized_nfe=8"):
+                _load_forecast_rows_csv(
+                    path,
+                    scenario_key="traffic_hourly",
+                    split_phase="validation_tuning",
+                    seeds=(0,),
+                    solver_names=("heun",),
+                    target_nfe_values=(4,),
+                    checkpoint_step=20_000,
+                    checkpoint_id="checkpoint",
+                )
+
+    def test_imported_comparison_rows_reject_fractional_gipo_step_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rows.csv"
+            row = {
+                "split_phase": "validation_tuning",
+                "scenario_key": "traffic_hourly",
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "macro_steps": 4,
+                "realized_nfe": 4,
+                "checkpoint_step": 20_000,
+                "checkpoint_id": "checkpoint",
+                "scheduler_key": "gipo_candidate",
+                "forecast_crps": 1.0,
+                "forecast_mase": 1.0,
+                "gipo_step_budget": "2.5",
+            }
+            with path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=list(row))
+                writer.writeheader()
+                writer.writerow(row)
+
+            with self.assertRaisesRegex(ValueError, "gipo_step_budget must be an integer"):
+                _load_forecast_rows_csv(
+                    path,
+                    scenario_key="traffic_hourly",
+                    split_phase="validation_tuning",
+                    seeds=(0,),
+                    solver_names=("euler",),
+                    target_nfe_values=(4,),
+                    checkpoint_step=20_000,
+                    checkpoint_id="checkpoint",
+                )
+
+    def test_schedule_predictions_reject_fractional_gipo_step_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "schedule.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "scenario_key": "traffic_hourly",
+                        "checkpoint_step": 20_000,
+                        "checkpoint_ids": ["checkpoint"],
+                        "gipo_step_budget": 2.5,
+                        "scheduler_key": GIPO_POLICY_KEY,
+                        "predictions": [
+                            {
+                                "solver_key": "euler",
+                                "target_nfe": 4,
+                                "macro_steps": 4,
+                                "realized_nfe": 4,
+                                "time_grid": _uniform_grid(4),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "gipo_step_budget must be an integer",
+            ):
+                load_schedule_predictions(
+                    path,
+                    scenario_key="traffic_hourly",
+                    solver_names=("euler",),
+                    target_nfe_values=(4,),
+                    require_complete=True,
+                )
+
+    def test_checkpoint_identity_is_explicit_and_strict(self) -> None:
+        base = {"checkpoint_step": 4000, "checkpoint_ids": ["checkpoint-a"]}
+        _validate_schedule_checkpoint_identity(
+            {("gipo", "euler", 4): base},
+            checkpoint_step=4000,
+            checkpoint_id="checkpoint-a",
+        )
+        for invalid in (
+            {"checkpoint_ids": ["checkpoint-a"]},
+            {"checkpoint_step": 4000.5, "checkpoint_ids": ["checkpoint-a"]},
+            {"checkpoint_step": 4000},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _validate_schedule_checkpoint_identity(
+                    {("gipo", "euler", 4): invalid},
+                    checkpoint_step=4000,
+                    checkpoint_id="checkpoint-a",
+                )
+
+    def test_resume_requires_exact_identity_bound_context_artifacts(self) -> None:
+        parent = {
+            "row_status": "complete",
+            "row_signature": "parent-row",
+            "selected_examples": 1,
+            "benchmark_family": "temporal_extrapolation",
+            "protocol_hash": "protocol-a",
+            "scenario_key": "traffic_hourly",
+            "split_phase": "validation_tuning",
+            "seed": 0,
+            "solver_key": "euler",
+            "target_nfe": 4,
+            "scheduler_key": "uniform",
+            "checkpoint_step": 4000,
+            "checkpoint_id": "checkpoint-a",
+        }
+        context = {
+            **parent,
+            "seed": "0",
+            "target_nfe": "4",
+            "checkpoint_step": "4000",
+            "parent_row_signature": "parent-row",
+            "row_signature": "context-row",
+            "context_id": "context-a",
+            "context_embedding_id": "embedding-a",
+            "context_embedding_kind": "ctx_summary",
+        }
+        self.assertTrue(
+            _row_has_complete_context_artifacts(
+                parent,
+                context_rows_by_signature={"context-row": context},
+                context_embeddings={"embedding-a": [0.0, 1.0]},
+                context_embedding_kind="ctx_summary",
+            )
+        )
+        self.assertFalse(
+            _row_has_complete_context_artifacts(
+                parent,
+                context_rows_by_signature={
+                    "context-row": {**context, "scenario_key": "wrong-scenario"}
+                },
+                context_embeddings={"embedding-a": [0.0, 1.0]},
+                context_embedding_kind="ctx_summary",
+            )
+        )
+        self.assertFalse(
+            _row_has_complete_context_artifacts(
+                parent,
+                context_rows_by_signature={"context-row": context},
+                context_embeddings={},
+                context_embedding_kind="ctx_summary",
+            )
+        )
+
     def test_train_tuning_hash_sampling_is_deterministic_and_stratified(self) -> None:
         class FakeDataset:
             def __len__(self) -> int:
@@ -141,6 +502,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
+                        "status": "ready",
+                        "artifact": "ser_ptg_schedule_summary",
                         "scenario_key": "traffic_hourly",
                         "schedules": [
                             {
@@ -241,14 +604,17 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         self.assertEqual(row["macro_steps"], 2)
         self.assertEqual(row["realized_nfe"], 4)
 
-    def test_schedule_grid_loader_registers_base_keys_for_checkpoint_scoped_summaries(self) -> None:
+    def test_schedule_grid_loader_keeps_claim_grids_checkpoint_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "ser_summary.json"
             path.write_text(
                 json.dumps(
                     {
+                        "status": "ready",
+                        "artifact": "ser_ptg_schedule_summary",
                         "scenario_key": "traffic_hourly",
                         "checkpoint_step": 4000,
+                        "checkpoint_ids": ["forecast-ckpt"],
                         "schedules": [
                             {
                                 "scheduler_key": SER_PTG_SCHEDULE_KEY,
@@ -267,12 +633,199 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            grids = load_schedule_summary_grids([str(path)])
+            grids = load_schedule_summary_grids(
+                [str(path)],
+                expected_rows=[
+                    {"checkpoint_step": 4000, "checkpoint_id": "forecast-ckpt"},
+                    {"checkpoint_step": 8000, "checkpoint_id": "later-ckpt"},
+                ],
+            )
 
-        self.assertIn((SER_PTG_SCHEDULE_KEY, "euler", 4), grids)
+        self.assertNotIn((SER_PTG_SCHEDULE_KEY, "euler", 4), grids)
         self.assertIn((SER_PTG_SCHEDULE_KEY, "euler", 4, 4000), grids)
-        self.assertIn((SER_PTG_REVERSED_SCHEDULE_KEY, "euler", 4), grids)
-        self.assertIn((SER_PTG_AVG_REVERSED_SCHEDULE_KEY, "euler", 4), grids)
+        self.assertNotIn((SER_PTG_SCHEDULE_KEY, "euler", 4, 8000), grids)
+        self.assertNotIn((SER_PTG_REVERSED_SCHEDULE_KEY, "euler", 4), grids)
+        self.assertNotIn((SER_PTG_AVG_REVERSED_SCHEDULE_KEY, "euler", 4), grids)
+
+    def test_schedule_grid_loader_rejects_checkpoint_identity_mismatch(self) -> None:
+        payload = {
+            "status": "ready",
+            "artifact": "ser_ptg_schedule_summary",
+            "scenario_key": "traffic_hourly",
+            "checkpoint_step": 4000,
+            "checkpoint_ids": ["forecast-ckpt"],
+            "schedules": [
+                {
+                    "scheduler_key": SER_PTG_SCHEDULE_KEY,
+                    "predictions": [
+                        {
+                            "solver_key": "euler",
+                            "target_nfe": 4,
+                            "macro_steps": 4,
+                            "time_grid": _uniform_grid(4),
+                        }
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ser_summary.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "checkpoint_ids do not match"):
+                load_schedule_summary_grids(
+                    [str(path)],
+                    expected_rows=[
+                        {"checkpoint_step": 4000, "checkpoint_id": "other-ckpt"}
+                    ],
+                )
+
+            del payload["checkpoint_ids"]
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "requires top-level checkpoint_ids"):
+                load_schedule_summary_grids(
+                    [str(path)],
+                    expected_rows=[
+                        {"checkpoint_step": 4000, "checkpoint_id": "forecast-ckpt"}
+                    ],
+                )
+
+    def test_schedule_grid_loader_rejects_noninteger_nfe_metadata(self) -> None:
+        base_prediction = {
+            "solver_key": "euler",
+            "target_nfe": 4,
+            "macro_steps": 4,
+            "realized_nfe": 4,
+            "time_grid": _uniform_grid(4),
+        }
+        mutations = (
+            ("target_nfe", 4.5),
+            ("target_nfe", True),
+            ("macro_steps", 4.5),
+            ("realized_nfe", True),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "summary.json"
+            for field, value in mutations:
+                with self.subTest(field=field, value=value):
+                    prediction = {**base_prediction, field: value}
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "scenario_key": "traffic_hourly",
+                                "schedules": [
+                                    {
+                                        "scheduler_key": SER_PTG_SCHEDULE_KEY,
+                                        "predictions": [prediction],
+                                    }
+                                ],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ValueError, "must be an integer"):
+                        load_schedule_summary_grids([str(path)])
+
+    def test_schedule_prediction_loader_rejects_noninteger_target_nfe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "summary.json"
+            for target_nfe in (4.5, True):
+                with self.subTest(target_nfe=target_nfe):
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "scenario_key": "traffic_hourly",
+                                "schedules": [
+                                    {
+                                        "scheduler_key": "candidate",
+                                        "predictions": [
+                                            {
+                                                "solver_key": "euler",
+                                                "target_nfe": target_nfe,
+                                                "macro_steps": 4,
+                                                "realized_nfe": 4,
+                                                "time_grid": _uniform_grid(4),
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(ValueError, "non-integer target_nfe"):
+                        load_schedule_predictions(
+                            path,
+                            scenario_key="traffic_hourly",
+                            solver_names=("euler",),
+                            target_nfe_values=(4,),
+                        )
+
+    def test_schedule_grid_loader_requires_train_reference_split_provenance(self) -> None:
+        payload = {
+            "status": "ready",
+            "artifact": "ser_ptg_schedule_summary",
+            "scenario_key": "traffic_hourly",
+            "checkpoint_step": 4000,
+            "checkpoint_ids": ["forecast-ckpt"],
+            "reference_split": "train_tuning",
+            "reference_split_key": "train",
+            "schedules": [
+                {
+                    "scheduler_key": SER_PTG_SCHEDULE_KEY,
+                    "predictions": [
+                        {
+                            "solver_key": "euler",
+                            "target_nfe": 4,
+                            "macro_steps": 4,
+                            "time_grid": _uniform_grid(4),
+                        }
+                    ],
+                }
+            ],
+        }
+        expected_rows = [{"checkpoint_step": 4000, "checkpoint_id": "forecast-ckpt"}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ser_summary.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            load_schedule_summary_grids(
+                [str(path)],
+                expected_scenario_key="traffic_hourly",
+                expected_reference_split="train_tuning",
+                expected_rows=expected_rows,
+            )
+
+            payload["reference_split"] = "validation_tuning"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "reference_split='train_tuning'"):
+                load_schedule_summary_grids(
+                    [str(path)],
+                    expected_scenario_key="traffic_hourly",
+                    expected_reference_split="train_tuning",
+                    expected_rows=expected_rows,
+                )
+
+            payload["reference_split"] = "train_tuning"
+            del payload["reference_split_key"]
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "reference_split_key='<missing>'"):
+                load_schedule_summary_grids(
+                    [str(path)],
+                    expected_scenario_key="traffic_hourly",
+                    expected_reference_split="train_tuning",
+                    expected_rows=expected_rows,
+                )
+
+            payload["reference_split_key"] = "train"
+            payload["status"] = "partial"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must be a ready"):
+                load_schedule_summary_grids(
+                    [str(path)],
+                    expected_scenario_key="traffic_hourly",
+                    expected_reference_split="train_tuning",
+                    expected_rows=expected_rows,
+                )
 
     def test_load_schedule_predictions_rejects_empty_filtered_candidate_set(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -517,6 +1070,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 json.dumps(
                     {
                         "scenario_key": "traffic_hourly",
+                        "checkpoint_step": 20000,
+                        "checkpoint_ids": ["checkpoint"],
                         "schedules": [
                             {
                                 "scheduler_key": scheduler_key,
@@ -671,6 +1226,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 json.dumps(
                     {
                         "scenario_key": "traffic_hourly",
+                        "checkpoint_step": 20000,
+                        "checkpoint_ids": ["ck"],
                         "schedules": [
                             {
                                 "scheduler_key": GIPO_POLICY_KEY,
@@ -738,6 +1295,20 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "cpu",
                 ]
             )
+            summary_path = root / "out" / "locked_test_schedule_summary.json"
+            write_state = {"comparison_built": False, "summary_writes": 0}
+
+            def build_comparison_once(**kwargs):
+                del kwargs
+                write_state["comparison_built"] = True
+                return {"status": "captured"}
+
+            def save_after_optional_outputs(payload, path):
+                if Path(path) == summary_path:
+                    self.assertTrue(write_state["comparison_built"])
+                    write_state["summary_writes"] += 1
+                atomic_save_json(payload, path)
+
             with mock.patch(
                 "genode.gipo.evaluate_schedule_summary.load_forecast_checkpoint_splits",
                 return_value=fake_checkpoint,
@@ -760,9 +1331,21 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 return_value=mixed_rows,
             ), mock.patch(
                 "genode.gipo.evaluate_schedule_summary.build_comparison_summary",
-                return_value={"status": "captured"},
+                side_effect=build_comparison_once,
             ) as build_mock:
-                evaluate_schedule_summary(args)
+                with mock.patch(
+                    "genode.gipo.evaluate_schedule_summary.save_json",
+                    side_effect=save_after_optional_outputs,
+                ):
+                    evaluate_schedule_summary(args)
+                persisted_summary = json.loads(
+                    summary_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    persisted_summary["comparison_summary"],
+                    {"status": "captured"},
+                )
+                self.assertEqual(write_state["summary_writes"], 1)
 
         call_kwargs = build_mock.call_args.kwargs
         self.assertEqual([row["scheduler_key"] for row in call_kwargs["baseline_rows"]], [BASELINE_SCHEDULE_KEYS[0]])
@@ -776,6 +1359,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 json.dumps(
                     {
                         "scenario_key": "traffic_hourly",
+                        "checkpoint_step": 20000,
+                        "checkpoint_ids": ["forecast-ckpt"],
                         "schedules": [
                             {
                                 "scheduler_key": GIPO_POLICY_KEY,
@@ -878,16 +1463,18 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         rows = []
         fixed_rows = []
         for schedule_key in BASELINE_SCHEDULE_KEYS:
-            fixed_rows.append(
-                {
-                    "seed": 0,
-                    "solver_key": "euler",
-                    "target_nfe": 4,
-                    "scheduler_key": schedule_key,
-                    "forecast_crps": 1.0,
-                    "forecast_mase": 2.0,
-                }
-            )
+            for seed in (0, 1, 2):
+                fixed_rows.append(
+                    {
+                        "seed": seed,
+                        "solver_key": "euler",
+                        "target_nfe": 4,
+                        "scheduler_key": schedule_key,
+                        "forecast_crps": 1.0,
+                        "forecast_mase": 2.0,
+                        **_panel_fields(seed),
+                    }
+                )
         for schedule_key, budget, crps, mase in (
             ("gipo_candidate_steps20", 20, 1.0, 2.0),
             ("gipo_candidate_steps25", 25, 1.0, 2.0),
@@ -902,6 +1489,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "scheduler_key": schedule_key,
                     "forecast_crps": crps,
                     "forecast_mase": mase,
+                    **_panel_fields(seed),
                 }
                 if budget is not None:
                     row["gipo_step_budget"] = budget
@@ -915,8 +1503,18 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         self.assertNotIn("eps_rho", selection["schedule_table"][0])
         self.assertNotIn("kl_weight", selection["schedule_table"][0])
 
-    def test_validation_schedule_selection_tie_breaks_smaller_budget(self) -> None:
-        rows = []
+    def test_validation_schedule_selection_rejects_mismatched_physical_panels(self) -> None:
+        candidate_rows = [
+            {
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "gipo_candidate",
+                "forecast_crps": 1.0,
+                "forecast_mase": 1.0,
+                **_panel_fields(0, panel="candidate"),
+            }
+        ]
         fixed_rows = [
             {
                 "seed": 0,
@@ -924,9 +1522,96 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 "target_nfe": 4,
                 "scheduler_key": schedule_key,
                 "forecast_crps": 2.0,
-                "forecast_mase": 3.0,
+                "forecast_mase": 2.0,
+                **_panel_fields(0, panel="fixed"),
             }
             for schedule_key in BASELINE_SCHEDULE_KEYS
+        ]
+
+        with self.assertRaisesRegex(ValueError, "chosen-example/evaluation panels"):
+            select_best_validation_schedule(candidate_rows, reference_rows=fixed_rows)
+
+    def test_validation_schedule_selection_requires_sha256_panel_digests(self) -> None:
+        candidate = {
+            "seed": 0,
+            "solver_key": "euler",
+            "target_nfe": 4,
+            "scheduler_key": "gipo_candidate",
+            "forecast_crps": 1.0,
+            "forecast_mase": 1.0,
+            **_panel_fields(0),
+        }
+        fixed_rows = [
+            {
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": schedule_key,
+                "forecast_crps": 2.0,
+                "forecast_mase": 2.0,
+                **_panel_fields(0),
+            }
+            for schedule_key in BASELINE_SCHEDULE_KEYS
+        ]
+        for field, value in (
+            ("chosen_examples_hash", "not-a-digest"),
+            ("evaluation_protocol_hash", "A" * 64),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError,
+                f"{field} must be a lowercase SHA-256 digest",
+            ):
+                select_best_validation_schedule(
+                    [{**candidate, field: value}],
+                    reference_rows=fixed_rows,
+                )
+
+    def test_validation_schedule_selection_allows_schedule_specific_protocol_hashes(self) -> None:
+        candidate_rows = [
+            {
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "gipo_candidate",
+                "forecast_crps": 1.0,
+                "forecast_mase": 1.0,
+                **_panel_fields(0, protocol="candidate"),
+            }
+        ]
+        fixed_rows = [
+            {
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": schedule_key,
+                "forecast_crps": 2.0,
+                "forecast_mase": 2.0,
+                **_panel_fields(0, protocol=f"fixed-{schedule_key}"),
+            }
+            for schedule_key in BASELINE_SCHEDULE_KEYS
+        ]
+
+        selection = select_best_validation_schedule(
+            candidate_rows,
+            reference_rows=fixed_rows,
+        )
+
+        self.assertEqual(selection["selected_scheduler_key"], "gipo_candidate")
+
+    def test_validation_schedule_selection_tie_breaks_smaller_budget(self) -> None:
+        rows = []
+        fixed_rows = [
+            {
+                "seed": seed,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": schedule_key,
+                "forecast_crps": 2.0,
+                "forecast_mase": 3.0,
+                **_panel_fields(seed),
+            }
+            for schedule_key in BASELINE_SCHEDULE_KEYS
+            for seed in (0, 1, 2)
         ]
         for schedule_key, budget in (("gipo_candidate_steps20", 20), ("gipo_candidate_steps25", 25)):
             for seed in (0, 1, 2):
@@ -939,6 +1624,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "gipo_step_budget": budget,
                         "forecast_crps": 1.0,
                         "forecast_mase": 2.0,
+                        **_panel_fields(seed),
                     }
                 )
         selection = select_best_validation_schedule(rows, reference_rows=fixed_rows)
@@ -953,14 +1639,16 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         rows = []
         fixed_rows = [
             {
-                "seed": 0,
+                "seed": seed,
                 "solver_key": "euler",
                 "target_nfe": 4,
                 "scheduler_key": schedule_key,
                 "forecast_crps": 1.0,
                 "forecast_mase": 1.0,
+                **_panel_fields(seed),
             }
             for schedule_key in BASELINE_SCHEDULE_KEYS
+            for seed in (0, 1, 2)
         ]
         # Same composite utility relative to best fixed: 0.5*(+log 2 - log 2) == 0.
         # The 25-step schedule has a better worst-metric utility and should win
@@ -979,6 +1667,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "gipo_step_budget": budget,
                         "forecast_crps": crps,
                         "forecast_mase": mase,
+                        **_panel_fields(seed),
                     }
                 )
         selection = select_best_validation_schedule(rows, reference_rows=fixed_rows)
@@ -1045,6 +1734,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 json.dumps(
                     {
                         "scenario_key": "traffic_hourly",
+                        "checkpoint_step": 20000,
+                        "checkpoint_ids": ["ck"],
                         "schedules": [
                             {
                                 "scheduler_key": GIPO_POLICY_KEY,
@@ -1139,6 +1830,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 json.dumps(
                     {
                         "scenario_key": "traffic_hourly",
+                        "checkpoint_step": 20000,
+                        "checkpoint_ids": ["ck"],
                         "schedules": [
                             {
                                 "scheduler_key": GIPO_POLICY_KEY,
@@ -1237,6 +1930,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 json.dumps(
                     {
                         "scenario_key": "traffic_hourly",
+                        "checkpoint_step": 20000,
+                        "checkpoint_ids": ["ck"],
                         "schedules": [
                             {
                                 "scheduler_key": GIPO_POLICY_KEY,
@@ -1275,6 +1970,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             def fake_eval(*args, **kwargs):
                 del args
                 captured_lengths.append(len(kwargs["example_indices"]))
+                context_indices = [int(value) for value in kwargs["example_indices"]]
                 return {
                     "forecast_crps": 1.0,
                     "forecast_mse": 1.5,
@@ -1288,9 +1984,11 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "realized_nfe": 4,
                     "per_example_rows": [
                         {
-                            "row_signature": "context-row",
-                            "context_id": "context-0",
-                            "context_embedding_id": "ck:context-0",
+                            "row_signature": f"context-row-{index}",
+                            "context_id": f"context-{index}",
+                            "context_embedding_id": f"ck:context-{index}",
+                            "scenario_key": "traffic_hourly",
+                            "split_phase": "locked_test",
                             "seed": 0,
                             "logical_seed": 0,
                             "evaluation_seed": 0,
@@ -1298,13 +1996,17 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                             "target_nfe": 4,
                             "realized_nfe": 4,
                             "scheduler_key": GIPO_POLICY_KEY,
-                            "example_idx": 0,
+                            "example_idx": index,
                             "forecast_crps": 1.0,
                             "forecast_mase": 2.0,
                             "forecast_mse": 1.5,
                         }
+                        for index in context_indices
                     ],
-                    "context_embeddings": {"ck:context-0": [0.1, 0.2]},
+                    "context_embeddings": {
+                        f"ck:context-{index}": [0.1, 0.2]
+                        for index in context_indices
+                    },
                 }
 
             args = build_argparser().parse_args(
@@ -1374,6 +2076,8 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 json.dumps(
                     {
                         "scenario_key": "traffic_hourly",
+                        "checkpoint_step": 20000,
+                        "checkpoint_ids": ["ck"],
                         "schedules": [
                             {
                                 "scheduler_key": GIPO_POLICY_KEY,

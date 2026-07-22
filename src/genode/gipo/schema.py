@@ -42,6 +42,27 @@ RETIRED_EVALUATION_KEYS = frozenset(
         "uniform_schedule_key",
     }
 )
+SPLIT_PHASE_FIELDS = ("source_split_phase", "split_phase", "split")
+
+
+def validate_declared_split_phase(
+    row: Mapping[str, Any],
+    *,
+    source: str,
+) -> str:
+    """Return one explicit split declaration without allowing aliases to disagree."""
+
+    declared = {
+        field: str(row.get(field, "") or "").strip()
+        for field in SPLIT_PHASE_FIELDS
+        if str(row.get(field, "") or "").strip()
+    }
+    if not declared:
+        raise ValueError(f"{source} requires an explicit split phase.")
+    phases = set(declared.values())
+    if len(phases) != 1:
+        raise ValueError(f"{source} contains conflicting split phase declarations: {declared}.")
+    return next(iter(phases))
 
 
 def reject_retired_evaluation_keys(value: Any, *, source: str) -> None:
@@ -170,4 +191,5 @@ __all__ = [
     "consistent_metadata_value",
     "evaluation_row_signature",
     "reject_retired_evaluation_keys",
+    "validate_declared_split_phase",
 ]

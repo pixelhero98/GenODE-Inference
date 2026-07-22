@@ -5,11 +5,14 @@ import csv
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from genode.checkpoint_validation import validate_strict_integer
 from genode.cli import parse_int_csv
 from genode.data.otflow_experiment_plan import FORECAST_FAMILY
 from genode.data.otflow_monash_datasets import monash_manifest_path
@@ -23,7 +26,6 @@ from genode.solver_protocol import (
     normalize_solver_key,
     normalize_solver_keys,
     normalize_solver_nfe_fields,
-    solver_runtime_name,
 )
 from genode.gipo.density_representation import (
     average_density_masses,
@@ -33,7 +35,11 @@ from genode.gipo.density_representation import (
 )
 from genode.gipo.models import validate_time_grid
 from genode.gipo.ablation_plan import GIPO_POLICY_KEY
-from genode.gipo.policy import load_context_embedding_table, save_context_embedding_table
+from genode.gipo.policy import (
+    context_embedding_table_manifest_path,
+    load_context_embedding_table,
+    save_context_embedding_table,
+)
 from genode.gipo.schedule_hash import schedule_grid_hash
 from genode.gipo.schema import (
     cap_context_indices,
@@ -73,6 +79,7 @@ from genode.evaluation.otflow_evaluation_support import (
 )
 from genode.models.otflow_train_val import save_json
 from genode.provenance import fingerprint_identity, path_fingerprint
+from genode.path_safety import resolve_portable_relative_path
 from genode.runtime import ProgressBar, resolve_torch_device
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
@@ -212,6 +219,7 @@ CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "target_stop",
     "context_id",
     "context_embedding_id",
+    "context_embedding_kind",
     "checkpoint_step",
     "checkpoint_id",
     "forecast_crps",
@@ -246,6 +254,21 @@ def _optional_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return float(val) if math.isfinite(val) else None
+
+
+def _strict_artifact_integer(value: Any, *, label: str, minimum: int = 1) -> int:
+    if isinstance(value, str):
+        if value != value.strip() or not value or not value.isascii() or not value.isdecimal():
+            raise ValueError(f"{label} must be an integer, got {value!r}.")
+        value = int(value)
+    return validate_strict_integer(value, label=label, minimum=minimum)
+
+
+def _strict_sha256_digest(value: Any, *, label: str) -> str:
+    digest = str(value or "")
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest.")
+    return digest
 
 
 def _mean(values: Iterable[Any]) -> Optional[float]:
@@ -433,11 +456,20 @@ def _register_prediction(
     key = (str(scheduler_key), str(solver_key), int(target_nfe))
     prediction = dict(item)
     intervals = [float(x) for x in np.diff(np.asarray(time_grid, dtype=np.float64)).tolist()]
+    normalized_budget = (
+        None
+        if budget in (None, "")
+        else _strict_artifact_integer(
+            budget,
+            label="Schedule prediction gipo_step_budget",
+            minimum=1,
+        )
+    )
     prediction.update(
         {
             "scheduler_key": str(scheduler_key),
             "schedule_name": str(schedule_name),
-            "gipo_step_budget": None if budget in (None, "") else int(budget),
+            "gipo_step_budget": normalized_budget,
             "solver_key": str(solver_key),
             "target_nfe": int(target_nfe),
             "macro_steps": int(macro_steps),
@@ -545,16 +577,16 @@ def load_schedule_predictions(
                 if value is not None:
                     prediction[meta_key] = value
             solver_key = normalize_solver_key(str(item.get("solver_key")))
-            target_nfe = int(item.get("target_nfe"))
-            if solver_key not in allowed_solvers or target_nfe not in allowed_nfes:
-                continue
             nfe = normalize_solver_nfe_fields(
                 solver_key,
-                target_nfe,
+                item.get("target_nfe"),
                 macro_steps=item.get("macro_steps"),
                 realized_nfe=item.get("realized_nfe"),
-                source=f"Schedule {scheduler_key} {solver_key}/{target_nfe}",
+                source=f"Schedule {scheduler_key} prediction {item_index}",
             )
+            target_nfe = int(nfe.target_nfe)
+            if solver_key not in allowed_solvers or target_nfe not in allowed_nfes:
+                continue
             time_grid = validate_time_grid(item.get("time_grid", []), macro_steps=nfe.macro_steps)
             prediction["solver_key"] = solver_key
             for meta_key in (
@@ -631,18 +663,92 @@ def _load_existing_rows(jsonl_path: Path, *, protocol_hash: str) -> Dict[Tuple[A
     if not jsonl_path.exists():
         return rows
     with jsonl_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
+        line_number = 0
+        line = fh.readline()
+        while line:
+            line_number += 1
+            next_line = fh.readline()
+            stripped = line.strip()
+            if not stripped:
+                line = next_line
                 continue
-            row = json.loads(line)
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                if not next_line and not line.endswith(("\n", "\r")):
+                    break
+                raise ValueError(
+                    f"Invalid JSONL record in {jsonl_path} at line {line_number}."
+                ) from exc
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"JSONL record in {jsonl_path} at line {line_number} must be an object."
+                )
             reject_retired_evaluation_keys(row, source=f"Evaluation row in {jsonl_path}")
             if str(row.get("protocol_hash")) != str(protocol_hash):
-                continue
+                raise ValueError(
+                    "Existing schedule-evaluation rows use a different protocol; "
+                    "choose a new output directory instead of replacing prior results."
+                )
             if str(row.get("row_status")) != "complete":
+                line = next_line
                 continue
             rows[_row_key(row)] = row
+            line = next_line
     return rows
+
+
+def _output_path(
+    out_dir: Path,
+    value: object,
+    *,
+    fallback: str,
+    suffix: str,
+    label: str,
+) -> Path:
+    name = str(value or fallback)
+    path = resolve_portable_relative_path(
+        out_dir,
+        name,
+        label=label,
+        reject_links=True,
+    )
+    if path.suffix.lower() != suffix:
+        raise ValueError(f"{label} must end in {suffix!r}.")
+    return path
+
+
+def _validate_distinct_artifact_paths(
+    paths: Mapping[str, Path],
+    *,
+    input_paths: Optional[Mapping[str, Path]] = None,
+) -> None:
+    names_by_path: Dict[Path, List[str]] = {}
+    for name, path in paths.items():
+        names_by_path.setdefault(path.resolve(strict=False), []).append(str(name))
+    collisions = {
+        str(path): names
+        for path, names in names_by_path.items()
+        if len(names) > 1
+    }
+    input_names_by_path: Dict[Path, List[str]] = {}
+    for name, path in (input_paths or {}).items():
+        input_names_by_path.setdefault(path.resolve(strict=False), []).append(str(name))
+    input_output_collisions = {
+        str(path): {
+            "outputs": names_by_path[path],
+            "inputs": input_names,
+        }
+        for path, input_names in input_names_by_path.items()
+        if path in names_by_path
+    }
+    if collisions or input_output_collisions:
+        raise ValueError(
+            "Schedule-evaluation artifact paths must be pairwise distinct, including "
+            "implicit sidecars, and inputs may not collide with outputs: "
+            f"output_collisions={collisions}, "
+            f"input/output_collisions={input_output_collisions}."
+        )
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -652,6 +758,30 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({field: row.get(field) for field in SCHEDULE_ROW_FIELDS})
+
+
+def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            tmp_path = Path(fh.name)
+            for row in rows:
+                fh.write(json.dumps(dict(row), sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp_path.replace(path)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def _write_context_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -693,6 +823,87 @@ def _merge_context_embeddings_checked(
         existing[key_text] = new_vec.astype(float).tolist()
 
 
+def _identity_field_text(value: Any) -> str:
+    """Normalize persisted identity values without discarding numeric zero."""
+    return "" if value is None or value == "" else str(value)
+
+
+def _row_has_complete_context_artifacts(
+    row: Mapping[str, Any],
+    *,
+    context_rows_by_signature: Mapping[str, Mapping[str, Any]],
+    context_embeddings: Mapping[str, Any],
+    context_embedding_kind: str,
+) -> bool:
+    if str(row.get("row_status", "")) != "complete":
+        return False
+    parent_signature = str(row.get("row_signature", "") or "").strip()
+    if not parent_signature:
+        return False
+    selected_examples = row.get("selected_examples")
+    if isinstance(selected_examples, bool) or not isinstance(selected_examples, int):
+        return False
+    if selected_examples <= 0:
+        return False
+    parent_identity = {
+        field: _identity_field_text(row.get(field, ""))
+        for field in (
+            "benchmark_family",
+            "protocol_hash",
+            "scenario_key",
+            "split_phase",
+            "seed",
+            "target_nfe",
+            "scheduler_key",
+            "checkpoint_step",
+            "checkpoint_id",
+        )
+    }
+    rows_for_parent = [
+        context_row
+        for context_row in context_rows_by_signature.values()
+        if str(context_row.get("parent_row_signature", "") or "").strip()
+        == parent_signature
+    ]
+    if len(rows_for_parent) != selected_examples:
+        return False
+    context_ids: set[str] = set()
+    embedding_ids: set[str] = set()
+    for context_row in rows_for_parent:
+        if any(
+            _identity_field_text(context_row.get(field, "")) != expected
+            for field, expected in parent_identity.items()
+        ):
+            return False
+        try:
+            context_solver_key = normalize_solver_key(
+                str(context_row.get("solver_key", "") or "")
+            )
+        except ValueError:
+            return False
+        if context_solver_key != str(row.get("solver_key", "") or ""):
+            return False
+        if str(context_row.get("context_embedding_kind", "") or "") != str(
+            context_embedding_kind
+        ):
+            return False
+        context_id = str(context_row.get("context_id", "") or "").strip()
+        embedding_id = str(
+            context_row.get("context_embedding_id", "") or ""
+        ).strip()
+        if (
+            not context_id
+            or context_id in context_ids
+            or not embedding_id
+            or embedding_id in embedding_ids
+            or embedding_id not in context_embeddings
+        ):
+            return False
+        context_ids.add(context_id)
+        embedding_ids.add(embedding_id)
+    return True
+
+
 def _schedule_row(
     *,
     seed: int,
@@ -730,7 +941,7 @@ def _schedule_row(
         "target_nfe": int(target_nfe),
         "macro_steps": int(nfe.macro_steps),
         "solver_key": solver_key,
-        "solver_name": solver_runtime_name(solver_key),
+        "solver_name": normalize_solver_key(solver_key),
         "scheduler_key": scheduler_key,
         "scheduler_name": str(prediction.get("schedule_name") or schedule_display_name_for_key(scheduler_key)),
         "gipo_step_budget": prediction.get("gipo_step_budget"),
@@ -836,6 +1047,13 @@ def _load_forecast_rows_csv(
                 continue
             if seed not in seed_set or target_nfe not in nfe_set or solver_key not in solver_set:
                 continue
+            nfe = normalize_solver_nfe_fields(
+                solver_key,
+                target_nfe,
+                macro_steps=row.get("macro_steps"),
+                realized_nfe=row.get("realized_nfe"),
+                source=f"Evaluation row in {resolved}",
+            )
             if checkpoint_step is not None or str(checkpoint_id).strip():
                 raw_step = row.get("checkpoint_step")
                 raw_id = str(row.get("checkpoint_id", "") or "").strip()
@@ -857,12 +1075,26 @@ def _load_forecast_rows_csv(
             clean["solver_key"] = solver_key
             clean["seed"] = int(seed)
             clean["target_nfe"] = int(target_nfe)
+            clean["macro_steps"] = int(nfe.macro_steps)
+            clean["realized_nfe"] = int(nfe.realized_nfe)
             clean["forecast_crps"] = float(crps)
             clean["forecast_mase"] = float(mase)
-            for key in ("forecast_mse", "latency_ms_per_sample", "realized_nfe", "gipo_step_budget"):
+            for key in ("num_eval_samples", "eval_examples", "eval_horizon"):
+                if clean.get(key) not in (None, ""):
+                    clean[key] = _strict_artifact_integer(
+                        clean[key],
+                        label=f"Evaluation row {key}",
+                    )
+            if clean.get("gipo_step_budget") not in (None, ""):
+                clean["gipo_step_budget"] = _strict_artifact_integer(
+                    clean["gipo_step_budget"],
+                    label="Evaluation row gipo_step_budget",
+                    minimum=1,
+                )
+            for key in ("forecast_mse", "latency_ms_per_sample"):
                 value = _optional_float(clean.get(key))
                 if value is not None:
-                    clean[key] = int(value) if key in {"realized_nfe", "gipo_step_budget"} else float(value)
+                    clean[key] = float(value)
             rows.append(clean)
     if mismatched_identities:
         raise ValueError(
@@ -879,12 +1111,18 @@ def _validate_schedule_checkpoint_identity(
     checkpoint_step: int,
     checkpoint_id: str,
 ) -> None:
-    declared_steps = {
-        int(prediction["checkpoint_step"])
-        for prediction in predictions.values()
-        if prediction.get("checkpoint_step") not in (None, "")
-    }
-    if declared_steps and declared_steps != {int(checkpoint_step)}:
+    declared_steps: set[int] = set()
+    for prediction in predictions.values():
+        if prediction.get("checkpoint_step") in (None, ""):
+            raise ValueError("Every schedule prediction requires checkpoint_step.")
+        declared_steps.add(
+            validate_strict_integer(
+                prediction["checkpoint_step"],
+                label="Schedule summary checkpoint_step",
+                minimum=0,
+            )
+        )
+    if declared_steps != {int(checkpoint_step)}:
         raise ValueError(
             "Schedule summary checkpoint_step does not match the loaded backbone artifact: "
             f"declared={sorted(declared_steps)}, loaded={int(checkpoint_step)}."
@@ -898,7 +1136,9 @@ def _validate_schedule_checkpoint_identity(
         if isinstance(plural, (str, bytes)):
             plural = [plural]
         declared_ids.update(str(value).strip() for value in plural if str(value).strip())
-    if declared_ids and declared_ids != {str(checkpoint_id)}:
+    if not declared_ids:
+        raise ValueError("Every claim-bearing schedule summary requires checkpoint identity.")
+    if declared_ids != {str(checkpoint_id)}:
         raise ValueError(
             "Schedule summary checkpoint identity does not match the loaded backbone artifact: "
             f"declared={sorted(declared_ids)}, loaded={str(checkpoint_id)!r}."
@@ -992,6 +1232,10 @@ def _selection_rewards(
     candidate_rows: Sequence[Mapping[str, Any]],
     reference_rows: Sequence[Mapping[str, Any]] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[Tuple[str, int], Dict[str, float]], str, List[str]]:
+    _validate_paired_selection_panel(
+        candidate_rows=candidate_rows,
+        reference_rows=reference_rows,
+    )
     aggregated_candidates = seed_mean_metric_rows(candidate_rows)
     aggregated_references = seed_mean_metric_rows(reference_rows)
     if not aggregated_references:
@@ -1005,6 +1249,108 @@ def _selection_rewards(
     ]
     rewards = rewards_by_setting([*aggregated_references, *aggregated_candidates], fixed_scheduler_keys=BASELINE_SCHEDULE_KEYS)
     return annotated_candidates, rewards, "best_fixed_baseline_crps_mase", list(BASELINE_SCHEDULE_KEYS)
+
+
+def _selection_cell(row: Mapping[str, Any]) -> Tuple[int, str, int]:
+    return (
+        int(row.get("seed", -1)),
+        normalize_solver_key(str(row.get("solver_key", ""))),
+        int(row.get("target_nfe", -1)),
+    )
+
+
+def _selection_panel_identity(row: Mapping[str, Any]) -> Tuple[str, int, int, int]:
+    chosen_examples_hash = _strict_sha256_digest(
+        row.get("chosen_examples_hash"),
+        label="Validation selection row chosen_examples_hash",
+    )
+    # The evaluation-protocol digest intentionally includes the schedule grid and
+    # scheduler key, so it cannot be equal across schedules.  Its digest integrity
+    # is still required before the schedule-independent panel fields are paired.
+    _strict_sha256_digest(
+        row.get("evaluation_protocol_hash"),
+        label="Validation selection row evaluation_protocol_hash",
+    )
+    values: List[int] = []
+    for field in ("num_eval_samples", "eval_examples", "eval_horizon"):
+        values.append(
+            _strict_artifact_integer(
+                row.get(field),
+                label=f"Validation selection row {field}",
+                minimum=1,
+            )
+        )
+    return chosen_examples_hash, values[0], values[1], values[2]
+
+
+def _validate_paired_selection_panel(
+    *,
+    candidate_rows: Sequence[Mapping[str, Any]],
+    reference_rows: Sequence[Mapping[str, Any]],
+) -> None:
+    """Require every selected schedule and fixed baseline on one chosen-example/evaluation panel."""
+
+    candidate_keys = sorted(
+        {
+            str(row.get("scheduler_key", "") or "")
+            for row in candidate_rows
+            if str(row.get("scheduler_key", "") or "")
+        }
+    )
+    reference_keys = sorted(
+        {
+            str(row.get("scheduler_key", "") or "")
+            for row in reference_rows
+            if str(row.get("scheduler_key", "") or "") in BASELINE_SCHEDULE_KEYS
+        }
+    )
+    if not candidate_keys or not reference_keys:
+        return
+    missing_reference_keys = sorted(set(BASELINE_SCHEDULE_KEYS) - set(reference_keys))
+    if missing_reference_keys:
+        raise ValueError(
+            "Validation selection requires every declared fixed baseline; missing "
+            f"scheduler keys: {missing_reference_keys}."
+        )
+
+    rows_by_schedule: Dict[str, Dict[Tuple[int, str, int], Mapping[str, Any]]] = {}
+    for row in [*candidate_rows, *reference_rows]:
+        scheduler_key = str(row.get("scheduler_key", "") or "")
+        if scheduler_key not in set(candidate_keys).union(reference_keys):
+            continue
+        cell = _selection_cell(row)
+        schedule_rows = rows_by_schedule.setdefault(scheduler_key, {})
+        if cell in schedule_rows:
+            raise ValueError(
+                "Validation selection contains duplicate rows for "
+                f"scheduler={scheduler_key!r}, cell={cell!r}."
+            )
+        schedule_rows[cell] = row
+
+    expected_cells = set(rows_by_schedule[candidate_keys[0]])
+    if not expected_cells:
+        raise ValueError("Validation selection requires at least one candidate cell.")
+    for scheduler_key in [*candidate_keys, *reference_keys]:
+        observed_cells = set(rows_by_schedule.get(scheduler_key, {}))
+        if observed_cells != expected_cells:
+            missing = sorted(expected_cells - observed_cells)
+            extra = sorted(observed_cells - expected_cells)
+            raise ValueError(
+                "Validation selection requires the same seed/solver/NFE cells for every "
+                f"candidate and fixed baseline; scheduler={scheduler_key!r}, "
+                f"missing={missing[:8]}, extra={extra[:8]}."
+            )
+
+    for cell in sorted(expected_cells):
+        identities = {
+            _selection_panel_identity(rows_by_schedule[scheduler_key][cell])
+            for scheduler_key in [*candidate_keys, *reference_keys]
+        }
+        if len(identities) != 1:
+            raise ValueError(
+                "Validation selection candidate and fixed-baseline rows use different "
+                f"chosen-example/evaluation panels for cell={cell!r}."
+            )
 
 
 def _optional_int(value: Any) -> int | None:
@@ -1488,15 +1834,6 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
     split_phase = str(args.split_phase)
     if split_phase not in {TRAIN_TUNING_PHASE, VALIDATION_PHASE, LOCKED_TEST_PHASE}:
         raise ValueError(f"split_phase must be {TRAIN_TUNING_PHASE!r}, {VALIDATION_PHASE!r}, or {LOCKED_TEST_PHASE!r}.")
-    predictions = load_schedule_predictions(
-        args.schedule_summary,
-        scenario_key=str(args.scenario_key),
-        solver_names=solver_names,
-        target_nfe_values=target_nfes,
-        require_complete=True,
-    )
-    scheduler_keys = sorted({key[0] for key in predictions})
-    protocol_hash = _protocol_hash(args)
     fallback_row_csv_name = {
         TRAIN_TUNING_PHASE: "train_tuning_rows.csv",
         VALIDATION_PHASE: "validation_rows.csv",
@@ -1508,20 +1845,95 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
         LOCKED_TEST_PHASE: "test_rows.jsonl",
     }[split_phase]
     row_csv_name = str(args.row_csv_name or fallback_row_csv_name)
-    row_jsonl_name = str(args.row_jsonl_name or fallback_row_jsonl_name)
-    csv_path = out_dir / row_csv_name
-    jsonl_path = out_dir / row_jsonl_name
-    context_csv_path = out_dir / str(args.context_row_csv_name or f"context_{row_csv_name}")
-    context_embeddings_path = out_dir / str(args.context_embeddings_npz_name or "context_embeddings.npz")
-    rows_by_key = _load_existing_rows(jsonl_path, protocol_hash=protocol_hash)
-    if rows_by_key:
-        _write_csv(csv_path, list(rows_by_key.values()))
-    context_rows_by_signature = _load_context_rows(context_csv_path) if bool(args.write_context_rows) else {}
-    context_embeddings: Dict[str, Sequence[float]] = (
-        load_context_embedding_table(context_embeddings_path)
-        if bool(args.write_context_rows) and context_embeddings_path.exists()
-        else {}
+    csv_path = _output_path(
+        out_dir,
+        row_csv_name,
+        fallback=fallback_row_csv_name,
+        suffix=".csv",
+        label="row CSV output",
     )
+    jsonl_path = _output_path(
+        out_dir,
+        args.row_jsonl_name,
+        fallback=fallback_row_jsonl_name,
+        suffix=".jsonl",
+        label="row JSONL output",
+    )
+    context_csv_path = _output_path(
+        out_dir,
+        args.context_row_csv_name,
+        fallback=f"context_{row_csv_name}",
+        suffix=".csv",
+        label="context-row CSV output",
+    )
+    context_embeddings_path = _output_path(
+        out_dir,
+        args.context_embeddings_npz_name,
+        fallback="context_embeddings.npz",
+        suffix=".npz",
+        label="context-embedding output",
+    )
+    summary_path = _output_path(
+        out_dir,
+        args.summary_output_name,
+        fallback=f"{split_phase}_schedule_summary.json",
+        suffix=".json",
+        label="summary output",
+    )
+    comparison_path = _output_path(
+        out_dir,
+        args.comparison_output_name,
+        fallback="student_vs_baselines_ser_ptg_summary.json",
+        suffix=".json",
+        label="comparison output",
+    )
+    selection_path = out_dir / "validation_schedule_selection.json"
+    selected_summary_path = out_dir / "selected_student_schedule_summary.json"
+    output_paths: Dict[str, Path] = {
+        "row CSV": csv_path,
+        "row JSONL": jsonl_path,
+        "summary JSON": summary_path,
+        "comparison JSON": comparison_path,
+    }
+    if bool(args.write_context_rows):
+        output_paths.update(
+            {
+                "context-row CSV": context_csv_path,
+                "context embeddings": context_embeddings_path,
+                "context-embedding manifest": context_embedding_table_manifest_path(
+                    context_embeddings_path
+                ),
+            }
+        )
+    if bool(args.select_schedule_from_validation):
+        output_paths.update(
+            {
+                "validation selection": selection_path,
+                "selected schedule summary": selected_summary_path,
+            }
+        )
+    input_paths = {
+        "schedule summary": resolve_project_path(str(args.schedule_summary)),
+    }
+    for label, value in (
+        ("baseline rows", args.baseline_rows),
+        ("comparator rows", args.comparator_rows),
+        ("selection reference rows", args.selection_reference_rows),
+    ):
+        if str(value).strip():
+            input_paths[label] = resolve_project_path(str(value))
+    _validate_distinct_artifact_paths(output_paths, input_paths=input_paths)
+
+    predictions = load_schedule_predictions(
+        args.schedule_summary,
+        scenario_key=str(args.scenario_key),
+        solver_names=solver_names,
+        target_nfe_values=target_nfes,
+        require_complete=True,
+    )
+    scheduler_keys = sorted({key[0] for key in predictions})
+    protocol_hash = _protocol_hash(args)
+
     dataset_root = resolve_project_path(str(args.dataset_root))
     shared_backbone_root = resolve_project_path(str(args.shared_backbone_root))
     device = resolve_torch_device(str(args.device))
@@ -1566,6 +1978,78 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
         if str(args.comparator_rows).strip()
         else []
     )
+    rows_by_key = _load_existing_rows(jsonl_path, protocol_hash=protocol_hash)
+    context_rows_by_signature = _load_context_rows(context_csv_path) if bool(args.write_context_rows) else {}
+    original_context_signatures = set(context_rows_by_signature)
+    context_embeddings: Dict[str, Sequence[float]] = {}
+    context_table_was_invalid = False
+    if bool(args.write_context_rows) and context_embeddings_path.exists():
+        try:
+            context_embeddings = load_context_embedding_table(
+                context_embeddings_path,
+                expected_context_embedding_kind=str(args.context_embedding_kind),
+                require_manifest=True,
+                expected_context_rows=list(context_rows_by_signature.values()),
+            )
+        except ValueError:
+            context_embeddings = {}
+            context_table_was_invalid = True
+    original_embedding_ids = set(context_embeddings)
+    if bool(args.write_context_rows):
+        rows_by_key = {
+            key: row
+            for key, row in rows_by_key.items()
+            if _row_has_complete_context_artifacts(
+                row,
+                context_rows_by_signature=context_rows_by_signature,
+                context_embeddings=context_embeddings,
+                context_embedding_kind=str(args.context_embedding_kind),
+            )
+        }
+        retained_parent_signatures = {
+            str(row.get("row_signature", "") or "").strip()
+            for row in rows_by_key.values()
+        }
+        context_rows_by_signature = {
+            signature: row
+            for signature, row in context_rows_by_signature.items()
+            if str(row.get("parent_row_signature", "") or "").strip()
+            in retained_parent_signatures
+        }
+        retained_embedding_ids = {
+            str(row.get("context_embedding_id", "") or "").strip()
+            for row in context_rows_by_signature.values()
+            if str(row.get("context_embedding_id", "") or "").strip()
+        }
+        context_embeddings = {
+            embedding_id: vector
+            for embedding_id, vector in context_embeddings.items()
+            if embedding_id in retained_embedding_ids
+        }
+        _write_context_csv(
+            context_csv_path,
+            list(context_rows_by_signature.values()),
+        )
+        context_artifacts_changed = (
+            context_table_was_invalid
+            or set(context_rows_by_signature) != original_context_signatures
+            or set(context_embeddings) != original_embedding_ids
+        )
+        if context_artifacts_changed:
+            if context_embeddings:
+                save_context_embedding_table(
+                    context_embeddings_path,
+                    context_embeddings,
+                    metadata={"context_embedding_kind": str(args.context_embedding_kind)},
+                    context_rows=list(context_rows_by_signature.values()),
+                )
+            else:
+                context_embeddings_path.unlink(missing_ok=True)
+                context_embedding_table_manifest_path(context_embeddings_path).unlink(
+                    missing_ok=True
+                )
+    _write_jsonl(jsonl_path, list(rows_by_key.values()))
+    _write_csv(csv_path, list(rows_by_key.values()))
     model = checkpoint["model"]
     cfg = checkpoint["cfg"]
     split_key = {TRAIN_TUNING_PHASE: "train", VALIDATION_PHASE: "val", LOCKED_TEST_PHASE: "test"}[split_phase]
@@ -1640,7 +2124,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                             model,
                             eval_ds,
                             cfg,
-                            solver_name=solver_runtime_name(solver_key),
+                            solver_name=normalize_solver_key(solver_key),
                             macro_steps=int(prediction["macro_steps"]),
                             target_nfe=int(target_nfe),
                             time_grid=prediction["time_grid"],
@@ -1701,10 +2185,6 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                                     "train_tuning_val_split_fraction": float(args.train_tuning_val_split_fraction),
                                 }
                             )
-                        rows_by_key[_row_key(row)] = row
-                        fh.write(json.dumps(row, sort_keys=True) + "\n")
-                        fh.flush()
-                        _write_csv(csv_path, list(rows_by_key.values()))
                         if bool(args.write_context_rows):
                             for detail_row in list(metrics.get("per_example_rows", []) or []):
                                 copied_detail = dict(detail_row)
@@ -1737,6 +2217,9 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                                         selection_was_capped=bool(selection_meta["selection_was_capped"]),
                                     )
                                 )
+                                copied_detail["context_embedding_kind"] = str(
+                                    args.context_embedding_kind
+                                )
                                 if split_phase == TRAIN_TUNING_PHASE:
                                     copied_detail.update(
                                         {
@@ -1767,7 +2250,22 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                                         "chosen_examples_hash": str(metrics.get("chosen_examples_hash", "")),
                                         "evaluation_protocol_hash": str(metrics.get("evaluation_protocol_hash", "")),
                                     },
+                                    context_rows=list(context_rows_by_signature.values()),
                                 )
+                            if not _row_has_complete_context_artifacts(
+                                row,
+                                context_rows_by_signature=context_rows_by_signature,
+                                context_embeddings=context_embeddings,
+                                context_embedding_kind=str(args.context_embedding_kind),
+                            ):
+                                raise ValueError(
+                                    "Schedule evaluation did not produce a complete, identity-matched "
+                                    "context row and embedding set for its parent row."
+                                )
+                        rows_by_key[_row_key(row)] = row
+                        fh.write(json.dumps(row, sort_keys=True) + "\n")
+                        fh.flush()
+                        _write_csv(csv_path, list(rows_by_key.values()))
                         progress.update()
     rows = list(rows_by_key.values())
     summary: Dict[str, Any] = {
@@ -1820,22 +2318,20 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
             "val_split_fraction": float(args.train_tuning_val_split_fraction),
             "split_key": "train",
         }
-    save_json(summary, str(out_dir / str(args.summary_output_name or f"{split_phase}_schedule_summary.json")))
     if bool(args.select_schedule_from_validation):
         if split_phase != VALIDATION_PHASE:
             raise ValueError("Validation selection requires --split_phase validation_tuning.")
         selection = select_best_validation_schedule(rows, reference_rows=selection_reference_rows)
-        selection_name = "validation_schedule_selection.json"
-        save_json(selection, str(out_dir / selection_name))
+        save_json(selection, str(selection_path))
         selected_summary = write_selected_schedule_summary(
             args.schedule_summary,
             selection,
-            out_dir / "selected_student_schedule_summary.json",
+            selected_summary_path,
         )
         summary["selection"] = selection
-        summary["selection_json"] = display_project_path(out_dir / selection_name)
+        summary["selection_json"] = display_project_path(selection_path)
         summary["selected_student_schedule_summary"] = display_project_path(
-            out_dir / "selected_student_schedule_summary.json"
+            selected_summary_path
         )
         summary["selected_summary_schedule_count"] = int(len(selected_summary.get("schedules", [])))
     if str(args.baseline_rows).strip():
@@ -1855,8 +2351,9 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
             solver_names=solver_names,
             target_nfe_values=target_nfes,
         )
-        save_json(comparison, str(out_dir / str(args.comparison_output_name or "student_vs_baselines_ser_ptg_summary.json")))
+        save_json(comparison, str(comparison_path))
         summary["comparison_summary"] = comparison
+    save_json(summary, str(summary_path))
     return summary
 
 

@@ -4,12 +4,23 @@ import argparse
 import hashlib
 import json
 import math
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import torch
 
+from genode.artifact_bundle import (
+    bundle_journal_path,
+    discard_temporary_bundle_path,
+    preflight_artifact_bundle,
+    promote_artifact_bundle,
+    recover_artifact_bundle,
+    temporary_bundle_path,
+    validate_artifact_bundle,
+    validate_artifact_bundle_layout,
+)
 from genode.cli import parse_csv, parse_int_csv
 from genode.experiment_layout import (
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
@@ -58,6 +69,7 @@ from genode.gipo.policy import (
     build_gipo_student_model,
     build_gipo_teacher_model,
     context_embedding_id_from_row,
+    context_embedding_kind_from_rows,
     context_id_from_row,
     context_pair_key,
     density_mass_for_row,
@@ -66,7 +78,6 @@ from genode.gipo.policy import (
     read_metric_rows_csv,
     recommended_context_calibration_count,
     sample_context_ids_stratified,
-    select_weighted_normalized_regret_checkpoint,
     series_key_from_row,
     split_rows_by_context_holdout,
     split_rows_by_density_family_holdout,
@@ -82,11 +93,14 @@ from genode.gipo.policy import (
 )
 from genode.gipo.density_representation import DENSITY_BIN_COUNT, density_metadata, reference_grid_hash, uniform_reference_grid
 from genode.gipo.preflight import (
+    infer_single_scenario_key,
     resolve_teacher_metric_target_keys,
     teacher_metric_target_coverage,
+    validate_scenario_benchmark_family,
 )
 from genode.gipo.checkpoint_scope import checkpoint_scope_from_row
 from genode.gipo.schedule_grids import load_schedule_summary_grids, validate_schedule_grid_coverage
+from genode.gipo.schema import validate_declared_split_phase
 from genode.gipo.models import (
     SETTING_ENCODER_MODE_CONTINUOUS,
     setting_encoder_config_for_rows,
@@ -97,7 +111,7 @@ from genode.data.otflow_paths import resolve_project_path
 from genode.data.otflow_experiment_plan import FORECAST_FAMILY
 from genode.evaluation.otflow_evaluation_support import TRAIN_TUNING_SAMPLER_WINDOW_FRACTION
 from genode.models.otflow_train_val import seed_all
-from genode.provenance import fingerprint_identity, path_fingerprint
+from genode.provenance import file_sha256, fingerprint_identity, path_fingerprint
 from genode.runtime import resolve_torch_device
 from genode.solver_protocol import normalize_solver_key
 
@@ -110,6 +124,190 @@ REFERENCE_TEACHER_REGRESSION_WEIGHT = 0.25
 REFERENCE_TEACHER_PAIR_MARGIN = 0.0
 TRAIN_TUNING_FRACTION = 0.20
 REFERENCE_REWARD_UTILITY_TRANSFORM = "directional_log_uniform_anchor"
+GIPO_TRAINING_SUMMARY_HASH_FIELD = "gipo_training_summary_sha256"
+
+
+def _gipo_training_summary_sha256(payload: Mapping[str, Any]) -> str:
+    try:
+        encoded = json.dumps(
+            dict(payload),
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"GIPO training summary must be strict JSON: {exc}") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _gipo_bundle_targets(out_dir: Path) -> dict[str, Path]:
+    root = out_dir.expanduser().resolve()
+    targets = {
+        "teacher": root / "gipo_teacher.pt",
+        "student": root / "gipo_student.pt",
+        "summary": root / "gipo_training_summary.json",
+    }
+    validate_artifact_bundle_layout(targets["student"], targets)
+    return targets
+
+
+def _validate_gipo_bundle_identity(
+    paths: Mapping[str, Path],
+    targets: Mapping[str, Path],
+) -> None:
+    try:
+        summary = json.loads(paths["summary"].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read GIPO training summary: {exc}") from exc
+    if not isinstance(summary, Mapping) or summary.get("status") != "completed":
+        raise ValueError("GIPO training summary must be a completed JSON object.")
+    semantic_summary = dict(summary)
+    for generated_field in (
+        "gipo_teacher_checkpoint",
+        "gipo_teacher_checkpoint_sha256",
+        "gipo_student_checkpoint",
+        "gipo_student_checkpoint_sha256",
+        GIPO_TRAINING_SUMMARY_HASH_FIELD,
+    ):
+        semantic_summary.pop(generated_field, None)
+    expected_summary_hash = _gipo_training_summary_sha256(semantic_summary)
+    if summary.get(GIPO_TRAINING_SUMMARY_HASH_FIELD) != expected_summary_hash:
+        raise ValueError("GIPO training summary semantic hash does not match.")
+    for role in ("teacher", "student"):
+        name_field = f"gipo_{role}_checkpoint"
+        hash_field = f"{name_field}_sha256"
+        if (
+            summary.get(name_field) != targets[role].name
+            or summary.get(hash_field) != file_sha256(paths[role])
+        ):
+            raise ValueError(
+                f"GIPO {role} checkpoint and training summary {hash_field} do not match."
+            )
+        try:
+            checkpoint_payload = torch.load(
+                paths[role], map_location="cpu", weights_only=True
+            )
+        except (OSError, RuntimeError, ValueError, EOFError) as exc:
+            raise ValueError(f"Could not read GIPO {role} checkpoint: {exc}") from exc
+        if not isinstance(checkpoint_payload, Mapping):
+            raise ValueError(f"GIPO {role} checkpoint must contain a mapping payload.")
+        if (
+            checkpoint_payload.get(GIPO_TRAINING_SUMMARY_HASH_FIELD)
+            != expected_summary_hash
+        ):
+            raise ValueError(
+                f"GIPO {role} checkpoint is bound to a different training summary."
+            )
+
+
+def recover_gipo_training_bundle(out_dir: str | Path) -> None:
+    root = Path(out_dir).expanduser().resolve()
+    targets = _gipo_bundle_targets(root)
+    recover_artifact_bundle(
+        targets["student"],
+        targets,
+        validator=_validate_gipo_bundle_identity,
+    )
+
+
+def validate_gipo_training_bundle(out_dir: str | Path) -> None:
+    root = Path(out_dir).expanduser().resolve()
+    targets = _gipo_bundle_targets(root)
+    validate_artifact_bundle(
+        targets["student"],
+        targets,
+        validator=_validate_gipo_bundle_identity,
+    )
+
+
+def _preflight_gipo_training_bundle(out_dir: Path, *, overwrite: bool) -> None:
+    targets = _gipo_bundle_targets(out_dir)
+    preflight_artifact_bundle(
+        targets["student"],
+        targets,
+        overwrite=overwrite,
+        validator=_validate_gipo_bundle_identity,
+    )
+
+
+def _write_training_bundle(
+    *,
+    teacher_path: Path,
+    teacher_payload: Mapping[str, Any],
+    student_path: Path,
+    student_payload: Mapping[str, Any],
+    summary_path: Path,
+    summary_payload: Mapping[str, Any],
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    targets = (teacher_path, student_path, summary_path)
+    if len(set(targets)) != len(targets):
+        raise ValueError("GIPO training artifact paths must be pairwise distinct.")
+    targets_by_role = {
+        "teacher": teacher_path.expanduser().resolve(),
+        "student": student_path.expanduser().resolve(),
+        "summary": summary_path.expanduser().resolve(),
+    }
+    validate_artifact_bundle_layout(targets_by_role["student"], targets_by_role)
+    staged: dict[str, Path] = {}
+    staged_hashes: dict[str, str] = {}
+    try:
+        if GIPO_TRAINING_SUMMARY_HASH_FIELD in summary_payload or any(
+            GIPO_TRAINING_SUMMARY_HASH_FIELD in payload
+            for payload in (teacher_payload, student_payload)
+        ):
+            raise ValueError(
+                f"{GIPO_TRAINING_SUMMARY_HASH_FIELD} is reserved for bundle binding."
+            )
+        semantic_summary = dict(summary_payload)
+        summary_hash = _gipo_training_summary_sha256(semantic_summary)
+        for role, target, payload in (
+            ("teacher", teacher_path, teacher_payload),
+            ("student", student_path, student_payload),
+        ):
+            temporary = temporary_bundle_path(target)
+            staged[role] = temporary
+            torch.save(
+                {
+                    **dict(payload),
+                    GIPO_TRAINING_SUMMARY_HASH_FIELD: summary_hash,
+                },
+                temporary,
+            )
+        summary = {
+            **semantic_summary,
+            "gipo_teacher_checkpoint": teacher_path.name,
+            "gipo_teacher_checkpoint_sha256": file_sha256(staged["teacher"]),
+            "gipo_student_checkpoint": student_path.name,
+            "gipo_student_checkpoint_sha256": file_sha256(staged["student"]),
+            GIPO_TRAINING_SUMMARY_HASH_FIELD: summary_hash,
+        }
+        summary_temporary = temporary_bundle_path(summary_path)
+        staged["summary"] = summary_temporary
+        summary_temporary.write_text(
+            json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        _validate_gipo_bundle_identity(staged, targets_by_role)
+        staged_hashes = {role: file_sha256(path) for role, path in staged.items()}
+        promote_artifact_bundle(
+            targets_by_role["student"],
+            targets_by_role,
+            staged,
+            overwrite=overwrite,
+            validator=_validate_gipo_bundle_identity,
+        )
+        return summary
+    finally:
+        cleanup_allowed = not bundle_journal_path(targets_by_role["student"]).exists()
+        for role, temporary in staged.items():
+            if not cleanup_allowed:
+                continue
+            discard_temporary_bundle_path(
+                temporary,
+                targets_by_role[role],
+                expected_sha256=staged_hashes.get(role),
+            )
 
 
 def _read_metric_rows_csvs(paths_text: str) -> List[Dict[str, Any]]:
@@ -119,12 +317,37 @@ def _read_metric_rows_csvs(paths_text: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def _load_context_embedding_tables(paths_text: str) -> Dict[str, np.ndarray]:
+def _load_context_embedding_tables(
+    paths_text: str,
+    *,
+    expected_context_embedding_kind: str,
+    expected_context_rows: Sequence[Mapping[str, Any]],
+) -> Dict[str, np.ndarray]:
     merged: Dict[str, np.ndarray] = {}
     for path_text in parse_csv(paths_text):
-        table = load_context_embedding_table(resolve_project_path(path_text))
+        table = load_context_embedding_table(
+            resolve_project_path(path_text),
+            expected_context_embedding_kind=expected_context_embedding_kind,
+            require_manifest=True,
+            expected_context_rows=expected_context_rows,
+        )
         _merge_embedding_tables_guarded(merged, table, label="context_embeddings")
     return merged
+
+
+def _merge_schedule_grids_checked(
+    destination: Dict[Tuple[Any, ...], Tuple[float, ...]],
+    source: Mapping[Tuple[Any, ...], Sequence[float]],
+    *,
+    label: str,
+) -> None:
+    for key, raw_grid in source.items():
+        grid = tuple(float(value) for value in raw_grid)
+        if key in destination and tuple(destination[key]) != grid:
+            raise ValueError(
+                f"Conflicting schedule grid for {key!r} while merging {label}."
+            )
+        destination[key] = grid
 
 
 def _artifact_input_summary(paths_text: str) -> List[Dict[str, Any]]:
@@ -138,6 +361,15 @@ def _artifact_input_summary(paths_text: str) -> List[Dict[str, Any]]:
                 **fingerprint_identity(fingerprint),
             }
         )
+        if path.suffix.lower() == ".npz":
+            manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+            manifest_fingerprint = path_fingerprint(manifest_path)
+            summary.append(
+                {
+                    "logical_path": str(manifest_fingerprint["logical_path"]),
+                    **fingerprint_identity(manifest_fingerprint),
+                }
+            )
     return summary
 
 
@@ -157,6 +389,15 @@ def _parse_float_mapping(text: str) -> Dict[str, float]:
 def _rows_for_target_nfes(rows: Sequence[Mapping[str, Any]], target_nfes: Sequence[int]) -> List[Dict[str, Any]]:
     allowed = {int(value) for value in target_nfes}
     return [dict(row) for row in rows if int(row["target_nfe"]) in allowed]
+
+
+def _validated_target_nfe_values(values: Sequence[int], *, label: str) -> List[int]:
+    parsed = [int(value) for value in values]
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f"{label} may not contain duplicates.")
+    if any(value <= 0 for value in parsed):
+        raise ValueError(f"{label} must contain only positive values.")
+    return sorted(parsed)
 
 
 def _has_nonempty_value(row: Mapping[str, Any], key: str) -> bool:
@@ -195,108 +436,6 @@ def _needs_forecast_uniform_rewards(rows: Sequence[Mapping[str, Any]], target_ke
 def _rows_without_schedule_keys(rows: Sequence[Mapping[str, Any]], schedule_keys: Sequence[str]) -> List[Dict[str, Any]]:
     excluded = {str(value) for value in schedule_keys}
     return [dict(row) for row in rows if str(row["scheduler_key"]) not in excluded]
-
-
-def _history_by_step(training_summary: Mapping[str, Any]) -> Dict[int, Dict[str, Any]]:
-    selection = dict(training_summary.get("teacher_checkpoint_selection", {}))
-    out: Dict[int, Dict[str, Any]] = {}
-    for entry in list(selection.get("history", []) or []):
-        if not bool(entry.get("selection_constraints_passed", True)):
-            continue
-        out[int(entry["step"])] = dict(entry)
-    return out
-
-
-def _select_weighted_normalized_regret_step(
-    *,
-    context_density_training: Mapping[str, Any],
-    unseen_nfe_training: Mapping[str, Any],
-    component_weights: Mapping[str, float],
-) -> Dict[str, Any]:
-    context_history = _history_by_step(context_density_training)
-    unseen_history = _history_by_step(unseen_nfe_training)
-    common_steps = sorted(set(context_history) & set(unseen_history))
-    if not common_steps:
-        raise ValueError("Weighted normalized-regret checkpoint selection found no common checkpoint steps.")
-    required_splits = (
-        "context_disjoint",
-        "density_family_holdout",
-        "unseen_nfe_holdout",
-    )
-    combined_history: List[Dict[str, Any]] = []
-    for step in common_steps:
-        context_diagnostics = dict(context_history[step].get("diagnostics", {}) or {})
-        unseen_diagnostics = dict(unseen_history[step].get("diagnostics", {}) or {})
-        diagnostics = {
-            "context_disjoint": dict(context_diagnostics.get("context_disjoint", {}) or {}),
-            "density_family_holdout": dict(context_diagnostics.get("density_family_holdout", {}) or {}),
-            "unseen_nfe_holdout": dict(unseen_diagnostics.get("unseen_nfe_holdout", {}) or {}),
-        }
-        combined_history.append({"step": int(step), "diagnostics": diagnostics})
-    weight_summary = _teacher_selection_weight_summary(
-        component_weights,
-        active_axes=("context", "density_family", "unseen_nfe"),
-    )
-    effective_weights = dict(weight_summary["effective_axis_weights"])
-    split_weights = {
-        "context": float(effective_weights["context"]),
-        "density_family": float(effective_weights["density_family"]),
-        "unseen_nfe_holdout": float(effective_weights["unseen_nfe"]),
-    }
-    selection = select_weighted_normalized_regret_checkpoint(
-        combined_history,
-        required_split_names=required_splits,
-        component_weights=split_weights,
-    )
-    return {
-        **selection,
-        "selection_component_axis_weights": dict(effective_weights),
-        "selection_nominal_axis_weights": dict(weight_summary["nominal_axis_weights"]),
-        "selection_effective_axis_weights": dict(effective_weights),
-        "selection_inactive_axes": list(weight_summary["inactive_axes"]),
-        "uses_unseen_nfe_selection_diagnostics": True,
-        "component_histories": {
-            "context_density": context_density_training.get("teacher_checkpoint_selection", {}).get("history", []),
-            "unseen_nfe": unseen_nfe_training.get("teacher_checkpoint_selection", {}).get("history", []),
-        },
-    }
-
-
-def _select_context_density_regret_step(
-    *,
-    context_density_training: Mapping[str, Any],
-    component_weights: Mapping[str, float],
-) -> Dict[str, Any]:
-    context_history = _history_by_step(context_density_training)
-    if not context_history:
-        raise ValueError("Context/density checkpoint selection found no eligible checkpoint steps.")
-    required_splits = ("context_disjoint", "density_family_holdout")
-    weight_summary = _teacher_selection_weight_summary(
-        component_weights,
-        active_axes=("context", "density_family"),
-    )
-    effective_weights = dict(weight_summary["effective_axis_weights"])
-    split_weights = {
-        "context": float(effective_weights["context"]),
-        "density_family": float(effective_weights["density_family"]),
-    }
-    selection = select_weighted_normalized_regret_checkpoint(
-        [{"step": int(step), "diagnostics": dict(entry.get("diagnostics", {}) or {})} for step, entry in sorted(context_history.items())],
-        required_split_names=required_splits,
-        component_weights=split_weights,
-    )
-    return {
-        **selection,
-        "selection_component_axis_weights": dict(effective_weights),
-        "selection_nominal_axis_weights": dict(weight_summary["nominal_axis_weights"]),
-        "selection_effective_axis_weights": dict(effective_weights),
-        "selection_inactive_axes": list(weight_summary["inactive_axes"]),
-        "uses_unseen_nfe_selection_diagnostics": False,
-        "component_histories": {
-            "context_density": context_density_training.get("teacher_checkpoint_selection", {}).get("history", []),
-            "unseen_nfe": [],
-        },
-    }
 
 
 def _observed_support(rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
@@ -597,32 +736,33 @@ def _required_embedding_table(
     return {key: np.asarray(embeddings[key], dtype=np.float32) for key in sorted(required_ids)}
 
 
-def _checkpoint_id_from_row(row: Mapping[str, Any]) -> str:
-    return _checkpoint_scope_from_row(row)
-
-
-def _sample_context_keys_by_checkpoint(
+def _sample_context_keys_by_scope(
     rows: Sequence[Mapping[str, Any]],
     *,
     sample_count: int,
     seed: int,
 ) -> set[Tuple[str, str]]:
-    by_checkpoint: Dict[str, List[Mapping[str, Any]]] = {}
+    by_scope: Dict[str, List[Mapping[str, Any]]] = {}
     for row in rows:
-        by_checkpoint.setdefault(_checkpoint_id_from_row(row), []).append(row)
+        by_scope.setdefault(_checkpoint_scope_from_row(row), []).append(row)
     selected: set[Tuple[str, str]] = set()
-    for checkpoint_idx, checkpoint_id in enumerate(sorted(by_checkpoint)):
-        checkpoint_rows = by_checkpoint[checkpoint_id]
-        per_checkpoint_count = min(
+    for scope_index, checkpoint_scope in enumerate(sorted(by_scope)):
+        scope_rows = by_scope[checkpoint_scope]
+        per_scope_count = min(
             int(sample_count),
-            len({context_id_from_row(row) for row in checkpoint_rows}),
+            len({context_id_from_row(row) for row in scope_rows}),
         )
         context_ids = sample_context_ids_stratified(
-            checkpoint_rows,
-            sample_count=per_checkpoint_count,
-            seed=_scope_seed(int(seed) + 10_000 * int(checkpoint_idx), checkpoint_id),
+            scope_rows,
+            sample_count=per_scope_count,
+            seed=_scope_seed(
+                int(seed) + 10_000 * int(scope_index),
+                checkpoint_scope,
+            ),
         )
-        selected.update((str(checkpoint_id), str(context_id)) for context_id in context_ids)
+        selected.update(
+            (str(checkpoint_scope), str(context_id)) for context_id in context_ids
+        )
     return selected
 
 
@@ -643,26 +783,40 @@ def _context_sampling_summary(
     *,
     sample_count: int,
 ) -> Dict[str, Any]:
-    per_checkpoint: Dict[str, Dict[str, int]] = {}
-    available_by_checkpoint: Dict[str, set[str]] = {}
-    selected_by_checkpoint: Dict[str, set[str]] = {}
+    per_scope: Dict[str, Dict[str, int]] = {}
+    available_by_scope: Dict[str, set[str]] = {}
+    selected_by_scope: Dict[str, set[str]] = {}
     for row in rows:
-        checkpoint_id = _checkpoint_id_from_row(row)
-        available_by_checkpoint.setdefault(checkpoint_id, set()).add(context_id_from_row(row))
-    for checkpoint_id, context_id in selected:
-        selected_by_checkpoint.setdefault(str(checkpoint_id), set()).add(str(context_id))
-    for checkpoint_id in sorted(available_by_checkpoint):
-        per_checkpoint[checkpoint_id] = {
-            "available_contexts": int(len(available_by_checkpoint[checkpoint_id])),
-            "selected_contexts": int(len(selected_by_checkpoint.get(checkpoint_id, set()))),
+        checkpoint_scope = _checkpoint_scope_from_row(row)
+        available_by_scope.setdefault(checkpoint_scope, set()).add(
+            context_id_from_row(row)
+        )
+    for checkpoint_scope, context_id in selected:
+        selected_by_scope.setdefault(str(checkpoint_scope), set()).add(str(context_id))
+    for checkpoint_scope in sorted(available_by_scope):
+        per_scope[checkpoint_scope] = {
+            "available_contexts": int(len(available_by_scope[checkpoint_scope])),
+            "selected_contexts": int(
+                len(selected_by_scope.get(checkpoint_scope, set()))
+            ),
         }
     return {
         "protocol": "checkpoint_maturity_stratified_context_sample",
         "sample_count_per_checkpoint": int(sample_count),
-        "checkpoint_count": int(len(available_by_checkpoint)),
-        "available_physical_context_count": int(len({context_id for values in available_by_checkpoint.values() for context_id in values})),
-        "selected_physical_context_count": int(len({context_id for _checkpoint_id, context_id in selected})),
-        "per_checkpoint": per_checkpoint,
+        "checkpoint_count": int(len(available_by_scope)),
+        "available_physical_context_count": int(
+            len(
+                {
+                    context_id
+                    for values in available_by_scope.values()
+                    for context_id in values
+                }
+            )
+        ),
+        "selected_physical_context_count": int(
+            len({context_id for _checkpoint_scope, context_id in selected})
+        ),
+        "per_checkpoint": per_scope,
     }
 
 
@@ -707,30 +861,22 @@ def _merge_embedding_tables_guarded(
 
 
 def _source_split_phase(row: Mapping[str, Any]) -> str:
-    return str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))).strip()
-
-
-def _raw_split_phase(row: Mapping[str, Any]) -> str:
-    return str(row.get("split_phase", row.get("split", ""))).strip()
+    return validate_declared_split_phase(row, source="GIPO training row")
 
 
 def _validate_train_tuning_rows(rows: Sequence[Mapping[str, Any]], *, label: str) -> None:
-    locked_rows = [
-        row
-        for row in rows
-        if _source_split_phase(row) == "locked_test" or _raw_split_phase(row) == "locked_test"
-    ]
+    phases = [_source_split_phase(row) for row in rows]
+    locked_rows = [phase for phase in phases if phase == "locked_test"]
     if locked_rows:
         raise ValueError(f"{label} refuses locked_test rows; found {len(locked_rows)} locked-test rows.")
     bad_source_phases = sorted(
-        {
-            _source_split_phase(row)
-            for row in rows
-            if _source_split_phase(row) and _source_split_phase(row) != "train_tuning"
-        }
+        {phase for phase in phases if phase != "train_tuning"}
     )
     if bad_source_phases:
-        raise ValueError(f"{label} requires train_tuning source rows; found {bad_source_phases}.")
+        display_phases = [phase or "<missing>" for phase in bad_source_phases]
+        raise ValueError(
+            f"{label} requires explicit train_tuning source rows; found {display_phases}."
+        )
 
 
 def _validate_train_tuning_reward_provenance_metadata(
@@ -742,7 +888,7 @@ def _validate_train_tuning_reward_provenance_metadata(
     active_target_keys = tuple(str(key) for key in target_keys)
     active_target_set = set(active_target_keys)
     for row_idx, row in enumerate(rows):
-        if _source_split_phase(row) == "locked_test" or _raw_split_phase(row) == "locked_test":
+        if _source_split_phase(row) == "locked_test":
             continue
         if _source_split_phase(row) and _source_split_phase(row) != "train_tuning":
             continue
@@ -871,6 +1017,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--context_embeddings_npz", required=True, help="Frozen context embedding sidecar NPZ.")
     parser.add_argument("--schedule_summary_json", default="", help="Comma-separated schedule summaries for non-fixed references such as SER.")
     parser.add_argument("--out_dir", required=True)
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--support_schedule_keys", default="", help="Comma-separated fixed/SER supervision keys. Defaults to observed row keys.")
     parser.add_argument("--context_sample_count", type=int, default=TRAIN_TUNING_CONTEXT_SAMPLE_COUNT)
     parser.add_argument("--context_holdout_fraction", type=float, default=0.20)
@@ -987,6 +1134,12 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     _validate_positive_training_args(args)
+    out_dir = resolve_project_path(str(args.out_dir))
+    if not bool(args.dry_run):
+        _preflight_gipo_training_bundle(
+            out_dir,
+            overwrite=bool(getattr(args, "overwrite", False)),
+        )
     seed_all(int(args.seed))
     density_bin_count = DENSITY_BIN_COUNT
     selection_mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
@@ -998,16 +1151,18 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     rows = _read_metric_rows_csvs(str(args.rows_csv))
     if not rows:
         raise ValueError("rows_csv contains no rows.")
-    locked_rows = [
-        row
-        for row in rows
-        if _source_split_phase(row) == "locked_test" or _raw_split_phase(row) == "locked_test"
-    ]
-    if locked_rows:
-        raise ValueError(f"GIPO training refuses locked_test rows in rows_csv; found {len(locked_rows)} locked-test rows.")
-    observed_source_phases = sorted({_source_split_phase(row) for row in rows if _source_split_phase(row)})
-    if observed_source_phases and observed_source_phases != ["train_tuning"]:
-        raise ValueError(f"GIPO training rows_csv must contain only train_tuning source rows; found {observed_source_phases}.")
+    scenario_key = infer_single_scenario_key(rows)
+    benchmark_family = validate_scenario_benchmark_family(
+        rows,
+        scenario_key=scenario_key,
+        label="GIPO training rows_csv",
+    )
+    context_embedding_kind = context_embedding_kind_from_rows(
+        rows,
+        label="GIPO training rows_csv",
+        require_explicit=True,
+    )
+    _validate_train_tuning_rows(rows, label="GIPO training rows_csv")
     _validate_unique_schedule_rows(rows, label="GIPO training rows_csv")
     _validate_context_embedding_checkpoint_scope(rows, label="GIPO training rows_csv")
     validate_teacher_objective_hyperparameters(
@@ -1024,22 +1179,28 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     missing_support_rows = sorted(set(support_keys) - observed_keys)
     if missing_support_rows:
         raise ValueError(f"Supervision schedules must have measured context rows; missing rows for {missing_support_rows}")
-    seen_target_nfes = sorted(
-        set(
-            parse_int_csv(
-                getattr(args, "seen_target_nfe_values", ",".join(str(value) for value in REFERENCE_SEEN_NFES)),
-                default=REFERENCE_SEEN_NFES,
-            )
-        )
+    seen_target_nfe_values = parse_int_csv(
+        getattr(args, "seen_target_nfe_values", ",".join(str(value) for value in REFERENCE_SEEN_NFES)),
+        default=REFERENCE_SEEN_NFES,
     )
-    unseen_target_nfes = sorted(
-        set(
-            parse_int_csv(
-                getattr(args, "unseen_target_nfe_values", ",".join(str(value) for value in REFERENCE_UNSEEN_NFES)),
-                default=REFERENCE_UNSEEN_NFES,
-            )
-        )
+    unseen_target_nfe_values = parse_int_csv(
+        getattr(args, "unseen_target_nfe_values", ",".join(str(value) for value in REFERENCE_UNSEEN_NFES)),
+        default=REFERENCE_UNSEEN_NFES,
     )
+    seen_target_nfes = _validated_target_nfe_values(
+        seen_target_nfe_values,
+        label="seen_target_nfe_values",
+    )
+    unseen_target_nfes = _validated_target_nfe_values(
+        unseen_target_nfe_values,
+        label="unseen_target_nfe_values",
+    )
+    overlap_target_nfes = sorted(set(seen_target_nfes) & set(unseen_target_nfes))
+    if overlap_target_nfes:
+        raise ValueError(
+            "Seen and unseen target NFE values must be disjoint; "
+            f"overlap={overlap_target_nfes}."
+        )
 
     teacher_metric_target_keys = resolve_teacher_metric_target_keys(args, rows)
     _validate_train_tuning_reward_provenance_metadata(
@@ -1104,7 +1265,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "--context_sample_count must not exceed the reference GIPO supervision cap "
             f"{TRAIN_TUNING_CONTEXT_SAMPLE_COUNT}; got {sample_count}."
         )
-    selected_context_keys = _sample_context_keys_by_checkpoint(
+    selected_context_keys = _sample_context_keys_by_scope(
         rewarded_rows,
         sample_count=sample_count,
         seed=int(args.seed),
@@ -1137,17 +1298,46 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         )
     unseen_selection_rows: List[Dict[str, Any]] = []
     unseen_context_sampling: Dict[str, Any] = {}
-    unseen_selection_target_nfes = parse_int_csv(args.teacher_unseen_selection_target_nfe_values)
+    unseen_selection_target_nfes: List[int] = []
     if str(args.teacher_unseen_selection_rows_csv).strip():
+        unseen_selection_target_nfes = _validated_target_nfe_values(
+            parse_int_csv(args.teacher_unseen_selection_target_nfe_values),
+            label="teacher_unseen_selection_target_nfe_values",
+        )
+        selection_overlap = sorted(
+            set(seen_target_nfes) & set(unseen_selection_target_nfes)
+        )
+        if selection_overlap:
+            raise ValueError(
+                "Teacher unseen-selection NFEs must be disjoint from seen target NFEs; "
+                f"overlap={selection_overlap}."
+            )
         unseen_raw_rows = _read_metric_rows_csvs(str(args.teacher_unseen_selection_rows_csv))
         if not unseen_raw_rows:
             raise ValueError("teacher_unseen_selection_rows_csv contains no rows.")
+        if infer_single_scenario_key(unseen_raw_rows) != scenario_key:
+            raise ValueError("Teacher unseen-selection rows belong to a different scenario.")
+        validate_scenario_benchmark_family(
+            unseen_raw_rows,
+            scenario_key=scenario_key,
+            label="Teacher unseen-selection rows",
+        )
+        unseen_context_embedding_kind = context_embedding_kind_from_rows(
+            unseen_raw_rows,
+            label="Teacher unseen selection rows",
+            require_explicit=True,
+        )
+        if unseen_context_embedding_kind != context_embedding_kind:
+            raise ValueError(
+                "Teacher unseen selection rows use a different context_embedding_kind: "
+                f"{unseen_context_embedding_kind!r} != {context_embedding_kind!r}."
+            )
         _validate_unique_schedule_rows(unseen_raw_rows, label="Teacher unseen selection rows")
         _validate_context_embedding_checkpoint_scope(unseen_raw_rows, label="Teacher unseen selection rows")
         unseen_locked_rows = [
             row
             for row in unseen_raw_rows
-            if _source_split_phase(row) == "locked_test" or _raw_split_phase(row) == "locked_test"
+            if _source_split_phase(row) == "locked_test"
         ]
         if unseen_locked_rows:
             raise ValueError(
@@ -1204,7 +1394,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             min_valid_rows=teacher_metric_min_valid_rows,
         )
         teacher_metric_coverage_scopes["teacher_unseen_selection_rows_csv"] = unseen_metric_coverage
-        unseen_context_keys = _sample_context_keys_by_checkpoint(
+        unseen_context_keys = _sample_context_keys_by_scope(
             unseen_rewarded_rows,
             sample_count=sample_count,
             seed=int(args.seed) + 404,
@@ -1266,7 +1456,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
 
     density_family_diagnostic_rows = [dict(row) for row in density_holdout_rows]
     unseen_nfe_diagnostic_rows = _rows_without_schedule_keys(unseen_selection_rows, density_holdout_keys)
-    context_embeddings = _load_context_embedding_tables(str(args.context_embeddings_npz))
+    context_embeddings = _load_context_embedding_tables(
+        str(args.context_embeddings_npz),
+        expected_context_embedding_kind=context_embedding_kind,
+        expected_context_rows=rows,
+    )
     fit_rows = final_fit_rows
     final_embedding_ids = sorted(_embedding_ids(fit_rows))
     selector_embedding_ids = sorted(_embedding_ids(selector_fit_rows))
@@ -1291,7 +1485,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     selector_normalized_embeddings = selector_embedding_normalizer.transform_table(selector_required_embeddings)
     if unseen_selection_rows:
         unseen_embeddings_path = str(args.teacher_unseen_selection_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
-        unseen_raw_embeddings = _load_context_embedding_tables(unseen_embeddings_path)
+        unseen_raw_embeddings = _load_context_embedding_tables(
+            unseen_embeddings_path,
+            expected_context_embedding_kind=context_embedding_kind,
+            expected_context_rows=unseen_selection_rows,
+        )
         unseen_required_embeddings = _required_embedding_table(
             unseen_raw_embeddings,
             _embedding_ids(unseen_selection_rows),
@@ -1311,10 +1509,24 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     context_dim = int(next(iter(normalized_embeddings.values())).shape[0])
     setting_dim = int(setting_feature_dim(mode, config=setting_encoder_config))
     reference_time_grid = uniform_reference_grid(density_bin_count)
-    schedule_grids = load_schedule_summary_grids(parse_csv(args.schedule_summary_json))
+    schedule_grids = load_schedule_summary_grids(
+        parse_csv(args.schedule_summary_json),
+        expected_scenario_key=scenario_key,
+        expected_reference_split="train_tuning",
+        expected_rows=rows,
+    )
     unseen_schedule_summary_paths = parse_csv(args.teacher_unseen_selection_schedule_summary_json)
     if unseen_schedule_summary_paths:
-        schedule_grids.update(load_schedule_summary_grids(unseen_schedule_summary_paths))
+        _merge_schedule_grids_checked(
+            schedule_grids,
+            load_schedule_summary_grids(
+                unseen_schedule_summary_paths,
+                expected_scenario_key=scenario_key,
+                expected_reference_split="train_tuning",
+                expected_rows=unseen_selection_rows,
+            ),
+            label="teacher unseen-selection summaries",
+        )
     schedule_grid_preflight = {
         "selector_fit_rows": validate_schedule_grid_coverage(
             selector_fit_rows,
@@ -1402,6 +1614,23 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         raw_unseen_target_rows = _read_metric_rows_csvs(str(args.student_unseen_target_rows_csv))
         if not raw_unseen_target_rows:
             raise ValueError("student_unseen_target_rows_csv contains no rows.")
+        if infer_single_scenario_key(raw_unseen_target_rows) != scenario_key:
+            raise ValueError("Student unseen-target rows belong to a different scenario.")
+        validate_scenario_benchmark_family(
+            raw_unseen_target_rows,
+            scenario_key=scenario_key,
+            label="Student unseen-target rows",
+        )
+        unseen_target_context_embedding_kind = context_embedding_kind_from_rows(
+            raw_unseen_target_rows,
+            label="Student unseen target rows",
+            require_explicit=True,
+        )
+        if unseen_target_context_embedding_kind != context_embedding_kind:
+            raise ValueError(
+                "Student unseen target rows use a different context_embedding_kind: "
+                f"{unseen_target_context_embedding_kind!r} != {context_embedding_kind!r}."
+            )
         _validate_unique_schedule_rows(raw_unseen_target_rows, label="Student unseen target rows")
         _validate_context_embedding_checkpoint_scope(raw_unseen_target_rows, label="Student unseen target rows")
         _validate_train_tuning_rows(raw_unseen_target_rows, label="Student unseen target distillation")
@@ -1453,7 +1682,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             min_valid_rows=teacher_metric_min_valid_rows,
         )
         teacher_metric_coverage_scopes["student_unseen_target_rows_csv"] = unseen_metric_coverage
-        unseen_context_keys = _sample_context_keys_by_checkpoint(
+        unseen_context_keys = _sample_context_keys_by_scope(
             unseen_target_source_rows,
             sample_count=sample_count,
             seed=int(args.seed) + 808,
@@ -1468,7 +1697,11 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             str(args.student_unseen_target_context_embeddings_npz).strip()
             or str(args.context_embeddings_npz)
         )
-        raw_unseen_embeddings = _load_context_embedding_tables(unseen_embeddings_path)
+        raw_unseen_embeddings = _load_context_embedding_tables(
+            unseen_embeddings_path,
+            expected_context_embedding_kind=context_embedding_kind,
+            expected_context_rows=unseen_target_source_rows,
+        )
         required_unseen_embeddings = _required_embedding_table(
             raw_unseen_embeddings,
             _embedding_ids(unseen_target_rows),
@@ -1483,7 +1716,16 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         unseen_target_schedule_grids = dict(schedule_grids)
         unseen_schedule_summary_paths = parse_csv(args.student_unseen_target_schedule_summary_json)
         if unseen_schedule_summary_paths:
-            unseen_target_schedule_grids.update(load_schedule_summary_grids(unseen_schedule_summary_paths))
+            _merge_schedule_grids_checked(
+                unseen_target_schedule_grids,
+                load_schedule_summary_grids(
+                    unseen_schedule_summary_paths,
+                    expected_scenario_key=scenario_key,
+                    expected_reference_split="train_tuning",
+                    expected_rows=unseen_target_source_rows,
+                ),
+                label="student unseen-target summaries",
+            )
         schedule_grid_preflight["student_unseen_target_rows"] = validate_schedule_grid_coverage(
             unseen_target_rows,
             schedule_grids=unseen_target_schedule_grids,
@@ -1644,16 +1886,47 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "teacher_target_coverage_protocol": GIPO_TEACHER_TARGET_COVERAGE_PROTOCOL,
         "teacher_selection_weight_protocol": GIPO_TEACHER_SELECTION_WEIGHT_PROTOCOL,
         "model_payload_version": int(MODEL_PAYLOAD_VERSION),
+        "context_embedding_kind": context_embedding_kind,
     }
 
     teacher = _build_teacher_instance(0)
     student = _build_student_instance(10_000)
     teacher_model_config = teacher.model_config()
     student_model_config = student.model_config()
+    training_inputs = {
+        "rows_csv": _artifact_input_summary(str(args.rows_csv)),
+        "context_embeddings_npz": _artifact_input_summary(
+            str(args.context_embeddings_npz)
+        ),
+        "schedule_summary_json": _artifact_input_summary(
+            str(args.schedule_summary_json)
+        ),
+        "teacher_unseen_selection_rows_csv": _artifact_input_summary(
+            str(args.teacher_unseen_selection_rows_csv)
+        ),
+        "teacher_unseen_selection_context_embeddings_npz": _artifact_input_summary(
+            str(args.teacher_unseen_selection_context_embeddings_npz)
+        ),
+        "teacher_unseen_selection_schedule_summary_json": _artifact_input_summary(
+            str(args.teacher_unseen_selection_schedule_summary_json)
+        ),
+        "student_unseen_target_rows_csv": _artifact_input_summary(
+            str(args.student_unseen_target_rows_csv)
+        ),
+        "student_unseen_target_context_embeddings_npz": _artifact_input_summary(
+            str(args.student_unseen_target_context_embeddings_npz)
+        ),
+        "student_unseen_target_schedule_summary_json": _artifact_input_summary(
+            str(args.student_unseen_target_schedule_summary_json)
+        ),
+    }
 
     summary_base: Dict[str, Any] = {
         "artifact": "gipo_training_summary",
         "protocol": GIPO_PROTOCOL,
+        "scenario_key": scenario_key,
+        "benchmark_family": benchmark_family,
+        "training_inputs": training_inputs,
         "student_policy_key": student_policy_key,
         "gipo_step_budget": int(args.student_steps),
         "student_policy_type": "continuous_density",
@@ -1679,6 +1952,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         },
         "teacher_objective": "pairwise_rank_plus_huber_regression",
         "model_payload_version": MODEL_PAYLOAD_VERSION,
+        "context_embedding_kind": context_embedding_kind,
         "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
         "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
         "teacher_model_config": teacher_model_config,
@@ -1689,7 +1963,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_utility_weights": teacher_utility_weights,
         "teacher_checkpoint_selection_mode": selection_mode,
-        "teacher_selection_axis_weights": dict(teacher_selection_weight_metadata["nominal_axis_weights"]),
         "teacher_selection_nominal_axis_weights": dict(teacher_selection_weight_metadata["nominal_axis_weights"]),
         "teacher_selection_effective_axis_weights": dict(teacher_selection_weight_metadata["effective_axis_weights"]),
         "teacher_selection_inactive_axes": list(teacher_selection_weight_metadata["inactive_axes"]),
@@ -1818,7 +2091,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "locked_test_used_for_selection": False,
     }
 
-    out_dir = resolve_project_path(str(args.out_dir))
     if bool(args.dry_run):
         return {**summary_base, "status": "dry_run"}
 
@@ -1863,7 +2135,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             device=device,
         )
 
-    context_density_diagnostics = {
+    selector_diagnostics = {
         "context_disjoint": context_holdout_diagnostic_rows,
         "density_family_holdout": density_family_diagnostic_rows,
     }
@@ -1871,37 +2143,59 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("weighted_normalized_regret selection requires non-empty context_disjoint diagnostic rows.")
     if not density_family_diagnostic_rows:
         raise ValueError("weighted_normalized_regret selection requires non-empty density_family_holdout diagnostic rows.")
-    context_density_training = _train_teacher_pass(
+    selector_candidate_schedule_keys = {
+        "context_disjoint": selection_support_schedule_keys,
+        "density_family_holdout": density_holdout_keys,
+    }
+    if unseen_nfe_diagnostic_rows:
+        selector_diagnostics["unseen_nfe_holdout"] = unseen_nfe_diagnostic_rows
+        selector_candidate_schedule_keys["unseen_nfe_holdout"] = (
+            selection_support_schedule_keys
+        )
+    selector_training = _train_teacher_pass(
         seed_offset=101,
-        pass_name="context_density_selector",
+        pass_name="selector",
         pass_fit_rows=selector_fit_rows,
-        diagnostic_splits=context_density_diagnostics,
-        diagnostic_candidate_schedule_keys={
-            "context_disjoint": selection_support_schedule_keys,
-            "density_family_holdout": density_holdout_keys,
-        },
+        diagnostic_splits=selector_diagnostics,
+        diagnostic_candidate_schedule_keys=selector_candidate_schedule_keys,
         steps=int(args.teacher_steps),
     )
-    unseen_nfe_training: Dict[str, Any] = {}
-    if unseen_nfe_diagnostic_rows:
-        unseen_nfe_training = _train_teacher_pass(
-            seed_offset=102,
-            pass_name="unseen_nfe_selector",
-            pass_fit_rows=selector_fit_rows,
-            diagnostic_splits={"unseen_nfe_holdout": unseen_nfe_diagnostic_rows},
-            diagnostic_candidate_schedule_keys={"unseen_nfe_holdout": selection_support_schedule_keys},
-            steps=int(args.teacher_steps),
-        )
-        checkpoint_selection = _select_weighted_normalized_regret_step(
-            context_density_training=context_density_training,
-            component_weights=selection_component_weights,
-            unseen_nfe_training=unseen_nfe_training,
-        )
-    else:
-        checkpoint_selection = _select_context_density_regret_step(
-            context_density_training=context_density_training,
-            component_weights=selection_component_weights,
-        )
+    checkpoint_selection = dict(
+        selector_training.get("teacher_checkpoint_selection", {}) or {}
+    )
+    selector_history = list(checkpoint_selection.get("history", []) or [])
+    selector_provenance = {
+        "single_trajectory": True,
+        "seed": int(args.seed) + 101,
+        "fit_scope": "selector_fit_rows",
+        "diagnostic_splits": list(selector_diagnostics),
+        "checkpoint_steps": [int(entry["step"]) for entry in selector_history],
+        "locked_test_used_for_selection": False,
+    }
+    checkpoint_selection.update(
+        {
+            "selection_nominal_axis_weights": dict(
+                teacher_selection_weight_metadata["nominal_axis_weights"]
+            ),
+            "selection_effective_axis_weights": dict(
+                teacher_selection_weight_metadata["effective_axis_weights"]
+            ),
+            "selection_active_axes": list(
+                teacher_selection_weight_metadata["active_axes"]
+            ),
+            "selection_inactive_axes": list(
+                teacher_selection_weight_metadata["inactive_axes"]
+            ),
+            "uses_unseen_nfe_selection_diagnostics": bool(
+                unseen_nfe_diagnostic_rows
+            ),
+            "selector_provenance": selector_provenance,
+        }
+    )
+    selector_training = {
+        **selector_training,
+        "teacher_checkpoint_selection": checkpoint_selection,
+    }
     selected_step = int(checkpoint_selection["selected_step"])
     teacher = _build_teacher_instance(0)
     final_teacher_training = train_gipo_teacher(
@@ -1934,7 +2228,10 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "fit_row_count": int(len(fit_rows)),
         "fit_context_count": int(len({context_id_from_row(row) for row in fit_rows})),
         "fit_schedule_count": int(len({str(row["scheduler_key"]) for row in fit_rows})),
-        "unseen_selection_diagnostics_used": bool(unseen_nfe_training),
+        "seed": int(args.seed),
+        "initialization": "fresh",
+        "step_source": "teacher_checkpoint_selection.selected_step",
+        "unseen_selection_diagnostics_used": bool(unseen_nfe_diagnostic_rows),
         "locked_test_used_for_selection": False,
     }
     teacher_training = {
@@ -1942,10 +2239,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "teacher_checkpoint_selection": checkpoint_selection,
         "teacher_checkpoint_selection_mode": selection_mode,
         "teacher_final_retrain": final_retrain_metadata,
-        "teacher_selection_passes": {
-            "context_density": context_density_training,
-            "unseen_nfe": unseen_nfe_training,
-        },
+        "teacher_selection_pass": selector_training,
     }
 
     def _train_student_instance(
@@ -2034,7 +2328,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "student_checkpoint_selection_mode": STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE,
         "student_checkpoint_selection": student_checkpoint_selection,
         "student_selection_pass": student_selection_training,
-        "student_selector_training": student_selection_training,
         "student_validation_split": {
             "protocol": "context_disjoint_student_validation",
             "fit_row_count": int(len(student_selector_fit_rows)),
@@ -2074,10 +2367,13 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
 
     teacher_path = out_dir / "gipo_teacher.pt"
     student_path = out_dir / "gipo_student.pt"
-    torch.save(
-        {
+    teacher_payload = {
             "protocol": GIPO_PROTOCOL,
+            "scenario_key": scenario_key,
+            "benchmark_family": benchmark_family,
+            "training_inputs": training_inputs,
             "model_payload_version": MODEL_PAYLOAD_VERSION,
+            "context_embedding_kind": context_embedding_kind,
             "student_policy_key": student_policy_key,
             "gipo_step_budget": int(args.student_steps),
             "teacher_architecture": ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
@@ -2115,13 +2411,14 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
             "nfe_sequence_diagnostics": summary_base["nfe_sequence_diagnostics"],
             "locked_test_used_for_selection": False,
-        },
-        teacher_path,
-    )
-    torch.save(
-        {
+        }
+    student_payload = {
             "protocol": GIPO_PROTOCOL,
+            "scenario_key": scenario_key,
+            "benchmark_family": benchmark_family,
+            "training_inputs": training_inputs,
             "model_payload_version": MODEL_PAYLOAD_VERSION,
+            "context_embedding_kind": context_embedding_kind,
             "student_policy_key": student_policy_key,
             "gipo_step_budget": int(args.student_steps),
             "student_policy_type": "continuous_density",
@@ -2163,15 +2460,19 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
             "nfe_sequence_diagnostics": summary_base["nfe_sequence_diagnostics"],
             "locked_test_used_for_selection": False,
-        },
-        student_path,
-    )
-
+        }
     policy_id_payload = {
         "protocol": GIPO_PROTOCOL,
+        "scenario_key": scenario_key,
+        "benchmark_family": benchmark_family,
+        "training_inputs": {
+            name: [fingerprint_identity(record) for record in records]
+            for name, records in training_inputs.items()
+        },
         "student_policy_key": student_policy_key,
         "gipo_step_budget": int(args.student_steps),
         "gipo_protocol_metadata": gipo_protocol_metadata,
+        "context_embedding_kind": context_embedding_kind,
         "reference_grid_hash": reference_grid_hash(reference_time_grid),
         "support_schedule_keys": list(support_keys),
         "context_sampling": context_sampling,
@@ -2208,8 +2509,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         **summary_base,
         "status": "completed",
         "policy_id": policy_id,
-        "gipo_teacher_checkpoint": teacher_path.name,
-        "gipo_student_checkpoint": student_path.name,
         "teacher_training": teacher_training,
         "teacher_checkpoint_selection": teacher_training.get("teacher_checkpoint_selection", {}),
         "student_checkpoint_selection": student_training.get("student_checkpoint_selection", {}),
@@ -2219,7 +2518,15 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         "student_target_summary": student_training.get("student_target_summary", {}),
         "student_training": student_training,
     }
-    (out_dir / "gipo_training_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    summary = _write_training_bundle(
+        teacher_path=teacher_path,
+        teacher_payload=teacher_payload,
+        student_path=student_path,
+        student_payload=student_payload,
+        summary_path=out_dir / "gipo_training_summary.json",
+        summary_payload=summary,
+        overwrite=bool(getattr(args, "overwrite", False)),
+    )
     return summary
 
 

@@ -45,7 +45,7 @@ def _tiny_cfg(*, cond_dim: int = 0) -> OTFlowConfig:
     )
 
 
-class ConditionalGenerationFixesTest(unittest.TestCase):
+class ConditionalGenerationTests(unittest.TestCase):
     def test_manifest_metadata_path_uses_project_relative_resolution(self) -> None:
         with mock.patch.object(eval_support, "resolve_project_path", side_effect=lambda value: Path("/repo") / str(value)):
             path = eval_support._metadata_path_for_checkpoint(

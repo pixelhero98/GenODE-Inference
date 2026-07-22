@@ -10,13 +10,18 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.checkpoint_validation import (
+    validate_locked_test_exclusion,
+    validate_strict_integer,
+    validate_tensor_state_dict,
+)
 from genode.cli import parse_csv, parse_int_csv
 from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
 from genode.experiment_layout import SCENARIO_FAMILY_MOLECULE
 from genode.data.molecule_xyz import load_molecule_group_manifest, molecule_group_root, trainable_molecule_group_members
 from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW_MOLECULE, MOLECULE_FAMILY, find_backbone_artifact, load_backbone_manifest
 from genode.evaluation.molecule_metrics import evaluate_molecule_rollout_schedule, load_molecule_checkpoint_splits
-from genode.solver_protocol import normalize_solver_key, normalize_solver_keys, solver_macro_steps, solver_runtime_name
+from genode.solver_protocol import normalize_solver_key, normalize_solver_keys, solver_macro_steps
 from genode.gipo.objectives import (
     CONDITIONAL_METRIC_SPECS,
     FORECAST_METRIC_SPECS,
@@ -34,6 +39,7 @@ from genode.gipo.policy import (
     EmbeddingNormalizer,
     build_gipo_student_model,
     context_embedding_id_from_row,
+    context_embedding_kind_from_rows,
     context_id_from_row,
     load_context_embedding_table,
     normalize_gipo_checkpoint_payload,
@@ -44,6 +50,7 @@ from genode.gipo.policy import (
     validate_conditioning_style,
     validate_gipo_density_token_attention,
     validate_gipo_teacher_training_metadata,
+    validate_context_embedding_kind,
 )
 from genode.gipo.evaluate_schedule_summary import (
     SER_REFERENCE_SCHEDULE_KEYS,
@@ -52,7 +59,12 @@ from genode.gipo.evaluate_schedule_summary import (
 )
 from genode.gipo.density_representation import DENSITY_BIN_COUNT
 from genode.gipo.models import setting_encoder_config_from_payload, setting_feature_dim, validate_setting_mode
-from genode.gipo.schema import reject_retired_evaluation_keys
+from genode.gipo.schema import reject_retired_evaluation_keys, validate_declared_split_phase
+from genode.provenance import (
+    file_sha256,
+    fingerprint_identity,
+    path_fingerprint,
+)
 from genode.data.otflow_paths import (
     backbone_manifest_path,
     project_dataset_root,
@@ -69,6 +81,29 @@ from genode.evaluation.otflow_evaluation_support import (
 )
 from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, run_fixed_schedule_variant
 from genode.runtime import ProgressBar, resolve_torch_device
+
+
+def _report_input_fingerprints(paths_text: str) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for value in parse_csv(paths_text):
+        path = resolve_project_path(value)
+        fingerprint = path_fingerprint(path)
+        records.append(
+            {
+                "logical_path": str(fingerprint["logical_path"]),
+                **fingerprint_identity(fingerprint),
+            }
+        )
+        if path.suffix.lower() == ".npz":
+            manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+            manifest_fingerprint = path_fingerprint(manifest_path)
+            records.append(
+                {
+                    "logical_path": str(manifest_fingerprint["logical_path"]),
+                    **fingerprint_identity(manifest_fingerprint),
+                }
+            )
+    return records
 
 SELECTION_MODE_REPORTING = "reporting"
 SELECTION_MODE_CALIBRATION = "calibration"
@@ -104,8 +139,16 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 def _validate_density_bin_count(payload: Mapping[str, Any], density_meta: Mapping[str, Any], *, role: str) -> None:
     expected = DENSITY_BIN_COUNT
-    density_dim = int(payload.get("density_dim", -1))
-    reference_bin_count = int(density_meta.get("reference_bin_count", -1))
+    density_dim = validate_strict_integer(
+        payload.get("density_dim"),
+        label=f"GIPO {role} density_dim",
+        minimum=2,
+    )
+    reference_bin_count = validate_strict_integer(
+        density_meta.get("reference_bin_count"),
+        label=f"GIPO {role} reference_bin_count",
+        minimum=2,
+    )
     reference_grid = tuple(density_meta.get("reference_time_grid", ()))
     if density_dim != expected or reference_bin_count != expected or len(reference_grid) != expected + 1:
         raise ValueError(
@@ -116,11 +159,29 @@ def _validate_density_bin_count(payload: Mapping[str, Any], density_meta: Mappin
 
 
 def _source_split_phase(row: Mapping[str, Any]) -> str:
-    return str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))).strip()
+    return validate_declared_split_phase(row, source="GIPO reporter context row")
 
 
 def _selection_split(row: Mapping[str, Any]) -> str:
     return str(row.get("selection_split") or row.get("report_split") or row.get("split_phase", row.get("split", ""))).strip()
+
+
+def _report_context_split_fields(
+    *,
+    source_split_phase: str,
+    report_split: str,
+) -> Dict[str, str]:
+    """Keep physical source provenance separate from the report partition."""
+
+    source = str(source_split_phase).strip()
+    report = str(report_split).strip()
+    if not source or not report:
+        raise ValueError("GIPO report rows require source_split_phase and report_split.")
+    return {
+        "split_phase": source,
+        "source_split_phase": source,
+        "report_split": report,
+    }
 
 
 def _validate_context_rows(
@@ -138,11 +199,7 @@ def _validate_context_rows(
     mode = str(selection_mode)
     requested = str(split_phase)
     if mode == SELECTION_MODE_CALIBRATION:
-        locked = [
-            row
-            for row in rows
-            if _source_split_phase(row) == LOCKED_TEST_PHASE or str(row.get("split_phase", row.get("split", ""))) == LOCKED_TEST_PHASE
-        ]
+        locked = [row for row in rows if _source_split_phase(row) == LOCKED_TEST_PHASE]
         if locked:
             raise ValueError("Calibration GIPO selection refuses locked_test rows.")
     if requested in CALIBRATION_HOLDOUT_PHASES:
@@ -385,7 +442,11 @@ def _validate_loaded_checkpoint_identity(
         raise ValueError("Loaded backbone artifact is missing checkpoint_id.")
     if checkpoint.get("checkpoint_step") in (None, ""):
         raise ValueError("Loaded backbone artifact is missing checkpoint_step.")
-    expected_step = int(checkpoint["checkpoint_step"])
+    expected_step = validate_strict_integer(
+        checkpoint["checkpoint_step"],
+        label="Loaded backbone checkpoint_step",
+        minimum=1,
+    )
     observed_ids = sorted({str(row.get("checkpoint_id", "") or "").strip() for row in rows})
     observed_steps = sorted({_checkpoint_step_from_row(row) for row in rows})
     if observed_ids != [expected_id] or observed_steps != [expected_step]:
@@ -448,7 +509,11 @@ def _load_student_checkpoint(
     payload = normalize_gipo_checkpoint_payload(payload)
     if str(payload.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError(f"Unsupported GIPO student protocol {payload.get('protocol')!r}; expected {GIPO_PROTOCOL!r}.")
-    if int(payload.get("model_payload_version", 0)) != MODEL_PAYLOAD_VERSION:
+    if validate_strict_integer(
+        payload.get("model_payload_version"),
+        label="GIPO student model_payload_version",
+        minimum=1,
+    ) != MODEL_PAYLOAD_VERSION:
         raise ValueError(
             f"GIPO student checkpoint model_payload_version must be {MODEL_PAYLOAD_VERSION}; "
             f"got {payload.get('model_payload_version')!r}."
@@ -460,8 +525,11 @@ def _load_student_checkpoint(
         )
     if str(payload.get("student_policy_type", "")) != "continuous_density":
         raise ValueError("GIPO locked reporter only accepts continuous_density student checkpoints.")
-    if bool(payload.get("locked_test_used_for_selection", False)):
-        raise ValueError("GIPO student checkpoint indicates locked_test was used for selection.")
+    validate_locked_test_exclusion(
+        payload,
+        label="GIPO student checkpoint",
+        required_root_keys=("locked_test_used_for_selection",),
+    )
     density_meta = dict(payload.get("density_representation", {}))
     if str(density_meta.get("density_protocol", "")) != "density_mass":
         raise ValueError("GIPO student checkpoint is missing density_mass metadata.")
@@ -479,16 +547,33 @@ def _load_student_checkpoint(
     if "mode" not in payload:
         raise ValueError("GIPO student checkpoint is missing mode.")
     mode_value = validate_setting_mode(str(payload["mode"]))
+    raw_setting_encoder_config = payload.get("setting_encoder_config")
+    if not isinstance(raw_setting_encoder_config, Mapping):
+        raise ValueError("GIPO student checkpoint is missing setting_encoder_config.")
     setting_encoder_config = setting_encoder_config_from_payload(
-        payload.get("setting_encoder_config", {"mode": mode_value})
+        raw_setting_encoder_config, require_complete=True
     )
     expected_setting_dim = setting_feature_dim(mode_value, config=setting_encoder_config)
-    if int(payload["setting_dim"]) != int(expected_setting_dim):
+    setting_dim = validate_strict_integer(
+        payload.get("setting_dim"),
+        label="GIPO student setting_dim",
+        minimum=1,
+    )
+    if setting_dim != int(expected_setting_dim):
         raise ValueError(
             f"GIPO student checkpoint setting_dim={payload['setting_dim']} does not match "
             f"setting encoder dim {expected_setting_dim} for {setting_encoder_config.mode}."
         )
     normalizer = EmbeddingNormalizer.from_payload(payload["embedding_normalizer"])
+    context_dim = validate_strict_integer(
+        payload.get("context_dim"),
+        label="GIPO student context_dim",
+        minimum=1,
+    )
+    if normalizer.mean.shape != (context_dim,):
+        raise ValueError(
+            "GIPO student checkpoint context_dim does not match its embedding normalizer."
+        )
     student_architecture = str(payload.get("student_architecture", ""))
     if student_architecture != ARCHITECTURE_DENSITY_QUERY_TRANSFORMER:
         raise ValueError(
@@ -500,15 +585,29 @@ def _load_student_checkpoint(
         require_present=True,
     )
     validate_gipo_density_token_attention(student_model_config, require_present=True)
-    validate_gipo_attention_heads(int(student_model_config.get("attention_heads", -1)))
+    validate_gipo_attention_heads(student_model_config.get("attention_heads"))
+    density_dim = validate_strict_integer(
+        payload.get("density_dim"),
+        label="GIPO student density_dim",
+        minimum=2,
+    )
     student = build_gipo_student_model(
         architecture=student_architecture,
-        setting_dim=int(payload["setting_dim"]),
-        density_dim=int(payload["density_dim"]),
-        context_dim=int(payload["context_dim"]),
+        setting_dim=setting_dim,
+        density_dim=density_dim,
+        context_dim=context_dim,
         model_config=student_model_config,
     )
-    student.load_state_dict(payload["student_state"])
+    raw_student_state = payload.get("student_state")
+    if not isinstance(raw_student_state, Mapping):
+        raise ValueError("GIPO student checkpoint is missing student_state.")
+    try:
+        student.load_state_dict(
+            validate_tensor_state_dict(raw_student_state, label="GIPO student state"),
+            strict=True,
+        )
+    except RuntimeError as exc:
+        raise ValueError(f"GIPO student state is incompatible: {exc}") from exc
     student.eval()
     payload["mode"] = mode_value
     payload["setting_encoder_config"] = setting_encoder_config.to_payload()
@@ -538,10 +637,16 @@ def _gipo_step_budget_metadata(
     summary_value = training_summary.get("gipo_step_budget")
     if checkpoint_value in (None, "") or summary_value in (None, ""):
         raise ValueError("GIPO checkpoint and training summary must identify gipo_step_budget.")
-    checkpoint_budget = int(checkpoint_value)
-    summary_budget = int(summary_value)
-    if checkpoint_budget <= 0 or summary_budget <= 0:
-        raise ValueError("gipo_step_budget must be positive.")
+    checkpoint_budget = validate_strict_integer(
+        checkpoint_value,
+        label="GIPO checkpoint gipo_step_budget",
+        minimum=1,
+    )
+    summary_budget = validate_strict_integer(
+        summary_value,
+        label="GIPO training summary gipo_step_budget",
+        minimum=1,
+    )
     if checkpoint_budget != summary_budget:
         raise ValueError(
             "GIPO checkpoint and training summary disagree on gipo_step_budget: "
@@ -765,20 +870,18 @@ def _forecast_dataset_for_source_phase(splits: Mapping[str, Any], source_phase: 
 
 def _benchmark_family_from_rows(rows: Sequence[Mapping[str, Any]], requested: str = "") -> str:
     requested = str(requested or "").strip()
-    families = {str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()}
+    values = [str(row.get("benchmark_family", "") or "").strip() for row in rows]
+    missing = [index for index, value in enumerate(values) if not value]
+    if missing:
+        raise ValueError(
+            "GIPO locked-test context rows require explicit benchmark_family values; "
+            f"missing at rows {missing[:8]}."
+        )
+    families = set(values)
     if requested:
-        if families and families != {requested}:
+        if families != {requested}:
             raise ValueError(f"context rows benchmark_family mismatch: requested {requested!r}, found {sorted(families)}.")
         return requested
-    if not families:
-        has_generic_context_schema = any(
-            str(row.get("context_schema", "") or "").strip()
-            or any(str(row.get(key, "") or "").strip() for key in row if str(key).startswith("axis_"))
-            for row in rows
-        )
-        if has_generic_context_schema:
-            raise ValueError("Generic GIPO context rows require benchmark_family for locked-test reporting.")
-        return FORECAST_FAMILY
     if len(families) != 1:
         raise ValueError(f"GIPO reporter requires one benchmark_family per report; found {sorted(families)}.")
     return next(iter(families))
@@ -953,18 +1056,48 @@ def _attach_uniform_rewards_to_gipo_row(
 
 
 def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
+    checkpoint_path = resolve_project_path(str(args.gipo_student_checkpoint))
     student, normalizer, reference_time_grid, checkpoint_payload = _load_student_checkpoint(
-        str(args.gipo_student_checkpoint),
+        str(checkpoint_path),
     )
-    training_summary = json.loads(
-        resolve_project_path(str(args.training_summary)).read_text(encoding="utf-8")
-    )
+    training_summary_path = resolve_project_path(str(args.training_summary))
+    training_summary = json.loads(training_summary_path.read_text(encoding="utf-8"))
     if "model_payload_version" in training_summary:
         training_summary = normalize_gipo_checkpoint_payload(training_summary)
     if str(training_summary.get("protocol", "")) != GIPO_PROTOCOL:
         raise ValueError("training_summary protocol does not match continuous-density GIPO.")
-    if bool(training_summary.get("locked_test_used_for_selection", False)):
-        raise ValueError("training_summary indicates locked_test was used for selection.")
+    validate_locked_test_exclusion(
+        training_summary,
+        label="GIPO training_summary",
+        required_root_keys=("locked_test_used_for_selection",),
+    )
+    expected_checkpoint_hash = str(
+        training_summary.get("gipo_student_checkpoint_sha256", "")
+    ).strip()
+    if len(expected_checkpoint_hash) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_checkpoint_hash
+    ):
+        raise ValueError(
+            "training_summary requires a valid gipo_student_checkpoint_sha256."
+        )
+    if file_sha256(checkpoint_path) != expected_checkpoint_hash:
+        raise ValueError(
+            "training_summary does not belong to the supplied GIPO student checkpoint."
+        )
+    if not str(checkpoint_payload.get("context_embedding_kind", "") or "").strip():
+        raise ValueError("GIPO checkpoint requires an explicit context_embedding_kind.")
+    if not str(training_summary.get("context_embedding_kind", "") or "").strip():
+        raise ValueError("GIPO training summary requires an explicit context_embedding_kind.")
+    checkpoint_embedding_kind = validate_context_embedding_kind(
+        checkpoint_payload.get("context_embedding_kind")
+    )
+    summary_embedding_kind = validate_context_embedding_kind(
+        training_summary.get("context_embedding_kind")
+    )
+    if checkpoint_embedding_kind != summary_embedding_kind:
+        raise ValueError(
+            "GIPO checkpoint and training summary disagree on context_embedding_kind."
+        )
     checkpoint_policy_key = str(checkpoint_payload.get("student_policy_key", "") or "").strip()
     summary_policy_key = str(training_summary.get("student_policy_key", "") or "").strip()
     if not checkpoint_policy_key or not summary_policy_key:
@@ -973,6 +1106,20 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError(
             "GIPO checkpoint and training summary disagree on student_policy_key: "
             f"{checkpoint_policy_key!r} != {summary_policy_key!r}."
+        )
+    checkpoint_scenario = str(checkpoint_payload.get("scenario_key", "") or "").strip()
+    summary_scenario = str(training_summary.get("scenario_key", "") or "").strip()
+    checkpoint_family = str(
+        checkpoint_payload.get("benchmark_family", "") or ""
+    ).strip()
+    summary_family = str(training_summary.get("benchmark_family", "") or "").strip()
+    if not all((checkpoint_scenario, summary_scenario, checkpoint_family, summary_family)):
+        raise ValueError(
+            "GIPO checkpoint and training summary require scenario and benchmark-family metadata."
+        )
+    if (checkpoint_scenario, checkpoint_family) != (summary_scenario, summary_family):
+        raise ValueError(
+            "GIPO checkpoint and training summary disagree on scenario provenance."
         )
     student_policy_key = checkpoint_policy_key
     gipo_step_budget = _gipo_step_budget_metadata(checkpoint_payload, training_summary)
@@ -1007,7 +1154,25 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("GIPO reporter requires --context_rows.")
     if not embeddings_arg.strip():
         raise ValueError("GIPO reporter requires --context_embeddings_npz.")
+    report_inputs = {
+        "gipo_student_checkpoint": _report_input_fingerprints(str(checkpoint_path)),
+        "training_summary": _report_input_fingerprints(str(training_summary_path)),
+        "context_rows": _report_input_fingerprints(context_rows_arg),
+        "context_embeddings_npz": _report_input_fingerprints(embeddings_arg),
+        "baseline_rows": _report_input_fingerprints(str(args.baseline_rows)),
+        "comparator_rows": _report_input_fingerprints(str(args.comparator_rows)),
+    }
     context_rows = _read_csvs(context_rows_arg)
+    row_embedding_kind = context_embedding_kind_from_rows(
+        context_rows,
+        label="GIPO reporting context_rows",
+        require_explicit=True,
+    )
+    if row_embedding_kind != checkpoint_embedding_kind:
+        raise ValueError(
+            "GIPO reporting context rows use a different context_embedding_kind than "
+            f"the checkpoint: {row_embedding_kind!r} != {checkpoint_embedding_kind!r}."
+        )
     _validate_context_rows(context_rows, split_phase=split_phase, selection_mode=selection_mode)
     _benchmark_family_from_rows(context_rows, str(getattr(args, "benchmark_family", "") or ""))
     representatives = _representative_context_rows(context_rows)
@@ -1018,6 +1183,10 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         requested=str(getattr(args, "scenario_key", "") or ""),
         arg_name="scenario_key",
     )
+    if (scenario_key, benchmark_family) != (checkpoint_scenario, checkpoint_family):
+        raise ValueError(
+            "GIPO reporting rows do not match the checkpoint training scenario."
+        )
     seeds = _infer_int_values_from_rows(
         representatives,
         field="seed",
@@ -1123,7 +1292,12 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         if str(row.get("scheduler_key", "")) == UNIFORM_SCHEDULE_KEY
     }
 
-    raw_embeddings = load_context_embedding_table(resolve_project_path(embeddings_arg))
+    raw_embeddings = load_context_embedding_table(
+        resolve_project_path(embeddings_arg),
+        expected_context_embedding_kind=checkpoint_embedding_kind,
+        require_manifest=True,
+        expected_context_rows=context_rows,
+    )
     required_embedding_ids = {context_embedding_id_from_row(row) for row in representatives}
     missing_context_embeddings = sorted(required_embedding_ids - set(raw_embeddings))
     if missing_context_embeddings:
@@ -1202,7 +1376,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                     model,
                     eval_ds,
                     cfg,
-                    solver_name=solver_runtime_name(solver),
+                    solver_name=normalize_solver_key(solver),
                     macro_steps=int(macro_steps),
                     target_nfe=int(target_nfe),
                     time_grid=prediction["time_grid"],
@@ -1232,8 +1406,9 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                         "grid_kind": "gipo_density_time_grid",
                         "selection_group": GIPO_POLICY_KEY,
                         "comparison_role": "student",
-                        "solver_name": solver_runtime_name(solver),
-                        "nfe": int(macro_steps),
+                        "solver_name": normalize_solver_key(solver),
+                        "target_nfe": int(target_nfe),
+                        "macro_steps": int(macro_steps),
                         "time_grid": prediction["time_grid"],
                     },
                     chosen_t0s=[int(target_t)],
@@ -1296,8 +1471,10 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
             selected_row = {
                 "benchmark_family": benchmark_family,
                 "scenario_key": scenario_key,
-                "split_phase": str(split_phase),
-                "source_split_phase": source_phase,
+                **_report_context_split_fields(
+                    source_split_phase=source_phase,
+                    report_split=split_phase,
+                ),
                 "selection_mode": selection_mode,
                 "selection_split": _selection_split(row),
                 "seed": int(logical_seed),
@@ -1414,6 +1591,8 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     comparison["gipo_step_budget"] = int(gipo_step_budget)
     comparison["mode"] = mode
     comparison["checkpoint_step"] = int(checkpoint_step)
+    comparison["gipo_student_checkpoint_sha256"] = expected_checkpoint_hash
+    comparison["report_inputs"] = report_inputs
     comparison["teacher_final_retrain"] = teacher_final_retrain
     comparison.update(locked_test_provenance)
     if strict_locked_comparison:
@@ -1456,6 +1635,8 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "method_key": student_policy_key,
         "gipo_step_budget": int(gipo_step_budget),
         "checkpoint_step": int(checkpoint_step),
+        "gipo_student_checkpoint_sha256": expected_checkpoint_hash,
+        "report_inputs": report_inputs,
         "student_policy_type": "continuous_density",
         "scheduler_key": GIPO_POLICY_KEY,
         "benchmark_family": benchmark_family,

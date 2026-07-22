@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from dataclasses import dataclass
+from numbers import Real
 from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import torch
+
+from genode.checkpoint_validation import validate_strict_integer
 
 from genode.experiment_layout import REFERENCE_SEEN_NFES
 from genode.solver_protocol import (
@@ -19,6 +23,7 @@ TARGET_NFES: Tuple[int, ...] = REFERENCE_SEEN_NFES
 DEFAULT_NFE_REFERENCE = 16
 SETTING_ENCODER_MODE_CONTINUOUS = "continuous"
 SOLVER_METADATA_VERSION = "solver_metadata"
+_INTEGER_TEXT = re.compile(r"[+-]?\d+")
 
 
 def validate_time_grid(grid: Sequence[float], *, macro_steps: int) -> Tuple[float, ...]:
@@ -56,8 +61,23 @@ def _fourier_phase_features(phase: float, frequencies: Sequence[float]) -> Tuple
 
 
 def _positive_sorted_ints(values: Sequence[Any], *, label: str) -> Tuple[int, ...]:
-    out = tuple(sorted({int(value) for value in values}))
-    if not out or any(value <= 0 for value in out):
+    def parse(value: Any) -> int:
+        if isinstance(value, str):
+            text = value.strip()
+            if _INTEGER_TEXT.fullmatch(text) is None:
+                raise ValueError(f"{label} must contain positive integer NFEs.")
+            integer = int(text)
+            if integer <= 0:
+                raise ValueError(f"{label} must contain positive integer NFEs.")
+            return integer
+        return validate_strict_integer(value, label=label, minimum=1)
+
+    out = tuple(
+        sorted(
+            {parse(value) for value in values}
+        )
+    )
+    if not out:
         raise ValueError(f"{label} must contain positive integer NFEs.")
     return out
 
@@ -93,10 +113,15 @@ def build_setting_encoder_config(
         TARGET_NFES if observed_target_nfes is None else observed_target_nfes,
         label="observed_target_nfes",
     )
-    reference = int(max(observed + (DEFAULT_NFE_REFERENCE,)) if nfe_reference is None else nfe_reference)
-    if reference <= 0:
-        raise ValueError("nfe_reference must be positive.")
-    rope = tuple(float(value) for value in ((1.0, 2.0, 4.0, 8.0) if rope_frequencies is None else rope_frequencies))
+    reference = validate_strict_integer(
+        max(observed + (DEFAULT_NFE_REFERENCE,)) if nfe_reference is None else nfe_reference,
+        label="nfe_reference",
+        minimum=1,
+    )
+    raw_rope = (1.0, 2.0, 4.0, 8.0) if rope_frequencies is None else rope_frequencies
+    if any(isinstance(value, bool) or not isinstance(value, Real) for value in raw_rope):
+        raise ValueError("rope_frequencies must contain finite positive numeric values.")
+    rope = tuple(float(value) for value in raw_rope)
     if not rope or any((not math.isfinite(value) or value <= 0.0) for value in rope):
         raise ValueError("rope_frequencies must contain finite positive values.")
     version = str(solver_metadata_version)
@@ -113,15 +138,33 @@ def build_setting_encoder_config(
 
 def setting_encoder_config_from_payload(
     payload: Mapping[str, Any] | SettingEncoderConfig | None,
+    *,
+    require_complete: bool = False,
 ) -> SettingEncoderConfig:
     if isinstance(payload, SettingEncoderConfig):
         return payload
+    if payload is not None and not isinstance(payload, Mapping):
+        raise ValueError("Setting encoder configuration must be an object.")
     data = dict(payload or {})
     retired_keys = sorted(set(data) & {"series_encoding"})
     if retired_keys:
         raise ValueError(f"Setting encoder configuration uses retired keys: {retired_keys}.")
     if "setting_feature_mode" in data:
         raise ValueError("Setting encoder configuration must use 'mode'; 'setting_feature_mode' is not supported.")
+    fields = {
+        "mode",
+        "observed_target_nfes",
+        "nfe_reference",
+        "rope_frequencies",
+        "solver_metadata_version",
+    }
+    unknown = sorted(set(data) - fields)
+    missing = sorted(fields - set(data)) if require_complete else []
+    if missing or unknown:
+        raise ValueError(
+            "Setting encoder configuration fields are invalid; "
+            f"missing={missing}, unknown={unknown}."
+        )
     mode = str(data.get("mode", SETTING_ENCODER_MODE_CONTINUOUS))
     return build_setting_encoder_config(
         mode,
@@ -137,8 +180,11 @@ def setting_encoder_config_for_rows(
     *,
     mode: str,
 ) -> SettingEncoderConfig:
-    observed = sorted({int(row["target_nfe"]) for row in rows})
-    return build_setting_encoder_config(mode, observed_target_nfes=observed or TARGET_NFES)
+    observed = [row["target_nfe"] for row in rows]
+    return build_setting_encoder_config(
+        mode,
+        observed_target_nfes=observed or TARGET_NFES,
+    )
 
 
 def setting_feature_dim(
@@ -151,8 +197,13 @@ def setting_feature_dim(
 
 def _continuous_features(solver_key: str, target_nfe: int, config: SettingEncoderConfig) -> torch.Tensor:
     solver = normalize_solver_key(str(solver_key))
-    target = float(target_nfe)
-    macro_steps = float(solver_macro_steps(solver, int(target_nfe)))
+    target_value = validate_strict_integer(
+        target_nfe,
+        label="target_nfe",
+        minimum=1,
+    )
+    target = float(target_value)
+    macro_steps = float(solver_macro_steps(solver, target_value))
     reference = float(config.nfe_reference)
     log_reference = math.log(max(reference, 1.000001))
     solver_phase = 2.0 * math.pi * _hash_unit(f"solver:{solver}")
@@ -189,4 +240,4 @@ def setting_features(
         raise ValueError(
             f"mode {feature_mode!r} does not match setting_encoder_config mode {encoder_config.mode!r}."
         )
-    return _continuous_features(str(solver_key), int(target_nfe), encoder_config)
+    return _continuous_features(str(solver_key), target_nfe, encoder_config)

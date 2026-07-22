@@ -97,6 +97,12 @@ class ExperimentLayoutTests(unittest.TestCase):
         self.assertEqual((nfe.macro_steps, nfe.realized_nfe), (2, 4))
         with self.assertRaisesRegex(ValueError, "macro_steps=4"):
             normalize_solver_nfe_fields("heun", 4, macro_steps=4)
+        for target_nfe in (4.5, True):
+            with self.subTest(target_nfe=target_nfe), self.assertRaisesRegex(
+                ValueError,
+                "non-integer target_nfe",
+            ):
+                solver_macro_steps("euler", target_nfe)
 
 
 if __name__ == "__main__":

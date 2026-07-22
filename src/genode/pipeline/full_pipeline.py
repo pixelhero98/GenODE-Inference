@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
@@ -24,7 +26,13 @@ from genode.experiment_layout import (
     STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGET,
     scenario_family_for_key,
 )
-from genode.data.molecule_xyz import molecule_group_root, load_molecule_group_manifest, trainable_molecule_group_members
+from genode.data.molecule_xyz import (
+    load_molecule_group_manifest,
+    molecule_group_manifest_path,
+    molecule_group_root,
+    trainable_molecule_group_members,
+)
+from genode.data.otflow_medical_constants import long_term_st_manifest_path
 from genode.data.otflow_experiment_plan import experiment_plan_by_key
 from genode.data.otflow_paths import (
     backbone_manifest_path,
@@ -65,6 +73,7 @@ from genode.gipo.ablation_plan import (
     gipo_policy,
 )
 from genode.gipo.policy import (
+    context_embedding_table_manifest_path,
     DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
     STUDENT_TARGET_MIXTURE_MODES,
 )
@@ -91,6 +100,7 @@ FLOW_MAP_PIPELINE_STAGES = (
     FLOW_MAP_TRAINING_STAGE,
     FLOW_MAP_EVALUATION_STAGE,
 )
+QUALITY_GATE_REJECTION_RESULT = "failed_without_performance_claim"
 PIPELINE_STAGE_ORDER = (
     *REFERENCE_PIPELINE_STAGES,
     "train_unseen_target_student",
@@ -173,7 +183,26 @@ def _json_hash(payload: Mapping[str, Any]) -> str:
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    encoded = json.dumps(payload, indent=2, sort_keys=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _display_path(path: str | Path, *, path_base: Path | None = None) -> str:
@@ -186,15 +215,38 @@ def _display_path(path: str | Path, *, path_base: Path | None = None) -> str:
     return display_project_path(path)
 
 
-def _display_optional_path(path: Any) -> str:
+def _display_optional_project_path(path: Any) -> str:
     text = str(path or "").strip()
-    return _display_path(text) if text else ""
+    return _display_path(resolve_project_path(text)) if text else ""
+
+
+def _resolve_optional_project_path(path: Any) -> str:
+    text = str(path or "").strip()
+    return str(resolve_project_path(text)) if text else ""
+
+
+def _optional_project_file_sha256(path: Any) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    resolved = resolve_project_path(text)
+    return file_sha256(resolved) if resolved.is_file() else ""
 
 
 def _display_command(command: Sequence[str], *, path_base: Path | None = None) -> List[str]:
     out: List[str] = []
     for token in command:
         text = str(token)
+        if "," in text:
+            components = text.split(",")
+            rendered = [
+                _display_path(component, path_base=path_base)
+                if Path(component).expanduser().is_absolute()
+                else component
+                for component in components
+            ]
+            out.append(",".join(rendered))
+            continue
         path = Path(text).expanduser()
         if path.is_absolute():
             out.append(_display_path(path, path_base=path_base))
@@ -365,9 +417,60 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         )
     if flow_map_stages and gipo_checkpoint:
         required_flow_map_paths.append("flow_map_gipo_checkpoint")
-    quality_rows = str(getattr(args, "flow_map_quality_rows_csv", "") or "").strip()
-    if flow_map_stages and quality_rows:
+    quality_argument_names = (
+        "flow_map_quality_rows_csv",
+        "flow_map_quality_candidate_catalog",
+        "flow_map_quality_contexts_npz",
+        "flow_map_quality_sample_panel_npz",
+        "flow_map_quality_measurement_protocol",
+    )
+    quality_arguments = {
+        name: str(getattr(args, name, "") or "").strip()
+        for name in quality_argument_names
+    }
+    supplied_quality_arguments = [
+        name for name, value in quality_arguments.items() if value
+    ]
+    quality_rows = quality_arguments["flow_map_quality_rows_csv"]
+    if supplied_quality_arguments:
+        if FLOW_MAP_EVALUATION_STAGE not in flow_map_stages:
+            raise ValueError(
+                "Flow-map quality artifacts require the evaluate_flow_map stage; "
+                "unused quality artifact arguments are not accepted."
+            )
+        conflicting = sorted(
+            flow_map_stages
+            & {FLOW_MAP_COLLECTION_STAGE, FLOW_MAP_TRAINING_STAGE}
+        )
+        if conflicting:
+            raise ValueError(
+                "Paired flow-map quality rows require a separate evaluation run "
+                "without collection or training stages; conflicting stages: "
+                + ", ".join(conflicting)
+            )
+        if not quality_rows:
+            raise ValueError(
+                "--flow_map_quality_rows_csv is required when any flow-map quality "
+                "artifact argument is supplied."
+            )
         required_flow_map_paths.append("flow_map_quality_rows_csv")
+        candidate_catalog = quality_arguments["flow_map_quality_candidate_catalog"]
+        if not candidate_catalog:
+            raise ValueError(
+                "--flow_map_quality_candidate_catalog is required when paired "
+                "quality rows are supplied."
+            )
+        required_flow_map_paths.append("flow_map_quality_candidate_catalog")
+        for name in (
+            "flow_map_quality_contexts_npz",
+            "flow_map_quality_sample_panel_npz",
+            "flow_map_quality_measurement_protocol",
+        ):
+            if not quality_arguments[name]:
+                raise ValueError(
+                    f"--{name} is required when paired quality rows are supplied."
+                )
+            required_flow_map_paths.append(name)
     if not bool(getattr(args, "dry_run", False)):
         for name in dict.fromkeys(required_flow_map_paths):
             path = resolve_project_path(str(getattr(args, name)))
@@ -381,6 +484,8 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
             raise ValueError("--flow_map_bootstrap_samples must be at least 1000.")
         if not 0.0 < float(args.flow_map_familywise_alpha) < 1.0:
             raise ValueError("--flow_map_familywise_alpha must be between zero and one.")
+        if int(args.flow_map_seed) < 0:
+            raise ValueError("--flow_map_seed must be nonnegative.")
     _locked_test_settings(args)
     effective_stages = set(_selected_stage_names(args))
     if "report_gipo_locked_test" in effective_stages:
@@ -429,6 +534,99 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
     return report
 
 
+def _flow_map_quality_protocol_fields(args: argparse.Namespace) -> Dict[str, str]:
+    rows_value = str(getattr(args, "flow_map_quality_rows_csv", "") or "").strip()
+    catalog_value = str(
+        getattr(args, "flow_map_quality_candidate_catalog", "") or ""
+    ).strip()
+    contexts_value = str(
+        getattr(args, "flow_map_quality_contexts_npz", "") or ""
+    ).strip()
+    sample_panel_value = str(
+        getattr(args, "flow_map_quality_sample_panel_npz", "") or ""
+    ).strip()
+    measurement_protocol_value = str(
+        getattr(args, "flow_map_quality_measurement_protocol", "") or ""
+    ).strip()
+    if not rows_value:
+        return {
+            "quality_candidate_catalog_sha256": "",
+            "quality_rows_sha256": "",
+            "quality_contexts_sha256": "",
+            "quality_sample_panel_sha256": "",
+            "quality_measurement_protocol_sha256": "",
+        }
+    if (
+        not catalog_value
+        or not contexts_value
+        or not sample_panel_value
+        or not measurement_protocol_value
+    ):
+        raise ValueError(
+            "The candidate catalog, quality contexts, quality sample panel, and "
+            "measurement protocol are required when paired quality rows are supplied."
+        )
+
+    from genode.distillation.evaluation import (
+        candidate_catalog_sha256,
+        metric_specs_for_scenario,
+        read_candidate_catalog,
+    )
+    from genode.distillation.measurement_protocol import (
+        read_quality_measurement_protocol,
+    )
+
+    rows_path = resolve_project_path(rows_value)
+    catalog_path = resolve_project_path(catalog_value)
+    contexts_path = resolve_project_path(contexts_value)
+    sample_panel_path = resolve_project_path(sample_panel_value)
+    measurement_protocol_path = resolve_project_path(measurement_protocol_value)
+    candidates = read_candidate_catalog(catalog_path)
+    catalog_hash = candidate_catalog_sha256(candidates)
+    contexts_hash = file_sha256(contexts_path)
+    sample_panel_hash = file_sha256(sample_panel_path)
+    artifact_binding = {
+        "flow_map_checkpoint_sha256": file_sha256(
+            resolve_project_path(str(args.flow_map_checkpoint))
+        ),
+        "backbone_checkpoint_sha256": file_sha256(
+            resolve_project_path(str(args.flow_map_backbone_checkpoint))
+        ),
+        "gipo_checkpoint_sha256": file_sha256(
+            resolve_project_path(str(args.flow_map_gipo_checkpoint))
+        ),
+    }
+    scenario_key = _resolved_scenario_key(args)
+    metric_payloads = [
+        {
+            "name": spec.name,
+            "direction": spec.direction,
+            "weight": float(spec.weight),
+            "applicable_key": spec.applicable_key,
+        }
+        for spec in metric_specs_for_scenario(scenario_key)
+    ]
+    _, measurement_protocol_hash = read_quality_measurement_protocol(
+        measurement_protocol_path,
+        scenario_key=scenario_key,
+        candidate_catalog_sha256=catalog_hash,
+        quality_contexts_sha256=contexts_hash,
+        quality_sample_panel_sha256=sample_panel_hash,
+        artifact_binding=artifact_binding,
+        primary_metrics=metric_payloads,
+        bootstrap_samples=int(args.flow_map_bootstrap_samples),
+        bootstrap_seed=int(args.flow_map_seed),
+        familywise_alpha=float(args.flow_map_familywise_alpha),
+    )
+    return {
+        "quality_candidate_catalog_sha256": catalog_hash,
+        "quality_rows_sha256": file_sha256(rows_path),
+        "quality_contexts_sha256": contexts_hash,
+        "quality_sample_panel_sha256": sample_panel_hash,
+        "quality_measurement_protocol_sha256": measurement_protocol_hash,
+    }
+
+
 def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
     dataset = _resolved_scenario_key(args)
     plan = experiment_plan_by_key().get(dataset)
@@ -442,6 +640,9 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
     student_source: Any = policy if gipo_active else args
     student_settings = _student_objective_settings_payload(student_source)
     flow_map_active = bool(set(effective_stages) & set(FLOW_MAP_PIPELINE_STAGES))
+    flow_map_quality_fields = (
+        _flow_map_quality_protocol_fields(args) if flow_map_active else {}
+    )
     return {
         "version": PIPELINE_VERSION,
         "scenario_key": dataset,
@@ -501,24 +702,51 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "backbone_package": backbone_package_protocol_payload(args),
         "flow_map": (
             {
+                **flow_map_quality_fields,
                 "quality_status": (
                     "pending"
                     if str(args.flow_map_quality_rows_csv).strip()
                     else "not_evaluated"
                 ),
                 "performance_claim": False,
-                "backbone_checkpoint": _display_optional_path(args.flow_map_backbone_checkpoint),
-                "gipo_checkpoint": _display_optional_path(args.flow_map_gipo_checkpoint),
-                "flow_map_checkpoint": _display_optional_path(
+                "backbone_checkpoint": _display_optional_project_path(
+                    args.flow_map_backbone_checkpoint
+                ),
+                "gipo_checkpoint": _display_optional_project_path(
+                    args.flow_map_gipo_checkpoint
+                ),
+                "flow_map_checkpoint": _display_optional_project_path(
                     getattr(args, "flow_map_checkpoint", "")
                 ),
-                "contexts_npz": _display_optional_path(args.flow_map_contexts_npz),
-                "demonstration_manifest": _display_optional_path(args.flow_map_demonstration_manifest),
+                "contexts_npz": _display_optional_project_path(
+                    args.flow_map_contexts_npz
+                ),
+                "contexts_source_sha256": _optional_project_file_sha256(
+                    args.flow_map_contexts_npz
+                ),
+                "demonstration_manifest": _display_optional_project_path(
+                    args.flow_map_demonstration_manifest
+                ),
                 "settings": str(args.flow_map_settings),
                 "rollouts_per_context": int(args.flow_map_rollouts_per_context),
                 "training_steps": int(args.flow_map_steps),
                 "training_batch_size": int(args.flow_map_batch_size),
-                "quality_rows_csv": _display_optional_path(args.flow_map_quality_rows_csv),
+                "seed": int(args.flow_map_seed),
+                "quality_rows_csv": _display_optional_project_path(
+                    args.flow_map_quality_rows_csv
+                ),
+                "quality_candidate_catalog": _display_optional_project_path(
+                    args.flow_map_quality_candidate_catalog
+                ),
+                "quality_contexts_npz": _display_optional_project_path(
+                    args.flow_map_quality_contexts_npz
+                ),
+                "quality_sample_panel_npz": _display_optional_project_path(
+                    args.flow_map_quality_sample_panel_npz
+                ),
+                "quality_measurement_protocol": _display_optional_project_path(
+                    args.flow_map_quality_measurement_protocol
+                ),
                 "bootstrap_samples": int(args.flow_map_bootstrap_samples),
                 "familywise_alpha": float(args.flow_map_familywise_alpha),
             }
@@ -646,34 +874,76 @@ def _python_module_command(module: str, args: Iterable[str]) -> List[str]:
 
 
 def _command_hash(command: Sequence[str]) -> str:
-    input_args_by_module = {
+    input_args_by_module: dict[str, tuple[tuple[str, bool, bool], ...]] = {
         "genode.distillation.demonstrations": (
-            "--backbone-checkpoint",
-            "--gipo-checkpoint",
-            "--contexts-npz",
+            ("--backbone-checkpoint", False, False),
+            ("--gipo-checkpoint", False, False),
+            ("--contexts-npz", False, False),
         ),
         "genode.distillation.training": (
-            "--demonstration-manifest",
-            "--backbone-checkpoint",
-            "--gipo-checkpoint",
+            ("--demonstration-manifest", False, False),
+            ("--backbone-checkpoint", False, False),
+            ("--gipo-checkpoint", False, False),
         ),
         "genode.distillation.evaluation": (
-            "--rows-csv",
-            "--flow-map-checkpoint",
-            "--backbone-checkpoint",
-            "--gipo-checkpoint",
+            ("--rows-csv", False, False),
+            ("--candidate-catalog", False, False),
+            ("--quality-contexts-npz", False, False),
+            ("--quality-sample-panel-npz", False, False),
+            ("--measurement-protocol-json", False, False),
+            ("--quality-protocol-json", False, False),
+            ("--flow-map-checkpoint", False, False),
+            ("--backbone-checkpoint", False, False),
+            ("--gipo-checkpoint", False, False),
+            ("--demonstration-manifest", False, False),
+        ),
+        "genode.gipo.train_gipo": (
+            ("--rows_csv", True, False),
+            ("--context_embeddings_npz", True, True),
+            ("--schedule_summary_json", True, False),
+            ("--teacher_unseen_selection_rows_csv", True, False),
+            ("--teacher_unseen_selection_context_embeddings_npz", True, True),
+            ("--teacher_unseen_selection_schedule_summary_json", True, False),
+            ("--student_unseen_target_rows_csv", True, False),
+            ("--student_unseen_target_context_embeddings_npz", True, True),
+            ("--student_unseen_target_schedule_summary_json", True, False),
+        ),
+        "genode.gipo.report_locked_test": (
+            ("--gipo_student_checkpoint", False, False),
+            ("--training_summary", False, False),
+            ("--context_rows", True, False),
+            ("--context_embeddings_npz", True, True),
+            ("--baseline_rows", True, False),
+            ("--comparator_rows", True, False),
+            ("--backbone_manifest", False, False),
+        ),
+        "genode.gipo.ser_ptg_reference": (
+            ("--backbone_manifest", False, False),
         ),
     }
     input_hashes: dict[str, str] = {}
-    for module, path_args in input_args_by_module.items():
+    for module, path_specs in input_args_by_module.items():
         if _command_module_args(command, module) is None:
             continue
-        for path_arg in path_args:
+        for path_arg, comma_separated, include_table_manifest in path_specs:
             value = _command_arg_value(command, path_arg)
             if not value:
                 continue
-            path = resolve_project_path(value)
-            input_hashes[path_arg] = file_sha256(path) if path.is_file() else "missing"
+            path_values = parse_csv(value) if comma_separated else [value]
+            for index, path_value in enumerate(path_values):
+                path = resolve_project_path(path_value)
+                input_key = f"{path_arg}[{index}]"
+                input_hashes[input_key] = (
+                    file_sha256(path) if path.is_file() else "missing"
+                )
+                if include_table_manifest:
+                    manifest_path = context_embedding_table_manifest_path(path)
+                    input_hashes[f"{input_key}:manifest"] = (
+                        file_sha256(manifest_path)
+                        if manifest_path.is_file()
+                        else "missing"
+                    )
+    input_hashes.update(_ser_reference_input_hashes(command))
     encoded = json.dumps(
         {
             "argv": [str(part) for part in command],
@@ -705,63 +975,119 @@ def _command_arg_value(command: Sequence[str], name: str) -> str:
     return parts[idx + 1]
 
 
+def _ser_reference_selected_artifacts(
+    command: Sequence[str],
+) -> List[Mapping[str, Any]]:
+    if _command_module_args(command, "genode.gipo.ser_ptg_reference") is None:
+        return []
+    manifest_value = _command_arg_value(command, "--backbone_manifest")
+    scenario_key = _command_arg_value(command, "--scenario_key")
+    checkpoint_step = _command_arg_value(command, "--checkpoint_step")
+    if not manifest_value or not scenario_key or not checkpoint_step:
+        return []
+    manifest_path = resolve_project_path(manifest_value)
+    if not manifest_path.is_file():
+        return []
+    try:
+        benchmark_family = scenario_family_for_key(scenario_key)
+        expected_backbone = (
+            BACKBONE_NAME_OTFLOW_MOLECULE
+            if benchmark_family == SCENARIO_FAMILY_MOLECULE
+            else BACKBONE_NAME_OTFLOW
+        )
+        manifest = load_portable_backbone_manifest(manifest_path)
+        selected = [
+            artifact
+            for artifact in manifest.get("artifacts", [])
+            if isinstance(artifact, Mapping)
+            and str(artifact.get("status", "")) == "ready"
+            and str(artifact.get("backbone_name", "")) == expected_backbone
+            and str(artifact.get("benchmark_family", "")) == benchmark_family
+            and str(artifact.get("dataset_key", "")) == scenario_key
+            and int(artifact.get("train_steps", -1)) == int(checkpoint_step)
+        ]
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return sorted(
+        selected,
+        key=lambda artifact: (
+            str(artifact.get("checkpoint_id", "")),
+            str(artifact.get("checkpoint_path", "")),
+        ),
+    )
+
+
+def _ser_reference_input_hashes(command: Sequence[str]) -> Dict[str, str]:
+    if _command_module_args(command, "genode.gipo.ser_ptg_reference") is None:
+        return {}
+    input_hashes: Dict[str, str] = {}
+    for artifact_index, artifact in enumerate(
+        _ser_reference_selected_artifacts(command)
+    ):
+        identity = str(artifact.get("checkpoint_id", "") or artifact_index)
+        for field in ("checkpoint_path", "metadata_path", "summary_path"):
+            value = str(artifact.get(field, "") or "")
+            path = Path(value) if value else None
+            input_hashes[f"ser_artifact[{identity}]:{field}"] = (
+                file_sha256(path) if path is not None and path.is_file() else "missing"
+            )
+
+    scenario_key = _command_arg_value(command, "--scenario_key")
+    try:
+        benchmark_family = scenario_family_for_key(scenario_key)
+    except (KeyError, ValueError):
+        benchmark_family = ""
+    auxiliary_paths: List[Tuple[str, Path]] = []
+    if benchmark_family == SCENARIO_FAMILY_FORECAST:
+        dataset_root = _command_arg_value(command, "--dataset_root")
+        if dataset_root:
+            auxiliary_paths.append(
+                (
+                    "ser_dataset_manifest",
+                    resolve_project_path(dataset_root)
+                    / "monash"
+                    / scenario_key
+                    / "manifest.json",
+                )
+            )
+    elif benchmark_family == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
+        option_by_scenario = {
+            "cryptos": "--cryptos_path",
+            "lobster_synthetic": "--lobster_synthetic_profile_path",
+            "long_term_st": "--long_term_st_path",
+        }
+        option = option_by_scenario.get(scenario_key, "")
+        value = _command_arg_value(command, option) if option else ""
+        if value:
+            path = resolve_project_path(value)
+            auxiliary_paths.append(
+                (
+                    "ser_dataset_input",
+                    long_term_st_manifest_path(path)
+                    if scenario_key == "long_term_st"
+                    else path,
+                )
+            )
+    elif benchmark_family == SCENARIO_FAMILY_MOLECULE:
+        group_root = _command_arg_value(command, "--molecule_group_root")
+        if group_root:
+            auxiliary_paths.append(
+                (
+                    "ser_molecule_group_manifest",
+                    molecule_group_manifest_path(scenario_key, group_root),
+                )
+            )
+    for key, path in auxiliary_paths:
+        input_hashes[key] = file_sha256(path) if path.is_file() else "missing"
+    return input_hashes
+
+
 def _schedule_row_command_status(command: Sequence[str]) -> Dict[str, Any] | None:
     runner_args = _command_module_args(command, "genode.evaluation.diffusion_flow_time_reparameterization")
     if runner_args is None:
         return None
     parsed = schedule_runner.build_argparser().parse_args(runner_args)
     return schedule_runner.schedule_row_output_status(resolve_project_path(str(parsed.out_root)), parsed)
-
-
-def _command_json_output_exists(command: Sequence[str], *, module: str, out_arg: str, relative_path: str) -> Tuple[bool, str]:
-    if _command_module_args(command, module) is None:
-        return True, ""
-    out_dir = _command_arg_value(command, out_arg)
-    if not out_dir:
-        return False, f"missing {out_arg} in {module} command"
-    path = resolve_project_path(out_dir) / relative_path
-    if not path.exists():
-        return False, f"missing expected artifact: {_display_path(path)}"
-    try:
-        json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        return False, f"invalid JSON artifact {path}: {exc}"
-    return True, ""
-
-
-def _command_path_exists(command: Sequence[str], *, module: str, out_arg: str, relative_path: str) -> Tuple[bool, str]:
-    if _command_module_args(command, module) is None:
-        return True, ""
-    out_dir = _command_arg_value(command, out_arg)
-    if not out_dir:
-        return False, f"missing {out_arg} in {module} command"
-    path = resolve_project_path(out_dir) / relative_path
-    if not path.exists():
-        return False, f"missing expected artifact: {path}"
-    return True, ""
-
-
-def _command_output_file_exists(
-    command: Sequence[str],
-    *,
-    module: str,
-    path_arg: str,
-    require_json: bool = False,
-) -> Tuple[bool, str]:
-    if _command_module_args(command, module) is None:
-        return True, ""
-    value = _command_arg_value(command, path_arg)
-    if not value:
-        return False, f"missing {path_arg} in {module} command"
-    path = resolve_project_path(value)
-    if not path.is_file():
-        return False, f"missing expected artifact: {_display_path(path)}"
-    if require_json:
-        try:
-            json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            return False, f"invalid JSON artifact {path}: {exc}"
-    return True, ""
 
 
 def _backbone_manifest_artifacts_complete(
@@ -887,16 +1213,377 @@ def _backbone_training_command_outputs_complete(command: Sequence[str]) -> Tuple
     )
 
 
+def _read_json_object(path: Path, *, artifact_label: str) -> Dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{artifact_label} must contain a JSON object")
+    return payload
+
+
+def _gipo_training_command_outputs_complete(
+    command: Sequence[str],
+) -> Tuple[bool, str]:
+    module_args = _command_module_args(command, "genode.gipo.train_gipo")
+    if module_args is None:
+        return True, ""
+    out_dir_value = _command_arg_value(command, "--out_dir")
+    if not out_dir_value:
+        return False, "GIPO training command is missing --out_dir"
+    out_dir = resolve_project_path(out_dir_value)
+    summary_path = out_dir / "gipo_training_summary.json"
+    try:
+        from genode.gipo import train_gipo as train_gipo_module
+
+        parsed = train_gipo_module.build_argparser().parse_args(module_args)
+        train_gipo_module.validate_gipo_training_bundle(out_dir)
+        summary = _read_json_object(
+            summary_path,
+            artifact_label="GIPO training summary",
+        )
+        if str(summary.get("status", "")) != "completed":
+            return False, "GIPO training summary status is not 'completed'"
+        for checkpoint_kind in ("teacher", "student"):
+            name_field = f"gipo_{checkpoint_kind}_checkpoint"
+            hash_field = f"{name_field}_sha256"
+            expected_name = f"gipo_{checkpoint_kind}.pt"
+            if str(summary.get(name_field, "")) != expected_name:
+                return False, f"GIPO training summary has invalid {name_field}"
+            checkpoint_path = out_dir / expected_name
+            if not checkpoint_path.is_file():
+                return False, f"missing expected GIPO checkpoint: {checkpoint_path}"
+            expected_hash = str(summary.get(hash_field, ""))
+            if expected_hash != file_sha256(checkpoint_path):
+                return False, f"GIPO training summary {hash_field} does not match"
+        requested_policy = _command_arg_value(command, "--student_policy_key")
+        if requested_policy and str(summary.get("student_policy_key", "")) != requested_policy:
+            return False, "GIPO training summary student_policy_key does not match"
+        input_names = (
+            "rows_csv",
+            "context_embeddings_npz",
+            "schedule_summary_json",
+            "teacher_unseen_selection_rows_csv",
+            "teacher_unseen_selection_context_embeddings_npz",
+            "teacher_unseen_selection_schedule_summary_json",
+            "student_unseen_target_rows_csv",
+            "student_unseen_target_context_embeddings_npz",
+            "student_unseen_target_schedule_summary_json",
+        )
+        expected_inputs = {
+            name: train_gipo_module._artifact_input_summary(
+                str(getattr(parsed, name))
+            )
+            for name in input_names
+        }
+        if summary.get("training_inputs") != expected_inputs:
+            return False, "GIPO training summary input fingerprints do not match"
+        if int(summary.get("gipo_step_budget", -1)) != int(parsed.student_steps):
+            return False, "GIPO training summary student step budget does not match"
+        expected_seen_nfes = parse_int_csv(str(parsed.seen_target_nfe_values))
+        expected_unseen_nfes = parse_int_csv(str(parsed.unseen_target_nfe_values))
+        if list(summary.get("seen_target_nfe_values", [])) != expected_seen_nfes:
+            return False, "GIPO training summary seen target NFEs do not match"
+        if list(summary.get("unseen_target_nfe_values", [])) != expected_unseen_nfes:
+            return False, "GIPO training summary unseen target NFEs do not match"
+        if int(summary.get("context_sample_count", -1)) != int(
+            parsed.context_sample_count
+        ):
+            return False, "GIPO training summary context sample count does not match"
+        expected_support = parse_csv(str(parsed.support_schedule_keys))
+        if expected_support and list(summary.get("support_schedule_keys", [])) != expected_support:
+            return False, "GIPO training summary support schedules do not match"
+        if not str(summary.get("policy_id", "")).strip():
+            return False, "GIPO training summary is missing policy_id"
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, SystemExit) as exc:
+        return False, f"invalid GIPO training artifact: {exc}"
+    return True, ""
+
+
+def _gipo_report_command_outputs_complete(
+    command: Sequence[str],
+) -> Tuple[bool, str]:
+    if _command_module_args(command, "genode.gipo.report_locked_test") is None:
+        return True, ""
+
+    from genode.gipo.report_locked_test import (
+        SELECTION_MODE_REPORTING,
+        _output_prefix,
+        _report_input_fingerprints,
+    )
+
+    out_dir_value = _command_arg_value(command, "--out_dir")
+    checkpoint_value = _command_arg_value(command, "--gipo_student_checkpoint")
+    if not out_dir_value or not checkpoint_value:
+        return False, "GIPO report command is missing --out_dir or --gipo_student_checkpoint"
+    out_dir = resolve_project_path(out_dir_value)
+    split_phase = _command_arg_value(command, "--split_phase") or "locked_test"
+    selection_mode = (
+        _command_arg_value(command, "--selection_mode") or SELECTION_MODE_REPORTING
+    )
+    report_label = _command_arg_value(command, "--report_label")
+    output_prefix = _output_prefix(split_phase, selection_mode, report_label)
+    policy_summary_path = out_dir / f"{output_prefix}_policy_summary.json"
+    comparison_summary_path = out_dir / f"{output_prefix}_comparison_summary.json"
+    try:
+        policy_summary = _read_json_object(
+            policy_summary_path,
+            artifact_label="GIPO policy summary",
+        )
+        comparison_summary = _read_json_object(
+            comparison_summary_path,
+            artifact_label="GIPO comparison summary",
+        )
+        checkpoint_path = resolve_project_path(checkpoint_value)
+        checkpoint_hash = file_sha256(checkpoint_path)
+        for label, payload in (
+            ("policy", policy_summary),
+            ("comparison", comparison_summary),
+        ):
+            if str(payload.get("gipo_student_checkpoint_sha256", "")) != checkpoint_hash:
+                return False, f"GIPO {label} summary checkpoint hash does not match"
+
+        input_args = {
+            "gipo_student_checkpoint": "--gipo_student_checkpoint",
+            "training_summary": "--training_summary",
+            "context_rows": "--context_rows",
+            "context_embeddings_npz": "--context_embeddings_npz",
+            "baseline_rows": "--baseline_rows",
+            "comparator_rows": "--comparator_rows",
+        }
+        expected_inputs = {
+            name: _report_input_fingerprints(_command_arg_value(command, option))
+            for name, option in input_args.items()
+        }
+        for label, payload in (
+            ("policy", policy_summary),
+            ("comparison", comparison_summary),
+        ):
+            if payload.get("report_inputs") != expected_inputs:
+                return False, f"GIPO {label} summary input fingerprints do not match"
+
+        expected_scalars = {
+            "scenario_key": _command_arg_value(command, "--scenario_key"),
+            "benchmark_family": _command_arg_value(command, "--benchmark_family"),
+            "split_phase": split_phase,
+        }
+        for field, expected in expected_scalars.items():
+            if expected and str(policy_summary.get(field, "")) != expected:
+                return False, f"GIPO policy summary {field} does not match"
+            if expected and str(comparison_summary.get(field, "")) != expected:
+                return False, f"GIPO comparison summary {field} does not match"
+        checkpoint_step = _command_arg_value(command, "--checkpoint_step")
+        if checkpoint_step:
+            expected_step = int(checkpoint_step)
+            if int(policy_summary.get("checkpoint_step", -1)) != expected_step:
+                return False, "GIPO policy summary checkpoint_step does not match"
+            if int(comparison_summary.get("checkpoint_step", -1)) != expected_step:
+                return False, "GIPO comparison summary checkpoint_step does not match"
+        target_nfes = _command_arg_value(command, "--target_nfe_values")
+        if target_nfes:
+            expected_nfes = parse_int_csv(target_nfes)
+            if list(policy_summary.get("target_nfe_values", [])) != expected_nfes:
+                return False, "GIPO policy summary target_nfe_values do not match"
+            if list(comparison_summary.get("target_nfe_values", [])) != expected_nfes:
+                return False, "GIPO comparison summary target_nfe_values do not match"
+        if str(policy_summary.get("comparison_summary_path", "")) != comparison_summary_path.name:
+            return False, "GIPO policy summary comparison path does not match"
+        for suffix in ("rows.csv", "aggregate_rows.csv", "decisions.csv"):
+            output_path = out_dir / f"{output_prefix}_{suffix}"
+            if not output_path.is_file():
+                return False, f"missing expected GIPO report artifact: {output_path}"
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return False, f"invalid GIPO report artifact: {exc}"
+    return True, ""
+
+
+def _ser_reference_command_outputs_complete(
+    command: Sequence[str],
+) -> Tuple[bool, str]:
+    module_args = _command_module_args(command, "genode.gipo.ser_ptg_reference")
+    if module_args is None:
+        return True, ""
+    from genode.gipo import ser_ptg_reference
+
+    try:
+        parsed = ser_ptg_reference.build_argparser().parse_args(module_args)
+        out_dir = resolve_project_path(str(parsed.out_dir))
+        summary_path = out_dir / "ser_ptg_schedule_summary.json"
+        summary = _read_json_object(
+            summary_path,
+            artifact_label="SER-PTG schedule summary",
+        )
+        solvers = parse_csv(str(parsed.solver_names)) or list(SUPPORTED_SOLVER_KEYS)
+        target_nfes = parse_int_csv(
+            str(parsed.target_nfe_values), default=REFERENCE_SEEN_NFES
+        )
+        seeds = parse_int_csv(str(parsed.seeds), default=(0, 1, 2))
+        if bool(parsed.smoke):
+            solvers = solvers[:1]
+            target_nfes = target_nfes[:1]
+
+        expected_scalars: Dict[str, Any] = {
+            "status": "ready",
+            "artifact": "ser_ptg_schedule_summary",
+            "scenario_key": str(parsed.scenario_key),
+            "example_selection_protocol": SER_PTG_EXAMPLE_SELECTION_PROTOCOL,
+            "local_defect_trace_protocol": SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL,
+            "reference_split": str(parsed.reference_split),
+            "reference_split_key": (
+                "train" if str(parsed.reference_split) == "train_tuning" else "val"
+            ),
+            "checkpoint_step": int(parsed.checkpoint_step),
+            "context_sample_count": int(parsed.context_sample_count),
+            "calibration_trace_samples": int(parsed.calibration_trace_samples),
+            "density_floor_eta": float(parsed.density_floor_eta),
+            "reference_macro_factor": float(parsed.reference_macro_factor),
+        }
+        for field, expected in expected_scalars.items():
+            if summary.get(field) != expected:
+                return False, f"SER-PTG schedule summary {field} does not match"
+        expected_lists = {
+            "solver_names": [str(value) for value in solvers],
+            "target_nfe_values": [int(value) for value in target_nfes],
+            "seeds": [int(value) for value in seeds],
+        }
+        for field, expected in expected_lists.items():
+            if list(summary.get(field, [])) != expected:
+                return False, f"SER-PTG schedule summary {field} does not match"
+
+        selected_artifacts = _ser_reference_selected_artifacts(command)
+        family = scenario_family_for_key(str(parsed.scenario_key))
+        if family == SCENARIO_FAMILY_MOLECULE:
+            if not selected_artifacts:
+                return False, "SER-PTG command has no selected molecule backbone artifacts"
+        elif len(selected_artifacts) != 1:
+            return False, (
+                "SER-PTG command must select exactly one temporal backbone artifact; "
+                f"found {len(selected_artifacts)}"
+            )
+        expected_checkpoint_ids = sorted(
+            str(artifact.get("checkpoint_id", ""))
+            for artifact in selected_artifacts
+        )
+        if list(summary.get("checkpoint_ids", [])) != expected_checkpoint_ids:
+            return False, "SER-PTG schedule summary checkpoint_ids do not match"
+
+        predictions = summary.get("predictions")
+        if not isinstance(predictions, list):
+            return False, "SER-PTG schedule summary predictions must be a list"
+        expected_pairs = {
+            (str(solver), int(target_nfe))
+            for solver in solvers
+            for target_nfe in target_nfes
+        }
+        observed_pairs: set[Tuple[str, int]] = set()
+        for prediction in predictions:
+            if not isinstance(prediction, Mapping):
+                return False, "SER-PTG schedule summary contains an invalid prediction"
+            pair = (
+                str(prediction.get("solver_key", "")),
+                int(prediction.get("target_nfe", -1)),
+            )
+            if pair in observed_pairs:
+                return False, "SER-PTG schedule summary contains duplicate predictions"
+            observed_pairs.add(pair)
+            if int(prediction.get("checkpoint_step", -1)) != int(
+                parsed.checkpoint_step
+            ):
+                return False, "SER-PTG prediction checkpoint_step does not match"
+            if str(prediction.get("reference_split", "")) != str(
+                parsed.reference_split
+            ):
+                return False, "SER-PTG prediction reference_split does not match"
+        if observed_pairs != expected_pairs:
+            return False, "SER-PTG schedule summary prediction matrix does not match"
+        if int(summary.get("prediction_count", -1)) != len(predictions):
+            return False, "SER-PTG schedule summary prediction_count does not match"
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        SystemExit,
+    ) as exc:
+        return False, f"invalid SER-PTG schedule artifact: {exc}"
+    return True, ""
+
+
 def _flow_map_command_outputs_complete(command: Sequence[str]) -> Tuple[bool, str]:
     demonstration_args = _command_module_args(command, "genode.distillation.demonstrations")
     if demonstration_args is not None:
-        from genode.distillation.artifacts import load_demonstration_manifest
+        from genode.distillation.artifacts import (
+            context_binding,
+            load_demonstration_manifest,
+            validate_context_binding,
+        )
+        from genode.distillation.demonstrations import (
+            load_distillation_contexts,
+            parse_distillation_settings,
+        )
 
         output_dir = _command_arg_value(command, "--output-dir")
         try:
-            load_demonstration_manifest(
+            manifest = load_demonstration_manifest(
                 resolve_project_path(output_dir) / DEMONSTRATION_MANIFEST_NAME
             )
+            metadata = dict(manifest["metadata"])
+            source_paths = {
+                "backbone_checkpoint_sha256": _command_arg_value(
+                    command, "--backbone-checkpoint"
+                ),
+                "gipo_checkpoint_sha256": _command_arg_value(
+                    command, "--gipo-checkpoint"
+                ),
+                "contexts_source_sha256": _command_arg_value(
+                    command, "--contexts-npz"
+                ),
+            }
+            if str(metadata.get("contexts_source_kind", "")) != "npz":
+                return False, "flow-map demonstration source is not the commanded NPZ"
+            for field, source_path in source_paths.items():
+                if not source_path or str(metadata.get(field, "")) != file_sha256(
+                    resolve_project_path(source_path)
+                ):
+                    return False, f"flow-map demonstration {field} does not match"
+            expected_scalars = {
+                "split_phase": _command_arg_value(command, "--split-phase"),
+                "scenario_key": _command_arg_value(command, "--scenario-key"),
+                "benchmark_family": _command_arg_value(
+                    command, "--benchmark-family"
+                ),
+            }
+            for field, expected in expected_scalars.items():
+                if expected and str(metadata.get(field, "")) != expected:
+                    return False, f"flow-map demonstration {field} does not match"
+            expected_settings = [
+                {
+                    "solver_key": setting.solver_key,
+                    "target_nfe": int(setting.target_nfe),
+                }
+                for setting in parse_distillation_settings(
+                    _command_arg_value(command, "--settings")
+                )
+            ]
+            if metadata.get("settings") != expected_settings:
+                return False, "flow-map demonstration settings do not match"
+            expected_rollouts = int(
+                _command_arg_value(command, "--rollouts-per-context") or 4
+            )
+            if int(metadata.get("rollouts_per_context", -1)) != expected_rollouts:
+                return False, "flow-map demonstration rollout count does not match"
+            expected_seed = int(_command_arg_value(command, "--seed") or 0)
+            if int(metadata.get("collection_seed", -1)) != expected_seed:
+                return False, "flow-map demonstration collection seed does not match"
+            source_contexts = load_distillation_contexts(
+                resolve_project_path(_command_arg_value(command, "--contexts-npz"))
+            )
+            source_binding = context_binding(
+                source_contexts.content_fingerprints()
+            )
+            if validate_context_binding(
+                metadata.get("context_binding", {})
+            ) != source_binding:
+                return False, "flow-map demonstration context binding does not match source NPZ"
         except (OSError, TypeError, ValueError) as exc:
             return False, f"invalid flow-map demonstration artifact: {exc}"
 
@@ -904,13 +1591,21 @@ def _flow_map_command_outputs_complete(command: Sequence[str]) -> Tuple[bool, st
     if training_args is not None:
         from genode.distillation.artifacts import load_demonstration_manifest
         from genode.distillation.checkpoint import load_flow_map_checkpoint
+        from genode.distillation.training import (
+            build_argparser as build_flow_map_training_argparser,
+            validate_flow_map_bundle,
+        )
 
-        checkpoint_path = resolve_project_path(_command_arg_value(command, "--output-checkpoint"))
-        backbone_path = resolve_project_path(_command_arg_value(command, "--backbone-checkpoint"))
-        gipo_path = resolve_project_path(_command_arg_value(command, "--gipo-checkpoint"))
-        manifest_path = resolve_project_path(_command_arg_value(command, "--demonstration-manifest"))
-        summary_path = resolve_project_path(_command_arg_value(command, "--summary-json"))
         try:
+            parsed = build_flow_map_training_argparser().parse_args(training_args)
+            checkpoint_path = resolve_project_path(parsed.output_checkpoint)
+            backbone_path = resolve_project_path(parsed.backbone_checkpoint)
+            gipo_path = resolve_project_path(parsed.gipo_checkpoint)
+            manifest_path = resolve_project_path(parsed.demonstration_manifest)
+            if not str(parsed.summary_json).strip():
+                return False, "flow-map training command is missing --summary-json"
+            summary_path = resolve_project_path(parsed.summary_json)
+            validate_flow_map_bundle(checkpoint_path, summary_path)
             load_demonstration_manifest(manifest_path)
             _, payload = load_flow_map_checkpoint(
                 checkpoint_path,
@@ -922,20 +1617,68 @@ def _flow_map_command_outputs_complete(command: Sequence[str]) -> Tuple[bool, st
             ):
                 return False, "flow-map checkpoint demonstration hash does not match"
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if not isinstance(summary, dict):
+                return False, "flow-map training summary must be an object"
+            if str(summary.get("status", "")) != "completed":
+                return False, "flow-map training summary status is not 'completed'"
+            if str(summary.get("checkpoint_name", "")) != checkpoint_path.name:
+                return False, "flow-map training summary checkpoint name does not match"
             if str(summary.get("checkpoint_sha256", "")) != file_sha256(checkpoint_path):
                 return False, "flow-map training summary checkpoint hash does not match"
-        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            embedded_summary = payload.get("training_summary")
+            if not isinstance(embedded_summary, Mapping):
+                return False, "flow-map checkpoint is missing its training summary"
+            report_summary = {
+                key: value
+                for key, value in summary.items()
+                if key not in {"status", "checkpoint_name", "checkpoint_sha256"}
+            }
+            if report_summary != dict(embedded_summary):
+                return False, "flow-map file and checkpoint training summaries disagree"
+            expected_summary_fields = {
+                "steps": int(parsed.steps),
+                "batch_size": int(parsed.batch_size),
+                "learning_rate": float(parsed.learning_rate),
+                "weight_decay": float(parsed.weight_decay),
+                "grad_clip": float(parsed.grad_clip),
+                "seed": int(parsed.seed),
+                "split_seed": int(parsed.seed),
+                "validation_fraction": float(parsed.validation_fraction),
+                "validation_interval": int(parsed.validation_interval),
+                "validation_shards": int(parsed.validation_shards),
+                "validation_seed": int(parsed.seed) + 1_000_003,
+                "batches_per_shard": int(parsed.batches_per_shard),
+                "initialized_from_backbone_field": not bool(
+                    parsed.no_backbone_initialization
+                ),
+            }
+            for field, expected in expected_summary_fields.items():
+                if summary.get(field) != expected:
+                    return False, f"flow-map training summary {field} does not match"
+        except (OSError, RuntimeError, SystemExit, TypeError, ValueError, json.JSONDecodeError) as exc:
             return False, f"invalid flow-map training artifact: {exc}"
 
     evaluation_args = _command_module_args(command, "genode.distillation.evaluation")
     if evaluation_args is not None:
+        from genode.distillation.artifacts import (
+            load_demonstration_manifest,
+            validate_context_binding,
+        )
         from genode.distillation.checkpoint import load_flow_map_checkpoint
         from genode.distillation.evaluation import (
             QualityGateConfig,
+            candidate_catalog_sha256,
             evaluate_quality_gate,
             metric_specs_for_scenario,
             not_evaluated_report,
+            read_candidate_catalog,
+            read_quality_contexts,
+            read_quality_protocol,
             read_quality_rows,
+            read_quality_sample_panel,
+        )
+        from genode.distillation.measurement_protocol import (
+            read_quality_measurement_protocol,
         )
 
         output_path = resolve_project_path(_command_arg_value(command, "--output-json"))
@@ -943,12 +1686,34 @@ def _flow_map_command_outputs_complete(command: Sequence[str]) -> Tuple[bool, st
         backbone_path = resolve_project_path(_command_arg_value(command, "--backbone-checkpoint"))
         gipo_path = resolve_project_path(_command_arg_value(command, "--gipo-checkpoint"))
         scenario_key = _command_arg_value(command, "--scenario-key")
+        manifest_value = _command_arg_value(command, "--demonstration-manifest")
         try:
+            quality_protocol_path = resolve_project_path(
+                _command_arg_value(command, "--quality-protocol-json")
+            )
+            quality_protocol, quality_protocol_hash = read_quality_protocol(
+                quality_protocol_path,
+                scenario_key=scenario_key,
+            )
             _, payload = load_flow_map_checkpoint(
                 flow_map_path,
                 backbone_checkpoint=backbone_path,
                 gipo_checkpoint=gipo_path,
             )
+            checkpoint_scenario = str(payload.get("scenario_key", "")).strip()
+            if checkpoint_scenario and checkpoint_scenario != scenario_key:
+                return False, "flow-map quality checkpoint scenario does not match"
+            checkpoint_family = str(payload.get("benchmark_family", "")).strip()
+            try:
+                expected_family = scenario_family_for_key(scenario_key)
+            except KeyError:
+                expected_family = ""
+            if (
+                expected_family
+                and checkpoint_family
+                and checkpoint_family != expected_family
+            ):
+                return False, "flow-map quality checkpoint family does not match"
             binding = {
                 "scenario_key": scenario_key,
                 "flow_map_checkpoint_sha256": file_sha256(flow_map_path),
@@ -957,11 +1722,109 @@ def _flow_map_command_outputs_complete(command: Sequence[str]) -> Tuple[bool, st
             }
             rows_path_value = _command_arg_value(command, "--rows-csv")
             if rows_path_value:
+                if manifest_value:
+                    manifest_path = resolve_project_path(manifest_value)
+                    if file_sha256(manifest_path) != str(
+                        payload["demonstration_manifest_sha256"]
+                    ):
+                        return False, "flow-map quality manifest hash does not match"
+                    manifest = load_demonstration_manifest(manifest_path)
+                    manifest_metadata = dict(manifest["metadata"])
+                    if str(manifest_metadata.get("scenario_key", "")).strip() != scenario_key:
+                        return False, "flow-map quality manifest scenario does not match"
+                    manifest_family = str(
+                        manifest_metadata.get("benchmark_family", "")
+                    ).strip()
+                    if checkpoint_family and manifest_family != checkpoint_family:
+                        return False, "flow-map quality manifest family does not match checkpoint"
+                    if expected_family and manifest_family != expected_family:
+                        return False, "flow-map quality manifest family does not match scenario"
+                    context_binding = validate_context_binding(
+                        manifest_metadata["context_binding"]
+                    )
+                    checkpoint_context_binding = payload.get(
+                        "demonstration_context_binding"
+                    )
+                    if checkpoint_context_binding is not None and validate_context_binding(
+                        checkpoint_context_binding
+                    ) != context_binding:
+                        return False, "flow-map quality manifest binding does not match checkpoint"
+                else:
+                    context_binding = validate_context_binding(
+                        payload.get("demonstration_context_binding", {})
+                    )
                 rows_path = resolve_project_path(rows_path_value)
+                catalog_path = resolve_project_path(
+                    _command_arg_value(command, "--candidate-catalog")
+                )
+                quality_contexts_path = resolve_project_path(
+                    _command_arg_value(command, "--quality-contexts-npz")
+                )
+                sample_panel_path = resolve_project_path(
+                    _command_arg_value(command, "--quality-sample-panel-npz")
+                )
+                measurement_protocol_path = resolve_project_path(
+                    _command_arg_value(command, "--measurement-protocol-json")
+                )
+                catalog = read_candidate_catalog(catalog_path)
+                quality_contexts = read_quality_contexts(quality_contexts_path)
+                quality_sample_panel = read_quality_sample_panel(
+                    sample_panel_path,
+                    quality_context_binding=quality_contexts,
+                )
+                rows_hash = file_sha256(rows_path)
+                metric_specs = metric_specs_for_scenario(scenario_key)
+                metric_payloads = [
+                    {
+                        "name": spec.name,
+                        "direction": spec.direction,
+                        "weight": float(spec.weight),
+                        "applicable_key": spec.applicable_key,
+                    }
+                    for spec in metric_specs
+                ]
+                measurement_protocol, measurement_protocol_hash = (
+                    read_quality_measurement_protocol(
+                        measurement_protocol_path,
+                        scenario_key=scenario_key,
+                        candidate_catalog_sha256=candidate_catalog_sha256(catalog),
+                        quality_contexts_sha256=quality_contexts["artifact_sha256"],
+                        quality_sample_panel_sha256=quality_sample_panel[
+                            "artifact_sha256"
+                        ],
+                        artifact_binding={
+                            "flow_map_checkpoint_sha256": binding[
+                                "flow_map_checkpoint_sha256"
+                            ],
+                            "backbone_checkpoint_sha256": binding[
+                                "backbone_checkpoint_sha256"
+                            ],
+                            "gipo_checkpoint_sha256": binding[
+                                "gipo_checkpoint_sha256"
+                            ],
+                        },
+                        primary_metrics=metric_payloads,
+                        bootstrap_samples=int(
+                            _command_arg_value(command, "--bootstrap-samples")
+                        ),
+                        bootstrap_seed=int(_command_arg_value(command, "--seed")),
+                        familywise_alpha=float(
+                            _command_arg_value(command, "--familywise-alpha")
+                        ),
+                    )
+                )
                 expected = evaluate_quality_gate(
                     read_quality_rows(rows_path),
-                    metric_specs=metric_specs_for_scenario(scenario_key),
+                    metric_specs=metric_specs,
+                    candidate_catalog=catalog,
                     artifact_binding=binding,
+                    demonstration_context_binding=context_binding,
+                    quality_context_binding=quality_contexts,
+                    quality_sample_panel_binding=quality_sample_panel,
+                    quality_protocol=quality_protocol,
+                    quality_rows_sha256=rows_hash,
+                    measurement_protocol=measurement_protocol,
+                    measurement_protocol_sha256=measurement_protocol_hash,
                     config=QualityGateConfig(
                         bootstrap_samples=int(_command_arg_value(command, "--bootstrap-samples")),
                         familywise_alpha=float(_command_arg_value(command, "--familywise-alpha")),
@@ -969,17 +1832,46 @@ def _flow_map_command_outputs_complete(command: Sequence[str]) -> Tuple[bool, st
                         seed=int(_command_arg_value(command, "--seed")),
                     ),
                 )
-                expected["rows_sha256"] = file_sha256(rows_path)
+                expected["rows_sha256"] = rows_hash
+                expected["candidate_catalog_file_sha256"] = file_sha256(catalog_path)
             else:
                 expected = not_evaluated_report(
                     reason=_command_arg_value(command, "--not-evaluated-reason"),
                     artifact_binding=binding,
                 )
+                expected["quality_protocol_hash"] = quality_protocol_hash
             actual = json.loads(output_path.read_text(encoding="utf-8"))
             if actual != expected:
                 return False, "flow-map quality report does not match its bound inputs"
         except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
             return False, f"invalid flow-map quality artifact: {exc}"
+    return True, ""
+
+
+def _accepted_flow_map_quality_rejection(
+    command: Sequence[str],
+) -> Tuple[bool, str]:
+    if _command_module_args(command, "genode.distillation.evaluation") is None:
+        return False, "command is not a flow-map evaluation"
+    if not _command_arg_value(command, "--rows-csv"):
+        return False, "a not-evaluated report cannot be accepted as a quality-gate rejection"
+    outputs_complete, reason = _flow_map_command_outputs_complete(command)
+    if not outputs_complete:
+        return False, reason
+    output_path = resolve_project_path(_command_arg_value(command, "--output-json"))
+    try:
+        report = _read_json_object(
+            output_path,
+            artifact_label="flow-map quality report",
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return False, f"invalid flow-map quality rejection report: {exc}"
+    if str(report.get("status", "")) != "failed":
+        return False, "quality-gate rejection report status is not 'failed'"
+    if report.get("performance_claim") is not False:
+        return False, "quality-gate rejection report must deny the performance claim"
+    if report.get("locked_test_used_for_selection") is not False:
+        return False, "quality-gate rejection report must preserve locked-test isolation"
     return True, ""
 
 
@@ -993,88 +1885,16 @@ def _stage_outputs_complete(entry: StageCommand) -> Tuple[bool, str]:
         ok, reason = _flow_map_command_outputs_complete(command)
         if not ok:
             return False, reason
+        ok, reason = _gipo_training_command_outputs_complete(command)
+        if not ok:
+            return False, reason
+        ok, reason = _gipo_report_command_outputs_complete(command)
+        if not ok:
+            return False, reason
         schedule_status = _schedule_row_command_status(command)
         if schedule_status is not None and not bool(schedule_status.get("complete", False)):
             return False, str(schedule_status.get("reason", "schedule-row output is incomplete"))
-        ok, reason = _command_json_output_exists(
-            command,
-            module="genode.gipo.ser_ptg_reference",
-            out_arg="--out_dir",
-            relative_path="ser_ptg_schedule_summary.json",
-        )
-        if not ok:
-            return False, reason
-        ok, reason = _command_json_output_exists(
-            command,
-            module="genode.gipo.train_gipo",
-            out_arg="--out_dir",
-            relative_path="gipo_training_summary.json",
-        )
-        if not ok:
-            return False, reason
-        ok, reason = _command_path_exists(
-            command,
-            module="genode.gipo.train_gipo",
-            out_arg="--out_dir",
-            relative_path="gipo_student.pt",
-        )
-        if not ok:
-            return False, reason
-        ok, reason = _command_json_output_exists(
-            command,
-            module="genode.gipo.report_locked_test",
-            out_arg="--out_dir",
-            relative_path="locked_test_gipo_policy_summary.json",
-        )
-        if not ok:
-            return False, reason
-        ok, reason = _command_json_output_exists(
-            command,
-            module="genode.gipo.report_locked_test",
-            out_arg="--out_dir",
-            relative_path="locked_test_gipo_comparison_summary.json",
-        )
-        if not ok:
-            return False, reason
-        for relative_path in (
-            "locked_test_gipo_rows.csv",
-            "locked_test_gipo_aggregate_rows.csv",
-            "locked_test_gipo_decisions.csv",
-        ):
-            ok, reason = _command_path_exists(
-                command,
-                module="genode.gipo.report_locked_test",
-                out_arg="--out_dir",
-                relative_path=relative_path,
-            )
-            if not ok:
-                return False, reason
-        ok, reason = _command_json_output_exists(
-            command,
-            module="genode.distillation.demonstrations",
-            out_arg="--output-dir",
-            relative_path=DEMONSTRATION_MANIFEST_NAME,
-        )
-        if not ok:
-            return False, reason
-        for path_arg, require_json in (
-            ("--output-checkpoint", False),
-            ("--summary-json", True),
-        ):
-            ok, reason = _command_output_file_exists(
-                command,
-                module="genode.distillation.training",
-                path_arg=path_arg,
-                require_json=require_json,
-            )
-            if not ok:
-                return False, reason
-        ok, reason = _command_output_file_exists(
-            command,
-            module="genode.distillation.evaluation",
-            path_arg="--output-json",
-            require_json=True,
-        )
+        ok, reason = _ser_reference_command_outputs_complete(command)
         if not ok:
             return False, reason
     return True, ""
@@ -1106,11 +1926,73 @@ def _stage_manifest_complete(run_root: Path, entry: StageCommand, *, protocol_ha
     for idx, result in enumerate(results):
         if int(result.get("command_index", -1)) != int(idx):
             return False, f"stage command_result index mismatch at {idx}"
-        if int(result.get("returncode", -1)) != 0:
+        returncode = int(result.get("returncode", -1))
+        if returncode == 0:
+            continue
+        accepted_rejection = (
+            returncode == 2
+            and entry.stage == FLOW_MAP_EVALUATION_STAGE
+            and result.get("accepted_quality_gate_result")
+            == QUALITY_GATE_REJECTION_RESULT
+        )
+        if not accepted_rejection:
             return False, f"stage command {idx} did not complete successfully"
+        rejection_valid, reason = _accepted_flow_map_quality_rejection(
+            entry.commands[idx]
+        )
+        if not rejection_valid:
+            return False, f"stage command {idx} has an invalid accepted rejection: {reason}"
     outputs_complete, reason = _stage_outputs_complete(entry)
     if not outputs_complete:
         return False, reason
+    return True, ""
+
+
+def _interrupted_stage_manifest_matches(
+    run_root: Path,
+    entry: StageCommand,
+    *,
+    protocol_hash: str,
+) -> Tuple[bool, str]:
+    path = run_root / entry.manifest_name
+    if not path.is_file():
+        return False, f"missing interrupted stage manifest: {path}"
+    try:
+        manifest = _read_json_object(
+            path,
+            artifact_label="interrupted stage manifest",
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return False, f"invalid interrupted stage manifest: {exc}"
+    if str(manifest.get("status", "")) != "running":
+        return False, "stage manifest is not an interrupted running stage"
+    if manifest.get("dry_run") is not False:
+        return False, "interrupted stage manifest is not a non-dry-run manifest"
+    if str(manifest.get("stage", "")) != str(entry.stage):
+        return False, "interrupted stage manifest stage does not match"
+    if str(manifest.get("protocol_hash", "")) != str(protocol_hash):
+        return False, "interrupted stage manifest protocol hash does not match"
+    expected_commands = [
+        _display_command(command, path_base=run_root) for command in entry.commands
+    ]
+    if manifest.get("commands") != expected_commands:
+        return False, "interrupted stage manifest commands do not match"
+    expected_hashes = [_command_hash(command) for command in entry.commands]
+    if manifest.get("command_hashes") != expected_hashes:
+        return False, "interrupted stage manifest command hashes do not match"
+    results = manifest.get("command_results")
+    if not isinstance(results, list) or len(results) > len(entry.commands):
+        return False, "interrupted stage manifest command_results are invalid"
+    for index, result in enumerate(results):
+        if not isinstance(result, Mapping):
+            return False, "interrupted stage manifest contains an invalid command result"
+        try:
+            result_index = int(result.get("command_index", -1))
+            returncode = int(result.get("returncode", -1))
+        except (TypeError, ValueError):
+            return False, "interrupted stage manifest contains an invalid command result"
+        if result_index != index or returncode != 0:
+            return False, "interrupted stage manifest command_results do not match"
     return True, ""
 
 
@@ -1239,6 +2121,7 @@ def _backbone_training_commands(args: argparse.Namespace, dataset: str, checkpoi
 
 
 def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[StageCommand]:
+    stage_filter = set(_selected_stage_names(args))
     dataset = _resolved_scenario_key(args)
     checkpoint_values = parse_int_csv(args.checkpoint_steps, default=REFERENCE_CHECKPOINT_STEPS)
     checkpoints = ",".join(str(value) for value in checkpoint_values)
@@ -1283,8 +2166,29 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
     )
     flow_map_training_summary = flow_map_root / "training_summary.json"
     flow_map_quality_report = flow_map_root / "quality_report.json"
+    flow_map_backbone_checkpoint = _resolve_optional_project_path(
+        args.flow_map_backbone_checkpoint
+    )
+    flow_map_contexts_npz = _resolve_optional_project_path(args.flow_map_contexts_npz)
+    flow_map_quality_rows = _resolve_optional_project_path(
+        args.flow_map_quality_rows_csv
+    )
+    flow_map_quality_catalog = _resolve_optional_project_path(
+        args.flow_map_quality_candidate_catalog
+    )
+    flow_map_quality_contexts = _resolve_optional_project_path(
+        args.flow_map_quality_contexts_npz
+    )
+    flow_map_quality_sample_panel = _resolve_optional_project_path(
+        args.flow_map_quality_sample_panel_npz
+    )
+    flow_map_quality_measurement_protocol = _resolve_optional_project_path(
+        args.flow_map_quality_measurement_protocol
+    )
     flow_map_gipo_checkpoint = str(getattr(args, "flow_map_gipo_checkpoint", "") or "").strip()
-    if not flow_map_gipo_checkpoint:
+    if flow_map_gipo_checkpoint:
+        flow_map_gipo_checkpoint = str(resolve_project_path(flow_map_gipo_checkpoint))
+    else:
         flow_map_gipo_checkpoint = str(gipo_training_root / "gipo_student.pt")
     split_phases = SCHEDULE_ROW_SPLIT_PHASES
     role_nfes = {"seen": seen_nfes, "unseen": unseen_nfes}
@@ -1365,6 +2269,8 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                 out_dir,
             ]
         )
+        if bool(args.overwrite):
+            command_args.append("--overwrite")
         return _python_module_command("genode.gipo.train_gipo", command_args)
 
     def _schedule_row_commands(role: str, nfe_values: str) -> List[List[str]]:
@@ -1495,11 +2401,11 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
     def _flow_map_collection_command() -> List[str]:
         command_args: List[Any] = [
             "--backbone-checkpoint",
-            str(args.flow_map_backbone_checkpoint),
+            flow_map_backbone_checkpoint,
             "--gipo-checkpoint",
             flow_map_gipo_checkpoint,
             "--contexts-npz",
-            str(args.flow_map_contexts_npz),
+            flow_map_contexts_npz,
             "--output-dir",
             demonstration_root,
             "--split-phase",
@@ -1526,7 +2432,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             "--demonstration-manifest",
             demonstration_manifest,
             "--backbone-checkpoint",
-            str(args.flow_map_backbone_checkpoint),
+            flow_map_backbone_checkpoint,
             "--gipo-checkpoint",
             flow_map_gipo_checkpoint,
             "--output-checkpoint",
@@ -1558,7 +2464,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             "--flow-map-checkpoint",
             flow_map_checkpoint,
             "--backbone-checkpoint",
-            str(args.flow_map_backbone_checkpoint),
+            flow_map_backbone_checkpoint,
             "--gipo-checkpoint",
             flow_map_gipo_checkpoint,
             "--bootstrap-samples",
@@ -1567,10 +2473,23 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             float(args.flow_map_familywise_alpha),
             "--seed",
             int(args.flow_map_seed),
+            "--quality-protocol-json",
+            run_root / "protocol.json",
         ]
-        quality_rows = str(args.flow_map_quality_rows_csv).strip()
-        if quality_rows:
-            command_args.extend(["--rows-csv", quality_rows])
+        if flow_map_quality_rows:
+            command_args.extend(["--rows-csv", flow_map_quality_rows])
+            command_args.extend(
+                [
+                    "--candidate-catalog",
+                    flow_map_quality_catalog,
+                    "--quality-contexts-npz",
+                    flow_map_quality_contexts,
+                    "--quality-sample-panel-npz",
+                    flow_map_quality_sample_panel,
+                    "--measurement-protocol-json",
+                    flow_map_quality_measurement_protocol,
+                ]
+            )
         else:
             command_args.extend(
                 [
@@ -1578,6 +2497,16 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                     "No benchmark rows were supplied; this artifact has no performance claim.",
                 ]
             )
+        if (
+            explicit_demonstration_manifest
+            or FLOW_MAP_COLLECTION_STAGE in stage_filter
+            or FLOW_MAP_TRAINING_STAGE in stage_filter
+        ):
+            command_args.extend(
+                ["--demonstration-manifest", demonstration_manifest]
+            )
+        if bool(args.overwrite):
+            command_args.append("--overwrite")
         return _python_module_command("genode.distillation.evaluation", command_args)
 
     ser_commands = [
@@ -1691,7 +2620,6 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             "flow_map_evaluation_manifest.json",
         ),
     ]
-    stage_filter = set(_selected_stage_names(args))
     return [entry for entry in commands if entry.stage in stage_filter]
 
 
@@ -1707,6 +2635,7 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     has_ablation_stage = _has_ablation_stage(commands)
     skipped_entries = _resume_completed_prefix(run_root, commands, protocol_hash=protocol_hash) if bool(args.resume) and not bool(args.overwrite) else []
     skipped_stage_names = [entry.stage for entry in skipped_entries]
+    adopted_stage_names: List[str] = []
     commands_to_run = list(commands[len(skipped_entries) :])
     should_write_ablation_manifest = has_ablation_stage and (
         not (bool(args.resume) and not bool(args.overwrite))
@@ -1738,6 +2667,15 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     )
     completed: List[str] = list(skipped_stage_names)
     for entry in commands_to_run:
+        interrupted_manifest_matches = False
+        if bool(args.resume) and not bool(args.overwrite):
+            interrupted_manifest_matches, _ = (
+                _interrupted_stage_manifest_matches(
+                    run_root,
+                    entry,
+                    protocol_hash=protocol_hash,
+                )
+            )
         manifest = {
             "stage": entry.stage,
             "protocol_hash": protocol_hash,
@@ -1745,9 +2683,11 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             "command_hashes": [_command_hash(command) for command in entry.commands],
             "dry_run": bool(args.dry_run),
             "command_results": [],
+            "status": "planned" if bool(args.dry_run) else "running",
         }
         if entry.stage == INPUT_PREFLIGHT_STAGE:
             manifest["preflight"] = preflight
+        _write_json(run_root / entry.manifest_name, manifest)
         if not bool(args.dry_run):
             for command_idx, command in enumerate(entry.commands):
                 if command and command[0] == "internal":
@@ -1757,6 +2697,73 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                     )
                 log_path = run_root / "logs" / f"{entry.stage}_{command_idx}.log"
                 log_path.parent.mkdir(parents=True, exist_ok=True)
+                if interrupted_manifest_matches:
+                    gipo_validator = None
+                    if (
+                        _command_module_args(command, "genode.gipo.train_gipo")
+                        is not None
+                    ):
+                        gipo_validator = _gipo_training_command_outputs_complete
+                    elif (
+                        _command_module_args(
+                            command, "genode.gipo.report_locked_test"
+                        )
+                        is not None
+                    ):
+                        gipo_validator = _gipo_report_command_outputs_complete
+                    if gipo_validator is not None:
+                        gipo_complete, _ = gipo_validator(command)
+                        if gipo_complete:
+                            manifest["command_results"].append(
+                                {
+                                    "command_index": int(command_idx),
+                                    "returncode": 0,
+                                    "log_path": str(log_path.relative_to(run_root)),
+                                    "skipped": True,
+                                    "skip_reason": (
+                                        "verified GIPO output already complete after "
+                                        "an exact interrupted-stage match"
+                                    ),
+                                }
+                            )
+                            _write_json(run_root / entry.manifest_name, manifest)
+                            continue
+                if (
+                    bool(args.resume)
+                    and not bool(args.overwrite)
+                    and interrupted_manifest_matches
+                    and entry.stage
+                    in {
+                        FLOW_MAP_COLLECTION_STAGE,
+                        FLOW_MAP_TRAINING_STAGE,
+                        FLOW_MAP_EVALUATION_STAGE,
+                    }
+                ):
+                    flow_map_complete, _ = _flow_map_command_outputs_complete(
+                        command
+                    )
+                    if flow_map_complete:
+                        accepted_rejection, _ = (
+                            _accepted_flow_map_quality_rejection(command)
+                            if entry.stage == FLOW_MAP_EVALUATION_STAGE
+                            else (False, "")
+                        )
+                        command_result = {
+                            "command_index": int(command_idx),
+                            "returncode": 2 if accepted_rejection else 0,
+                            "log_path": str(log_path.relative_to(run_root)),
+                            "skipped": True,
+                            "skip_reason": (
+                                "verified flow-map output already complete"
+                            ),
+                        }
+                        if accepted_rejection:
+                            command_result["accepted_quality_gate_result"] = (
+                                QUALITY_GATE_REJECTION_RESULT
+                            )
+                        manifest["command_results"].append(command_result)
+                        _write_json(run_root / entry.manifest_name, manifest)
+                        continue
                 schedule_status = _schedule_row_command_status(command)
                 if schedule_status is not None and bool(schedule_status.get("complete", False)):
                     command_result = {
@@ -1788,7 +2795,10 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                             "failed_command_index": int(command_idx),
                             "protocol_hash": protocol_hash,
                             "completed_stages": completed,
-                            "skipped_stages": list(skipped_stage_names),
+                            "skipped_stages": [
+                                *skipped_stage_names,
+                                *adopted_stage_names,
+                            ],
                             "failure_reason": str(schedule_status.get("reason", "protocol mismatch")),
                         },
                     )
@@ -1805,6 +2815,23 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 }
                 manifest["command_results"].append(command_result)
                 if int(result.returncode) != 0:
+                    accepted_rejection = False
+                    rejection_reason = ""
+                    if (
+                        int(result.returncode) == 2
+                        and entry.stage == FLOW_MAP_EVALUATION_STAGE
+                    ):
+                        accepted_rejection, rejection_reason = (
+                            _accepted_flow_map_quality_rejection(command)
+                        )
+                    if accepted_rejection:
+                        command_result["accepted_quality_gate_result"] = (
+                            QUALITY_GATE_REJECTION_RESULT
+                        )
+                        _write_json(run_root / entry.manifest_name, manifest)
+                        continue
+                    if rejection_reason:
+                        command_result["error"] = rejection_reason
                     manifest["status"] = "failed"
                     _write_json(run_root / entry.manifest_name, manifest)
                     if has_ablation_stage:
@@ -1832,12 +2859,73 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                             "failed_command_index": int(command_idx),
                             "protocol_hash": protocol_hash,
                             "completed_stages": completed,
-                            "skipped_stages": list(skipped_stage_names),
+                            "skipped_stages": [
+                                *skipped_stage_names,
+                                *adopted_stage_names,
+                            ],
                         },
                     )
                     raise RuntimeError(f"Pipeline stage {entry.stage!r} failed; see {log_path}.")
+            outputs_complete, output_validation_error = _stage_outputs_complete(
+                entry
+            )
+            if not outputs_complete:
+                manifest["status"] = "failed"
+                manifest["output_validation_error"] = output_validation_error
+                _write_json(run_root / entry.manifest_name, manifest)
+                if has_ablation_stage:
+                    failed_ablation_manifest = _build_ablation_manifest(
+                        args,
+                        run_root,
+                        protocol_hash=protocol_hash,
+                        status="failed",
+                        extra={
+                            "failed_stage": entry.stage,
+                            "failure_reason": output_validation_error,
+                        },
+                    )
+                    _write_json(
+                        _ablation_root(run_root, str(args.ablation_preset))
+                        / "ablation_manifest.json",
+                        failed_ablation_manifest,
+                    )
+                _write_json(
+                    _status_path(run_root),
+                    {
+                        "version": PIPELINE_VERSION,
+                        "status": "failed",
+                        "failed_stage": entry.stage,
+                        "protocol_hash": protocol_hash,
+                        "completed_stages": completed,
+                        "skipped_stages": [
+                            *skipped_stage_names,
+                            *adopted_stage_names,
+                        ],
+                        "failure_reason": output_validation_error,
+                    },
+                )
+                raise RuntimeError(
+                    f"Pipeline stage {entry.stage!r} produced invalid or incomplete "
+                    f"outputs: {output_validation_error}"
+                )
         manifest["status"] = "planned" if bool(args.dry_run) else "complete"
         _write_json(run_root / entry.manifest_name, manifest)
+        if (
+            not bool(args.dry_run)
+            and len(manifest["command_results"]) == len(entry.commands)
+            and bool(entry.commands)
+            and all(
+                result.get("skipped") is True
+                for result in manifest["command_results"]
+            )
+            and any(
+                str(result.get("skip_reason", "")).startswith(
+                    ("verified flow-map output", "verified GIPO output")
+                )
+                for result in manifest["command_results"]
+            )
+        ):
+            adopted_stage_names.append(entry.stage)
         completed.append(entry.stage)
         _write_json(
             _status_path(run_root),
@@ -1846,7 +2934,10 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 "status": "dry_run" if bool(args.dry_run) else "running",
                 "protocol_hash": protocol_hash,
                 "completed_stages": completed,
-                "skipped_stages": list(skipped_stage_names),
+                "skipped_stages": [
+                    *skipped_stage_names,
+                    *adopted_stage_names,
+                ],
                 "remaining_stages": [cmd.stage for cmd in commands if cmd.stage not in set(completed)],
             },
         )
@@ -1857,8 +2948,12 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         "stage_count": int(len(commands)),
         "stages": [_display_stage(entry, path_base=run_root) for entry in commands],
         "completed_stages": [entry.stage for entry in commands],
-        "skipped_stages": list(skipped_stage_names),
-        "executed_stages": [entry.stage for entry in commands_to_run],
+        "skipped_stages": [*skipped_stage_names, *adopted_stage_names],
+        "executed_stages": [
+            entry.stage
+            for entry in commands_to_run
+            if entry.stage not in set(adopted_stage_names)
+        ],
         "run_root": _display_path(run_root),
         "preflight": preflight,
     }
@@ -2043,6 +3138,37 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "Optional paired benchmark rows for the quality gate. Omitted writes status=not_evaluated "
             "and makes no performance claim."
+        ),
+    )
+    parser.add_argument(
+        "--flow_map_quality_candidate_catalog",
+        default="",
+        help=(
+            "JSON catalog that prespecifies the exact flow-map, GIPO, and fixed "
+            "solver/NFE candidates covered by quality rows."
+        ),
+    )
+    parser.add_argument(
+        "--flow_map_quality_contexts_npz",
+        default="",
+        help=(
+            "Validation and locked-test physical contexts used to recompute quality "
+            "row fingerprints."
+        ),
+    )
+    parser.add_argument(
+        "--flow_map_quality_sample_panel_npz",
+        default="",
+        help=(
+            "Common logical seeds and initial states used by every quality candidate."
+        ),
+    )
+    parser.add_argument(
+        "--flow_map_quality_measurement_protocol",
+        default="",
+        help=(
+            "External measurement protocol binding the evaluated artifacts, runner, "
+            "reference data, candidates, metrics, contexts, sample panel, and gate settings."
         ),
     )
     parser.add_argument("--flow_map_bootstrap_samples", type=int, default=10_000)

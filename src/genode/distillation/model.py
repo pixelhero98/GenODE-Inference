@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import TYPE_CHECKING, Any, Dict, Mapping
 
 import torch
 import torch.nn as nn
 
+from genode.checkpoint_validation import validate_tensor_state_dict
 from genode.gipo.models import (
     SettingEncoderConfig,
     setting_encoder_config_from_payload,
@@ -56,8 +58,8 @@ class EndpointFlowMap(nn.Module):
             raise ValueError("setting_dim must be positive.")
         if int(density_dim) <= 1:
             raise ValueError("density_dim must be greater than one.")
-        if float(loss_delta) <= 0.0:
-            raise ValueError("loss_delta must be positive.")
+        if not math.isfinite(float(loss_delta)) or float(loss_delta) <= 0.0:
+            raise ValueError("loss_delta must be finite and positive.")
         self.cfg = cfg
         self.setting_dim = int(setting_dim)
         self.density_dim = int(density_dim)
@@ -87,6 +89,19 @@ class EndpointFlowMap(nn.Module):
             use_res=bool(cfg.model.use_res_mlp),
         )
         self.map_network = TransformerFUNet(cfg)
+
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        strict: bool = True,
+        assign: bool = False,
+    ):
+        validated = validate_tensor_state_dict(
+            state_dict,
+            label="Flow-map model state",
+            target_module=self,
+        )
+        return super().load_state_dict(validated, strict=strict, assign=assign)
 
     def initialize_from_teacher(self, teacher: nn.Module) -> None:
         teacher_type = str(getattr(teacher, "fu_net_type", "")).strip().lower()
@@ -134,17 +149,26 @@ class EndpointFlowMap(nn.Module):
                 raise ValueError(f"{name} batch size does not match state batch size {batch}.")
         if validate_values:
             mass_sum = density_mass.sum(dim=-1)
-            valid = (
-                torch.isfinite(state).all()
-                & torch.isfinite(source_time).all()
-                & torch.isfinite(setting).all()
-                & torch.isfinite(density_mass).all()
-                & (source_time >= 0.0).all()
-                & (source_time <= 1.0).all()
-                & (density_mass >= 0.0).all()
-                & ((mass_sum - 1.0).abs() <= 1e-5).all()
+            finite_tensors = [
+                state,
+                source_time,
+                setting,
+                density_mass,
+                conditioning.ctx,
+                conditioning.ctx_summary,
+                conditioning.t_emb,
+                conditioning.ctx_tokens,
+            ]
+            if conditioning.cond_emb is not None:
+                finite_tensors.append(conditioning.cond_emb)
+            valid = bool(
+                all(bool(torch.isfinite(tensor).all()) for tensor in finite_tensors)
+                and bool((source_time >= 0.0).all())
+                and bool((source_time <= 1.0).all())
+                and bool((density_mass >= 0.0).all())
+                and bool(((mass_sum - 1.0).abs() <= 1e-5).all())
             )
-            if not bool(valid):
+            if not valid:
                 raise ValueError(
                     "Flow-map inputs must be finite, source_time must lie in [0, 1], and "
                     "density_mass must be nonnegative and sum to one per example."
@@ -181,8 +205,8 @@ def endpoint_consistency_loss(
             f"{tuple(teacher_endpoint.shape)}."
         )
     scale = float(delta)
-    if scale <= 0.0:
-        raise ValueError("delta must be positive.")
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("delta must be finite and positive.")
     error = (prediction - teacher_endpoint) / scale
     return (scale * scale * (torch.sqrt(1.0 + error.square()) - 1.0)).mean()
 
@@ -264,6 +288,8 @@ class FlowMapSampler:
                 "initial_state must have shape [batch, sample_state_dim], got "
                 f"{tuple(initial_state.shape)}."
             )
+        if not initial_state.is_floating_point() or not torch.isfinite(initial_state).all():
+            raise ValueError("initial_state must contain finite floating-point values.")
         self.conditioner.eval()
         nfe = normalize_solver_nfe_fields(solver_key, target_nfe, source="flow-map sample")
         batch = int(initial_state.shape[0])
@@ -283,7 +309,8 @@ class FlowMapSampler:
             source = initial_state.new_full((batch, 1), float(source_time))
         cache = conditioning_cache
         if cache is None:
-            assert hist is not None
+            if hist is None:  # Guarded by the exclusive-input check above.
+                raise RuntimeError("hist unexpectedly became unavailable.")
             cache = self.conditioner.precompute(hist, cond=cond)
         conditioning = self.conditioner.build_conditioning(
             hist=hist,
@@ -299,7 +326,7 @@ class FlowMapSampler:
                     "density_mass is required when the sampler has no bound GIPO policy."
                 )
             schedule = self.gipo_policy.predict(
-                cache.ctx_summary,
+                self.gipo_policy.context_embedding_from_cache(cache),
                 solver_key=nfe.solver_key,
                 target_nfe=nfe.target_nfe,
             )
@@ -316,6 +343,12 @@ class FlowMapSampler:
             density,
             validate_values=True,
         )
+        if (
+            not torch.is_tensor(output)
+            or not output.is_floating_point()
+            or not bool(torch.isfinite(output).all())
+        ):
+            raise ValueError("Flow-map output must contain finite floating-point values.")
         return FlowMapSample(
             sample=output,
             model_evaluations=1,
@@ -325,8 +358,10 @@ class FlowMapSampler:
         )
 
     def _initial_state(self, hist: torch.Tensor) -> torch.Tensor:
-        if hist.ndim < 1:
+        if hist.ndim < 1 or int(hist.shape[0]) <= 0:
             raise ValueError(f"hist must include a batch dimension, got {tuple(hist.shape)}.")
+        if not hist.is_floating_point() or not torch.isfinite(hist).all():
+            raise ValueError("hist must contain finite floating-point values.")
         return torch.randn(
             int(hist.shape[0]),
             int(self.flow_map.cfg.sample_state_dim),

@@ -44,7 +44,7 @@ from genode.data.otflow_paths import (
     display_project_path,
     lobster_synthetic_profile_path,
     long_term_st_data_path,
-    project_results_root,
+    project_outputs_root,
     resolve_project_path,
 )
 from genode.runtime import ProgressBar
@@ -71,7 +71,7 @@ DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION = 0.70
 DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION = 0.10
 
 UNIFORM_SCHEDULER_KEY = "uniform"
-DEFAULT_SHARED_BACKBONE_ROOT = project_results_root() / "shared_backbones" / "otflow_fullhorizon_seed0"
+DEFAULT_SHARED_BACKBONE_ROOT = project_outputs_root() / "shared_backbones" / "otflow_fullhorizon_seed0"
 DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE = "transformer"
 DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS = 20_000
 TEMPORAL_ROLLOUT_MODE = "non_ar"
@@ -1604,9 +1604,7 @@ __all__ = [
     "load_conditional_generation_checkpoint_splits",
     "load_forecast_checkpoint_splits",
     "parse_conditional_generation_datasets",
-    "parse_csv",
     "parse_forecast_datasets",
-    "parse_int_csv",
     "resolve_reference_macro_steps",
     "resolved_eval_horizon",
     "resolved_future_block_len",

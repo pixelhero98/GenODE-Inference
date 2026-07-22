@@ -13,6 +13,7 @@ import torch
 from genode.evaluation import diffusion_flow_time_reparameterization as runner
 from genode.evaluation.otflow_evaluation_support import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
 from genode.gipo import evaluate_schedule_summary
+from genode.gipo import train_gipo as train_gipo_module
 from genode.gipo.evaluate_schedule_summary import build_comparison_summary
 from genode.gipo.objectives import (
     CONDITIONAL_METRIC_SPECS,
@@ -37,6 +38,7 @@ from genode.gipo.policy import (
     stable_context_id,
 )
 from genode.gipo import report_locked_test
+from genode.provenance import file_sha256
 from genode.gipo.ablation_plan import (
     ABLATION_PRESET_ALL,
     GIPO_POLICY_KEY,
@@ -49,11 +51,13 @@ from genode.gipo.train_gipo import (
     _merge_embedding_tables_guarded,
     resolve_teacher_metric_target_keys,
     _rows_for_context_keys,
-    _sample_context_keys_by_checkpoint,
+    _sample_context_keys_by_scope,
     _split_membership_summary,
     _validate_context_embedding_checkpoint_scope,
     _validate_support_group_counts,
+    _validate_train_tuning_rows,
     _validate_unique_schedule_rows,
+    _write_training_bundle,
     train_gipo,
 )
 from genode.gipo.preflight import _context_identity_fingerprint
@@ -129,6 +133,7 @@ class GenericContextGipoTests(unittest.TestCase):
                 "target_nfe",
                 "scheduler_key",
                 "context_id",
+                "context_embedding_kind",
                 "series_id",
                 "target_t",
                 "forecast_crps",
@@ -150,6 +155,7 @@ class GenericContextGipoTests(unittest.TestCase):
                                     "target_nfe": nfe,
                                     "scheduler_key": scheduler_key,
                                     "context_id": f"ctx_{ctx_idx}",
+                                    "context_embedding_kind": "ctx_summary",
                                     "series_id": f"series_{ctx_idx}",
                                     "target_t": 100 + ctx_idx,
                                     "forecast_crps": crps,
@@ -164,9 +170,13 @@ class GenericContextGipoTests(unittest.TestCase):
             embeddings = root / "context_embeddings.npz"
             write_rows(seen_rows, (4, 8, 12, 16))
             write_rows(unseen_target_rows, (6, 10, 14, 20))
+            with seen_rows.open("r", newline="", encoding="utf-8") as fh:
+                embedding_context_rows = [dict(row) for row in csv.DictReader(fh)]
             save_context_embedding_table(
                 embeddings,
                 {"ctx_0": [0.0, 1.0], "ctx_1": [1.0, 0.0], "ctx_2": [0.5, 0.5]},
+                metadata={"context_embedding_kind": "ctx_summary"},
+                context_rows=embedding_context_rows,
             )
             args = SimpleNamespace(
                 rows_csv=str(seen_rows),
@@ -231,6 +241,25 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertTrue(unseen_target_summary["unseen_target_distillation_used"])
         self.assertEqual(unseen_target_summary["unseen_target_nfes"], [6, 10, 14, 20])
         self.assertEqual(unseen_target_summary["student_target_mixture_mode"], "full")
+        selection = summary["teacher_checkpoint_selection"]
+        self.assertEqual(len(selection["history"]), 1)
+        provenance = selection["selector_provenance"]
+        self.assertTrue(provenance["single_trajectory"])
+        self.assertEqual(provenance["seed"], 101)
+        self.assertEqual(
+            provenance["diagnostic_splits"],
+            ["context_disjoint", "density_family_holdout"],
+        )
+        self.assertEqual(
+            selection["selection_effective_axis_weights"],
+            {"context": 0.5, "density_family": 0.5, "unseen_nfe": 0.0},
+        )
+        self.assertTrue(summary["teacher_final_retrain"]["enabled"])
+        self.assertEqual(summary["teacher_final_retrain"]["seed"], 0)
+        self.assertEqual(
+            summary["teacher_final_retrain"]["selected_step"],
+            selection["selected_step"],
+        )
 
     def test_conditional_context_rows_use_physical_ids_and_checkpoint_scoped_embeddings(self) -> None:
         rows = runner._conditional_context_records(
@@ -535,7 +564,7 @@ class GenericContextGipoTests(unittest.TestCase):
                         }
                     )
 
-        selected = _sample_context_keys_by_checkpoint(rows, sample_count=1, seed=17)
+        selected = _sample_context_keys_by_scope(rows, sample_count=1, seed=17)
         sampled_rows = _rows_for_context_keys(rows, selected)
         summary = _context_sampling_summary(rows, selected, sample_count=1)
 
@@ -646,6 +675,27 @@ class GenericContextGipoTests(unittest.TestCase):
                 runner._load_context_rows(path)
             with self.assertRaisesRegex(ValueError, "Duplicate context row signature"):
                 evaluate_schedule_summary._load_context_rows(path)
+
+    def test_schedule_evaluator_context_csv_preserves_embedding_kind(self) -> None:
+        row = {
+            field: ""
+            for field in evaluate_schedule_summary.CONTEXT_ROW_FIELDS
+        }
+        row.update(
+            {
+                "row_signature": "sig",
+                "context_id": "ctx",
+                "context_embedding_id": "ckpt:ctx",
+                "context_embedding_kind": "ctx_summary",
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "context_rows.csv"
+            evaluate_schedule_summary._write_context_csv(path, [row])
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                written = next(csv.DictReader(handle))
+
+        self.assertEqual(written["context_embedding_kind"], "ctx_summary")
 
     def test_masked_teacher_targets_and_scalarization_match_composite(self) -> None:
         row = {
@@ -815,6 +865,50 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertAlmostEqual(float(aggregated[0]["temporal_uw1"]), 0.3)
         with self.assertRaises(ValueError):
             report_locked_test._benchmark_family_from_rows([rows[0], {"benchmark_family": FORECAST_FAMILY}])
+        with self.assertRaisesRegex(ValueError, "require explicit benchmark_family"):
+            report_locked_test._benchmark_family_from_rows(
+                [rows[0], {"benchmark_family": ""}],
+                requested=CONDITIONAL_GENERATION_FAMILY,
+            )
+
+    def test_locked_test_split_cannot_hide_behind_blank_alias(self) -> None:
+        row = {
+            "source_split_phase": "train_tuning",
+            "split_phase": "",
+            "split": "locked_test",
+            "scenario_key": "lobster_synthetic",
+        }
+        with self.assertRaisesRegex(ValueError, "conflicting split phase"):
+            _validate_train_tuning_rows([row], label="test")
+        with self.assertRaisesRegex(ValueError, "conflicting split phase"):
+            report_locked_test._validate_context_rows(
+                [row],
+                split_phase="validation_tuning",
+                selection_mode=report_locked_test.SELECTION_MODE_CALIBRATION,
+            )
+
+    def test_calibration_report_keeps_source_and_report_splits_distinct(self) -> None:
+        fields = report_locked_test._report_context_split_fields(
+            source_split_phase="train_tuning",
+            report_split="context_disjoint",
+        )
+
+        self.assertEqual(fields["split_phase"], "train_tuning")
+        self.assertEqual(fields["source_split_phase"], "train_tuning")
+        self.assertEqual(fields["report_split"], "context_disjoint")
+        self.assertEqual(report_locked_test._source_split_phase(fields), "train_tuning")
+        self.assertEqual(report_locked_test._selection_split(fields), "context_disjoint")
+
+    def test_gipo_step_budget_metadata_rejects_fractional_or_boolean_values(self) -> None:
+        for checkpoint_value, summary_value in ((500.5, 500), (True, 1)):
+            with self.subTest(
+                checkpoint_value=checkpoint_value,
+                summary_value=summary_value,
+            ), self.assertRaisesRegex(ValueError, "must be an integer"):
+                report_locked_test._gipo_step_budget_metadata(
+                    {"gipo_step_budget": checkpoint_value},
+                    {"gipo_step_budget": summary_value},
+                )
 
     def test_locked_reporter_infers_manual_matrix_selectors_from_context_rows(self) -> None:
         rows = [
@@ -1084,6 +1178,7 @@ class GenericContextGipoTests(unittest.TestCase):
                 "scheduler_key": "uniform",
                 "context_id": f"ctx-{target_nfe}",
                 "context_embedding_id": f"ckpt:ctx-{target_nfe}",
+                "context_embedding_kind": "ctx_summary",
                 "checkpoint_id": "ckpt",
                 "locked_test_mode": "full",
                 "locked_test_context_limit": "",
@@ -1105,6 +1200,8 @@ class GenericContextGipoTests(unittest.TestCase):
                 writer.writeheader()
                 writer.writerows(rows)
             training_summary = tmp / "gipo_training_summary.json"
+            student_checkpoint = tmp / "gipo_student.pt"
+            student_checkpoint.write_bytes(b"student-checkpoint")
             training_summary.write_text(
                 json.dumps(
                     {
@@ -1112,7 +1209,11 @@ class GenericContextGipoTests(unittest.TestCase):
                         "student_policy_key": GIPO_POLICY_KEY,
                         "gipo_step_budget": 500,
                         "mode": "continuous",
+                        "context_embedding_kind": "ctx_summary",
+                        "scenario_key": "solar_energy_10m",
+                        "benchmark_family": FORECAST_FAMILY,
                         "locked_test_used_for_selection": False,
+                        "gipo_student_checkpoint_sha256": file_sha256(student_checkpoint),
                     }
                 ),
                 encoding="utf-8",
@@ -1146,6 +1247,9 @@ class GenericContextGipoTests(unittest.TestCase):
                         "student_policy_key": GIPO_POLICY_KEY,
                         "gipo_step_budget": 500,
                         "mode": "continuous",
+                        "context_embedding_kind": "ctx_summary",
+                        "scenario_key": "solar_energy_10m",
+                        "benchmark_family": FORECAST_FAMILY,
                     },
                 ),
             ):
@@ -1169,6 +1273,7 @@ class GenericContextGipoTests(unittest.TestCase):
                 "scheduler_key": "ser_ptg_local_defect_eta005",
                 "context_id": "ctx-4",
                 "context_embedding_id": "ckpt:ctx-4",
+                "context_embedding_kind": "ctx_summary",
                 "checkpoint_id": "ckpt",
                 "locked_test_mode": "full",
                 "locked_test_context_limit": "",
@@ -1196,6 +1301,7 @@ class GenericContextGipoTests(unittest.TestCase):
                 "scheduler_key": "uniform",
                 "context_id": "ctx-4",
                 "context_embedding_id": "ckpt:ctx-4",
+                "context_embedding_kind": "ctx_summary",
                 "checkpoint_id": "ckpt",
                 "locked_test_mode": "full",
                 "locked_test_context_limit": "",
@@ -1218,6 +1324,8 @@ class GenericContextGipoTests(unittest.TestCase):
                 writer.writeheader()
                 writer.writerows(context_rows)
             training_summary = tmp / "gipo_training_summary.json"
+            student_checkpoint = tmp / "gipo_student.pt"
+            student_checkpoint.write_bytes(b"student-checkpoint")
             training_summary.write_text(
                 json.dumps(
                     {
@@ -1225,7 +1333,11 @@ class GenericContextGipoTests(unittest.TestCase):
                         "student_policy_key": "custom_gipo",
                         "gipo_step_budget": 500,
                         "mode": "continuous",
+                        "context_embedding_kind": "ctx_summary",
+                        "scenario_key": "solar_energy_10m",
+                        "benchmark_family": FORECAST_FAMILY,
                         "locked_test_used_for_selection": False,
+                        "gipo_student_checkpoint_sha256": file_sha256(student_checkpoint),
                     }
                 ),
                 encoding="utf-8",
@@ -1270,6 +1382,9 @@ class GenericContextGipoTests(unittest.TestCase):
                             "student_policy_key": "custom_gipo",
                             "gipo_step_budget": 500,
                             "mode": "continuous",
+                            "context_embedding_kind": "ctx_summary",
+                            "scenario_key": "solar_energy_10m",
+                            "benchmark_family": FORECAST_FAMILY,
                         },
                     ),
                 ),
@@ -1524,6 +1639,838 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(summary["skipped_stages"], ["input_preflight"])
         self.assertEqual(summary["executed_stages"], ["ser_summaries"])
 
+    def test_full_pipeline_resume_adopts_verified_flow_map_output_after_interrupt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            run_root.mkdir(parents=True)
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                    "--resume",
+                ]
+            )
+            protocol_hash = full_pipeline._json_hash(
+                full_pipeline._protocol_payload(args)
+            )
+            command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.distillation.training",
+                "--output-checkpoint",
+                str(run_root / "flow_map.pt"),
+            ]
+            stage = full_pipeline.StageCommand(
+                full_pipeline.FLOW_MAP_TRAINING_STAGE,
+                [command],
+                "flow_map_training_manifest.json",
+            )
+            (run_root / "status.json").write_text(
+                json.dumps({"protocol_hash": protocol_hash, "status": "running"}),
+                encoding="utf-8",
+            )
+            (run_root / stage.manifest_name).write_text(
+                json.dumps(
+                    {
+                        "stage": stage.stage,
+                        "status": "running",
+                        "protocol_hash": protocol_hash,
+                        "commands": [
+                            full_pipeline._display_command(
+                                command,
+                                path_base=run_root,
+                            )
+                        ],
+                        "command_hashes": [full_pipeline._command_hash(command)],
+                        "dry_run": False,
+                        "command_results": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(
+                    full_pipeline,
+                    "_validate_inputs_preflight",
+                    return_value={"status": "complete"},
+                ),
+                mock.patch.object(
+                    full_pipeline, "_build_stage_commands", return_value=[stage]
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_flow_map_command_outputs_complete",
+                    return_value=(True, ""),
+                ),
+                mock.patch.object(full_pipeline.subprocess, "run") as run_mock,
+            ):
+                summary = full_pipeline.run_full_pipeline(args)
+
+            manifest = json.loads(
+                (run_root / stage.manifest_name).read_text(encoding="utf-8")
+            )
+
+        run_mock.assert_not_called()
+        self.assertEqual(summary["status"], "complete")
+        self.assertTrue(manifest["command_results"][0]["skipped"])
+        self.assertEqual(manifest["status"], "complete")
+        self.assertEqual(
+            summary["skipped_stages"],
+            [full_pipeline.FLOW_MAP_TRAINING_STAGE],
+        )
+        self.assertEqual(summary["executed_stages"], [])
+
+    def test_full_pipeline_resume_adopts_verified_gipo_train_and_report_outputs_after_interrupt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            run_root.mkdir(parents=True)
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                    "--resume",
+                ]
+            )
+            protocol_hash = full_pipeline._json_hash(
+                full_pipeline._protocol_payload(args)
+            )
+            train_command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.gipo.train_gipo",
+                "--out_dir",
+                str(run_root / "training"),
+            ]
+            report_command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.gipo.report_locked_test",
+                "--out_dir",
+                str(run_root / "report"),
+                "--gipo_student_checkpoint",
+                str(run_root / "training" / "gipo_student.pt"),
+            ]
+            stages = [
+                full_pipeline.StageCommand(
+                    "train_gipo",
+                    [train_command],
+                    "gipo_training_manifest.json",
+                ),
+                full_pipeline.StageCommand(
+                    "report_gipo_locked_test",
+                    [report_command],
+                    "gipo_locked_test_manifest.json",
+                ),
+            ]
+            (run_root / "status.json").write_text(
+                json.dumps({"protocol_hash": protocol_hash, "status": "running"}),
+                encoding="utf-8",
+            )
+            for stage in stages:
+                (run_root / stage.manifest_name).write_text(
+                    json.dumps(
+                        {
+                            "stage": stage.stage,
+                            "status": "running",
+                            "protocol_hash": protocol_hash,
+                            "commands": [
+                                full_pipeline._display_command(
+                                    command,
+                                    path_base=run_root,
+                                )
+                                for command in stage.commands
+                            ],
+                            "command_hashes": [
+                                full_pipeline._command_hash(command)
+                                for command in stage.commands
+                            ],
+                            "dry_run": False,
+                            "command_results": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            with (
+                mock.patch.object(
+                    full_pipeline,
+                    "_validate_inputs_preflight",
+                    return_value={"status": "complete"},
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_build_stage_commands",
+                    return_value=stages,
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_gipo_training_command_outputs_complete",
+                    return_value=(True, ""),
+                ) as train_validator,
+                mock.patch.object(
+                    full_pipeline,
+                    "_gipo_report_command_outputs_complete",
+                    return_value=(True, ""),
+                ) as report_validator,
+                mock.patch.object(
+                    full_pipeline,
+                    "_stage_outputs_complete",
+                    return_value=(True, ""),
+                ),
+                mock.patch.object(full_pipeline.subprocess, "run") as run_mock,
+            ):
+                summary = full_pipeline.run_full_pipeline(args)
+
+            manifests = [
+                json.loads(
+                    (run_root / stage.manifest_name).read_text(encoding="utf-8")
+                )
+                for stage in stages
+            ]
+
+        run_mock.assert_not_called()
+        train_validator.assert_called_once_with(train_command)
+        report_validator.assert_called_once_with(report_command)
+        self.assertEqual(
+            summary["skipped_stages"],
+            ["train_gipo", "report_gipo_locked_test"],
+        )
+        self.assertEqual(summary["executed_stages"], [])
+        self.assertTrue(
+            all(manifest["command_results"][0]["skipped"] for manifest in manifests)
+        )
+
+    def test_interrupted_stage_match_rejects_changed_gipo_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir)
+            command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.gipo.train_gipo",
+                "--out_dir",
+                str(run_root / "training"),
+            ]
+            stage = full_pipeline.StageCommand(
+                "train_gipo",
+                [command],
+                "gipo_training_manifest.json",
+            )
+            (run_root / stage.manifest_name).write_text(
+                json.dumps(
+                    {
+                        "stage": stage.stage,
+                        "status": "running",
+                        "protocol_hash": "protocol",
+                        "commands": [
+                            full_pipeline._display_command(
+                                command,
+                                path_base=run_root,
+                            )
+                        ],
+                        "command_hashes": ["stale-command-hash"],
+                        "dry_run": False,
+                        "command_results": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            matches, reason = full_pipeline._interrupted_stage_manifest_matches(
+                run_root,
+                stage,
+                protocol_hash="protocol",
+            )
+
+        self.assertFalse(matches)
+        self.assertIn("command hashes", reason)
+
+    def test_full_pipeline_persists_stage_output_validation_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                ]
+            )
+            command = [full_pipeline.sys.executable, "-c", "print('done')"]
+            stage = full_pipeline.StageCommand(
+                "ser_summaries",
+                [command],
+                "ser_summaries_manifest.json",
+            )
+            with (
+                mock.patch.object(
+                    full_pipeline,
+                    "_validate_inputs_preflight",
+                    return_value={"status": "complete"},
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_build_stage_commands",
+                    return_value=[stage],
+                ),
+                mock.patch.object(
+                    full_pipeline.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0),
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_stage_outputs_complete",
+                    return_value=(False, "missing verified output"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "invalid or incomplete outputs",
+                ):
+                    full_pipeline.run_full_pipeline(args)
+
+            manifest = json.loads(
+                (run_root / stage.manifest_name).read_text(encoding="utf-8")
+            )
+            status = json.loads(
+                (run_root / "status.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(
+            manifest["output_validation_error"],
+            "missing verified output",
+        )
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["failure_reason"], "missing verified output")
+
+    def test_flow_map_quality_exit_two_is_recorded_and_resumable_only_when_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            output_path = run_root / "flow_map" / "quality_report.json"
+            output_path.parent.mkdir(parents=True)
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "performance_claim": False,
+                        "locked_test_used_for_selection": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                ]
+            )
+            command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.distillation.evaluation",
+                "--rows-csv",
+                str(run_root / "rows.csv"),
+                "--output-json",
+                str(output_path),
+                "--quality-protocol-json",
+                str(run_root / "protocol.json"),
+            ]
+            stage = full_pipeline.StageCommand(
+                full_pipeline.FLOW_MAP_EVALUATION_STAGE,
+                [command],
+                "flow_map_evaluation_manifest.json",
+            )
+            observed_statuses: list[str] = []
+
+            def run_command(*_args, **_kwargs):
+                stage_manifest = json.loads(
+                    (run_root / stage.manifest_name).read_text(encoding="utf-8")
+                )
+                observed_statuses.append(str(stage_manifest["status"]))
+                return SimpleNamespace(returncode=2)
+
+            with (
+                mock.patch.object(
+                    full_pipeline,
+                    "_validate_inputs_preflight",
+                    return_value={"status": "complete"},
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_build_stage_commands",
+                    return_value=[stage],
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_accepted_flow_map_quality_rejection",
+                    return_value=(True, ""),
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_stage_outputs_complete",
+                    return_value=(True, ""),
+                ),
+                mock.patch.object(
+                    full_pipeline.subprocess,
+                    "run",
+                    side_effect=run_command,
+                ),
+            ):
+                summary = full_pipeline.run_full_pipeline(args)
+
+            manifest = json.loads(
+                (run_root / stage.manifest_name).read_text(encoding="utf-8")
+            )
+            protocol_hash = str(manifest["protocol_hash"])
+            self.assertEqual(observed_statuses, ["running"])
+            self.assertEqual(summary["status"], "complete")
+            self.assertEqual(manifest["status"], "complete")
+            self.assertEqual(
+                manifest["command_results"][0]["accepted_quality_gate_result"],
+                full_pipeline.QUALITY_GATE_REJECTION_RESULT,
+            )
+
+            with (
+                mock.patch.object(
+                    full_pipeline,
+                    "_accepted_flow_map_quality_rejection",
+                    return_value=(True, ""),
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_stage_outputs_complete",
+                    return_value=(True, ""),
+                ),
+            ):
+                complete, reason = full_pipeline._stage_manifest_complete(
+                    run_root,
+                    stage,
+                    protocol_hash=protocol_hash,
+                )
+            self.assertTrue(complete, reason)
+
+            changed_stage = full_pipeline.StageCommand(
+                stage.stage,
+                [[*command, "--seed", "99"]],
+                stage.manifest_name,
+            )
+            complete, reason = full_pipeline._stage_manifest_complete(
+                run_root,
+                changed_stage,
+                protocol_hash=protocol_hash,
+            )
+            self.assertFalse(complete)
+            self.assertIn("command hashes", reason)
+
+            with mock.patch.object(
+                full_pipeline,
+                "_accepted_flow_map_quality_rejection",
+                return_value=(True, ""),
+            ), mock.patch.object(
+                full_pipeline,
+                "_stage_outputs_complete",
+                return_value=(False, "missing quality report"),
+            ):
+                complete, reason = full_pipeline._stage_manifest_complete(
+                    run_root,
+                    stage,
+                    protocol_hash=protocol_hash,
+                )
+            self.assertFalse(complete)
+            self.assertEqual(reason, "missing quality report")
+
+    def test_flow_map_quality_rejection_requires_failed_no_claim_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "quality_report.json"
+            command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.distillation.evaluation",
+                "--rows-csv",
+                str(Path(tmpdir) / "rows.csv"),
+                "--output-json",
+                str(output_path),
+            ]
+            cases = (
+                (
+                    {
+                        "status": "failed",
+                        "performance_claim": False,
+                        "locked_test_used_for_selection": False,
+                    },
+                    True,
+                ),
+                (
+                    {
+                        "status": "passed",
+                        "performance_claim": False,
+                        "locked_test_used_for_selection": False,
+                    },
+                    False,
+                ),
+                (
+                    {
+                        "status": "failed",
+                        "performance_claim": True,
+                        "locked_test_used_for_selection": False,
+                    },
+                    False,
+                ),
+                (
+                    {
+                        "status": "failed",
+                        "performance_claim": False,
+                        "locked_test_used_for_selection": True,
+                    },
+                    False,
+                ),
+            )
+            with mock.patch.object(
+                full_pipeline,
+                "_flow_map_command_outputs_complete",
+                return_value=(True, ""),
+            ):
+                for report, expected in cases:
+                    with self.subTest(report=report):
+                        output_path.write_text(json.dumps(report), encoding="utf-8")
+                        accepted, _ = full_pipeline._accepted_flow_map_quality_rejection(
+                            command
+                        )
+                        self.assertEqual(accepted, expected)
+
+    def test_pipeline_json_write_is_atomic_on_replace_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "manifest.json"
+            output_path.write_text('{"status":"old"}', encoding="utf-8")
+            with mock.patch.object(
+                full_pipeline.os,
+                "replace",
+                side_effect=OSError("simulated replace failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "simulated replace failure"):
+                    full_pipeline._write_json(output_path, {"status": "new"})
+            self.assertEqual(
+                json.loads(output_path.read_text(encoding="utf-8")),
+                {"status": "old"},
+            )
+            self.assertEqual(list(Path(tmpdir).glob(".manifest.json.*.tmp")), [])
+
+    def test_gipo_training_resume_validates_both_checkpoint_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "training"
+            out_dir.mkdir()
+            rows_path = Path(tmpdir) / "rows.csv"
+            embeddings_path = Path(tmpdir) / "context_embeddings.npz"
+            rows_path.write_text("context_id\nctx\n", encoding="utf-8")
+            embeddings_path.write_bytes(b"npz")
+            embeddings_path.with_suffix(".npz.manifest.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            command_args = [
+                "--rows_csv",
+                str(rows_path),
+                "--context_embeddings_npz",
+                str(embeddings_path),
+                "--student_policy_key",
+                "gipo",
+                "--out_dir",
+                str(out_dir),
+            ]
+            parsed = train_gipo_module.build_argparser().parse_args(command_args)
+            input_names = (
+                "rows_csv",
+                "context_embeddings_npz",
+                "schedule_summary_json",
+                "teacher_unseen_selection_rows_csv",
+                "teacher_unseen_selection_context_embeddings_npz",
+                "teacher_unseen_selection_schedule_summary_json",
+                "student_unseen_target_rows_csv",
+                "student_unseen_target_context_embeddings_npz",
+                "student_unseen_target_schedule_summary_json",
+            )
+            teacher_path = out_dir / "gipo_teacher.pt"
+            student_path = out_dir / "gipo_student.pt"
+            _write_training_bundle(
+                teacher_path=teacher_path,
+                teacher_payload={"artifact": "teacher"},
+                student_path=student_path,
+                student_payload={"artifact": "student"},
+                summary_path=out_dir / "gipo_training_summary.json",
+                summary_payload={
+                    "status": "completed",
+                    "policy_id": "gipo_test",
+                    "student_policy_key": "gipo",
+                    "training_inputs": {
+                        name: train_gipo_module._artifact_input_summary(
+                            str(getattr(parsed, name))
+                        )
+                        for name in input_names
+                    },
+                    "gipo_step_budget": int(parsed.student_steps),
+                    "seen_target_nfe_values": full_pipeline.parse_int_csv(
+                        str(parsed.seen_target_nfe_values)
+                    ),
+                    "unseen_target_nfe_values": full_pipeline.parse_int_csv(
+                        str(parsed.unseen_target_nfe_values)
+                    ),
+                    "context_sample_count": int(parsed.context_sample_count),
+                },
+            )
+            command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.gipo.train_gipo",
+                *command_args,
+            ]
+            complete, reason = full_pipeline._gipo_training_command_outputs_complete(
+                command
+            )
+            self.assertTrue(complete, reason)
+            rows_path.write_text("context_id\nchanged\n", encoding="utf-8")
+            complete, reason = full_pipeline._gipo_training_command_outputs_complete(
+                command
+            )
+            self.assertFalse(complete)
+            self.assertIn("input fingerprints", reason)
+            rows_path.write_text("context_id\nctx\n", encoding="utf-8")
+            teacher_path.write_bytes(b"mutated")
+            complete, reason = full_pipeline._gipo_training_command_outputs_complete(
+                command
+            )
+            self.assertFalse(complete)
+            self.assertIn("teacher_checkpoint_sha256", reason)
+
+    def test_gipo_report_resume_validates_bound_input_fingerprints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_dir = root / "report"
+            out_dir.mkdir()
+            checkpoint_path = root / "gipo_student.pt"
+            training_summary_path = root / "gipo_training_summary.json"
+            context_rows_path = root / "context_rows.csv"
+            embeddings_path = root / "context_embeddings.npz"
+            baseline_path = root / "baseline.csv"
+            comparator_path = root / "comparator.csv"
+            checkpoint_path.write_bytes(b"student")
+            training_summary_path.write_text("{}", encoding="utf-8")
+            context_rows_path.write_text("context_id\nctx\n", encoding="utf-8")
+            embeddings_path.write_bytes(b"npz")
+            embeddings_path.with_suffix(".npz.manifest.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            baseline_path.write_text("context_id\nctx\n", encoding="utf-8")
+            comparator_path.write_text("context_id\nctx\n", encoding="utf-8")
+            command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.gipo.report_locked_test",
+                "--gipo_student_checkpoint",
+                str(checkpoint_path),
+                "--training_summary",
+                str(training_summary_path),
+                "--context_rows",
+                str(context_rows_path),
+                "--context_embeddings_npz",
+                str(embeddings_path),
+                "--baseline_rows",
+                str(baseline_path),
+                "--comparator_rows",
+                str(comparator_path),
+                "--benchmark_family",
+                CONDITIONAL_GENERATION_FAMILY,
+                "--scenario_key",
+                "lobster_synthetic",
+                "--split_phase",
+                "locked_test",
+                "--target_nfe_values",
+                "4,8",
+                "--checkpoint_step",
+                "4000",
+                "--out_dir",
+                str(out_dir),
+            ]
+            input_options = {
+                "gipo_student_checkpoint": str(checkpoint_path),
+                "training_summary": str(training_summary_path),
+                "context_rows": str(context_rows_path),
+                "context_embeddings_npz": str(embeddings_path),
+                "baseline_rows": str(baseline_path),
+                "comparator_rows": str(comparator_path),
+            }
+            report_inputs = {
+                name: report_locked_test._report_input_fingerprints(value)
+                for name, value in input_options.items()
+            }
+            summary_base = {
+                "gipo_student_checkpoint_sha256": file_sha256(checkpoint_path),
+                "report_inputs": report_inputs,
+                "scenario_key": "lobster_synthetic",
+                "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+                "split_phase": "locked_test",
+                "checkpoint_step": 4000,
+                "target_nfe_values": [4, 8],
+            }
+            (out_dir / "locked_test_gipo_policy_summary.json").write_text(
+                json.dumps(
+                    {
+                        **summary_base,
+                        "comparison_summary_path": "locked_test_gipo_comparison_summary.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (out_dir / "locked_test_gipo_comparison_summary.json").write_text(
+                json.dumps(summary_base),
+                encoding="utf-8",
+            )
+            for name in (
+                "locked_test_gipo_rows.csv",
+                "locked_test_gipo_aggregate_rows.csv",
+                "locked_test_gipo_decisions.csv",
+            ):
+                (out_dir / name).write_text("context_id\nctx\n", encoding="utf-8")
+
+            complete, reason = full_pipeline._gipo_report_command_outputs_complete(
+                command
+            )
+            self.assertTrue(complete, reason)
+            context_rows_path.write_text("context_id\nchanged\n", encoding="utf-8")
+            complete, reason = full_pipeline._gipo_report_command_outputs_complete(
+                command
+            )
+            self.assertFalse(complete)
+            self.assertIn("input fingerprints", reason)
+
+    def test_ser_resume_hashes_selected_checkpoint_and_validates_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifact_root = root / "artifact"
+            artifact_root.mkdir()
+            checkpoint_path = artifact_root / "model.pt"
+            metadata_path = artifact_root / "checkpoint_metadata.json"
+            summary_path = artifact_root / "artifact_summary.json"
+            checkpoint_path.write_bytes(b"checkpoint-one")
+            metadata_path.write_text("{}", encoding="utf-8")
+            summary_path.write_text("{}", encoding="utf-8")
+            backbone_manifest = root / "backbone_manifest.json"
+            backbone_manifest.write_text(
+                json.dumps(
+                    {
+                        "version": "fm_backbone_manifest",
+                        "path_base": "manifest_parent",
+                        "artifacts": [
+                            {
+                                "backbone_name": "otflow",
+                                "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+                                "dataset_key": "lobster_synthetic",
+                                "train_steps": 4000,
+                                "status": "ready",
+                                "checkpoint_id": "lobster_synthetic_4000",
+                                "checkpoint_path": "artifact/model.pt",
+                                "metadata_path": "artifact/checkpoint_metadata.json",
+                                "summary_path": "artifact/artifact_summary.json",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            profile_path = root / "lobster_profile.json"
+            profile_path.write_text("{}", encoding="utf-8")
+            out_dir = root / "ser"
+            out_dir.mkdir()
+            command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.gipo.ser_ptg_reference",
+                "--scenario_key",
+                "lobster_synthetic",
+                "--solver_names",
+                "euler",
+                "--target_nfe_values",
+                "4",
+                "--seeds",
+                "0",
+                "--reference_split",
+                "train_tuning",
+                "--checkpoint_step",
+                "4000",
+                "--context_sample_count",
+                "3",
+                "--calibration_trace_samples",
+                "1",
+                "--density_floor_eta",
+                "0.05",
+                "--reference_macro_factor",
+                "4.0",
+                "--backbone_manifest",
+                str(backbone_manifest),
+                "--lobster_synthetic_profile_path",
+                str(profile_path),
+                "--out_dir",
+                str(out_dir),
+            ]
+            ser_summary = {
+                "status": "ready",
+                "artifact": "ser_ptg_schedule_summary",
+                "scenario_key": "lobster_synthetic",
+                "example_selection_protocol": full_pipeline.SER_PTG_EXAMPLE_SELECTION_PROTOCOL,
+                "local_defect_trace_protocol": full_pipeline.SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL,
+                "reference_split": "train_tuning",
+                "reference_split_key": "train",
+                "checkpoint_step": 4000,
+                "context_sample_count": 3,
+                "calibration_trace_samples": 1,
+                "density_floor_eta": 0.05,
+                "reference_macro_factor": 4.0,
+                "solver_names": ["euler"],
+                "target_nfe_values": [4],
+                "seeds": [0],
+                "checkpoint_ids": ["lobster_synthetic_4000"],
+                "prediction_count": 1,
+                "predictions": [
+                    {
+                        "solver_key": "euler",
+                        "target_nfe": 4,
+                        "checkpoint_step": 4000,
+                        "reference_split": "train_tuning",
+                    }
+                ],
+            }
+            output_path = out_dir / "ser_ptg_schedule_summary.json"
+            output_path.write_text(json.dumps(ser_summary), encoding="utf-8")
+
+            complete, reason = (
+                full_pipeline._ser_reference_command_outputs_complete(command)
+            )
+            self.assertTrue(complete, reason)
+            first_hash = full_pipeline._command_hash(command)
+            checkpoint_path.write_bytes(b"checkpoint-two")
+            second_hash = full_pipeline._command_hash(command)
+            self.assertNotEqual(first_hash, second_hash)
+
+            ser_summary["prediction_count"] = 0
+            output_path.write_text(json.dumps(ser_summary), encoding="utf-8")
+            complete, reason = (
+                full_pipeline._ser_reference_command_outputs_complete(command)
+            )
+
+        self.assertFalse(complete)
+        self.assertIn("prediction_count", reason)
+
     def test_full_pipeline_resume_reruns_backbone_stage_when_required_artifact_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             run_root = Path(tmpdir) / "run"
@@ -1620,6 +2567,11 @@ class GenericContextGipoTests(unittest.TestCase):
                 mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
                 mock.patch.object(full_pipeline, "_build_stage_commands", return_value=[backbone_stage]),
                 mock.patch.object(full_pipeline, "backbone_manifest_path", return_value=manifest_path),
+                mock.patch.object(
+                    full_pipeline,
+                    "_stage_outputs_complete",
+                    side_effect=[(False, "missing checkpoint"), (True, "")],
+                ),
                 mock.patch.object(full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run_mock,
             ):
                 summary = full_pipeline.run_full_pipeline(args)
@@ -1686,6 +2638,7 @@ class GenericContextGipoTests(unittest.TestCase):
                 mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
                 mock.patch.object(full_pipeline, "_build_stage_commands", return_value=[complete_stage, schedule_stage]),
                 mock.patch.object(full_pipeline, "_schedule_row_command_status", side_effect=schedule_status),
+                mock.patch.object(full_pipeline, "_stage_outputs_complete", return_value=(True, "")),
                 mock.patch.object(full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run_mock,
             ):
                 summary = full_pipeline.run_full_pipeline(args)
@@ -1741,6 +2694,7 @@ class GenericContextGipoTests(unittest.TestCase):
             with (
                 mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
                 mock.patch.object(full_pipeline, "_build_stage_commands", return_value=stages),
+                mock.patch.object(full_pipeline, "_stage_outputs_complete", return_value=(True, "")),
                 mock.patch.object(full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run_mock,
             ):
                 summary = full_pipeline.run_full_pipeline(args)
@@ -1781,6 +2735,7 @@ class GenericContextGipoTests(unittest.TestCase):
             with (
                 mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
                 mock.patch.object(full_pipeline, "_build_stage_commands", return_value=[stage]),
+                mock.patch.object(full_pipeline, "_stage_outputs_complete", return_value=(True, "")),
                 mock.patch.object(full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run_mock,
             ):
                 summary = full_pipeline.run_full_pipeline(args)

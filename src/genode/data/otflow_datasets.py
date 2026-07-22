@@ -160,16 +160,6 @@ def apply_standardizer(x: np.ndarray, mu: np.ndarray, sig: np.ndarray) -> np.nda
     return ((x - mu[None, :]) / sig[None, :]).astype(np.float32)
 
 
-def standardize_params(params: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    mu, sig = fit_standardizer(params)
-    return apply_standardizer(params, mu, sig), mu, sig
-
-
-def standardize_cond(cond: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    mu, sig = fit_standardizer(cond)
-    return apply_standardizer(cond, mu, sig), mu, sig
-
-
 def _future_horizon_from_cfg(cfg: OTFlowConfig) -> int:
     required = 0
     rollout_mode = str(getattr(cfg.model, "rollout_mode", "autoregressive")).strip().lower()
@@ -1469,8 +1459,6 @@ __all__ = [
     "download_lobster_synthetic_profile",
     "load_lobster_synth_profile",
     "validate_lobster_synth_profile",
-    "standardize_params",
-    "standardize_cond",
     "load_l2_npz",
     "fit_standardizer",
     "apply_standardizer",

@@ -20,11 +20,11 @@ from genode.experiment_layout import (
 from genode.data.molecule_xyz import load_molecule_group_manifest, molecule_group_root, trainable_molecule_group_members
 from genode.solver_protocol import (
     SUPPORTED_SOLVER_KEYS,
+    normalize_solver_key,
     normalize_solver_keys,
     solver_eval_multiplier,
     solver_macro_steps,
     solver_order_p,
-    solver_runtime_name,
     target_nfe_for_macro_steps,
     uniform_time_grid,
 )
@@ -583,7 +583,7 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
     train_tuning_reference_examples = int(max(len(ref["checkpoint"]["splits"].get("val", [])) for ref in member_refs))
     predictions: List[Dict[str, Any]] = []
     for solver_idx, solver_key in enumerate(solvers):
-        solver_name = solver_runtime_name(solver_key)
+        solver_name = normalize_solver_key(solver_key)
         solver_p = solver_order_for_ptg(str(solver_key))
         for target_idx, target_nfe in enumerate(target_nfes):
             macro_steps = solver_macro_steps(str(solver_key), int(target_nfe))

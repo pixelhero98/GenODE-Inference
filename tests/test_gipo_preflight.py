@@ -8,21 +8,27 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from genode.experiment_layout import SCENARIO_FAMILY_FORECAST
-from genode.gipo.preflight import build_argparser, main as preflight_main, preflight_gipo_rows, validate_gipo_support_preflight_report
+from genode.experiment_layout import (
+    SCENARIO_FAMILY_CONDITIONAL_GENERATION,
+    SCENARIO_FAMILY_FORECAST,
+)
+from genode.gipo.preflight import build_argparser, main as preflight_main, preflight_gipo_rows
 
 
 SUPPORT_SCHEDULES = ("uniform", "late_power_3")
 ROW_FIELDS = (
     "benchmark_family",
-    "dataset",
+    "scenario_key",
+    "source_split_phase",
     "split_phase",
+    "split",
     "seed",
     "solver_key",
     "target_nfe",
     "scheduler_key",
     "context_id",
     "context_embedding_id",
+    "context_embedding_kind",
     "checkpoint_id",
     "series_id",
     "target_t",
@@ -42,13 +48,14 @@ def _row(
     context_idx = int(suffix) if suffix.isdigit() else 0
     return {
         "benchmark_family": SCENARIO_FAMILY_FORECAST,
-        "dataset": "private_forecast_dataset",
+        "scenario_key": "private_forecast_dataset",
         "split_phase": "train_tuning",
         "seed": 0,
         "solver_key": "euler",
         "target_nfe": 4,
         "scheduler_key": scheduler_key,
         "context_id": context_id,
+        "context_embedding_kind": "ctx_summary",
         "series_id": series_id if series_id is not None else f"series_{context_idx}",
         "target_t": target_t if target_t is not None else 100 + context_idx,
         "u_comp_uniform": utility,
@@ -317,17 +324,54 @@ class GipoPreflightTests(unittest.TestCase):
         self.assertGreaterEqual(report["context_count_preflight"]["row_error_count"], 1)
         self.assertIn("Context rows require context_id", report["context_count_preflight"]["row_errors"][0])
 
-    def test_support_preflight_validator_rejects_schedule_grid_load_error(self) -> None:
-        report = {
-            "support_cells": {"bad_group_count": 0},
-            "context_identity": {"conflict_group_count": 0, "conflicts": []},
-            "context_count_preflight": {"errors": []},
-            "schedule_grid_preflight": {"missing_grid_row_count": 0},
-            "schedule_grid_preflight_error": "Schedule summary not found: missing.json",
-        }
+    def test_preflight_rejects_missing_or_mismatched_benchmark_family(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows_csv = Path(tmpdir) / "rows.csv"
+            rows = [
+                _row(f"ctx_{context_idx}", scheduler_key, utility=float(context_idx + 1))
+                for context_idx in range(3)
+                for scheduler_key in SUPPORT_SCHEDULES
+            ]
+            for row in rows:
+                row["scenario_key"] = "traffic_hourly"
+                row["benchmark_family"] = SCENARIO_FAMILY_CONDITIONAL_GENERATION
+            _write_rows(rows_csv, rows)
+            mismatched = _run_preflight(rows_csv)
 
-        with self.assertRaisesRegex(ValueError, "schedule_grid_error"):
-            validate_gipo_support_preflight_report(report)
+            for row in rows:
+                row["benchmark_family"] = ""
+            _write_rows(rows_csv, rows)
+            missing = _run_preflight(rows_csv)
+
+        self.assertEqual(mismatched["status"], "issues_found")
+        self.assertIn("does not match registered scenario", mismatched["scenario_errors"][0])
+        self.assertEqual(missing["status"], "issues_found")
+        self.assertIn("requires explicit benchmark_family", missing["scenario_errors"][0])
+
+    def test_preflight_rejects_conflicting_split_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows_csv = Path(tmpdir) / "rows.csv"
+            rows = [
+                _row(f"ctx_{context_idx}", scheduler_key, utility=float(context_idx + 1))
+                for context_idx in range(3)
+                for scheduler_key in SUPPORT_SCHEDULES
+            ]
+            for row in rows:
+                row.update(
+                    {
+                        "source_split_phase": "train_tuning",
+                        "split_phase": "",
+                        "split": "locked_test",
+                    }
+                )
+            _write_rows(rows_csv, rows)
+
+            report = _run_preflight(rows_csv)
+
+        self.assertEqual(report["status"], "issues_found")
+        self.assertTrue(
+            any("conflicting split phase" in error for error in report["split_provenance_errors"])
+        )
 
 
 if __name__ == "__main__":

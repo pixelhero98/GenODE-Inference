@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+from numbers import Real
 from pathlib import Path
+import pickle
 from typing import Any, Mapping
 
 import numpy as np
 import torch
 
+from genode.checkpoint_validation import (
+    validate_locked_test_exclusion,
+    validate_strict_integer,
+    validate_tensor_state_dict,
+)
 from genode.gipo.density_representation import (
     DENSITY_PROTOCOL,
     validate_reference_grid,
@@ -24,8 +32,87 @@ from genode.gipo.policy import (
     EmbeddingNormalizer,
     build_gipo_student_model,
     normalize_gipo_checkpoint_payload,
+    validate_gipo_teacher_training_metadata,
+    validate_context_embedding_kind,
 )
 from genode.solver_protocol import normalize_solver_nfe_fields
+from genode.models.conditioning import ConditioningCache
+
+
+_STUDENT_MODEL_CONFIG_FIELDS = frozenset(
+    {
+        "architecture",
+        "setting_dim",
+        "density_dim",
+        "context_dim",
+        "hidden_dim",
+        "num_layers",
+        "attention_heads",
+        "dropout",
+        "conditioning_style",
+        "density_token_attention",
+        "density_feature_mean",
+        "density_feature_std",
+    }
+)
+
+
+def _validate_student_model_config(
+    model_config: Mapping[str, Any],
+    *,
+    setting_dim: int,
+    density_dim: int,
+    context_dim: int,
+) -> dict[str, Any]:
+    """Validate the complete normalized config written by a GIPO student."""
+
+    config = dict(model_config)
+    missing = sorted(_STUDENT_MODEL_CONFIG_FIELDS - set(config))
+    unknown = sorted(set(config) - _STUDENT_MODEL_CONFIG_FIELDS)
+    if missing or unknown:
+        raise ValueError(
+            "GIPO student model configuration must be complete; "
+            f"missing={missing}, unknown={unknown}."
+        )
+    expected_dimensions = {
+        "setting_dim": int(setting_dim),
+        "density_dim": int(density_dim),
+        "context_dim": int(context_dim),
+    }
+    for field, expected in expected_dimensions.items():
+        actual = validate_strict_integer(
+            config[field],
+            label=f"GIPO student model_config {field}",
+            minimum=1,
+        )
+        if actual != expected:
+            raise ValueError(
+                f"GIPO student model_config {field}={actual} does not match "
+                f"the checkpoint value {expected}."
+            )
+        config[field] = actual
+    for field in ("hidden_dim", "num_layers", "attention_heads"):
+        config[field] = validate_strict_integer(
+            config[field],
+            label=f"GIPO student model_config {field}",
+            minimum=1,
+        )
+    dropout = config["dropout"]
+    if isinstance(dropout, bool) or not isinstance(dropout, Real):
+        raise ValueError("GIPO student model_config dropout must be numeric.")
+    dropout = float(dropout)
+    if not math.isfinite(dropout) or not 0.0 <= dropout < 1.0:
+        raise ValueError("GIPO student model_config dropout must be finite and in [0, 1).")
+    config["dropout"] = dropout
+    if config["architecture"] != ARCHITECTURE_DENSITY_QUERY_TRANSFORMER:
+        raise ValueError(
+            "GIPO student model_config architecture does not match the student architecture."
+        )
+    if config["density_feature_mean"] is not None or config["density_feature_std"] is not None:
+        raise ValueError(
+            "GIPO student model_config may not contain teacher density-feature statistics."
+        )
+    return config
 
 
 @dataclass(frozen=True)
@@ -57,6 +144,9 @@ class GIPOSchedulePolicy:
         metadata = dict(checkpoint_payload)
         metadata.pop("student_state", None)
         self.checkpoint_payload = metadata
+        self.context_embedding_kind = validate_context_embedding_kind(
+            metadata.get("context_embedding_kind")
+        )
         try:
             parameter = next(student.parameters())
         except StopIteration as exc:
@@ -94,6 +184,28 @@ class GIPOSchedulePolicy:
             self.setting_encoder_config.mode,
             config=self.setting_encoder_config,
         )
+
+    def context_embedding_from_cache(
+        self,
+        conditioning_cache: ConditioningCache | Mapping[str, Any],
+    ) -> torch.Tensor:
+        """Return the backbone cache field that this GIPO checkpoint was trained on."""
+
+        if isinstance(conditioning_cache, Mapping):
+            embedding = conditioning_cache.get(self.context_embedding_kind)
+        else:
+            embedding = getattr(conditioning_cache, self.context_embedding_kind, None)
+        if not torch.is_tensor(embedding) or embedding.ndim != 2:
+            raise ValueError(
+                f"GIPO context embedding {self.context_embedding_kind!r} must have shape "
+                "[batch, context_dim]."
+            )
+        if not embedding.is_floating_point() or not torch.isfinite(embedding).all():
+            raise ValueError(
+                f"GIPO context embedding {self.context_embedding_kind!r} must contain "
+                "finite floating-point values."
+            )
+        return embedding
 
     def _time_grid(self, density_mass: torch.Tensor, *, macro_steps: int) -> torch.Tensor:
         """Invert a batch of piecewise-linear density CDFs without host transfers."""
@@ -139,22 +251,24 @@ class GIPOSchedulePolicy:
     @torch.no_grad()
     def predict(
         self,
-        context_summary: torch.Tensor,
+        context_embedding: torch.Tensor,
         *,
         solver_key: str,
         target_nfe: int,
     ) -> GIPOSchedule:
-        if context_summary.ndim != 2:
+        if context_embedding.ndim != 2:
             raise ValueError(
-                "context_summary must have shape [batch, context_dim], "
-                f"got {tuple(context_summary.shape)}."
+                "context_embedding must have shape [batch, context_dim], "
+                f"got {tuple(context_embedding.shape)}."
             )
-        if not torch.isfinite(context_summary).all():
-            raise ValueError("context_summary contains non-finite values.")
+        if not context_embedding.is_floating_point():
+            raise ValueError("context_embedding must use a floating-point dtype.")
+        if not torch.isfinite(context_embedding).all():
+            raise ValueError("context_embedding contains non-finite values.")
         nfe = normalize_solver_nfe_fields(solver_key, target_nfe, source="GIPO schedule prediction")
-        output_device = context_summary.device
-        output_dtype = context_summary.dtype
-        student_context = context_summary.to(
+        output_device = context_embedding.device
+        output_dtype = context_embedding.dtype
+        student_context = context_embedding.to(
             device=self._student_device,
             dtype=self._student_dtype,
         )
@@ -166,6 +280,8 @@ class GIPOSchedulePolicy:
                 f"normalizer={tuple(mean.shape)}, context={tuple(student_context.shape[1:])}."
             )
         normalized_context = (student_context - mean) / std.clamp_min(1e-6)
+        if not torch.isfinite(normalized_context).all():
+            raise ValueError("GIPO context normalization produced non-finite values.")
         setting_key = (nfe.solver_key, nfe.target_nfe)
         if setting_key not in self._setting_feature_cache:
             self._setting_feature_cache[setting_key] = setting_features(
@@ -182,12 +298,62 @@ class GIPOSchedulePolicy:
                 "GIPO student returned an invalid density shape: "
                 f"{tuple(student_density.shape)}."
             )
+        if (
+            not student_density.is_floating_point()
+            or not torch.isfinite(student_density).all()
+            or bool((student_density < 0.0).any())
+            or not torch.allclose(
+                student_density.sum(dim=-1),
+                torch.ones(
+                    int(student_density.shape[0]),
+                    device=student_density.device,
+                    dtype=student_density.dtype,
+                ),
+                atol=1e-6,
+                rtol=1e-5,
+            )
+        ):
+            raise ValueError(
+                "GIPO student density must be finite, nonnegative, and sum to one."
+            )
         student_time_grid = self._time_grid(
             student_density,
             macro_steps=nfe.macro_steps,
         )
         density_mass = student_density.to(device=output_device, dtype=output_dtype)
         time_grid = student_time_grid.to(device=output_device, dtype=output_dtype)
+        density_tolerance = max(
+            1e-6,
+            4.0 * float(torch.finfo(density_mass.dtype).eps),
+        )
+        if (
+            not torch.isfinite(density_mass).all()
+            or bool((density_mass < 0.0).any())
+            or not torch.allclose(
+                density_mass.sum(dim=-1),
+                torch.ones(
+                    int(density_mass.shape[0]),
+                    device=density_mass.device,
+                    dtype=density_mass.dtype,
+                ),
+                atol=density_tolerance,
+                rtol=density_tolerance,
+            )
+        ):
+            raise ValueError(
+                "GIPO density is invalid in the requested output dtype."
+            )
+        expected_grid_shape = (int(student_context.shape[0]), nfe.macro_steps + 1)
+        if (
+            time_grid.shape != expected_grid_shape
+            or not torch.isfinite(time_grid).all()
+            or not bool((torch.diff(time_grid, dim=-1) > 0.0).all())
+            or not bool((time_grid[:, 0] == 0.0).all())
+            or not bool((time_grid[:, -1] == 1.0).all())
+        ):
+            raise ValueError(
+                "GIPO time grid must be finite, strictly increasing, and span [0, 1]."
+            )
         return GIPOSchedule(
             solver_key=nfe.solver_key,
             target_nfe=nfe.target_nfe,
@@ -206,7 +372,7 @@ def load_gipo_schedule_policy(
     checkpoint_path = Path(path).expanduser().resolve()
     try:
         payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, pickle.UnpicklingError, EOFError) as exc:
         raise ValueError(f"Could not load GIPO checkpoint {checkpoint_path.name!r}: {exc}") from exc
     if not isinstance(payload, Mapping):
         raise ValueError("GIPO student checkpoint must contain a mapping payload.")
@@ -215,15 +381,29 @@ def load_gipo_schedule_policy(
         raise ValueError(
             f"Unsupported GIPO protocol {payload.get('protocol')!r}; expected {GIPO_PROTOCOL!r}."
         )
-    if int(payload.get("model_payload_version", 0)) != MODEL_PAYLOAD_VERSION:
+    if validate_strict_integer(
+        payload.get("model_payload_version"),
+        label="GIPO model_payload_version",
+        minimum=1,
+    ) != MODEL_PAYLOAD_VERSION:
         raise ValueError(
             f"Unsupported GIPO model_payload_version {payload.get('model_payload_version')!r}; "
             f"expected {MODEL_PAYLOAD_VERSION}."
         )
     if str(payload.get("student_policy_type", "")) != "continuous_density":
         raise ValueError("GIPO checkpoint must contain a continuous-density student policy.")
-    if bool(payload.get("locked_test_used_for_selection", False)):
-        raise ValueError("GIPO checkpoint indicates that locked-test data was used for selection.")
+    validate_locked_test_exclusion(
+        payload,
+        label="GIPO checkpoint",
+        required_root_keys=("locked_test_used_for_selection",),
+    )
+    if not str(payload.get("context_embedding_kind", "") or "").strip():
+        raise ValueError("GIPO checkpoint requires an explicit context_embedding_kind.")
+    validate_context_embedding_kind(payload.get("context_embedding_kind"))
+    teacher_training = payload.get("teacher_training")
+    if not isinstance(teacher_training, Mapping):
+        raise ValueError("GIPO checkpoint is missing teacher_training metadata.")
+    validate_gipo_teacher_training_metadata(teacher_training)
     architecture = str(payload.get("student_architecture", ""))
     if architecture != ARCHITECTURE_DENSITY_QUERY_TRANSFORMER:
         raise ValueError(
@@ -233,15 +413,27 @@ def load_gipo_schedule_policy(
     if str(density_metadata.get("density_protocol", "")) != DENSITY_PROTOCOL:
         raise ValueError("GIPO checkpoint is missing density-mass metadata.")
     reference_time_grid = validate_reference_grid(density_metadata.get("reference_time_grid", ()))
-    density_dim = int(payload.get("density_dim", 0))
+    density_dim = validate_strict_integer(
+        payload.get("density_dim"),
+        label="GIPO density_dim",
+        minimum=2,
+    )
     if density_dim != len(reference_time_grid) - 1:
         raise ValueError("GIPO density_dim does not match its reference time grid.")
     encoder_payload = payload.get("setting_encoder_config")
     if not isinstance(encoder_payload, Mapping):
         raise ValueError("GIPO checkpoint is missing its setting encoder configuration.")
-    encoder_config = setting_encoder_config_from_payload(encoder_payload)
+    encoder_config = setting_encoder_config_from_payload(
+        encoder_payload,
+        require_complete=True,
+    )
     expected_setting_dim = setting_feature_dim(encoder_config.mode, config=encoder_config)
-    if int(payload.get("setting_dim", 0)) != expected_setting_dim:
+    setting_dim = validate_strict_integer(
+        payload.get("setting_dim"),
+        label="GIPO setting_dim",
+        minimum=1,
+    )
+    if setting_dim != expected_setting_dim:
         raise ValueError("GIPO setting_dim does not match its setting encoder configuration.")
     normalizer_payload = payload.get("embedding_normalizer")
     if not isinstance(normalizer_payload, Mapping):
@@ -253,26 +445,43 @@ def load_gipo_schedule_policy(
         raise ValueError("GIPO context embedding normalizer contains non-finite values.")
     if np.any(embedding_normalizer.std <= 0.0):
         raise ValueError("GIPO context embedding normalizer must have positive standard deviations.")
-    context_dim = int(payload.get("context_dim", 0))
-    if context_dim <= 0 or embedding_normalizer.mean.shape != (context_dim,):
+    context_dim = validate_strict_integer(
+        payload.get("context_dim"),
+        label="GIPO context_dim",
+        minimum=1,
+    )
+    if embedding_normalizer.mean.shape != (context_dim,):
         raise ValueError("GIPO context_dim does not match its context embedding normalizer.")
     model_config = payload.get("student_model_config")
     state = payload.get("student_state")
     if not isinstance(model_config, Mapping) or not isinstance(state, Mapping):
         raise ValueError("GIPO checkpoint is missing student model configuration or state.")
+    validated_model_config = _validate_student_model_config(
+        model_config,
+        setting_dim=setting_dim,
+        density_dim=density_dim,
+        context_dim=context_dim,
+    )
     student = build_gipo_student_model(
         architecture=architecture,
         setting_dim=expected_setting_dim,
         density_dim=density_dim,
         context_dim=context_dim,
-        model_config=model_config,
+        model_config=validated_model_config,
     ).to(device)
-    result = student.load_state_dict(dict(state), strict=True)
-    if result.missing_keys or result.unexpected_keys:
+    if student.model_config() != validated_model_config:
         raise ValueError(
-            "GIPO student state is incompatible: "
-            f"missing={result.missing_keys}, unexpected={result.unexpected_keys}."
+            "GIPO student model configuration does not match the loaded model."
         )
+    validated_state = validate_tensor_state_dict(
+        state,
+        label="GIPO student state",
+        target_module=student,
+    )
+    try:
+        student.load_state_dict(validated_state, strict=True)
+    except RuntimeError as exc:
+        raise ValueError(f"GIPO student state is incompatible: {exc}") from exc
     student.eval()
     return GIPOSchedulePolicy(
         student,

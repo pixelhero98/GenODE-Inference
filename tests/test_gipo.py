@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,6 +46,7 @@ from genode.gipo.policy import (
     build_gipo_teacher_model,
     build_teacher_weighted_density_targets,
     complete_candidate_group_payload,
+    load_context_embedding_table,
     density_mass_for_row,
     gipo_teacher_diagnostics,
     _density_mass_to_normalized_log_features_torch,
@@ -55,6 +57,7 @@ from genode.gipo.policy import (
     _student_teacher_score_eta,
     nfe_sequence_diagnostic_summary,
     realized_nfe_from_row,
+    save_context_embedding_table,
     teacher_selection_candidate_group_key,
     train_gipo_teacher,
     validate_conditioning_style,
@@ -119,6 +122,126 @@ class _DensityDependentTeacher(torch.nn.Module):
 
 
 class GIPOTests(unittest.TestCase):
+    def test_context_embedding_pair_rolls_back_if_manifest_promotion_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "contexts.npz"
+            manifest_path = path.with_suffix(".npz.manifest.json")
+            save_context_embedding_table(
+                path,
+                {"embedding-a": [0.0, 1.0]},
+                metadata={"context_embedding_kind": "ctx_summary"},
+            )
+            original_npz = path.read_bytes()
+            original_manifest = manifest_path.read_bytes()
+            real_replace = os.replace
+
+            def fail_manifest_promotion(source, destination):
+                if (
+                    Path(destination) == manifest_path
+                    and Path(source).suffix == ".tmp"
+                ):
+                    raise OSError("simulated manifest promotion failure")
+                return real_replace(source, destination)
+
+            with (
+                mock.patch(
+                    "genode.gipo.policy.os.replace",
+                    side_effect=fail_manifest_promotion,
+                ),
+                self.assertRaisesRegex(OSError, "simulated manifest promotion failure"),
+            ):
+                save_context_embedding_table(
+                    path,
+                    {"embedding-b": [1.0, 0.0]},
+                    metadata={"context_embedding_kind": "ctx_summary"},
+                )
+
+            self.assertEqual(path.read_bytes(), original_npz)
+            self.assertEqual(manifest_path.read_bytes(), original_manifest)
+            self.assertEqual(
+                set(load_context_embedding_table(path, require_manifest=True)),
+                {"embedding-a"},
+            )
+
+    def test_context_embedding_manifests_bind_exact_physical_context_coverage(self) -> None:
+        base = {
+            "benchmark_family": "temporal_extrapolation",
+            "scenario_key": "private_forecast_dataset",
+            "split_phase": "train_tuning",
+            "checkpoint_id": "checkpoint-a",
+            "context_schema": "forecast_window",
+            "context_embedding_kind": "ctx_summary",
+            "protocol_hash": "protocol-a",
+        }
+        row_a = {
+            **base,
+            "context_id": "context-a",
+            "context_embedding_id": "embedding-a",
+            "scheduler_key": "uniform",
+            "target_nfe": 4,
+        }
+        repeated_row_a = {
+            **row_a,
+            "scheduler_key": "late_power_3",
+            "target_nfe": 8,
+        }
+        row_b = {
+            **base,
+            "context_id": "context-b",
+            "context_embedding_id": "embedding-b",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = root / "first.npz"
+            second = root / "second.npz"
+            save_context_embedding_table(
+                first,
+                {"embedding-a": [0.0, 1.0]},
+                context_rows=[row_a, repeated_row_a],
+            )
+            save_context_embedding_table(
+                second,
+                {"embedding-b": [1.0, 0.0]},
+                context_rows=[row_b],
+            )
+
+            expected_rows = [row_a, repeated_row_a, row_b]
+            self.assertEqual(
+                set(
+                    load_context_embedding_table(
+                        first,
+                        require_manifest=True,
+                        expected_context_rows=expected_rows,
+                    )
+                ),
+                {"embedding-a"},
+            )
+            self.assertEqual(
+                set(
+                    load_context_embedding_table(
+                        second,
+                        require_manifest=True,
+                        expected_context_rows=expected_rows,
+                    )
+                ),
+                {"embedding-b"},
+            )
+
+            with self.assertRaisesRegex(ValueError, "coverage does not match"):
+                load_context_embedding_table(
+                    first,
+                    require_manifest=True,
+                    expected_context_rows=[
+                        {**row_a, "scenario_key": "different_scenario"},
+                    ],
+                )
+            with self.assertRaisesRegex(ValueError, "ids do not exactly match"):
+                save_context_embedding_table(
+                    root / "extra.npz",
+                    {"embedding-a": [0.0, 1.0], "embedding-b": [1.0, 0.0]},
+                    context_rows=[row_a],
+                )
+
     def test_density_grid_roundtrip_uses_required_64_bins(self) -> None:
         reference = uniform_reference_grid(64)
         source_grid = (0.0, 0.25, 0.5, 1.0)
@@ -166,6 +289,14 @@ class GIPOTests(unittest.TestCase):
         )
 
         self.assertTrue(torch.equal(isolated, mixed_batch[1]))
+
+    def test_setting_features_reject_noninteger_target_nfe(self) -> None:
+        for target_nfe in (4.5, True):
+            with self.subTest(target_nfe=target_nfe), self.assertRaisesRegex(
+                ValueError,
+                "target_nfe must be an integer",
+            ):
+                setting_features("euler", target_nfe)
 
     def test_teacher_diagnostics_candidate_schema_uses_checkpoint_scope(self) -> None:
         diagnostics = gipo_teacher_diagnostics(
@@ -246,6 +377,15 @@ class GIPOTests(unittest.TestCase):
             realized_nfe_from_row({"solver_key": "heun", "target_nfe": 4, "macro_steps": 2}),
             4,
         )
+
+    def test_realized_nfe_fallback_rejects_noninteger_values(self) -> None:
+        self.assertEqual(realized_nfe_from_row({"realized_nfe": "4"}), 4)
+        for value in (4.5, True, "4.5"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError,
+                "realized_nfe must be an integer",
+            ):
+                realized_nfe_from_row({"realized_nfe": value})
 
     def test_torch_density_features_match_numpy_and_keep_gradients(self) -> None:
         reference = uniform_reference_grid(4)
@@ -691,6 +831,37 @@ class GIPOTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "continuous_density"):
                 _load_student_checkpoint(scalar_policy_path)
 
+            malformed_dimensions = (
+                ("setting_dim", float(setting_dim)),
+                ("density_dim", True),
+                ("context_dim", 2.5),
+            )
+            for key, value in malformed_dimensions:
+                with self.subTest(key=key, value=value):
+                    malformed = {**payload, key: value}
+                    with (
+                        mock.patch(
+                            "genode.gipo.report_locked_test.torch.load",
+                            return_value=malformed,
+                        ),
+                        self.assertRaisesRegex(ValueError, "must be an integer"),
+                    ):
+                        _load_student_checkpoint(checkpoint_path)
+
+            malformed_config = dict(payload)
+            malformed_config["student_model_config"] = {
+                **payload["student_model_config"],
+                "hidden_dim": 16.5,
+            }
+            with (
+                mock.patch(
+                    "genode.gipo.report_locked_test.torch.load",
+                    return_value=malformed_config,
+                ),
+                self.assertRaisesRegex(ValueError, "hidden_dim must be an integer"),
+            ):
+                _load_student_checkpoint(checkpoint_path)
+
     def test_locked_report_conditioning_metadata_matches_reference_policy(self) -> None:
         from genode.gipo.report_locked_test import _conditioning_metadata_for_summary
 
@@ -706,6 +877,15 @@ class GIPOTests(unittest.TestCase):
         )
 
         self.assertEqual(metadata, {"conditioning_style": CONDITIONING_STYLE_ADDITIVE_MLP})
+
+    def test_locked_report_rejects_fractional_loaded_checkpoint_step(self) -> None:
+        from genode.gipo.report_locked_test import _validate_loaded_checkpoint_identity
+
+        with self.assertRaisesRegex(ValueError, "checkpoint_step must be an integer"):
+            _validate_loaded_checkpoint_identity(
+                [{"checkpoint_id": "checkpoint-a", "checkpoint_step": "4000"}],
+                {"checkpoint_id": "checkpoint-a", "checkpoint_step": 4000.5},
+            )
 
     def test_teacher_model_config_contains_metric_vector_metadata(self) -> None:
         setting_dim = int(setting_features("euler", 4).numel())

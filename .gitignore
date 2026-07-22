@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 pytest-of-*/
+torchinductor_*/
 .mypy_cache/
 .ruff_cache/
 .coverage

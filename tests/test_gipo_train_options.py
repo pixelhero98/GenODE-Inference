@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from genode.artifact_bundle import bundle_journal_path
 from genode.experiment_layout import (
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
     REFERENCE_SEEN_NFES,
@@ -19,10 +20,15 @@ from genode.gipo.objectives import CONDITIONAL_PRIMARY_LOB_METRIC_SPECS, FORECAS
 from genode.gipo.policy import GIPO_PROTOCOL, save_context_embedding_table
 from genode.gipo.train_gipo import (
     _assert_embedding_overlap_compatible,
+    _merge_schedule_grids_checked,
+    _write_training_bundle,
+    recover_gipo_training_bundle,
     resolve_teacher_metric_target_keys,
     build_argparser,
     train_gipo,
+    validate_gipo_training_bundle,
 )
+from genode.provenance import file_sha256
 
 
 SUPPORT_SCHEDULES = ("uniform", "late_power_3")
@@ -45,6 +51,7 @@ ROW_FIELDS = (
     "scheduler_key",
     "context_id",
     "context_embedding_id",
+    "context_embedding_kind",
     "checkpoint_id",
     "series_id",
     "target_t",
@@ -84,6 +91,7 @@ def _write_rows(
                         "scheduler_key": scheduler_key,
                         "context_id": context_id,
                         "context_embedding_id": context_id,
+                        "context_embedding_kind": "ctx_summary",
                         "checkpoint_id": "",
                         "series_id": f"series_{ctx_idx}",
                         "target_t": 100 + ctx_idx,
@@ -95,10 +103,21 @@ def _write_rows(
                     writer.writerow(row)
 
 
-def _write_embeddings(path: Path, contexts: tuple[str, ...] = ("ctx_0", "ctx_1", "ctx_2")) -> None:
+def _read_rows(path: Path) -> list[dict[str, str]]:
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        return [dict(row) for row in csv.DictReader(fh)]
+
+
+def _write_embeddings(
+    path: Path,
+    rows_path: Path,
+    contexts: tuple[str, ...] = ("ctx_0", "ctx_1", "ctx_2"),
+) -> None:
     save_context_embedding_table(
         path,
         {context_id: [float(idx), 1.0 - float(idx)] for idx, context_id in enumerate(contexts)},
+        metadata={"context_embedding_kind": "ctx_summary"},
+        context_rows=_read_rows(rows_path),
     )
 
 
@@ -138,6 +157,171 @@ def _trainer_args(root: Path, rows_csv: Path, embeddings_npz: Path, *extra: str)
 
 
 class GipoTrainOptionsTests(unittest.TestCase):
+    def test_training_bundle_rolls_back_checkpoints_when_summary_promotion_fails(
+        self,
+    ) -> None:
+        from genode import artifact_bundle
+
+        real_install = artifact_bundle._link_without_overwrite
+        for preexisting in (False, True):
+            with self.subTest(preexisting=preexisting), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                teacher = root / "teacher.pt"
+                student = root / "student.pt"
+                summary = root / "gipo_training_summary.json"
+                if preexisting:
+                    _write_training_bundle(
+                        teacher_path=teacher,
+                        teacher_payload={"artifact": "old teacher"},
+                        student_path=student,
+                        student_payload={"artifact": "old student"},
+                        summary_path=summary,
+                        summary_payload={"status": "completed"},
+                    )
+                old_values = {
+                    path: path.read_bytes()
+                    for path in (teacher, student, summary)
+                    if path.exists()
+                }
+
+                def fail_summary_promotion(source, destination):
+                    source_path = Path(source)
+                    destination_path = Path(destination)
+                    if (
+                        destination_path == summary
+                        and ".bundle-stage-" in source_path.name
+                    ):
+                        raise OSError("simulated summary promotion failure")
+                    return real_install(source_path, destination_path)
+
+                with mock.patch(
+                    "genode.artifact_bundle._link_without_overwrite",
+                    side_effect=fail_summary_promotion,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "summary promotion failure"
+                    ):
+                        _write_training_bundle(
+                            teacher_path=teacher,
+                            teacher_payload={"artifact": "new teacher"},
+                            student_path=student,
+                            student_payload={"artifact": "new student"},
+                            summary_path=summary,
+                            summary_payload={"status": "completed"},
+                            overwrite=preexisting,
+                        )
+
+                for path, old_value in old_values.items():
+                    if preexisting:
+                        self.assertEqual(path.read_bytes(), old_value)
+                    else:
+                        self.assertFalse(path.exists())
+                self.assertFalse(bundle_journal_path(student).exists())
+                self.assertFalse(list(root.glob(".*.bundle-stage-*.tmp")))
+                self.assertFalse(list(root.glob(".*.bundle-backup-*")))
+
+    def test_training_bundle_refuses_to_overwrite_complete_existing_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            teacher = root / "gipo_teacher.pt"
+            student = root / "gipo_student.pt"
+            summary = root / "gipo_training_summary.json"
+            first = _write_training_bundle(
+                teacher_path=teacher,
+                teacher_payload={"artifact": "teacher"},
+                student_path=student,
+                student_payload={"artifact": "student"},
+                summary_path=summary,
+                summary_payload={"status": "completed"},
+            )
+            original = {path: path.read_bytes() for path in (teacher, student, summary)}
+
+            with self.assertRaisesRegex(FileExistsError, "Refusing to overwrite"):
+                _write_training_bundle(
+                    teacher_path=teacher,
+                    teacher_payload={"artifact": "replacement teacher"},
+                    student_path=student,
+                    student_payload={"artifact": "replacement student"},
+                    summary_path=summary,
+                    summary_payload={"status": "completed"},
+                )
+
+            self.assertEqual(first["gipo_student_checkpoint_sha256"], file_sha256(student))
+            for path, content in original.items():
+                self.assertEqual(path.read_bytes(), content)
+
+    def test_training_bundle_restart_finishes_committed_cleanup(self) -> None:
+        from genode import artifact_bundle
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            teacher = root / "gipo_teacher.pt"
+            student = root / "gipo_student.pt"
+            summary = root / "gipo_training_summary.json"
+            real_cleanup = artifact_bundle._cleanup_finalized_transaction
+            with mock.patch(
+                "genode.artifact_bundle._cleanup_finalized_transaction",
+                side_effect=OSError("simulated interruption after commit"),
+            ):
+                with self.assertRaisesRegex(OSError, "interruption after commit"):
+                    _write_training_bundle(
+                        teacher_path=teacher,
+                        teacher_payload={"artifact": "teacher"},
+                        student_path=student,
+                        student_payload={"artifact": "student"},
+                        summary_path=summary,
+                        summary_payload={"status": "completed"},
+                    )
+
+            self.assertTrue(bundle_journal_path(student).is_file())
+            self.assertTrue(all(path.is_file() for path in (teacher, student, summary)))
+            with mock.patch(
+                "genode.artifact_bundle._cleanup_finalized_transaction",
+                side_effect=real_cleanup,
+            ):
+                recover_gipo_training_bundle(root)
+            self.assertFalse(bundle_journal_path(student).exists())
+            self.assertFalse(list(root.glob(".*.bundle-stage-*.tmp")))
+
+    def test_training_bundle_rejects_edited_summary_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            teacher = root / "gipo_teacher.pt"
+            student = root / "gipo_student.pt"
+            summary = root / "gipo_training_summary.json"
+            _write_training_bundle(
+                teacher_path=teacher,
+                teacher_payload={"artifact": "teacher"},
+                student_path=student,
+                student_payload={"artifact": "student"},
+                summary_path=summary,
+                summary_payload={
+                    "status": "completed",
+                    "student_policy_key": "gipo",
+                },
+            )
+            edited = json.loads(summary.read_text(encoding="utf-8"))
+            edited["student_policy_key"] = "edited"
+            summary.write_text(json.dumps(edited), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "semantic hash does not match"):
+                validate_gipo_training_bundle(root)
+
+    def test_schedule_grid_merge_rejects_conflicting_overlap(self) -> None:
+        key = ("uniform", "euler", 4)
+        destination = {key: (0.0, 0.25, 0.5, 0.75, 1.0)}
+        _merge_schedule_grids_checked(
+            destination,
+            {key: destination[key]},
+            label="matching summaries",
+        )
+        with self.assertRaisesRegex(ValueError, "Conflicting schedule grid"):
+            _merge_schedule_grids_checked(
+                destination,
+                {key: (0.0, 0.1, 0.4, 0.8, 1.0)},
+                label="overlapping summaries",
+            )
+
     def test_parser_defaults_keep_reference_seen_and_unseen_target_nfes(self) -> None:
         args = build_argparser().parse_args(
             [
@@ -178,7 +362,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             rows_csv = root / "seen.csv"
             embeddings_npz = root / "ctx.npz"
             _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES)
-            _write_embeddings(embeddings_npz)
+            _write_embeddings(embeddings_npz, rows_csv)
             args = build_argparser().parse_args(
                 [
                     "--rows_csv",
@@ -230,7 +414,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             rows_csv = root / "seen.csv"
             embeddings_npz = root / "ctx.npz"
             _write_rows(rows_csv, target_nfes=(5, 7))
-            _write_embeddings(embeddings_npz)
+            _write_embeddings(embeddings_npz, rows_csv)
 
             with self.assertRaisesRegex(ValueError, r"seen calibration NFEs \[4, 8, 12, 16\].*found \[5, 7\]"):
                 train_gipo(_trainer_args(root, rows_csv, embeddings_npz))
@@ -267,6 +451,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
                                         "scheduler_key": scheduler_key,
                                         "context_id": context_id,
                                         "context_embedding_id": f"{checkpoint_id}:{context_id}",
+                                        "context_embedding_kind": "ctx_summary",
                                         "checkpoint_id": checkpoint_id,
                                         "series_id": f"series_{ctx_idx}",
                                         "target_t": 100 + ctx_idx,
@@ -282,6 +467,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
                     for checkpoint_idx, checkpoint_id in enumerate(("ckpt_a", "ckpt_b"))
                     for ctx_idx, context_id in enumerate(contexts)
                 },
+                context_rows=_read_rows(rows_csv),
             )
 
             args = _trainer_args(
@@ -331,6 +517,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
                                         "scheduler_key": scheduler_key,
                                         "context_id": retired_context_id,
                                         "context_embedding_id": retired_context_id,
+                                        "context_embedding_kind": "ctx_summary",
                                         "checkpoint_id": checkpoint_id,
                                         "series_id": f"series_{ctx_idx}",
                                         "target_t": 100 + ctx_idx,
@@ -339,7 +526,11 @@ class GipoTrainOptionsTests(unittest.TestCase):
                                         "u_alt_uniform": "",
                                     }
                                 )
-            save_context_embedding_table(embeddings_npz, embeddings)
+            save_context_embedding_table(
+                embeddings_npz,
+                embeddings,
+                context_rows=_read_rows(rows_csv),
+            )
 
             with self.assertRaisesRegex(ValueError, "physical context_id values without checkpoint prefixes"):
                 train_gipo(_trainer_args(root, rows_csv, embeddings_npz, "--seen_target_nfe_values", "5,7"))
@@ -365,7 +556,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             rows_csv = root / "seen.csv"
             embeddings_npz = root / "ctx.npz"
             _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES, schedules=("uniform", "late_power_3", "flowts_power_sampling"))
-            _write_embeddings(embeddings_npz)
+            _write_embeddings(embeddings_npz, rows_csv)
 
             summary = train_gipo(
                 _trainer_args(
@@ -402,7 +593,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             rows_csv = root / "seen.csv"
             embeddings_npz = root / "ctx.npz"
             _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES)
-            _write_embeddings(embeddings_npz)
+            _write_embeddings(embeddings_npz, rows_csv)
 
             with self.assertRaisesRegex(ValueError, r"Teacher metric target coverage failed.*u_alt_uniform"):
                 train_gipo(
@@ -453,7 +644,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
                     rows_csv = root / "seen.csv"
                     embeddings_npz = root / "ctx.npz"
                     _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES, row_overrides=overrides)
-                    _write_embeddings(embeddings_npz)
+                    _write_embeddings(embeddings_npz, rows_csv)
 
                     with self.assertRaisesRegex(ValueError, pattern):
                         train_gipo(_trainer_args(root, rows_csv, embeddings_npz))
@@ -474,7 +665,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
                     rows_csv = root / "seen.csv"
                     embeddings_npz = root / "ctx.npz"
                     _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES, row_overrides=overrides)
-                    _write_embeddings(embeddings_npz)
+                    _write_embeddings(embeddings_npz, rows_csv)
 
                     with self.assertRaisesRegex(ValueError, pattern):
                         train_gipo(_trainer_args(root, rows_csv, embeddings_npz))
@@ -485,7 +676,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             rows_csv = root / "seen.csv"
             embeddings_npz = root / "ctx.npz"
             _write_rows(rows_csv, target_nfes=REFERENCE_SEEN_NFES, row_overrides={"selected_examples_cap": ""})
-            _write_embeddings(embeddings_npz)
+            _write_embeddings(embeddings_npz, rows_csv)
 
             with self.assertRaisesRegex(ValueError, "must not exceed the reference GIPO supervision cap"):
                 train_gipo(
@@ -520,6 +711,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
                                     "scheduler_key": scheduler_key,
                                     "context_id": context_id,
                                     "context_embedding_id": context_id,
+                                    "context_embedding_kind": "ctx_summary",
                                     "checkpoint_id": "",
                                     "series_id": f"series_{ctx_idx}",
                                     "target_t": 100 + ctx_idx,
@@ -528,7 +720,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
                                     "u_alt_uniform": "",
                                 }
                             )
-            _write_embeddings(embeddings_npz)
+            _write_embeddings(embeddings_npz, rows_csv)
 
             with mock.patch("genode.gipo.train_gipo.train_gipo_teacher") as teacher_train:
                 with self.assertRaisesRegex(ValueError, "rank_pair_preflight.*rankable_pair_count=0"):
@@ -554,7 +746,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             embeddings_npz = root / "ctx.npz"
             _write_rows(seen_csv, target_nfes=REFERENCE_SEEN_NFES)
             _write_rows(unseen_csv, target_nfes=(5, 6, 7))
-            _write_embeddings(embeddings_npz)
+            _write_embeddings(embeddings_npz, seen_csv)
 
             summary = train_gipo(
                 _trainer_args(
@@ -576,7 +768,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
         self.assertEqual(summary["student_unseen_target_distillation"]["target_nfes"], [5, 7])
         self.assertEqual(summary["split_counts"]["student_unseen_target"]["row_count"], 12)
 
-    def test_unused_unseen_embedding_overlap_does_not_block_training(self) -> None:
+    def test_disjoint_unseen_embedding_table_does_not_block_training(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             seen_csv = root / "seen.csv"
@@ -589,15 +781,15 @@ class GipoTrainOptionsTests(unittest.TestCase):
                 target_nfes=REFERENCE_UNSEEN_NFES,
                 contexts=("unseen_ctx_0", "unseen_ctx_1", "unseen_ctx_2"),
             )
-            _write_embeddings(seen_embeddings_npz)
+            _write_embeddings(seen_embeddings_npz, seen_csv)
             save_context_embedding_table(
                 unseen_embeddings_npz,
                 {
                     "unseen_ctx_0": [0.0, 1.0],
                     "unseen_ctx_1": [1.0, 0.0],
                     "unseen_ctx_2": [2.0, -1.0],
-                    "ctx_0": [99.0, 99.0],
                 },
+                context_rows=_read_rows(unseen_csv),
             )
 
             summary = train_gipo(
@@ -624,10 +816,11 @@ class GipoTrainOptionsTests(unittest.TestCase):
             unseen_embeddings_npz = root / "unseen_ctx.npz"
             _write_rows(seen_csv, target_nfes=REFERENCE_SEEN_NFES)
             _write_rows(unseen_csv, target_nfes=REFERENCE_UNSEEN_NFES)
-            _write_embeddings(seen_embeddings_npz)
+            _write_embeddings(seen_embeddings_npz, seen_csv)
             save_context_embedding_table(
                 unseen_embeddings_npz,
                 {"ctx_0": [0.5, 1.0], "ctx_1": [1.0, 0.0], "ctx_2": [2.0, -1.0]},
+                context_rows=_read_rows(unseen_csv),
             )
 
             with self.assertRaisesRegex(ValueError, r"student_unseen_target context embeddings collide.*ctx_0"):
@@ -651,7 +844,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             embeddings_npz = root / "ctx.npz"
             _write_rows(seen_csv, target_nfes=REFERENCE_SEEN_NFES)
             _write_rows(unseen_csv, target_nfes=(6,))
-            _write_embeddings(embeddings_npz)
+            _write_embeddings(embeddings_npz, seen_csv)
 
             with self.assertRaisesRegex(ValueError, r"unseen_target_nfe_values \[5, 7\]"):
                 train_gipo(
@@ -676,7 +869,7 @@ class GipoTrainOptionsTests(unittest.TestCase):
             embeddings_npz = root / "ctx.npz"
             _write_rows(seen_csv, target_nfes=REFERENCE_SEEN_NFES)
             _write_rows(unseen_csv, target_nfes=REFERENCE_UNSEEN_NFES, schedules=("uniform", "ays"))
-            _write_embeddings(embeddings_npz)
+            _write_embeddings(embeddings_npz, seen_csv)
 
             with self.assertRaisesRegex(ValueError, r"missing=\['late_power_3'\], extra=\['ays'\]"):
                 train_gipo(

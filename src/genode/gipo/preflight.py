@@ -27,6 +27,7 @@ from genode.gipo.objectives import (
 from genode.gipo.density_representation import uniform_reference_grid
 from genode.gipo.policy import (
     context_embedding_id_from_row,
+    context_embedding_kind_from_rows,
     context_id_from_row,
     context_pair_key,
     teacher_rank_pair_diagnostics,
@@ -34,6 +35,7 @@ from genode.gipo.policy import (
     validate_teacher_metric_target_keys,
 )
 from genode.gipo.schedule_grids import load_schedule_summary_grids, schedule_grid_coverage_report
+from genode.gipo.schema import validate_declared_split_phase
 from genode.solver_protocol import normalize_solver_key
 
 
@@ -74,16 +76,47 @@ def infer_single_benchmark_family(rows: Sequence[Mapping[str, Any]]) -> str:
 
 
 def infer_single_scenario_key(rows: Sequence[Mapping[str, Any]]) -> str:
+    if not rows:
+        raise ValueError("GIPO training rows may not be empty.")
     if any("dataset" in row or "dataset_key" in row for row in rows):
         raise ValueError("GIPO rows must use 'scenario_key'; 'dataset' and 'dataset_key' are not supported.")
-    scenario_keys = {
-        str(row.get("scenario_key", "")).strip()
-        for row in rows
-        if str(row.get("scenario_key", "")).strip()
-    }
-    if len(scenario_keys) > 1:
+    values = [str(row.get("scenario_key", "") or "").strip() for row in rows]
+    missing = [index for index, value in enumerate(values) if not value]
+    if missing:
+        raise ValueError(
+            f"GIPO training rows require explicit scenario_key values; missing at rows {missing[:8]}."
+        )
+    scenario_keys = set(values)
+    if len(scenario_keys) != 1:
         raise ValueError(f"GIPO training rows must contain exactly one scenario_key; found {sorted(scenario_keys)}.")
-    return next(iter(scenario_keys)) if scenario_keys else ""
+    return next(iter(scenario_keys))
+
+
+def validate_scenario_benchmark_family(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    scenario_key: str,
+    label: str,
+) -> str:
+    """Require one explicit supported family and bind registered scenarios to it."""
+    values = [str(row.get("benchmark_family", "") or "").strip() for row in rows]
+    missing = [index for index, value in enumerate(values) if not value]
+    if missing:
+        raise ValueError(
+            f"{label} requires explicit benchmark_family values; missing at rows "
+            f"{missing[:8]}."
+        )
+    observed_family = infer_single_benchmark_family(rows)
+    try:
+        registered_family = scenario_family_for_key(scenario_key)
+    except KeyError:
+        registered_family = observed_family
+    if observed_family != registered_family:
+        raise ValueError(
+            f"{label} benchmark_family={observed_family!r} does not match registered "
+            f"scenario {scenario_key!r} ({registered_family!r})."
+        )
+    return observed_family
 
 
 def resolve_teacher_metric_target_keys(
@@ -313,7 +346,6 @@ def _identity_conflict_report(
         )
 
     conflicts.extend(checkpoint_scope_conflicts)
-    conflicts.extend(row_errors)
     return conflicts, dirty_rows, row_context_ids, row_errors
 
 
@@ -568,42 +600,6 @@ def _rank_pair_preflight_report(
     }
 
 
-def validate_gipo_support_preflight_report(report: Mapping[str, Any], *, label: str = "GIPO rows") -> None:
-    support_cells = dict(report.get("support_cells", {}) or {})
-    identity = dict(report.get("context_identity", {}) or {})
-    context_count = dict(report.get("context_count_preflight", {}) or {})
-    schedule_grid = dict(report.get("schedule_grid_preflight", {}) or {})
-    teacher_metric_targets = dict(report.get("teacher_metric_targets", {}) or {})
-    rank_pair_preflight = dict(report.get("rank_pair_preflight", {}) or {})
-    bad_group_count = int(support_cells.get("bad_group_count", 0))
-    conflict_count = int(identity.get("conflict_group_count", 0))
-    context_errors = list(context_count.get("errors", []) or [])
-    missing_grid_count = int(schedule_grid.get("missing_grid_row_count", 0) or 0)
-    schedule_grid_error = str(report.get("schedule_grid_preflight_error", "") or "")
-    metric_failure_count = int(teacher_metric_targets.get("failure_count", 0) or 0)
-    rank_pair_error_count = int(rank_pair_preflight.get("error_count", 0) or 0)
-    if (
-        bad_group_count
-        or conflict_count
-        or context_errors
-        or missing_grid_count
-        or schedule_grid_error
-        or metric_failure_count
-        or rank_pair_error_count
-    ):
-        raise ValueError(
-            f"{label} failed GIPO row preflight: "
-            f"bad_support_groups={bad_group_count}, "
-            f"context_identity_conflicts={conflict_count}, "
-            f"context_count_errors={context_errors}, "
-            f"missing_schedule_grid_rows={missing_grid_count}, "
-            f"schedule_grid_error={schedule_grid_error!r}, "
-            f"teacher_metric_target_failures={metric_failure_count}, "
-            f"rank_pair_errors={rank_pair_error_count}, "
-            f"support={support_cells}, first_identity={list(identity.get('conflicts', []) or [])[:1]}."
-        )
-
-
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Preflight GIPO support rows without training.")
     parser.add_argument("--rows_csv", required=True, help="Comma-separated per-example fixed/SER metric rows CSVs.")
@@ -648,12 +644,60 @@ def build_argparser() -> argparse.ArgumentParser:
 def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
     records, fieldnames, inputs = _read_rows_csvs(str(args.rows_csv))
     rows = [record.row for record in records]
+    scenario_key = ""
+    benchmark_family = ""
+    scenario_errors: List[str] = []
+    try:
+        scenario_key = infer_single_scenario_key(rows)
+        benchmark_family = validate_scenario_benchmark_family(
+            rows,
+            scenario_key=scenario_key,
+            label="GIPO preflight rows",
+        )
+    except ValueError as exc:
+        scenario_errors.append(str(exc))
     support_keys = (
         validate_gipo_support_schedule_keys(parse_csv(args.support_schedule_keys))
         if str(args.support_schedule_keys).strip()
         else _observed_support(rows)
     )
     support_set = set(support_keys)
+
+    split_provenance_errors: List[str] = []
+    for record in records:
+        row_label = (
+            f"{display_project_path(record.source_path)}:{record.source_row_number}"
+        )
+        try:
+            source_phase = validate_declared_split_phase(
+                record.row,
+                source=f"GIPO preflight row {row_label}",
+            )
+        except ValueError as exc:
+            split_provenance_errors.append(str(exc))
+            continue
+        if source_phase == "locked_test":
+            split_provenance_errors.append(
+                f"{row_label}: "
+                "locked_test rows are forbidden for GIPO training"
+            )
+        elif source_phase != "train_tuning":
+            split_provenance_errors.append(
+                f"{row_label}: "
+                f"expected explicit train_tuning source rows, got {source_phase or '<missing>'!r}"
+            )
+    context_embedding_kind_errors: List[str] = []
+    try:
+        observed_embedding_kinds = [
+            context_embedding_kind_from_rows(
+                rows,
+                label="GIPO preflight rows",
+                require_explicit=True,
+            )
+        ]
+    except ValueError as exc:
+        observed_embedding_kinds = []
+        context_embedding_kind_errors.append(str(exc))
 
     identity_conflicts, dirty_rows, _, identity_row_errors = _identity_conflict_report(records)
     support, complete_cell_keys, complete_records = _support_report(records, support_keys, dirty_rows)
@@ -693,7 +737,12 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
         "missing_grid_rows": [],
     }
     try:
-        schedule_grids = load_schedule_summary_grids(parse_csv(args.schedule_summary_json))
+        schedule_grids = load_schedule_summary_grids(
+            parse_csv(args.schedule_summary_json),
+            expected_scenario_key=scenario_key or None,
+            expected_reference_split="train_tuning",
+            expected_rows=rows,
+        )
         schedule_grid_report = schedule_grid_coverage_report(
             rows,
             schedule_grids=schedule_grids,
@@ -777,6 +826,13 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
         "context_identity_conflict_count": int(len(identity_conflicts)),
         "context_identity_conflicts": identity_conflicts,
         "identity_row_error_count": int(len(identity_row_errors)),
+        "split_provenance_error_count": int(len(split_provenance_errors)),
+        "split_provenance_errors": split_provenance_errors,
+        "context_embedding_kinds": observed_embedding_kinds,
+        "context_embedding_kind_errors": context_embedding_kind_errors,
+        "scenario_key": scenario_key,
+        "benchmark_family": benchmark_family,
+        "scenario_errors": scenario_errors,
         "report_json": report_json_path,
         "complete_rows_csv": complete_rows_path,
         "complete_rows_row_count": int(len(complete_records)),
@@ -789,6 +845,10 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
         + len(support.get("row_errors", []))
         + len(support.get("support_semantic_errors", []))
         + int(len(identity_conflicts))
+        + int(len(identity_row_errors))
+        + int(len(split_provenance_errors))
+        + int(len(context_embedding_kind_errors))
+        + int(len(scenario_errors))
         + (1 if target_resolution_error else 0)
         + int(metric_target_report.get("failure_count", 0) or 0)
         + int(rank_pair_preflight.get("error_count", 0) or 0)

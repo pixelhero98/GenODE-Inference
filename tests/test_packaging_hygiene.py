@@ -104,9 +104,13 @@ class PackagingHygieneTests(unittest.TestCase):
     def test_existing_long_term_st_manifest_loading_does_not_require_wfdb(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            (root / "series").mkdir()
+            prepared = root / "prepared"
+            (prepared / "series").mkdir(parents=True)
             for series_name in ("s1", "s2", "s3"):
-                np.save(root / "series" / f"{series_name}.npy", np.arange(32, dtype=np.float32))
+                np.save(
+                    prepared / "series" / f"{series_name}.npy",
+                    np.arange(32, dtype=np.float32),
+                )
             manifest = {
                 "dataset_key": LONG_TERM_ST_DATASET_KEY,
                 "history_len": 20,
@@ -147,11 +151,15 @@ class PackagingHygieneTests(unittest.TestCase):
                     },
                 ],
             }
-            (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (prepared / "manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
 
             prepare_long_term_st_dataset = self._prepare_long_term_st_dataset()
             with patch("importlib.util.find_spec", return_value=None):
-                loaded = prepare_long_term_st_dataset(root, history_len=20, horizon=5)
+                loaded = prepare_long_term_st_dataset(
+                    prepared, history_len=20, horizon=5
+                )
 
             self.assertEqual(loaded["dataset_key"], LONG_TERM_ST_DATASET_KEY)
 

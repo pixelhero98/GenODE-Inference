@@ -271,13 +271,29 @@ class MedicalChannelPathTests(unittest.TestCase):
     def test_preparation_rejects_reparse_point_destination_before_reading_archives(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             destination = Path(tmpdir) / "prepared"
-            with mock.patch.object(otflow_medical_datasets, "is_link_or_reparse_point", return_value=True):
+            with (
+                mock.patch.object(
+                    otflow_medical_datasets,
+                    "is_link_or_reparse_point",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    otflow_medical_datasets,
+                    "_coerce_archive_paths",
+                ) as archive_resolution,
+                mock.patch.object(
+                    otflow_medical_datasets,
+                    "medical_staging_root",
+                ) as staging_resolution,
+            ):
                 with self.assertRaisesRegex(ValueError, "prepared destination.*reparse point"):
                     otflow_medical_datasets.prepare_long_term_st_dataset(
                         destination,
                         archive_paths=[],
                         force=True,
                     )
+            archive_resolution.assert_not_called()
+            staging_resolution.assert_not_called()
 
     def test_zip_member_copy_rejects_existing_symlink_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

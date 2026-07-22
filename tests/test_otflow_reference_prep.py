@@ -492,6 +492,7 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
             macro_steps=10,
             solver_key="euler",
             scheduler_key="uniform",
+            context_embedding_kind="ctx_summary",
             details={"reference_macro_steps": 10, "schedule_grid_hash": "grid"},
             metrics={
                 "score_main": 0.4,
@@ -534,8 +535,10 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
         self.assertEqual(row["eval_horizon"], 3000)
         self.assertEqual(row["schedule_grid_hash"], "grid")
         self.assertEqual(row["chosen_examples_hash"], "examples")
+        self.assertEqual(row["context_embedding_kind"], "ctx_summary")
+        self.assertIn("context_embedding_kind", runner.ROW_RECORD_FIELDS)
 
-    def test_row_recorder_drops_stale_protocol_rows(self) -> None:
+    def test_row_recorder_resume_rejects_protocol_mismatch_without_writing(self) -> None:
         manifest = PROJECT_ROOT / "backbone_manifest.json"
         with tempfile.TemporaryDirectory() as tmpdir:
             args = runner.build_argparser().parse_args(
@@ -554,8 +557,11 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
             )
             recorder = runner._init_row_recorder(Path(tmpdir), args)
             recorder["fh"].close()
+            run_config_path = Path(tmpdir) / "run_config.json"
+            original_run_config = run_config_path.read_text(encoding="utf-8")
             row_path = Path(tmpdir) / "rows.jsonl"
-            row_path.write_text('{"protocol_hash":"old","row_status":"complete"}\n', encoding="utf-8")
+            original_rows = '{"protocol_hash":"old","row_status":"complete"}\n'
+            row_path.write_text(original_rows, encoding="utf-8")
 
             args_changed = runner.build_argparser().parse_args(
                 [
@@ -571,9 +577,219 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
                     "8",
                 ]
             )
-            recorder_changed = runner._init_row_recorder(Path(tmpdir), args_changed)
-            recorder_changed["fh"].close()
+            with self.assertRaisesRegex(ValueError, "different protocol"):
+                runner._init_row_recorder(Path(tmpdir), args_changed)
+            self.assertEqual(run_config_path.read_text(encoding="utf-8"), original_run_config)
+            self.assertEqual(row_path.read_text(encoding="utf-8"), original_rows)
+
+    def test_row_recorder_rejects_colliding_context_and_parent_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--write_context_rows",
+                    "--row_csv_name",
+                    "shared.csv",
+                    "--context_row_csv_name",
+                    "shared.csv",
+                ]
+            )
+
+            with self.assertRaisesRegex(ValueError, "pairwise distinct"):
+                runner._init_row_recorder(Path(tmpdir), args)
+
+            self.assertFalse((Path(tmpdir) / "run_config.json").exists())
+
+    def test_runner_rejects_schedule_summary_input_output_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_root = Path(tmpdir)
+            collision_path = out_root / "combined_summary.json"
+            original = b"schedule summary input must remain unchanged\n"
+            collision_path.write_bytes(original)
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    str(out_root),
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--schedule_summary_json",
+                    str(collision_path),
+                ]
+            )
+
+            with self.assertRaisesRegex(ValueError, "input/output_collisions"):
+                runner.run_diffusion_flow_time_reparameterization(args)
+
+            self.assertEqual(collision_path.read_bytes(), original)
+            self.assertFalse((out_root / "run_config.json").exists())
+
+    def test_row_recorder_no_resume_explicitly_replaces_protocol_outputs(self) -> None:
+        manifest = PROJECT_ROOT / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--target_nfe_values",
+                    "4",
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            original_protocol_hash = recorder["protocol_hash"]
+            recorder["fh"].close()
+            row_path = Path(tmpdir) / "rows.jsonl"
+            row_path.write_text(
+                '{"protocol_hash":"old","row_status":"complete"}\n',
+                encoding="utf-8",
+            )
+
+            replacement_args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--target_nfe_values",
+                    "8",
+                    "--no_resume",
+                ]
+            )
+            replacement = runner._init_row_recorder(Path(tmpdir), replacement_args)
+            replacement["fh"].close()
+
+            self.assertNotEqual(replacement["protocol_hash"], original_protocol_hash)
             self.assertEqual(row_path.read_text(encoding="utf-8"), "")
+
+    def test_row_recorder_resume_rejects_journal_without_run_config(self) -> None:
+        manifest = PROJECT_ROOT / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                ]
+            )
+            row_path = Path(tmpdir) / "rows.jsonl"
+            original = '{"protocol_hash":"unknown","row_status":"complete"}\n'
+            row_path.write_text(original, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "without run_config.json"):
+                runner._init_row_recorder(Path(tmpdir), args)
+
+            self.assertFalse((Path(tmpdir) / "run_config.json").exists())
+            self.assertEqual(row_path.read_text(encoding="utf-8"), original)
+
+    def test_row_recorder_resume_rejects_mixed_protocol_journal(self) -> None:
+        manifest = PROJECT_ROOT / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            protocol_hash = recorder["protocol_hash"]
+            recorder["fh"].close()
+            row_path = Path(tmpdir) / "rows.jsonl"
+            journal = (
+                json.dumps({"protocol_hash": protocol_hash, "row_status": "complete"})
+                + "\n"
+                + json.dumps({"protocol_hash": "other", "row_status": "complete"})
+                + "\n"
+            )
+            row_path.write_text(journal, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "different protocol"):
+                runner._init_row_recorder(Path(tmpdir), args)
+            self.assertEqual(row_path.read_text(encoding="utf-8"), journal)
+
+    def test_row_recorder_resume_discards_only_unterminated_final_fragment(self) -> None:
+        manifest = PROJECT_ROOT / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    tmpdir,
+                    "--forecast_datasets",
+                    "",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                ]
+            )
+            recorder = runner._init_row_recorder(Path(tmpdir), args)
+            protocol_hash = recorder["protocol_hash"]
+            recorder["fh"].close()
+            row = {"protocol_hash": protocol_hash, "row_status": "complete"}
+            row_path = Path(tmpdir) / "rows.jsonl"
+            row_path.write_text(
+                json.dumps(row, sort_keys=True) + "\n" + '{"protocol_hash":',
+                encoding="utf-8",
+            )
+
+            resumed = runner._init_row_recorder(Path(tmpdir), args)
+            resumed["fh"].close()
+
+            self.assertEqual(
+                row_path.read_text(encoding="utf-8"),
+                json.dumps(row, sort_keys=True) + "\n",
+            )
+
+    def test_row_loader_rejects_terminated_or_mid_file_corruption(self) -> None:
+        valid = json.dumps({"protocol_hash": "protocol", "row_status": "complete"})
+        malformed = '{"protocol_hash":'
+        for journal in (
+            valid + "\n" + malformed + "\n",
+            valid + "\n" + malformed + "\n" + valid + "\n",
+        ):
+            with self.subTest(journal=journal), tempfile.TemporaryDirectory() as tmpdir:
+                row_path = Path(tmpdir) / "rows.jsonl"
+                row_path.write_text(journal, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "line 2"):
+                    runner._load_rows(row_path, protocol_hash="protocol")
+
+    def test_row_jsonl_compaction_preserves_target_on_serialization_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            row_path = Path(tmpdir) / "rows.jsonl"
+            original = '{"existing":true}\n'
+            row_path.write_text(original, encoding="utf-8")
+
+            with self.assertRaises(TypeError):
+                runner._write_row_jsonl(row_path, [{"not_json": {1}}])
+
+            self.assertEqual(row_path.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(Path(tmpdir).glob(".rows.jsonl.*.tmp")), [])
 
     def test_row_recorder_same_protocol_resume_preserves_rows_jsonl(self) -> None:
         manifest = PROJECT_ROOT / "backbone_manifest.json"
@@ -2217,9 +2433,15 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
             checkpoint_id = str(kwargs["checkpoint"]["checkpoint_id"])
             return [
                 {
+                    "benchmark_family": str(kwargs["benchmark_family"]),
+                    "experiment_layout": runner.EXPERIMENT_LAYOUT_ID,
                     "protocol_hash": protocol_hash,
                     "parent_row_signature": parent,
                     "row_signature": f"{parent}:ctx:{int(t0)}",
+                    "scenario_family": str(kwargs["benchmark_family"]),
+                    "method_key": str(kwargs["details"].get("method_key") or runner.METHOD_KEY),
+                    "nfe_role": str(kwargs["nfe_role"]),
+                    "checkpoint_step": int(kwargs["checkpoint_step"]),
                     "context_id": f"ctx-{int(t0)}",
                     "context_embedding_id": f"{checkpoint_id}:ctx-{int(t0)}",
                     "context_schema": "conditional_generation_window",
@@ -2229,6 +2451,7 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
                     "solver_key": str(kwargs["solver_key"]),
                     "target_nfe": int(kwargs["target_nfe"]),
                     "scheduler_key": str(kwargs["scheduler_key"]),
+                    "schedule_grid_hash": str(kwargs["details"]["schedule_grid_hash"]),
                     "checkpoint_id": checkpoint_id,
                     "target_t": int(t0),
                 }
@@ -2283,6 +2506,64 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
                         seeds=[0],
                         scheduler_cases_by_dataset={"cryptos": [{"scheduler_key": "uniform"}]},
                     )
+                self.assertTrue(
+                    runner._row_has_complete_context_artifacts(
+                        first_rows[0],
+                        context_rows_by_signature=recorder["context_rows_by_signature"],
+                        context_embeddings=recorder["context_embeddings"],
+                    ),
+                    msg={
+                        "parent": first_rows[0],
+                        "context_rows": list(recorder["context_rows_by_signature"].values()),
+                        "embedding_ids": sorted(recorder["context_embeddings"]),
+                    },
+                )
+                persisted_context_rows = runner._load_context_rows(
+                    recorder["context_csv_path"]
+                )
+                persisted_embeddings = runner.load_context_embedding_table(
+                    recorder["context_embeddings_path"],
+                    expected_context_embedding_kind="ctx_summary",
+                    require_manifest=True,
+                    expected_context_rows=list(persisted_context_rows.values()),
+                )
+                identity_fields = (
+                    "benchmark_family",
+                    "experiment_layout",
+                    "scenario_key",
+                    "scenario_family",
+                    "method_key",
+                    "nfe_role",
+                    "checkpoint_step",
+                    "checkpoint_id",
+                    "protocol_hash",
+                    "split_phase",
+                    "seed",
+                    "solver_key",
+                    "target_nfe",
+                    "scheduler_key",
+                    "schedule_grid_hash",
+                    "context_embedding_kind",
+                )
+                identity_mismatches = [
+                    (
+                        field,
+                        str(first_rows[0].get(field, "")),
+                        str(context_row.get(field, "")),
+                    )
+                    for context_row in persisted_context_rows.values()
+                    for field in identity_fields
+                    if str(first_rows[0].get(field, ""))
+                    != str(context_row.get(field, ""))
+                ]
+                self.assertEqual(identity_mismatches, [])
+                self.assertTrue(
+                    runner._row_has_complete_context_artifacts(
+                        first_rows[0],
+                        context_rows_by_signature=persisted_context_rows,
+                        context_embeddings=persisted_embeddings,
+                    )
+                )
             finally:
                 recorder["fh"].close()
 

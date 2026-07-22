@@ -5,7 +5,11 @@ import copy
 import csv
 import hashlib
 import json
+from numbers import Integral
+import os
 from pathlib import Path
+import re
+import tempfile
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -89,12 +93,12 @@ from genode.gipo.objectives import (
 from genode.gipo.models import validate_time_grid
 from genode.solver_protocol import (
     SUPPORTED_SOLVER_KEYS,
+    normalize_solver_key,
     normalize_solver_keys,
     normalize_solver_nfe_fields,
     solver_eval_multiplier,
     solver_experiment_scope,
     solver_macro_steps,
-    solver_runtime_name,
 )
 from genode.data.otflow_experiment_plan import (
     CONDITIONAL_GENERATION_FAMILY,
@@ -119,7 +123,13 @@ from genode.provenance import fingerprint_identity, path_fingerprint
 from genode.path_safety import portable_relative_path, resolve_portable_relative_path
 from genode.models.otflow_train_val import _get_dataset_item_by_t, _parse_batch, save_json
 from genode.runtime import resolve_torch_device
-from genode.gipo.policy import GIPO_PROTOCOL, load_context_embedding_table, save_context_embedding_table
+from genode.gipo.policy import (
+    GIPO_PROTOCOL,
+    context_embedding_table_manifest_path,
+    load_context_embedding_table,
+    save_context_embedding_table,
+    validate_context_embedding_kind,
+)
 from genode.gipo.schedule_hash import schedule_grid_hash
 from genode.gipo.schema import (
     consistent_metadata_value,
@@ -176,6 +186,7 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "scheduler_name",
     "schedule_family",
     "density_source_key",
+    "context_embedding_kind",
     "student_training_mode",
     "row_signature",
     "signal_trace_key",
@@ -307,6 +318,7 @@ CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "target_stop",
     "context_id",
     "context_embedding_id",
+    "context_embedding_kind",
     "checkpoint_id",
     "effective_train_steps",
     "checkpoint_export_protocol",
@@ -471,6 +483,167 @@ def _runner_output_path(out_root: Path, value: Any, *, default: str, label: str)
         label=label,
         reject_links=True,
     )
+
+
+def _validate_recorder_artifact_paths(
+    *,
+    jsonl_path: Path,
+    csv_path: Path,
+    context_csv_path: Path,
+    context_embeddings_path: Path,
+    run_config_path: Path,
+    combined_summary_path: Path,
+    write_context_rows: bool,
+    input_paths: Optional[Mapping[str, Path]] = None,
+) -> None:
+    suffix_checks = [
+        (jsonl_path, ".jsonl", "row JSONL name"),
+        (csv_path, ".csv", "row CSV name"),
+    ]
+    if write_context_rows:
+        suffix_checks.extend(
+            [
+                (context_csv_path, ".csv", "context row CSV name"),
+                (context_embeddings_path, ".npz", "context embeddings NPZ name"),
+            ]
+        )
+    for path, suffix, label in suffix_checks:
+        if path.suffix.lower() != suffix:
+            raise ValueError(f"{label} must end in {suffix!r}.")
+
+    artifacts: Dict[str, Path] = {
+        "row JSONL": jsonl_path,
+        "row CSV": csv_path,
+        "run configuration": run_config_path,
+        "combined summary": combined_summary_path,
+    }
+    if write_context_rows:
+        artifacts.update(
+            {
+                "context-row CSV": context_csv_path,
+                "context embeddings": context_embeddings_path,
+                "context-embedding manifest": context_embedding_table_manifest_path(
+                    context_embeddings_path
+                ),
+            }
+        )
+    names_by_path: Dict[Path, List[str]] = {}
+    for name, path in artifacts.items():
+        names_by_path.setdefault(path.resolve(strict=False), []).append(name)
+    collisions = {
+        str(path): names
+        for path, names in names_by_path.items()
+        if len(names) > 1
+    }
+    input_names_by_path: Dict[Path, List[str]] = {}
+    for name, path in (input_paths or {}).items():
+        input_names_by_path.setdefault(path.resolve(strict=False), []).append(str(name))
+    input_output_collisions = {
+        str(path): {
+            "outputs": names_by_path[path],
+            "inputs": input_names,
+        }
+        for path, input_names in input_names_by_path.items()
+        if path in names_by_path
+    }
+    if collisions or input_output_collisions:
+        raise ValueError(
+            "Evaluation artifact paths must be pairwise distinct, including reserved "
+            "outputs and implicit sidecars, and inputs may not collide with outputs: "
+            f"output_collisions={collisions}, "
+            f"input/output_collisions={input_output_collisions}."
+        )
+
+
+def _runner_input_artifact_paths(cli_args: argparse.Namespace) -> Dict[str, Path]:
+    inputs: Dict[str, Path] = {}
+    for label, value in (
+        ("backbone manifest", getattr(cli_args, "backbone_manifest", "")),
+        ("schedule summary", getattr(cli_args, "schedule_summary_json", "")),
+    ):
+        if str(value).strip():
+            inputs[label] = resolve_project_path(str(value))
+
+    conditional_paths = {
+        "cryptos": str(getattr(cli_args, "cryptos_path", "")).strip()
+        or cryptos_data_path(),
+        "lobster_synthetic": str(
+            getattr(cli_args, "lobster_synthetic_profile_path", "")
+        ).strip()
+        or lobster_synthetic_profile_path(),
+        "long_term_st": str(getattr(cli_args, "long_term_st_path", "")).strip()
+        or long_term_st_data_path(),
+    }
+    for scenario_key in parse_conditional_generation_datasets(
+        str(cli_args.conditional_generation_datasets)
+    ):
+        inputs[f"conditional input {scenario_key}"] = resolve_project_path(
+            str(conditional_paths[scenario_key])
+        )
+
+    dataset_root = resolve_project_path(str(cli_args.dataset_root))
+    for scenario_key in parse_forecast_datasets(str(cli_args.forecast_datasets)):
+        inputs[f"forecast manifest {scenario_key}"] = monash_manifest_path(
+            dataset_root,
+            str(scenario_key),
+        )
+
+    molecule_root = resolve_project_path(
+        str(getattr(cli_args, "molecule_group_root", molecule_group_root()))
+    )
+    for scenario_key in parse_molecule_datasets(
+        str(getattr(cli_args, "molecule_datasets", ""))
+    ):
+        inputs[f"molecule manifest {scenario_key}"] = molecule_group_manifest_path(
+            str(scenario_key),
+            molecule_root,
+        )
+    return inputs
+
+
+def _resolve_recorder_artifact_paths(
+    out_root: Path,
+    cli_args: argparse.Namespace,
+) -> Dict[str, Path]:
+    paths = {
+        "jsonl": _runner_output_path(
+            out_root,
+            getattr(cli_args, "row_jsonl_name", "rows.jsonl"),
+            default="rows.jsonl",
+            label="row JSONL name",
+        ),
+        "csv": _runner_output_path(
+            out_root,
+            getattr(cli_args, "row_csv_name", "rows.csv"),
+            default="rows.csv",
+            label="row CSV name",
+        ),
+        "context_csv": _runner_output_path(
+            out_root,
+            _context_row_csv_name(cli_args),
+            default="context_rows.csv",
+            label="context row CSV name",
+        ),
+        "context_embeddings": _runner_output_path(
+            out_root,
+            _context_embeddings_npz_name(cli_args),
+            default="context_embeddings.npz",
+            label="context embeddings NPZ name",
+        ),
+        "run_config": out_root / "run_config.json",
+        "combined_summary": out_root / "combined_summary.json",
+    }
+    _validate_recorder_artifact_paths(
+        jsonl_path=paths["jsonl"],
+        csv_path=paths["csv"],
+        context_csv_path=paths["context_csv"],
+        context_embeddings_path=paths["context_embeddings"],
+        run_config_path=paths["run_config"],
+        combined_summary_path=paths["combined_summary"],
+        write_context_rows=_write_context_rows_enabled(cli_args),
+        input_paths=_runner_input_artifact_paths(cli_args),
+    )
+    return paths
 
 
 def _parse_schedule_names(text: str) -> List[str]:
@@ -1146,11 +1319,52 @@ def _write_row_csv(csv_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 def _write_row_jsonl(jsonl_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = jsonl_path.with_name(f"{jsonl_path.name}.tmp")
-    with tmp_path.open("w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(dict(row), sort_keys=True) + "\n")
-    tmp_path.replace(jsonl_path)
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            dir=jsonl_path.parent,
+            prefix=f".{jsonl_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            tmp_path = Path(fh.name)
+            for row in rows:
+                fh.write(json.dumps(dict(row), sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp_path.replace(jsonl_path)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def _iter_jsonl_rows(jsonl_path: Path) -> Iterable[Dict[str, Any]]:
+    """Yield JSONL objects, ignoring only an interrupted final record."""
+    with jsonl_path.open("r", encoding="utf-8") as fh:
+        line_number = 0
+        line = fh.readline()
+        while line:
+            line_number += 1
+            next_line = fh.readline()
+            stripped = line.strip()
+            if stripped:
+                try:
+                    row = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    if not next_line and not line.endswith(("\n", "\r")):
+                        return
+                    raise ValueError(
+                        f"Invalid JSONL record in {jsonl_path} at line {line_number}."
+                    ) from exc
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        f"JSONL record in {jsonl_path} at line {line_number} must be an object."
+                    )
+                yield row
+            line = next_line
 
 
 def _write_context_row_csv(csv_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -1193,23 +1407,21 @@ def _load_rows_with_duplicate_report(
     duplicate_extra_count = 0
     if not jsonl_path.exists():
         return rows, {"duplicate_key_count": 0, "duplicate_extra_count": 0, "duplicate_examples": []}
-    with jsonl_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            reject_retired_evaluation_keys(row, source=f"Evaluation row in {jsonl_path}")
-            if str(row.get("protocol_hash", "")) != str(protocol_hash):
-                continue
-            key = _row_key(row)
-            if key in rows:
-                duplicate_extra_count += 1
-                if key not in duplicate_keys:
-                    duplicate_keys.add(key)
-                    if len(duplicate_examples) < 8:
-                        duplicate_examples.append(list(key))
-            rows[key] = row
+    for row in _iter_jsonl_rows(jsonl_path):
+        reject_retired_evaluation_keys(row, source=f"Evaluation row in {jsonl_path}")
+        if str(row.get("protocol_hash", "")) != str(protocol_hash):
+            raise ValueError(
+                "Existing evaluation rows use a different protocol; choose a new "
+                "output directory or rerun with --no_resume to replace prior results."
+            )
+        key = _row_key(row)
+        if key in rows:
+            duplicate_extra_count += 1
+            if key not in duplicate_keys:
+                duplicate_keys.add(key)
+                if len(duplicate_examples) < 8:
+                    duplicate_examples.append(list(key))
+        rows[key] = row
     return rows, {
         "duplicate_key_count": int(len(duplicate_keys)),
         "duplicate_extra_count": int(duplicate_extra_count),
@@ -1219,34 +1431,33 @@ def _load_rows_with_duplicate_report(
 
 def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str, Any]:
     out_root.mkdir(parents=True, exist_ok=True)
-    jsonl_path = _runner_output_path(
-        out_root,
-        getattr(cli_args, "row_jsonl_name", "rows.jsonl"),
-        default="rows.jsonl",
-        label="row JSONL name",
-    )
-    csv_path = _runner_output_path(
-        out_root,
-        getattr(cli_args, "row_csv_name", "rows.csv"),
-        default="rows.csv",
-        label="row CSV name",
-    )
-    context_csv_path = _runner_output_path(
-        out_root,
-        _context_row_csv_name(cli_args),
-        default="context_rows.csv",
-        label="context row CSV name",
-    )
-    context_embeddings_path = _runner_output_path(
-        out_root,
-        _context_embeddings_npz_name(cli_args),
-        default="context_embeddings.npz",
-        label="context embeddings NPZ name",
-    )
+    artifact_paths = _resolve_recorder_artifact_paths(out_root, cli_args)
+    jsonl_path = artifact_paths["jsonl"]
+    csv_path = artifact_paths["csv"]
+    context_csv_path = artifact_paths["context_csv"]
+    context_embeddings_path = artifact_paths["context_embeddings"]
+    run_config_path = artifact_paths["run_config"]
     protocol_hash = _protocol_config_fingerprint(cli_args)
-    run_config_path = out_root / "run_config.json"
-    previous_config = json.loads(run_config_path.read_text(encoding="utf-8")) if run_config_path.exists() else {}
-    can_resume = bool(getattr(cli_args, "resume", True)) and str(previous_config.get("protocol_hash", "")) == protocol_hash
+    resume_requested = bool(getattr(cli_args, "resume", True))
+    if (
+        resume_requested
+        and not run_config_path.exists()
+        and jsonl_path.exists()
+        and jsonl_path.stat().st_size > 0
+    ):
+        raise ValueError(
+            "Cannot resume an existing evaluation journal without run_config.json; "
+            "choose a new output directory or rerun with --no_resume to replace prior results."
+        )
+    can_resume = resume_requested and run_config_path.exists()
+    if can_resume:
+        previous_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+        previous_protocol_hash = str(previous_config.get("protocol_hash", ""))
+        if previous_protocol_hash != protocol_hash:
+            raise ValueError(
+                "Existing run_config.json uses a different protocol; choose a new "
+                "output directory or rerun with --no_resume to replace prior results."
+            )
     rows_by_key = _load_rows(jsonl_path, protocol_hash=str(protocol_hash)) if can_resume else {}
     save_json(
         {
@@ -1260,7 +1471,19 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
         str(run_config_path),
     )
     context_rows_by_signature = _load_context_rows(context_csv_path) if can_resume else {}
-    existing_context_embeddings = load_context_embedding_table(context_embeddings_path) if can_resume and context_embeddings_path.exists() else {}
+    existing_context_embeddings: Dict[str, np.ndarray] = {}
+    if can_resume and context_embeddings_path.exists():
+        try:
+            existing_context_embeddings = load_context_embedding_table(
+                context_embeddings_path,
+                expected_context_embedding_kind=str(
+                    getattr(cli_args, "context_embedding_kind", "ctx_summary")
+                ),
+                require_manifest=True,
+                expected_context_rows=list(context_rows_by_signature.values()),
+            )
+        except ValueError:
+            existing_context_embeddings = {}
     if can_resume and _write_context_rows_enabled(cli_args):
         rows_by_key = {
             key: row
@@ -1271,12 +1494,32 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
                 context_embeddings=existing_context_embeddings,
             )
         }
+        retained_parents = {
+            str(row.get("row_signature", "") or "").strip()
+            for row in rows_by_key.values()
+        }
+        context_rows_by_signature = {
+            signature: row
+            for signature, row in context_rows_by_signature.items()
+            if str(row.get("parent_row_signature", "") or "").strip()
+            in retained_parents
+        }
+        retained_embedding_ids = {
+            str(row.get("context_embedding_id", "") or "").strip()
+            for row in context_rows_by_signature.values()
+            if str(row.get("context_embedding_id", "") or "").strip()
+        }
+        existing_context_embeddings = {
+            key: value
+            for key, value in existing_context_embeddings.items()
+            if key in retained_embedding_ids
+        }
     if can_resume:
         compact_rows = list(rows_by_key.values())
         _write_row_jsonl(jsonl_path, compact_rows)
         _write_row_csv(csv_path, compact_rows)
     fh = jsonl_path.open("a" if can_resume else "w", encoding="utf-8")
-    if context_rows_by_signature:
+    if _write_context_rows_enabled(cli_args):
         _write_context_row_csv(context_csv_path, list(context_rows_by_signature.values()))
     return {
         "out_root": out_root,
@@ -1288,8 +1531,6 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
         "rows_by_key": rows_by_key,
         "context_rows_by_signature": context_rows_by_signature,
         "context_embeddings": existing_context_embeddings,
-        "context_embedding_metadata": {},
-        "context_embedding_coverage": {},
         "protocol_hash": protocol_hash,
     }
 
@@ -1300,6 +1541,7 @@ def _context_row_compatible(existing: Mapping[str, Any], new: Mapping[str, Any])
         "parent_row_signature",
         "context_id",
         "context_embedding_id",
+        "context_embedding_kind",
         "scenario_key",
         "split_phase",
         "seed",
@@ -1317,6 +1559,11 @@ def _context_row_compatible(existing: Mapping[str, Any], new: Mapping[str, Any])
     return True
 
 
+def _identity_field_text(value: Any) -> str:
+    """Normalize persisted identity values without discarding numeric zero."""
+    return "" if value is None or value == "" else str(value)
+
+
 def _row_has_complete_context_artifacts(
     row: Mapping[str, Any],
     *,
@@ -1328,21 +1575,58 @@ def _row_has_complete_context_artifacts(
     parent = str(row.get("row_signature", "") or "").strip()
     if not parent:
         return False
-    protocol_hash = str(row.get("protocol_hash", "") or "")
     rows_for_parent = [
         context_row
         for context_row in context_rows_by_signature.values()
         if str(context_row.get("parent_row_signature", "") or "").strip() == parent
-        and str(context_row.get("protocol_hash", "") or "") == protocol_hash
     ]
     expected = _expected_context_rows_for_parent(row)
-    if expected is None or len(rows_for_parent) < expected:
+    if expected is None or len(rows_for_parent) != expected:
         return False
-    return all(
-        not str(context_row.get("context_embedding_id", "") or "").strip()
-        or str(context_row.get("context_embedding_id", "") or "").strip() in context_embeddings
-        for context_row in rows_for_parent
+    identity_fields = (
+        "benchmark_family",
+        "experiment_layout",
+        "scenario_key",
+        "scenario_family",
+        "method_key",
+        "nfe_role",
+        "checkpoint_step",
+        "checkpoint_id",
+        "protocol_hash",
+        "split_phase",
+        "seed",
+        "solver_key",
+        "target_nfe",
+        "scheduler_key",
+        "schedule_grid_hash",
+        "context_embedding_kind",
     )
+    parent_identity = {
+        field: _identity_field_text(row.get(field, "")) for field in identity_fields
+    }
+    context_ids: set[str] = set()
+    embedding_ids: set[str] = set()
+    for context_row in rows_for_parent:
+        if any(
+            _identity_field_text(context_row.get(field, "")) != value
+            for field, value in parent_identity.items()
+        ):
+            return False
+        context_id = str(context_row.get("context_id", "") or "").strip()
+        embedding_id = str(
+            context_row.get("context_embedding_id", "") or ""
+        ).strip()
+        if (
+            not context_id
+            or context_id in context_ids
+            or not embedding_id
+            or embedding_id in embedding_ids
+            or embedding_id not in context_embeddings
+        ):
+            return False
+        context_ids.add(context_id)
+        embedding_ids.add(embedding_id)
+    return True
 
 
 def _append_row_record(row_recorder: Mapping[str, Any], row: Mapping[str, Any]) -> None:
@@ -1368,20 +1652,38 @@ def _append_context_records(
 ) -> None:
     if not rows and not context_embeddings:
         return
+    context_embedding_kind = validate_context_embedding_kind(
+        metadata.get("context_embedding_kind")
+    )
     rows_by_signature = row_recorder["context_rows_by_signature"]
-    added_row_count = 0
     for row in rows:
         signature = str(row.get("row_signature", "")).strip()
         if not signature:
             continue
+        context_row = {**dict(row), "context_embedding_kind": context_embedding_kind}
+        for field in (
+            "benchmark_family",
+            "scenario_key",
+            "split_phase",
+            "checkpoint_id",
+            "context_schema",
+        ):
+            metadata_value = metadata.get(field, "")
+            if metadata_value in (None, ""):
+                continue
+            row_value = context_row.get(field, "")
+            if row_value not in (None, "") and str(row_value) != str(metadata_value):
+                raise ValueError(
+                    f"Context row {signature!r} has {field}={row_value!r}, which conflicts "
+                    f"with artifact metadata {metadata_value!r}."
+                )
+            context_row[field] = metadata_value
         if signature in rows_by_signature:
-            if not _context_row_compatible(rows_by_signature[signature], row):
+            if not _context_row_compatible(rows_by_signature[signature], context_row):
                 raise ValueError(f"Context row collision for {signature!r} with different values/protocol.")
             continue
-        rows_by_signature[signature] = dict(row)
-        added_row_count += 1
+        rows_by_signature[signature] = context_row
     existing_embeddings = row_recorder["context_embeddings"]
-    added_embedding_count = 0
     for key, value in context_embeddings.items():
         key_text = str(key)
         new_vec = np.asarray(value, dtype=np.float32)
@@ -1391,7 +1693,6 @@ def _append_context_records(
                 raise ValueError(f"Context embedding collision for {key_text!r} with different vector/protocol.")
             continue
         existing_embeddings[key_text] = new_vec.astype(float).tolist()
-        added_embedding_count += 1
     missing_embeddings = sorted(
         {
             str(row.get("context_embedding_id", "") or "").strip()
@@ -1402,34 +1703,13 @@ def _append_context_records(
     )
     if missing_embeddings:
         raise KeyError(f"Context rows are missing embedding vectors: {missing_embeddings[:8]}")
-    coverage_key = "|".join(
-        str(metadata.get(field, ""))
-        for field in ("benchmark_family", "scenario_key", "checkpoint_id", "split_phase", "context_schema")
-    )
-    coverage = row_recorder["context_embedding_coverage"].setdefault(
-        coverage_key,
-        {
-            "benchmark_family": str(metadata.get("benchmark_family", "")),
-            "scenario_key": str(metadata.get("scenario_key", "")),
-            "checkpoint_id": str(metadata.get("checkpoint_id", "")),
-            "checkpoint_step": metadata.get("checkpoint_step", ""),
-            "split_phase": str(metadata.get("split_phase", "")),
-            "context_schema": str(metadata.get("context_schema", "")),
-            "row_count": 0,
-            "embedding_count": 0,
-        },
-    )
-    coverage["row_count"] = int(coverage.get("row_count", 0)) + int(added_row_count)
-    coverage["embedding_count"] = int(coverage.get("embedding_count", 0)) + int(added_embedding_count)
-    row_recorder["context_embedding_metadata"] = {
-        "coverage": sorted(row_recorder["context_embedding_coverage"].values(), key=lambda item: tuple(str(item.get(field, "")) for field in ("benchmark_family", "scenario_key", "checkpoint_id", "split_phase", "context_schema"))),
-    }
     _write_context_row_csv(Path(row_recorder["context_csv_path"]), list(rows_by_signature.values()))
     if row_recorder["context_embeddings"]:
         save_context_embedding_table(
             Path(row_recorder["context_embeddings_path"]),
             row_recorder["context_embeddings"],
-            metadata=row_recorder["context_embedding_metadata"],
+            metadata={"context_embedding_kind": context_embedding_kind},
+            context_rows=list(rows_by_signature.values()),
         )
 
 
@@ -1947,9 +2227,13 @@ def _positive_int_field(row: Mapping[str, Any], field: str) -> Optional[int]:
     value = row.get(field)
     if value in (None, ""):
         return None
-    try:
-        parsed = int(float(value))
-    except (TypeError, ValueError):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Integral):
+        parsed = int(value)
+    elif isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value):
+        parsed = int(value)
+    else:
         return None
     return parsed if parsed > 0 else None
 
@@ -1987,46 +2271,42 @@ def _schedule_context_outputs_complete(
         return False, f"missing context row CSV: {context_csv_path}"
     if not context_embeddings_path.exists():
         return False, f"missing context embedding table: {context_embeddings_path}"
-    context_rows = [
-        row
-        for row in _load_context_rows(context_csv_path).values()
+    context_rows_by_signature = {
+        signature: row
+        for signature, row in _load_context_rows(context_csv_path).items()
         if str(row.get("protocol_hash", "")) == str(protocol_hash)
-    ]
-    context_rows_by_parent: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
-    for row in context_rows:
-        parent = str(row.get("parent_row_signature", "") or "").strip()
-        if parent:
-            context_rows_by_parent[parent].append(row)
-    missing_parent_contexts: List[str] = []
-    short_parent_contexts: List[str] = []
+    }
+    context_rows = list(context_rows_by_signature.values())
+    try:
+        embeddings = load_context_embedding_table(
+            context_embeddings_path,
+            expected_context_embedding_kind=str(
+                getattr(cli_args, "context_embedding_kind", "ctx_summary")
+            ),
+            require_manifest=True,
+            expected_context_rows=context_rows,
+        )
+    except ValueError as exc:
+        return False, f"invalid context embedding artifact: {exc}"
+    expected_parents = {
+        str(row.get("row_signature", "") or "").strip() for row in complete_rows
+    }
+    observed_parents = {
+        str(row.get("parent_row_signature", "") or "").strip()
+        for row in context_rows
+    }
+    if not expected_parents or "" in expected_parents or observed_parents != expected_parents:
+        return False, "context rows do not exactly match the complete parent-row set"
     for row in complete_rows:
-        parent = str(row.get("row_signature", "") or "").strip()
-        if not parent:
-            return False, "complete row is missing row_signature"
-        rows_for_parent = context_rows_by_parent.get(parent, [])
-        if not rows_for_parent:
-            missing_parent_contexts.append(parent)
-            continue
-        expected = _expected_context_rows_for_parent(row)
-        if expected is None:
-            return False, f"cannot prove expected context row count for parent {parent}"
-        if len(rows_for_parent) < expected:
-            short_parent_contexts.append(f"{parent}:{len(rows_for_parent)}/{expected}")
-    if missing_parent_contexts:
-        return False, f"missing context rows for parents: {missing_parent_contexts[:8]}"
-    if short_parent_contexts:
-        return False, f"incomplete context rows for parents: {short_parent_contexts[:8]}"
-    embeddings = load_context_embedding_table(context_embeddings_path)
-    missing_embeddings = sorted(
-        {
-            str(row.get("context_embedding_id", "") or "").strip()
-            for row in context_rows
-            if str(row.get("context_embedding_id", "") or "").strip()
-            and str(row.get("context_embedding_id", "") or "").strip() not in embeddings
-        }
-    )
-    if missing_embeddings:
-        return False, f"missing context embeddings: {missing_embeddings[:8]}"
+        if not _row_has_complete_context_artifacts(
+            row,
+            context_rows_by_signature=context_rows_by_signature,
+            context_embeddings=embeddings,
+        ):
+            return False, (
+                "incomplete or identity-mismatched context artifacts for parent "
+                f"{str(row.get('row_signature', '') or '')}"
+            )
     return True, ""
 
 
@@ -2355,7 +2635,7 @@ def _evaluation_protocol_fields(result_row: Mapping[str, Any], *, eval_horizon: 
     }
 
 
-def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: str, checkpoint: Mapping[str, Any], checkpoint_step: int, nfe_role: str, target_nfe: int, macro_steps: int, solver_key: str, scheduler_key: str, details: Mapping[str, Any], metrics: Mapping[str, Any], row_signature: str, protocol_hash: str) -> Dict[str, Any]:
+def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: str, checkpoint: Mapping[str, Any], checkpoint_step: int, nfe_role: str, target_nfe: int, macro_steps: int, solver_key: str, scheduler_key: str, context_embedding_kind: str, details: Mapping[str, Any], metrics: Mapping[str, Any], row_signature: str, protocol_hash: str) -> Dict[str, Any]:
     selection_metric = selection_metric_for_family(str(benchmark_family))
     nfe = normalize_solver_nfe_fields(
         str(solver_key),
@@ -2398,11 +2678,14 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "target_nfe": int(target_nfe),
         "macro_steps": int(nfe.macro_steps),
         "solver_key": str(solver_key),
-        "solver_name": solver_runtime_name(solver_key),
+        "solver_name": normalize_solver_key(solver_key),
         "scheduler_key": str(scheduler_key),
         "scheduler_name": schedule_display_name(str(scheduler_key)),
         "schedule_family": schedule_family_for_key(str(scheduler_key)),
         "density_source_key": density_source_key_for_schedule(str(scheduler_key)),
+        "context_embedding_kind": validate_context_embedding_kind(
+            context_embedding_kind
+        ),
         "student_training_mode": "",
         "row_signature": str(row_signature),
         "signal_trace_key": None,
@@ -2712,7 +2995,7 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                 model,
                                 eval_ds,
                                 cfg,
-                                solver_name=solver_runtime_name(solver_key),
+                                solver_name=normalize_solver_key(solver_key),
                                 macro_steps=int(macro_steps),
                                 target_nfe=int(target_nfe),
                                 time_grid=details["time_grid"],
@@ -2752,6 +3035,13 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                 macro_steps=int(macro_steps),
                                 solver_key=str(solver_key),
                                 scheduler_key=scheduler_key,
+                                context_embedding_kind=str(
+                                    getattr(
+                                        cli_args,
+                                        "context_embedding_kind",
+                                        "ctx_summary",
+                                    )
+                                ),
                                 details=details,
                                 metrics=metrics,
                                 row_signature=str(case["row_signature"]),
@@ -3006,8 +3296,9 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 "grid_kind": "fixed_diffusion_flow_time_grid",
                                 "selection_group": scheduler_key,
                                 "comparison_role": "transferred" if scheduler_key in TRANSFER_SCHEDULE_KEYS else "baseline",
-                                "solver_name": solver_runtime_name(solver_key),
-                                "nfe": int(macro_steps),
+                                "solver_name": normalize_solver_key(solver_key),
+                                "target_nfe": int(target_nfe),
+                                "macro_steps": int(macro_steps),
                                 "time_grid": details["time_grid"],
                             }
                             metrics_seed = int(seed) + 1_000_000 * dataset_idx + 10_000 * target_idx + solver_idx
@@ -3061,6 +3352,13 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 macro_steps=int(macro_steps),
                                 solver_key=str(solver_key),
                                 scheduler_key=scheduler_key,
+                                context_embedding_kind=str(
+                                    getattr(
+                                        cli_args,
+                                        "context_embedding_kind",
+                                        "ctx_summary",
+                                    )
+                                ),
                                 details=details,
                                 metrics=metrics,
                                 row_signature=str(case["row_signature"]),
@@ -3417,6 +3715,13 @@ def _run_molecule_phase(
                                 macro_steps=int(macro_steps),
                                 solver_key=str(solver_key),
                                 scheduler_key=scheduler_key,
+                                context_embedding_kind=str(
+                                    getattr(
+                                        cli_args,
+                                        "context_embedding_kind",
+                                        "ctx_summary",
+                                    )
+                                ),
                                 details=details,
                                 metrics=row_metrics,
                                 row_signature=str(case["row_signature"]),
@@ -3775,6 +4080,7 @@ def build_argparser() -> argparse.ArgumentParser:
 def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> Dict[str, Any]:
     out_root = resolve_project_path(str(cli_args.out_root))
     out_root.mkdir(parents=True, exist_ok=True)
+    _resolve_recorder_artifact_paths(out_root, cli_args)
     prep_payload = _prep_summary(cli_args)
     if bool(getattr(cli_args, "diagnose_locked_forecast_only", False)):
         rows = list(

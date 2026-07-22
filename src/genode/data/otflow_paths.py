@@ -13,14 +13,10 @@ def project_root() -> Path:
 
 
 def resolve_project_path(path: str | Path) -> Path:
-    raw = normalize_project_relative_path(path).expanduser()
+    raw = Path(path).expanduser()
     if raw.is_absolute():
         return raw.resolve()
     return (project_root() / raw).resolve()
-
-
-def normalize_project_relative_path(path: str | Path) -> Path:
-    return Path(path)
 
 
 def display_project_path(path: str | Path) -> str:
@@ -51,10 +47,6 @@ def project_dataset_root() -> Path:
 
 def project_outputs_root() -> Path:
     return project_root() / "outputs"
-
-
-def project_results_root() -> Path:
-    return project_outputs_root()
 
 
 def project_backbone_matrix_root() -> Path:
