@@ -116,8 +116,9 @@ class BackboneMatrixTests(unittest.TestCase):
             self.assertEqual(payload["molecule_group_root"], "molecule_3d")
             self.assertEqual(payload["molecule_backbone_root"], "molecule_3d_backbones")
             loaded = load_backbone_manifest(manifest_path)
-            self.assertEqual(Path(loaded["matrix_root"]), manifest_path.parent / "matrix")
-            self.assertEqual(Path(loaded["molecule_group_root"]), manifest_path.parent / "molecule_3d")
+            resolved_manifest_root = manifest_path.parent.resolve()
+            self.assertEqual(Path(loaded["matrix_root"]), resolved_manifest_root / "matrix")
+            self.assertEqual(Path(loaded["molecule_group_root"]), resolved_manifest_root / "molecule_3d")
 
     def test_manifest_loader_resolves_paths_from_explicit_base(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -140,10 +141,17 @@ class BackboneMatrixTests(unittest.TestCase):
             manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
             loaded = load_backbone_manifest(manifest_path)
+            resolved_manifest_root = manifest_path.parent.resolve()
 
         artifact = loaded["artifacts"][0]
-        self.assertEqual(Path(artifact["checkpoint_path"]), root / "outputs" / "backbone_matrix" / "example" / "model.pt")
-        self.assertEqual(Path(artifact["summary_path"]), root / "outputs" / "backbone_matrix" / "example" / "artifact_summary.json")
+        self.assertEqual(
+            Path(artifact["checkpoint_path"]),
+            resolved_manifest_root / "outputs" / "backbone_matrix" / "example" / "model.pt",
+        )
+        self.assertEqual(
+            Path(artifact["summary_path"]),
+            resolved_manifest_root / "outputs" / "backbone_matrix" / "example" / "artifact_summary.json",
+        )
 
     def test_manifest_loader_rejects_absolute_path_base(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -188,7 +188,8 @@ class GipoTrainOptionsTests(unittest.TestCase):
                     source_path = Path(source)
                     destination_path = Path(destination)
                     if (
-                        destination_path == summary
+                        destination_path.resolve(strict=False)
+                        == summary.resolve(strict=False)
                         and ".bundle-stage-" in source_path.name
                     ):
                         raise OSError("simulated summary promotion failure")

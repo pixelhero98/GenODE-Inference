@@ -70,6 +70,10 @@ def _tree_snapshot(root: Path) -> dict[str, bytes]:
     }
 
 
+def _physical_path(path: Path) -> Path:
+    return path.resolve(strict=False)
+
+
 def _materialize_interrupted_move(source: Path, destination: Path) -> None:
     """Create a post-rename directory state without relying on Windows rename timing."""
 
@@ -472,7 +476,10 @@ class LongTermSTTests(unittest.TestCase):
             def fail_stage_promotion(source, destination):
                 source_path = Path(source)
                 destination_path = Path(destination)
-                if source_path.name.startswith(".prepared.staging-") and destination_path == prepared:
+                if (
+                    source_path.name.startswith(".prepared.staging-")
+                    and _physical_path(destination_path) == _physical_path(prepared)
+                ):
                     raise OSError("simulated promotion failure")
                 return real_replace(source_path, destination_path)
 
@@ -566,11 +573,16 @@ class LongTermSTTests(unittest.TestCase):
 
             def tracked_file_hash(path: Path, *, sync: bool) -> str:
                 if sync:
-                    events.append(("file", path.relative_to(staging).as_posix()))
+                    events.append(
+                        (
+                            "file",
+                            _physical_path(path).relative_to(_physical_path(staging)).as_posix(),
+                        )
+                    )
                 return real_file_hash(path, sync=sync)
 
             def tracked_sync_directory(path: Path) -> None:
-                events.append(("directory", str(path)))
+                events.append(("directory", str(_physical_path(path))))
                 real_sync_directory(path)
 
             def tracked_write_journal(path: Path, record) -> None:
@@ -617,9 +629,9 @@ class LongTermSTTests(unittest.TestCase):
             synced_directories = {
                 value for kind, value in events[:journal_index] if kind == "directory"
             }
-            self.assertIn(str(staging / "series"), synced_directories)
-            self.assertIn(str(staging), synced_directories)
-            self.assertIn(str(root), synced_directories)
+            self.assertIn(str(_physical_path(staging / "series")), synced_directories)
+            self.assertIn(str(_physical_path(staging)), synced_directories)
+            self.assertIn(str(_physical_path(root)), synced_directories)
 
     def test_promotion_restart_finishes_installed_staging_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

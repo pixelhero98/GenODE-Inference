@@ -1304,7 +1304,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 return {"status": "captured"}
 
             def save_after_optional_outputs(payload, path):
-                if Path(path) == summary_path:
+                if Path(path).resolve(strict=False) == summary_path.resolve(strict=False):
                     self.assertTrue(write_state["comparison_built"])
                     write_state["summary_writes"] += 1
                 atomic_save_json(payload, path)

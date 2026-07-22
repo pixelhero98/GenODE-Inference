@@ -265,7 +265,7 @@ class MedicalChannelPathTests(unittest.TestCase):
                 file_name = str(row["file_name"])
                 resolved = resolve_portable_relative_path(prepared_dir, file_name, reject_links=True)
                 self.assertTrue(resolved.is_file())
-                self.assertTrue(resolved.is_relative_to(prepared_dir))
+                self.assertTrue(resolved.is_relative_to(prepared_dir.resolve(strict=False)))
             self.assertFalse((root / "outside.npy").exists())
 
     def test_preparation_rejects_reparse_point_destination_before_reading_archives(self) -> None:

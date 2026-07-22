@@ -796,6 +796,7 @@ def _validated_long_term_st_artifact_sha256(
 ) -> str:
     if is_link_or_reparse_point(root) or not root.is_dir():
         raise ValueError("Managed Long-Term ST artifact must be a regular directory.")
+    root = root.resolve(strict=True)
     manifest_path = long_term_st_manifest_path(root)
     if is_link_or_reparse_point(manifest_path) or not manifest_path.is_file():
         raise ValueError(
