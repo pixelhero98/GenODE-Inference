@@ -86,8 +86,8 @@ from genode.evaluation.otflow_evaluation_support import (
 )
 from genode.gipo.objectives import (
     MOLECULE_METRIC_SPECS,
+    materialized_objective_specs_for_scenario,
     teacher_metric_profile_for_scenario,
-    teacher_objective_specs_for_scenario,
     uniform_anchored_objective_columns,
 )
 from genode.gipo.models import validate_time_grid
@@ -214,6 +214,9 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "temporal_cw1",
     "temporal_tstr_f1",
     "temporal_tstr_f1_applicable",
+    "temporal_tstr_f1_status",
+    "temporal_tstr_f1_train_class_count",
+    "temporal_tstr_f1_test_class_count",
     "u_l1",
     "c_l1",
     "spread_specific_error",
@@ -355,6 +358,9 @@ CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "temporal_cw1",
     "temporal_tstr_f1",
     "temporal_tstr_f1_applicable",
+    "temporal_tstr_f1_status",
+    "temporal_tstr_f1_train_class_count",
+    "temporal_tstr_f1_test_class_count",
     "u_l1",
     "c_l1",
     "spread_specific_error",
@@ -1519,7 +1525,9 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
         _write_row_jsonl(jsonl_path, compact_rows)
         _write_row_csv(csv_path, compact_rows)
     fh = jsonl_path.open("a" if can_resume else "w", encoding="utf-8")
-    if _write_context_rows_enabled(cli_args):
+    # Keep the persisted CSV/NPZ/manifest generation intact until replacement
+    # context records are written by _append_context_records().
+    if _write_context_rows_enabled(cli_args) and not can_resume:
         _write_context_row_csv(context_csv_path, list(context_rows_by_signature.values()))
     return {
         "out_root": out_root,
@@ -1545,10 +1553,19 @@ def _context_row_compatible(existing: Mapping[str, Any], new: Mapping[str, Any])
         "scenario_key",
         "split_phase",
         "seed",
+        "evaluation_seed",
         "solver_key",
         "target_nfe",
         "scheduler_key",
         "checkpoint_id",
+        "example_idx",
+        "target_t",
+        "sample_seed_start",
+        "sample_seed_values_json",
+        "chosen_examples_hash",
+        "evaluation_protocol_hash",
+        "temporal_uw1",
+        "temporal_cw1",
     ):
         old_value = existing.get(field, "")
         new_value = new.get(field, "")
@@ -1626,6 +1643,75 @@ def _row_has_complete_context_artifacts(
             return False
         context_ids.add(context_id)
         embedding_ids.add(embedding_id)
+    if str(row.get("benchmark_family", "")) == CONDITIONAL_GENERATION_FAMILY:
+        parent_chosen_hash = str(
+            row.get("chosen_t0s_hash") or row.get("chosen_examples_hash") or ""
+        ).strip()
+        parent_protocol_hash = str(
+            row.get("evaluation_protocol_hash", "") or ""
+        ).strip()
+        if any(
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in (parent_chosen_hash, parent_protocol_hash)
+        ):
+            return False
+        try:
+            parent_uw1 = float(row["temporal_uw1"])
+            parent_cw1 = float(row["temporal_cw1"])
+            ordered_rows = sorted(
+                rows_for_parent,
+                key=lambda context_row: int(context_row["example_idx"]),
+            )
+            example_indices = [
+                int(context_row["example_idx"]) for context_row in ordered_rows
+            ]
+            target_t_values = [
+                int(context_row["target_t"]) for context_row in ordered_rows
+            ]
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            not np.isfinite(parent_uw1)
+            or not np.isfinite(parent_cw1)
+            or example_indices != list(range(int(expected)))
+            or len(set(target_t_values)) != int(expected)
+        ):
+            return False
+        observed_chosen_hash = hashlib.sha256(
+            json.dumps(target_t_values, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if observed_chosen_hash != parent_chosen_hash:
+            return False
+        seed_bases: set[int] = set()
+        for context_row, example_idx in zip(ordered_rows, example_indices):
+            try:
+                evaluation_seed = int(context_row["evaluation_seed"])
+                sample_seed_start = int(context_row["sample_seed_start"])
+                sample_seed_values = json.loads(
+                    str(context_row["sample_seed_values_json"])
+                )
+                context_uw1 = float(context_row["temporal_uw1"])
+                context_cw1 = float(context_row["temporal_cw1"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return False
+            if (
+                isinstance(sample_seed_values, bool)
+                or sample_seed_values != [evaluation_seed]
+                or sample_seed_start != evaluation_seed
+                or str(context_row.get("chosen_examples_hash", "")).strip()
+                != parent_chosen_hash
+                or str(context_row.get("evaluation_protocol_hash", "")).strip()
+                != parent_protocol_hash
+                or not np.isfinite(context_uw1)
+                or not np.isfinite(context_cw1)
+                or context_uw1 != parent_uw1
+                or context_cw1 != parent_cw1
+            ):
+                return False
+            seed_bases.add(int(evaluation_seed) - int(example_idx))
+        if len(seed_bases) != 1:
+            return False
     return True
 
 
@@ -1852,7 +1938,7 @@ def _conditional_context_records(
     uniform_aggregate_metrics = dict(uniform_metric_row or {})
     per_window = {int(key): dict(value) for key, value in dict(per_window_metrics_by_t0 or {}).items()}
     uniform_per_window = {int(key): dict(value) for key, value in dict(uniform_per_window_metrics_by_t0 or {}).items()}
-    teacher_specs = teacher_objective_specs_for_scenario(str(dataset))
+    materialized_specs = materialized_objective_specs_for_scenario(str(dataset))
     axis_values = [int(x) for x in (chosen_t0s if axis_t0s is None else axis_t0s)]
     for local_window_idx, t0 in enumerate([int(x) for x in chosen_t0s]):
         window_idx = int(window_index_offset) + int(local_window_idx)
@@ -1883,7 +1969,7 @@ def _conditional_context_records(
         reward_columns = uniform_anchored_objective_columns(
             {**reward_metric_row, "scheduler_key": scheduler_key},
             {**uniform_reward_metric_row, "scheduler_key": UNIFORM_SCHEDULER_KEY},
-            teacher_specs,
+            materialized_specs,
             uniform_scheduler_key=UNIFORM_SCHEDULER_KEY,
         )
         if reward_columns.get("u_comp_uniform") in (None, ""):
@@ -1977,6 +2063,15 @@ def _conditional_context_records(
                 "temporal_cw1": reward_metric_row.get("temporal_cw1", ""),
                 "temporal_tstr_f1": reward_metric_row.get("temporal_tstr_f1", ""),
                 "temporal_tstr_f1_applicable": reward_metric_row.get("temporal_tstr_f1_applicable", ""),
+                "temporal_tstr_f1_status": reward_metric_row.get(
+                    "temporal_tstr_f1_status", ""
+                ),
+                "temporal_tstr_f1_train_class_count": reward_metric_row.get(
+                    "temporal_tstr_f1_train_class_count", ""
+                ),
+                "temporal_tstr_f1_test_class_count": reward_metric_row.get(
+                    "temporal_tstr_f1_test_class_count", ""
+                ),
                 "u_l1": metrics_for_row.get("u_l1", ""),
                 "c_l1": metrics_for_row.get("c_l1", ""),
                 "spread_specific_error": metrics_for_row.get("spread_specific_error", ""),
@@ -2713,6 +2808,13 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "temporal_cw1": metrics.get("temporal_cw1"),
         "temporal_tstr_f1": metrics.get("temporal_tstr_f1"),
         "temporal_tstr_f1_applicable": metrics.get("temporal_tstr_f1_applicable"),
+        "temporal_tstr_f1_status": metrics.get("temporal_tstr_f1_status"),
+        "temporal_tstr_f1_train_class_count": metrics.get(
+            "temporal_tstr_f1_train_class_count"
+        ),
+        "temporal_tstr_f1_test_class_count": metrics.get(
+            "temporal_tstr_f1_test_class_count"
+        ),
         "u_l1": metrics.get("u_l1"),
         "c_l1": metrics.get("c_l1"),
         "spread_specific_error": metrics.get("spread_specific_error"),
@@ -3323,6 +3425,15 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 "score_main": result_row.get("score_main"),
                                 "temporal_tstr_f1": result_row.get("temporal_tstr_f1"),
                                 "temporal_tstr_f1_applicable": result_row.get("temporal_tstr_f1_applicable"),
+                                "temporal_tstr_f1_status": result_row.get(
+                                    "temporal_tstr_f1_status"
+                                ),
+                                "temporal_tstr_f1_train_class_count": result_row.get(
+                                    "temporal_tstr_f1_train_class_count"
+                                ),
+                                "temporal_tstr_f1_test_class_count": result_row.get(
+                                    "temporal_tstr_f1_test_class_count"
+                                ),
                                 "disc_auc": result_row.get("disc_auc"),
                                 "disc_auc_gap": result_row.get("disc_auc_gap"),
                                 "temporal_uw1": result_row.get("temporal_uw1"),

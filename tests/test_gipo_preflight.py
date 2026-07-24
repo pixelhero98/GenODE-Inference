@@ -33,6 +33,9 @@ ROW_FIELDS = (
     "series_id",
     "target_t",
     "u_comp_uniform",
+    "u_temporal_tstr_f1_uniform",
+    "temporal_tstr_f1_applicable",
+    "reward_metric_weights_json",
 )
 
 
@@ -246,6 +249,50 @@ class GipoPreflightTests(unittest.TestCase):
         self.assertEqual(report["rank_pair_preflight"]["error_count"], 1)
         self.assertTrue(report["rank_pair_preflight"]["example_bad_groups"])
         self.assertGreater(report["issue_count"], 0)
+
+    def test_preflight_accepts_explicit_optional_tstr_weight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows_csv = Path(tmpdir) / "rows.csv"
+            rows = []
+            for context_idx in range(3):
+                for scheduler_key in SUPPORT_SCHEDULES:
+                    row = _row(f"ctx_{context_idx}", scheduler_key)
+                    row.update(
+                        {
+                            "u_temporal_tstr_f1_uniform": (
+                                0.0 if scheduler_key == "uniform" else 0.5
+                            ),
+                            "temporal_tstr_f1_applicable": True,
+                            "reward_metric_weights_json": (
+                                '{"u_temporal_cw1_uniform":0.5,'
+                                '"u_temporal_uw1_uniform":0.5}'
+                            ),
+                        }
+                    )
+                    rows.append(row)
+            _write_rows(rows_csv, rows)
+
+            args = build_argparser().parse_args(
+                [
+                    "--rows_csv",
+                    str(rows_csv),
+                    "--support_schedule_keys",
+                    ",".join(SUPPORT_SCHEDULES),
+                    "--teacher_metric_target_keys",
+                    "u_temporal_tstr_f1_uniform",
+                    "--teacher_utility_weights",
+                    "u_temporal_tstr_f1_uniform=1",
+                ]
+            )
+            report = preflight_gipo_rows(args)
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(
+            report["teacher_metric_targets"]["teacher_utility_weights"],
+            {"u_temporal_tstr_f1_uniform": 1.0},
+        )
+        self.assertEqual(report["rank_pair_preflight"]["rankable_pair_count"], 3)
+        self.assertEqual(report["teacher_utility_weight_resolution_error"], "")
 
     def test_preflight_cli_exits_nonzero_when_issues_found(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import os
+import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
@@ -27,7 +31,7 @@ from genode.gipo.objectives import (
     FORECAST_METRIC_SPECS,
     MOLECULE_METRIC_SPECS,
     UNIFORM_SCHEDULE_KEY,
-    teacher_objective_specs_for_scenario,
+    materialized_objective_specs_for_scenario,
     uniform_anchored_objective_columns,
 )
 from genode.gipo.ablation_plan import GIPO_POLICY_KEY
@@ -79,7 +83,10 @@ from genode.evaluation.otflow_evaluation_support import (
     load_conditional_generation_checkpoint_splits,
     load_forecast_checkpoint_splits,
 )
-from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, run_fixed_schedule_variant
+from genode.schedule_transfer.diffusion_flow_schedules import (
+    BASELINE_SCHEDULE_KEYS,
+    run_context_schedule_panel_variant,
+)
 from genode.runtime import ProgressBar, resolve_torch_device
 
 
@@ -109,6 +116,7 @@ SELECTION_MODE_REPORTING = "reporting"
 SELECTION_MODE_CALIBRATION = "calibration"
 CONTEXT_DISJOINT_PHASE = "context_disjoint"
 CALIBRATION_HOLDOUT_PHASES = (CONTEXT_DISJOINT_PHASE,)
+CONDITIONAL_PANEL_METRIC_PROTOCOL = "conditional_generation_panel_metrics_v1"
 
 
 def _read_csvs(paths_text: str) -> List[Dict[str, Any]]:
@@ -118,11 +126,7 @@ def _read_csvs(paths_text: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
+def _row_columns(rows: Sequence[Mapping[str, Any]]) -> List[str]:
     fields: List[str] = []
     seen: set[str] = set()
     for row in rows:
@@ -130,11 +134,93 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             if key not in seen:
                 seen.add(str(key))
                 fields.append(str(key))
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(dict(row))
+    return fields
+
+
+def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = _row_columns(rows)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            temporary_path = Path(fh.name)
+            if fields:
+                writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(dict(row))
+            fh.flush()
+            os.fsync(fh.fileno())
+        for attempt in range(8):
+            try:
+                os.replace(temporary_path, path)
+                break
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(0.01 * (2**attempt))
+        temporary_path = None
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(
+        dict(payload),
+        indent=2,
+        sort_keys=True,
+        allow_nan=False,
+    )
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            temporary_path = Path(fh.name)
+            fh.write(encoded)
+            fh.flush()
+            os.fsync(fh.fileno())
+        for attempt in range(8):
+            try:
+                os.replace(temporary_path, path)
+                break
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(0.01 * (2**attempt))
+        temporary_path = None
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _report_output_fingerprint(
+    path: Path,
+    *,
+    row_count: int,
+    columns: Sequence[str],
+) -> Dict[str, Any]:
+    return {
+        "sha256": file_sha256(path),
+        "size_bytes": int(path.stat().st_size),
+        "row_count": int(row_count),
+        "columns": [str(column) for column in columns],
+    }
 
 
 def _validate_density_bin_count(payload: Mapping[str, Any], density_meta: Mapping[str, Any], *, role: str) -> None:
@@ -253,7 +339,15 @@ def _checkpoint_step_from_row(row: Mapping[str, Any]) -> int:
     return int(raw)
 
 
+def _required_sha256(value: Any, *, label: str) -> str:
+    digest = str(value or "").strip()
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest.")
+    return digest
+
+
 ContextMatchKey = Tuple[str, str, str, int, str, int, int, str, str]
+ConditionalPanelKey = Tuple[str, str, int, str, int, int, str, int]
 
 
 def _row_group_key(row: Mapping[str, Any]) -> ContextMatchKey:
@@ -268,6 +362,161 @@ def _row_group_key(row: Mapping[str, Any]) -> ContextMatchKey:
         str(row.get("checkpoint_id", "")),
         context_id_from_row(row),
     )
+
+
+def _conditional_eval_horizon(row: Mapping[str, Any]) -> int:
+    target_t = int(row["target_t"])
+    horizon = int(row.get("eval_horizon") or (int(row.get("target_stop", target_t + 1)) - target_t))
+    if horizon <= 0:
+        raise ValueError(f"Conditional-generation context requires a positive eval_horizon, got {horizon}.")
+    return horizon
+
+
+def _conditional_panel_key(row: Mapping[str, Any]) -> ConditionalPanelKey:
+    return (
+        _source_split_phase(row),
+        str(row.get("scenario_key", "")),
+        _logical_seed_from_row(row),
+        normalize_solver_key(str(row["solver_key"])),
+        int(row["target_nfe"]),
+        _checkpoint_step_from_row(row),
+        str(row.get("checkpoint_id", "")),
+        _conditional_eval_horizon(row),
+    )
+
+
+def _evaluate_conditional_generation_panels(
+    *,
+    model: torch.nn.Module,
+    splits: Mapping[str, Any],
+    cfg: Any,
+    representatives: Sequence[Mapping[str, Any]],
+    predictions: Sequence[Mapping[str, Any]],
+) -> Dict[ContextMatchKey, Dict[str, Any]]:
+    if len(representatives) != len(predictions):
+        raise ValueError(
+            "Conditional-generation representatives and GIPO predictions must have identical lengths."
+        )
+    grouped: Dict[ConditionalPanelKey, List[Tuple[Mapping[str, Any], Mapping[str, Any]]]] = defaultdict(list)
+    for row, prediction in zip(representatives, predictions):
+        grouped[_conditional_panel_key(row)].append((row, prediction))
+
+    metrics_by_context: Dict[ContextMatchKey, Dict[str, Any]] = {}
+    for panel_key, panel_items in sorted(grouped.items()):
+        source_phase, _, _, solver, target_nfe, _, _, eval_horizon = panel_key
+        ordered = sorted(
+            panel_items,
+            key=lambda item: (int(item[0]["example_idx"]), context_id_from_row(item[0])),
+        )
+        example_indices = [int(row["example_idx"]) for row, _ in ordered]
+        target_t_values = [int(row["target_t"]) for row, _ in ordered]
+        evaluation_seeds = [_evaluation_seed_from_row(row) for row, _ in ordered]
+        for label, values in (
+            ("example_idx", example_indices),
+            ("target_t", target_t_values),
+            ("evaluation_seed", evaluation_seeds),
+        ):
+            if len(set(values)) != len(values):
+                raise ValueError(f"Conditional GIPO panel contains duplicate {label} values.")
+
+        metric_seed_candidates = {
+            int(evaluation_seed) - int(example_idx)
+            for evaluation_seed, example_idx in zip(evaluation_seeds, example_indices)
+        }
+        if len(metric_seed_candidates) != 1:
+            raise ValueError(
+                "Conditional GIPO panel cannot recover one matched metrics seed from "
+                "evaluation_seed - example_idx."
+            )
+        metrics_seed = next(iter(metric_seed_candidates))
+        chosen_hash = hashlib.sha256(
+            json.dumps(target_t_values, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        declared_hashes = {
+            _required_sha256(
+                row.get("chosen_examples_hash"),
+                label="Conditional GIPO context chosen_examples_hash",
+            )
+            for row, _ in ordered
+        }
+        if declared_hashes != {chosen_hash}:
+            raise ValueError(
+                "Conditional GIPO panel chosen context hash does not match the ordered target_t panel."
+            )
+
+        panel_result = run_context_schedule_panel_variant(
+            model=model,
+            ds=_forecast_dataset_for_source_phase(splits, source_phase),
+            cfg=cfg,
+            eval_horizon=int(eval_horizon),
+            solver_name=solver,
+            target_nfe=int(target_nfe),
+            time_grids=[prediction["time_grid"] for _, prediction in ordered],
+            chosen_t0s=target_t_values,
+            generation_seed_values=evaluation_seeds,
+            metrics_seed=int(metrics_seed),
+            score_main_only=False,
+        )
+        window_rows = list(panel_result.get("per_window_metric_rows", []) or [])
+        if len(window_rows) != len(ordered):
+            raise ValueError(
+                "Conditional GIPO panel evaluator returned the wrong number of per-window diagnostics: "
+                f"{len(window_rows)} != {len(ordered)}."
+            )
+        panel_metrics = {}
+        for key in (
+            "score_main",
+            "temporal_uw1",
+            "temporal_cw1",
+            "temporal_tstr_f1",
+            "temporal_tstr_f1_applicable",
+            "disc_auc",
+            "disc_auc_gap",
+            "u_l1",
+            "c_l1",
+            "spread_specific_error",
+            "imbalance_specific_error",
+            "ret_vol_acf_error",
+            "impact_response_error",
+            "temporal_tstr_f1_status",
+            "temporal_tstr_f1_train_class_count",
+            "temporal_tstr_f1_test_class_count",
+        ):
+            value = panel_result.get(key)
+            if (
+                value is not None
+                and not isinstance(value, (bool, str))
+                and not np.isfinite(float(value))
+            ):
+                value = None
+            panel_metrics[key] = value
+        panel_metrics.update(
+            {
+                "metric_protocol": CONDITIONAL_PANEL_METRIC_PROTOCOL,
+                "metric_granularity": "matched_context_panel",
+                "panel_context_count": int(len(ordered)),
+                "panel_metrics_seed": int(metrics_seed),
+                "panel_chosen_t0s_hash": chosen_hash,
+            }
+        )
+        for (row, _), window_row in zip(ordered, window_rows):
+            if int(window_row.get("target_t", row["target_t"])) != int(row["target_t"]):
+                raise ValueError("Conditional GIPO per-window diagnostics are not aligned with target_t.")
+            metrics_by_context[_row_group_key(row)] = {
+                **panel_metrics,
+                "window_score_main": window_row.get("score_main", ""),
+                "window_u_l1": window_row.get("u_l1", ""),
+                "window_c_l1": window_row.get("c_l1", ""),
+                "window_spread_specific_error": window_row.get("spread_specific_error", ""),
+                "window_imbalance_specific_error": window_row.get("imbalance_specific_error", ""),
+                "window_ret_vol_acf_error": window_row.get("ret_vol_acf_error", ""),
+                "window_impact_response_error": window_row.get("impact_response_error", ""),
+            }
+    if len(metrics_by_context) != len(representatives):
+        raise ValueError(
+            "Conditional GIPO panel evaluation did not produce one metric mapping per representative context."
+        )
+    return metrics_by_context
 
 
 def _representative_context_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -297,6 +546,7 @@ def _representative_context_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict
                 "history_start",
                 "history_stop",
                 "target_stop",
+                "chosen_examples_hash",
                 "locked_test_mode",
                 "locked_test_context_limit",
                 "locked_test_context_limit_scope",
@@ -464,14 +714,83 @@ def _validate_strict_comparison_context_coverage(
     comparator_rows: Sequence[Mapping[str, Any]],
 ) -> None:
     expected = {_row_group_key(row) for row in representatives}
+    expected_evaluation_seeds = {
+        _row_group_key(row): _evaluation_seed_from_row(row)
+        for row in representatives
+    }
+    is_conditional = bool(representatives) and all(
+        str(row.get("benchmark_family", "")) == CONDITIONAL_GENERATION_FAMILY
+        for row in representatives
+    )
+    expected_chosen_hashes: Dict[ContextMatchKey, str] = {}
+    expected_evaluation_protocol_hashes: Dict[ContextMatchKey, str] = {}
+    if is_conditional:
+        expected_chosen_hashes = {
+            _row_group_key(row): _required_sha256(
+                row.get("chosen_examples_hash"),
+                label="Conditional representative chosen_examples_hash",
+            )
+            for row in representatives
+        }
+        expected_evaluation_protocol_hashes = {
+            _row_group_key(row): _required_sha256(
+                row.get("evaluation_protocol_hash"),
+                label="Conditional representative evaluation_protocol_hash",
+            )
+            for row in representatives
+        }
     problems: List[str] = []
     for label, rows, schedule_keys in (
         ("baseline", baseline_rows, BASELINE_SCHEDULE_KEYS),
         ("SER comparator", comparator_rows, SER_REFERENCE_SCHEDULE_KEYS),
     ):
         counts: Dict[Tuple[str, ContextMatchKey], int] = defaultdict(int)
+        panel_rows: Dict[Tuple[str, ConditionalPanelKey], List[Mapping[str, Any]]] = defaultdict(list)
         for row in rows:
-            counts[(str(row.get("scheduler_key", "")), _row_group_key(row))] += 1
+            schedule_key = str(row.get("scheduler_key", ""))
+            context_key = _row_group_key(row)
+            counts[(schedule_key, context_key)] += 1
+            if (
+                schedule_key in schedule_keys
+                and context_key in expected_evaluation_seeds
+                and _evaluation_seed_from_row(row) != expected_evaluation_seeds[context_key]
+            ):
+                problems.append(
+                    f"{label} schedule={schedule_key!r} sampling seed mismatch for "
+                    f"context={context_key}: {_evaluation_seed_from_row(row)} != "
+                    f"{expected_evaluation_seeds[context_key]}"
+                )
+            if (
+                is_conditional
+                and schedule_key in schedule_keys
+                and context_key in expected_chosen_hashes
+            ):
+                try:
+                    chosen_hash = _required_sha256(
+                        row.get("chosen_examples_hash"),
+                        label=f"{label} chosen_examples_hash",
+                    )
+                    evaluation_protocol_hash = _required_sha256(
+                        row.get("evaluation_protocol_hash"),
+                        label=f"{label} evaluation_protocol_hash",
+                    )
+                except ValueError as exc:
+                    problems.append(str(exc))
+                else:
+                    if chosen_hash != expected_chosen_hashes[context_key]:
+                        problems.append(
+                            f"{label} schedule={schedule_key!r} chosen panel hash mismatch "
+                            f"for context={context_key}."
+                        )
+                    if (
+                        evaluation_protocol_hash
+                        != expected_evaluation_protocol_hashes[context_key]
+                    ):
+                        problems.append(
+                            f"{label} schedule={schedule_key!r} evaluation protocol hash mismatch "
+                            f"for context={context_key}."
+                        )
+                panel_rows[(schedule_key, _conditional_panel_key(row))].append(row)
         for schedule_key in schedule_keys:
             observed = {key for (schedule, key), count in counts.items() if schedule == schedule_key and count > 0}
             missing = sorted(expected - observed)
@@ -484,6 +803,31 @@ def _validate_strict_comparison_context_coverage(
                 problems.append(f"{label} schedule={schedule_key!r} missing contexts={missing[:4]}")
             if duplicates:
                 problems.append(f"{label} schedule={schedule_key!r} duplicate contexts={duplicates[:4]}")
+        if is_conditional:
+            for (schedule_key, panel_key), group in sorted(panel_rows.items()):
+                for metric_key in ("temporal_uw1", "temporal_cw1"):
+                    values: List[float] = []
+                    for row in group:
+                        try:
+                            value = float(row.get(metric_key))
+                        except (TypeError, ValueError):
+                            problems.append(
+                                f"{label} schedule={schedule_key!r} panel={panel_key} "
+                                f"has non-numeric {metric_key}."
+                            )
+                            break
+                        if not np.isfinite(value):
+                            problems.append(
+                                f"{label} schedule={schedule_key!r} panel={panel_key} "
+                                f"has non-finite {metric_key}."
+                            )
+                            break
+                        values.append(value)
+                    if values and any(value != values[0] for value in values[1:]):
+                        problems.append(
+                            f"{label} schedule={schedule_key!r} panel={panel_key} "
+                            f"does not repeat {metric_key} identically."
+                        )
     if problems:
         raise ValueError("Strict locked-test comparison context coverage is incomplete: " + "; ".join(problems))
 
@@ -762,6 +1106,50 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str)
         ):
             if field in group[0]:
                 row[field] = group[0].get(field)
+        for field in (
+            "metric_protocol",
+            "metric_granularity",
+            "panel_context_count",
+            "panel_metrics_seed",
+            "panel_chosen_t0s_hash",
+            "temporal_tstr_f1_status",
+            "temporal_tstr_f1_train_class_count",
+            "temporal_tstr_f1_test_class_count",
+        ):
+            values = {
+                str(item.get(field, ""))
+                for item in group
+                if item.get(field, "") not in (None, "")
+            }
+            if not values:
+                continue
+            if len(values) != 1:
+                raise ValueError(
+                    f"GIPO aggregate rows require one {field} value per group; found {sorted(values)}."
+                )
+            value = next(iter(values))
+            row[field] = (
+                int(value)
+                if field
+                in {
+                    "panel_context_count",
+                    "panel_metrics_seed",
+                    "temporal_tstr_f1_train_class_count",
+                    "temporal_tstr_f1_test_class_count",
+                }
+                else value
+            )
+        is_panel_metric_group = (
+            str(row.get("metric_granularity", "")) == "matched_context_panel"
+        )
+        tstr_applicable = any(
+            str(item.get("temporal_tstr_f1_applicable", "")).lower() == "true"
+            for item in group
+        )
+        required_panel_metrics = {
+            "temporal_uw1",
+            "temporal_cw1",
+        }
         for metric_key in (
             "forecast_crps",
             "forecast_mase",
@@ -788,23 +1176,53 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str)
             "u_comp_uniform",
         ):
             vals = []
+            present_count = 0
             for item in group:
                 value = item.get(metric_key, "")
                 if value in (None, ""):
                     continue
+                present_count += 1
                 try:
                     numeric = float(value)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError) as exc:
+                    if is_panel_metric_group and metric_key in required_panel_metrics:
+                        raise ValueError(
+                            f"GIPO aggregate metric {metric_key!r} must be numeric, got {value!r}."
+                        ) from exc
                     continue
-                if np.isfinite(numeric):
-                    vals.append(float(numeric))
+                if not np.isfinite(numeric):
+                    if is_panel_metric_group and metric_key in required_panel_metrics:
+                        raise FloatingPointError(
+                            f"GIPO aggregate metric {metric_key!r} must be finite, got {value!r}."
+                        )
+                    continue
+                vals.append(float(numeric))
+            if (
+                is_panel_metric_group
+                and metric_key in required_panel_metrics
+                and present_count != len(group)
+            ):
+                raise ValueError(
+                    f"Matched-panel GIPO aggregate requires {metric_key!r} on every context row; "
+                    f"found {present_count}/{len(group)}."
+                )
+            if (
+                is_panel_metric_group
+                and metric_key in required_panel_metrics
+                and vals
+                and any(value != vals[0] for value in vals[1:])
+            ):
+                raise ValueError(
+                    f"Matched-panel GIPO metric {metric_key!r} must be repeated identically "
+                    f"across context rows, got {vals}."
+                )
             if vals:
                 arr = np.asarray(vals, dtype=np.float64)
                 row[metric_key] = float(np.mean(arr))
                 row[f"{metric_key}_std"] = float(np.std(arr))
         if any("temporal_tstr_f1_applicable" in item for item in group):
             row["temporal_tstr_f1_applicable"] = bool(
-                any(str(item.get("temporal_tstr_f1_applicable", "")).lower() == "true" for item in group)
+                tstr_applicable
             )
         out.append(row)
     return out
@@ -950,7 +1368,11 @@ def _metric_specs_for_family(benchmark_family: str, scenario_key: str = ""):
     if str(benchmark_family) == FORECAST_FAMILY:
         return FORECAST_METRIC_SPECS
     if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
-        return teacher_objective_specs_for_scenario(str(scenario_key)) if str(scenario_key).strip() else CONDITIONAL_METRIC_SPECS
+        return (
+            materialized_objective_specs_for_scenario(str(scenario_key))
+            if str(scenario_key).strip()
+            else CONDITIONAL_METRIC_SPECS
+        )
     if str(benchmark_family) == SCENARIO_FAMILY_MOLECULE:
         return MOLECULE_METRIC_SPECS
     raise ValueError(f"Unsupported benchmark_family={benchmark_family!r}.")
@@ -1051,7 +1473,11 @@ def _attach_uniform_rewards_to_gipo_row(
     out["gipo_reward_protocol"] = GIPO_PROTOCOL
     out["reward_anchor_scheduler_key"] = UNIFORM_SCHEDULE_KEY
     out["reward_utility_transform"] = "directional_log_uniform_anchor"
-    out["reward_granularity"] = "context_window_metric_components"
+    out["reward_granularity"] = (
+        "matched_context_panel_metric_components"
+        if benchmark_family == CONDITIONAL_GENERATION_FAMILY
+        else "context_window_metric_components"
+    )
     return out
 
 
@@ -1359,6 +1785,15 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         setting_encoder_config=checkpoint_payload.get("setting_encoder_config"),
         device=device,
     )
+    conditional_panel_metrics: Dict[ContextMatchKey, Dict[str, Any]] = {}
+    if benchmark_family == CONDITIONAL_GENERATION_FAMILY:
+        conditional_panel_metrics = _evaluate_conditional_generation_panels(
+            model=model,
+            splits=splits,
+            cfg=cfg,
+            representatives=representatives,
+            predictions=predictions,
+        )
     with ProgressBar(len(representatives), f"GIPO {split_phase}") as progress:
         for row_idx, row in enumerate(representatives):
             context_id = context_id_from_row(row)
@@ -1392,30 +1827,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                     return_per_example_rows=False,
                 )
             elif benchmark_family == CONDITIONAL_GENERATION_FAMILY:
-                eval_ds = _forecast_dataset_for_source_phase(splits, source_phase)
-                target_t = int(row["target_t"])
-                eval_horizon = int(row.get("eval_horizon") or (int(row.get("target_stop", target_t + 1)) - target_t))
-                metrics = run_fixed_schedule_variant(
-                    model=model,
-                    ds=eval_ds,
-                    cfg=cfg,
-                    eval_horizon=int(eval_horizon),
-                    eval_windows=1,
-                    grid_spec={
-                        "grid_name": GIPO_POLICY_KEY,
-                        "grid_kind": "gipo_density_time_grid",
-                        "selection_group": GIPO_POLICY_KEY,
-                        "comparison_role": "student",
-                        "solver_name": normalize_solver_key(solver),
-                        "target_nfe": int(target_nfe),
-                        "macro_steps": int(macro_steps),
-                        "time_grid": prediction["time_grid"],
-                    },
-                    chosen_t0s=[int(target_t)],
-                    generation_seed_base=int(eval_seed),
-                    metrics_seed=int(eval_seed),
-                    score_main_only=False,
-                )
+                metrics = dict(conditional_panel_metrics[_row_group_key(row)])
             else:
                 member_key, stratum = _molecule_member_from_row(row)
                 member = molecule_members.get((member_key, stratum))
@@ -1523,6 +1935,13 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                         "temporal_cw1": metrics.get("temporal_cw1"),
                         "temporal_tstr_f1": metrics.get("temporal_tstr_f1"),
                         "temporal_tstr_f1_applicable": metrics.get("temporal_tstr_f1_applicable"),
+                        "temporal_tstr_f1_status": metrics.get("temporal_tstr_f1_status"),
+                        "temporal_tstr_f1_train_class_count": metrics.get(
+                            "temporal_tstr_f1_train_class_count"
+                        ),
+                        "temporal_tstr_f1_test_class_count": metrics.get(
+                            "temporal_tstr_f1_test_class_count"
+                        ),
                         "disc_auc": metrics.get("disc_auc"),
                         "disc_auc_gap": metrics.get("disc_auc_gap"),
                         "u_l1": metrics.get("u_l1"),
@@ -1531,6 +1950,26 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                         "imbalance_specific_error": metrics.get("imbalance_specific_error"),
                         "ret_vol_acf_error": metrics.get("ret_vol_acf_error"),
                         "impact_response_error": metrics.get("impact_response_error"),
+                        "metric_protocol": metrics.get("metric_protocol"),
+                        "metric_granularity": metrics.get("metric_granularity"),
+                        "panel_context_count": metrics.get("panel_context_count"),
+                        "panel_metrics_seed": metrics.get("panel_metrics_seed"),
+                        "panel_chosen_t0s_hash": metrics.get("panel_chosen_t0s_hash"),
+                        "window_score_main": metrics.get("window_score_main"),
+                        "window_u_l1": metrics.get("window_u_l1"),
+                        "window_c_l1": metrics.get("window_c_l1"),
+                        "window_spread_specific_error": metrics.get(
+                            "window_spread_specific_error"
+                        ),
+                        "window_imbalance_specific_error": metrics.get(
+                            "window_imbalance_specific_error"
+                        ),
+                        "window_ret_vol_acf_error": metrics.get(
+                            "window_ret_vol_acf_error"
+                        ),
+                        "window_impact_response_error": metrics.get(
+                            "window_impact_response_error"
+                        ),
                     }
                 )
             else:
@@ -1569,11 +2008,30 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         if benchmark_family == SCENARIO_FAMILY_MOLECULE
         else []
     )
-    _write_csv(out_dir / f"{output_prefix}_rows.csv", per_context_rows)
-    _write_csv(out_dir / f"{output_prefix}_aggregate_rows.csv", aggregate_rows)
+    rows_path = out_dir / f"{output_prefix}_rows.csv"
+    aggregate_rows_path = out_dir / f"{output_prefix}_aggregate_rows.csv"
+    decisions_path = out_dir / f"{output_prefix}_decisions.csv"
+    member_aggregate_rows_path = out_dir / f"{output_prefix}_member_aggregate_rows.csv"
+    _write_csv(rows_path, per_context_rows)
+    _write_csv(aggregate_rows_path, aggregate_rows)
     if member_aggregate_rows:
-        _write_csv(out_dir / f"{output_prefix}_member_aggregate_rows.csv", member_aggregate_rows)
-    _write_csv(out_dir / f"{output_prefix}_decisions.csv", decision_rows)
+        _write_csv(member_aggregate_rows_path, member_aggregate_rows)
+    _write_csv(decisions_path, decision_rows)
+    output_rows = {
+        rows_path: per_context_rows,
+        aggregate_rows_path: aggregate_rows,
+        decisions_path: decision_rows,
+    }
+    if member_aggregate_rows:
+        output_rows[member_aggregate_rows_path] = member_aggregate_rows
+    report_outputs = {
+        path.name: _report_output_fingerprint(
+            path,
+            row_count=len(rows),
+            columns=_row_columns(rows),
+        )
+        for path, rows in output_rows.items()
+    }
 
     comparison_student_rows = per_context_rows if selection_mode == SELECTION_MODE_CALIBRATION else aggregate_rows
     comparison = build_comparison_summary(
@@ -1593,7 +2051,11 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     comparison["checkpoint_step"] = int(checkpoint_step)
     comparison["gipo_student_checkpoint_sha256"] = expected_checkpoint_hash
     comparison["report_inputs"] = report_inputs
+    comparison["report_outputs"] = report_outputs
     comparison["teacher_final_retrain"] = teacher_final_retrain
+    if benchmark_family == CONDITIONAL_GENERATION_FAMILY:
+        comparison["metric_protocol"] = CONDITIONAL_PANEL_METRIC_PROTOCOL
+        comparison["metric_granularity"] = "matched_context_panel"
     comparison.update(locked_test_provenance)
     if strict_locked_comparison:
         missing_baselines = list(comparison.get("missing_baseline_cells", []) or [])
@@ -1604,9 +2066,9 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 f"missing_baseline_cells={missing_baselines[:8]}, "
                 f"missing_ser_ptg_cells={missing_comparators[:8]}."
             )
-    (out_dir / f"{output_prefix}_comparison_summary.json").write_text(
-        json.dumps(comparison, indent=2, sort_keys=True),
-        encoding="utf-8",
+    _write_json(
+        out_dir / f"{output_prefix}_comparison_summary.json",
+        comparison,
     )
 
     crps_values = [float(row["forecast_crps"]) for row in aggregate_rows if row.get("forecast_crps") not in (None, "")]
@@ -1637,6 +2099,7 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "checkpoint_step": int(checkpoint_step),
         "gipo_student_checkpoint_sha256": expected_checkpoint_hash,
         "report_inputs": report_inputs,
+        "report_outputs": report_outputs,
         "student_policy_type": "continuous_density",
         "scheduler_key": GIPO_POLICY_KEY,
         "benchmark_family": benchmark_family,
@@ -1673,7 +2136,14 @@ def report_gipo_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         **locked_test_provenance,
         "comparison_summary_path": "" if comparison is None else comparison_file,
     }
-    (out_dir / f"{output_prefix}_policy_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    if benchmark_family == CONDITIONAL_GENERATION_FAMILY:
+        summary.update(
+            {
+                "metric_protocol": CONDITIONAL_PANEL_METRIC_PROTOCOL,
+                "metric_granularity": "matched_context_panel",
+            }
+        )
+    _write_json(out_dir / f"{output_prefix}_policy_summary.json", summary)
     return summary
 
 

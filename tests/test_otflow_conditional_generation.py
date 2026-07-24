@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 
 import genode.evaluation.otflow_evaluation_support as eval_support
+import genode.models.otflow_train_val as train_val
 from genode.models.config import OTFlowConfig
 from genode.evaluation.fm_backbone_registry import (
     BACKBONE_NAME_OTFLOW,
@@ -18,7 +20,7 @@ from genode.evaluation.fm_backbone_registry import (
     FORECAST_FAMILY,
     materialize_backbone_manifest,
 )
-from genode.data.otflow_datasets import build_dataset_splits_from_arrays
+from genode.data.otflow_datasets import L2FeatureMap, build_dataset_splits_from_arrays
 from genode.evaluation.otflow_evaluation_support import load_conditional_generation_checkpoint_splits
 from genode.models.otflow_model import OTFlow
 from genode.models.otflow_train_val import _parse_batch, train_loop
@@ -46,6 +48,432 @@ def _tiny_cfg(*, cond_dim: int = 0) -> OTFlowConfig:
 
 
 class ConditionalGenerationTests(unittest.TestCase):
+    def test_panel_w1_is_not_the_mean_of_singleton_estimands(self) -> None:
+        def metric_series(ask_p, ask_v, bid_p, bid_v):
+            del ask_v, bid_p, bid_v
+            values = np.asarray(ask_p, dtype=np.float64).ravel()
+            return {key: values for key in train_val.CORE_L2_STATS}
+
+        def metric_row(gen_values, true_values):
+            gen = np.asarray(gen_values, dtype=np.float64)
+            true = np.asarray(true_values, dtype=np.float64)
+            return {
+                "seq": {
+                    "gen": {
+                        "ask_p": gen,
+                        "ask_v": gen,
+                        "bid_p": gen,
+                        "bid_v": gen,
+                    },
+                    "true": {
+                        "ask_p": true,
+                        "ask_v": true,
+                        "bid_p": true,
+                        "bid_v": true,
+                    },
+                }
+            }
+
+        rows = [
+            metric_row([2.0, 2.0], [0.0, 0.0]),
+            metric_row([0.0, 0.0], [2.0, 2.0]),
+        ]
+        with mock.patch.object(train_val, "microstructure_series", side_effect=metric_series):
+            panel = train_val._aggregate_core_l2_distribution_metrics(rows)
+            singletons = [
+                train_val._aggregate_core_l2_distribution_metrics([row])
+                for row in rows
+            ]
+
+        self.assertAlmostEqual(panel["unconditional_w1"], 0.0)
+        self.assertAlmostEqual(panel["conditional_w1"], 2.0, places=5)
+        for singleton in singletons:
+            self.assertAlmostEqual(
+                singleton["unconditional_w1"],
+                singleton["conditional_w1"],
+            )
+            self.assertGreater(singleton["unconditional_w1"], 1_000_000.0)
+
+    def test_constant_class_tstr_is_reported_instead_of_missing(self) -> None:
+        downstream = {
+            "real_x": np.asarray(
+                [[-3.0, 0.0], [0.0, 0.0], [3.0, 0.0], [0.1, 0.0]],
+                dtype=np.float32,
+            ),
+            "real_moves": np.asarray([-3.0, 0.0, 3.0, 0.1], dtype=np.float32),
+            "gen_x": np.ones((4, 2), dtype=np.float32),
+            "gen_moves": np.asarray([3.0, 4.0, 5.0, 6.0], dtype=np.float32),
+        }
+        distances = {
+            "unconditional_w1": 0.1,
+            "conditional_w1": 0.2,
+            "u_l1": 0.3,
+            "c_l1": 0.4,
+            "unconditional_w1_by_stat": {"spread": 0.1},
+            "conditional_w1_by_stat": {"spread": 0.2},
+            "unconditional_l1_by_stat": {"spread": 0.3},
+            "conditional_l1_by_stat": {"spread": 0.4},
+            "stat_scales": {"spread": 1.0},
+        }
+        with (
+            mock.patch.object(
+                train_val,
+                "_collect_downstream_examples",
+                return_value=downstream,
+            ),
+            mock.patch.object(
+                train_val,
+                "_aggregate_core_l2_distribution_metrics",
+                return_value=distances,
+            ),
+            mock.patch.object(
+                train_val,
+                "_train_small_discriminator_auc",
+                return_value=0.5,
+            ),
+        ):
+            metrics = train_val._evaluate_generation_main_metrics(
+                [{}],
+                SimpleNamespace(device=torch.device("cpu")),
+                horizon=10,
+                seed=7,
+            )
+
+        self.assertTrue(metrics["temporal_tstr_f1_applicable"])
+        self.assertEqual(metrics["temporal_tstr_f1_status"], "constant_train_class_fallback")
+        self.assertEqual(metrics["temporal_tstr_f1_train_class_count"], 1)
+        self.assertEqual(metrics["temporal_tstr_f1_test_class_count"], 3)
+        self.assertIsNotNone(metrics["temporal_tstr_f1"])
+        self.assertAlmostEqual(float(metrics["temporal_tstr_f1"]), 2.0 / 15.0)
+        self.assertAlmostEqual(
+            float(metrics["score_main"]),
+            (math.log1p(0.1) + math.log1p(0.2)) / 3.0,
+        )
+
+    def test_optional_classifier_failures_do_not_discard_distribution_metrics(self) -> None:
+        downstream = {
+            "real_x": np.asarray(
+                [[-3.0, 0.0], [0.0, 0.0], [3.0, 0.0]],
+                dtype=np.float32,
+            ),
+            "real_moves": np.asarray([-3.0, 0.0, 3.0], dtype=np.float32),
+            "gen_x": np.asarray(
+                [[-2.0, 0.0], [0.1, 0.0], [2.0, 0.0]],
+                dtype=np.float32,
+            ),
+            "gen_moves": np.asarray([-2.0, 0.1, 2.0], dtype=np.float32),
+        }
+        distances = {
+            "unconditional_w1": 0.1,
+            "conditional_w1": 0.2,
+            "u_l1": 0.3,
+            "c_l1": 0.4,
+            "unconditional_w1_by_stat": {"spread": 0.1},
+            "conditional_w1_by_stat": {"spread": 0.2},
+            "unconditional_l1_by_stat": {"spread": 0.3},
+            "conditional_l1_by_stat": {"spread": 0.4},
+            "stat_scales": {"spread": 1.0},
+        }
+        with (
+            mock.patch.object(
+                train_val,
+                "_collect_downstream_examples",
+                return_value=downstream,
+            ),
+            mock.patch.object(
+                train_val,
+                "_aggregate_core_l2_distribution_metrics",
+                return_value=distances,
+            ),
+            mock.patch.object(
+                train_val,
+                "_train_small_multiclass_mlp_f1",
+                side_effect=RuntimeError("classifier failure"),
+            ),
+            mock.patch.object(
+                train_val,
+                "_train_small_discriminator_auc",
+                side_effect=RuntimeError("discriminator failure"),
+            ),
+        ):
+            metrics = train_val._evaluate_generation_main_metrics(
+                [{}],
+                SimpleNamespace(device=torch.device("cpu")),
+                horizon=10,
+                seed=7,
+            )
+
+        self.assertIsNone(metrics["temporal_tstr_f1"])
+        self.assertEqual(metrics["temporal_tstr_f1_status"], "failed")
+        self.assertAlmostEqual(float(metrics["temporal_uw1"]), 0.1)
+        self.assertAlmostEqual(float(metrics["temporal_cw1"]), 0.2)
+        self.assertTrue(np.isfinite(float(metrics["score_main"])))
+
+    def test_optional_feature_preparation_failure_does_not_discard_distribution_metrics(
+        self,
+    ) -> None:
+        distances = {
+            "unconditional_w1": 0.1,
+            "conditional_w1": 0.2,
+            "u_l1": 0.3,
+            "c_l1": 0.4,
+            "unconditional_w1_by_stat": {"spread": 0.1},
+            "conditional_w1_by_stat": {"spread": 0.2},
+            "unconditional_l1_by_stat": {"spread": 0.3},
+            "conditional_l1_by_stat": {"spread": 0.4},
+            "stat_scales": {"spread": 1.0},
+        }
+        with (
+            mock.patch.object(
+                train_val,
+                "_collect_downstream_examples",
+                side_effect=RuntimeError("feature preparation failure"),
+            ),
+            mock.patch.object(
+                train_val,
+                "_aggregate_core_l2_distribution_metrics",
+                return_value=distances,
+            ),
+        ):
+            metrics = train_val._evaluate_generation_main_metrics(
+                [{}],
+                SimpleNamespace(device=torch.device("cpu")),
+                horizon=10,
+                seed=7,
+            )
+
+        self.assertIsNone(metrics["temporal_tstr_f1"])
+        self.assertEqual(metrics["temporal_tstr_f1_status"], "failed")
+        self.assertEqual(metrics["temporal_tstr_f1_train_class_count"], 0)
+        self.assertEqual(metrics["temporal_tstr_f1_test_class_count"], 0)
+        self.assertAlmostEqual(float(metrics["temporal_uw1"]), 0.1)
+        self.assertAlmostEqual(float(metrics["temporal_cw1"]), 0.2)
+        self.assertTrue(np.isfinite(float(metrics["score_main"])))
+
+    def test_eval_many_windows_binds_each_context_to_its_grid_and_seed(self) -> None:
+        calls = []
+
+        def evaluate_one(ds, model, cfg, **kwargs):
+            del ds, model, cfg
+            calls.append(
+                (
+                    kwargs["t0"],
+                    kwargs["seed"],
+                    tuple(kwargs["time_grid"]),
+                )
+            )
+            return {
+                "cmp": {},
+                "timing": {},
+                "gen": {},
+                "true": {},
+                "horizon": {},
+                "meta": {"t": kwargs["t0"]},
+            }
+
+        main_metrics = {
+            "temporal_tstr_f1": 0.5,
+            "temporal_tstr_f1_applicable": True,
+            "temporal_tstr_f1_status": "trained",
+            "temporal_tstr_f1_train_class_count": 3,
+            "temporal_tstr_f1_test_class_count": 3,
+            "disc_auc": 0.5,
+            "disc_auc_gap": 0.0,
+            "temporal_uw1": 0.1,
+            "temporal_cw1": 0.2,
+            "u_l1": 0.3,
+            "c_l1": 0.4,
+            "temporal_uw1_by_stat": {"spread": 0.1},
+            "temporal_cw1_by_stat": {"spread": 0.2},
+            "stat_scales": {"spread": 1.0},
+            "score_main": 0.2,
+            "label_horizon": 1,
+            "n_examples_real": 2,
+            "n_examples_gen": 2,
+            "threshold_abs_move": 0.1,
+        }
+        ds = SimpleNamespace(dataset_kind="l2", dataset_metadata={})
+        grids = ((0.0, 0.2, 1.0), (0.0, 0.8, 1.0))
+        with (
+            mock.patch.object(
+                train_val,
+                "_valid_eval_indices",
+                return_value=np.asarray([10, 20], dtype=np.int64),
+            ),
+            mock.patch.object(
+                train_val,
+                "eval_one_window",
+                side_effect=evaluate_one,
+            ),
+            mock.patch.object(
+                train_val,
+                "_evaluate_generation_main_metrics",
+                return_value=main_metrics,
+            ) as reduce_metrics,
+        ):
+            result = train_val.eval_many_windows(
+                ds,
+                object(),
+                SimpleNamespace(),
+                horizon=5,
+                nfe=2,
+                chosen_t0s=[10, 20],
+                generation_seed_values=[700, 701],
+                metrics_seed=700,
+                solver_key="euler",
+                time_grids=grids,
+            )
+
+        self.assertEqual(
+            calls,
+            [(10, 700, grids[0]), (20, 701, grids[1])],
+        )
+        self.assertEqual(reduce_metrics.call_count, 1)
+        self.assertEqual(result["meta"]["generation_seed_values"], [700, 701])
+        self.assertEqual(result["meta"]["time_grid_mode"], "per_window")
+
+    def test_fixed_and_adaptive_panels_share_the_same_metric_estimator(self) -> None:
+        calls = []
+
+        def metric_series(ask_p, ask_v, bid_p, bid_v):
+            del ask_v, bid_p, bid_v
+            values = np.asarray(ask_p, dtype=np.float64).ravel()
+            return {key: values for key in train_val.CORE_L2_STATS}
+
+        def evaluate_one(ds, model, cfg, **kwargs):
+            del ds, model, cfg
+            target_t = int(kwargs["t0"])
+            calls.append(
+                (
+                    target_t,
+                    int(kwargs["seed"]),
+                    tuple(kwargs["time_grid"]),
+                )
+            )
+            if target_t == 10:
+                gen_values = np.asarray([2.0, 2.0], dtype=np.float64)
+                true_values = np.asarray([0.0, 0.0], dtype=np.float64)
+            else:
+                gen_values = np.asarray([0.0, 0.0], dtype=np.float64)
+                true_values = np.asarray([2.0, 2.0], dtype=np.float64)
+            return {
+                "cmp": {},
+                "timing": {},
+                "gen": {},
+                "true": {},
+                "horizon": {},
+                "meta": {"t": target_t},
+                "seq": {
+                    "gen": {
+                        "ask_p": gen_values,
+                        "ask_v": gen_values,
+                        "bid_p": gen_values,
+                        "bid_v": gen_values,
+                    },
+                    "true": {
+                        "ask_p": true_values,
+                        "ask_v": true_values,
+                        "bid_p": true_values,
+                        "bid_v": true_values,
+                    },
+                },
+            }
+
+        downstream = {
+            "real_x": np.zeros((0, 1), dtype=np.float32),
+            "real_moves": np.zeros(0, dtype=np.float32),
+            "gen_x": np.zeros((0, 1), dtype=np.float32),
+            "gen_moves": np.zeros(0, dtype=np.float32),
+        }
+        ds = SimpleNamespace(dataset_kind="l2", dataset_metadata={})
+        cfg = SimpleNamespace(device=torch.device("cpu"))
+        grid = (0.0, 0.5, 1.0)
+        with (
+            mock.patch.object(
+                train_val,
+                "_valid_eval_indices",
+                return_value=np.asarray([10, 20], dtype=np.int64),
+            ),
+            mock.patch.object(
+                train_val,
+                "eval_one_window",
+                side_effect=evaluate_one,
+            ),
+            mock.patch.object(
+                train_val,
+                "microstructure_series",
+                side_effect=metric_series,
+            ),
+            mock.patch.object(
+                train_val,
+                "_collect_downstream_examples",
+                return_value=downstream,
+            ),
+        ):
+            fixed = train_val.eval_many_windows(
+                ds,
+                object(),
+                cfg,
+                horizon=5,
+                nfe=2,
+                chosen_t0s=[10, 20],
+                generation_seed_base=100,
+                metrics_seed=100,
+                solver_key="euler",
+                time_grid=grid,
+            )
+            adaptive = train_val.eval_many_windows(
+                ds,
+                object(),
+                cfg,
+                horizon=5,
+                nfe=2,
+                chosen_t0s=[10, 20],
+                generation_seed_values=[100, 101],
+                metrics_seed=100,
+                solver_key="euler",
+                time_grids=[grid, grid],
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                (10, 100, grid),
+                (20, 101, grid),
+                (10, 100, grid),
+                (20, 101, grid),
+            ],
+        )
+        self.assertEqual(fixed["meta"]["chosen_t0s"], adaptive["meta"]["chosen_t0s"])
+        self.assertEqual(
+            fixed["meta"]["generation_seed_values"],
+            adaptive["meta"]["generation_seed_values"],
+        )
+        self.assertEqual(fixed["meta"]["time_grid_mode"], "shared")
+        self.assertEqual(adaptive["meta"]["time_grid_mode"], "per_window")
+        for metric_key in ("temporal_uw1", "temporal_cw1", "stat_scales"):
+            with self.subTest(metric_key=metric_key):
+                self.assertEqual(
+                    fixed["cmp"]["main"][metric_key],
+                    adaptive["cmp"]["main"][metric_key],
+                )
+        self.assertEqual(fixed["cmp"]["score_main"], adaptive["cmp"]["score_main"])
+        for scale in fixed["cmp"]["main"]["stat_scales"].values():
+            self.assertAlmostEqual(float(scale["mean"]), 1.000001)
+
+    def test_l2_decode_rejects_nonfinite_and_overflowing_parameters(self) -> None:
+        feature_map = L2FeatureMap(levels=1)
+        with self.assertRaisesRegex(FloatingPointError, "non-finite"):
+            feature_map.decode_sequence(
+                np.asarray([[0.0, np.nan, 0.0, 0.0]], dtype=np.float64),
+                init_mid=100.0,
+            )
+        with self.assertRaisesRegex(FloatingPointError, "overflowed"):
+            feature_map.decode_sequence(
+                np.asarray([[0.0, 1_000.0, 0.0, 0.0]], dtype=np.float64),
+                init_mid=100.0,
+            )
+
     def test_manifest_metadata_path_uses_project_relative_resolution(self) -> None:
         with mock.patch.object(eval_support, "resolve_project_path", side_effect=lambda value: Path("/repo") / str(value)):
             path = eval_support._metadata_path_for_checkpoint(

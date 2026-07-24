@@ -497,6 +497,14 @@ def run_fixed_schedule_variant(
         chosen_t0s=chosen_t0s,
         generation_seed_base=int(generation_seed_base),
     )
+    main_metrics = dict(result.get("cmp", {}).get("main", {}) or {})
+    bundle = _metric_bundle(result)
+    for metric_key in ("score_main", "temporal_uw1", "temporal_cw1"):
+        value = bundle.get(metric_key)
+        if value is None or not np.isfinite(float(value)):
+            raise FloatingPointError(
+                f"Fixed panel evaluation produced invalid {metric_key}={value!r}."
+            )
 
     row = {
         "grid_name": str(grid_spec["grid_name"]),
@@ -532,8 +540,120 @@ def run_fixed_schedule_variant(
         },
         "per_window_metric_rows": [dict(row) for row in list(result["meta"].get("per_window_metric_rows", []) or [])],
         "score_main_only": bool(result["meta"].get("main_metrics_only", False)),
+        "temporal_tstr_f1_status": str(
+            main_metrics.get("temporal_tstr_f1_status", "")
+        ),
+        "temporal_tstr_f1_train_class_count": int(
+            main_metrics.get("temporal_tstr_f1_train_class_count", 0) or 0
+        ),
+        "temporal_tstr_f1_test_class_count": int(
+            main_metrics.get("temporal_tstr_f1_test_class_count", 0) or 0
+        ),
     }
-    row.update(_metric_bundle(result))
+    row.update(bundle)
+    return row
+
+
+def run_context_schedule_panel_variant(
+    *,
+    model,
+    ds,
+    cfg,
+    eval_horizon: int,
+    solver_name: str,
+    target_nfe: int,
+    time_grids: Sequence[Sequence[float]],
+    chosen_t0s: Sequence[int],
+    generation_seed_values: Sequence[int],
+    metrics_seed: int,
+    score_main_only: bool,
+) -> Dict[str, Any]:
+    """Evaluate one matched context panel with a distinct schedule per window."""
+
+    chosen = [int(value) for value in chosen_t0s]
+    grids = [tuple(float(value) for value in grid) for grid in time_grids]
+    seeds = [int(value) for value in generation_seed_values]
+    if not chosen:
+        raise ValueError("Adaptive panel evaluation requires at least one chosen context.")
+    if len(grids) != len(chosen) or len(seeds) != len(chosen):
+        raise ValueError(
+            "Adaptive panel contexts, time grids, and generation seeds must have identical lengths: "
+            f"{len(chosen)}, {len(grids)}, {len(seeds)}."
+        )
+    nfe = normalize_solver_nfe_fields(
+        str(solver_name),
+        int(target_nfe),
+        source="context schedule panel",
+    )
+    for grid_index, grid in enumerate(grids):
+        if len(grid) != int(nfe.macro_steps) + 1:
+            raise ValueError(
+                f"Adaptive panel time_grid[{grid_index}] has {len(grid)} points; "
+                f"expected {int(nfe.macro_steps) + 1} for solver={nfe.solver_key!r} "
+                f"target_nfe={nfe.target_nfe}."
+            )
+
+    t0 = time.time()
+    result = eval_many_windows(
+        ds,
+        model,
+        cfg,
+        horizon=int(eval_horizon),
+        nfe=nfe.target_nfe,
+        n_windows=len(chosen),
+        seed=int(metrics_seed),
+        horizons_eval=[int(eval_horizon)],
+        chosen_t0s=chosen,
+        generation_seed_values=seeds,
+        metrics_seed=int(metrics_seed),
+        main_metrics_only=bool(score_main_only),
+        solver_key=nfe.solver_key,
+        time_grids=grids,
+    )
+    bundle = _metric_bundle(result)
+    for metric_key in ("score_main", "temporal_uw1", "temporal_cw1"):
+        value = bundle.get(metric_key)
+        if value is None or not np.isfinite(float(value)):
+            raise FloatingPointError(
+                f"Adaptive panel evaluation produced invalid {metric_key}={value!r}."
+            )
+    main_metrics = result["cmp"]["main"]
+    row: Dict[str, Any] = {
+        "grid_name": "gipo",
+        "grid_kind": "gipo_density_time_grid",
+        "selection_group": "gipo",
+        "comparison_role": "student",
+        "solver_name": nfe.solver_key,
+        "nfe": nfe.target_nfe,
+        "target_total_field_evals": nfe.target_nfe,
+        "solver_override": nfe.solver_key,
+        "eval_seconds": float(time.time() - t0),
+        "panel_context_count": len(chosen),
+        "time_grid_mode": "per_window",
+        "evaluation_protocol": {
+            "chosen_t0s": [int(value) for value in result["meta"]["chosen_t0s"]],
+            "chosen_t0s_hash": str(result["meta"].get("chosen_t0s_hash", "")),
+            "eval_horizon": int(result["meta"].get("horizon", eval_horizon)),
+            "dataset_kind": str(result["meta"].get("dataset_kind", "")),
+            "generation_seed_values": [int(value) for value in result["meta"]["generation_seed_values"]],
+            "metrics_seed": int(result["meta"]["metrics_seed"]),
+            "main_metrics_only": bool(result["meta"].get("main_metrics_only", False)),
+            "time_grid_mode": str(result["meta"].get("time_grid_mode", "")),
+        },
+        "per_window_metric_rows": [
+            dict(metric_row)
+            for metric_row in list(result["meta"].get("per_window_metric_rows", []) or [])
+        ],
+        "score_main_only": bool(result["meta"].get("main_metrics_only", False)),
+        "temporal_tstr_f1_status": str(main_metrics.get("temporal_tstr_f1_status", "")),
+        "temporal_tstr_f1_train_class_count": int(
+            main_metrics.get("temporal_tstr_f1_train_class_count", 0) or 0
+        ),
+        "temporal_tstr_f1_test_class_count": int(
+            main_metrics.get("temporal_tstr_f1_test_class_count", 0) or 0
+        ),
+    }
+    row.update(bundle)
     return row
 
 
@@ -547,6 +667,7 @@ __all__ = [
     "fixed_schedule_shape_statistics",
     "load_external_schedule_catalog",
     "run_fixed_schedule_variant",
+    "run_context_schedule_panel_variant",
     "schedule_display_name",
     "schedule_time_alignment",
 ]

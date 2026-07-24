@@ -23,6 +23,7 @@ from genode.experiment_layout import (
     TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
     REFERENCE_SUPERVISION_SCHEDULE_KEYS,
     REVERSED_SCHEDULE_BASE,
+    SCENARIO_FAMILY_CONDITIONAL_GENERATION,
 )
 from genode.gipo.density_representation import (
     DEFAULT_LOG_DENSITY_EPS,
@@ -79,7 +80,8 @@ ScheduleGridKey = Tuple[str, str, int] | Tuple[str, str, int, int]
 GIPO_PROTOCOL = "gipo_density"
 CONTEXT_EMBEDDING_KINDS: Tuple[str, ...] = ("ctx_summary", "summary")
 DEFAULT_CONTEXT_EMBEDDING_KIND = "ctx_summary"
-CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION = 2
+CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION = 3
+LEGACY_CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION = 2
 DEFAULT_CONTEXT_CALIBRATION_TOTAL = TRAIN_TUNING_CONTEXT_SAMPLE_COUNT
 MIN_CONTEXT_CALIBRATION_TOTAL = 72
 MAX_CONTEXT_CALIBRATION_TOTAL = TRAIN_TUNING_CONTEXT_SAMPLE_COUNT
@@ -1816,13 +1818,53 @@ _CONTEXT_EMBEDDING_SCOPE_FIELDS = (
     "context_embedding_kind",
     "protocol_hash",
 )
+_CONDITIONAL_PANEL_COVERAGE_PROTOCOL = (
+    "conditional_schedule_panel_context_binding"
+)
+_CONDITIONAL_PANEL_COVERAGE_FIELDS = (
+    "benchmark_family",
+    "experiment_layout",
+    "scenario_key",
+    "scenario_family",
+    "method_key",
+    "nfe_role",
+    "checkpoint_step",
+    "checkpoint_id",
+    "protocol_hash",
+    "split_phase",
+    "seed",
+    "solver_key",
+    "target_nfe",
+    "scheduler_key",
+    "schedule_grid_hash",
+    "context_schema",
+    "context_embedding_kind",
+    "parent_row_signature",
+    "row_signature",
+    "context_id",
+    "context_embedding_id",
+    "evaluation_seed",
+    "example_idx",
+    "target_t",
+    "sample_seed_start",
+    "sample_seed_values_json",
+    "chosen_examples_hash",
+    "evaluation_protocol_hash",
+    "temporal_uw1",
+    "temporal_cw1",
+)
 
 
 def _context_embedding_coverage(
     embedding_ids: Sequence[str],
     context_rows: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
+    def coverage_value(row: Mapping[str, Any], field: str) -> str:
+        value = row.get(field, "")
+        return "" if value is None or value == "" else str(value).strip()
+
     identities_by_embedding: Dict[str, Dict[str, str]] = {}
+    conditional_panel_identities: List[Dict[str, str]] = []
     for row_index, row in enumerate(context_rows):
         embedding_id = context_embedding_id_from_row(row)
         identity = {
@@ -1844,6 +1886,13 @@ def _context_embedding_coverage(
             "context_id": context_id_from_row(row),
             "context_embedding_id": embedding_id,
         }
+        if identity["benchmark_family"] == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
+            conditional_panel_identities.append(
+                {
+                    field: coverage_value(row, field)
+                    for field in _CONDITIONAL_PANEL_COVERAGE_FIELDS
+                }
+            )
         if not identity["benchmark_family"] or not identity["scenario_key"]:
             raise ValueError(
                 "Context embedding coverage rows require benchmark_family and scenario_key."
@@ -1886,12 +1935,27 @@ def _context_embedding_coverage(
                 "identity_sha256": digest(records),
             }
         )
-    return {
+    coverage = {
         "protocol": _CONTEXT_EMBEDDING_COVERAGE_PROTOCOL,
         "context_count": len(identities),
         "identity_sha256": digest(identities),
         "scopes": scopes,
     }
+    if conditional_panel_identities:
+        ordered_panel_identities = sorted(
+            conditional_panel_identities,
+            key=lambda record: json.dumps(
+                record,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        coverage["conditional_panel"] = {
+            "protocol": _CONDITIONAL_PANEL_COVERAGE_PROTOCOL,
+            "row_count": len(ordered_panel_identities),
+            "identity_sha256": digest(ordered_panel_identities),
+        }
+    return coverage
 
 
 def save_context_embedding_table(
@@ -2096,15 +2160,27 @@ def load_context_embedding_table(
         )
         manifest_metadata = raw_metadata
         artifact_version = manifest_integer("artifact_version", default=0)
-        if artifact_version not in {0, 1, CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION}:
+        if artifact_version not in {
+            0,
+            1,
+            LEGACY_CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION,
+            CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION,
+        }:
             raise ValueError(
                 f"Unsupported context embedding artifact_version={artifact_version}."
             )
-        if claim_manifest_required and artifact_version != CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION:
+        if claim_manifest_required and artifact_version not in {
+            LEGACY_CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION,
+            CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION,
+        }:
             raise ValueError(
-                "Claim-bearing context embedding tables require a current, digest-bound manifest."
+                "Claim-bearing context embedding tables require a digest-bound v2 or v3 manifest."
             )
-        if artifact_version in {1, CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION}:
+        if artifact_version in {
+            1,
+            LEGACY_CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION,
+            CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION,
+        }:
             if "context_embedding_kind" not in raw_metadata:
                 raise ValueError(
                     "Context embedding manifest metadata is missing context_embedding_kind."
@@ -2140,15 +2216,27 @@ def load_context_embedding_table(
             ],
         )
         raw_coverage = manifest_metadata.get("coverage")
+        accepted_coverages = [expected_coverage]
+        if (
+            artifact_version
+            == LEGACY_CONTEXT_EMBEDDING_TABLE_ARTIFACT_VERSION
+            and "conditional_panel" in expected_coverage
+        ):
+            legacy_coverage = dict(expected_coverage)
+            legacy_coverage.pop("conditional_panel", None)
+            accepted_coverages.append(legacy_coverage)
         if not isinstance(raw_coverage, Mapping) or json.dumps(
             raw_coverage,
             sort_keys=True,
             separators=(",", ":"),
-        ) != json.dumps(
-            expected_coverage,
-            sort_keys=True,
-            separators=(",", ":"),
-        ):
+        ) not in {
+            json.dumps(
+                coverage,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for coverage in accepted_coverages
+        }:
             raise ValueError(
                 "Context embedding manifest coverage does not match the requested context rows."
             )
@@ -2768,11 +2856,11 @@ def _teacher_metric_weights(
         reference_weights = objective_weight_map_for_keys(keys)
         explicit_weights = normalize_teacher_utility_weights(keys, teacher_utility_weights) if teacher_utility_weights is not None else {}
         for row in rows:
-            reward_weights = _row_reward_metric_weights(row, keys)
-            if reward_weights:
-                row_weights = {key: float(reward_weights.get(key, 0.0)) for key in keys}
-            elif explicit_weights:
+            reward_weights = {} if explicit_weights else _row_reward_metric_weights(row, keys)
+            if explicit_weights:
                 row_weights = {key: float(explicit_weights[key]) for key in keys}
+            elif reward_weights:
+                row_weights = {key: float(reward_weights.get(key, 0.0)) for key in keys}
             else:
                 row_weights = {key: float(reference_weights.get(key, 1.0)) for key in keys}
             values.append([float(row_weights[key]) for key in keys])

@@ -1,5 +1,6 @@
 import argparse
 import csv
+import hashlib
 import json
 import math
 import tempfile
@@ -321,6 +322,9 @@ class GenericContextGipoTests(unittest.TestCase):
                 "temporal_uw1": 0.25,
                 "temporal_tstr_f1": 0.8,
                 "temporal_tstr_f1_applicable": True,
+                "temporal_tstr_f1_status": "trained",
+                "temporal_tstr_f1_train_class_count": 3,
+                "temporal_tstr_f1_test_class_count": 3,
             },
             uniform_metric_row={
                 "scheduler_key": "uniform",
@@ -362,8 +366,13 @@ class GenericContextGipoTests(unittest.TestCase):
         reward_weights = json.loads(str(rows[0]["reward_metric_weights_json"]))
         self.assertEqual(
             set(reward_weights),
-            {"u_temporal_uw1_uniform", "u_temporal_cw1_uniform", "u_temporal_tstr_f1_uniform"},
+            {"u_temporal_uw1_uniform", "u_temporal_cw1_uniform"},
         )
+        self.assertEqual(set(reward_weights.values()), {0.5})
+        self.assertEqual(rows[0]["reward_metric_count"], 2)
+        self.assertEqual(rows[0]["temporal_tstr_f1_status"], "trained")
+        self.assertEqual(rows[0]["temporal_tstr_f1_train_class_count"], 3)
+        self.assertEqual(rows[0]["temporal_tstr_f1_test_class_count"], 3)
         self.assertEqual({row["axis_window"] for row in rows}, {"512", "768"})
 
     def test_conditional_context_rows_use_aggregate_primary_metrics_not_score_gain(self) -> None:
@@ -406,13 +415,18 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertAlmostEqual(float(rows[0]["u_comp_uniform"]), math.log(2.0))
         self.assertNotAlmostEqual(float(rows[0]["u_comp_uniform"]), float(rows[0]["u_score_uniform"]))
 
-    def test_directional_objective_columns_mix_lower_and_higher_metrics(self) -> None:
-        row = {"scheduler_key": "late_power_3", "temporal_cw1": 0.5, "temporal_uw1": 1.0, "temporal_tstr_f1": 0.8, "temporal_tstr_f1_applicable": True}
+    def test_tstr_utility_is_reported_but_excluded_from_default_composite(self) -> None:
+        row = {"scheduler_key": "late_power_3", "temporal_cw1": 0.5, "temporal_uw1": 1.0, "temporal_tstr_f1": 0.2, "temporal_tstr_f1_applicable": True}
         uniform = {"scheduler_key": "uniform", "temporal_cw1": 1.0, "temporal_uw1": 2.0, "temporal_tstr_f1": 0.4, "temporal_tstr_f1_applicable": True}
         cols = uniform_anchored_objective_columns(row, uniform, CONDITIONAL_METRIC_SPECS)
         self.assertAlmostEqual(float(cols["u_temporal_cw1_uniform"]), math.log(1.0 / 0.5))
         self.assertAlmostEqual(float(cols["u_temporal_uw1_uniform"]), math.log(2.0 / 1.0))
-        self.assertAlmostEqual(float(cols["u_temporal_tstr_f1_uniform"]), math.log(0.8 / 0.4))
+        self.assertAlmostEqual(float(cols["u_temporal_tstr_f1_uniform"]), math.log(0.2 / 0.4))
+        self.assertAlmostEqual(float(cols["u_comp_uniform"]), math.log(2.0))
+        self.assertEqual(
+            json.loads(str(cols["reward_metric_weights_json"])),
+            {"u_temporal_cw1_uniform": 0.5, "u_temporal_uw1_uniform": 0.5},
+        )
         uniform_cols = uniform_anchored_objective_columns(uniform, uniform, CONDITIONAL_METRIC_SPECS)
         self.assertEqual(float(uniform_cols["u_comp_uniform"]), 0.0)
 
@@ -723,7 +737,7 @@ class GenericContextGipoTests(unittest.TestCase):
         scalar = _scalarize_teacher_metric_values(values, raw_weights, target_keys=target_keys, target_mask=mask)
         self.assertAlmostEqual(float(scalar.item()), 2.0)
 
-    def test_row_reward_weights_override_explicit_teacher_weights(self) -> None:
+    def test_explicit_teacher_weights_override_default_row_weights(self) -> None:
         row = {
             "context_id": "ctx",
             "scheduler_key": "late_power_3",
@@ -743,7 +757,52 @@ class GenericContextGipoTests(unittest.TestCase):
             target_mask=mask,
         )
         scalar = _scalarize_teacher_metric_values(values, weights, target_keys=target_keys, target_mask=mask)
-        self.assertAlmostEqual(float(scalar.item()), 2.5)
+        self.assertAlmostEqual(float(scalar.item()), 1.0)
+
+    def test_explicit_optional_tstr_target_accepts_default_row_weight_metadata(self) -> None:
+        row = {
+            "split_phase": "train_tuning",
+            "context_id": "ctx",
+            "scheduler_key": "late_power_3",
+            "u_temporal_tstr_f1_uniform": 0.2,
+            "temporal_tstr_f1_applicable": True,
+            "gipo_reward_protocol": GIPO_PROTOCOL,
+            "reward_anchor_scheduler_key": "uniform",
+            "reward_utility_transform": "directional_log_uniform_anchor",
+            "reward_metric_weights_json": (
+                '{"u_temporal_cw1_uniform":0.5,'
+                '"u_temporal_uw1_uniform":0.5}'
+            ),
+        }
+
+        train_gipo_module._validate_train_tuning_reward_provenance_metadata(
+            [row],
+            target_keys=("u_temporal_tstr_f1_uniform",),
+            label="test rows",
+            teacher_utility_weights={"u_temporal_tstr_f1_uniform": 1.0},
+        )
+        values, mask = _teacher_metric_targets(
+            [row],
+            target_keys=("u_temporal_tstr_f1_uniform",),
+            device="cpu",
+        )
+        weights = _teacher_metric_weights(
+            [row],
+            target_keys=("u_temporal_tstr_f1_uniform",),
+            batch=1,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            teacher_utility_weights={"u_temporal_tstr_f1_uniform": 1.0},
+            target_mask=mask,
+        )
+        scalar = _scalarize_teacher_metric_values(
+            values,
+            weights,
+            target_keys=("u_temporal_tstr_f1_uniform",),
+            target_mask=mask,
+        )
+        self.assertEqual(weights.tolist(), [[1.0]])
+        self.assertAlmostEqual(float(scalar.item()), 0.2)
 
     def test_schedule_summary_context_embedding_collisions_are_rejected(self) -> None:
         embeddings = {"ckpt:ctx": [0.0, 1.0]}
@@ -812,9 +871,18 @@ class GenericContextGipoTests(unittest.TestCase):
         lob = teacher_metric_profile_for_scenario("cryptos")
         self.assertEqual(
             lob["target_utility_keys"],
-            ["u_temporal_uw1_uniform", "u_temporal_cw1_uniform", "u_temporal_tstr_f1_uniform"],
+            ["u_temporal_uw1_uniform", "u_temporal_cw1_uniform"],
         )
-        self.assertTrue(all(math.isclose(float(value), 1.0 / 3.0) for value in lob["target_weights"].values()))
+        self.assertEqual(
+            lob["target_weights"],
+            {"u_temporal_uw1_uniform": 0.5, "u_temporal_cw1_uniform": 0.5},
+        )
+        self.assertEqual(lob["optional_metric_keys"], ["temporal_tstr_f1"])
+        self.assertEqual(lob["optional_utility_keys"], ["u_temporal_tstr_f1_uniform"])
+        self.assertEqual(
+            lob["optional_weights"],
+            {"u_temporal_tstr_f1_uniform": 0.0},
+        )
         self.assertIn("spread_specific_error", lob["diagnostic_metric_keys"])
 
         ecg = teacher_metric_profile_for_scenario("long_term_st")
@@ -835,10 +903,18 @@ class GenericContextGipoTests(unittest.TestCase):
                 "gipo_step_budget": 500,
                 "mode": "continuous",
                 "teacher_final_retrain": "{}",
-                "score_main": "0.8",
+                "metric_protocol": report_locked_test.CONDITIONAL_PANEL_METRIC_PROTOCOL,
+                "metric_granularity": "matched_context_panel",
+                "panel_context_count": 2,
+                "panel_metrics_seed": 100,
+                "panel_chosen_t0s_hash": "panel-hash",
+                "score_main": "1.0",
                 "temporal_uw1": "0.2",
                 "temporal_cw1": "0.3",
+                "temporal_tstr_f1": "",
                 "temporal_tstr_f1_applicable": "true",
+                "temporal_tstr_f1_status": "failed",
+                "impact_response_error": "nan",
             },
             {
                 "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
@@ -852,23 +928,251 @@ class GenericContextGipoTests(unittest.TestCase):
                 "gipo_step_budget": 500,
                 "mode": "continuous",
                 "teacher_final_retrain": "{}",
-                "score_main": "0.6",
-                "temporal_uw1": "0.4",
-                "temporal_cw1": "0.5",
+                "metric_protocol": report_locked_test.CONDITIONAL_PANEL_METRIC_PROTOCOL,
+                "metric_granularity": "matched_context_panel",
+                "panel_context_count": 2,
+                "panel_metrics_seed": 100,
+                "panel_chosen_t0s_hash": "panel-hash",
+                "score_main": "0.8",
+                "temporal_uw1": "0.2",
+                "temporal_cw1": "0.3",
+                "temporal_tstr_f1": "",
                 "temporal_tstr_f1_applicable": "true",
+                "temporal_tstr_f1_status": "failed",
+                "impact_response_error": "nan",
             },
         ]
         self.assertEqual(report_locked_test._benchmark_family_from_rows(rows), CONDITIONAL_GENERATION_FAMILY)
         aggregated = report_locked_test._aggregate_seed_rows(rows, split_phase="locked_test")
         self.assertEqual(len(aggregated), 1)
-        self.assertAlmostEqual(float(aggregated[0]["score_main"]), 0.7)
-        self.assertAlmostEqual(float(aggregated[0]["temporal_uw1"]), 0.3)
+        self.assertAlmostEqual(float(aggregated[0]["score_main"]), 0.9)
+        self.assertAlmostEqual(float(aggregated[0]["temporal_uw1"]), 0.2)
+        self.assertNotIn("temporal_tstr_f1", aggregated[0])
+        self.assertEqual(aggregated[0]["temporal_tstr_f1_status"], "failed")
+        self.assertTrue(aggregated[0]["temporal_tstr_f1_applicable"])
+        self.assertNotIn("impact_response_error", aggregated[0])
+        inconsistent = [dict(row) for row in rows]
+        inconsistent[1]["temporal_uw1"] = "0.4"
+        with self.assertRaisesRegex(ValueError, "repeated identically"):
+            report_locked_test._aggregate_seed_rows(
+                inconsistent,
+                split_phase="locked_test",
+            )
+        nonfinite = [dict(row) for row in rows]
+        nonfinite[1]["temporal_uw1"] = "nan"
+        with self.assertRaisesRegex(FloatingPointError, "must be finite"):
+            report_locked_test._aggregate_seed_rows(
+                nonfinite,
+                split_phase="locked_test",
+            )
         with self.assertRaises(ValueError):
             report_locked_test._benchmark_family_from_rows([rows[0], {"benchmark_family": FORECAST_FAMILY}])
         with self.assertRaisesRegex(ValueError, "require explicit benchmark_family"):
             report_locked_test._benchmark_family_from_rows(
                 [rows[0], {"benchmark_family": ""}],
                 requested=CONDITIONAL_GENERATION_FAMILY,
+            )
+
+    def test_conditional_reporter_evaluates_one_ordered_panel_per_cell(self) -> None:
+        chosen_examples_hash = hashlib.sha256(
+            json.dumps([10, 20], separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        base = {
+            "split_phase": "locked_test",
+            "source_split_phase": "locked_test",
+            "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+            "scenario_key": "lobster_synthetic",
+            "seed": 7,
+            "logical_seed": 7,
+            "solver_key": "euler",
+            "target_nfe": 2,
+            "checkpoint_step": 4000,
+            "checkpoint_id": "checkpoint",
+            "eval_horizon": 5,
+            "chosen_examples_hash": chosen_examples_hash,
+        }
+        representatives = [
+            {
+                **base,
+                "context_id": "context-b",
+                "example_idx": 1,
+                "target_t": 20,
+                "evaluation_seed": 501,
+            },
+            {
+                **base,
+                "context_id": "context-a",
+                "example_idx": 0,
+                "target_t": 10,
+                "evaluation_seed": 500,
+            },
+        ]
+        predictions = [
+            {"time_grid": [0.0, 0.75, 1.0]},
+            {"time_grid": [0.0, 0.25, 1.0]},
+        ]
+        panel_result = {
+            "score_main": 0.3,
+            "temporal_uw1": 0.1,
+            "temporal_cw1": 0.2,
+            "temporal_tstr_f1": 0.7,
+            "temporal_tstr_f1_applicable": True,
+            "disc_auc": 0.5,
+            "disc_auc_gap": 0.0,
+            "u_l1": 0.1,
+            "c_l1": 0.2,
+            "spread_specific_error": 0.3,
+            "imbalance_specific_error": 0.4,
+            "ret_vol_acf_error": 0.5,
+            "impact_response_error": float("nan"),
+            "temporal_tstr_f1_status": "trained",
+            "temporal_tstr_f1_train_class_count": 3,
+            "temporal_tstr_f1_test_class_count": 3,
+            "per_window_metric_rows": [
+                {"target_t": 10, "score_main": 1.0},
+                {"target_t": 20, "score_main": 2.0},
+            ],
+        }
+        with mock.patch.object(
+            report_locked_test,
+            "run_context_schedule_panel_variant",
+            return_value=panel_result,
+        ) as evaluate:
+            metrics = report_locked_test._evaluate_conditional_generation_panels(
+                model=object(),
+                splits={"test": object()},
+                cfg=SimpleNamespace(),
+                representatives=representatives,
+                predictions=predictions,
+            )
+
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual(evaluate.call_args.kwargs["chosen_t0s"], [10, 20])
+        self.assertEqual(
+            evaluate.call_args.kwargs["generation_seed_values"],
+            [500, 501],
+        )
+        self.assertEqual(
+            evaluate.call_args.kwargs["time_grids"],
+            [[0.0, 0.25, 1.0], [0.0, 0.75, 1.0]],
+        )
+        first = metrics[report_locked_test._row_group_key(representatives[1])]
+        second = metrics[report_locked_test._row_group_key(representatives[0])]
+        self.assertEqual(first["metric_protocol"], report_locked_test.CONDITIONAL_PANEL_METRIC_PROTOCOL)
+        self.assertEqual(first["temporal_uw1"], second["temporal_uw1"])
+        self.assertIsNone(first["impact_response_error"])
+        self.assertNotEqual(first["window_score_main"], second["window_score_main"])
+
+    def test_strict_comparison_rejects_sampling_seed_mismatch(self) -> None:
+        chosen_examples_hash = hashlib.sha256(b"[10]").hexdigest()
+        representative = {
+            "split_phase": "locked_test",
+            "source_split_phase": "locked_test",
+            "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+            "scenario_key": "lobster_synthetic",
+            "seed": 0,
+            "logical_seed": 0,
+            "evaluation_seed": 100,
+            "solver_key": "euler",
+            "target_nfe": 4,
+            "checkpoint_step": 4000,
+            "checkpoint_id": "checkpoint",
+            "context_id": "context-a",
+            "example_idx": 0,
+            "target_t": 10,
+            "target_stop": 15,
+            "chosen_examples_hash": chosen_examples_hash,
+            "evaluation_protocol_hash": "a" * 64,
+            "score_main": 0.3,
+            "temporal_uw1": 0.1,
+            "temporal_cw1": 0.2,
+        }
+        baseline_rows = [
+            {**representative, "scheduler_key": schedule_key}
+            for schedule_key in report_locked_test.BASELINE_SCHEDULE_KEYS
+        ]
+        comparator_rows = [
+            {**representative, "scheduler_key": schedule_key}
+            for schedule_key in report_locked_test.SER_REFERENCE_SCHEDULE_KEYS
+        ]
+        report_locked_test._validate_strict_comparison_context_coverage(
+            representatives=[representative],
+            baseline_rows=baseline_rows,
+            comparator_rows=comparator_rows,
+        )
+        baseline_rows[0]["evaluation_seed"] = 999
+        with self.assertRaisesRegex(ValueError, "sampling seed mismatch"):
+            report_locked_test._validate_strict_comparison_context_coverage(
+                representatives=[representative],
+                baseline_rows=baseline_rows,
+                comparator_rows=comparator_rows,
+            )
+
+    def test_strict_conditional_comparison_rejects_mixed_panel_metrics_and_hashes(self) -> None:
+        chosen_examples_hash = hashlib.sha256(b"[10,20]").hexdigest()
+        representatives = [
+            {
+                "split_phase": "locked_test",
+                "source_split_phase": "locked_test",
+                "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+                "scenario_key": "lobster_synthetic",
+                "seed": 0,
+                "logical_seed": 0,
+                "evaluation_seed": 100 + example_idx,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "checkpoint_step": 4000,
+                "checkpoint_id": "checkpoint",
+                "context_id": f"context-{example_idx}",
+                "example_idx": example_idx,
+                "target_t": target_t,
+                "target_stop": target_t + 5,
+                "chosen_examples_hash": chosen_examples_hash,
+                "evaluation_protocol_hash": "a" * 64,
+                "score_main": 0.3 + example_idx,
+                "temporal_uw1": 0.1,
+                "temporal_cw1": 0.2,
+            }
+            for example_idx, target_t in enumerate((10, 20))
+        ]
+        baseline_rows = [
+            {**row, "scheduler_key": schedule_key}
+            for schedule_key in report_locked_test.BASELINE_SCHEDULE_KEYS
+            for row in representatives
+        ]
+        comparator_rows = [
+            {**row, "scheduler_key": schedule_key}
+            for schedule_key in report_locked_test.SER_REFERENCE_SCHEDULE_KEYS
+            for row in representatives
+        ]
+
+        report_locked_test._validate_strict_comparison_context_coverage(
+            representatives=representatives,
+            baseline_rows=baseline_rows,
+            comparator_rows=comparator_rows,
+        )
+        baseline_rows[1]["temporal_uw1"] = 0.4
+        with self.assertRaisesRegex(ValueError, "does not repeat temporal_uw1"):
+            report_locked_test._validate_strict_comparison_context_coverage(
+                representatives=representatives,
+                baseline_rows=baseline_rows,
+                comparator_rows=comparator_rows,
+            )
+        baseline_rows[1]["temporal_uw1"] = 0.1
+        baseline_rows[1]["chosen_examples_hash"] = "b" * 64
+        with self.assertRaisesRegex(ValueError, "chosen panel hash mismatch"):
+            report_locked_test._validate_strict_comparison_context_coverage(
+                representatives=representatives,
+                baseline_rows=baseline_rows,
+                comparator_rows=comparator_rows,
+            )
+        baseline_rows[1]["chosen_examples_hash"] = chosen_examples_hash
+        baseline_rows[1]["evaluation_protocol_hash"] = "b" * 64
+        with self.assertRaisesRegex(ValueError, "evaluation protocol hash mismatch"):
+            report_locked_test._validate_strict_comparison_context_coverage(
+                representatives=representatives,
+                baseline_rows=baseline_rows,
+                comparator_rows=comparator_rows,
             )
 
     def test_locked_test_split_cannot_hide_behind_blank_alias(self) -> None:
@@ -1064,13 +1368,14 @@ class GenericContextGipoTests(unittest.TestCase):
                 "scenario_key": "solar_energy_10m",
                 "source_split_phase": "locked_test",
                 "logical_seed": 0,
+                "evaluation_seed": 100 + context_index,
                 "solver_key": "euler",
                 "target_nfe": 4,
                 "checkpoint_step": 4000,
                 "checkpoint_id": "checkpoint",
                 "context_id": context_id,
             }
-            for context_id in ("context-a", "context-b")
+            for context_index, context_id in enumerate(("context-a", "context-b"))
         ]
         baseline_rows = [
             {**row, "scheduler_key": schedule_key}
@@ -1570,6 +1875,101 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertEqual(ranking["metric_rankings"]["temporal_tstr_f1"], ["gipo", "uniform"])
         self.assertGreater(ranking["student_comparisons"][0]["student_temporal_tstr_f1_gain_vs_uniform"], 0.0)
 
+    def test_missing_optional_tstr_serializes_as_null_comparisons(self) -> None:
+        baseline = [
+            {
+                "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+                "scenario_key": "lobster_synthetic",
+                "split_phase": "locked_test",
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "uniform",
+                "temporal_uw1": 1.0,
+                "temporal_cw1": 1.0,
+                "temporal_tstr_f1": None,
+                "u_comp_uniform": 0.0,
+            }
+        ]
+        student = [
+            {
+                "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+                "scenario_key": "lobster_synthetic",
+                "split_phase": "locked_test",
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "gipo",
+                "temporal_uw1": 0.5,
+                "temporal_cw1": 0.5,
+                "temporal_tstr_f1": None,
+                "u_comp_uniform": 0.4,
+            }
+        ]
+
+        summary = build_comparison_summary(
+            baseline_rows=baseline,
+            student_rows=student,
+            scenario_key="lobster_synthetic",
+            benchmark_family=CONDITIONAL_GENERATION_FAMILY,
+            split_phase="locked_test",
+            seeds=[0],
+            solver_names=["euler"],
+            target_nfe_values=[4],
+        )
+
+        ranking = summary["cell_rankings"][0]
+        comparison = ranking["student_comparisons"][0]
+        self.assertEqual(ranking["metric_rankings"]["temporal_tstr_f1"], [])
+        self.assertIsNone(ranking["best_baseline_by_temporal_tstr_f1"])
+        self.assertIsNone(comparison["student_temporal_tstr_f1_delta_vs_uniform"])
+        self.assertIsNone(comparison["student_temporal_tstr_f1_gain_vs_uniform"])
+        self.assertIsNone(comparison["student_temporal_tstr_f1_gain_vs_best_baseline"])
+        json.dumps(summary, allow_nan=False)
+
+    def test_comparison_summary_weights_seeds_not_context_rows(self) -> None:
+        rows = [
+            {
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "uniform",
+                "seed": 0,
+                "temporal_uw1": 1.0,
+            },
+            {
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "uniform",
+                "seed": 0,
+                "temporal_uw1": 1.0,
+            },
+            {
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "uniform",
+                "seed": 0,
+                "temporal_uw1": 1.0,
+            },
+            {
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "uniform",
+                "seed": 1,
+                "temporal_uw1": 5.0,
+            },
+        ]
+
+        aggregated = evaluate_schedule_summary._aggregate_schedule_rows(rows)
+
+        self.assertEqual(len(aggregated), 1)
+        self.assertEqual(aggregated[0]["n_seeds"], 2)
+        self.assertEqual(aggregated[0]["seed_values"], [0, 1])
+        self.assertAlmostEqual(float(aggregated[0]["temporal_uw1_mean"]), 3.0)
+        self.assertAlmostEqual(
+            float(aggregated[0]["temporal_uw1_std"]),
+            math.sqrt(8.0),
+        )
+
     def test_full_pipeline_dry_run_accepts_molecule_scenario_without_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             args = full_pipeline.build_argparser().parse_args(
@@ -1606,7 +2006,7 @@ class GenericContextGipoTests(unittest.TestCase):
                     "--resume",
                 ]
             )
-            protocol_hash = full_pipeline._json_hash(full_pipeline._protocol_payload(args))
+            protocol_hash = full_pipeline._pipeline_protocol_hash(args)
             first_command = [full_pipeline.sys.executable, "-c", "print('first')"]
             second_command = [full_pipeline.sys.executable, "-c", "print('second')"]
             first_stage = full_pipeline.StageCommand("input_preflight", [first_command], "input_preflight_manifest.json")
@@ -1654,9 +2054,7 @@ class GenericContextGipoTests(unittest.TestCase):
                     "--resume",
                 ]
             )
-            protocol_hash = full_pipeline._json_hash(
-                full_pipeline._protocol_payload(args)
-            )
+            protocol_hash = full_pipeline._pipeline_protocol_hash(args)
             command = [
                 full_pipeline.sys.executable,
                 "-m",
@@ -1739,9 +2137,7 @@ class GenericContextGipoTests(unittest.TestCase):
                     "--resume",
                 ]
             )
-            protocol_hash = full_pipeline._json_hash(
-                full_pipeline._protocol_payload(args)
-            )
+            protocol_hash = full_pipeline._pipeline_protocol_hash(args)
             train_command = [
                 full_pipeline.sys.executable,
                 "-m",
@@ -1847,6 +2243,273 @@ class GenericContextGipoTests(unittest.TestCase):
         self.assertTrue(
             all(manifest["command_results"][0]["skipped"] for manifest in manifests)
         )
+
+    def test_full_pipeline_resume_appends_ablations_to_completed_paper_run(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            paper_args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                ]
+            )
+            ablation_args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                    "--resume",
+                    "--include_ablations",
+                ]
+            )
+            subset_args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                    "--stages",
+                    "train_gipo,report_gipo_locked_test",
+                ]
+            )
+            self.assertEqual(
+                full_pipeline._pipeline_protocol_hash(paper_args),
+                full_pipeline._pipeline_protocol_hash(ablation_args),
+            )
+            self.assertNotEqual(
+                full_pipeline._pipeline_protocol_hash(paper_args),
+                full_pipeline._pipeline_protocol_hash(subset_args),
+            )
+            self.assertNotEqual(
+                full_pipeline._json_hash(full_pipeline._protocol_payload(paper_args)),
+                full_pipeline._json_hash(
+                    full_pipeline._protocol_payload(ablation_args)
+                ),
+            )
+
+            paper_command = [
+                full_pipeline.sys.executable,
+                "-c",
+                "print('paper')",
+            ]
+            ablation_command = [
+                full_pipeline.sys.executable,
+                "-c",
+                "print('ablation')",
+            ]
+            paper_stage = full_pipeline.StageCommand(
+                full_pipeline.INPUT_PREFLIGHT_STAGE,
+                [paper_command],
+                "input_preflight_manifest.json",
+            )
+            ablation_stage = full_pipeline.StageCommand(
+                full_pipeline.ABLATION_STUDENT_STAGE,
+                [ablation_command],
+                "ablation_students_manifest.json",
+            )
+            with (
+                mock.patch.object(
+                    full_pipeline,
+                    "_validate_inputs_preflight",
+                    return_value={"status": "complete"},
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_build_stage_commands",
+                    return_value=[paper_stage],
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_stage_outputs_complete",
+                    return_value=(True, ""),
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_git_head_commit",
+                    return_value="test-commit",
+                ),
+                mock.patch.object(
+                    full_pipeline.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0),
+                ),
+            ):
+                full_pipeline.run_full_pipeline(paper_args)
+
+            legacy_protocol = dict(full_pipeline._protocol_payload(paper_args))
+            legacy_protocol.pop("protocol_hash_scope")
+            legacy_protocol_hash = full_pipeline._json_hash(legacy_protocol)
+            self.assertIn(
+                legacy_protocol_hash,
+                full_pipeline._legacy_pipeline_protocol_hashes(
+                    full_pipeline._protocol_payload(ablation_args)
+                ),
+            )
+            for path in (
+                run_root / "status.json",
+                run_root / paper_stage.manifest_name,
+            ):
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["protocol_hash"] = legacy_protocol_hash
+                path.write_text(
+                    json.dumps(payload, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+
+            with (
+                mock.patch.object(
+                    full_pipeline,
+                    "_validate_inputs_preflight",
+                    return_value={"status": "complete"},
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_build_stage_commands",
+                    return_value=[paper_stage, ablation_stage],
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_stage_outputs_complete",
+                    return_value=(True, ""),
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_git_head_commit",
+                    return_value="test-commit",
+                ),
+                mock.patch.object(
+                    full_pipeline.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0),
+                ) as run_mock,
+            ):
+                summary = full_pipeline.run_full_pipeline(ablation_args)
+
+        run_mock.assert_called_once()
+        self.assertEqual(run_mock.call_args.args[0], ablation_command)
+        self.assertEqual(
+            summary["skipped_stages"],
+            [full_pipeline.INPUT_PREFLIGHT_STAGE],
+        )
+        self.assertEqual(
+            summary["executed_stages"],
+            [full_pipeline.ABLATION_STUDENT_STAGE],
+        )
+
+    def test_complete_report_stage_adopts_valid_commands_before_partial_rerun(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "run"
+            run_root.mkdir(parents=True)
+            args = full_pipeline.build_argparser().parse_args(
+                [
+                    "--scenario_key",
+                    "lobster_synthetic",
+                    "--run_root",
+                    str(run_root),
+                    "--resume",
+                ]
+            )
+            protocol_hash = full_pipeline._pipeline_protocol_hash(args)
+            commands = [
+                [
+                    full_pipeline.sys.executable,
+                    "-m",
+                    "genode.gipo.report_locked_test",
+                    "--out_dir",
+                    str(run_root / f"report-{index}"),
+                ]
+                for index in range(2)
+            ]
+            stage = full_pipeline.StageCommand(
+                "report_gipo_locked_test",
+                commands,
+                "gipo_locked_test_manifest.json",
+            )
+            (run_root / "status.json").write_text(
+                json.dumps({"protocol_hash": protocol_hash, "status": "complete"}),
+                encoding="utf-8",
+            )
+            (run_root / stage.manifest_name).write_text(
+                json.dumps(
+                    {
+                        "stage": stage.stage,
+                        "status": "complete",
+                        "protocol_hash": protocol_hash,
+                        "commands": [
+                            full_pipeline._display_command(
+                                command,
+                                path_base=run_root,
+                            )
+                            for command in commands
+                        ],
+                        "command_hashes": [
+                            full_pipeline._command_hash(command)
+                            for command in commands
+                        ],
+                        "dry_run": False,
+                        "command_results": [
+                            {
+                                "command_index": index,
+                                "returncode": 0,
+                                "log_path": f"logs/report_{index}.log",
+                            }
+                            for index in range(2)
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(
+                    full_pipeline,
+                    "_validate_inputs_preflight",
+                    return_value={"status": "complete"},
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_build_stage_commands",
+                    return_value=[stage],
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_stage_manifest_complete",
+                    return_value=(False, "one report is stale"),
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_gipo_report_command_outputs_complete",
+                    side_effect=[(True, ""), (False, "stale report")],
+                ),
+                mock.patch.object(
+                    full_pipeline,
+                    "_stage_outputs_complete",
+                    return_value=(True, ""),
+                ),
+                mock.patch.object(
+                    full_pipeline.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0),
+                ) as run_mock,
+            ):
+                summary = full_pipeline.run_full_pipeline(args)
+
+            manifest = json.loads(
+                (run_root / stage.manifest_name).read_text(encoding="utf-8")
+            )
+
+        run_mock.assert_called_once()
+        self.assertEqual(run_mock.call_args.args[0], commands[1])
+        self.assertTrue(manifest["command_results"][0]["skipped"])
+        self.assertNotIn("skipped", manifest["command_results"][1])
+        self.assertEqual(summary["executed_stages"], ["report_gipo_locked_test"])
 
     def test_interrupted_stage_match_rejects_changed_gipo_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2314,14 +2977,50 @@ class GenericContextGipoTests(unittest.TestCase):
                 name: report_locked_test._report_input_fingerprints(value)
                 for name, value in input_options.items()
             }
+            output_columns = [
+                "scenario_key",
+                "seed",
+                "solver_key",
+                "target_nfe",
+                "scheduler_key",
+                "metric_protocol",
+                "temporal_uw1",
+                "temporal_cw1",
+            ]
+            output_text = (
+                ",".join(output_columns)
+                + "\n"
+                + "lobster_synthetic,0,euler,4,gipo,"
+                + report_locked_test.CONDITIONAL_PANEL_METRIC_PROTOCOL
+                + ",0.1,0.2\n"
+            )
+            output_paths = [
+                out_dir / "locked_test_gipo_rows.csv",
+                out_dir / "locked_test_gipo_aggregate_rows.csv",
+                out_dir / "locked_test_gipo_decisions.csv",
+            ]
+            for path in output_paths:
+                path.write_text(output_text, encoding="utf-8")
+            report_outputs = {
+                path.name: report_locked_test._report_output_fingerprint(
+                    path,
+                    row_count=1,
+                    columns=output_columns,
+                )
+                for path in output_paths
+            }
             summary_base = {
                 "gipo_student_checkpoint_sha256": file_sha256(checkpoint_path),
                 "report_inputs": report_inputs,
+                "report_outputs": report_outputs,
                 "scenario_key": "lobster_synthetic",
                 "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+                "metric_protocol": report_locked_test.CONDITIONAL_PANEL_METRIC_PROTOCOL,
                 "split_phase": "locked_test",
                 "checkpoint_step": 4000,
                 "target_nfe_values": [4, 8],
+                "context_row_count": 1,
+                "aggregate_row_count": 1,
             }
             (out_dir / "locked_test_gipo_policy_summary.json").write_text(
                 json.dumps(
@@ -2336,23 +3035,190 @@ class GenericContextGipoTests(unittest.TestCase):
                 json.dumps(summary_base),
                 encoding="utf-8",
             )
-            for name in (
-                "locked_test_gipo_rows.csv",
-                "locked_test_gipo_aggregate_rows.csv",
-                "locked_test_gipo_decisions.csv",
-            ):
-                (out_dir / name).write_text("context_id\nctx\n", encoding="utf-8")
-
             complete, reason = full_pipeline._gipo_report_command_outputs_complete(
                 command
             )
             self.assertTrue(complete, reason)
+            output_paths[0].write_text(",".join(output_columns) + "\n", encoding="utf-8")
+            complete, reason = full_pipeline._gipo_report_command_outputs_complete(
+                command
+            )
+            self.assertFalse(complete)
+            self.assertTrue(
+                "row count" in reason or "fingerprint" in reason,
+                reason,
+            )
+            output_paths[0].write_text(output_text, encoding="utf-8")
+            legacy_summary = dict(summary_base)
+            legacy_summary.pop("metric_protocol")
+            (out_dir / "locked_test_gipo_policy_summary.json").write_text(
+                json.dumps(
+                    {
+                        **legacy_summary,
+                        "comparison_summary_path": "locked_test_gipo_comparison_summary.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (out_dir / "locked_test_gipo_comparison_summary.json").write_text(
+                json.dumps(legacy_summary),
+                encoding="utf-8",
+            )
+            complete, reason = full_pipeline._gipo_report_command_outputs_complete(
+                command
+            )
+            self.assertFalse(complete)
+            self.assertIn("metric_protocol", reason)
+            (out_dir / "locked_test_gipo_policy_summary.json").write_text(
+                json.dumps(
+                    {
+                        **summary_base,
+                        "comparison_summary_path": "locked_test_gipo_comparison_summary.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (out_dir / "locked_test_gipo_comparison_summary.json").write_text(
+                json.dumps(summary_base),
+                encoding="utf-8",
+            )
             context_rows_path.write_text("context_id\nchanged\n", encoding="utf-8")
             complete, reason = full_pipeline._gipo_report_command_outputs_complete(
                 command
             )
             self.assertFalse(complete)
             self.assertIn("input fingerprints", reason)
+
+    def test_gipo_report_resume_validates_bound_molecule_member_aggregate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_dir = root / "report"
+            out_dir.mkdir()
+            checkpoint_path = root / "gipo_student.pt"
+            training_summary_path = root / "gipo_training_summary.json"
+            context_rows_path = root / "context_rows.csv"
+            embeddings_path = root / "context_embeddings.npz"
+            baseline_path = root / "baseline.csv"
+            comparator_path = root / "comparator.csv"
+            checkpoint_path.write_bytes(b"student")
+            training_summary_path.write_text("{}", encoding="utf-8")
+            context_rows_path.write_text("context_id\nctx\n", encoding="utf-8")
+            embeddings_path.write_bytes(b"npz")
+            embeddings_path.with_suffix(".npz.manifest.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            baseline_path.write_text("context_id\nctx\n", encoding="utf-8")
+            comparator_path.write_text("context_id\nctx\n", encoding="utf-8")
+            command = [
+                full_pipeline.sys.executable,
+                "-m",
+                "genode.gipo.report_locked_test",
+                "--gipo_student_checkpoint",
+                str(checkpoint_path),
+                "--training_summary",
+                str(training_summary_path),
+                "--context_rows",
+                str(context_rows_path),
+                "--context_embeddings_npz",
+                str(embeddings_path),
+                "--baseline_rows",
+                str(baseline_path),
+                "--comparator_rows",
+                str(comparator_path),
+                "--benchmark_family",
+                "molecule_3d_coordinate_generation",
+                "--scenario_key",
+                "molecule_3d_set1",
+                "--split_phase",
+                "locked_test",
+                "--target_nfe_values",
+                "4",
+                "--checkpoint_step",
+                "20000",
+                "--out_dir",
+                str(out_dir),
+            ]
+            input_options = {
+                "gipo_student_checkpoint": str(checkpoint_path),
+                "training_summary": str(training_summary_path),
+                "context_rows": str(context_rows_path),
+                "context_embeddings_npz": str(embeddings_path),
+                "baseline_rows": str(baseline_path),
+                "comparator_rows": str(comparator_path),
+            }
+            output_columns = [
+                "scenario_key",
+                "seed",
+                "solver_key",
+                "target_nfe",
+                "scheduler_key",
+            ]
+            output_text = (
+                ",".join(output_columns)
+                + "\n"
+                + "molecule_3d_set1,0,euler,4,gipo\n"
+            )
+            output_paths = [
+                out_dir / "locked_test_gipo_rows.csv",
+                out_dir / "locked_test_gipo_aggregate_rows.csv",
+                out_dir / "locked_test_gipo_decisions.csv",
+                out_dir / "locked_test_gipo_member_aggregate_rows.csv",
+            ]
+            for path in output_paths:
+                path.write_text(output_text, encoding="utf-8")
+            report_outputs = {
+                path.name: report_locked_test._report_output_fingerprint(
+                    path,
+                    row_count=1,
+                    columns=output_columns,
+                )
+                for path in output_paths
+            }
+            summary_base = {
+                "gipo_student_checkpoint_sha256": file_sha256(checkpoint_path),
+                "report_inputs": {
+                    name: report_locked_test._report_input_fingerprints(value)
+                    for name, value in input_options.items()
+                },
+                "report_outputs": report_outputs,
+                "scenario_key": "molecule_3d_set1",
+                "benchmark_family": "molecule_3d_coordinate_generation",
+                "split_phase": "locked_test",
+                "checkpoint_step": 20000,
+                "target_nfe_values": [4],
+                "context_row_count": 1,
+                "aggregate_row_count": 1,
+                "member_aggregate_row_count": 1,
+            }
+            (out_dir / "locked_test_gipo_policy_summary.json").write_text(
+                json.dumps(
+                    {
+                        **summary_base,
+                        "comparison_summary_path": (
+                            "locked_test_gipo_comparison_summary.json"
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (out_dir / "locked_test_gipo_comparison_summary.json").write_text(
+                json.dumps(summary_base),
+                encoding="utf-8",
+            )
+
+            complete, reason = full_pipeline._gipo_report_command_outputs_complete(
+                command
+            )
+            self.assertTrue(complete, reason)
+            output_paths[-1].unlink()
+            complete, reason = full_pipeline._gipo_report_command_outputs_complete(
+                command
+            )
+            self.assertFalse(complete)
+            self.assertIn("member_aggregate_rows.csv", reason)
 
     def test_ser_resume_hashes_selected_checkpoint_and_validates_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2517,7 +3383,7 @@ class GenericContextGipoTests(unittest.TestCase):
                     "--resume",
                 ]
             )
-            protocol_hash = full_pipeline._json_hash(full_pipeline._protocol_payload(args))
+            protocol_hash = full_pipeline._pipeline_protocol_hash(args)
             backbone_command = [
                 full_pipeline.sys.executable,
                 "-m",
@@ -2610,7 +3476,7 @@ class GenericContextGipoTests(unittest.TestCase):
                     "--resume",
                 ]
             )
-            protocol_hash = full_pipeline._json_hash(full_pipeline._protocol_payload(args))
+            protocol_hash = full_pipeline._pipeline_protocol_hash(args)
             complete_command = [full_pipeline.sys.executable, "-c", "print('complete')"]
             schedule_command = [full_pipeline.sys.executable, "-c", "print('schedule')"]
             complete_stage = full_pipeline.StageCommand("input_preflight", [complete_command], "input_preflight_manifest.json")
@@ -2826,7 +3692,8 @@ class GenericContextGipoTests(unittest.TestCase):
         )
         self.assertNotIn("--student_unseen_target_rows_csv", gipo_command)
         for command in (gipo_command, unseen_target_command):
-            self.assertIn("--teacher_metric_target_keys u_temporal_uw1_uniform,u_temporal_cw1_uniform,u_temporal_tstr_f1_uniform", command)
+            self.assertIn("--teacher_metric_target_keys u_temporal_uw1_uniform,u_temporal_cw1_uniform", command)
+            self.assertNotIn("--teacher_metric_target_keys u_temporal_uw1_uniform,u_temporal_cw1_uniform,u_temporal_tstr_f1_uniform", command)
             self.assertIn("--teacher_steps 500", command)
             self.assertIn("--student_steps 500", command)
             self.assertIn("--seen_target_nfe_values 4,8,12,16", command)
@@ -3035,9 +3902,9 @@ class GenericContextGipoTests(unittest.TestCase):
         commands = self._dry_run_gipo_commands_for_scenario("lobster_synthetic")
         expected = ",".join(spec.utility_key for spec in CONDITIONAL_PRIMARY_LOB_METRIC_SPECS)
         self.assertIn(f"--teacher_metric_target_keys {expected}", commands)
-        self.assertIn("u_temporal_uw1_uniform=0.333333", commands)
-        self.assertIn("u_temporal_cw1_uniform=0.333333", commands)
-        self.assertIn("u_temporal_tstr_f1_uniform=0.333333", commands)
+        self.assertIn("u_temporal_uw1_uniform=0.5", commands)
+        self.assertIn("u_temporal_cw1_uniform=0.5", commands)
+        self.assertNotIn("u_temporal_tstr_f1_uniform=", commands)
         self.assertNotIn("u_temporal_u_l1_uniform=", commands)
         self.assertNotIn("--teacher_metric_target_keys u_comp_uniform", commands)
 

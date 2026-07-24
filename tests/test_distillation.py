@@ -2690,7 +2690,7 @@ def test_quality_gate_passes_only_with_familywise_evidence_on_every_primary_metr
     assert report["multiple_testing_correction"] == "holm"
     assert report["all_primary_metrics_required"] is True
     assert report["locked_test_used_for_selection"] is False
-    assert len(report["comparisons"]) == 6
+    assert len(report["comparisons"]) == 4
     assert all(comparison["paired_context_count"] == 20 for comparison in report["comparisons"])
     assert all(comparison["passed"] for comparison in report["comparisons"])
     assert all(
@@ -2925,7 +2925,7 @@ def test_quality_gate_metric_override_must_match_registered_claim_metrics() -> N
     ]
     assert _resolve_metric_specs("cryptos", json.dumps(payload)) == registered
 
-    payload[-1]["applicable_key"] = ""
+    payload[-1]["weight"] = 0.25
     with pytest.raises(ValueError, match="exactly match"):
         _resolve_metric_specs("cryptos", json.dumps(payload))
     with pytest.raises(ValueError, match="metric objects"):
@@ -3153,7 +3153,7 @@ def test_public_quality_gate_rejects_fabricated_pipeline_protocol_hash() -> None
         )
 
 
-def test_quality_gate_requires_shared_metric_applicability_by_context() -> None:
+def test_quality_gate_ignores_optional_tstr_applicability_mismatch() -> None:
     rows = _quality_rows()
     changed = next(
         row
@@ -3165,18 +3165,23 @@ def test_quality_gate_requires_shared_metric_applicability_by_context() -> None:
     )
     changed["temporal_tstr_f1_applicable"] = False
 
-    with pytest.raises(ValueError, match="shared context property"):
-        evaluate_quality_gate(
-            rows,
-            metric_specs=metric_specs_for_scenario("cryptos"),
-            candidate_catalog=_quality_candidate_catalog(),
-            artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
-            quality_protocol=_quality_protocol(),
-            config=QualityGateConfig(bootstrap_samples=1_000, seed=40),
-        )
+    report = evaluate_quality_gate(
+        rows,
+        metric_specs=metric_specs_for_scenario("cryptos"),
+        candidate_catalog=_quality_candidate_catalog(),
+        artifact_binding=_quality_binding(),
+        demonstration_context_binding=context_binding(
+            (_test_context_fingerprint("training-0"),)
+        ),
+        quality_protocol=_quality_protocol(),
+        config=QualityGateConfig(bootstrap_samples=1_000, seed=40),
+    )
+
+    assert report["status"] == "passed"
+    assert all(
+        comparison["metric"] != "temporal_tstr_f1"
+        for comparison in report["comparisons"]
+    )
 
 
 def test_read_quality_rows_parses_plain_csv_target_nfe(tmp_path: Path) -> None:

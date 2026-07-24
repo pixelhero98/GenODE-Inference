@@ -330,6 +330,35 @@ class OTFlowCoreTests(unittest.TestCase):
                 time_grid=(0.0, 1.0, 1.0),
             )
 
+    def test_solve_rejects_nonfinite_inputs_and_velocity(self) -> None:
+        cfg = self._cfg(use_minibatch_ot=False)
+        model = OTFlow(cfg)
+        hist = torch.zeros(1, cfg.history_len, cfg.context_dim)
+        initial_state = torch.zeros(1, cfg.sample_state_dim)
+
+        with self.assertRaisesRegex(FloatingPointError, "non-finite initial_state"):
+            model.solve(
+                torch.full_like(initial_state, float("nan")),
+                hist,
+                solver_key="euler",
+                target_nfe=1,
+                time_grid=(0.0, 1.0),
+            )
+
+        def nonfinite_field(x, t, hist_arg, cond=None, conditioning_cache=None):
+            del t, hist_arg, cond, conditioning_cache
+            return torch.full_like(x, float("inf"))
+
+        model.v_forward = nonfinite_field  # type: ignore[method-assign]
+        with self.assertRaisesRegex(FloatingPointError, "non-finite velocity"):
+            model.solve(
+                initial_state,
+                hist,
+                solver_key="euler",
+                target_nfe=1,
+                time_grid=(0.0, 1.0),
+            )
+
     def test_checkpoint_loader_rejects_removed_otflow_keys(self) -> None:
         torch.manual_seed(3)
         cfg = self._cfg(use_minibatch_ot=True)

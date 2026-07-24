@@ -37,13 +37,15 @@ FORECAST_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec("forecast_mase", "u_mase_uniform", METRIC_DIRECTION_LOWER, 0.5),
 )
 CONDITIONAL_PRIMARY_LOB_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
-    MetricObjectiveSpec("temporal_uw1", "u_temporal_uw1_uniform", METRIC_DIRECTION_LOWER, 1.0 / 3.0),
-    MetricObjectiveSpec("temporal_cw1", "u_temporal_cw1_uniform", METRIC_DIRECTION_LOWER, 1.0 / 3.0),
+    MetricObjectiveSpec("temporal_uw1", "u_temporal_uw1_uniform", METRIC_DIRECTION_LOWER, 0.5),
+    MetricObjectiveSpec("temporal_cw1", "u_temporal_cw1_uniform", METRIC_DIRECTION_LOWER, 0.5),
+)
+CONDITIONAL_OPTIONAL_LOB_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec(
         "temporal_tstr_f1",
         "u_temporal_tstr_f1_uniform",
         METRIC_DIRECTION_HIGHER,
-        1.0 / 3.0,
+        0.0,
         applicable_key="temporal_tstr_f1_applicable",
     ),
 )
@@ -61,6 +63,7 @@ CONDITIONAL_DIAGNOSTIC_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
 )
 CONDITIONAL_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
     *CONDITIONAL_PRIMARY_LOB_METRIC_SPECS,
+    *CONDITIONAL_OPTIONAL_LOB_METRIC_SPECS,
     *CONDITIONAL_DIAGNOSTIC_METRIC_SPECS,
 )
 MOLECULE_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
@@ -108,6 +111,25 @@ def teacher_objective_specs_for_scenario(scenario_key: str) -> Tuple[MetricObjec
     return objective_specs_for_family(family)
 
 
+def optional_objective_specs_for_scenario(scenario_key: str) -> Tuple[MetricObjectiveSpec, ...]:
+    key = str(scenario_key).strip()
+    if (
+        scenario_family_for_key(key) == SCENARIO_FAMILY_CONDITIONAL_GENERATION
+        and key in {"cryptos", "lobster_synthetic"}
+    ):
+        return CONDITIONAL_OPTIONAL_LOB_METRIC_SPECS
+    return ()
+
+
+def materialized_objective_specs_for_scenario(
+    scenario_key: str,
+) -> Tuple[MetricObjectiveSpec, ...]:
+    return (
+        *teacher_objective_specs_for_scenario(str(scenario_key)),
+        *optional_objective_specs_for_scenario(str(scenario_key)),
+    )
+
+
 def teacher_objective_utility_keys_for_family(benchmark_family: str) -> Tuple[str, ...]:
     return tuple(spec.utility_key for spec in teacher_objective_specs_for_family(benchmark_family))
 
@@ -118,6 +140,7 @@ def teacher_objective_utility_keys_for_scenario(scenario_key: str) -> Tuple[str,
 
 def teacher_metric_profile_for_scenario(scenario_key: str) -> Dict[str, object]:
     specs = teacher_objective_specs_for_scenario(str(scenario_key))
+    optional_specs = optional_objective_specs_for_scenario(str(scenario_key))
     diagnostic_specs: Tuple[MetricObjectiveSpec, ...] = ()
     if scenario_family_for_key(str(scenario_key)) == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
         diagnostic_specs = CONDITIONAL_DIAGNOSTIC_METRIC_SPECS
@@ -127,6 +150,12 @@ def teacher_metric_profile_for_scenario(scenario_key: str) -> Dict[str, object]:
         "target_metric_keys": [spec.metric_key for spec in specs],
         "target_utility_keys": [spec.utility_key for spec in specs],
         "target_weights": {spec.utility_key: float(spec.weight) for spec in specs},
+        "optional_metric_keys": [spec.metric_key for spec in optional_specs],
+        "optional_utility_keys": [spec.utility_key for spec in optional_specs],
+        "optional_weights": {
+            spec.utility_key: float(spec.weight)
+            for spec in optional_specs
+        },
         "diagnostic_metric_keys": [spec.metric_key for spec in diagnostic_specs],
         "diagnostic_utility_keys": [spec.utility_key for spec in diagnostic_specs],
     }

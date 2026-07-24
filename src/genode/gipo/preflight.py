@@ -30,7 +30,9 @@ from genode.gipo.policy import (
     context_embedding_kind_from_rows,
     context_id_from_row,
     context_pair_key,
+    normalize_teacher_utility_weights,
     teacher_rank_pair_diagnostics,
+    teacher_utility_weights_for_summary,
     validate_gipo_support_schedule_keys,
     validate_teacher_metric_target_keys,
 )
@@ -134,6 +136,19 @@ def resolve_teacher_metric_target_keys(
                     raise
         return teacher_objective_utility_keys_for_family(infer_single_benchmark_family(rows))
     return validate_teacher_metric_target_keys(raw)
+
+
+def _parse_teacher_utility_weights(text: str) -> Dict[str, float]:
+    weights: Dict[str, float] = {}
+    for part in parse_csv(text):
+        if "=" not in part:
+            raise ValueError("teacher_utility_weights entries must be name=value pairs.")
+        key, raw_value = part.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError("teacher_utility_weights contains an empty metric name.")
+        weights[key] = float(raw_value)
+    return weights
 
 
 def _read_rows_csvs(paths_text: str) -> Tuple[List[_RowRecord], List[str], List[Dict[str, Any]]]:
@@ -580,10 +595,13 @@ def _teacher_metric_target_validation_report(
 def _rank_pair_preflight_report(
     rows: Sequence[Mapping[str, Any]],
     target_keys: Sequence[str],
+    *,
+    teacher_utility_weights: Mapping[str, float],
 ) -> Dict[str, Any]:
     diagnostics = teacher_rank_pair_diagnostics(
         rows,
         target_keys=target_keys,
+        teacher_utility_weights=teacher_utility_weights,
         pair_margin=0.0,
         pair_on_seed=True,
     )
@@ -614,6 +632,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--teacher_metric_target_keys",
         default="auto",
         help="Comma-separated teacher utility columns, or auto for the same family defaults as genode-train-gipo.",
+    )
+    parser.add_argument(
+        "--teacher_utility_weights",
+        default="",
+        help="Optional comma-separated name=value weights for --teacher_metric_target_keys.",
     )
     parser.add_argument(
         "--teacher_metric_min_coverage_fraction",
@@ -760,6 +783,21 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
     except Exception as exc:
         target_keys = ()
         target_resolution_error = str(exc)
+    weight_resolution_error = ""
+    teacher_utility_weights: Dict[str, float] = {}
+    if target_keys:
+        try:
+            raw_teacher_weights = (
+                _parse_teacher_utility_weights(str(getattr(args, "teacher_utility_weights", "")))
+                if str(getattr(args, "teacher_utility_weights", "")).strip()
+                else None
+            )
+            teacher_utility_weights = teacher_utility_weights_for_summary(
+                target_keys,
+                normalize_teacher_utility_weights(target_keys, raw_teacher_weights),
+            )
+        except Exception as exc:
+            weight_resolution_error = str(exc)
     metric_min_coverage = float(getattr(args, "teacher_metric_min_coverage_fraction", 1.0))
     if not math.isfinite(metric_min_coverage) or metric_min_coverage < 0.0 or metric_min_coverage > 1.0:
         raise ValueError("teacher_metric_min_coverage_fraction must be finite and in [0, 1].")
@@ -767,6 +805,7 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
     if metric_min_valid_rows < 0:
         raise ValueError("teacher_metric_min_valid_rows must be nonnegative.")
     metric_target_report = _metric_target_coverage(rows, support_rows, complete_clean_rows, target_keys)
+    metric_target_report["teacher_utility_weights"] = dict(teacher_utility_weights)
     rank_pair_preflight: Dict[str, Any] = {
         "row_count": int(len(complete_clean_rows)),
         "rankable_pair_count": 0,
@@ -784,12 +823,20 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
         metric_target_report["validation"] = metric_validation
         metric_target_report["failure_count"] = int(metric_validation["failure_count"])
         metric_target_report["failures"] = list(metric_validation["failures"])
-        if int(metric_validation["failure_count"]) == 0:
-            rank_pair_preflight = _rank_pair_preflight_report(complete_clean_rows, target_keys)
+        if int(metric_validation["failure_count"]) == 0 and not weight_resolution_error:
+            rank_pair_preflight = _rank_pair_preflight_report(
+                complete_clean_rows,
+                target_keys,
+                teacher_utility_weights=teacher_utility_weights,
+            )
         else:
             rank_pair_preflight = {
                 "status": "skipped",
-                "skip_reason": "metric_target_coverage_failed",
+                "skip_reason": (
+                    "teacher_utility_weight_resolution_failed"
+                    if weight_resolution_error
+                    else "metric_target_coverage_failed"
+                ),
                 "row_count": int(len(complete_clean_rows)),
                 "rankable_pair_count": 0,
                 "error_count": 0,
@@ -819,6 +866,7 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
         "support": support,
         "teacher_metric_targets": metric_target_report,
         "teacher_metric_target_resolution_error": target_resolution_error,
+        "teacher_utility_weight_resolution_error": weight_resolution_error,
         "rank_pair_preflight": rank_pair_preflight,
         "context_count_preflight": context_count_preflight,
         "schedule_grid_preflight": schedule_grid_report,
@@ -850,6 +898,7 @@ def preflight_gipo_rows(args: argparse.Namespace) -> Dict[str, Any]:
         + int(len(context_embedding_kind_errors))
         + int(len(scenario_errors))
         + (1 if target_resolution_error else 0)
+        + (1 if weight_resolution_error else 0)
         + int(metric_target_report.get("failure_count", 0) or 0)
         + int(rank_pair_preflight.get("error_count", 0) or 0)
         + len(context_count_errors)

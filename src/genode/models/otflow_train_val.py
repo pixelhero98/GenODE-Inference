@@ -700,6 +700,11 @@ def generate_continuation(
             else:
                 raise RuntimeError("Non-autoregressive continuation is currently implemented for OTFlow only.")
 
+            if not bool(torch.isfinite(x_block).all()):
+                raise FloatingPointError(
+                    f"Non-finite generated block at rollout cursor={int(cursor)} "
+                    f"solver={solver_key!r} target_nfe={int(nfe)}."
+                )
             take = min(int(prediction_horizon), int(steps) - int(cursor))
             block_slice = x_block[:, :take, :]
             out.append(block_slice)
@@ -723,6 +728,11 @@ def generate_continuation(
         else:
             raise RuntimeError("Generation is implemented for OTFlow only.")
 
+        if not bool(torch.isfinite(x_next).all()):
+            raise FloatingPointError(
+                f"Non-finite generated state at rollout step={int(k)} "
+                f"solver={solver_key!r} target_nfe={int(nfe)}."
+            )
         out.append(x_next[:, None, :])
         hist_step = _append_context_features(x_next[:, None, :], cursor=k, take=1)
         x_hist = torch.cat([x_hist, hist_step], dim=1)
@@ -759,10 +769,17 @@ def _wasserstein_1d(x: np.ndarray, y: np.ndarray) -> float:
     n = min(x.size, y.size)
     if n == 0:
         return float("nan")
+    if not np.all(np.isfinite(x)):
+        raise FloatingPointError("Wasserstein input x contains non-finite values.")
+    if not np.all(np.isfinite(y)):
+        raise FloatingPointError("Wasserstein input y contains non-finite values.")
     q = (np.arange(n, dtype=np.float64) + 0.5) / float(n)
     xq = np.quantile(x, q)
     yq = np.quantile(y, q)
-    return float(np.mean(np.abs(xq - yq)))
+    value = float(np.mean(np.abs(xq - yq)))
+    if not np.isfinite(value):
+        raise FloatingPointError("Wasserstein computation produced a non-finite value.")
+    return value
 
 
 def _acf(x: np.ndarray, max_lag: int = 20) -> np.ndarray:
@@ -798,8 +815,15 @@ def _normalized_mae(x: np.ndarray, y: np.ndarray) -> float:
     n = min(x.size, y.size)
     if n == 0:
         return float("nan")
+    if not np.all(np.isfinite(x[:n])):
+        raise FloatingPointError("Normalized MAE input x contains non-finite values.")
+    if not np.all(np.isfinite(y[:n])):
+        raise FloatingPointError("Normalized MAE input y contains non-finite values.")
     scale = float(np.std(y[:n]) + 1e-6)
-    return float(np.mean(np.abs(x[:n] - y[:n])) / scale)
+    value = float(np.mean(np.abs(x[:n] - y[:n])) / scale)
+    if not np.isfinite(value):
+        raise FloatingPointError("Normalized MAE computation produced a non-finite value.")
+    return value
 
 
 def _hist_l1(x: np.ndarray, y: np.ndarray, bins: int = 64) -> float:
@@ -807,10 +831,12 @@ def _hist_l1(x: np.ndarray, y: np.ndarray, bins: int = 64) -> float:
     y = np.asarray(y, dtype=np.float64).ravel()
     if x.size == 0 or y.size == 0:
         return float("nan")
+    if not np.all(np.isfinite(x)):
+        raise FloatingPointError("Histogram L1 input x contains non-finite values.")
+    if not np.all(np.isfinite(y)):
+        raise FloatingPointError("Histogram L1 input y contains non-finite values.")
     lo = float(min(np.min(x), np.min(y)))
     hi = float(max(np.max(x), np.max(y)))
-    if not np.isfinite(lo) or not np.isfinite(hi):
-        return float("nan")
     if hi <= lo:
         return 0.0
     edges = np.linspace(lo, hi, int(bins) + 1, dtype=np.float64)
@@ -878,6 +904,10 @@ def _downstream_device(cfg: OTFlowConfig) -> torch.device:
 
 
 def _standardize_pair(train_x: np.ndarray, test_x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if not np.all(np.isfinite(train_x)):
+        raise FloatingPointError("Cannot standardize non-finite training features.")
+    if not np.all(np.isfinite(test_x)):
+        raise FloatingPointError("Cannot standardize non-finite test features.")
     mu = train_x.mean(axis=0, keepdims=True).astype(np.float32)
     sig = (train_x.std(axis=0, keepdims=True) + 1e-6).astype(np.float32)
     return ((train_x - mu) / sig).astype(np.float32), ((test_x - mu) / sig).astype(np.float32)
@@ -985,12 +1015,22 @@ def _train_small_multiclass_mlp_f1(
     batch_size: int = 512,
     num_classes: Optional[int] = None,
 ) -> float:
+    train_y = np.asarray(train_y, dtype=np.int64)
     test_x = np.asarray(test_x, dtype=np.float32)
     test_y = np.asarray(test_y, dtype=np.int64)
-    if len(test_x) == 0:
+    if len(train_x) == 0 or len(test_x) == 0:
         return float("nan")
+    class_count = int(
+        num_classes
+        if num_classes is not None
+        else max(int(np.max(train_y)) if train_y.size else 0, int(np.max(test_y)) if test_y.size else 0) + 1
+    )
+    train_classes = np.unique(train_y)
+    if train_classes.size == 1:
+        constant_pred = np.full(test_y.shape, int(train_classes[0]), dtype=np.int64)
+        return _macro_f1_score(test_y, constant_pred, num_classes=class_count)
     try:
-        model, class_count = _train_small_multiclass_mlp(
+        model, fitted_class_count = _train_small_multiclass_mlp(
             train_x,
             train_y,
             device=device,
@@ -998,12 +1038,12 @@ def _train_small_multiclass_mlp_f1(
             hidden_dim=hidden_dim,
             epochs=epochs,
             batch_size=batch_size,
-            num_classes=num_classes,
+            num_classes=class_count,
         )
     except ValueError:
         return float("nan")
     pred = _predict_small_multiclass_mlp(model, test_x, device=device)
-    return _macro_f1_score(test_y, pred, num_classes=class_count)
+    return _macro_f1_score(test_y, pred, num_classes=fitted_class_count)
 
 
 def _train_small_discriminator_auc(
@@ -1513,6 +1553,9 @@ def _evaluate_generation_main_metrics(
         return {
             "temporal_tstr_f1": None,
             "temporal_tstr_f1_applicable": False,
+            "temporal_tstr_f1_status": "not_applicable",
+            "temporal_tstr_f1_train_class_count": 0,
+            "temporal_tstr_f1_test_class_count": 0,
             "disc_auc": float(disc_auc),
             "disc_auc_gap": float(disc_auc_gap),
             "temporal_uw1": float(w1_metrics["unconditional_w1"]),
@@ -1531,54 +1574,93 @@ def _evaluate_generation_main_metrics(
             "threshold_abs_move": float("nan"),
         }
     label_horizon = int(max(1, min(10, max(1, horizon // 10))))
-    downstream = _collect_downstream_examples(
-        rows,
-        label_horizon=label_horizon,
-        max_examples_per_split=max_examples_per_split,
-        seed=seed,
-    )
-    device = _downstream_device(cfg)
-
-    real_x = downstream["real_x"]
-    real_moves = downstream["real_moves"]
-    gen_x = downstream["gen_x"]
-    gen_moves = downstream["gen_moves"]
-
-    threshold = float(np.quantile(np.abs(real_moves), 1.0 / 3.0)) if len(real_moves) > 0 else float("nan")
-    real_y = _ternary_labels(real_moves, threshold) if np.isfinite(threshold) else np.zeros(0, dtype=np.int64)
-    gen_y = _ternary_labels(gen_moves, threshold) if np.isfinite(threshold) else np.zeros(0, dtype=np.int64)
-
+    w1_metrics = _aggregate_core_l2_distribution_metrics(rows)
+    real_x = np.zeros((0, 1), dtype=np.float32)
+    real_y = np.zeros(0, dtype=np.int64)
+    gen_x = np.zeros((0, 1), dtype=np.float32)
+    gen_y = np.zeros(0, dtype=np.int64)
+    threshold = float("nan")
     tstr_macro_f1 = float("nan")
-    if len(gen_x) > 0 and len(real_x) > 0 and np.unique(gen_y).size >= 2 and np.unique(real_y).size >= 2:
-        x_train, x_test = _standardize_pair(gen_x, real_x)
-        tstr_macro_f1 = _train_small_multiclass_mlp_f1(
-            x_train,
-            gen_y,
-            x_test,
-            real_y,
-            device=device,
-            seed=seed + 31,
+    tstr_train_class_count = 0
+    tstr_test_class_count = 0
+    tstr_status = "failed"
+    device: torch.device | None = None
+    try:
+        downstream = _collect_downstream_examples(
+            rows,
+            label_horizon=label_horizon,
+            max_examples_per_split=max_examples_per_split,
+            seed=seed,
         )
+        device = _downstream_device(cfg)
+        real_x = downstream["real_x"]
+        real_moves = downstream["real_moves"]
+        gen_x = downstream["gen_x"]
+        gen_moves = downstream["gen_moves"]
+        threshold = (
+            float(np.quantile(np.abs(real_moves), 1.0 / 3.0))
+            if len(real_moves) > 0
+            else float("nan")
+        )
+        real_y = (
+            _ternary_labels(real_moves, threshold)
+            if np.isfinite(threshold)
+            else np.zeros(0, dtype=np.int64)
+        )
+        gen_y = (
+            _ternary_labels(gen_moves, threshold)
+            if np.isfinite(threshold)
+            else np.zeros(0, dtype=np.int64)
+        )
+        tstr_train_class_count = int(np.unique(gen_y).size)
+        tstr_test_class_count = int(np.unique(real_y).size)
+        tstr_status = "no_examples"
+        if len(gen_x) > 0 and len(real_x) > 0:
+            x_train, x_test = _standardize_pair(gen_x, real_x)
+            tstr_macro_f1 = _train_small_multiclass_mlp_f1(
+                x_train,
+                gen_y,
+                x_test,
+                real_y,
+                device=device,
+                seed=seed + 31,
+                num_classes=3,
+            )
+            if np.isfinite(tstr_macro_f1):
+                tstr_status = (
+                    "constant_train_class_fallback"
+                    if tstr_train_class_count == 1
+                    else "trained"
+                )
+            else:
+                tstr_status = "failed"
+    except Exception:
+        tstr_macro_f1 = float("nan")
+        tstr_status = "failed"
 
     disc_auc = float("nan")
-    if len(gen_x) > 1 and len(real_x) > 1:
-        train_x, train_y, test_x, test_y = _pairwise_split(real_x, gen_x, seed=seed + 17)
-        if len(train_x) > 0 and len(test_x) > 0:
-            train_x, test_x = _standardize_pair(train_x, test_x)
-            disc_auc = _train_small_discriminator_auc(
-                train_x,
-                train_y.astype(np.float32),
-                test_x,
-                test_y,
-                device=device,
-                seed=seed + 47,
+    try:
+        if device is not None and len(gen_x) > 1 and len(real_x) > 1:
+            train_x, train_y, test_x, test_y = _pairwise_split(
+                real_x,
+                gen_x,
+                seed=seed + 17,
             )
+            if len(train_x) > 0 and len(test_x) > 0:
+                train_x, test_x = _standardize_pair(train_x, test_x)
+                disc_auc = _train_small_discriminator_auc(
+                    train_x,
+                    train_y.astype(np.float32),
+                    test_x,
+                    test_y,
+                    device=device,
+                    seed=seed + 47,
+                )
+    except Exception:
+        disc_auc = float("nan")
     disc_auc_gap = float(abs(disc_auc - 0.5)) if np.isfinite(disc_auc) else float("nan")
 
-    w1_metrics = _aggregate_core_l2_distribution_metrics(rows)
-
     score_terms = [
-        1.0 - tstr_macro_f1 if np.isfinite(tstr_macro_f1) else np.nan,
         disc_auc_gap,
         np.log1p(w1_metrics["unconditional_w1"]) if np.isfinite(w1_metrics["unconditional_w1"]) else np.nan,
         np.log1p(w1_metrics["conditional_w1"]) if np.isfinite(w1_metrics["conditional_w1"]) else np.nan,
@@ -1589,6 +1671,9 @@ def _evaluate_generation_main_metrics(
     return {
         "temporal_tstr_f1": float(tstr_macro_f1) if np.isfinite(tstr_macro_f1) else None,
         "temporal_tstr_f1_applicable": True,
+        "temporal_tstr_f1_status": str(tstr_status),
+        "temporal_tstr_f1_train_class_count": int(tstr_train_class_count),
+        "temporal_tstr_f1_test_class_count": int(tstr_test_class_count),
         "disc_auc": float(disc_auc),
         "disc_auc_gap": float(disc_auc_gap),
         "temporal_uw1": float(w1_metrics["unconditional_w1"]),
@@ -1761,9 +1846,18 @@ def select_eval_window_starts(ds: WindowedParamSequenceDataset, horizon: int, n_
 
 
 def _denorm_params_seq(ds: WindowedParamSequenceDataset, x_norm: np.ndarray) -> np.ndarray:
+    x_norm = np.asarray(x_norm)
+    if not np.all(np.isfinite(x_norm)):
+        raise FloatingPointError("Cannot denormalize non-finite generated parameters.")
     if ds.params_mean is not None and ds.params_std is not None:
-        return (x_norm * ds.params_std[None, :] + ds.params_mean[None, :]).astype(np.float32)
-    return x_norm.astype(np.float32)
+        if not np.all(np.isfinite(ds.params_mean)) or not np.all(np.isfinite(ds.params_std)):
+            raise FloatingPointError("Dataset parameter normalization statistics contain non-finite values.")
+        result = (x_norm * ds.params_std[None, :] + ds.params_mean[None, :]).astype(np.float32)
+    else:
+        result = x_norm.astype(np.float32)
+    if not np.all(np.isfinite(result)):
+        raise FloatingPointError("Parameter denormalization produced non-finite values.")
+    return result
 
 
 def _get_dataset_item_by_t(ds: WindowedParamSequenceDataset, t0: int):
@@ -2072,10 +2166,12 @@ def eval_many_windows(
     horizons_eval: Sequence[int] = (1, 10, 50, 100, 200),
     chosen_t0s: Optional[Sequence[int]] = None,
     generation_seed_base: Optional[int] = None,
+    generation_seed_values: Optional[Sequence[int]] = None,
     metrics_seed: Optional[int] = None,
     main_metrics_only: bool = False,
     solver_key: str = "euler",
     time_grid: Optional[Sequence[float]] = None,
+    time_grids: Optional[Sequence[Sequence[float]]] = None,
 ) -> Dict[str, Any]:
     dataset_kind = str(getattr(ds, "dataset_kind", "l2"))
     dataset_metadata = dict(getattr(ds, "dataset_metadata", {}) or {})
@@ -2095,15 +2191,45 @@ def eval_many_windows(
     else:
         chosen = select_eval_window_starts(ds, horizon=int(horizon), n_windows=int(n_windows), seed=int(seed))
 
+    if generation_seed_base is not None and generation_seed_values is not None:
+        raise ValueError("Specify generation_seed_base or generation_seed_values, not both.")
+    if time_grid is not None and time_grids is not None:
+        raise ValueError("Specify time_grid or time_grids, not both.")
+    if generation_seed_values is not None:
+        resolved_generation_seeds = [int(value) for value in generation_seed_values]
+        if len(resolved_generation_seeds) != int(chosen.size):
+            raise ValueError(
+                "generation_seed_values must match the number of chosen windows: "
+                f"{len(resolved_generation_seeds)} != {int(chosen.size)}."
+            )
+    else:
+        resolved_generation_seeds = []
+    if time_grids is not None:
+        resolved_time_grids = [tuple(float(value) for value in grid) for grid in time_grids]
+        if len(resolved_time_grids) != int(chosen.size):
+            raise ValueError(
+                "time_grids must match the number of chosen windows: "
+                f"{len(resolved_time_grids)} != {int(chosen.size)}."
+            )
+    else:
+        resolved_time_grids = []
+
     metrics_seed_value = int(seed if metrics_seed is None else metrics_seed)
 
     rows = []
+    used_generation_seeds: List[int] = []
     for window_idx, t0 in enumerate(chosen.tolist()):
         window_seed = (
-            int(generation_seed_base) + int(window_idx)
-            if generation_seed_base is not None
-            else int(rng.integers(0, 1_000_000))
+            int(resolved_generation_seeds[window_idx])
+            if resolved_generation_seeds
+            else (
+                int(generation_seed_base) + int(window_idx)
+                if generation_seed_base is not None
+                else int(rng.integers(0, 1_000_000))
+            )
         )
+        used_generation_seeds.append(int(window_seed))
+        window_time_grid = resolved_time_grids[window_idx] if resolved_time_grids else time_grid
         rows.append(
             eval_one_window(
                 ds, model, cfg,
@@ -2114,7 +2240,7 @@ def eval_many_windows(
                 return_sequences=True,
                 main_metrics_only=bool(main_metrics_only),
                 solver_key=solver_key,
-                time_grid=time_grid,
+                time_grid=window_time_grid,
             )
         )
 
@@ -2132,6 +2258,9 @@ def eval_many_windows(
     cmp["main"] = {
         "temporal_tstr_f1": _wrap_optional_scalar_as_mean_std(main_metrics["temporal_tstr_f1"]),
         "temporal_tstr_f1_applicable": bool(main_metrics["temporal_tstr_f1_applicable"]),
+        "temporal_tstr_f1_status": str(main_metrics["temporal_tstr_f1_status"]),
+        "temporal_tstr_f1_train_class_count": int(main_metrics["temporal_tstr_f1_train_class_count"]),
+        "temporal_tstr_f1_test_class_count": int(main_metrics["temporal_tstr_f1_test_class_count"]),
         "disc_auc": _wrap_scalar_as_mean_std(main_metrics["disc_auc"]),
         "disc_auc_gap": _wrap_scalar_as_mean_std(main_metrics["disc_auc_gap"]),
         "temporal_uw1": _wrap_scalar_as_mean_std(main_metrics["temporal_uw1"]),
@@ -2201,9 +2330,11 @@ def eval_many_windows(
                 json.dumps([int(t0) for t0 in chosen.tolist()], separators=(",", ":")).encode("utf-8")
             ).hexdigest(),
             "generation_seed_base": None if generation_seed_base is None else int(generation_seed_base),
+            "generation_seed_values": used_generation_seeds,
             "metrics_seed": int(metrics_seed_value),
             "main_metrics_only": bool(main_metrics_only),
             "dataset_kind": dataset_kind,
+            "time_grid_mode": "per_window" if resolved_time_grids else "shared",
             "per_window_metric_rows": _per_window_metric_rows(rows, dataset_kind),
         },
     }

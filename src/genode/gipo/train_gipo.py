@@ -884,9 +884,18 @@ def _validate_train_tuning_reward_provenance_metadata(
     *,
     target_keys: Sequence[str],
     label: str,
+    teacher_utility_weights: Mapping[str, float] | None = None,
 ) -> None:
     active_target_keys = tuple(str(key) for key in target_keys)
     active_target_set = set(active_target_keys)
+    explicit_weights = (
+        normalize_teacher_utility_weights(
+            active_target_keys,
+            teacher_utility_weights,
+        )
+        if teacher_utility_weights is not None
+        else {}
+    )
     for row_idx, row in enumerate(rows):
         if _source_split_phase(row) == "locked_test":
             continue
@@ -926,7 +935,7 @@ def _validate_train_tuning_reward_provenance_metadata(
             present_target_set = set(present_target_keys)
             missing = sorted(present_target_set - weight_keys)
             unexpected = sorted(weight_keys - active_target_set)
-            if missing or unexpected:
+            if not explicit_weights and (missing or unexpected):
                 raise ValueError(
                     f"{label} row {row_idx} reward_metric_weights_json must match active teacher metric targets; "
                     f"missing={missing}, unexpected={unexpected}."
@@ -941,11 +950,15 @@ def _validate_train_tuning_reward_provenance_metadata(
                     raise ValueError(
                         f"{label} row {row_idx} reward_metric_weights_json values must be finite and nonnegative."
                     )
-                if str(key) in present_target_set:
+                if not explicit_weights and str(key) in present_target_set:
                     positive_weight_sum += float(weight)
+            if explicit_weights:
+                positive_weight_sum = float(
+                    sum(explicit_weights[key] for key in present_target_set)
+                )
             if positive_weight_sum <= 0.0:
                 raise ValueError(
-                    f"{label} row {row_idx} reward_metric_weights_json must assign positive mass to present targets."
+                    f"{label} row {row_idx} teacher utility weights must assign positive mass to present targets."
                 )
 
         if _has_nonempty_value(row, "train_tuning_fraction"):
@@ -1203,11 +1216,6 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
         )
 
     teacher_metric_target_keys = resolve_teacher_metric_target_keys(args, rows)
-    _validate_train_tuning_reward_provenance_metadata(
-        rows,
-        target_keys=teacher_metric_target_keys,
-        label="GIPO training rows_csv",
-    )
     explicit_teacher_weights = _parse_float_mapping(str(args.teacher_utility_weights)) if str(args.teacher_utility_weights).strip() else None
     if explicit_teacher_weights is None and teacher_metric_target_keys == ("u_crps_uniform", "u_mase_uniform"):
         explicit_teacher_weights = {
@@ -1217,6 +1225,12 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
     teacher_utility_weights = teacher_utility_weights_for_summary(
         teacher_metric_target_keys,
         normalize_teacher_utility_weights(teacher_metric_target_keys, explicit_teacher_weights),
+    )
+    _validate_train_tuning_reward_provenance_metadata(
+        rows,
+        target_keys=teacher_metric_target_keys,
+        label="GIPO training rows_csv",
+        teacher_utility_weights=explicit_teacher_weights,
     )
     teacher_metric_min_coverage_fraction = float(getattr(args, "teacher_metric_min_coverage_fraction", 1.0))
     if (
@@ -1366,6 +1380,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             unseen_filtered_rows,
             target_keys=teacher_metric_target_keys,
             label="Teacher unseen selection rows",
+            teacher_utility_weights=explicit_teacher_weights,
         )
         if _needs_forecast_uniform_rewards(unseen_filtered_rows, teacher_metric_target_keys):
             unseen_rewarded_rows = attach_uniform_gipo_rewards(
@@ -1644,6 +1659,7 @@ def train_gipo(args: argparse.Namespace) -> Dict[str, Any]:
             unseen_target_filtered_rows,
             target_keys=teacher_metric_target_keys,
             label="Student unseen target distillation",
+            teacher_utility_weights=explicit_teacher_weights,
         )
         unseen_target_support_keys = _observed_support(unseen_target_filtered_rows)
         missing_unseen_support = sorted(set(support_keys) - set(unseen_target_support_keys))

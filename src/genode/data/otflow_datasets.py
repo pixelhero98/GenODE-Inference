@@ -110,9 +110,17 @@ class L2FeatureMap:
         `delta_mid[t]` is interpreted as `mid[t] - mid[t-1]`. Therefore, `init_mid`
         should be the previous mid (at t-1 for the first decoded row).
         """
+        params = np.asarray(params)
+        if params.ndim != 2:
+            raise ValueError(f"Expected a two-dimensional parameter sequence, got shape={params.shape}.")
+        if not np.all(np.isfinite(params)):
+            raise FloatingPointError("Cannot decode a parameter sequence containing non-finite values.")
+        if not np.isfinite(float(init_mid)):
+            raise FloatingPointError(f"Cannot decode with non-finite init_mid={init_mid!r}.")
         T, D = params.shape
         L = self.L
-        assert D == 4 * L, f"Expected D={4*L}, got {D}"
+        if D != 4 * L:
+            raise ValueError(f"Expected D={4 * L}, got {D}.")
 
         delta_mid = params[:, 0]
         log_spread = params[:, 1]
@@ -127,7 +135,15 @@ class L2FeatureMap:
             prev_mid = prev_mid + float(delta_mid[t])
             mid[t] = prev_mid
 
-        spread = np.exp(log_spread)
+        try:
+            with np.errstate(over="raise", invalid="raise"):
+                spread = np.exp(log_spread)
+                ask_gaps = np.exp(log_ask_gaps)
+                bid_gaps = np.exp(log_bid_gaps)
+                ask_v = np.exp(log_ask_v).astype(np.float32)
+                bid_v = np.exp(log_bid_v).astype(np.float32)
+        except FloatingPointError as exc:
+            raise FloatingPointError("L2 parameter decoding overflowed or produced an invalid exponential.") from exc
         ask1 = mid + 0.5 * spread
         bid1 = mid - 0.5 * spread
 
@@ -136,15 +152,14 @@ class L2FeatureMap:
         ask_p[:, 0] = ask1
         bid_p[:, 0] = bid1
 
-        ask_gaps = np.exp(log_ask_gaps)
-        bid_gaps = np.exp(log_bid_gaps)
         for i in range(1, L):
             ask_p[:, i] = ask_p[:, i - 1] + ask_gaps[:, i - 1]
             bid_p[:, i] = bid_p[:, i - 1] - bid_gaps[:, i - 1]
 
-        ask_v = np.exp(log_ask_v).astype(np.float32)
-        bid_v = np.exp(log_bid_v).astype(np.float32)
-        return ask_p, ask_v, bid_p, bid_v
+        decoded = (ask_p, ask_v, bid_p, bid_v)
+        if not all(np.all(np.isfinite(values)) for values in decoded):
+            raise FloatingPointError("L2 parameter decoding produced non-finite prices or volumes.")
+        return decoded
 
 # -----------------------------
 # Standardization helpers

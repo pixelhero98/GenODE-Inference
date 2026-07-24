@@ -303,6 +303,14 @@ def _safe_high_gain(value: Any, reference: Any) -> Optional[float]:
     return float(float(v) / float(r) - 1.0)
 
 
+def _safe_delta(value: Any, reference: Any) -> Optional[float]:
+    v = _optional_float(value)
+    r = _optional_float(reference)
+    if v is None or r is None:
+        return None
+    return float(v - r)
+
+
 def _protocol_path_fingerprint(path: str | Path) -> Dict[str, Any]:
     return fingerprint_identity(path_fingerprint(resolve_project_path(str(path))))
 
@@ -1169,9 +1177,69 @@ def _missing_cells(
 
 
 def _aggregate_schedule_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    groups: Dict[Tuple[str, int, str], List[Mapping[str, Any]]] = {}
+    metrics = (
+        "forecast_crps",
+        "forecast_mase",
+        "forecast_mse",
+        "score_main",
+        "temporal_cw1",
+        "temporal_uw1",
+        "temporal_tstr_f1",
+        "molecule_kabsch_rmsd_3d",
+        "molecule_ensemble_velocity_norm_w1",
+        "molecule_ensemble_acceleration_norm_w1",
+        "molecule_rollout_velocity_norm_w1",
+        "molecule_rollout_acceleration_norm_w1",
+        "u_comp_uniform",
+        "latency_ms_per_sample",
+        "realized_nfe",
+    )
+    diagnostic_metrics = (
+        "internal_fraction_after_098",
+        "internal_count_after_098",
+        "internal_count",
+        "min_interval",
+        "max_interval",
+    )
+    seed_groups: Dict[Tuple[str, int, str, int], List[Mapping[str, Any]]] = {}
     for row in rows:
-        key = (str(row.get("solver_key")), int(row.get("target_nfe", -1)), str(row.get("scheduler_key")))
+        key = (
+            str(row.get("solver_key")),
+            int(row.get("target_nfe", -1)),
+            str(row.get("scheduler_key")),
+            int(row.get("seed", 0)),
+        )
+        seed_groups.setdefault(key, []).append(row)
+
+    seed_rows: List[Dict[str, Any]] = []
+    for (solver_key, target_nfe, scheduler_key, seed), group in sorted(
+        seed_groups.items(),
+        key=lambda item: (item[0][0], item[0][1], item[0][2], item[0][3]),
+    ):
+        seed_row: Dict[str, Any] = {
+            "solver_key": solver_key,
+            "target_nfe": int(target_nfe),
+            "scheduler_key": scheduler_key,
+            "seed": int(seed),
+        }
+        budgets = {
+            int(row["gipo_step_budget"])
+            for row in group
+            if row.get("gipo_step_budget") not in (None, "")
+        }
+        if len(budgets) == 1:
+            seed_row["gipo_step_budget"] = int(next(iter(budgets)))
+        for metric in (*metrics, *diagnostic_metrics):
+            seed_row[metric] = _mean(row.get(metric) for row in group)
+        seed_rows.append(seed_row)
+
+    groups: Dict[Tuple[str, int, str], List[Mapping[str, Any]]] = {}
+    for row in seed_rows:
+        key = (
+            str(row["solver_key"]),
+            int(row["target_nfe"]),
+            str(row["scheduler_key"]),
+        )
         groups.setdefault(key, []).append(row)
     summaries: List[Dict[str, Any]] = []
     for (solver_key, target_nfe, scheduler_key), group in sorted(groups.items(), key=lambda item: (item[0][0], item[0][1], item[0][2])):
@@ -1186,27 +1254,11 @@ def _aggregate_schedule_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str
         budgets = {int(row["gipo_step_budget"]) for row in group if row.get("gipo_step_budget") not in (None, "")}
         if len(budgets) == 1:
             summary["gipo_step_budget"] = int(next(iter(budgets)))
-        for metric in (
-            "forecast_crps",
-            "forecast_mase",
-            "forecast_mse",
-            "score_main",
-            "temporal_cw1",
-            "temporal_uw1",
-            "temporal_tstr_f1",
-            "molecule_kabsch_rmsd_3d",
-            "molecule_ensemble_velocity_norm_w1",
-            "molecule_ensemble_acceleration_norm_w1",
-            "molecule_rollout_velocity_norm_w1",
-            "molecule_rollout_acceleration_norm_w1",
-            "u_comp_uniform",
-            "latency_ms_per_sample",
-            "realized_nfe",
-        ):
+        for metric in metrics:
             values = [row.get(metric) for row in group]
             summary[f"{metric}_mean"] = _mean(values)
             summary[f"{metric}_std"] = _std(values)
-        for metric in ("internal_fraction_after_098", "internal_count_after_098", "internal_count", "min_interval", "max_interval"):
+        for metric in diagnostic_metrics:
             values = [row.get(metric) for row in group]
             summary[f"{metric}_mean"] = _mean(values)
         summaries.append(summary)
@@ -1597,24 +1649,47 @@ def build_comparison_summary(
                 }
                 for metric in metric_keys:
                     mean_key = f"{metric}_mean"
+                    available_baselines = [
+                        row for row in baselines if _optional_float(row.get(mean_key)) is not None
+                    ]
                     if _metric_higher_is_better(metric):
                         ordered = sorted(cell_rows, key=lambda row: (-_finite_metric_high(row, metric), str(row["scheduler_key"])))
-                        best_baseline = max(baselines, key=lambda row: _finite_metric_high(row, metric), default=None)
+                        best_baseline = max(
+                            available_baselines,
+                            key=lambda row: _finite_metric_high(row, metric),
+                            default=None,
+                        )
                     else:
                         ordered = sorted(cell_rows, key=lambda row: (_finite_metric(row, metric), str(row["scheduler_key"])))
-                        best_baseline = min(baselines, key=lambda row: _finite_metric(row, metric), default=None)
+                        best_baseline = min(
+                            available_baselines,
+                            key=lambda row: _finite_metric(row, metric),
+                            default=None,
+                        )
                     ranking["metric_rankings"][metric] = [row["scheduler_key"] for row in ordered if row.get(mean_key) not in (None, "")]
                     ranking[f"best_baseline_by_{metric}"] = None if best_baseline is None else best_baseline["scheduler_key"]
                 for student_row in sorted([row for row in cell_rows if str(row["scheduler_key"]) in student_scheduler_keys], key=lambda row: str(row["scheduler_key"])):
                     comparison: Dict[str, Any] = {"scheduler_key": student_row["scheduler_key"]}
                     for metric in metric_keys:
                         mean_key = f"{metric}_mean"
+                        available_baselines = [
+                            row for row in baselines if _optional_float(row.get(mean_key)) is not None
+                        ]
                         comparison[f"student_{metric}_mean"] = student_row.get(mean_key)
                         if _metric_higher_is_better(metric):
-                            comparison[f"student_{metric}_delta_vs_uniform"] = None if uniform is None else (
-                                _finite_metric_high(student_row, metric) - _finite_metric_high(uniform, metric)
+                            comparison[f"student_{metric}_delta_vs_uniform"] = (
+                                None
+                                if uniform is None
+                                else _safe_delta(
+                                    student_row.get(mean_key),
+                                    uniform.get(mean_key),
+                                )
                             )
-                            best_baseline = max(baselines, key=lambda row: _finite_metric_high(row, metric), default=None)
+                            best_baseline = max(
+                                available_baselines,
+                                key=lambda row: _finite_metric_high(row, metric),
+                                default=None,
+                            )
                             comparison[f"student_{metric}_gain_vs_uniform"] = _safe_high_gain(
                                 student_row.get(mean_key),
                                 None if uniform is None else uniform.get(mean_key),
@@ -1628,7 +1703,11 @@ def build_comparison_summary(
                                 None if ser_ptg is None else ser_ptg.get(mean_key),
                             )
                         else:
-                            best_baseline = min(baselines, key=lambda row: _finite_metric(row, metric), default=None)
+                            best_baseline = min(
+                                available_baselines,
+                                key=lambda row: _finite_metric(row, metric),
+                                default=None,
+                            )
                             comparison[f"student_{metric}_gain_vs_uniform"] = _safe_gain(
                                 student_row.get(mean_key),
                                 None if uniform is None else uniform.get(mean_key),

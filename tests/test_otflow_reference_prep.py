@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import re
 import tempfile
@@ -995,6 +996,121 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
             lines = [line for line in (Path(tmpdir) / "rows.jsonl").read_text(encoding="utf-8").splitlines() if line]
         self.assertEqual(len(lines), 1)
 
+    def test_repeated_resume_preserves_valid_parent_beside_incomplete_sibling(
+        self,
+    ) -> None:
+        manifest = PROJECT_ROOT / "backbone_manifest.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            args = runner.build_argparser().parse_args(
+                [
+                    "--out_root",
+                    str(root),
+                    "--forecast_datasets",
+                    "traffic_hourly",
+                    "--conditional_generation_datasets",
+                    "",
+                    "--backbone_manifest",
+                    str(manifest),
+                    "--target_nfe_values",
+                    "4",
+                    "--write_context_rows",
+                ]
+            )
+            recorder = runner._init_row_recorder(root, args)
+            protocol_hash = recorder["protocol_hash"]
+
+            def parent_row(
+                scheduler_key: str,
+                row_signature: str,
+                selected_examples: int,
+            ) -> dict:
+                return {
+                    "protocol_hash": protocol_hash,
+                    "benchmark_family": "temporal_extrapolation",
+                    "experiment_layout": runner.EXPERIMENT_LAYOUT_ID,
+                    "scenario_key": "traffic_hourly",
+                    "scenario_family": "temporal_extrapolation",
+                    "method_key": runner.METHOD_KEY,
+                    "nfe_role": "seen",
+                    "checkpoint_step": 4000,
+                    "checkpoint_id": "checkpoint",
+                    "split_phase": "locked_test",
+                    "seed": 0,
+                    "solver_key": "euler",
+                    "target_nfe": 4,
+                    "scheduler_key": scheduler_key,
+                    "schedule_grid_hash": f"{scheduler_key}-grid",
+                    "context_embedding_kind": "ctx_summary",
+                    "row_signature": row_signature,
+                    "row_status": "complete",
+                    "selected_examples": selected_examples,
+                }
+
+            valid_parent = parent_row("uniform", "valid-parent", 1)
+            incomplete_parent = parent_row("gits", "incomplete-parent", 2)
+            runner._append_row_record(recorder, valid_parent)
+            runner._append_row_record(recorder, incomplete_parent)
+
+            def context_row(parent: dict, suffix: str) -> dict:
+                return {
+                    **parent,
+                    "parent_row_signature": parent["row_signature"],
+                    "row_signature": f"context-{suffix}",
+                    "context_schema": "forecast_window",
+                    "context_id": f"context-{suffix}",
+                    "context_embedding_id": f"embedding-{suffix}",
+                }
+
+            context_rows = [
+                context_row(valid_parent, "valid"),
+                context_row(incomplete_parent, "incomplete"),
+            ]
+            runner._write_context_row_csv(
+                root / "context_rows.csv",
+                context_rows,
+            )
+            runner.save_context_embedding_table(
+                root / "context_embeddings.npz",
+                {
+                    "embedding-valid": [1.0, 0.0],
+                    "embedding-incomplete": [0.0, 1.0],
+                },
+                metadata={"context_embedding_kind": "ctx_summary"},
+                context_rows=context_rows,
+            )
+            recorder["fh"].close()
+
+            first_resume = runner._init_row_recorder(root, args)
+            try:
+                self.assertIn(
+                    runner._row_key(valid_parent),
+                    first_resume["rows_by_key"],
+                )
+                self.assertNotIn(
+                    runner._row_key(incomplete_parent),
+                    first_resume["rows_by_key"],
+                )
+            finally:
+                first_resume["fh"].close()
+
+            second_resume = runner._init_row_recorder(root, args)
+            try:
+                self.assertIn(
+                    runner._row_key(valid_parent),
+                    second_resume["rows_by_key"],
+                )
+                self.assertNotIn(
+                    runner._row_key(incomplete_parent),
+                    second_resume["rows_by_key"],
+                )
+                self.assertEqual(
+                    set(second_resume["context_embeddings"]),
+                    {"embedding-valid"},
+                )
+            finally:
+                second_resume["fh"].close()
+
     def test_schedule_row_output_status_rejects_duplicate_rows_jsonl_keys(self) -> None:
         manifest = PROJECT_ROOT / "backbone_manifest.json"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1131,7 +1247,11 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
         payload = runner._context_reward_protocol_payload(args)
         self.assertEqual(
             payload["conditional_generation_profiles"]["cryptos"]["target_utility_keys"],
-            ["u_temporal_uw1_uniform", "u_temporal_cw1_uniform", "u_temporal_tstr_f1_uniform"],
+            ["u_temporal_uw1_uniform", "u_temporal_cw1_uniform"],
+        )
+        self.assertEqual(
+            payload["conditional_generation_profiles"]["cryptos"]["optional_utility_keys"],
+            ["u_temporal_tstr_f1_uniform"],
         )
         self.assertFalse(payload["conditional_diagnostic_metrics_are_teacher_targets"])
 
@@ -2417,13 +2537,16 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
 
         def fake_run_fixed_schedule_variant(**kwargs):
             chosen_t0s = [int(x) for x in kwargs["chosen_t0s"].tolist()]
+            chosen_t0s_hash = hashlib.sha256(
+                json.dumps(chosen_t0s, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
             return {
                 "score_main": 1.0,
                 "temporal_uw1": 0.1,
                 "temporal_cw1": 0.2,
                 "temporal_tstr_f1": None,
                 "temporal_tstr_f1_applicable": False,
-                "evaluation_protocol": {"chosen_t0s_hash": ",".join(str(x) for x in chosen_t0s)},
+                "evaluation_protocol": {"chosen_t0s_hash": chosen_t0s_hash},
                 "per_window_metric_rows": [{"target_t": t0, "score_main": 1.0} for t0 in chosen_t0s],
             }
 
@@ -2431,32 +2554,54 @@ class DiffusionFlowReferencePrepTests(unittest.TestCase):
             parent = str(kwargs["parent_row_signature"])
             protocol_hash = str(kwargs["protocol_hash"])
             checkpoint_id = str(kwargs["checkpoint"]["checkpoint_id"])
-            return [
-                {
-                    "benchmark_family": str(kwargs["benchmark_family"]),
-                    "experiment_layout": runner.EXPERIMENT_LAYOUT_ID,
-                    "protocol_hash": protocol_hash,
-                    "parent_row_signature": parent,
-                    "row_signature": f"{parent}:ctx:{int(t0)}",
-                    "scenario_family": str(kwargs["benchmark_family"]),
-                    "method_key": str(kwargs["details"].get("method_key") or runner.METHOD_KEY),
-                    "nfe_role": str(kwargs["nfe_role"]),
-                    "checkpoint_step": int(kwargs["checkpoint_step"]),
-                    "context_id": f"ctx-{int(t0)}",
-                    "context_embedding_id": f"{checkpoint_id}:ctx-{int(t0)}",
-                    "context_schema": "conditional_generation_window",
-                    "scenario_key": str(kwargs["dataset"]),
-                    "split_phase": str(kwargs["split_phase"]),
-                    "seed": int(kwargs["seed"]),
-                    "solver_key": str(kwargs["solver_key"]),
-                    "target_nfe": int(kwargs["target_nfe"]),
-                    "scheduler_key": str(kwargs["scheduler_key"]),
-                    "schedule_grid_hash": str(kwargs["details"]["schedule_grid_hash"]),
-                    "checkpoint_id": checkpoint_id,
-                    "target_t": int(t0),
-                }
-                for t0 in kwargs["chosen_t0s"]
-            ]
+            rows = []
+            for local_idx, t0 in enumerate(kwargs["chosen_t0s"]):
+                example_idx = int(kwargs.get("window_index_offset", 0)) + int(
+                    local_idx
+                )
+                evaluation_seed = int(kwargs["evaluation_seed"]) + example_idx
+                rows.append(
+                    {
+                        "benchmark_family": str(kwargs["benchmark_family"]),
+                        "experiment_layout": runner.EXPERIMENT_LAYOUT_ID,
+                        "protocol_hash": protocol_hash,
+                        "parent_row_signature": parent,
+                        "row_signature": f"{parent}:ctx:{int(t0)}",
+                        "scenario_family": str(kwargs["benchmark_family"]),
+                        "method_key": str(
+                            kwargs["details"].get("method_key") or runner.METHOD_KEY
+                        ),
+                        "nfe_role": str(kwargs["nfe_role"]),
+                        "checkpoint_step": int(kwargs["checkpoint_step"]),
+                        "context_id": f"ctx-{int(t0)}",
+                        "context_embedding_id": f"{checkpoint_id}:ctx-{int(t0)}",
+                        "context_schema": "conditional_generation_window",
+                        "scenario_key": str(kwargs["dataset"]),
+                        "split_phase": str(kwargs["split_phase"]),
+                        "seed": int(kwargs["seed"]),
+                        "solver_key": str(kwargs["solver_key"]),
+                        "target_nfe": int(kwargs["target_nfe"]),
+                        "scheduler_key": str(kwargs["scheduler_key"]),
+                        "schedule_grid_hash": str(
+                            kwargs["details"]["schedule_grid_hash"]
+                        ),
+                        "checkpoint_id": checkpoint_id,
+                        "example_idx": example_idx,
+                        "target_t": int(t0),
+                        "evaluation_seed": evaluation_seed,
+                        "sample_seed_start": evaluation_seed,
+                        "sample_seed_values_json": json.dumps(
+                            [evaluation_seed], separators=(",", ":")
+                        ),
+                        "chosen_examples_hash": str(kwargs["chosen_t0s_hash"]),
+                        "evaluation_protocol_hash": str(
+                            kwargs["evaluation_protocol_hash"]
+                        ),
+                        "temporal_uw1": kwargs["metric_row"]["temporal_uw1"],
+                        "temporal_cw1": kwargs["metric_row"]["temporal_cw1"],
+                    }
+                )
+            return rows
 
         with tempfile.TemporaryDirectory() as tmpdir:
             args = runner.build_argparser().parse_args(

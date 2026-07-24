@@ -302,6 +302,12 @@ class OTFlow(RectifiedFlow):
             )
         if not initial_state.is_floating_point():
             raise TypeError("initial_state must use a floating-point dtype.")
+        if not bool(torch.isfinite(initial_state).all()):
+            raise FloatingPointError("OTFlow.solve received a non-finite initial_state.")
+        if hist is not None and not bool(torch.isfinite(hist).all()):
+            raise FloatingPointError("OTFlow.solve received non-finite history conditioning.")
+        if cond is not None and not bool(torch.isfinite(cond).all()):
+            raise FloatingPointError("OTFlow.solve received non-finite conditional features.")
 
         nfe = normalize_solver_nfe_fields(solver_key, target_nfe, source="OTFlow.solve")
         grid = self._validate_time_grid(
@@ -320,6 +326,10 @@ class OTFlow(RectifiedFlow):
             conditioning_cache,
             batch_size=batch_size,
         )
+        for cache_name in ("ctx_tokens", "ctx_summary", "summary", "cond_emb"):
+            cache_value = getattr(cache, cache_name)
+            if cache_value is not None and not bool(torch.isfinite(cache_value).all()):
+                raise FloatingPointError(f"OTFlow.solve received non-finite conditioning cache field {cache_name!r}.")
         guidance = float(self.cfg.sample.cfg_scale)
         if not torch.isfinite(torch.tensor(guidance)):
             raise ValueError(f"sample.cfg_scale must be finite, got {guidance!r}.")
@@ -338,6 +348,10 @@ class OTFlow(RectifiedFlow):
         previous_dt: Optional[float] = None
 
         def field(x_state: torch.Tensor, t_value: float) -> torch.Tensor:
+            if not bool(torch.isfinite(x_state).all()):
+                raise FloatingPointError(
+                    f"OTFlow solver={nfe.solver_key!r} received a non-finite field state at t={float(t_value):.9g}."
+                )
             t = torch.full(
                 (batch_size, 1),
                 float(t_value),
@@ -358,6 +372,10 @@ class OTFlow(RectifiedFlow):
                     f"Velocity field returned shape={tuple(velocity.shape)} for "
                     f"state shape={tuple(x_state.shape)}."
                 )
+            if not bool(torch.isfinite(velocity).all()):
+                raise FloatingPointError(
+                    f"OTFlow solver={nfe.solver_key!r} produced a non-finite velocity at t={float(t_value):.9g}."
+                )
             return velocity
 
         for step_index in range(nfe.macro_steps):
@@ -370,10 +388,20 @@ class OTFlow(RectifiedFlow):
                 x = x + dt * velocity
             elif nfe.solver_key == "heun":
                 predicted = x + dt * velocity
+                if not bool(torch.isfinite(predicted).all()):
+                    raise FloatingPointError(
+                        f"OTFlow solver='heun' produced a non-finite predictor at step={step_index} "
+                        f"t={t_current:.9g} dt={dt:.9g}."
+                    )
                 next_velocity = field(predicted, t_next)
                 x = x + 0.5 * dt * (velocity + next_velocity)
             elif nfe.solver_key == "midpoint_rk2":
                 midpoint = x + 0.5 * dt * velocity
+                if not bool(torch.isfinite(midpoint).all()):
+                    raise FloatingPointError(
+                        f"OTFlow solver='midpoint_rk2' produced a non-finite midpoint at step={step_index} "
+                        f"t={t_current:.9g} dt={dt:.9g}."
+                    )
                 midpoint_velocity = field(midpoint, t_current + 0.5 * dt)
                 x = x + dt * midpoint_velocity
             elif nfe.solver_key == "dpmpp2m":
@@ -390,6 +418,11 @@ class OTFlow(RectifiedFlow):
             else:  # pragma: no cover - normalize_solver_nfe_fields is authoritative.
                 raise AssertionError(f"Unhandled solver_key={nfe.solver_key!r}.")
 
+            if not bool(torch.isfinite(x).all()):
+                raise FloatingPointError(
+                    f"OTFlow solver={nfe.solver_key!r} produced a non-finite state at step={step_index} "
+                    f"t={t_current:.9g} dt={dt:.9g} target_nfe={nfe.target_nfe}."
+                )
             if states is not None:
                 states.append(x)
 

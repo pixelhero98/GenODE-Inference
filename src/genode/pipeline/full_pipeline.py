@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
@@ -181,6 +183,59 @@ def _json_hash(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+_OPTIONAL_EXTENSION_PROTOCOL_FIELDS = (
+    "include_ablations",
+    "ablation_preset",
+    "ablation_student_policies",
+)
+
+
+def _protocol_hash_payload(protocol: Mapping[str, Any]) -> Dict[str, Any]:
+    payload = dict(protocol)
+    stages = payload.get("stages")
+    if isinstance(stages, list):
+        payload["stages"] = [
+            str(stage)
+            for stage in stages
+            if str(stage)
+            not in {ABLATION_STUDENT_STAGE, ABLATION_LOCKED_TEST_STAGE}
+        ]
+    for field in _OPTIONAL_EXTENSION_PROTOCOL_FIELDS:
+        payload.pop(field, None)
+    return payload
+
+
+def _legacy_pipeline_protocol_hashes(
+    protocol: Mapping[str, Any],
+) -> Tuple[str, ...]:
+    exact_legacy = dict(protocol)
+    exact_legacy.pop("protocol_hash_scope", None)
+    paper_legacy = dict(exact_legacy)
+    stages = paper_legacy.get("stages")
+    if isinstance(stages, list):
+        paper_legacy["stages"] = [
+            str(stage)
+            for stage in stages
+            if str(stage)
+            not in {ABLATION_STUDENT_STAGE, ABLATION_LOCKED_TEST_STAGE}
+        ]
+    paper_legacy["include_ablations"] = False
+    paper_legacy["ablation_preset"] = ""
+    paper_legacy["ablation_student_policies"] = []
+    return tuple(
+        dict.fromkeys(
+            (
+                _json_hash(exact_legacy),
+                _json_hash(paper_legacy),
+            )
+        )
+    )
+
+
+def _pipeline_protocol_hash(args: argparse.Namespace) -> str:
+    return _json_hash(_protocol_hash_payload(_protocol_payload(args)))
+
+
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(payload, indent=2, sort_keys=True)
@@ -198,7 +253,14 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
+        for attempt in range(8):
+            try:
+                os.replace(temporary_path, path)
+                break
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(0.01 * (2**attempt))
         temporary_path = None
     finally:
         if temporary_path is not None:
@@ -645,6 +707,7 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
     )
     return {
         "version": PIPELINE_VERSION,
+        "protocol_hash_scope": "paper_core_with_optional_ablation_extensions",
         "scenario_key": dataset,
         "benchmark_family": "" if plan is None else str(plan.benchmark_family),
         "stages": effective_stages,
@@ -851,12 +914,34 @@ def _load_existing_status(run_root: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _validate_run_root(run_root: Path, protocol_hash: str, *, resume: bool, overwrite: bool) -> None:
+def _protocol_hash_matches(
+    observed: Any,
+    protocol_hash: str,
+    compatible_protocol_hashes: Sequence[str] = (),
+) -> bool:
+    return str(observed or "") in {
+        str(protocol_hash),
+        *(str(value) for value in compatible_protocol_hashes),
+    }
+
+
+def _validate_run_root(
+    run_root: Path,
+    protocol_hash: str,
+    *,
+    resume: bool,
+    overwrite: bool,
+    compatible_protocol_hashes: Sequence[str] = (),
+) -> None:
     existing = _load_existing_status(run_root)
     if not existing:
         return
     existing_hash = str(existing.get("protocol_hash", "") or "")
-    if existing_hash == str(protocol_hash):
+    if _protocol_hash_matches(
+        existing_hash,
+        protocol_hash,
+        compatible_protocol_hashes,
+    ):
         if bool(resume) or bool(overwrite):
             return
         raise ValueError(f"Run root {run_root} already has status.json; pass --resume or --overwrite explicitly.")
@@ -1305,6 +1390,7 @@ def _gipo_report_command_outputs_complete(
         return True, ""
 
     from genode.gipo.report_locked_test import (
+        CONDITIONAL_PANEL_METRIC_PROTOCOL,
         SELECTION_MODE_REPORTING,
         _output_prefix,
         _report_input_fingerprints,
@@ -1370,6 +1456,16 @@ def _gipo_report_command_outputs_complete(
                 return False, f"GIPO policy summary {field} does not match"
             if expected and str(comparison_summary.get(field, "")) != expected:
                 return False, f"GIPO comparison summary {field} does not match"
+        if expected_scalars["benchmark_family"] == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
+            for label, payload in (
+                ("policy", policy_summary),
+                ("comparison", comparison_summary),
+            ):
+                if str(payload.get("metric_protocol", "")) != CONDITIONAL_PANEL_METRIC_PROTOCOL:
+                    return False, (
+                        f"GIPO {label} summary metric_protocol does not match "
+                        f"{CONDITIONAL_PANEL_METRIC_PROTOCOL!r}"
+                    )
         checkpoint_step = _command_arg_value(command, "--checkpoint_step")
         if checkpoint_step:
             expected_step = int(checkpoint_step)
@@ -1386,10 +1482,72 @@ def _gipo_report_command_outputs_complete(
                 return False, "GIPO comparison summary target_nfe_values do not match"
         if str(policy_summary.get("comparison_summary_path", "")) != comparison_summary_path.name:
             return False, "GIPO policy summary comparison path does not match"
-        for suffix in ("rows.csv", "aggregate_rows.csv", "decisions.csv"):
+        policy_outputs = policy_summary.get("report_outputs")
+        comparison_outputs = comparison_summary.get("report_outputs")
+        outputs_are_bound = (
+            isinstance(policy_outputs, Mapping)
+            and policy_outputs == comparison_outputs
+        )
+        is_conditional_report = (
+            expected_scalars["benchmark_family"]
+            == SCENARIO_FAMILY_CONDITIONAL_GENERATION
+        )
+        if is_conditional_report and not outputs_are_bound:
+            return False, "GIPO report output fingerprints are missing or inconsistent"
+        expected_row_counts = {
+            "rows.csv": int(policy_summary.get("context_row_count", -1)),
+            "aggregate_rows.csv": int(policy_summary.get("aggregate_row_count", -1)),
+            "decisions.csv": int(policy_summary.get("context_row_count", -1)),
+        }
+        member_aggregate_row_count = int(
+            policy_summary.get("member_aggregate_row_count", 0) or 0
+        )
+        if outputs_are_bound and member_aggregate_row_count > 0:
+            expected_row_counts["member_aggregate_rows.csv"] = (
+                member_aggregate_row_count
+            )
+        required_columns = {
+            "scenario_key",
+            "seed",
+            "solver_key",
+            "target_nfe",
+            "scheduler_key",
+        }
+        if expected_scalars["benchmark_family"] == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
+            required_columns.update(
+                {"metric_protocol", "temporal_uw1", "temporal_cw1"}
+            )
+        for suffix, expected_row_count in expected_row_counts.items():
             output_path = out_dir / f"{output_prefix}_{suffix}"
             if not output_path.is_file():
                 return False, f"missing expected GIPO report artifact: {output_path}"
+            if not outputs_are_bound:
+                continue
+            with output_path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                columns = list(reader.fieldnames or [])
+                row_count = sum(1 for _ in reader)
+            missing_columns = sorted(required_columns - set(columns))
+            if missing_columns:
+                return False, (
+                    f"GIPO report artifact {output_path.name} is missing columns "
+                    f"{missing_columns}"
+                )
+            if expected_row_count < 0 or row_count != expected_row_count:
+                return False, (
+                    f"GIPO report artifact {output_path.name} row count does not match"
+                )
+            expected_output = policy_outputs.get(output_path.name)
+            actual_output = {
+                "sha256": file_sha256(output_path),
+                "size_bytes": int(output_path.stat().st_size),
+                "row_count": int(row_count),
+                "columns": columns,
+            }
+            if expected_output != actual_output:
+                return False, (
+                    f"GIPO report artifact {output_path.name} fingerprint does not match"
+                )
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         return False, f"invalid GIPO report artifact: {exc}"
     return True, ""
@@ -1900,7 +2058,13 @@ def _stage_outputs_complete(entry: StageCommand) -> Tuple[bool, str]:
     return True, ""
 
 
-def _stage_manifest_complete(run_root: Path, entry: StageCommand, *, protocol_hash: str) -> Tuple[bool, str]:
+def _stage_manifest_complete(
+    run_root: Path,
+    entry: StageCommand,
+    *,
+    protocol_hash: str,
+    compatible_protocol_hashes: Sequence[str] = (),
+) -> Tuple[bool, str]:
     path = run_root / entry.manifest_name
     if not path.exists():
         return False, f"missing stage manifest: {path}"
@@ -1912,7 +2076,11 @@ def _stage_manifest_complete(run_root: Path, entry: StageCommand, *, protocol_ha
         return False, f"stage manifest status is {manifest.get('status')!r}"
     if str(manifest.get("stage", "")) != str(entry.stage):
         return False, f"stage manifest is for {manifest.get('stage')!r}, expected {entry.stage!r}"
-    if str(manifest.get("protocol_hash", "")) != str(protocol_hash):
+    if not _protocol_hash_matches(
+        manifest.get("protocol_hash", ""),
+        protocol_hash,
+        compatible_protocol_hashes,
+    ):
         return False, "stage manifest protocol hash does not match"
     expected_hashes = [_command_hash(command) for command in entry.commands]
     manifest_hashes = manifest.get("command_hashes")
@@ -1953,6 +2121,7 @@ def _interrupted_stage_manifest_matches(
     entry: StageCommand,
     *,
     protocol_hash: str,
+    compatible_protocol_hashes: Sequence[str] = (),
 ) -> Tuple[bool, str]:
     path = run_root / entry.manifest_name
     if not path.is_file():
@@ -1964,13 +2133,18 @@ def _interrupted_stage_manifest_matches(
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return False, f"invalid interrupted stage manifest: {exc}"
-    if str(manifest.get("status", "")) != "running":
-        return False, "stage manifest is not an interrupted running stage"
+    manifest_status = str(manifest.get("status", ""))
+    if manifest_status not in {"running", "complete"}:
+        return False, "stage manifest is not an adoptable running or complete stage"
     if manifest.get("dry_run") is not False:
         return False, "interrupted stage manifest is not a non-dry-run manifest"
     if str(manifest.get("stage", "")) != str(entry.stage):
         return False, "interrupted stage manifest stage does not match"
-    if str(manifest.get("protocol_hash", "")) != str(protocol_hash):
+    if not _protocol_hash_matches(
+        manifest.get("protocol_hash", ""),
+        protocol_hash,
+        compatible_protocol_hashes,
+    ):
         return False, "interrupted stage manifest protocol hash does not match"
     expected_commands = [
         _display_command(command, path_base=run_root) for command in entry.commands
@@ -1996,10 +2170,21 @@ def _interrupted_stage_manifest_matches(
     return True, ""
 
 
-def _resume_completed_prefix(run_root: Path, commands: Sequence[StageCommand], *, protocol_hash: str) -> List[StageCommand]:
+def _resume_completed_prefix(
+    run_root: Path,
+    commands: Sequence[StageCommand],
+    *,
+    protocol_hash: str,
+    compatible_protocol_hashes: Sequence[str] = (),
+) -> List[StageCommand]:
     completed: List[StageCommand] = []
     for entry in commands:
-        is_complete, _reason = _stage_manifest_complete(run_root, entry, protocol_hash=protocol_hash)
+        is_complete, _reason = _stage_manifest_complete(
+            run_root,
+            entry,
+            protocol_hash=protocol_hash,
+            compatible_protocol_hashes=compatible_protocol_hashes,
+        )
         if not is_complete:
             break
         completed.append(entry)
@@ -2629,11 +2814,28 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     run_root.mkdir(parents=True, exist_ok=True)
     preflight = _validate_inputs_preflight(args)
     protocol = _protocol_payload(args)
-    protocol_hash = _json_hash(protocol)
-    _validate_run_root(run_root, protocol_hash, resume=bool(args.resume), overwrite=bool(args.overwrite))
+    protocol_hash_payload = _protocol_hash_payload(protocol)
+    protocol_hash = _json_hash(protocol_hash_payload)
+    compatible_protocol_hashes = _legacy_pipeline_protocol_hashes(protocol)
+    _validate_run_root(
+        run_root,
+        protocol_hash,
+        resume=bool(args.resume),
+        overwrite=bool(args.overwrite),
+        compatible_protocol_hashes=compatible_protocol_hashes,
+    )
     commands = _build_stage_commands(args, run_root)
     has_ablation_stage = _has_ablation_stage(commands)
-    skipped_entries = _resume_completed_prefix(run_root, commands, protocol_hash=protocol_hash) if bool(args.resume) and not bool(args.overwrite) else []
+    skipped_entries = (
+        _resume_completed_prefix(
+            run_root,
+            commands,
+            protocol_hash=protocol_hash,
+            compatible_protocol_hashes=compatible_protocol_hashes,
+        )
+        if bool(args.resume) and not bool(args.overwrite)
+        else []
+    )
     skipped_stage_names = [entry.stage for entry in skipped_entries]
     adopted_stage_names: List[str] = []
     commands_to_run = list(commands[len(skipped_entries) :])
@@ -2650,7 +2852,17 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             status="dry_run" if bool(args.dry_run) else "running",
         )
         _write_json(_ablation_root(run_root, str(args.ablation_preset)) / "ablation_manifest.json", ablation_manifest)
-    _write_json(run_root / "protocol.json", {**protocol, "protocol_hash": protocol_hash})
+    _write_json(
+        run_root / "protocol.json",
+        {
+            **protocol,
+            "protocol_hash": protocol_hash,
+            "protocol_hash_payload": protocol_hash_payload,
+            "compatible_legacy_protocol_hashes": list(
+                compatible_protocol_hashes
+            ),
+        },
+    )
     _write_json(
         _status_path(run_root),
         {
@@ -2667,13 +2879,14 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     )
     completed: List[str] = list(skipped_stage_names)
     for entry in commands_to_run:
-        interrupted_manifest_matches = False
+        adoptable_manifest_matches = False
         if bool(args.resume) and not bool(args.overwrite):
-            interrupted_manifest_matches, _ = (
+            adoptable_manifest_matches, _ = (
                 _interrupted_stage_manifest_matches(
                     run_root,
                     entry,
                     protocol_hash=protocol_hash,
+                    compatible_protocol_hashes=compatible_protocol_hashes,
                 )
             )
         manifest = {
@@ -2697,7 +2910,7 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                     )
                 log_path = run_root / "logs" / f"{entry.stage}_{command_idx}.log"
                 log_path.parent.mkdir(parents=True, exist_ok=True)
-                if interrupted_manifest_matches:
+                if adoptable_manifest_matches:
                     gipo_validator = None
                     if (
                         _command_module_args(command, "genode.gipo.train_gipo")
@@ -2722,7 +2935,7 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                                     "skipped": True,
                                     "skip_reason": (
                                         "verified GIPO output already complete after "
-                                        "an exact interrupted-stage match"
+                                        "an exact prior-stage manifest match"
                                     ),
                                 }
                             )
@@ -2731,7 +2944,7 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 if (
                     bool(args.resume)
                     and not bool(args.overwrite)
-                    and interrupted_manifest_matches
+                    and adoptable_manifest_matches
                     and entry.stage
                     in {
                         FLOW_MAP_COLLECTION_STAGE,
