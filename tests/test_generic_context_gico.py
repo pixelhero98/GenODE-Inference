@@ -1666,6 +1666,8 @@ class GenericContextGicoTests(unittest.TestCase):
         validation = summary["preflight"]["provided_backbone_validation"]
         self.assertEqual(validation["status"], "skipped_missing_manifest")
         self.assertTrue(any("Backbone manifest is missing" in error for error in validation["errors"]))
+        self.assertEqual(validation["manifest"], "backbone_manifest.json")
+        self.assertNotIn(str(Path(tmpdir).resolve()), json.dumps(validation, sort_keys=True))
 
     def test_full_pipeline_ser_controls_are_protocolized_without_entering_primary_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -49,6 +49,7 @@ from genode.provenance import file_sha256
 IMAGE_GICO_CONDITIONAL_BUNDLE_PROTOCOL = (
     "image_gico_backbone_context_policy_bundle_v4"
 )
+_BOUND_ARTIFACT_CONSTRUCTION_TOKEN = object()
 _MANIFEST = "manifest.json"
 _FEATURE_GROUPS = "reward-feature-groups.json"
 _TARGETS = "conditional-targets.json"
@@ -189,11 +190,7 @@ def _manifest_fields() -> set[str]:
     }
 
 
-def _validate_bundle(
-    paths: Mapping[str, Path],
-    expected_paths: Mapping[str, Path],
-) -> None:
-    manifest = _canonical_payload(paths["manifest"])
+def _verified_manifest_artifact_sha256(manifest: Mapping[str, Any]) -> str:
     if set(manifest) != _manifest_fields():
         raise ValueError(
             "Backbone-context bundle manifest fields must be exactly "
@@ -212,6 +209,15 @@ def _validate_bundle(
     )
     if stored_artifact_sha256 != observed_artifact_sha256:
         raise ValueError("Backbone-context GICO artifact hash is inconsistent.")
+    return observed_artifact_sha256
+
+
+def _validate_bundle(
+    paths: Mapping[str, Path],
+    expected_paths: Mapping[str, Path],
+) -> None:
+    manifest = _canonical_payload(paths["manifest"])
+    _verified_manifest_artifact_sha256(manifest)
 
     feature_groups = ImageGICOFeatureGroups.from_payload(
         _canonical_payload(paths["feature_groups"])
@@ -377,6 +383,47 @@ class BoundImageGICOConditionalArtifact:
     feature_groups: ImageGICOFeatureGroups
     targets: ImageGICOConditionalTargets
     manifest: Mapping[str, Any]
+    _construction_token: object = field(repr=False, compare=False)
+    _bound_artifact_sha256: str = field(init=False, repr=False, compare=False)
+    _expected_state_dict: Mapping[str, torch.Tensor] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _expected_context_table: np.ndarray = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self._construction_token is not _BOUND_ARTIFACT_CONSTRUCTION_TOKEN:
+            raise TypeError(
+                "Bound GICO artifacts must be created by LoadedImageGICOConditionalArtifact.bind()."
+            )
+        if type(self.policy) is not ImageGICOBackboneContextSchedulePolicy:
+            raise TypeError("Bound GICO policy must use the canonical policy class.")
+        if type(self.policy.model) is not ImageGICOBackboneContextDensityModel:
+            raise TypeError("Bound GICO policy must use the canonical density model.")
+        artifact_sha256 = _verified_manifest_artifact_sha256(self.manifest)
+        expected_state = MappingProxyType(
+            {
+                name: tensor.detach().to(device="cpu").contiguous().clone()
+                for name, tensor in sorted(self.policy.model.state_dict().items())
+            }
+        )
+        expected_contexts = np.ascontiguousarray(
+            self.prepared_context.normalized_context_table,
+            dtype=np.float32,
+        ).copy()
+        expected_contexts.setflags(write=False)
+        object.__setattr__(
+            self,
+            "_bound_artifact_sha256",
+            artifact_sha256,
+        )
+        object.__setattr__(self, "_expected_state_dict", expected_state)
+        object.__setattr__(self, "_expected_context_table", expected_contexts)
 
     @property
     def artifact_sha256(self) -> str:
@@ -402,6 +449,94 @@ class BoundImageGICOConditionalArtifact:
             raise ValueError("Class labels must be in [0, 1000).")
         contexts = table[indices]
         return contexts.to(device=labels.device, dtype=torch.float32).contiguous()
+
+    def verify_execution_identity(self) -> None:
+        """Revalidate every mutable value that controls policy execution."""
+
+        observed_artifact_sha256 = _verified_manifest_artifact_sha256(
+            self.manifest
+        )
+        if (
+            observed_artifact_sha256 != self._bound_artifact_sha256
+            or self.artifact_sha256 != self._bound_artifact_sha256
+        ):
+            raise ValueError("Bound GICO artifact identity is inconsistent.")
+        if type(self.policy) is not ImageGICOBackboneContextSchedulePolicy:
+            raise TypeError("Bound GICO policy must use the canonical policy class.")
+        if type(self.policy.model) is not ImageGICOBackboneContextDensityModel:
+            raise TypeError("Bound GICO policy must use the canonical density model.")
+
+        manifest_binding = ImageGICOBackboneContextBinding.from_payload(
+            self.manifest["context_binding"]
+        )
+        prepared_binding = self.prepared_context.binding
+        if (
+            manifest_binding.binding_sha256
+            != self.manifest["context_binding_sha256"]
+            or prepared_binding.binding_sha256
+            != manifest_binding.binding_sha256
+        ):
+            raise ValueError("Bound GICO context identity is inconsistent.")
+        observed_backbone = (
+            prepared_binding.backbone_model_key,
+            prepared_binding.backbone_protocol_sha256,
+            prepared_binding.backbone_checkpoint_sha256,
+        )
+        expected_backbone = (
+            self.manifest["backbone_model_key"],
+            self.manifest["backbone_protocol_sha256"],
+            self.manifest["backbone_checkpoint_sha256"],
+        )
+        if observed_backbone != expected_backbone:
+            raise ValueError("Bound GICO backbone identity is inconsistent.")
+        if (
+            self.feature_groups.sha256 != self.manifest["feature_group_sha256"]
+            or self.targets.sha256 != self.manifest["target_sha256"]
+            or self.policy.targets.sha256 != self.targets.sha256
+        ):
+            raise ValueError("Bound GICO reward or target identity is inconsistent.")
+
+        expected_config = ImageGICOBackboneContextModelConfig(
+            density_bin_count=self.targets.density_bin_count
+        )
+        training = self.manifest["training"]
+        if (
+            not isinstance(training, Mapping)
+            or self.policy.model.config != expected_config
+            or training.get("model_config") != expected_config.as_payload()
+        ):
+            raise ValueError("Bound GICO model configuration is inconsistent.")
+        if self.policy.model.global_logits_by_nfe.device.type != "cpu":
+            raise ValueError("Bound GICO policy execution requires the portable CPU model.")
+
+        prepared_contexts = np.asarray(
+            self.prepared_context.normalized_context_table,
+            dtype=np.float32,
+        )
+        observed_contexts = (
+            self.policy.model.canonical_context_table.detach()
+            .to(device="cpu", dtype=torch.float32)
+            .contiguous()
+            .numpy()
+        )
+        if (
+            not np.array_equal(prepared_contexts, self._expected_context_table)
+            or not np.array_equal(observed_contexts, self._expected_context_table)
+        ):
+            raise ValueError("Bound GICO canonical context table was modified.")
+
+        observed_state = self.policy.model.state_dict()
+        if set(observed_state) != set(self._expected_state_dict):
+            raise ValueError("Bound GICO student state was modified.")
+        for name, expected_tensor in self._expected_state_dict.items():
+            observed_tensor = observed_state[name].detach()
+            if (
+                observed_tensor.device.type != "cpu"
+                or observed_tensor.dtype != expected_tensor.dtype
+                or observed_tensor.shape != expected_tensor.shape
+                or not torch.equal(observed_tensor, expected_tensor)
+            ):
+                raise ValueError("Bound GICO student state was modified.")
 
 
 @dataclass(frozen=True)
@@ -448,6 +583,7 @@ class LoadedImageGICOConditionalArtifact:
             feature_groups=self.feature_groups,
             targets=self.targets,
             manifest=self.manifest,
+            _construction_token=_BOUND_ARTIFACT_CONSTRUCTION_TOKEN,
         )
 
 

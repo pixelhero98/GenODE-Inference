@@ -549,8 +549,8 @@ def _validate_file_record(package_root: Path, record: Mapping[str, Any]) -> List
     rel = str(record.get("path", ""))
     try:
         safe = _safe_rel(rel)
-    except ValueError as exc:
-        return [str(exc)]
+    except ValueError:
+        return ["Package manifest contains an unsafe file path."]
     path = package_root / safe
     if not path.exists():
         errors.append(f"Missing file listed in package manifest: {rel}")
@@ -591,19 +591,19 @@ def _validate_artifact_checkpoint_integrity(artifact: Mapping[str, Any], checkpo
     label = _checkpoint_label(artifact)
     errors: List[str] = []
     if not checkpoint_path.exists():
-        return [f"Provided artifact {label} is missing checkpoint_path: {checkpoint_path}"]
+        return [f"Provided artifact {label} is missing its checkpoint file."]
     if not checkpoint_path.is_file():
-        return [f"Provided artifact {label} checkpoint_path is not a file: {checkpoint_path}"]
+        return [f"Provided artifact {label} checkpoint path is not a regular file."]
     size_bytes = int(checkpoint_path.stat().st_size)
     if size_bytes < MIN_CHECKPOINT_SIZE_BYTES:
         errors.append(
             f"Provided artifact {label} checkpoint is too small to be valid: "
-            f"{checkpoint_path} has {size_bytes} bytes."
+            f"found {size_bytes} bytes."
         )
     with checkpoint_path.open("rb") as fh:
         header = fh.read(256)
     if _known_text_checkpoint_header(header):
-        errors.append(f"Provided artifact {label} checkpoint looks like text or a pointer: {checkpoint_path}")
+        errors.append(f"Provided artifact {label} checkpoint looks like text or a pointer.")
     if errors:
         return errors
     if (
@@ -618,7 +618,13 @@ def _validate_artifact_checkpoint_integrity(artifact: Mapping[str, Any], checkpo
                 expected_identity=f"provided backbone artifact {label}",
             )
         except Exception as exc:
-            errors.append(f"Provided artifact {label} checkpoint is not loadable: {exc}")
+            detail = str(exc).replace(str(checkpoint_path), "checkpoint").replace(
+                checkpoint_path.as_posix(),
+                "checkpoint",
+            )
+            if _contains_local_marker(detail):
+                detail = type(exc).__name__
+            errors.append(f"Provided artifact {label} checkpoint is not loadable: {detail}")
     return errors
 
 
@@ -634,7 +640,9 @@ def validate_backbone_package(
     if not package_manifest_path.exists():
         errors.append(f"Missing {PACKAGE_MANIFEST_NAME}")
         return {"status": "failed", "errors": errors}
-    package_manifest = json.loads(package_manifest_path.read_text(encoding="utf-8"))
+    package_manifest_bytes = package_manifest_path.read_bytes()
+    package_manifest = json.loads(package_manifest_bytes.decode("utf-8"))
+    package_manifest_sha256 = hashlib.sha256(package_manifest_bytes).hexdigest()
     if str(package_manifest.get("schema_version")) != PACKAGE_SCHEMA_VERSION:
         errors.append("Unexpected package schema version.")
     family = str(package_manifest.get("family", ""))
@@ -683,8 +691,8 @@ def validate_backbone_package(
                 if raw_path:
                     try:
                         _safe_rel(raw_path)
-                    except ValueError as exc:
-                        errors.append(f"Artifact {artifact.get('checkpoint_id', '')} has unsafe {field}: {exc}")
+                    except ValueError:
+                        errors.append(f"Artifact {artifact.get('checkpoint_id', '')} has unsafe {field}.")
         backbone_manifest = load_portable_backbone_manifest(backbone_manifest_path)
         if int(backbone_manifest.get("ready_count", -1)) != int(backbone_manifest.get("artifact_count", -2)):
             errors.append("Packaged backbone manifest is not fully ready.")
@@ -709,7 +717,7 @@ def validate_backbone_package(
                     else:
                         resolved = root / _safe_rel(_strip_known_prefix(path_value))
                     if not resolved.exists():
-                        errors.append(f"Artifact {artifact.get('checkpoint_id', '')} missing {field}: {path_value}")
+                        errors.append(f"Artifact {artifact.get('checkpoint_id', '')} is missing {field}.")
                     elif field == "checkpoint_path":
                         errors.extend(_validate_artifact_checkpoint_integrity(artifact, resolved))
     if require_clean_paths:
@@ -721,12 +729,12 @@ def validate_backbone_package(
                 continue
             for text in _iter_json_strings(payload):
                 if _contains_local_marker(text):
-                    errors.append(f"Local path marker found in {json_path.relative_to(root).as_posix()}: {text}")
+                    errors.append(f"Local path marker found in {json_path.relative_to(root).as_posix()}.")
                     break
     return {
         "status": "complete" if not errors else "failed",
         "family": family,
-        "package_root": str(root),
+        "package_manifest_sha256": package_manifest_sha256,
         "errors": errors,
         "artifact_count": int(package_manifest.get("artifact_count", 0) or 0),
         "file_count": int(len(package_manifest.get("files", []) or [])),
@@ -749,7 +757,13 @@ def validate_provided_backbone_manifest(
     resolved_manifest = resolve_project_path(str(manifest_path))
     errors: List[str] = []
     if not resolved_manifest.exists():
-        return {"status": "failed", "errors": [f"Provided backbone manifest is missing: {resolved_manifest}"]}
+        return {
+            "status": "failed",
+            "errors": ["Provided backbone manifest is missing."],
+            "backbone_manifest_sha256": "",
+            "artifact_count": 0,
+        }
+    backbone_manifest_sha256 = _sha256_file(resolved_manifest)
     manifest = load_portable_backbone_manifest(resolved_manifest)
     candidate_artifacts = [
         artifact
@@ -826,13 +840,13 @@ def validate_provided_backbone_manifest(
                 continue
             resolved = _resolve_loaded_artifact_path(value)
             if not resolved.exists():
-                errors.append(f"Provided artifact {artifact.get('checkpoint_id', '')} is missing {field}: {value}")
+                errors.append(f"Provided artifact {artifact.get('checkpoint_id', '')} is missing {field}.")
             elif field == "checkpoint_path":
                 errors.extend(_validate_artifact_checkpoint_integrity(artifact, resolved))
     return {
         "status": "complete" if not errors else "failed",
         "errors": errors,
-        "manifest_path": str(resolved_manifest),
+        "backbone_manifest_sha256": backbone_manifest_sha256,
         "artifact_count": int(len(matching_artifacts)),
     }
 
@@ -867,10 +881,11 @@ def backbone_package_protocol_payload(args: argparse.Namespace) -> Dict[str, Any
         return {"use_provided_backbones": bool(getattr(args, "use_provided_backbones", False))}
     package_root = resolve_project_path(raw_root)
     package_manifest_path = package_root / PACKAGE_MANIFEST_NAME
-    payload = json.loads(package_manifest_path.read_text(encoding="utf-8"))
+    manifest_bytes = package_manifest_path.read_bytes()
+    payload = json.loads(manifest_bytes.decode("utf-8"))
     return {
         "use_provided_backbones": True,
-        "backbone_package_root": str(package_root),
+        "backbone_package_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "backbone_package_schema": str(payload.get("schema_version", "")),
         "backbone_package_family": str(payload.get("family", "")),
         "backbone_package_source_commit": str(payload.get("source_commit", "")),

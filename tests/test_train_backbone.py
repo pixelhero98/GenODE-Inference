@@ -175,6 +175,118 @@ class TrainBackboneTests(unittest.TestCase):
                 self.assertEqual(metadata["selection"]["selection_metric"], "validation_loss")
                 self.assertEqual(metadata["selection"]["selected_step"], selected_step)
 
+    def test_train_backbone_propagates_validation_failures_for_every_export_mode(self) -> None:
+        for export_mode in ("exact_budget", "best_validation_within_budget"):
+            with self.subTest(export_mode=export_mode), tempfile.TemporaryDirectory() as tmpdir:
+                matrix_root = Path(tmpdir) / "matrix"
+                fake_model = _FakeModel()
+
+                def fake_train_loop(ds, cfg, *, model_name, steps, log_every, on_step, **kwargs):
+                    del ds, cfg, model_name, steps, log_every, kwargs
+                    fake_model.step = 1
+                    on_step(1, fake_model, 9.0, {"loss": 9.0})
+                    return fake_model
+
+                with patch.object(train_backbone_module, "ensure_forecast_dataset"), patch.object(
+                    train_backbone_module,
+                    "build_monash_forecast_splits",
+                    return_value={
+                        "train": object(),
+                        "val": object(),
+                        "stats": {"history_len": 1008, "n_val_examples": 3},
+                    },
+                ), patch.object(
+                    train_backbone_module,
+                    "train_loop",
+                    side_effect=fake_train_loop,
+                ), patch.object(
+                    train_backbone_module,
+                    "evaluate_average_loss",
+                    side_effect=RuntimeError("validation failed"),
+                ), patch.object(
+                    train_backbone_module,
+                    "project_backbone_matrix_root",
+                    return_value=matrix_root,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "validation failed"):
+                        train_backbone_module.train_backbone(
+                            _args(
+                                dataset_root=tmpdir,
+                                steps=1,
+                                checkpoint_steps="1",
+                                checkpoint_export_mode=export_mode,
+                            )
+                        )
+
+    def test_train_backbone_rejects_nonfinite_validation_losses(self) -> None:
+        for export_mode in ("exact_budget", "best_validation_within_budget"):
+            for invalid_loss in (float("nan"), float("inf"), float("-inf")):
+                with (
+                    self.subTest(
+                        export_mode=export_mode,
+                        invalid_loss=invalid_loss,
+                    ),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    matrix_root = Path(tmpdir) / "matrix"
+                    fake_model = _FakeModel()
+
+                    def fake_train_loop(
+                        ds,
+                        cfg,
+                        *,
+                        model_name,
+                        steps,
+                        log_every,
+                        on_step,
+                        **kwargs,
+                    ):
+                        del ds, cfg, model_name, steps, log_every, kwargs
+                        fake_model.step = 1
+                        on_step(1, fake_model, 9.0, {"loss": 9.0})
+                        return fake_model
+
+                    with patch.object(
+                        train_backbone_module,
+                        "ensure_forecast_dataset",
+                    ), patch.object(
+                        train_backbone_module,
+                        "build_monash_forecast_splits",
+                        return_value={
+                            "train": object(),
+                            "val": object(),
+                            "stats": {"history_len": 1008, "n_val_examples": 3},
+                        },
+                    ), patch.object(
+                        train_backbone_module,
+                        "train_loop",
+                        side_effect=fake_train_loop,
+                    ), patch.object(
+                        train_backbone_module,
+                        "evaluate_average_loss",
+                        return_value={
+                            "loss": invalid_loss,
+                            "examples": 3,
+                            "batches": 1,
+                        },
+                    ), patch.object(
+                        train_backbone_module,
+                        "project_backbone_matrix_root",
+                        return_value=matrix_root,
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "validation loss must be a finite real number",
+                        ):
+                            train_backbone_module.train_backbone(
+                                _args(
+                                    dataset_root=tmpdir,
+                                    steps=1,
+                                    checkpoint_steps="1",
+                                    checkpoint_export_mode=export_mode,
+                                )
+                            )
+
     def test_train_backbone_resumes_from_restart_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             matrix_root = Path(tmpdir) / "matrix"

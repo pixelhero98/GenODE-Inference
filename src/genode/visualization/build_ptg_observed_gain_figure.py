@@ -1138,38 +1138,15 @@ def write_points_csv(points: Sequence[Mapping[str, Any]], path: Path) -> None:
             writer.writerow(point)
 
 
-def _rankdata_average(values: Sequence[float]) -> np.ndarray:
-    arr = np.asarray(values, dtype=np.float64)
-    order = np.argsort(arr, kind="mergesort")
-    ranks = np.empty(arr.size, dtype=np.float64)
-    sorted_values = arr[order]
-    start = 0
-    while start < arr.size:
-        end = start + 1
-        while end < arr.size and sorted_values[end] == sorted_values[start]:
-            end += 1
-        avg_rank = 0.5 * (float(start + 1) + float(end))
-        ranks[order[start:end]] = avg_rank
-        start = end
-    return ranks
-
-
 def spearman_correlation(x: Sequence[float], y: Sequence[float]) -> Tuple[float, Optional[float]]:
     x_arr = np.asarray(x, dtype=np.float64)
     y_arr = np.asarray(y, dtype=np.float64)
     if x_arr.size != y_arr.size or x_arr.size < 2:
         return float("nan"), None
-    try:
-        from scipy.stats import spearmanr
+    from scipy.stats import spearmanr
 
-        result = spearmanr(x_arr, y_arr)
-        return float(result.statistic), float(result.pvalue)
-    except Exception:
-        xr = _rankdata_average(x_arr)
-        yr = _rankdata_average(y_arr)
-        if float(np.std(xr)) <= 0.0 or float(np.std(yr)) <= 0.0:
-            return float("nan"), None
-        return float(np.corrcoef(xr, yr)[0, 1]), None
+    result = spearmanr(x_arr, y_arr)
+    return float(result.statistic), float(result.pvalue)
 
 
 def _axis_limits(values: np.ndarray, *, pad_fraction: float = 0.08) -> Tuple[float, float]:

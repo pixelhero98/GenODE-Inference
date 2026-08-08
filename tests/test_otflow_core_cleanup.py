@@ -4,17 +4,175 @@ import random
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
+from genode.data.otflow_datasets import L2FeatureMap, build_dataset_splits_from_arrays
 from genode.models.config import OTFlowConfig
-from genode.evaluation.otflow_evaluation_support import load_checkpoint_model
+from genode.evaluation.otflow_evaluation_support import (
+    _forecast_example_detail_metadata,
+    load_checkpoint_model,
+    resolved_eval_windows,
+)
 from genode.models.otflow_model import OTFLOW_TRACE_FIELDS, OTFlow
 from genode.models.otflow_train_val import _temporary_eval_seed, seed_all
 
 
 class OTFlowCoreCleanupTest(unittest.TestCase):
+    def test_forecast_example_metadata_is_strict_and_row_metadata_wins(self) -> None:
+        class Dataset:
+            def example_metadata(self, example_idx: int):
+                self.requested = example_idx
+                return {
+                    "dataset": "dataset-value",
+                    "split_phase": "dataset-split",
+                    "series_id": "dataset-series",
+                    "series_idx": 3,
+                    "target_t": 21,
+                    "history_start": 1,
+                }
+
+        dataset = Dataset()
+        detail = _forecast_example_detail_metadata(
+            dataset,
+            7,
+            {
+                "series_id": "row-series",
+                "series_idx": 5,
+                "target_t": 34,
+                "history_start": 2,
+            },
+            dataset_key="requested-dataset",
+            split_phase="locked_test",
+        )
+        self.assertEqual(dataset.requested, 7)
+        self.assertEqual(
+            detail,
+            {
+                "dataset": "requested-dataset",
+                "split_phase": "locked_test",
+                "example_idx": 7,
+                "series_id": "row-series",
+                "series_idx": 5,
+                "target_t": 34,
+                "history_start": 2,
+                "history_stop": "",
+                "target_stop": "",
+            },
+        )
+
+        class RaisingDataset:
+            def example_metadata(self, example_idx: int):
+                del example_idx
+                raise RuntimeError("metadata failure")
+
+        with self.assertRaisesRegex(RuntimeError, "metadata failure"):
+            _forecast_example_detail_metadata(
+                RaisingDataset(),
+                0,
+                {},
+                dataset_key="dataset",
+                split_phase="locked_test",
+            )
+
+        class InvalidDataset:
+            def example_metadata(self, example_idx: int):
+                del example_idx
+                return ["not", "a", "mapping"]
+
+        with self.assertRaisesRegex(TypeError, "must return a mapping"):
+            _forecast_example_detail_metadata(
+                InvalidDataset(),
+                0,
+                {},
+                dataset_key="dataset",
+                split_phase="locked_test",
+            )
+
+    def test_resolved_eval_windows_rejects_unknown_split(self) -> None:
+        with self.assertRaisesRegex(ValueError, "split must be 'val' or 'test'"):
+            resolved_eval_windows(SimpleNamespace(), "traffic_hourly", "training")
+
+    def test_l2_feature_map_rejects_invalid_constructor_values(self) -> None:
+        for levels in (0, -1, True, 1.5, "3"):
+            with self.subTest(levels=levels), self.assertRaisesRegex(ValueError, "levels must be a positive integer"):
+                L2FeatureMap(levels=levels)
+        for eps in (0.0, -1.0, float("nan"), True, "not-a-number"):
+            with self.subTest(eps=eps), self.assertRaisesRegex(ValueError, "eps must be finite and positive"):
+                L2FeatureMap(eps=eps)
+
+    def test_l2_feature_map_validates_every_input_shape_rank_and_value(self) -> None:
+        feature_map = L2FeatureMap(levels=3)
+        ask_p = np.asarray([[101.0, 102.0, 103.0], [101.5, 102.5, 103.5]], dtype=np.float32)
+        bid_p = np.asarray([[99.0, 98.0, 97.0], [99.5, 98.5, 97.5]], dtype=np.float32)
+        volume = np.ones((2, 3), dtype=np.float32)
+
+        params, mids = feature_map.encode_sequence(ask_p, volume, bid_p, volume)
+        self.assertEqual(params.shape, (2, 12))
+        self.assertEqual(mids.shape, (2,))
+
+        with self.assertRaisesRegex(ValueError, "ask_v shape"):
+            feature_map.encode_sequence(ask_p, volume[:, :2], bid_p, volume[:, :2])
+        with self.assertRaisesRegex(ValueError, "bid_p must be a rank-2 array"):
+            feature_map.encode_sequence(ask_p, volume, bid_p.reshape(-1), volume)
+        with self.assertRaisesRegex(ValueError, "ask_p must contain at least one row"):
+            feature_map.encode_sequence(ask_p[:0], volume[:0], bid_p[:0], volume[:0])
+        complex_prices = ask_p.astype(np.complex64)
+        with self.assertRaisesRegex(ValueError, "ask_p must have a real numeric dtype"):
+            feature_map.encode_sequence(complex_prices, volume, bid_p, volume)
+        nonfinite = volume.copy()
+        nonfinite[0, 0] = np.nan
+        with self.assertRaisesRegex(ValueError, "bid_v must contain only finite values"):
+            feature_map.encode_sequence(ask_p, volume, bid_p, nonfinite)
+        with self.assertRaisesRegex(ValueError, "L2 input has 3 levels; expected 2"):
+            L2FeatureMap(levels=2).encode_sequence(ask_p, volume, bid_p, volume)
+
+    def test_l2_feature_map_decode_uses_explicit_dimension_and_finiteness_checks(self) -> None:
+        feature_map = L2FeatureMap(levels=3)
+        with self.assertRaisesRegex(ValueError, "params must be a rank-2 array"):
+            feature_map.decode_sequence(np.zeros(12, dtype=np.float32), init_mid=100.0)
+        with self.assertRaisesRegex(ValueError, "params must contain at least one row"):
+            feature_map.decode_sequence(np.zeros((0, 12), dtype=np.float32), init_mid=100.0)
+        with self.assertRaisesRegex(ValueError, "params must have a real numeric dtype"):
+            feature_map.decode_sequence(np.zeros((2, 12), dtype=np.complex64), init_mid=100.0)
+        with self.assertRaisesRegex(ValueError, r"expected exactly 4 \* levels = 12"):
+            feature_map.decode_sequence(np.zeros((2, 8), dtype=np.float32), init_mid=100.0)
+        nonfinite = np.zeros((2, 12), dtype=np.float32)
+        nonfinite[0, 0] = np.inf
+        with self.assertRaisesRegex(ValueError, "params must contain only finite values"):
+            feature_map.decode_sequence(nonfinite, init_mid=100.0)
+        with self.assertRaisesRegex(ValueError, "init_mid must be finite"):
+            feature_map.decode_sequence(np.zeros((2, 12), dtype=np.float32), init_mid=float("nan"))
+        with self.assertRaisesRegex(ValueError, "init_mid must be finite"):
+            feature_map.decode_sequence(np.zeros((2, 12), dtype=np.float32), init_mid="not-a-number")
+        overflowing = np.zeros((2, 12), dtype=np.float32)
+        overflowing[:, 6:] = 1_000.0
+        with self.assertRaisesRegex(ValueError, "Decoded L2 values exceed"):
+            feature_map.decode_sequence(overflowing, init_mid=100.0)
+
+    def test_split_builder_rejects_state_width_before_constructing_datasets(self) -> None:
+        cfg = self._cfg()
+        with self.assertRaisesRegex(ValueError, "does not match cfg.snapshot_dim=8"):
+            build_dataset_splits_from_arrays(
+                np.zeros((64, 7), dtype=np.float32),
+                np.zeros(64, dtype=np.float32),
+                cfg,
+            )
+        with self.assertRaisesRegex(ValueError, "finite real numeric values"):
+            build_dataset_splits_from_arrays(
+                np.zeros((64, 8), dtype=np.complex64),
+                np.zeros(64, dtype=np.float32),
+                cfg,
+            )
+        with self.assertRaisesRegex(ValueError, "finite real numeric values"):
+            build_dataset_splits_from_arrays(
+                np.zeros((64, 8), dtype=np.float32),
+                np.zeros(64, dtype=np.complex64),
+                cfg,
+            )
+
     def test_seed_all_normalizes_generated_seed_above_numpy_limit(self) -> None:
         seed_all(2**32 + 123)
         np_draw = float(np.random.random())

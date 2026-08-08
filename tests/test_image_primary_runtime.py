@@ -28,6 +28,7 @@ from genode.gico.image_conditional import (
     build_image_gico_feature_groups,
 )
 from genode.gico.image_conditional_artifacts import (
+    BoundImageGICOConditionalArtifact,
     load_image_gico_conditional_artifact,
     save_image_gico_conditional_artifact,
 )
@@ -36,6 +37,7 @@ from genode.gico.image_conditional_training import (
     ImageGICOBackboneContextTrainingConfig,
     train_image_gico_backbone_context,
 )
+from genode.schedules.policy import ScheduleBatch
 
 
 class DhariwalUNet(nn.Module):
@@ -78,6 +80,46 @@ def _frozen_imagenet_backbone(*, digest: str, offset: float) -> CanonicalNoiseTo
     adapter.eval()
     adapter.requires_grad_(False)
     return adapter
+
+
+def _frozen_cifar_backbone(*, digest: str) -> CanonicalNoiseToDataAdapter:
+    adapter = CanonicalNoiseToDataAdapter(
+        EDMPrecondVel(),
+        ImageBackboneManifest(
+            model_key="cifar10_rfpp_config_g",
+            checkpoint=CheckpointBinding(
+                filename="cifar-configG.pth",
+                sha256=digest,
+                size_bytes=1,
+            ),
+        ),
+    )
+    adapter.eval()
+    adapter.requires_grad_(False)
+    return adapter
+
+
+class _IdentifiedUniformPolicy:
+    policy_sha256 = semantic_sha256(
+        {"policy": "unconditional-uniform"},
+        namespace="test-image-policy",
+    )
+
+    def predict(
+        self,
+        context: torch.Tensor,
+        *,
+        target_nfe: int,
+    ) -> ScheduleBatch:
+        density = torch.full(
+            (int(context.shape[0]), 64),
+            1.0 / 64.0,
+            dtype=torch.float32,
+        )
+        return ScheduleBatch.from_density_mass(
+            density,
+            target_nfe=target_nfe,
+        )
 
 
 def test_all_four_backbones_bind_and_load_with_explicit_conditioning_contract(
@@ -129,6 +171,41 @@ def test_all_four_backbones_bind_and_load_with_explicit_conditioning_contract(
             with torch.no_grad():
                 native_context = loaded.native_model.model.map_label(one_hot)
             assert torch.equal(loaded.encode_conditioning(labels), native_context)
+
+
+def test_unconditional_cifar_executes_a_content_identified_policy() -> None:
+    backbone = _frozen_cifar_backbone(digest="2" * 64)
+    policy = _IdentifiedUniformPolicy()
+    context = torch.zeros((2, 1), dtype=torch.float32)
+    schedule = policy.predict(context, target_nfe=2)
+    output_hash, grid_hash, execution_hash, mass_hash = (
+        policy_schedule_request_hashes(schedule)
+    )
+    request = ImageGenerationRequest(
+        source_request_sha256=semantic_sha256(
+            {"request": "unconditional-policy"},
+            namespace="test-image-request",
+        ),
+        backbone_manifest=backbone.manifest,
+        latent_seeds=(11, 13),
+        class_labels=None,
+        target_nfe=2,
+        schedule_policy_sha256=policy.policy_sha256,
+        schedule_output_sha256=output_hash,
+        time_grid_sha256=grid_hash,
+        execution_time_grid_sha256=execution_hash,
+        density_mass_sha256=mass_hash,
+    )
+
+    generated = ImageEulerSampler(backbone, device="cpu").sample_policy(
+        request,
+        policy,
+        context=context,
+    )
+
+    assert generated.field_evaluations == 2
+    assert generated.request.class_labels is None
+    assert generated.schedule.schedule_policy_sha256 == policy.policy_sha256
 
 
 def test_imagenet_teacher_student_artifact_round_trip_and_euler_evaluation(
@@ -200,6 +277,15 @@ def test_imagenet_teacher_student_artifact_round_trip_and_euler_evaluation(
 
     portable = load_image_gico_conditional_artifact(policy_dir)
     bound = portable.bind(backbone)
+    with pytest.raises(TypeError, match="must be created by"):
+        BoundImageGICOConditionalArtifact(
+            policy=bound.policy,
+            prepared_context=bound.prepared_context,
+            feature_groups=bound.feature_groups,
+            targets=bound.targets,
+            manifest=bound.manifest,
+            _construction_token=object(),
+        )
     labels = torch.tensor([0, 999], dtype=torch.int64)
     contexts = bound.contexts_for_class_labels(labels)
     raw_contexts = backbone.encode_conditioning(labels).cpu().numpy()
@@ -236,8 +322,49 @@ def test_imagenet_teacher_student_artifact_round_trip_and_euler_evaluation(
         backbone,
         device="cpu",
         execution_batch_size=2,
-    ).sample_policy(request, bound.policy, context=contexts)
+    ).sample_gico(request, bound)
     assert generated.field_evaluations == 4
     assert generated.schedule.source_kind == "contextual_schedule_policy"
     assert torch.equal(generated.images, generated.noise.values)
     assert generated.request.class_labels == (0, 999)
+
+    original_weight = bound.policy.model.global_logits_by_nfe[0, 0].item()
+    with torch.no_grad():
+        bound.policy.model.global_logits_by_nfe[0, 0] = original_weight + 0.25
+    with pytest.raises(ValueError, match="student state was modified"):
+        ImageEulerSampler(backbone, device="cpu").sample_gico(request, bound)
+    with torch.no_grad():
+        bound.policy.model.global_logits_by_nfe[0, 0] = original_weight
+
+    original_context = bound.policy.model.canonical_context_table[0, 0].item()
+    with torch.no_grad():
+        bound.policy.model.canonical_context_table[0, 0] = original_context + 0.25
+    with pytest.raises(ValueError, match="context table was modified"):
+        ImageEulerSampler(backbone, device="cpu").sample_gico(request, bound)
+    with torch.no_grad():
+        bound.policy.model.canonical_context_table[0, 0] = original_context
+
+    with pytest.raises(ValueError, match="must use sample_gico"):
+        ImageEulerSampler(backbone, device="cpu").sample_policy(
+            request,
+            bound.policy,
+            context=bound.contexts_for_class_labels(torch.tensor([999, 0])),
+        )
+
+    mismatched_identity_request = ImageGenerationRequest(
+        source_request_sha256=request.source_request_sha256,
+        backbone_manifest=request.backbone_manifest,
+        latent_seeds=request.latent_seeds,
+        class_labels=request.class_labels,
+        target_nfe=request.target_nfe,
+        schedule_policy_sha256="9" * 64,
+        schedule_output_sha256=request.schedule_output_sha256,
+        time_grid_sha256=request.time_grid_sha256,
+        execution_time_grid_sha256=request.execution_time_grid_sha256,
+        density_mass_sha256=request.density_mass_sha256,
+    )
+    with pytest.raises(ValueError, match="artifact identity"):
+        ImageEulerSampler(backbone, device="cpu").sample_gico(
+            mismatched_identity_request,
+            bound,
+        )

@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from numbers import Integral
 import re
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
@@ -27,8 +28,17 @@ from genode.benchmarks.image.postprocess import (
 from genode.benchmarks.image.protocol import normalize_image_nfe
 from genode.schedules.density import density_mass_hash, time_grid_hash
 from genode.schedules.fixed import FixedSchedule
-from genode.schedules.policy import ScheduleBatch, SchedulePolicy
+from genode.schedules.policy import (
+    IdentifiedSchedulePolicy,
+    ScheduleBatch,
+    SchedulePolicy,
+)
 from genode.solvers.euler import integrate_euler
+
+if TYPE_CHECKING:
+    from genode.gico.image_conditional_artifacts import (
+        BoundImageGICOConditionalArtifact,
+    )
 
 
 IMAGE_GENERATION_REQUEST_PROTOCOL = "image_euler_generation_request_v2"
@@ -812,7 +822,14 @@ def _policy_output_binding(
     *,
     request: ImageGenerationRequest,
     source_kind: str,
+    schedule_policy_sha256: str,
 ) -> ScheduleExecutionBinding:
+    verified_policy_sha256 = _sha256_identity(
+        schedule_policy_sha256,
+        field="schedule_policy_sha256",
+    )
+    if verified_policy_sha256 != request.schedule_policy_sha256:
+        raise ValueError("Schedule policy identity does not match the generation request.")
     if schedule.target_nfe != request.target_nfe:
         raise ValueError("Schedule output target_nfe does not match the request.")
     if schedule.batch_size != request.sample_count:
@@ -838,7 +855,7 @@ def _policy_output_binding(
         raise ValueError("Executable schedule output does not match the request's output/grid/density hashes.")
     return ScheduleExecutionBinding(
         source_kind=(source_kind if shared and not batch_preserved else "contextual_schedule_policy"),
-        schedule_policy_sha256=request.schedule_policy_sha256,
+        schedule_policy_sha256=verified_policy_sha256,
         schedule_output_sha256=actual[0],
         time_grid_sha256=actual[1],
         execution_time_grid_sha256=actual[2],
@@ -1047,12 +1064,13 @@ class ImageEulerSampler:
             schedule_binding=schedule_binding,
         )
 
-    def sample_policy(
+    def _sample_verified_policy(
         self,
         request: ImageGenerationRequest,
         policy: SchedulePolicy[Tensor],
         *,
         context: Tensor,
+        schedule_policy_sha256: str,
     ) -> GeneratedImageBatch:
         self._validate_request(request)
         if not isinstance(context, Tensor):
@@ -1076,12 +1094,86 @@ class ImageEulerSampler:
             schedule,
             request=request,
             source_kind="schedule_policy",
+            schedule_policy_sha256=schedule_policy_sha256,
         )
         return self._execute(
             request,
             noise=noise,
             time_grid=schedule.time_grid,
             schedule_binding=schedule_binding,
+        )
+
+    def sample_policy(
+        self,
+        request: ImageGenerationRequest,
+        policy: IdentifiedSchedulePolicy[Tensor],
+        *,
+        context: Tensor,
+    ) -> GeneratedImageBatch:
+        """Execute a content-identified policy for an unconditional backbone.
+
+        Class-conditional GICO must use :meth:`sample_gico`, which derives the
+        policy context from the request labels and a verified bound artifact.
+        """
+
+        self._validate_request(request)
+        if request.class_labels is not None:
+            raise ValueError(
+                "Class-conditional schedule policies must use sample_gico with a bound artifact."
+            )
+        if not isinstance(policy, IdentifiedSchedulePolicy):
+            raise TypeError(
+                "Unconditional policy must implement IdentifiedSchedulePolicy."
+            )
+        return self._sample_verified_policy(
+            request,
+            policy,
+            context=context,
+            schedule_policy_sha256=_sha256_identity(
+                policy.policy_sha256,
+                field="policy.policy_sha256",
+            ),
+        )
+
+    def sample_gico(
+        self,
+        request: ImageGenerationRequest,
+        artifact: "BoundImageGICOConditionalArtifact",
+    ) -> GeneratedImageBatch:
+        """Execute class-conditional ImageNet GICO with label-derived context."""
+
+        from genode.gico.image_conditional_artifacts import (
+            BoundImageGICOConditionalArtifact,
+        )
+
+        self._validate_request(request)
+        if not isinstance(artifact, BoundImageGICOConditionalArtifact):
+            raise TypeError("artifact must be a bound ImageNet GICO conditional artifact.")
+        if request.class_labels is None:
+            raise ValueError("Bound ImageNet GICO execution requires class labels.")
+        if artifact.artifact_sha256 != request.schedule_policy_sha256:
+            raise ValueError("Bound GICO artifact identity does not match the generation request.")
+        binding = artifact.prepared_context.binding
+        expected_backbone = (
+            request.backbone_manifest.model_key,
+            request.backbone_manifest.protocol_sha256,
+            request.backbone_manifest.checkpoint.sha256,
+        )
+        observed_backbone = (
+            binding.backbone_model_key,
+            binding.backbone_protocol_sha256,
+            binding.backbone_checkpoint_sha256,
+        )
+        if observed_backbone != expected_backbone:
+            raise ValueError("Bound GICO context does not match the generation-request backbone.")
+        artifact.verify_execution_identity()
+        labels = torch.tensor(request.class_labels, dtype=torch.int64)
+        context = artifact.contexts_for_class_labels(labels)
+        return self._sample_verified_policy(
+            request,
+            artifact.policy,
+            context=context,
+            schedule_policy_sha256=artifact.artifact_sha256,
         )
 
 

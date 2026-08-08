@@ -2522,7 +2522,8 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
             selection_groups: List[Dict[str, Any]] = []
             for seed in seeds:
                 if str(split_phase) == TRAIN_TUNING_PHASE:
-                    assert selected_examples_cap is not None
+                    if selected_examples_cap is None:
+                        raise RuntimeError("Train-tuning example selection is missing its required cap.")
                     tuning_seed = int(cli_args.train_tuning_seed) + int(seed) + 1_000 * dataset_idx
                     uncapped_candidate_examples = train_tuning_target_example_count(
                         len(eval_ds),
@@ -2765,7 +2766,8 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
             selected_examples_cap, selected_examples_cap_source = _split_example_cap(cli_args, str(split_phase))
             available_windows = int(len(getattr(eval_ds, "start_indices", [])))
             if str(split_phase) == TRAIN_TUNING_PHASE:
-                assert selected_examples_cap is not None
+                if selected_examples_cap is None:
+                    raise RuntimeError("Train-tuning example selection is missing its required cap.")
                 eval_windows = train_tuning_target_example_count(
                     available_windows,
                     fraction=float(cli_args.eval_train_fraction),
@@ -3106,7 +3108,8 @@ def _run_molecule_phase(
                 ds = loaded["splits"][split_key]
                 for seed in seeds:
                     if str(split_phase) == TRAIN_TUNING_PHASE:
-                        assert selected_examples_cap is not None
+                        if selected_examples_cap is None:
+                            raise RuntimeError("Train-tuning example selection is missing its required cap.")
                         selection_seed = int(cli_args.train_tuning_seed) + int(seed) + 10_000 * dataset_idx + 1_000 * member_idx
                         candidate_indices, target_examples = _choose_stratified_train_tuning_positions(
                             len(ds),

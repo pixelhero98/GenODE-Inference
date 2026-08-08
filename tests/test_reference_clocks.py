@@ -20,6 +20,10 @@ from genode.schedule_transfer.reference_clocks import (
     AYS_SD15_TIMESTEPS,
     DEFAULT_REFERENCE_CLOCK_KEYS,
     GITS_CIFAR10_SIGMAS,
+    OTS_VP_LINEAR_OFFICIAL_LAMBDAS,
+    OTS_VP_LINEAR_OFFICIAL_TIMES,
+    OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS,
+    OTS_VP_LINEAR_TABLE_SHA256,
     SD15_BETA_END,
     SD15_BETA_SCHEDULE,
     SD15_BETA_START,
@@ -90,6 +94,7 @@ class ReferenceClockTests(unittest.TestCase):
 
     def test_image_protocol_uses_dynamic_canonical_clock_count_and_provenance(self) -> None:
         metadata = image_protocol_metadata()
+        self.assertEqual(metadata["protocol_key"], "image_euler_248_v6")
         self.assertEqual(metadata["schedule_count"], 23)
         self.assertEqual(tuple(metadata["schedule_keys"]), EXPECTED_DEFAULT_KEYS)
         self.assertEqual(len(metadata["reference_clock_provenance"]), 23)
@@ -98,6 +103,11 @@ class ReferenceClockTests(unittest.TestCase):
             euler_image_workload().backbone_image_evaluations,
             9_660_000,
         )
+        for dataset in metadata["datasets"].values():
+            self.assertEqual(
+                set(dataset),
+                {"key", "resolution", "class_count", "conditioning"},
+            )
         augmented = image_protocol_metadata(extra_late_p_values="3")
         self.assertEqual(augmented["schedule_count"], 25)
         self.assertIn("late_p_3", augmented["schedule_keys"])
@@ -117,6 +127,64 @@ class ReferenceClockTests(unittest.TestCase):
             self.assertAlmostEqual(observed, expected, places=5)
         for observed, expected in zip(ots_lambdas, expected_lambdas):
             self.assertAlmostEqual(observed, expected, places=5)
+
+        self.assertEqual(
+            OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS,
+            (2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20),
+        )
+        self.assertEqual(
+            tuple(OTS_VP_LINEAR_OFFICIAL_TIMES),
+            OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS,
+        )
+        self.assertEqual(
+            tuple(OTS_VP_LINEAR_OFFICIAL_LAMBDAS),
+            OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS,
+        )
+        for step_count in OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS:
+            with self.subTest(step_count=step_count):
+                times, lambdas = ots_vp_linear_source_nodes(step_count)
+                self.assertIs(times, OTS_VP_LINEAR_OFFICIAL_TIMES[step_count])
+                self.assertIs(lambdas, OTS_VP_LINEAR_OFFICIAL_LAMBDAS[step_count])
+                self.assertEqual(len(times), step_count + 1)
+                self.assertEqual(len(lambdas), step_count + 1)
+                self.assertTrue(all(left > right for left, right in zip(times, times[1:])))
+                self.assertTrue(all(left < right for left, right in zip(lambdas, lambdas[1:])))
+        self.assertEqual(
+            OTS_VP_LINEAR_TABLE_SHA256,
+            "ots-vp-linear-official-tables-v2:"
+            "7686201dc408a0c9d56b3f9abed9849967426dc352c5f9870488ceee57ad9271",
+        )
+        step7_times, step7_lambdas = ots_vp_linear_source_nodes(7)
+        self.assertEqual(
+            step7_times,
+            (
+                0.9999999999999998,
+                0.7688483584352114,
+                0.625333564004778,
+                0.5319211467485778,
+                0.3404677956461694,
+                0.1726471614387146,
+                0.06195925711813602,
+                0.0010000000000000588,
+            ),
+        )
+        self.assertEqual(
+            step7_lambdas,
+            (
+                -5.024978406659204,
+                -2.9780097879125127,
+                -1.9670130505029986,
+                -1.4049914624110396,
+                -0.4117932430386521,
+                0.49891679292980207,
+                1.5461919793144823,
+                4.557714932729866,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "supported source step counts"):
+            ots_vp_linear_source_nodes(9)
+        with self.assertRaisesRegex(ValueError, "supported source step counts"):
+            build_reference_clock_grid("ots_vp_linear_native", 9)
 
     def test_ays_log_sigma_terminal_uses_pinned_sd15_scaled_linear_config(self) -> None:
         self.assertEqual(SD15_NUM_TRAIN_TIMESTEPS, 1000)

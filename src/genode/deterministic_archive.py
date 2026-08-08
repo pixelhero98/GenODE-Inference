@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -11,7 +12,15 @@ import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Iterable, Mapping, Sequence
+from typing import Any, BinaryIO, Iterable, Iterator, Mapping, Sequence
+
+from genode.artifact_bundle import (
+    bundle_journal_path,
+    discard_temporary_bundle_path,
+    preflight_artifact_bundle,
+    promote_artifact_bundle,
+    validate_artifact_bundle_layout,
+)
 
 
 ARCHIVE_SCHEMA_VERSION = "genode_deterministic_archive_v1"
@@ -527,6 +536,144 @@ def _prepare_entries(entries: Iterable[ArchiveEntry]) -> tuple[list[_PreparedEnt
     return prepared, records
 
 
+def _archive_bundle_targets(output: Path) -> dict[str, Path]:
+    targets = {
+        "archive": output,
+        "manifest": output.with_suffix(output.suffix + ".manifest.json"),
+        "sha256": output.with_suffix(output.suffix + ".sha256"),
+    }
+    validate_artifact_bundle_layout(output, targets)
+    return targets
+
+
+@contextmanager
+def _exclusive_bundle_stage(target: Path) -> Iterator[tuple[Path, BinaryIO]]:
+    handle = tempfile.NamedTemporaryFile(
+        mode="w+b",
+        prefix=f".{target.name}.bundle-stage-",
+        suffix=".tmp",
+        dir=target.parent,
+        delete=False,
+    )
+    path = Path(handle.name)
+    try:
+        yield path, handle
+        handle.flush()
+        os.fsync(handle.fileno())
+        expected_identity = _file_identity(os.fstat(handle.fileno()))
+    finally:
+        handle.close()
+    observed = path.lstat()
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or _is_reparse_stat(observed)
+        or not stat.S_ISREG(observed.st_mode)
+        or _file_identity(observed) != expected_identity
+    ):
+        raise RuntimeError(f"Archive bundle staging path changed while open: {path.name}")
+
+
+def _write_stage_bytes(destination: BinaryIO, payload: bytes) -> None:
+    if destination.write(payload) != len(payload):
+        raise OSError("Could not write the complete deterministic archive sidecar.")
+
+
+def _write_archive_stage(
+    destination: BinaryIO,
+    *,
+    prepared: Sequence[_PreparedEntry],
+    records: Sequence[Mapping[str, Any]],
+    manifest_bytes: bytes,
+) -> None:
+    with zipfile.ZipFile(destination, "w", allowZip64=True) as archive:
+        members: list[tuple[str, bytes | _PreparedEntry]] = [
+            (ARCHIVE_MANIFEST_NAME, manifest_bytes),
+            *((prepared_entry.entry.archive_path, prepared_entry) for prepared_entry in prepared),
+        ]
+        expected_by_name = {str(record["path"]): record for record in records}
+        for name, value in sorted(members, key=lambda item: item[0]):
+            info = _zip_info(name)
+            if isinstance(value, bytes):
+                archive.writestr(info, value, compress_type=zipfile.ZIP_STORED)
+                continue
+            expected = expected_by_name[name]
+            source_path = value.entry.source
+            _reject_linked_components(source_path)
+            if _file_identity(source_path.lstat()) != value.identity:
+                raise RuntimeError(f"Archive source changed before it was written: {source_path}")
+            with source_path.open("rb") as source, archive.open(
+                info, "w", force_zip64=True
+            ) as target:
+                if _file_identity(os.fstat(source.fileno())) != value.identity:
+                    raise RuntimeError(
+                        f"Archive source changed before it was written: {source_path}"
+                    )
+                size, digest = _copy_and_hash(source, target)
+                opened_after = os.fstat(source.fileno())
+            _reject_linked_components(source_path)
+            if (
+                _file_identity(opened_after) != value.identity
+                or _file_identity(source_path.lstat()) != value.identity
+                or size != expected["size_bytes"]
+                or digest != expected["sha256"]
+            ):
+                raise RuntimeError(
+                    f"Archive source changed while it was being written: {source_path}"
+                )
+
+
+def _validate_archive_bundle_identity(
+    paths: Mapping[str, Path],
+    targets: Mapping[str, Path],
+) -> None:
+    validation = validate_deterministic_zip(paths["archive"])
+    if validation["status"] != "complete":
+        detail = "; ".join(str(error) for error in validation["errors"])
+        raise ValueError(f"Deterministic archive bundle contains an invalid ZIP: {detail}")
+
+    with zipfile.ZipFile(paths["archive"], "r") as archive:
+        manifest_bytes = archive.read(ARCHIVE_MANIFEST_NAME)
+    manifest = json.loads(manifest_bytes)
+    if not isinstance(manifest, Mapping):
+        raise ValueError("Deterministic archive manifest must be a JSON object.")
+
+    archive_digest = str(validation["sha256"])
+    expected_sidecar = {
+        "archive": targets["archive"].name,
+        "bundle_kind": manifest["bundle_kind"],
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "schema_version": ARCHIVE_SCHEMA_VERSION,
+        "sha256": archive_digest,
+        "size_bytes": paths["archive"].stat().st_size,
+    }
+    try:
+        sidecar_bytes = paths["manifest"].read_bytes()
+        sidecar = json.loads(
+            sidecar_bytes,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {value!r}")
+            ),
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"Could not read deterministic archive manifest sidecar: {exc}") from exc
+    if not isinstance(sidecar, Mapping) or sidecar_bytes != canonical_json_bytes(
+        expected_sidecar
+    ):
+        raise ValueError(
+            "Deterministic archive manifest sidecar does not match the ZIP artifact."
+        )
+
+    expected_sha256 = f"{archive_digest}  {targets['archive'].name}\n".encode("ascii")
+    try:
+        sha256_bytes = paths["sha256"].read_bytes()
+    except OSError as exc:
+        raise ValueError(f"Could not read deterministic archive SHA-256 sidecar: {exc}") from exc
+    if sha256_bytes != expected_sha256:
+        raise ValueError(
+            "Deterministic archive SHA-256 sidecar does not match the ZIP artifact."
+        )
+
+
 def write_deterministic_zip(
     entries: Sequence[ArchiveEntry],
     output_path: str | Path,
@@ -538,13 +685,10 @@ def write_deterministic_zip(
     output = _absolute_without_links(Path(output_path).expanduser())
     if output.suffix.lower() != ".zip":
         raise ValueError(f"Deterministic archive output must end in .zip: {output}")
-    sidecar_path = output.with_suffix(output.suffix + ".manifest.json")
-    sha_path = output.with_suffix(output.suffix + ".sha256")
-    for target in (output, sidecar_path, sha_path):
-        if target.is_symlink() or (target.exists() and _is_reparse_stat(target.lstat())):
-            raise ValueError(f"Deterministic archive output may not be a link or reparse point: {target}")
-    if not overwrite:
-        for target in (output, sidecar_path, sha_path):
+    targets = _archive_bundle_targets(output)
+    pending_transaction = os.path.lexists(bundle_journal_path(output))
+    if not overwrite and not pending_transaction:
+        for target in targets.values():
             if target.exists() or target.is_symlink():
                 raise FileExistsError(target)
     kind = str(bundle_kind).strip()
@@ -555,6 +699,14 @@ def write_deterministic_zip(
         raise TypeError("archive metadata must be a JSON object.")
     portable_metadata = dict(metadata or {})
     _portable_json(portable_metadata, label="archive metadata")
+    preflight_artifact_bundle(
+        output,
+        targets,
+        overwrite=overwrite,
+        validator=_validate_archive_bundle_identity,
+        allow_partial_previous=overwrite,
+        validate_previous=False,
+    )
     prepared, records = _prepare_entries(entries)
     manifest = {
         "bundle_kind": kind,
@@ -563,67 +715,65 @@ def write_deterministic_zip(
         "schema_version": ARCHIVE_SCHEMA_VERSION,
     }
     manifest_bytes = canonical_json_bytes(manifest)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
+    staged: dict[str, Path] = {}
+    staged_hashes: dict[str, str] = {}
     try:
-        handle = tempfile.NamedTemporaryFile(
-            mode="wb",
-            prefix=f".{output.name}.",
-            suffix=".tmp",
-            dir=output.parent,
-            delete=False,
+        with _exclusive_bundle_stage(targets["archive"]) as (
+            archive_stage,
+            archive_handle,
+        ):
+            staged["archive"] = archive_stage
+            _write_archive_stage(
+                archive_handle,
+                prepared=prepared,
+                records=records,
+                manifest_bytes=manifest_bytes,
+            )
+        archive_digest = sha256_file(staged["archive"])
+        staged_hashes["archive"] = archive_digest
+        sidecar = {
+            "archive": output.name,
+            "bundle_kind": kind,
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "schema_version": ARCHIVE_SCHEMA_VERSION,
+            "sha256": archive_digest,
+            "size_bytes": staged["archive"].stat().st_size,
+        }
+        sidecar_bytes = canonical_json_bytes(sidecar)
+        sha256_bytes = f"{archive_digest}  {output.name}\n".encode("ascii")
+        with _exclusive_bundle_stage(targets["manifest"]) as (
+            manifest_stage,
+            manifest_handle,
+        ):
+            staged["manifest"] = manifest_stage
+            _write_stage_bytes(manifest_handle, sidecar_bytes)
+        staged_hashes["manifest"] = hashlib.sha256(sidecar_bytes).hexdigest()
+        with _exclusive_bundle_stage(targets["sha256"]) as (
+            sha256_stage,
+            sha256_handle,
+        ):
+            staged["sha256"] = sha256_stage
+            _write_stage_bytes(sha256_handle, sha256_bytes)
+        staged_hashes["sha256"] = hashlib.sha256(sha256_bytes).hexdigest()
+        promote_artifact_bundle(
+            output,
+            targets,
+            staged,
+            overwrite=overwrite,
+            validator=_validate_archive_bundle_identity,
+            allow_partial_previous=overwrite,
+            validate_previous=False,
         )
-        temporary = Path(handle.name)
-        handle.close()
-        with zipfile.ZipFile(temporary, "w", allowZip64=True) as archive:
-            members: list[tuple[str, bytes | _PreparedEntry]] = [
-                (ARCHIVE_MANIFEST_NAME, manifest_bytes),
-                *((prepared_entry.entry.archive_path, prepared_entry) for prepared_entry in prepared),
-            ]
-            expected_by_name = {record["path"]: record for record in records}
-            for name, value in sorted(members, key=lambda item: item[0]):
-                info = _zip_info(name)
-                if isinstance(value, bytes):
-                    archive.writestr(info, value, compress_type=zipfile.ZIP_STORED)
-                    continue
-                expected = expected_by_name[name]
-                source_path = value.entry.source
-                _reject_linked_components(source_path)
-                if _file_identity(source_path.lstat()) != value.identity:
-                    raise RuntimeError(f"Archive source changed before it was written: {source_path}")
-                with source_path.open("rb") as source, archive.open(info, "w", force_zip64=True) as destination:
-                    if _file_identity(os.fstat(source.fileno())) != value.identity:
-                        raise RuntimeError(f"Archive source changed before it was written: {source_path}")
-                    size, digest = _copy_and_hash(source, destination)
-                    opened_after = os.fstat(source.fileno())
-                _reject_linked_components(source_path)
-                if (
-                    _file_identity(opened_after) != value.identity
-                    or _file_identity(source_path.lstat()) != value.identity
-                    or size != expected["size_bytes"]
-                    or digest != expected["sha256"]
-                ):
-                    raise RuntimeError(f"Archive source changed while it was being written: {source_path}")
-        if not overwrite:
-            for target in (output, sidecar_path, sha_path):
-                if target.exists() or target.is_symlink():
-                    raise FileExistsError(target)
-        os.replace(temporary, output)
-        temporary = None
     finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-    archive_digest = sha256_file(output)
-    sidecar = {
-        "archive": output.name,
-        "bundle_kind": kind,
-        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-        "schema_version": ARCHIVE_SCHEMA_VERSION,
-        "sha256": archive_digest,
-        "size_bytes": output.stat().st_size,
-    }
-    sidecar_path.write_bytes(canonical_json_bytes(sidecar))
-    sha_path.write_text(f"{archive_digest}  {output.name}\n", encoding="ascii", newline="\n")
+        cleanup_allowed = not bundle_journal_path(output).exists()
+        for role, temporary in staged.items():
+            if not cleanup_allowed:
+                continue
+            discard_temporary_bundle_path(
+                temporary,
+                targets[role],
+                expected_sha256=staged_hashes.get(role),
+            )
     return {"archive_path": str(output), "manifest": manifest, "sidecar": sidecar}
 
 

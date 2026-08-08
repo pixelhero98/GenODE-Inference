@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import struct
 import zipfile
@@ -8,6 +9,8 @@ from pathlib import Path
 import pytest
 
 import genode.deterministic_archive as deterministic_archive
+from genode import artifact_bundle
+from genode.artifact_bundle import bundle_journal_path
 from genode.deterministic_archive import (
     ARCHIVE_FILE_MODE,
     ARCHIVE_MANIFEST_NAME,
@@ -16,6 +19,35 @@ from genode.deterministic_archive import (
     validate_deterministic_zip,
     write_deterministic_zip,
 )
+
+
+def _archive_bundle_paths(output: Path) -> tuple[Path, Path, Path]:
+    return (
+        output,
+        output.with_suffix(output.suffix + ".manifest.json"),
+        output.with_suffix(output.suffix + ".sha256"),
+    )
+
+
+def _assert_archive_bundle_complete(output: Path) -> None:
+    archive_path, manifest_path, sha256_path = _archive_bundle_paths(output)
+    digest = deterministic_archive.sha256_file(archive_path)
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        manifest_bytes = archive.read(ARCHIVE_MANIFEST_NAME)
+        manifest = json.loads(manifest_bytes)
+    sidecar = json.loads(manifest_path.read_bytes())
+    assert sidecar == {
+        "archive": archive_path.name,
+        "bundle_kind": manifest["bundle_kind"],
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "schema_version": deterministic_archive.ARCHIVE_SCHEMA_VERSION,
+        "sha256": digest,
+        "size_bytes": archive_path.stat().st_size,
+    }
+    assert sha256_path.read_bytes() == f"{digest}  {archive_path.name}\n".encode(
+        "ascii"
+    )
+    assert validate_deterministic_zip(archive_path)["status"] == "complete"
 
 
 def test_deterministic_zip_is_byte_identical_across_output_names(tmp_path: Path) -> None:
@@ -44,6 +76,9 @@ def test_deterministic_zip_is_byte_identical_across_output_names(tmp_path: Path)
     )
 
     assert archive_a.read_bytes() == archive_b.read_bytes()
+    assert hashlib.sha256(archive_a.read_bytes()).hexdigest() == (
+        "3445f970b0d3b2f7966ffc5a7af02cbfb9467ed0894b66c7f8755719bdf43cf7"
+    )
     assert validate_deterministic_zip(archive_a)["status"] == "complete"
     assert validate_deterministic_zip(archive_b)["status"] == "complete"
     with zipfile.ZipFile(archive_a) as archive:
@@ -384,6 +419,406 @@ def test_existing_sidecar_blocks_non_overwriting_build(tmp_path: Path) -> None:
             bundle_kind="test",
         )
     assert sidecar.read_text(encoding="utf-8") == "preserve me"
+
+
+def test_archive_bundle_staging_failure_leaves_no_partial_publication_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"payload")
+    output = tmp_path / "out.zip"
+    real_write_stage_bytes = deterministic_archive._write_stage_bytes
+
+    def fail_manifest_stage(destination: object, data: bytes) -> None:
+        if data.startswith(b"{"):
+            raise OSError("simulated manifest staging failure")
+        real_write_stage_bytes(destination, data)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        deterministic_archive,
+        "_write_stage_bytes",
+        fail_manifest_stage,
+    )
+    with pytest.raises(OSError, match="manifest staging failure"):
+        write_deterministic_zip(
+            [ArchiveEntry(source, "payload.bin", "payload")],
+            output,
+            bundle_kind="test",
+        )
+
+    assert not any(path.exists() for path in _archive_bundle_paths(output))
+    assert not bundle_journal_path(output).exists()
+    assert not list(tmp_path.glob(".*.bundle-stage-*.tmp"))
+
+    monkeypatch.setattr(
+        deterministic_archive,
+        "_write_stage_bytes",
+        real_write_stage_bytes,
+    )
+    write_deterministic_zip(
+        [ArchiveEntry(source, "payload.bin", "payload")],
+        output,
+        bundle_kind="test",
+    )
+    _assert_archive_bundle_complete(output)
+
+
+@pytest.mark.parametrize(
+    "predecessor",
+    ("archive_only", "sidecar_only", "invalid_complete"),
+)
+def test_archive_bundle_overwrite_replaces_partial_or_invalid_predecessor(
+    tmp_path: Path,
+    predecessor: str,
+) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"replacement payload")
+    output = tmp_path / "out.zip"
+    archive_path, manifest_path, sha256_path = _archive_bundle_paths(output)
+    if predecessor in {"archive_only", "invalid_complete"}:
+        archive_path.write_bytes(b"legacy archive")
+    if predecessor in {"sidecar_only", "invalid_complete"}:
+        manifest_path.write_bytes(b"legacy manifest")
+    if predecessor == "invalid_complete":
+        sha256_path.write_bytes(b"legacy checksum")
+
+    write_deterministic_zip(
+        [ArchiveEntry(source, "payload.bin", "payload")],
+        output,
+        bundle_kind="test",
+        overwrite=True,
+    )
+
+    _assert_archive_bundle_complete(output)
+    assert archive_path.read_bytes() != b"legacy archive"
+    assert manifest_path.read_bytes() != b"legacy manifest"
+    assert sha256_path.read_bytes() != b"legacy checksum"
+    assert not bundle_journal_path(output).exists()
+    assert not list(tmp_path.glob(".*.bundle-backup-*"))
+
+
+@pytest.mark.parametrize("predecessor", ("archive_only", "sidecar_only"))
+def test_archive_bundle_failed_overwrite_restores_partial_predecessor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    predecessor: str,
+) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"replacement payload")
+    output = tmp_path / "out.zip"
+    archive_path, manifest_path, _ = _archive_bundle_paths(output)
+    if predecessor == "archive_only":
+        archive_path.write_bytes(b"legacy archive")
+    else:
+        manifest_path.write_bytes(b"legacy manifest")
+    previous = {
+        path: path.read_bytes()
+        for path in _archive_bundle_paths(output)
+        if path.exists()
+    }
+    real_install = artifact_bundle._link_without_overwrite
+
+    def fail_manifest_promotion(source_path: Path, destination: Path) -> None:
+        if destination == manifest_path and ".bundle-stage-" in source_path.name:
+            raise OSError("simulated manifest promotion failure")
+        real_install(source_path, destination)
+
+    monkeypatch.setattr(
+        artifact_bundle,
+        "_link_without_overwrite",
+        fail_manifest_promotion,
+    )
+    with pytest.raises(OSError, match="manifest promotion failure"):
+        write_deterministic_zip(
+            [ArchiveEntry(source, "payload.bin", "payload")],
+            output,
+            bundle_kind="test",
+            overwrite=True,
+        )
+
+    assert {
+        path: path.read_bytes()
+        for path in _archive_bundle_paths(output)
+        if path.exists()
+    } == previous
+    assert not bundle_journal_path(output).exists()
+    assert not list(tmp_path.glob(".*.bundle-stage-*.tmp"))
+    assert not list(tmp_path.glob(".*.bundle-backup-*"))
+
+
+@pytest.mark.parametrize("preexisting", (False, True))
+def test_archive_bundle_promotion_failure_rolls_back_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"old payload")
+    output = tmp_path / "out.zip"
+    if preexisting:
+        write_deterministic_zip(
+            [ArchiveEntry(source, "payload.bin", "payload")],
+            output,
+            bundle_kind="test",
+        )
+    previous = {
+        path: path.read_bytes()
+        for path in _archive_bundle_paths(output)
+        if path.exists()
+    }
+    source.write_bytes(b"new payload")
+    manifest_path = output.with_suffix(output.suffix + ".manifest.json")
+    real_install = artifact_bundle._link_without_overwrite
+
+    def fail_manifest_promotion(source_path: Path, destination: Path) -> None:
+        if (
+            destination == manifest_path
+            and ".bundle-stage-" in source_path.name
+        ):
+            raise OSError("simulated manifest promotion failure")
+        real_install(source_path, destination)
+
+    monkeypatch.setattr(
+        artifact_bundle,
+        "_link_without_overwrite",
+        fail_manifest_promotion,
+    )
+    with pytest.raises(OSError, match="manifest promotion failure"):
+        write_deterministic_zip(
+            [ArchiveEntry(source, "payload.bin", "payload")],
+            output,
+            bundle_kind="test",
+            overwrite=preexisting,
+        )
+
+    assert {
+        path: path.read_bytes()
+        for path in _archive_bundle_paths(output)
+        if path.exists()
+    } == previous
+    assert not bundle_journal_path(output).exists()
+    assert not list(tmp_path.glob(".*.bundle-stage-*.tmp"))
+    assert not list(tmp_path.glob(".*.bundle-backup-*"))
+
+    monkeypatch.setattr(artifact_bundle, "_link_without_overwrite", real_install)
+    write_deterministic_zip(
+        [ArchiveEntry(source, "payload.bin", "payload")],
+        output,
+        bundle_kind="test",
+        overwrite=preexisting,
+    )
+    _assert_archive_bundle_complete(output)
+    if preexisting:
+        assert output.read_bytes() != previous[output]
+
+
+def test_archive_bundle_retry_recovers_prepared_partial_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"payload")
+    output = tmp_path / "out.zip"
+    manifest_path = output.with_suffix(output.suffix + ".manifest.json")
+    real_install = artifact_bundle._link_without_overwrite
+    real_recover = artifact_bundle._recover_locked
+
+    def interrupt_manifest_promotion(source_path: Path, destination: Path) -> None:
+        if (
+            destination == manifest_path
+            and ".bundle-stage-" in source_path.name
+        ):
+            raise OSError("simulated process interruption")
+        real_install(source_path, destination)
+
+    def leave_prepared_journal(*args: object, force_abort: bool = False, **kwargs: object) -> None:
+        if force_abort:
+            raise OSError("simulated unavailable in-process recovery")
+        real_recover(*args, force_abort=force_abort, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        artifact_bundle,
+        "_link_without_overwrite",
+        interrupt_manifest_promotion,
+    )
+    monkeypatch.setattr(artifact_bundle, "_recover_locked", leave_prepared_journal)
+    with pytest.raises(OSError, match="process interruption"):
+        write_deterministic_zip(
+            [ArchiveEntry(source, "payload.bin", "payload")],
+            output,
+            bundle_kind="test",
+        )
+
+    assert output.is_file()
+    assert not manifest_path.exists()
+    assert bundle_journal_path(output).is_file()
+
+    monkeypatch.setattr(artifact_bundle, "_link_without_overwrite", real_install)
+    monkeypatch.setattr(artifact_bundle, "_recover_locked", real_recover)
+    write_deterministic_zip(
+        [ArchiveEntry(source, "payload.bin", "payload")],
+        output,
+        bundle_kind="test",
+    )
+
+    _assert_archive_bundle_complete(output)
+    assert not bundle_journal_path(output).exists()
+    assert not list(tmp_path.glob(".*.bundle-stage-*.tmp"))
+    assert not list(tmp_path.glob(".*.bundle-backup-*"))
+
+
+def test_archive_bundle_stage_link_swap_cannot_modify_external_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"payload")
+    output = tmp_path / "out.zip"
+    external = tmp_path / "external.txt"
+    external.write_bytes(b"external owner")
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    probe.unlink()
+    real_named_temporary = deterministic_archive.tempfile.NamedTemporaryFile
+    swapped_stage: Path | None = None
+
+    def swap_archive_stage(*args: object, **kwargs: object):
+        nonlocal swapped_stage
+        handle = real_named_temporary(*args, **kwargs)  # type: ignore[arg-type]
+        if kwargs.get("prefix") == ".out.zip.bundle-stage-":
+            swapped_stage = Path(handle.name)
+            swapped_stage.unlink()
+            swapped_stage.symlink_to(external)
+        return handle
+
+    monkeypatch.setattr(
+        deterministic_archive.tempfile,
+        "NamedTemporaryFile",
+        swap_archive_stage,
+    )
+    with pytest.raises(RuntimeError, match="staging path changed while open"):
+        write_deterministic_zip(
+            [ArchiveEntry(source, "payload.bin", "payload")],
+            output,
+            bundle_kind="test",
+        )
+
+    assert external.read_bytes() == b"external owner"
+    assert not any(path.exists() for path in _archive_bundle_paths(output))
+    assert swapped_stage is not None and swapped_stage.is_symlink()
+    swapped_stage.unlink()
+    assert not bundle_journal_path(output).exists()
+    assert not list(tmp_path.glob(".*.bundle-stage-*.tmp"))
+
+
+def test_staging_cleanup_preserves_managed_name_symlink_referent(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "out.zip"
+    owner = tmp_path / ".out.zip.bundle-stage-owner.tmp"
+    owner.write_bytes(b"separately owned staging file")
+    linked_stage = tmp_path / ".out.zip.bundle-stage-link.tmp"
+    try:
+        linked_stage.symlink_to(owner)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    removed = artifact_bundle.discard_temporary_bundle_path(
+        linked_stage,
+        output,
+    )
+
+    assert not removed
+    assert linked_stage.is_symlink()
+    assert owner.read_bytes() == b"separately owned staging file"
+    linked_stage.unlink()
+    owner.unlink()
+
+
+def test_archive_bundle_rejects_post_stage_managed_name_symlink_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"payload")
+    output = tmp_path / "out.zip"
+    owner = tmp_path / ".out.zip.bundle-stage-owner.tmp"
+    real_promote = deterministic_archive.promote_artifact_bundle
+    swapped_stage: Path | None = None
+    owner_payload = b""
+
+    def swap_before_promotion(
+        anchor: Path,
+        targets: dict[str, Path],
+        staged: dict[str, Path],
+        **kwargs: object,
+    ) -> None:
+        nonlocal swapped_stage, owner_payload
+        swapped_stage = Path(staged["archive"])
+        owner_payload = swapped_stage.read_bytes()
+        owner.write_bytes(owner_payload)
+        swapped_stage.unlink()
+        try:
+            swapped_stage.symlink_to(owner)
+        except OSError as exc:
+            pytest.skip(f"symlinks are unavailable: {exc}")
+        real_promote(anchor, targets, staged, **kwargs)
+
+    monkeypatch.setattr(
+        deterministic_archive,
+        "promote_artifact_bundle",
+        swap_before_promotion,
+    )
+    with pytest.raises(ValueError, match="staging sidecar may not be a link"):
+        write_deterministic_zip(
+            [ArchiveEntry(source, "payload.bin", "payload")],
+            output,
+            bundle_kind="test",
+        )
+
+    assert not any(path.exists() for path in _archive_bundle_paths(output))
+    assert swapped_stage is not None and swapped_stage.is_symlink()
+    assert owner.read_bytes() == owner_payload
+    swapped_stage.unlink()
+    owner.unlink()
+    assert not bundle_journal_path(output).exists()
+    assert not list(tmp_path.glob(".*.bundle-stage-*.tmp"))
+
+
+@pytest.mark.parametrize("member_suffix", ("", ".manifest.json", ".sha256"))
+def test_archive_bundle_rejects_linked_publication_targets(
+    tmp_path: Path,
+    member_suffix: str,
+) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"payload")
+    output = tmp_path / "out.zip"
+    external = tmp_path / "external.txt"
+    external.write_bytes(b"external owner")
+    linked_target = Path(f"{output}{member_suffix}")
+    try:
+        linked_target.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="symlink, junction, or reparse point"):
+        write_deterministic_zip(
+            [ArchiveEntry(source, "payload.bin", "payload")],
+            output,
+            bundle_kind="test",
+            overwrite=True,
+        )
+
+    assert external.read_bytes() == b"external owner"
+    for path in _archive_bundle_paths(output):
+        if path != linked_target:
+            assert not path.exists()
+    assert linked_target.is_symlink()
+    assert not list(tmp_path.glob(".*.bundle-stage-*.tmp"))
 
 
 def test_validator_reports_malformed_manifest_without_raising(tmp_path: Path) -> None:

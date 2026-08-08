@@ -8,11 +8,11 @@ Contains:
 - WindowedParamSequenceDataset (history->target windows; optional future horizon for rollout)
 - Builders for prepared NPZ, crypto, and LOBSTER-calibrated synthetic sequences
 - Basic raw-space metrics
-- NEW: chronological split builders with train-only normalization (anti-leakage)
+- Chronological split builders with train-only normalization (anti-leakage)
 
 Also includes derived microstructure conditioning features (cond) computed from the
 parameter sequence: spread, returns, abs returns, microprice deviation, multi-depth
-imbalance, Δbest sizes, rolling vol.
+imbalance, changes in best sizes, and rolling volatility.
 """
 
 from __future__ import annotations
@@ -69,8 +69,31 @@ class L2FeatureMap:
     """
 
     def __init__(self, levels: int = 10, eps: float = 1e-8):
+        if isinstance(levels, bool) or not isinstance(levels, (int, np.integer)) or int(levels) <= 0:
+            raise ValueError(f"levels must be a positive integer, got {levels!r}.")
+        if isinstance(eps, bool):
+            raise ValueError(f"eps must be finite and positive, got {eps!r}.")
+        try:
+            eps_value = float(eps)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"eps must be finite and positive, got {eps!r}.") from exc
+        if not math.isfinite(eps_value) or eps_value <= 0.0:
+            raise ValueError(f"eps must be finite and positive, got {eps!r}.")
         self.L = int(levels)
-        self.eps = float(eps)
+        self.eps = eps_value
+
+    @staticmethod
+    def _finite_numeric_matrix(value: object, *, label: str) -> np.ndarray:
+        array = np.asarray(value)
+        if array.ndim != 2:
+            raise ValueError(f"{label} must be a rank-2 array, got shape {array.shape}.")
+        if array.shape[0] == 0:
+            raise ValueError(f"{label} must contain at least one row.")
+        if not np.issubdtype(array.dtype, np.number) or np.issubdtype(array.dtype, np.complexfloating):
+            raise ValueError(f"{label} must have a real numeric dtype, got {array.dtype}.")
+        if not bool(np.all(np.isfinite(array))):
+            raise ValueError(f"{label} must contain only finite values.")
+        return array.astype(np.float64, copy=False)
 
     def encode_sequence(
         self,
@@ -79,8 +102,25 @@ class L2FeatureMap:
         bid_p: np.ndarray,
         bid_v: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        T, L = ask_p.shape
-        assert L == self.L
+        matrices = {
+            "ask_p": self._finite_numeric_matrix(ask_p, label="ask_p"),
+            "ask_v": self._finite_numeric_matrix(ask_v, label="ask_v"),
+            "bid_p": self._finite_numeric_matrix(bid_p, label="bid_p"),
+            "bid_v": self._finite_numeric_matrix(bid_v, label="bid_v"),
+        }
+        ask_p = matrices["ask_p"]
+        expected_shape = ask_p.shape
+        for label, matrix in matrices.items():
+            if matrix.shape != expected_shape:
+                raise ValueError(
+                    f"{label} shape {matrix.shape} does not match the required L2 shape {expected_shape}."
+                )
+        T, levels = expected_shape
+        if levels != self.L:
+            raise ValueError(f"L2 input has {levels} levels; expected {self.L}.")
+        ask_v = matrices["ask_v"]
+        bid_p = matrices["bid_p"]
+        bid_v = matrices["bid_v"]
 
         mid = 0.5 * (ask_p[:, 0] + bid_p[:, 0])
         spread = np.maximum(ask_p[:, 0] - bid_p[:, 0], self.eps)
@@ -111,9 +151,14 @@ class L2FeatureMap:
                 log_bid_v,
             ],
             axis=1,
-        ).astype(np.float32)
+        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            params_float32 = params.astype(np.float32)
+            mid_float32 = mid.astype(np.float32)
+        if not bool(np.all(np.isfinite(params_float32))) or not bool(np.all(np.isfinite(mid_float32))):
+            raise ValueError("Encoded L2 parameters exceed the finite float32 representation.")
 
-        return params, mid.astype(np.float32)
+        return params_float32, mid_float32
 
     def decode_sequence(self, params: np.ndarray, init_mid: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Decode params to raw L2 arrays using the mid immediately before the window.
@@ -123,9 +168,20 @@ class L2FeatureMap:
         `delta_mid[t]` is interpreted as `mid[t] - mid[t-1]`. Therefore, `init_mid`
         should be the previous mid (at t-1 for the first decoded row).
         """
+        params = self._finite_numeric_matrix(params, label="params")
         T, D = params.shape
         L = self.L
-        assert D == 4 * L, f"Expected D={4*L}, got {D}"
+        expected_dim = 4 * L
+        if D != expected_dim:
+            raise ValueError(f"params has width {D}; expected exactly 4 * levels = {expected_dim}.")
+        if isinstance(init_mid, bool):
+            raise ValueError(f"init_mid must be finite, got {init_mid!r}.")
+        try:
+            initial_mid = float(init_mid)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"init_mid must be finite, got {init_mid!r}.") from exc
+        if not math.isfinite(initial_mid):
+            raise ValueError(f"init_mid must be finite, got {init_mid!r}.")
 
         delta_mid = params[:, 0]
         log_spread = params[:, 1]
@@ -134,29 +190,37 @@ class L2FeatureMap:
         log_ask_v = params[:, 2 + 2 * (L - 1) : 2 + 2 * (L - 1) + L]
         log_bid_v = params[:, 2 + 2 * (L - 1) + L :]
 
-        mid = np.zeros(T, dtype=np.float32)
-        prev_mid = float(init_mid)
+        mid = np.zeros(T, dtype=np.float64)
+        prev_mid = initial_mid
         for t in range(T):
             prev_mid = prev_mid + float(delta_mid[t])
             mid[t] = prev_mid
 
-        spread = np.exp(log_spread)
+        with np.errstate(over="ignore", invalid="ignore"):
+            spread = np.exp(log_spread)
         ask1 = mid + 0.5 * spread
         bid1 = mid - 0.5 * spread
 
-        ask_p = np.zeros((T, L), dtype=np.float32)
-        bid_p = np.zeros((T, L), dtype=np.float32)
+        ask_p = np.zeros((T, L), dtype=np.float64)
+        bid_p = np.zeros((T, L), dtype=np.float64)
         ask_p[:, 0] = ask1
         bid_p[:, 0] = bid1
 
-        ask_gaps = np.exp(log_ask_gaps)
-        bid_gaps = np.exp(log_bid_gaps)
+        with np.errstate(over="ignore", invalid="ignore"):
+            ask_gaps = np.exp(log_ask_gaps)
+            bid_gaps = np.exp(log_bid_gaps)
         for i in range(1, L):
             ask_p[:, i] = ask_p[:, i - 1] + ask_gaps[:, i - 1]
             bid_p[:, i] = bid_p[:, i - 1] - bid_gaps[:, i - 1]
 
-        ask_v = np.exp(log_ask_v).astype(np.float32)
-        bid_v = np.exp(log_bid_v).astype(np.float32)
+        with np.errstate(over="ignore", invalid="ignore"):
+            ask_p = ask_p.astype(np.float32)
+            bid_p = bid_p.astype(np.float32)
+            ask_v = np.exp(log_ask_v).astype(np.float32)
+            bid_v = np.exp(log_bid_v).astype(np.float32)
+        decoded = (ask_p, ask_v, bid_p, bid_v)
+        if any(not bool(np.all(np.isfinite(value))) for value in decoded):
+            raise ValueError("Decoded L2 values exceed the finite float32 representation.")
         return ask_p, ask_v, bid_p, bid_v
 
 # -----------------------------
@@ -454,7 +518,7 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
         valid_start_mask: Optional[np.ndarray] = None,
         dataset_kind: Optional[str] = None,
         dataset_metadata: Optional[Dict[str, object]] = None,
-        global_offset: int = 0,  # NEW: maps local t -> original/global t
+        global_offset: int = 0,  # Maps a split-local timestep to the source timeline.
     ):
         super().__init__()
         self.params = params.astype(np.float32)
@@ -560,7 +624,7 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
 
         meta = {
             "t": int(t),  # local
-            "t_global": int(t_global),  # NEW
+            "t_global": int(t_global),
             "mid_prev": float(self.mids[t - 1]),
             "init_mid_for_window": float(self.mids[t - self.H]),
         }
@@ -821,7 +885,8 @@ def _generate_synthetic_l2(
             segment_remaining = _sample_segment_length(T - t)
         segment_remaining -= 1
 
-        assert current_regime is not None
+        if current_regime is None:
+            raise RuntimeError("Synthetic profile generation failed to initialize a market regime.")
         seasonality = current_regime["seasonality_abs_ret"]
         season_idx = min(len(seasonality) - 1, int(len(seasonality) * t / max(1, T)))
         season_scale = max(0.05, float(seasonality[season_idx]))
@@ -900,7 +965,7 @@ def _generate_synthetic_l2(
 
 
 # -----------------------------
-# Split-aware builders (NEW)
+# Split-aware builders
 # -----------------------------
 def _resolve_split_bounds(
     T: int,
@@ -1150,6 +1215,29 @@ def build_dataset_splits_from_arrays(
       - 'train', 'val', 'test' : WindowedParamSequenceDataset
       - 'stats' : normalization statistics and split bounds
     """
+    params_raw = np.asarray(params_raw)
+    if params_raw.ndim != 2:
+        raise ValueError(f"params_raw must be rank 2, got shape {params_raw.shape}.")
+    if (
+        not np.issubdtype(params_raw.dtype, np.number)
+        or np.issubdtype(params_raw.dtype, np.complexfloating)
+        or not bool(np.all(np.isfinite(params_raw)))
+    ):
+        raise ValueError("params_raw must contain finite real numeric values.")
+    expected_snapshot_dim = int(cfg.snapshot_dim)
+    if params_raw.shape[1] != expected_snapshot_dim:
+        raise ValueError(
+            f"params_raw width {params_raw.shape[1]} does not match cfg.snapshot_dim={expected_snapshot_dim}."
+        )
+    mids = np.asarray(mids)
+    if mids.ndim != 1:
+        raise ValueError(f"mids must be rank 1, got shape {mids.shape}.")
+    if (
+        not np.issubdtype(mids.dtype, np.number)
+        or np.issubdtype(mids.dtype, np.complexfloating)
+        or not bool(np.all(np.isfinite(mids)))
+    ):
+        raise ValueError("mids must contain finite real numeric values.")
     T = int(len(params_raw))
     if len(mids) != T:
         raise ValueError("params_raw and mids length mismatch")

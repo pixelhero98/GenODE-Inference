@@ -24,7 +24,11 @@ from genode.schedules.fixed import (
     group_fixed_schedules_by_time_grid,
     validate_fixed_schedule_keys,
 )
-from genode.schedules.policy import ScheduleBatch, SchedulePolicy
+from genode.schedules.policy import (
+    IdentifiedSchedulePolicy,
+    ScheduleBatch,
+    SchedulePolicy,
+)
 from genode.schedules.progress import (
     DATA_ENDPOINT,
     NOISE_ENDPOINT,
@@ -50,6 +54,7 @@ __all__ = [
     "FIXED_SCHEDULE_TARGET_NFES",
     "FixedSchedule",
     "FixedScheduleGridGroup",
+    "IdentifiedSchedulePolicy",
     "NOISE_ENDPOINT",
     "PROGRESS_PROTOCOL",
     "SCHEDULE_SPECIFICATION_PROTOCOL",

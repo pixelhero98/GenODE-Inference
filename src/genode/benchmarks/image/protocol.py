@@ -22,8 +22,8 @@ from genode.schedule_transfer.reference_clocks import (
 from genode.schedules.fixed import FIXED_SCHEDULE_TARGET_NFES
 from genode.schedules.specification import ScheduleSpecification
 
-IMAGE_PROTOCOL_VERSION = 5
-IMAGE_PROTOCOL_KEY = "image_euler_248_v5"
+IMAGE_PROTOCOL_VERSION = 6
+IMAGE_PROTOCOL_KEY = "image_euler_248_v6"
 IMAGE_GICO_TEACHER_SCORE_WEIGHT = 0.01
 IMAGE_GICO_TEACHER_SCORE_WARMUP_FRACTION = 0.60
 IMAGE_GICO_TEACHER_SCORE_CLIP = 5.0
@@ -82,15 +82,6 @@ LOCKED_TORCH_FIDELITY_FIXED_OPTIONS: Mapping[str, object] = MappingProxyType({
     "verbose": False,
 })
 
-CONTEXT_SPLIT_TRAIN = "train"
-CONTEXT_SPLIT_VALIDATION = "validation"
-CONTEXT_SPLIT_LOCKED = "locked"
-CONTEXT_SPLITS: Tuple[str, ...] = (
-    CONTEXT_SPLIT_TRAIN,
-    CONTEXT_SPLIT_VALIDATION,
-    CONTEXT_SPLIT_LOCKED,
-)
-
 PANEL_PHASE_REWARD_TRAIN = "reward_train"
 PANEL_PHASE_SELECTION_SCREENING = "selection_screening"
 PANEL_PHASE_SURVIVOR_CONFIRMATION = "survivor_confirmation"
@@ -142,9 +133,6 @@ class ImageBenchmarkSpec:
     resolution: int
     class_count: int
     conditioning: str
-    distillation_train_contexts: int
-    distillation_validation_contexts: int
-    distillation_locked_contexts: int
 
     @property
     def is_class_conditional(self) -> bool:
@@ -156,11 +144,6 @@ class ImageBenchmarkSpec:
             "resolution": int(self.resolution),
             "class_count": int(self.class_count),
             "conditioning": self.conditioning,
-            "distillation_context_counts": {
-                CONTEXT_SPLIT_TRAIN: int(self.distillation_train_contexts),
-                CONTEXT_SPLIT_VALIDATION: int(self.distillation_validation_contexts),
-                CONTEXT_SPLIT_LOCKED: int(self.distillation_locked_contexts),
-            },
         }
 
 
@@ -170,18 +153,12 @@ _BENCHMARK_SPECS: Mapping[str, ImageBenchmarkSpec] = {
         resolution=32,
         class_count=0,
         conditioning="unconditional",
-        distillation_train_contexts=500_000,
-        distillation_validation_contexts=10_000,
-        distillation_locked_contexts=50_000,
     ),
     IMAGENET64_DATASET_KEY: ImageBenchmarkSpec(
         key=IMAGENET64_DATASET_KEY,
         resolution=64,
         class_count=1_000,
         conditioning="balanced_class_conditional",
-        distillation_train_contexts=1_000_000,
-        distillation_validation_contexts=10_000,
-        distillation_locked_contexts=50_000,
     ),
 }
 
@@ -443,10 +420,6 @@ __all__ = [
     "CONDITIONAL_KID_REWARD_TRAIN_BLOCKS",
     "CONDITIONAL_KID_SELECTION_SCREENING_BLOCKS",
     "CONDITIONAL_KID_SURVIVOR_CONFIRMATION_BLOCKS",
-    "CONTEXT_SPLITS",
-    "CONTEXT_SPLIT_LOCKED",
-    "CONTEXT_SPLIT_TRAIN",
-    "CONTEXT_SPLIT_VALIDATION",
     "EulerImageWorkload",
     "FID_COMPLEX_IMAGINARY_TOLERANCE",
     "FID_COVARIANCE_EPSILON",

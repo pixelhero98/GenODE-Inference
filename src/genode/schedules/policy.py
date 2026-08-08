@@ -189,7 +189,16 @@ class SchedulePolicy(Protocol[ContextT]):
     ) -> ScheduleBatch: ...
 
 
+@runtime_checkable
+class IdentifiedSchedulePolicy(SchedulePolicy[ContextT], Protocol[ContextT]):
+    """A schedule policy whose executable state has a content identity."""
+
+    @property
+    def policy_sha256(self) -> str: ...
+
+
 __all__ = [
+    "IdentifiedSchedulePolicy",
     "ScheduleBatch",
     "SchedulePolicy",
 ]

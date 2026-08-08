@@ -378,12 +378,10 @@ def _forecast_example_detail_metadata(
 ) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {}
     if hasattr(ds, "example_metadata"):
-        try:
-            loaded = ds.example_metadata(int(example_idx))
-            if isinstance(loaded, Mapping):
-                metadata.update(dict(loaded))
-        except Exception:
-            metadata = {}
+        loaded = ds.example_metadata(int(example_idx))
+        if not isinstance(loaded, Mapping):
+            raise TypeError("Dataset example_metadata must return a mapping.")
+        metadata.update(dict(loaded))
     if isinstance(meta, Mapping):
         metadata.update(dict(meta))
     dataset = str(
@@ -700,7 +698,8 @@ def resolved_rollout_mode(cli_args: argparse.Namespace, dataset: str) -> str:
 
 
 def resolved_eval_windows(cli_args: argparse.Namespace, dataset: str, split: str) -> int:
-    assert split in {"val", "test"}
+    if split not in {"val", "test"}:
+        raise ValueError(f"split must be 'val' or 'test', got {split!r}.")
     raw = int(cli_args.eval_windows_val if split == "val" else cli_args.eval_windows_test)
     if raw > 0:
         return raw

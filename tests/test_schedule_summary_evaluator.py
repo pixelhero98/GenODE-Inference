@@ -203,7 +203,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     target_nfe_values=(4,),
                 )
 
-    def test_load_schedule_predictions_accepts_legacy_runtime_macro_steps(self) -> None:
+    def test_load_schedule_predictions_accepts_runtime_macro_step_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "ser_summary.json"
             path.write_text(

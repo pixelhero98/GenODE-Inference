@@ -3882,10 +3882,13 @@ def train_gico_student(
                 clip=DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
             )
         if unseen_targets_enabled:
-            assert unseen_sx is not None
-            assert unseen_cx is not None
-            assert unseen_target_mass is not None
-            assert next_unseen_batch is not None
+            if (
+                unseen_sx is None
+                or unseen_cx is None
+                or unseen_target_mass is None
+                or next_unseen_batch is None
+            ):
+                raise RuntimeError("Unseen-target training inputs are incomplete.")
             unseen_batch_indices = next_unseen_batch()
             unseen_batch_idx = _index_tensor(unseen_batch_indices, device=unseen_target_mass.device)
             unseen_batch_rows = [unseen_representative_rows[int(idx)] for idx in unseen_batch_indices]
@@ -3900,8 +3903,8 @@ def train_gico_student(
             unseen_log_probs = torch.log_softmax(unseen_logits, dim=-1)
             unseen_ce_loss = -(unseen_batch_target_mass * unseen_log_probs).sum(dim=-1).mean()
             if eta > 0.0 and bool(student_teacher_score_include_unseen_targets):
-                assert unseen_score_mean is not None
-                assert unseen_score_std is not None
+                if unseen_score_mean is None or unseen_score_std is None:
+                    raise RuntimeError("Unseen-target teacher-score statistics are incomplete.")
                 unseen_batch_score_mean = unseen_score_mean.index_select(0, unseen_batch_idx)
                 unseen_batch_score_std = unseen_score_std.index_select(0, unseen_batch_idx)
                 unseen_teacher_score_z, unseen_teacher_score_mean = _student_teacher_score_objective(
@@ -3954,9 +3957,8 @@ def train_gico_student(
                 }
             )
         if should_checkpoint:
-            assert validation_sx is not None
-            assert validation_cx is not None
-            assert validation_target_mass is not None
+            if validation_sx is None or validation_cx is None or validation_target_mass is None:
+                raise RuntimeError("Validation-selection inputs are incomplete.")
             validation_ce, validation_entropy = _evaluate_student_ce(
                 validation_sx,
                 validation_cx,

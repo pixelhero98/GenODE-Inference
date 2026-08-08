@@ -11,6 +11,8 @@ from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import numpy as np
 
+from genode.artifacts.identity import semantic_sha256
+
 
 AYS_SD15_TIMESTEPS: Tuple[int, ...] = (999, 850, 736, 645, 545, 455, 343, 233, 124, 24)
 AYS_SD15_SIGMAS: Tuple[float, ...] = (14.615, 6.475, 3.861, 2.697, 1.886, 1.396, 0.963, 0.652, 0.399, 0.152, 0.0)
@@ -65,6 +67,8 @@ class ReferenceClockSpec:
     source_path: str
     source_nodes: Tuple[float, ...] = ()
     derivation: str = "source_reference"
+    realization_sha256: str = ""
+    realization_environment: str = ""
     notes: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
@@ -77,6 +81,328 @@ _DIFFUSERS_COMMIT = "50e7158093710f9c1b4ea9ff100137a91c9228f3"
 _GITS_COMMIT = "68d5ce427f261962b89ce3b0ee8f6b29f0577328"
 _OTS_COMMIT = "95d4ac6b8a3d1d389ab63a197e1b05d8512b6a99"
 _FLOWTS_COMMIT = "1ec35fb1d3d89d91a1607a9f949a515347d54c8c"
+
+OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS: Tuple[int, ...] = (
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    10,
+    12,
+    14,
+    16,
+    20,
+)
+OTS_VP_LINEAR_OFFICIAL_TIMES: Mapping[int, Tuple[float, ...]] = MappingProxyType(
+    {
+        2: (0.9999999999999998, 0.2968592779377656, 0.001000000000000059),
+        3: (
+            0.9999999999999998,
+            0.4871723341685362,
+            0.2114636736803679,
+            0.001000000000000059,
+        ),
+        4: (
+            0.9999999999999998,
+            0.6291000431235867,
+            0.41664592556647934,
+            0.12023062390135601,
+            0.001000000000000059,
+        ),
+        5: (
+            0.9999999999999998,
+            0.658190396737669,
+            0.497844866116979,
+            0.3094591651941131,
+            0.10136362626069051,
+            0.001000000000000059,
+        ),
+        6: (
+            0.9999999999999998,
+            0.7106528480563642,
+            0.5351537705859608,
+            0.42062979153539964,
+            0.24027053475200535,
+            0.083550784166524,
+            0.001000000000000059,
+        ),
+        7: (
+            0.9999999999999998,
+            0.7688483584352114,
+            0.625333564004778,
+            0.5319211467485778,
+            0.3404677956461694,
+            0.1726471614387146,
+            0.06195925711813602,
+            0.0010000000000000588,
+        ),
+        8: (
+            0.9999999999999998,
+            0.8409368051544779,
+            0.7423683355204655,
+            0.6743971648516056,
+            0.5153113958646132,
+            0.33637703646275485,
+            0.1728957995830331,
+            0.06183390009283608,
+            0.001000000000000059,
+        ),
+        10: (
+            0.9999999999999998,
+            0.8556787089630243,
+            0.7822074406464122,
+            0.7405486706278098,
+            0.6457873420868624,
+            0.5349625034891581,
+            0.3659867076077955,
+            0.205215945327609,
+            0.10898664233449319,
+            0.04560919381622387,
+            0.001000000000000059,
+        ),
+        12: (
+            0.9999999999999998,
+            0.8669631104044307,
+            0.7956871870570249,
+            0.7534649790129124,
+            0.6845395703024086,
+            0.6015461560499665,
+            0.5099149314932314,
+            0.4333900417589155,
+            0.297456614963729,
+            0.17680117176673427,
+            0.10098538898731046,
+            0.04529088192567791,
+            0.001000000000000059,
+        ),
+        14: (
+            0.9999999999999998,
+            0.8987724040731033,
+            0.8364261020842262,
+            0.7994228033533177,
+            0.7463752263696931,
+            0.6769521400833034,
+            0.5961742407038784,
+            0.5122766250948144,
+            0.4507101495515668,
+            0.3715270483518498,
+            0.2588901299081079,
+            0.15554278377281855,
+            0.09059770811686044,
+            0.04114644808221137,
+            0.001000000000000059,
+        ),
+        16: (
+            0.9999999999999998,
+            0.9067654258228279,
+            0.853585230653121,
+            0.8264716021289307,
+            0.7804037993525473,
+            0.7232164406053437,
+            0.6567217628862884,
+            0.5916140748878191,
+            0.52394325275001,
+            0.4493671734731429,
+            0.3873187285305019,
+            0.3230747711843748,
+            0.2216022203134519,
+            0.13307841235070522,
+            0.07642719987716971,
+            0.032204350339732964,
+            0.001000000000000059,
+        ),
+        20: (
+            0.9999999999999998,
+            0.9323888585388722,
+            0.8972361554518902,
+            0.8778422122292521,
+            0.8320133359968838,
+            0.7774415281314796,
+            0.7123305228681149,
+            0.6525918848451091,
+            0.5975954607761669,
+            0.5447026456645336,
+            0.4964786477430131,
+            0.4454152650991521,
+            0.40282525338778075,
+            0.3649830333083829,
+            0.31634782784740456,
+            0.24496714513737797,
+            0.160020787276962,
+            0.09215753735962925,
+            0.052969757199088315,
+            0.023610451007962864,
+            0.001000000000000059,
+        ),
+    }
+)
+OTS_VP_LINEAR_OFFICIAL_LAMBDAS: Mapping[int, Tuple[float, ...]] = MappingProxyType(
+    {
+        2: (-5.024978406659204, -0.19457526997875002, 4.557714932729866),
+        3: (
+            -5.024978406659204,
+            -1.1580665618456478,
+            0.26066235803787174,
+            4.557714932729866,
+        ),
+        4: (
+            -5.024978406659204,
+            -1.9911597979507625,
+            -0.7909855525546063,
+            0.8899472408394126,
+            4.557714932729866,
+        ),
+        5: (
+            -5.024978406659204,
+            -2.1818264330714485,
+            -1.2158225647349772,
+            -0.25779321904113806,
+            1.0646307527024288,
+            4.557714932729866,
+        ),
+        6: (
+            -5.024978406659204,
+            -2.5449745839537155,
+            -1.4233381356651889,
+            -0.8111628079555614,
+            0.09966575552969238,
+            1.2571414781755568,
+            4.557714932729866,
+        ),
+        7: (
+            -5.024978406659204,
+            -2.9780097879125127,
+            -1.9670130505029986,
+            -1.4049914624110396,
+            -0.4117932430386521,
+            0.49891679292980207,
+            1.5461919793144823,
+            4.557714932729866,
+        ),
+        8: (
+            -5.024978406659204,
+            -3.559836671871322,
+            -2.7769619985702403,
+            -2.2913192882100146,
+            -1.3118436352295364,
+            -0.39155336923669665,
+            0.49728580216192664,
+            1.5481178350437772,
+            4.557714932729866,
+        ),
+        10: (
+            -5.024978406659204,
+            -3.685094773690985,
+            -3.082005767547916,
+            -2.7633933634928165,
+            -2.099622077975055,
+            -1.4222505817275104,
+            -0.5379871253379569,
+            0.29709330387596766,
+            0.9910210918535388,
+            1.8329604372549202,
+            4.557714932729866,
+        ),
+        12: (
+            -5.024978406659204,
+            -3.7824235925237986,
+            -3.1886978547386606,
+            -2.8603919938129097,
+            -2.3610557169796387,
+            -1.8172935025108519,
+            -1.2819716704101976,
+            -0.8761693403309915,
+            -0.19758468458697115,
+            0.4718743586431552,
+            1.0684038847883346,
+            1.839410164156582,
+            4.557714932729866,
+        ),
+        14: (
+            -5.024978406659204,
+            -4.063555307500059,
+            -3.5219380324380314,
+            -3.2185784764907224,
+            -2.806951667871525,
+            -2.308797973199281,
+            -1.7841346456871083,
+            -1.2950217144679097,
+            -0.9654445000080086,
+            -0.5654283150652567,
+            0.000368446775468576,
+            0.6153043776192275,
+            1.1770864191306973,
+            1.9273134413549573,
+            4.557714932729866,
+        ),
+        16: (
+            -5.024978406659204,
+            -4.1357725415724165,
+            -3.66717654128337,
+            -3.439008916133693,
+            -3.0678639825252065,
+            -2.6357334079666415,
+            -2.1720211868671977,
+            -1.7561711943584413,
+            -1.36002024733613,
+            -0.9584756481852844,
+            -0.6438714436314388,
+            -0.3256135245978011,
+            0.2027892290544528,
+            0.7834994385915632,
+            1.3443272764006873,
+            2.1476728346444087,
+            4.557714932729866,
+        ),
+        20: (
+            -5.024978406659204,
+            -4.371550863233067,
+            -4.049747759956291,
+            -3.877447411007579,
+            -3.485055915035512,
+            -3.044706253964199,
+            -2.557008080670721,
+            -2.144551534021468,
+            -1.7928843193840711,
+            -1.4779613543473638,
+            -1.208391410064323,
+            -0.9380156958671095,
+            -0.7213727975558561,
+            -0.5330191064957805,
+            -0.2921586296314561,
+            0.0743211684185572,
+            0.5839852619825979,
+            1.160102038883269,
+            1.6940556594365184,
+            2.4179805213825576,
+            4.557714932729866,
+        ),
+    }
+)
+OTS_VP_LINEAR_REALIZATION_ENVIRONMENT = (
+    "Python 3.13.5; NumPy 2.5.1; SciPy 1.18.0; Torch 2.13.0+cpu; "
+    "torch default dtype float32"
+)
+OTS_VP_LINEAR_TABLE_SHA256 = semantic_sha256(
+    {
+        "source_commit": _OTS_COMMIT,
+        "source_path": "step_optim.py::StepOptim.get_ts_lambdas(initType='unif_t')",
+        "environment": OTS_VP_LINEAR_REALIZATION_ENVIRONMENT,
+        "tables_by_source_step_count": [
+            {
+                "source_step_count": step_count,
+                "macro_steps": step_count,
+                "times": list(OTS_VP_LINEAR_OFFICIAL_TIMES[step_count]),
+                "lambdas": list(OTS_VP_LINEAR_OFFICIAL_LAMBDAS[step_count]),
+            }
+            for step_count in OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS
+        ],
+    },
+    namespace="ots-vp-linear-official-tables-v2",
+)
 
 
 def _base_specs() -> Dict[str, ReferenceClockSpec]:
@@ -179,7 +505,7 @@ def _base_specs() -> Dict[str, ReferenceClockSpec]:
             display_name="OTS linear VP (native time)",
             family="ots_vp_linear",
             coordinate="native",
-            realization="official_objective_reimplementation",
+            realization="pinned_official_float32_initialized_tables",
             application_behavior="transferred_reference",
             source_model="continuous linear VP, beta(t)=0.1..20.0",
             source_solver="DPM-Solver/UniPC; uniform-time initialization",
@@ -188,14 +514,21 @@ def _base_specs() -> Dict[str, ReferenceClockSpec]:
             source_commit=_OTS_COMMIT,
             source_license="MIT",
             source_path="step_optim.py::NoiseScheduleVP,StepOptim.get_ts_lambdas",
-            notes="Official linear-VP optimizer semantics; applying its nodes to GenODE is a transfer.",
+            derivation="pinned_upstream_runtime_outputs",
+            realization_sha256=OTS_VP_LINEAR_TABLE_SHA256,
+            realization_environment=OTS_VP_LINEAR_REALIZATION_ENVIRONMENT,
+            notes=(
+                "Official unif_t outputs are pinned for source step counts "
+                "2,3,4,5,6,7,8,10,12,14,16,20, which are used as GenODE macro steps; "
+                "applying their nodes to GenODE is a transfer."
+            ),
         ),
         "ots_vp_linear_log_sigma": ReferenceClockSpec(
             key="ots_vp_linear_log_sigma",
             display_name="OTS linear VP (log sigma/alpha)",
             family="ots_vp_linear",
             coordinate="log_sigma",
-            realization="official_objective_reimplementation",
+            realization="pinned_official_float32_initialized_tables",
             application_behavior="transferred_reference",
             source_model="continuous linear VP, beta(t)=0.1..20.0",
             source_solver="DPM-Solver/UniPC; uniform-time initialization",
@@ -204,7 +537,13 @@ def _base_specs() -> Dict[str, ReferenceClockSpec]:
             source_commit=_OTS_COMMIT,
             source_license="MIT",
             source_path="step_optim.py::NoiseScheduleVP,StepOptim.get_ts_lambdas",
-            notes="The same optimized VP nodes viewed in log(sigma/alpha), then normalized to GenODE progress.",
+            derivation="pinned_upstream_runtime_outputs_then_coordinate_view",
+            realization_sha256=OTS_VP_LINEAR_TABLE_SHA256,
+            realization_environment=OTS_VP_LINEAR_REALIZATION_ENVIRONMENT,
+            notes=(
+                "The pinned official lambda_res nodes viewed in log(sigma/alpha), then normalized "
+                "to GenODE progress."
+            ),
         ),
         "flowts_power_0p03": ReferenceClockSpec(
             key="flowts_power_0p03",
@@ -404,118 +743,18 @@ def _gits_progression(coordinate: str) -> Tuple[float, ...]:
     return _normalize_descending(values)
 
 
-def _vp_alpha(t: np.ndarray) -> np.ndarray:
-    log_alpha = -0.25 * t * t * (OTS_VP_LINEAR_BETA_1 - OTS_VP_LINEAR_BETA_0) - 0.5 * t * OTS_VP_LINEAR_BETA_0
-    return np.exp(log_alpha)
-
-
-def _vp_lambda(t: Sequence[float] | np.ndarray) -> np.ndarray:
-    times = np.asarray(t, dtype=np.float64)
-    alpha = _vp_alpha(times)
-    sigma = np.sqrt(1.0 - alpha * alpha)
-    return np.log(alpha / sigma)
-
-
-def _vp_inverse_lambda(values: Sequence[float] | np.ndarray) -> np.ndarray:
-    lambdas = np.asarray(values, dtype=np.float64)
-    beta_delta = OTS_VP_LINEAR_BETA_1 - OTS_VP_LINEAR_BETA_0
-    temporary = 2.0 * beta_delta * np.logaddexp(-2.0 * lambdas, 0.0)
-    return temporary / ((np.sqrt(OTS_VP_LINEAR_BETA_0**2 + temporary) + OTS_VP_LINEAR_BETA_0) * beta_delta)
-
-
-def _ots_objective(lambda_vec: np.ndarray) -> float:
-    lambda_t = float(_vp_lambda([1.0])[0])
-    lambda_eps = float(_vp_lambda([OTS_VP_LINEAR_EPS])[0])
-    nodes = np.concatenate(([lambda_t], np.asarray(lambda_vec, dtype=np.float64), [lambda_eps]))
-    h = np.diff(nodes)
-    exp_lambda = np.exp(nodes)
-    exp_minus_two_lambda = np.exp(-2.0 * nodes)
-    alpha = 1.0 / np.sqrt(1.0 + exp_minus_two_lambda)
-    sigma = 1.0 / np.sqrt(1.0 + np.exp(2.0 * nodes))
-    data_error = sigma**2 / alpha
-    coefficients = np.zeros(len(nodes) - 1, dtype=np.float64)
-    result = 0.0
-
-    def h0(value: float) -> float:
-        return math.exp(value) - 1.0
-
-    def h1(value: float) -> float:
-        return math.exp(value) * value - h0(value)
-
-    def h2(value: float) -> float:
-        return math.exp(value) * value * value - 2.0 * h1(value)
-
-    n_intervals = len(nodes) - 1
-    for step in range(n_intervals):
-        if step in (0, n_intervals - 1):
-            result += abs((exp_lambda[step + 1] - exp_lambda[step]) * data_error[step])
-        elif step in (1, n_intervals - 2):
-            index = step - 1
-            j0 = -exp_lambda[index + 1] * h1(h[index + 1]) / h[index]
-            j1 = exp_lambda[index + 1] * (h1(h[index + 1]) + h[index] * h0(h[index + 1])) / h[index]
-            if step >= 3:
-                coefficients[index] += data_error[index] * j0
-                coefficients[index + 1] += data_error[index + 1] * j1
-            else:
-                result += math.hypot(data_error[index] * j0, data_error[index + 1] * j1)
-        else:
-            index = step - 2
-            j0 = exp_lambda[index + 2] * (h2(h[index + 2]) + h[index + 1] * h1(h[index + 2])) / (h[index] * (h[index] + h[index + 1]))
-            j1 = -exp_lambda[index + 2] * (h2(h[index + 2]) + (h[index] + h[index + 1]) * h1(h[index + 2])) / (h[index] * h[index + 1])
-            j2 = exp_lambda[index + 2] * (
-                h2(h[index + 2])
-                + (2.0 * h[index + 1] + h[index]) * h1(h[index + 2])
-                + h[index + 1] * (h[index] + h[index + 1]) * h0(h[index + 2])
-            ) / (h[index + 1] * (h[index] + h[index + 1]))
-            if step >= 3:
-                coefficients[index] += data_error[index] * j0
-                coefficients[index + 1] += data_error[index + 1] * j1
-                coefficients[index + 2] += data_error[index + 2] * j2
-            else:
-                result += math.sqrt(
-                    (data_error[index] * j0) ** 2
-                    + (data_error[index + 1] * j1) ** 2
-                    + (data_error[index + 2] * j2) ** 2
-                )
-    return float(result + np.sum(np.abs(coefficients)))
-
-
 @lru_cache(maxsize=None)
 def ots_vp_linear_source_nodes(n_steps: int) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
     n_steps = _validate_n_steps(n_steps)
-    lambda_t = float(_vp_lambda([1.0])[0])
-    lambda_eps = float(_vp_lambda([OTS_VP_LINEAR_EPS])[0])
-    if n_steps == 1:
-        lambdas = np.asarray([lambda_t, lambda_eps], dtype=np.float64)
-        return (1.0, OTS_VP_LINEAR_EPS), tuple(float(value) for value in lambdas)
-
     try:
-        from scipy.optimize import LinearConstraint, minimize
-    except ImportError as exc:
-        raise RuntimeError("OTS reference clocks require scipy.optimize.") from exc
-
-    constraint_matrix = np.zeros((n_steps, n_steps - 1), dtype=np.float64)
-    for index in range(n_steps - 1):
-        constraint_matrix[index, index] = 1.0
-        constraint_matrix[index + 1, index] = -1.0
-    lower = np.zeros(n_steps, dtype=np.float64)
-    lower[0], lower[-1] = lambda_t, -lambda_eps
-    constraint = LinearConstraint(constraint_matrix, lower, np.full(n_steps, np.inf, dtype=np.float64))
-    initial_times = np.linspace(1.0, OTS_VP_LINEAR_EPS, n_steps + 1, dtype=np.float64)
-    initial_lambdas = _vp_lambda(initial_times)[1:-1]
-    result = minimize(
-        _ots_objective,
-        initial_lambdas,
-        method="trust-constr",
-        constraints=[constraint],
-        options={"verbose": 0},
-    )
-    if not bool(result.success) or not bool(np.all(np.isfinite(result.x))):
-        raise RuntimeError(f"OTS optimizer failed: {result.message}")
-    lambdas = np.concatenate(([lambda_t], np.asarray(result.x, dtype=np.float64), [lambda_eps]))
-    times = _vp_inverse_lambda(lambdas)
-    times[0], times[-1] = 1.0, OTS_VP_LINEAR_EPS
-    return tuple(float(value) for value in times), tuple(float(value) for value in lambdas)
+        times = OTS_VP_LINEAR_OFFICIAL_TIMES[n_steps]
+        lambdas = OTS_VP_LINEAR_OFFICIAL_LAMBDAS[n_steps]
+    except KeyError as exc:
+        raise ValueError(
+            "Pinned official OTS nodes are available only for supported source step counts "
+            f"{OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS}; got {n_steps}."
+        ) from exc
+    return times, lambdas
 
 
 def build_reference_clock_grid(key: str, n_steps: int) -> Tuple[float, ...]:
@@ -567,6 +806,11 @@ __all__ = [
     "OTS_VP_LINEAR_BETA_0",
     "OTS_VP_LINEAR_BETA_1",
     "OTS_VP_LINEAR_EPS",
+    "OTS_VP_LINEAR_OFFICIAL_LAMBDAS",
+    "OTS_VP_LINEAR_OFFICIAL_TIMES",
+    "OTS_VP_LINEAR_REALIZATION_ENVIRONMENT",
+    "OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS",
+    "OTS_VP_LINEAR_TABLE_SHA256",
     "REFERENCE_CLOCK_BASE_KEYS",
     "REFERENCE_CLOCK_REVERSED_KEYS",
     "SD15_BETA_END",

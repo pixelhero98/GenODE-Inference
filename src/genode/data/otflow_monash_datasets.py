@@ -244,7 +244,7 @@ def _safe_extraction_root(destination_dir: Path) -> Path:
             f"{absolute}."
         )
     # Resolve only after accepting the caller-selected destination.  This
-    # permits trusted platform mount aliases (for example /projects -> /lfs)
+    # permits trusted platform mount aliases (for example /mount -> /storage)
     # above the destination while giving member extraction a canonical root.
     # Link/reparse components created *beneath* this root remain forbidden.
     return absolute.resolve(strict=True)

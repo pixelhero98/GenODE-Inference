@@ -36,6 +36,11 @@ def _lightweight_grid(schedule_key: str, runtime_nfe: int):
 
 
 class PtgObservedGainFigureTests(unittest.TestCase):
+    def test_spearman_does_not_hide_scipy_failures(self) -> None:
+        with mock.patch("scipy.stats.spearmanr", side_effect=RuntimeError("scipy failure")):
+            with self.assertRaisesRegex(RuntimeError, "scipy failure"):
+                ptg_fig.spearman_correlation([1.0, 2.0, 3.0], [3.0, 2.0, 1.0])
+
     def test_hardness_normalization_integrates_to_one(self) -> None:
         reference_grid = [0.0, 0.2, 0.5, 1.0]
         kappa, widths, _eps_h, integral = ptg_fig.normalize_hardness_for_ptg([1.0, 2.0, 4.0], reference_grid)

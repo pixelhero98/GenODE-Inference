@@ -287,8 +287,8 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         else:
             provided_validation = {
                 "status": "skipped_missing_manifest",
-                "errors": [f"Backbone manifest is missing: {manifest_path}"],
-                "manifest_path": str(manifest_path),
+                "errors": ["Backbone manifest is missing."],
+                "manifest": manifest_path.name,
             }
     if includes_backbone_training and family in {SCENARIO_FAMILY_FORECAST, SCENARIO_FAMILY_CONDITIONAL_GENERATION}:
         requested_manifest = resolve_project_path(str(args.backbone_manifest))
@@ -354,7 +354,11 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "student_target_elite_blend_all_weight": float(args.student_target_elite_blend_all_weight),
         "teacher_metric_profile": teacher_metric_profile_for_scenario(dataset),
         "synthetic_length": int(args.synthetic_length),
-        "locked_test_rows": str(args.locked_test_rows),
+        "locked_test_rows": (
+            _display_path(str(args.locked_test_rows))
+            if str(args.locked_test_rows).strip()
+            else ""
+        ),
         "dataset_root": _display_path(str(args.dataset_root)),
         "shared_backbone_root": _display_path(str(args.shared_backbone_root)),
         "backbone_manifest": _display_path(str(args.backbone_manifest)),

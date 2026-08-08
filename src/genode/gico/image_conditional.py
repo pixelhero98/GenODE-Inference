@@ -1119,7 +1119,8 @@ class ImageGICOBackboneContextDensityModel(nn.Module):
             torch.zeros(len(config.target_nfes), config.density_bin_count)
         )
         final = self.context_network[-1]
-        assert isinstance(final, nn.Linear)
+        if not isinstance(final, nn.Linear):
+            raise RuntimeError("Image GICO context network must end in a linear layer.")
         nn.init.zeros_(final.weight)
         nn.init.zeros_(final.bias)
 

@@ -504,7 +504,8 @@ class OTFlow(RectifiedFlow):
             record_trace=True,
             oracle_local_error=oracle_local_error,
         )
-        assert trace is not None
+        if trace is None:
+            raise RuntimeError("Trace recording completed without trace statistics.")
         return x, trace
 
     @torch.no_grad()
@@ -549,7 +550,8 @@ class OTFlow(RectifiedFlow):
             record_trace=True,
             oracle_local_error=oracle_local_error,
         )
-        assert trace is not None
+        if trace is None:
+            raise RuntimeError("Trace recording completed without trace statistics.")
         return self._reshape_sample_block(x), trace
 
     @torch.no_grad()

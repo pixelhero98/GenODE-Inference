@@ -4,6 +4,8 @@ import argparse
 import copy
 import hashlib
 import json
+import math
+from numbers import Real
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -44,7 +46,7 @@ CHECKPOINT_EXPORT_MODE_BEST_VALIDATION = "best_validation_within_budget"
 CHECKPOINT_EXPORT_MODES = (CHECKPOINT_EXPORT_MODE_EXACT_BUDGET, CHECKPOINT_EXPORT_MODE_BEST_VALIDATION)
 CHECKPOINT_EXPORT_PROTOCOL_EXACT_BUDGET = "exact_budget_step_state"
 CHECKPOINT_EXPORT_PROTOCOL_BEST_VALIDATION = "best_validation_state_within_budget"
-TEMPORAL_BACKBONE_TRAINING_STATE_VERSION = "temporal_otflow_backbone_training_state_v2"
+TEMPORAL_BACKBONE_TRAINING_STATE_VERSION = "temporal_otflow_backbone_training_state_v3"
 
 
 def _project_display_path(path: str | Path) -> str:
@@ -470,8 +472,6 @@ def _train_temporal_backbone(args: argparse.Namespace, *, benchmark_family: str,
         "metric_source": None,
         "validation": None,
         "train_loss": None,
-        "error": None,
-        "validation_available": False,
     }
     exported: List[Dict[str, Any]] = []
     exported_budget_steps: set[int] = set()
@@ -523,23 +523,16 @@ def _train_temporal_backbone(args: argparse.Namespace, *, benchmark_family: str,
         *,
         step: int,
         train_loss: float,
-        validation: Optional[Mapping[str, Any]],
-        error: Optional[BaseException],
+        validation: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        if validation is not None:
-            metric_source = "validation_loss"
-            score = float(validation["loss"])
-        else:
-            metric_source = "train_loss_fallback"
-            score = float(train_loss)
+        score = _validated_validation_score(validation)
         return {
-            "selection_metric": metric_source,
-            "selection_score": float(score),
+            "selection_metric": "validation_loss",
+            "selection_score": score,
             "selected_step": int(step),
             "export_step": int(step),
-            "validation": None if validation is None else dict(validation),
+            "validation": dict(validation),
             "train_loss_at_selected_step": float(train_loss),
-            "fallback_error": None if error is None else f"{type(error).__name__}: {error}",
         }
 
     def _record_candidate(
@@ -547,36 +540,34 @@ def _train_temporal_backbone(args: argparse.Namespace, *, benchmark_family: str,
         step: int,
         model: torch.nn.Module,
         train_loss: float,
-        validation: Optional[Mapping[str, Any]],
-        error: Optional[BaseException],
+        validation: Mapping[str, Any],
     ) -> None:
-        if validation is not None:
-            score = float(validation["loss"])
-            metric_source = "validation_loss"
-            best["validation_available"] = True
-        else:
-            if bool(best.get("validation_available")):
-                return
-            score = float(train_loss)
-            metric_source = "train_loss_fallback"
-        current_metric = str(best.get("metric_source") or "")
-        should_update = best["score"] is None
-        if not should_update and metric_source == "validation_loss" and current_metric != "validation_loss":
-            should_update = True
-        elif not should_update and metric_source == current_metric and score < float(best["score"]):
-            should_update = True
+        score = _validated_validation_score(validation)
+        should_update = best["score"] is None or score < float(best["score"])
         if should_update:
             best.update(
                 {
                     "score": float(score),
                     "state_dict": _clone_state_dict_cpu(model),
                     "step": int(step),
-                    "metric_source": metric_source,
-                    "validation": None if validation is None else dict(validation),
+                    "metric_source": "validation_loss",
+                    "validation": dict(validation),
                     "train_loss": float(train_loss),
-                    "error": None if error is None else f"{type(error).__name__}: {error}",
                 }
             )
+
+    def _validated_validation_score(
+        validation: Mapping[str, Any],
+    ) -> float:
+        if not isinstance(validation, Mapping):
+            raise TypeError("Backbone validation result must be a mapping.")
+        raw_score = validation.get("loss")
+        if isinstance(raw_score, bool) or not isinstance(raw_score, Real):
+            raise TypeError("Backbone validation loss must be a finite real number.")
+        score = float(raw_score)
+        if not math.isfinite(score):
+            raise ValueError("Backbone validation loss must be a finite real number.")
+        return score
 
     def _export_budget(
         *,
@@ -656,28 +647,30 @@ def _train_temporal_backbone(args: argparse.Namespace, *, benchmark_family: str,
 
     def _on_step(step: int, model: torch.nn.Module, train_loss: float, logs: Dict[str, float]) -> None:
         del logs
-        should_validate = int(step) in checkpoint_step_set or (val_every > 0 and int(step) % val_every == 0)
+        is_budget_step = int(step) in checkpoint_step_set
+        should_validate = is_budget_step or (
+            not exact_budget_export
+            and val_every > 0
+            and int(step) % val_every == 0
+        )
         validation = None
-        error = None
         if should_validate:
-            try:
-                validation = evaluate_average_loss(
-                    splits["val"],
-                    model,
-                    cfg,
-                    model_name="otflow",
-                    max_batches=val_max_batches,
-                    shuffle=False,
-                )
-            except Exception as exc:
-                error = exc
+            validation = evaluate_average_loss(
+                splits["val"],
+                model,
+                cfg,
+                model_name="otflow",
+                max_batches=val_max_batches,
+                shuffle=False,
+            )
         if exact_budget_export:
-            if int(step) in checkpoint_step_set:
+            if is_budget_step:
+                if validation is None:
+                    raise RuntimeError("Exact-budget export requires validation at every budget step.")
                 selection = _make_selection(
                     step=int(step),
                     train_loss=float(train_loss),
                     validation=validation,
-                    error=error,
                 )
                 _export_budget(
                     step=int(step),
@@ -687,14 +680,14 @@ def _train_temporal_backbone(args: argparse.Namespace, *, benchmark_family: str,
                 )
             return
 
-        _record_candidate(
-            step=int(step),
-            model=model,
-            train_loss=float(train_loss),
-            validation=validation,
-            error=error,
-        )
-        if int(step) in checkpoint_step_set:
+        if validation is not None:
+            _record_candidate(
+                step=int(step),
+                model=model,
+                train_loss=float(train_loss),
+                validation=validation,
+            )
+        if is_budget_step:
             if best["state_dict"] is None:
                 raise RuntimeError(f"No checkpoint candidate is available at step {int(step)}.")
             selection = {
@@ -704,7 +697,6 @@ def _train_temporal_backbone(args: argparse.Namespace, *, benchmark_family: str,
                 "export_step": int(step),
                 "validation": best["validation"],
                 "train_loss_at_selected_step": best["train_loss"],
-                "fallback_error": best["error"],
             }
             _export_budget(
                 step=int(step),
@@ -900,7 +892,7 @@ def build_argparser() -> argparse.ArgumentParser:
         default=CHECKPOINT_EXPORT_MODE_BEST_VALIDATION,
         help=(
             "How budget checkpoints are exported. exact_budget saves the model at each requested training budget; "
-            "best_validation_within_budget preserves the older cumulative validation-best behavior."
+            "best_validation_within_budget saves the lowest finite validation-loss state reached by each budget."
         ),
     )
     parser.add_argument(

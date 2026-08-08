@@ -71,8 +71,13 @@ grids are deterministic, coordinate-preserving transfers of those nodes, not
 claims that the upstream optimizers were rerun for a GenODE backbone. The AYS
 log-sigma terminal uses the pinned SD1.5 scaled-linear scheduler realization
 (`1000` steps, `beta_start=0.00085`, `beta_end=0.012`) so the terminal is finite.
-OTS reimplements the pinned official linear-VP objective. FlowTS uses the
-released power-clock formula and exponent. Every catalog record is generated
+OTS uses immutable paired `t_res` and `lambda_res` tables produced by the pinned
+official linear-VP implementation with its float32 initialization semantics.
+The supported source step counts (used as GenODE macro steps) are exactly
+`2,3,4,5,6,7,8,10,12,14,16,20`; other counts are rejected, so runtime SciPy
+versions cannot change either coordinate view. The exact raw upstream endpoints
+and both vector families are bound by the versioned table identity. FlowTS uses
+the released power-clock formula and exponent. Every catalog record is generated
 from the runtime registry and includes the exact source model, solver,
 coordinate, commit, file, and license:
 

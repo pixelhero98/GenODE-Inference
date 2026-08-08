@@ -349,7 +349,8 @@ def _otflow_artifact_compatibility(
     signature, error = _checkpoint_signature(checkpoint_path)
     if error is not None:
         return None, "invalid", error
-    assert signature is not None
+    if signature is None:
+        return None, "invalid", "Checkpoint signature inspection returned no result."
     model_cond_dim = int(signature["model_cond_dim"])
     spec = experiment_plan_by_key()[str(dataset_key)]
     errors: List[str] = []

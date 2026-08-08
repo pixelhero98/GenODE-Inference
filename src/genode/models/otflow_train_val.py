@@ -2297,7 +2297,6 @@ def run_ablation_grid(
     ablations: Sequence[Tuple[str, Dict[str, Any]]],
     model_name: str = "otflow",
     train_steps: int = 10_000,
-    stage2_steps_nf: Optional[int] = None,
     eval_horizon: int = 200,
     eval_nfe: int = 1,
     n_windows: int = 30,

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
+import shutil
 import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
 
 from genode.backbone_packages import (
+    PACKAGE_MANIFEST_NAME,
+    PACKAGE_SCHEMA_VERSION,
     PACKAGED_BACKBONE_MANIFEST,
+    backbone_package_protocol_payload,
     load_portable_backbone_manifest,
     package_backbone_family,
     validate_backbone_package,
@@ -143,13 +149,94 @@ class BackbonePackageTests(unittest.TestCase):
             package_root = Path(summary["package_root"])
             with mock.patch("genode.backbone_packages._validate_artifact_checkpoint_integrity", return_value=[]):
                 validation = validate_backbone_package(package_root, expected_family="temporal-extrapolation")
+                relocated_root = Path(tmpdir) / "relocated" / "package"
+                shutil.copytree(package_root, relocated_root)
+                relocated_validation = validate_backbone_package(
+                    relocated_root,
+                    expected_family="temporal-extrapolation",
+                )
             self.assertEqual(validation["status"], "complete", validation.get("errors"))
+            self.assertEqual(validation, relocated_validation)
+            self.assertNotIn("package_root", validation)
+            self.assertEqual(
+                validation["package_manifest_sha256"],
+                hashlib.sha256((package_root / PACKAGE_MANIFEST_NAME).read_bytes()).hexdigest(),
+            )
+            self.assertNotIn(str(Path(tmpdir).resolve()), json.dumps(validation, sort_keys=True))
             raw_manifest = json.loads((package_root / PACKAGED_BACKBONE_MANIFEST).read_text(encoding="utf-8"))
             artifact = raw_manifest["artifacts"][0]
             self.assertEqual(artifact["checkpoint_path"], "outputs/backbone_matrix/otflow/temporal_extrapolation/4k/solar_energy_10m/model.pt")
             self.assertEqual(raw_manifest["path_base"], "../..")
             loaded = load_portable_backbone_manifest(package_root / PACKAGED_BACKBONE_MANIFEST)
             self.assertTrue(Path(loaded["artifacts"][0]["checkpoint_path"]).exists())
+
+    def test_package_protocol_identity_is_content_bound_and_relocation_invariant(self) -> None:
+        manifest_bytes = json.dumps(
+            {
+                "schema_version": PACKAGE_SCHEMA_VERSION,
+                "family": "temporal-extrapolation",
+                "source_commit": "1" * 40,
+                "artifact_count": 12,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            roots = (Path(tmpdir) / "first" / "package", Path(tmpdir) / "second" / "package")
+            payloads = []
+            for root in roots:
+                _write(root / PACKAGE_MANIFEST_NAME, manifest_bytes)
+                payloads.append(
+                    backbone_package_protocol_payload(
+                        argparse.Namespace(
+                            backbone_package_root=str(root),
+                            use_provided_backbones=False,
+                        )
+                    )
+                )
+
+        self.assertEqual(payloads[0], payloads[1])
+        self.assertNotIn("backbone_package_root", payloads[0])
+        self.assertEqual(
+            payloads[0]["backbone_package_manifest_sha256"],
+            hashlib.sha256(manifest_bytes).hexdigest(),
+        )
+        self.assertNotIn(str(Path(tmpdir).resolve()), json.dumps(payloads[0], sort_keys=True))
+
+    def test_package_validation_redacts_unsafe_manifest_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            package_root = Path(tmpdir) / "package"
+            local_path = Path(tmpdir).resolve() / "private" / "checkpoint.pt"
+            _write(
+                package_root / PACKAGE_MANIFEST_NAME,
+                json.dumps(
+                    {
+                        "schema_version": PACKAGE_SCHEMA_VERSION,
+                        "family": "temporal-extrapolation",
+                        "scenarios": [],
+                        "expected_artifact_count": 0,
+                        "data_roots": [],
+                        "artifact_count": 0,
+                        "files": [{"path": str(local_path)}],
+                    }
+                ),
+            )
+
+            validation = validate_backbone_package(package_root)
+
+        self.assertEqual(validation["status"], "failed")
+        self.assertTrue(any("unsafe file path" in error for error in validation["errors"]))
+        self.assertNotIn(str(local_path), json.dumps(validation, sort_keys=True))
+
+    def test_missing_provided_manifest_error_is_path_free(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_path = Path(tmpdir).resolve() / "private" / "backbone_manifest.json"
+            validation = validate_provided_backbone_manifest(missing_path)
+
+        self.assertEqual(validation["status"], "failed")
+        self.assertEqual(validation["backbone_manifest_sha256"], "")
+        self.assertEqual(validation["artifact_count"], 0)
+        self.assertNotIn(str(missing_path), json.dumps(validation, sort_keys=True))
 
     def test_package_family_zip_is_reproducible_and_preserves_archive_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -311,6 +398,9 @@ class BackbonePackageTests(unittest.TestCase):
 
         self.assertEqual(validation["status"], "complete", validation.get("errors"))
         self.assertEqual(validation["artifact_count"], len(TRAIN_BUDGET_STEPS))
+        self.assertNotIn("manifest_path", validation)
+        self.assertRegex(validation["backbone_manifest_sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotIn(str(Path(tmpdir).resolve()), json.dumps(validation, sort_keys=True))
 
     def test_provided_manifest_validation_rejects_wrong_backbone_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
