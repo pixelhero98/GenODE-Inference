@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from numbers import Integral
+import math
+from numbers import Integral, Real
 import re
 from typing import TYPE_CHECKING
 
@@ -36,6 +37,9 @@ from genode.schedules.policy import (
 from genode.solvers.euler import integrate_euler
 
 if TYPE_CHECKING:
+    from genode.gico.image_clock_mixture_artifacts import (
+        BoundImageGICOClockMixtureArtifact,
+    )
     from genode.gico.image_conditional_artifacts import (
         BoundImageGICOConditionalArtifact,
     )
@@ -961,6 +965,48 @@ class ImageEulerSampler:
         if request.backbone_manifest.to_manifest_dict() != self.backbone.manifest.to_manifest_dict():
             raise ValueError("Generation request does not match the loaded backbone.")
 
+    def _bound_gico_clock_labels(
+        self,
+        request: ImageGenerationRequest,
+        artifact: "BoundImageGICOClockMixtureArtifact",
+    ) -> Tensor:
+        from genode.gico.image_clock_mixture_artifacts import (
+            BoundImageGICOClockMixtureArtifact,
+        )
+
+        self._validate_request(request)
+        if not isinstance(artifact, BoundImageGICOClockMixtureArtifact):
+            raise TypeError(
+                "artifact must be a bound ImageNet GICO clock-mixture artifact."
+            )
+        if request.class_labels is None:
+            raise ValueError(
+                "Bound ImageNet GICO clock-mixture execution requires class labels."
+            )
+        if artifact.artifact_sha256 != request.schedule_policy_sha256:
+            raise ValueError(
+                "Bound GICO clock-mixture artifact identity does not match "
+                "the generation request."
+            )
+        binding = artifact.source_artifact.prepared_context.binding
+        expected_backbone = (
+            request.backbone_manifest.model_key,
+            request.backbone_manifest.protocol_sha256,
+            request.backbone_manifest.checkpoint.sha256,
+        )
+        observed_backbone = (
+            binding.backbone_model_key,
+            binding.backbone_protocol_sha256,
+            binding.backbone_checkpoint_sha256,
+        )
+        if observed_backbone != expected_backbone:
+            raise ValueError(
+                "Bound GICO clock-mixture context does not match the "
+                "generation-request backbone."
+            )
+        artifact.verify_execution_identity()
+        return torch.tensor(request.class_labels, dtype=torch.int64)
+
     def _execute(
         self,
         request: ImageGenerationRequest,
@@ -1174,6 +1220,110 @@ class ImageEulerSampler:
             artifact.policy,
             context=context,
             schedule_policy_sha256=artifact.artifact_sha256,
+        )
+
+    def sample_gico_clock_barycenter(
+        self,
+        request: ImageGenerationRequest,
+        artifact: "BoundImageGICOClockMixtureArtifact",
+    ) -> GeneratedImageBatch:
+        """Execute the bound conditional complete-clock barycenter."""
+
+        labels = self._bound_gico_clock_labels(request, artifact)
+        with torch.inference_mode():
+            schedule = artifact.predict_for_class_labels(
+                labels,
+                target_nfe=request.target_nfe,
+            )
+        if not isinstance(schedule, ScheduleBatch):
+            raise TypeError(
+                "Bound GICO clock-mixture prediction must return a ScheduleBatch."
+            )
+        schedule_binding = _policy_output_binding(
+            schedule,
+            request=request,
+            source_kind="schedule_policy",
+            schedule_policy_sha256=artifact.artifact_sha256,
+        )
+        noise = generate_seeded_image_noise(
+            request.dataset_key,
+            request.latent_seeds,
+        )
+        return self._execute(
+            request,
+            noise=noise,
+            time_grid=schedule.time_grid,
+            schedule_binding=schedule_binding,
+        )
+
+    def sample_gico_clock_realization(
+        self,
+        request: ImageGenerationRequest,
+        artifact: "BoundImageGICOClockMixtureArtifact",
+        *,
+        uniforms: Tensor,
+        alpha: float,
+    ) -> GeneratedImageBatch:
+        """Execute an explicit stochastic complete-clock realization."""
+
+        from genode.gico.image_clock_mixture import ImageGICOClockRealization
+        labels = self._bound_gico_clock_labels(request, artifact)
+        if not isinstance(uniforms, Tensor):
+            raise TypeError("uniforms must be a torch.Tensor.")
+        if uniforms.device.type != "cpu" or uniforms.dtype != torch.float64:
+            raise TypeError("uniforms must be a CPU torch.float64 tensor.")
+        if uniforms.ndim != 1 or int(uniforms.shape[0]) != request.sample_count:
+            raise ValueError("uniforms must have shape [request.sample_count].")
+        if (
+            not bool(torch.isfinite(uniforms).all())
+            or bool(torch.any(uniforms < 0.0))
+            or bool(torch.any(uniforms >= 1.0))
+        ):
+            raise ValueError("uniforms must contain only values in [0, 1).")
+        if isinstance(alpha, bool) or not isinstance(alpha, Real):
+            raise TypeError("alpha must be a finite real in [0, 1].")
+        mixing = float(alpha)
+        if not math.isfinite(mixing) or not 0.0 <= mixing <= 1.0:
+            raise ValueError("alpha must be a finite real in [0, 1].")
+
+        with torch.inference_mode():
+            realization = artifact.realize_for_class_labels(
+                labels,
+                target_nfe=request.target_nfe,
+                uniforms=uniforms,
+                alpha=mixing,
+            )
+        if not isinstance(realization, ImageGICOClockRealization):
+            raise TypeError(
+                "Bound GICO clock-mixture realization has an invalid type."
+            )
+        expected_policy_sha256 = artifact.policy.policy_sha256
+        expected_library_sha256 = artifact.library.sha256
+        if realization.policy_sha256 != expected_policy_sha256:
+            raise ValueError(
+                "GICO clock realization does not match the bound policy identity."
+            )
+        if realization.clock_library_sha256 != expected_library_sha256:
+            raise ValueError(
+                "GICO clock realization does not match the bound library identity."
+            )
+        if realization.alpha != mixing:
+            raise ValueError("GICO clock realization does not match the requested alpha.")
+        schedule_binding = _policy_output_binding(
+            realization.schedule,
+            request=request,
+            source_kind="schedule_policy",
+            schedule_policy_sha256=artifact.artifact_sha256,
+        )
+        noise = generate_seeded_image_noise(
+            request.dataset_key,
+            request.latent_seeds,
+        )
+        return self._execute(
+            request,
+            noise=noise,
+            time_grid=realization.schedule.time_grid,
+            schedule_binding=schedule_binding,
         )
 
 

@@ -110,6 +110,32 @@ For ImageNet-64, GICO uses the frozen RF++/1-RF model's native
 backbone/checkpoint/context identities. Both registered CIFAR-10 backbones are
 unconditional; supplying a label is an error.
 
+### Complete-clock stochastic decoding
+
+ImageNet-64 policies can add a source-bound complete-clock sidecar. For each
+class context and NFE, the decoder predicts probabilities `q` over whole clocks
+from the supervised pool. Its deterministic schedule is the density barycenter
+`mu = sum(q_i * d_i)`. A caller may also supply one replayable uniform draw and
+`alpha` in `[0, 1]` to execute
+`D_alpha = (1 - alpha) * mu + alpha * d_I`. Thus `alpha=0` is exactly the
+barycenter, `alpha=1` is exactly one supervised complete clock, and intermediate
+values preserve the mean while scaling covariance by `alpha^2`.
+
+The default 23-clock pool is represented on the exact union of all NFE 2, 4,
+and 8 clock nodes (171 nodes, 170 density bins), so complete clocks reconstruct
+without finite-bin drift. Duplicate supervision aliases are trained as grouped
+categorical targets and split uniformly inside each group. Randomness is never
+created inside the policy: SHA-256 counter draws are explicitly bound to the
+sampling plan, policy artifact, clock library, frozen context binding, seed,
+class label, and NFE; `alpha` is deliberately excluded so comparisons use the
+same selected clock.
+
+The six-file sidecar contains only its manifest, model state, clock-library
+identity, and exact NFE 2/4/8 clock grids. It carries neither raw/normalized
+contexts nor copied conditional targets. Loading requires the original GICO
+source artifact, and execution requires rebinding that source to its verified
+frozen backbone so contexts can only be derived from class labels.
+
 ## Primary workflow
 
 Run or resume the canonical backbone and schedule pipeline:
@@ -169,6 +195,7 @@ Build checkpoint-only, named-checkpoint, or frozen policy archives with:
 genode-build-release-archive backbone-manifest --help
 genode-build-release-archive named-checkpoints --help
 genode-build-release-archive gico-policy --help
+genode-build-release-archive gico-clock-policy --help
 genode-build-release-archive validate --archive release.zip
 ```
 
@@ -177,6 +204,15 @@ teacher state, student state, density table, context normalizers, and a fresh
 portable GICO manifest. The wrapper records the original manifest digest and
 actual training clock pool without carrying obsolete protocol-labelled JSON;
 packaging does not imply retraining on the current 23-clock default.
+
+`gico-clock-policy` accepts only the native current-v4 source policy (historical
+frozen policies remain supported by `gico-policy`). It performs the strict
+source validation, then uses the native source and complete-clock artifact
+loaders before packaging either artifact. The distinct combined schema is
+self-contained after extraction: it includes all eight source-policy files and
+all six sidecar files. Its portable archive metadata binds the source and
+decoder artifact identities, the decoder execution-state identity, and the
+independently load-verifiable serialized-state identity.
 
 Each build writes:
 

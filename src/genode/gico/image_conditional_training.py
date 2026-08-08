@@ -19,7 +19,7 @@ from genode.gico.image_conditional import (
     ImageGICOBackboneContextDensityModel,
     ImageGICOBackboneContextModelConfig,
     ImageGICOConditionalTargets,
-    _normalized_backbone_context_tensor,
+    validate_image_gico_backbone_context_tensor,
 )
 
 
@@ -668,7 +668,7 @@ def train_image_gico_backbone_context(
     if not isinstance(training, ImageGICOBackboneContextTrainingConfig):
         raise TypeError("config must be ImageGICOBackboneContextTrainingConfig.")
     execution_device = torch.device(device)
-    context_table = _normalized_backbone_context_tensor(
+    context_table = validate_image_gico_backbone_context_tensor(
         normalized_context_table,
         field="normalized_context_table",
         expected_rows=IMAGE_GICO_CLASS_COUNT,

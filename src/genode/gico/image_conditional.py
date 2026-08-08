@@ -987,7 +987,7 @@ def build_image_gico_conditional_targets(
     )
 
 
-def _normalized_backbone_context_tensor(
+def validate_image_gico_backbone_context_tensor(
     value: np.ndarray | Tensor,
     *,
     field: str,
@@ -1097,7 +1097,7 @@ class ImageGICOBackboneContextDensityModel(nn.Module):
         if not isinstance(config, ImageGICOBackboneContextModelConfig):
             raise TypeError("config must be an ImageGICOBackboneContextModelConfig.")
         self.config = config
-        table = _normalized_backbone_context_tensor(
+        table = validate_image_gico_backbone_context_tensor(
             canonical_context_table,
             field="canonical_context_table",
             expected_rows=config.class_count,
@@ -1300,4 +1300,5 @@ __all__ = [
     "ImageGICOFeatureGroups",
     "build_image_gico_conditional_targets",
     "build_image_gico_feature_groups",
+    "validate_image_gico_backbone_context_tensor",
 ]

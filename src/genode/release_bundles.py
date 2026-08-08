@@ -28,9 +28,17 @@ from genode.gico.image_conditional import (
     ImageGICOBackboneContextModelConfig,
 )
 from genode.gico.image_conditional_training import ImageGICOBackboneContextTeacher
+from genode.gico.image_clock_mixture_artifacts import (
+    load_image_gico_clock_mixture_artifact,
+)
+from genode.gico.image_conditional_artifacts import (
+    IMAGE_GICO_CONDITIONAL_BUNDLE_PROTOCOL,
+    load_image_gico_conditional_artifact,
+)
 
 
 FROZEN_GICO_POLICY_SCHEMA = "frozen_gico_policy_v1"
+FROZEN_GICO_CLOCK_MIXTURE_POLICY_SCHEMA = "frozen_gico_clock_mixture_policy_v1"
 FROZEN_BACKBONE_COLLECTION_SCHEMA = "frozen_backbone_collection_v1"
 _SOURCE_POLICY_FILES: Mapping[str, str] = {
     "class-density-table.npy": "density_table",
@@ -45,6 +53,19 @@ _ARCHIVED_POLICY_FILES: Mapping[str, str] = {
     filename: role
     for filename, role in _SOURCE_POLICY_FILES.items()
     if filename.endswith((".npy", ".pt"))
+}
+_ARCHIVED_CLOCK_MIXTURE_FILES: Mapping[str, str] = {
+    "manifest.json": "clock_mixture_manifest",
+    "clock-mixture-state.pt": "clock_mixture_state",
+    "clock-library.json": "clock_library",
+    "complete-clocks-nfe-2.npy": "clock_grid_nfe_2",
+    "complete-clocks-nfe-4.npy": "clock_grid_nfe_4",
+    "complete-clocks-nfe-8.npy": "clock_grid_nfe_8",
+}
+_ARCHIVED_CLOCK_POLICY_METADATA_FILES: Mapping[str, str] = {
+    "manifest.json": "source_policy_manifest",
+    "conditional-targets.json": "conditional_targets",
+    "reward-feature-groups.json": "reward_feature_groups",
 }
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SEMANTIC_NAMESPACE_PATTERN = re.compile(r"^image-[a-z0-9-]+-backbone-context-(?P<kind>[a-z-]+)-v[1-9][0-9]*$")
@@ -1117,15 +1138,9 @@ def _validate_policy_semantic_bindings(policy_root: Path, source_manifest: Mappi
         raise ValueError("Policy density-table digest differs from its source file.")
 
 
-def package_frozen_gico_policy(
-    *,
-    policy_dir: str | Path,
-    output_path: str | Path,
-    overwrite: bool = False,
-) -> dict[str, Any]:
-    root = Path(os.path.abspath(os.fspath(Path(policy_dir).expanduser())))
-    if not root.is_dir():
-        raise ValueError(f"Policy bundle source is not a directory: {root}")
+def _validated_frozen_policy_source(
+    root: Path,
+) -> tuple[list[ArchiveEntry], dict[str, Any], Mapping[str, Any]]:
     metadata, source_manifest, policy_token, bundle_version = _frozen_policy_metadata(root)
     entries: list[ArchiveEntry] = []
     for filename, role in _ARCHIVED_POLICY_FILES.items():
@@ -1154,10 +1169,107 @@ def package_frozen_gico_policy(
         if (root / filename).stat().st_size < 1024:
             raise ValueError(f"Frozen policy state is too small to be valid: {filename}")
         _load_policy_state(root / filename, label=filename.removesuffix("-state.pt"))
+    return entries, metadata, source_manifest
+
+
+def package_frozen_gico_policy(
+    *,
+    policy_dir: str | Path,
+    output_path: str | Path,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    root = Path(os.path.abspath(os.fspath(Path(policy_dir).expanduser())))
+    if not root.is_dir():
+        raise ValueError(f"Policy bundle source is not a directory: {root}")
+    entries, metadata, _source_manifest = _validated_frozen_policy_source(root)
     return write_deterministic_zip(
         entries,
         output_path,
         bundle_kind="frozen_gico_policy",
+        metadata=metadata,
+        overwrite=overwrite,
+    )
+
+
+def package_frozen_gico_clock_mixture_policy(
+    *,
+    policy_dir: str | Path,
+    decoder_dir: str | Path,
+    output_path: str | Path,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    policy_root = Path(os.path.abspath(os.fspath(Path(policy_dir).expanduser())))
+    if not policy_root.is_dir():
+        raise ValueError(f"Policy bundle source is not a directory: {policy_root}")
+    decoder_root = Path(os.path.abspath(os.fspath(Path(decoder_dir).expanduser())))
+    if not decoder_root.is_dir():
+        raise ValueError(f"Clock-mixture sidecar source is not a directory: {decoder_root}")
+    decoder_entries: list[ArchiveEntry] = []
+    for filename, role in _ARCHIVED_CLOCK_MIXTURE_FILES.items():
+        source = decoder_root / filename
+        if not source.is_file() or source.stat().st_size <= 0:
+            raise ValueError(f"Frozen clock-mixture file is missing or empty: {filename}")
+        decoder_entries.append(ArchiveEntry(source, f"decoder/{filename}", role))
+
+    policy_entries, source_metadata, source_manifest = _validated_frozen_policy_source(
+        policy_root
+    )
+    if source_manifest.get("protocol") != IMAGE_GICO_CONDITIONAL_BUNDLE_PROTOCOL:
+        raise ValueError(
+            "Complete-clock GICO releases require the current v4 source-policy artifact; "
+            "package frozen historical source policies with the gico-policy command."
+        )
+    source_metadata_entries = [
+        ArchiveEntry(policy_root / filename, f"policy/{filename}", role)
+        for filename, role in _ARCHIVED_CLOCK_POLICY_METADATA_FILES.items()
+    ]
+    loaded_source = load_image_gico_conditional_artifact(policy_root)
+    loaded_decoder = load_image_gico_clock_mixture_artifact(
+        decoder_root,
+        source_artifact=loaded_source,
+    )
+    decoder_manifest = loaded_decoder.manifest
+    entries = [*policy_entries, *source_metadata_entries, *decoder_entries]
+
+    inference_contract = {
+        **dict(source_metadata["inference_contract"]),
+        "clock_conditioning": "normalized_frozen_backbone_map_label_plus_target_nfe",
+        "clock_selection": "explicit_complete_clock_categorical",
+        "internal_rng": False,
+        "stochastic_alpha_range": [0.0, 1.0],
+        "target_nfes": [int(value) for value in loaded_decoder.library.target_nfes],
+    }
+    metadata = {
+        "backbone": dict(source_metadata["backbone"]),
+        "clock_mixture": {
+            "artifact_sha256": loaded_decoder.artifact_sha256,
+            "clock_library_sha256": loaded_decoder.library.sha256,
+            "manifest_sha256": sha256_file(decoder_root / "manifest.json"),
+            "model_config_sha256": str(decoder_manifest["model_config_sha256"]),
+            "execution_model_state_sha256": str(
+                decoder_manifest["model_state_sha256"]
+            ),
+            "protocol": str(decoder_manifest["protocol"]),
+            "serialized_model_state_sha256": str(
+                decoder_manifest["serialized_model_state_sha256"]
+            ),
+        },
+        "context": dict(source_metadata["context"]),
+        "inference_contract": inference_contract,
+        "policy_schema_version": FROZEN_GICO_CLOCK_MIXTURE_POLICY_SCHEMA,
+        "source_model": dict(source_metadata["model"]),
+        "source_policy": {
+            "artifact_sha256": loaded_source.artifact_sha256,
+            "manifest_sha256": sha256_file(policy_root / "manifest.json"),
+            "protocol": str(source_manifest["protocol"]),
+            "schema_version": FROZEN_GICO_POLICY_SCHEMA,
+        },
+        "training_clock_pool": list(source_metadata["training_clock_pool"]),
+    }
+    return write_deterministic_zip(
+        entries,
+        output_path,
+        bundle_kind="frozen_gico_clock_mixture_policy",
         metadata=metadata,
         overwrite=overwrite,
     )
@@ -1192,6 +1304,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     policy_parser.add_argument("--output", required=True)
     policy_parser.add_argument("--overwrite", action="store_true")
 
+    clock_policy_parser = subparsers.add_parser("gico-clock-policy")
+    clock_policy_parser.add_argument("--policy-dir", required=True)
+    clock_policy_parser.add_argument("--decoder-dir", required=True)
+    clock_policy_parser.add_argument("--output", required=True)
+    clock_policy_parser.add_argument("--overwrite", action="store_true")
+
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--archive", required=True)
 
@@ -1214,6 +1332,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     elif args.command == "gico-policy":
         result = package_frozen_gico_policy(
             policy_dir=args.policy_dir,
+            output_path=args.output,
+            overwrite=args.overwrite,
+        )
+    elif args.command == "gico-clock-policy":
+        result = package_frozen_gico_clock_mixture_policy(
+            policy_dir=args.policy_dir,
+            decoder_dir=args.decoder_dir,
             output_path=args.output,
             overwrite=args.overwrite,
         )
