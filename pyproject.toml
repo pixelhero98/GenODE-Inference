@@ -4,17 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "genode"
-version = "0.1.0"
-description = "GIPO schedule optimization and endpoint flow-map distillation for frozen OT flow-matching backbones."
+version = "0.4.0"
+description = "GICO inference-clock optimization and optional consistency distillation for frozen flow-matching backbones."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "LICENSES/*", "THIRD_PARTY_NOTICES.md"]
 authors = [{name = "GenODE contributors"}]
 keywords = [
   "flow-matching",
   "generative-modeling",
-  "GIPO",
+  "GICO",
   "ordinary-differential-equations",
   "schedule-optimization",
 ]
@@ -25,6 +25,8 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
@@ -36,7 +38,7 @@ dependencies = [
 
 [project.optional-dependencies]
 medical = ["wfdb>=4.1"]
-test = ["pytest>=8", "ruff>=0.12"]
+test = ["pytest>=8,<10", "ruff>=0.12"]
 
 [project.urls]
 Homepage = "https://github.com/pixelhero98/GenODE-Inference"
@@ -50,24 +52,24 @@ genode-train-backbone = "genode.training.train_backbone:main"
 genode-prepare-molecule-xyz = "genode.data.prepare_molecule_xyz:main"
 genode-train-molecule-backbone = "genode.training.train_molecule_backbone:main"
 genode-evaluate-molecule-backbone = "genode.evaluation.molecule_metrics:main"
-genode-train-gipo = "genode.gipo.train_gipo:main"
-genode-preflight-gipo-rows = "genode.gipo.preflight:main"
-genode-report-gipo-locked-test = "genode.gipo.report_locked_test:main"
-genode-build-ser-ptg-reference = "genode.gipo.ser_ptg_reference:main"
-genode-evaluate-schedule-summary = "genode.gipo.evaluate_schedule_summary:main"
+genode-train-gico = "genode.gico.train_gico:main"
+genode-preflight-gico-rows = "genode.gico.preflight:main"
+genode-report-gico-locked-test = "genode.gico.report_locked_test:main"
+genode-build-ser-ptg-reference = "genode.gico.ser_ptg_reference:main"
+genode-evaluate-schedule-summary = "genode.gico.evaluate_schedule_summary:main"
 genode-build-hardness-figure = "genode.visualization.build_hardness_mismatch_figure:main"
 genode-build-ptg-figure = "genode.visualization.build_ptg_observed_gain_figure:main"
 genode-package-backbone-family = "genode.backbone_packages:package_main"
 genode-validate-backbone-package = "genode.backbone_packages:validate_main"
+genode-build-release-archive = "genode.release_bundles:main"
 genode-collect-flow-map-demonstrations = "genode.distillation.demonstrations:main"
 genode-train-flow-map = "genode.distillation.training:main"
 genode-evaluate-flow-map = "genode.distillation.evaluation:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-"genode.schedule_transfer" = ["otflow_external_schedule_catalog.json"]
+include = ["genode*"]
+namespaces = false
 
 [tool.ruff]
 line-length = 120

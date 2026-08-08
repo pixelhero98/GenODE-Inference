@@ -8,10 +8,14 @@ from typing import TextIO
 import torch
 
 
+def default_torch_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def resolve_torch_device(requested: str | None = None) -> torch.device:
     value = str(requested or "auto").strip().lower()
     if value in {"", "auto"}:
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(default_torch_device())
     if value.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"Requested device {requested!r}, but CUDA is not available.")
     return torch.device(value)

@@ -8,13 +8,13 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 import numpy as np
 
-from genode.data.otflow_paths import project_outputs_root
+from genode.data.otflow_paths import project_root
 from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, TRANSFER_SCHEDULE_KEYS, build_schedule_grid, schedule_display_name
 from genode.schedule_transfer.otflow_signal_traces import NATIVE_INFO_GROWTH_TRACE_KEY
 
-DEFAULT_OUTPUT_ROOT = project_outputs_root()
-DEFAULT_RESULTS_DIR = DEFAULT_OUTPUT_ROOT / "native_info_growth_hardness"
-DEFAULT_FIGURE_DIR = DEFAULT_OUTPUT_ROOT / "figures"
+PROJECT_ROOT = project_root()
+DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results" / "native_info_growth_hardness"
+DEFAULT_FIGURE_DIR = PROJECT_ROOT / "figures"
 DEFAULT_INPUT_JSON = DEFAULT_RESULTS_DIR / "native_info_growth_payload.json"
 DEFAULT_PNG = DEFAULT_FIGURE_DIR / "native_info_growth_schedule_trace.png"
 DEFAULT_PDF = DEFAULT_FIGURE_DIR / "native_info_growth_schedule_trace.pdf"
@@ -26,7 +26,11 @@ DATASET_ORDER = (
 )
 SCHEDULE_ORDER = BASELINE_SCHEDULE_KEYS
 NATIVE_HARDNESS_TRACE_KEY = NATIVE_INFO_GROWTH_TRACE_KEY
-REPORT_TRACE_NAME = "native_info_growth"
+PAPER_FACING_TRACE_NAME = "native_info_growth"
+
+
+def parse_csv(text: str) -> List[str]:
+    return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
 def validate_time_grid(grid: Sequence[float], *, name: str = "time_grid") -> np.ndarray:
@@ -51,19 +55,19 @@ def normalize_trace(values: Sequence[float]) -> List[float]:
     return [float(x) for x in (arr / mean).tolist()]
 
 
-def schedule_node_summary(scheduler_key: str, macro_steps: int) -> Dict[str, Any]:
-    key = str(scheduler_key).strip().lower()
+def schedule_node_summary(schedule_key: str, runtime_nfe: int) -> Dict[str, Any]:
+    key = str(schedule_key).strip().lower()
     if key not in SCHEDULE_ORDER:
-        raise ValueError(f"Unsupported active schedule {scheduler_key!r}.")
-    grid = build_schedule_grid(key, int(macro_steps))
+        raise ValueError(f"Unsupported active schedule {schedule_key!r}.")
+    grid = build_schedule_grid(key, int(runtime_nfe))
     if grid is None:
         raise ValueError(f"Could not build active schedule {key!r}.")
     arr = validate_time_grid(grid, name=f"{key}_grid")
     widths = np.diff(arr)
     return {
-        "scheduler_key": key,
-        "scheduler_name": schedule_display_name(key),
-        "macro_steps": int(macro_steps),
+        "schedule_key": key,
+        "schedule_name": schedule_display_name(key),
+        "runtime_nfe": int(runtime_nfe),
         "time_grid": [float(x) for x in arr.tolist()],
         "min_step": float(np.min(widths)),
         "max_step": float(np.max(widths)),
@@ -72,18 +76,18 @@ def schedule_node_summary(scheduler_key: str, macro_steps: int) -> Dict[str, Any
     }
 
 
-def synthetic_payload(*, macro_steps: int = 10) -> Dict[str, Any]:
+def synthetic_payload(*, runtime_nfe: int = 10) -> Dict[str, Any]:
     reference_grid = np.linspace(0.0, 1.0, 41, dtype=np.float64)
     mid = 0.5 * (reference_grid[:-1] + reference_grid[1:])
     trace = 0.45 + 0.35 * np.sin(np.pi * mid) ** 2 + 0.20 * mid
     return {
         "artifact": "native_info_growth_hardness_payload",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "report_trace": REPORT_TRACE_NAME,
+        "paper_facing_trace": PAPER_FACING_TRACE_NAME,
         "native_trace_key": NATIVE_HARDNESS_TRACE_KEY,
         "reference_time_grid": [float(x) for x in reference_grid.tolist()],
         "native_info_growth_trace": normalize_trace(trace),
-        "schedule_nodes": [schedule_node_summary(key, int(macro_steps)) for key in SCHEDULE_ORDER],
+        "schedule_nodes": [schedule_node_summary(key, int(runtime_nfe)) for key in SCHEDULE_ORDER],
     }
 
 
@@ -111,11 +115,11 @@ def build_figure(payload: Mapping[str, Any]):
     rows = list(payload.get("schedule_nodes", []))
     y_positions = np.arange(len(rows), dtype=np.float64)
     for y, row in zip(y_positions, rows):
-        grid = validate_time_grid(row["time_grid"], name=f"{row['scheduler_key']}_grid")
+        grid = validate_time_grid(row["time_grid"], name=f"{row['schedule_key']}_grid")
         color = "#1B4E9B" if bool(row.get("is_transfer_schedule")) else "#666666"
         ax_nodes.vlines(grid, y - 0.34, y + 0.34, color=color, linewidth=1.0)
     ax_nodes.set_yticks(y_positions)
-    ax_nodes.set_yticklabels([str(row["scheduler_name"]) for row in rows])
+    ax_nodes.set_yticklabels([str(row["schedule_name"]) for row in rows])
     ax_nodes.set_xlabel("Flow time")
     ax_nodes.set_xlim(0.0, 1.0)
     ax_nodes.grid(True, axis="x", color="#E5E5E5", linewidth=0.8)
@@ -141,7 +145,7 @@ def build_argparser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     synth = sub.add_parser("synthetic", help="Write a lightweight native info-growth payload.")
     synth.add_argument("--out-json", type=Path, default=DEFAULT_INPUT_JSON)
-    synth.add_argument("--macro-steps", type=int, default=10)
+    synth.add_argument("--runtime-nfe", type=int, default=10)
     plot = sub.add_parser("plot", help="Render a native info-growth payload.")
     plot.add_argument("--input-json", type=Path, default=DEFAULT_INPUT_JSON)
     plot.add_argument("--png", type=Path, default=DEFAULT_PNG)
@@ -153,7 +157,7 @@ def build_argparser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> Dict[str, Any]:
     args = build_argparser().parse_args(argv)
     if args.command == "synthetic":
-        payload = synthetic_payload(macro_steps=int(args.macro_steps))
+        payload = synthetic_payload(runtime_nfe=int(args.runtime_nfe))
         write_payload(payload, Path(args.out_json))
         return {"json": str(args.out_json), "payload": payload}
     if args.command == "plot":

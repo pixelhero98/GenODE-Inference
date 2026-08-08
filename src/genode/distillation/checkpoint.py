@@ -19,13 +19,14 @@ from genode.checkpoint_validation import (
 )
 from genode.distillation.artifacts import CHECKPOINT_PROTOCOL, validate_context_binding
 from genode.distillation.model import EndpointFlowMap, FlowMapSampler
-from genode.experiment_layout import scenario_family_for_key
-from genode.gipo.models import (
+from genode.distillation.validation import setting_encoder_config_from_payload
+from genode.canonical_experiment_layout import scenario_family_for_key
+from genode.gico.models import (
     SettingEncoderConfig,
-    setting_encoder_config_from_payload,
     setting_feature_dim,
 )
 from genode.models.config import OTFlowConfig
+from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
 from genode.path_safety import is_link_or_reparse_point
 from genode.provenance import file_sha256
 
@@ -175,13 +176,13 @@ def save_flow_map_checkpoint(
     flow_map: EndpointFlowMap,
     *,
     backbone_checkpoint: str | Path,
-    gipo_checkpoint: str | Path,
+    gico_checkpoint: str | Path,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig,
     training_summary: Mapping[str, Any],
     demonstration_manifest_sha256: str,
     demonstration_metadata: Mapping[str, Any] | None = None,
     expected_backbone_checkpoint_sha256: str | None = None,
-    expected_gipo_checkpoint_sha256: str | None = None,
+    expected_gico_checkpoint_sha256: str | None = None,
     overwrite: bool = False,
 ) -> Path:
     """Write one portable, final flow-map checkpoint.
@@ -197,12 +198,12 @@ def save_flow_map_checkpoint(
         )
     target = lexical_target.parent.resolve() / lexical_target.name
     backbone_path = Path(backbone_checkpoint).expanduser().resolve()
-    gipo_path = Path(gipo_checkpoint).expanduser().resolve()
+    gico_path = Path(gico_checkpoint).expanduser().resolve()
     if not backbone_path.is_file():
         raise ValueError(f"Backbone checkpoint does not exist: {backbone_path.name!r}.")
-    if not gipo_path.is_file():
-        raise ValueError(f"GIPO checkpoint does not exist: {gipo_path.name!r}.")
-    if target in {backbone_path, gipo_path}:
+    if not gico_path.is_file():
+        raise ValueError(f"GICO checkpoint does not exist: {gico_path.name!r}.")
+    if target in {backbone_path, gico_path}:
         raise ValueError("Flow-map output checkpoint must differ from every source checkpoint.")
     if target.exists() and not bool(overwrite):
         raise FileExistsError(
@@ -217,10 +218,10 @@ def save_flow_map_checkpoint(
             "backbone",
         ),
         (
-            gipo_path,
-            expected_gipo_checkpoint_sha256,
-            "gipo_checkpoint_sha256",
-            "GIPO",
+            gico_path,
+            expected_gico_checkpoint_sha256,
+            "gico_checkpoint_sha256",
+            "GICO",
         ),
     ):
         actual_hash = file_sha256(source_path)
@@ -245,6 +246,18 @@ def save_flow_map_checkpoint(
         label="Flow-map training summary",
         required_root_keys=("locked_test_used_for_selection",),
     )
+    if "context_embedding_kind" in summary:
+        raise ValueError(
+            "Flow-map training summary may not contain the retired context_embedding_kind field."
+        )
+    if (
+        str(summary.get("context_embedding_protocol", ""))
+        != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
+    ):
+        raise ValueError(
+            "Flow-map training summary context_embedding_protocol must be "
+            f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
+        )
     encoder_config = setting_encoder_config_from_payload(
         setting_encoder_config,
         require_complete=not isinstance(setting_encoder_config, SettingEncoderConfig),
@@ -254,6 +267,14 @@ def save_flow_map_checkpoint(
     demonstration_family = ""
     if demonstration_metadata is not None:
         metadata = dict(demonstration_metadata)
+        if (
+            str(metadata.get("context_embedding_protocol", ""))
+            != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
+        ):
+            raise ValueError(
+                "Demonstration metadata context_embedding_protocol must be "
+                f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
+            )
         raw_binding = metadata.get("context_binding")
         if not isinstance(raw_binding, Mapping):
             raise ValueError("Demonstration metadata is missing its context binding.")
@@ -317,7 +338,7 @@ def load_flow_map_checkpoint(
     *,
     device: torch.device | str = "cpu",
     backbone_checkpoint: str | Path | None = None,
-    gipo_checkpoint: str | Path | None = None,
+    gico_checkpoint: str | Path | None = None,
 ) -> tuple[EndpointFlowMap, dict[str, Any]]:
     checkpoint_path = Path(path).expanduser().resolve()
     try:
@@ -341,7 +362,7 @@ def load_flow_map_checkpoint(
         )
     for hash_key in (
         "backbone_checkpoint_sha256",
-        "gipo_checkpoint_sha256",
+        "gico_checkpoint_sha256",
         "demonstration_manifest_sha256",
     ):
         if re.fullmatch(r"[0-9a-f]{64}", str(payload.get(hash_key, ""))) is None:
@@ -354,6 +375,19 @@ def load_flow_map_checkpoint(
         label="Flow-map checkpoint training_summary",
         required_root_keys=("locked_test_used_for_selection",),
     )
+    if "context_embedding_kind" in training_summary:
+        raise ValueError(
+            "Flow-map checkpoint training_summary may not contain the retired "
+            "context_embedding_kind field."
+        )
+    if (
+        str(training_summary.get("context_embedding_protocol", ""))
+        != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
+    ):
+        raise ValueError(
+            "Flow-map checkpoint training_summary context_embedding_protocol must be "
+            f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
+        )
     raw_context_binding = payload.get("demonstration_context_binding")
     if raw_context_binding is not None:
         if not isinstance(raw_context_binding, Mapping):
@@ -397,7 +431,7 @@ def load_flow_map_checkpoint(
         raise ValueError("Flow-map checkpoint has invalid quality-gate metadata.")
     for source_path, hash_key, label in (
         (backbone_checkpoint, "backbone_checkpoint_sha256", "backbone"),
-        (gipo_checkpoint, "gipo_checkpoint_sha256", "GIPO"),
+        (gico_checkpoint, "gico_checkpoint_sha256", "GICO"),
     ):
         if source_path is None:
             continue
@@ -497,7 +531,7 @@ def load_flow_map_sampler(
     path: str | Path,
     *,
     backbone_checkpoint: str | Path,
-    gipo_checkpoint: str | Path,
+    gico_checkpoint: str | Path,
     device: torch.device | str = "cpu",
 ) -> tuple[FlowMapSampler, dict[str, Any]]:
     """Load a sampler bound to the exact checkpoints used for distillation."""
@@ -505,22 +539,22 @@ def load_flow_map_sampler(
     from genode.evaluation.otflow_evaluation_support import load_checkpoint_model
 
     backbone_path = Path(backbone_checkpoint).expanduser().resolve()
-    gipo_path = Path(gipo_checkpoint).expanduser().resolve()
+    gico_path = Path(gico_checkpoint).expanduser().resolve()
     flow_map, payload = load_flow_map_checkpoint(
         path,
         device=device,
         backbone_checkpoint=backbone_path,
-        gipo_checkpoint=gipo_path,
+        gico_checkpoint=gico_path,
     )
-    from genode.distillation.gipo_policy import load_gipo_schedule_policy
+    from genode.distillation.gico_policy import load_gico_schedule_policy
 
     backbone_model, _ = load_checkpoint_model(backbone_path, torch.device(device))
-    gipo_policy = load_gipo_schedule_policy(gipo_path, device=device)
+    gico_policy = load_gico_schedule_policy(gico_path, device=device)
     sampler = FlowMapSampler(
         backbone_model,
         flow_map,
         setting_encoder_config=payload["setting_encoder_config"],
-        gipo_policy=gipo_policy,
+        gico_policy=gico_policy,
     )
     return sampler, payload
 

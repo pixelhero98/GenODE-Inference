@@ -2,7 +2,7 @@
 
 Shared utility functions for OTFlow.
 
-Consolidates helpers used across the OTFlow runtime and reference tooling.
+Consolidates helpers used across the OTFlow runtime and paper tooling.
 """
 
 from __future__ import annotations
@@ -69,8 +69,25 @@ def microstructure_series(
     }
 
 
+def keep_last_snapshot_per_bucket(timestamps: np.ndarray, bucket_ns: int) -> np.ndarray:
+    """Return a boolean mask that keeps the last row inside each time bucket."""
+    if timestamps.ndim != 1:
+        raise ValueError("timestamps must be 1D")
+    if len(timestamps) == 0:
+        return np.zeros(0, dtype=bool)
+    if bucket_ns <= 0:
+        return np.ones(len(timestamps), dtype=bool)
+
+    buckets = timestamps.astype(np.int64) // int(bucket_ns)
+    keep = np.empty(len(timestamps), dtype=bool)
+    keep[-1] = True
+    keep[:-1] = buckets[:-1] != buckets[1:]
+    return keep
+
+
 __all__ = [
     "flatten_dict",
     "unflatten_to_nested",
     "microstructure_series",
+    "keep_last_snapshot_per_bucket",
 ]

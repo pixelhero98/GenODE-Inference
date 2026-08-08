@@ -16,16 +16,16 @@ from genode.data.otflow_paths import resolve_project_path
 MEASUREMENT_PROTOCOL = "flow_map_quality_measurement"
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 QUALITY_EVALUATOR_SOURCE_FILES = (
+    "canonical_experiment_layout.py",
     "checkpoint_validation.py",
     "data/otflow_paths.py",
     "distillation/artifacts.py",
     "distillation/checkpoint.py",
     "distillation/evaluation.py",
     "distillation/measurement_protocol.py",
-    "experiment_layout.py",
-    "gipo/density_representation.py",
-    "gipo/models.py",
-    "gipo/objectives.py",
+    "gico/density_representation.py",
+    "gico/models.py",
+    "gico/objectives.py",
     "path_safety.py",
     "provenance.py",
     "schedule_transfer/diffusion_flow_schedules.py",
@@ -118,7 +118,7 @@ def _artifact_binding(values: Any) -> dict[str, str]:
     required = {
         "flow_map_checkpoint_sha256",
         "backbone_checkpoint_sha256",
-        "gipo_checkpoint_sha256",
+        "gico_checkpoint_sha256",
     }
     if not isinstance(values, Mapping) or set(values) != required:
         raise ValueError("Measurement protocol artifact_binding fields are invalid.")

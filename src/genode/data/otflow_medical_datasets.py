@@ -1,43 +1,39 @@
 from __future__ import annotations
 
-import hashlib
-import importlib.util
 import json
 import os
+import hashlib
+import importlib.util
 import re
 import shutil
 import stat
 import tempfile
-import time
 import unicodedata
 import zipfile
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 
 from genode.models.config import OTFlowConfig
+from genode.path_safety import (
+    is_link_or_reparse_point,
+    portable_relative_path,
+    resolve_portable_relative_path,
+)
 from genode.data.otflow_medical_constants import (
     LONG_TERM_ST_DATASET_KEY,
+    LONG_TERM_ST_DEFAULT_STRIDE,
     LONG_TERM_ST_FREQUENCY_LABEL,
     LONG_TERM_ST_HISTORY_LEN,
     LONG_TERM_ST_HORIZON_LEN,
     LONG_TERM_ST_SAMPLING_RATE_HZ,
     LONG_TERM_ST_SOURCE_SAMPLING_RATE_HZ,
-    LONG_TERM_ST_STRIDE,
-    long_term_st_manifest_path,
+    default_long_term_st_data_path,
+    default_long_term_st_manifest_path,
 )
-from genode.data.otflow_paths import long_term_st_data_path
-from genode.path_safety import (
-    first_link_or_reparse_component,
-    is_link_or_reparse_point,
-    portable_relative_path,
-    resolve_portable_relative_path,
-)
-from genode.provenance import file_sha256
 
 LONG_TERM_ST_EXPECTED_RECORDS = 86
 LONG_TERM_ST_PATIENT_GROUPS: Tuple[Tuple[str, ...], ...] = (
@@ -46,18 +42,6 @@ LONG_TERM_ST_PATIENT_GROUPS: Tuple[Tuple[str, ...], ...] = (
     ("s30741", "s30742"),
     ("s30751", "s30752"),
 )
-_LONG_TERM_ST_PROMOTION_PROTOCOL = "long_term_st_dataset_promotion"
-_LONG_TERM_ST_PROMOTION_VERSION = 1
-_LONG_TERM_ST_PROMOTION_FIELDS = {
-    "protocol",
-    "version",
-    "target_name",
-    "staging_name",
-    "staging_artifact_sha256",
-    "previous_kind",
-    "backup_name",
-    "backup_artifact_sha256",
-}
 
 def medical_staging_root() -> Path:
     raw = str(os.environ.get("OTFLOW_MEDICAL_STAGING_ROOT", "") or "").strip()
@@ -121,30 +105,26 @@ def _ascii_file_slug(name: str, *, fallback: str) -> str:
     return slug
 
 
-def _safe_channel_name(name: str, *, channel_index: int, used_slugs: set[str]) -> str:
-    base = _ascii_file_slug(name, fallback=f"channel_{int(channel_index)}")
+def _unique_file_slug(base: str, *, index: int, used_slugs: set[str]) -> str:
     candidate = base
     if candidate.casefold() in used_slugs:
-        candidate = f"{base}_{int(channel_index)}"
+        candidate = f"{base}_{int(index)}"
     suffix = 2
     while candidate.casefold() in used_slugs:
-        candidate = f"{base}_{int(channel_index)}_{suffix}"
+        candidate = f"{base}_{int(index)}_{suffix}"
         suffix += 1
     used_slugs.add(candidate.casefold())
     return candidate
+
+
+def _safe_channel_name(name: str, *, channel_index: int, used_slugs: set[str]) -> str:
+    base = _ascii_file_slug(name, fallback=f"channel_{int(channel_index)}")
+    return _unique_file_slug(base, index=int(channel_index), used_slugs=used_slugs)
 
 
 def _safe_record_name(record_id: str, *, record_index: int, used_slugs: set[str]) -> str:
     base = _ascii_file_slug(record_id, fallback=f"record_{int(record_index)}")
-    candidate = base
-    if candidate.casefold() in used_slugs:
-        candidate = f"{base}_{int(record_index)}"
-    suffix = 2
-    while candidate.casefold() in used_slugs:
-        candidate = f"{base}_{int(record_index)}_{suffix}"
-        suffix += 1
-    used_slugs.add(candidate.casefold())
-    return candidate
+    return _unique_file_slug(base, index=int(record_index), used_slugs=used_slugs)
 
 
 def long_term_st_raw_archive_dir() -> Path:
@@ -219,6 +199,14 @@ def _require_wfdb_for_long_term_st_preparation() -> None:
         )
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _parse_long_term_st_header(record_id: str, text: str) -> LongTermSTHeader:
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     if not lines:
@@ -237,7 +225,10 @@ def _parse_long_term_st_header(record_id: str, text: str) -> LongTermSTHeader:
         parts = line.split()
         if not parts:
             raise ValueError(f"Malformed signal line {channel_index} for {record_id}.")
-        dat_names.append(Path(parts[0]).name)
+        dat_path = portable_relative_path(parts[0], label=f"WFDB data file for {record_id}")
+        if len(dat_path.parts) != 1 or dat_path.suffix.casefold() != ".dat":
+            raise ValueError(f"WFDB data file for {record_id} must be a .dat basename: {parts[0]!r}.")
+        dat_names.append(dat_path.name)
         channel_names.append(str(parts[-1]) if len(parts) > 1 else f"channel_{channel_index}")
     return LongTermSTHeader(
         record_id=str(record_id),
@@ -258,15 +249,22 @@ def _scan_long_term_st_archives(archive_paths: Sequence[Path]) -> Tuple[Dict[str
             {
                 "name": str(archive_path.name),
                 "size_bytes": int(archive_path.stat().st_size),
-                "sha256": file_sha256(archive_path),
+                "sha256": _sha256_file(archive_path),
             }
         )
         with zipfile.ZipFile(archive_path) as zf:
             for info in zf.infolist():
+                unix_mode = int(info.external_attr) >> 16
+                if stat.S_ISLNK(unix_mode):
+                    raise ValueError(f"Long-Term ST archive contains a symbolic link: {info.filename!r}.")
+                file_type = stat.S_IFMT(unix_mode)
+                if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                    raise ValueError(f"Long-Term ST archive contains a special file: {info.filename!r}.")
                 if info.is_dir():
                     continue
-                member_name = str(info.filename)
-                base_name = Path(member_name).name
+                member_path = portable_relative_path(str(info.filename), label="Long-Term ST archive member")
+                member_name = member_path.as_posix()
+                base_name = member_path.name
                 lower = base_name.lower()
                 if lower.endswith(".hea"):
                     record_id = Path(base_name).stem
@@ -283,34 +281,54 @@ def _copy_zip_member(member: Tuple[Path, str], *, target_root: Path, target_name
     if len(relative.parts) != 1:
         raise ValueError(f"Long-Term ST extraction file must be a basename: {target_name!r}.")
     absolute_target_root = target_root.expanduser().absolute()
-    indirect = first_link_or_reparse_component(
-        absolute_target_root,
-        root=Path(absolute_target_root.anchor),
-    )
-    if indirect is not None:
+    if is_link_or_reparse_point(absolute_target_root):
         raise ValueError(
-            "Long-Term ST extraction destination traverses a symlink, junction, or reparse point: "
-            f"{indirect}."
+            "Long-Term ST extraction destination may not be a symlink, junction, or reparse point: "
+            f"{absolute_target_root}."
         )
-    target_root.mkdir(parents=True, exist_ok=True)
-    indirect = first_link_or_reparse_component(
-        absolute_target_root,
-        root=Path(absolute_target_root.anchor),
-    )
-    if indirect is not None:
+    if absolute_target_root.exists() and not absolute_target_root.is_dir():
         raise ValueError(
-            "Long-Term ST extraction destination traverses a symlink, junction, or reparse point: "
-            f"{indirect}."
+            f"Long-Term ST extraction destination must be a directory: {absolute_target_root}."
         )
+    absolute_target_root.mkdir(parents=True, exist_ok=True)
+    if is_link_or_reparse_point(absolute_target_root):
+        raise ValueError(
+            "Long-Term ST extraction destination may not be a symlink, junction, or reparse point: "
+            f"{absolute_target_root}."
+        )
+    canonical_target_root = absolute_target_root.resolve(strict=True)
     target = resolve_portable_relative_path(
-        target_root,
+        canonical_target_root,
         relative.as_posix(),
         label="Long-Term ST extraction file",
         reject_links=True,
     )
+    if target.exists() and not target.is_file():
+        raise ValueError(f"Long-Term ST extraction target must be a regular file: {target}.")
+    temporary: Path | None = None
     with zipfile.ZipFile(archive_path) as zf:
-        with zf.open(member_name) as src, target.open("wb") as dst:
-            shutil.copyfileobj(src, dst, length=1024 * 1024)
+        info = zf.getinfo(member_name)
+        unix_mode = int(info.external_attr) >> 16
+        if stat.S_ISLNK(unix_mode):
+            raise ValueError(f"Long-Term ST archive contains a symbolic link: {member_name!r}.")
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=canonical_target_root,
+                prefix=f".{target.name}.",
+                suffix=".extract",
+                delete=False,
+            ) as dst:
+                temporary = Path(dst.name)
+                with zf.open(info) as src:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+            if temporary.stat().st_size != int(info.file_size):
+                raise zipfile.BadZipFile(f"Long-Term ST archive member size mismatch: {member_name!r}.")
+            temporary.replace(target)
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def _extract_long_term_st_wfdb_members(
@@ -321,47 +339,47 @@ def _extract_long_term_st_wfdb_members(
     dat_members: Mapping[str, Tuple[Path, str]],
 ) -> List[str]:
     absolute_source_dir = source_dir.expanduser().absolute()
-    indirect = first_link_or_reparse_component(
-        absolute_source_dir,
-        root=Path(absolute_source_dir.anchor),
-    )
-    if indirect is not None:
+    if is_link_or_reparse_point(absolute_source_dir):
         raise ValueError(
-            "Long-Term ST extraction destination may not traverse a symlink, junction, "
-            f"or reparse point: {indirect}."
+            "Long-Term ST extraction destination may not be a symlink, junction, or reparse point: "
+            f"{absolute_source_dir}."
         )
-    source_dir.mkdir(parents=True, exist_ok=True)
-    indirect = first_link_or_reparse_component(
-        absolute_source_dir,
-        root=Path(absolute_source_dir.anchor),
-    )
-    if indirect is not None:
+    if absolute_source_dir.exists() and not absolute_source_dir.is_dir():
         raise ValueError(
-            "Long-Term ST extraction destination may not traverse a symlink, junction, "
-            f"or reparse point: {indirect}."
+            f"Long-Term ST extraction destination must be a directory: {absolute_source_dir}."
         )
+    absolute_source_dir.mkdir(parents=True, exist_ok=True)
+    if is_link_or_reparse_point(absolute_source_dir):
+        raise ValueError(
+            "Long-Term ST extraction destination may not be a symlink, junction, or reparse point: "
+            f"{absolute_source_dir}."
+        )
+    absolute_source_dir = absolute_source_dir.resolve(strict=True)
     missing_dat_names: List[str] = []
 
     header_members: Dict[str, Tuple[Path, str]] = {}
     for archive_path in archive_paths:
         with zipfile.ZipFile(archive_path) as zf:
             for info in zf.infolist():
-                if not info.is_dir() and Path(info.filename).name.lower().endswith(".hea"):
-                    header_members[Path(info.filename).name] = (archive_path, str(info.filename))
+                if info.is_dir():
+                    continue
+                member_path = portable_relative_path(str(info.filename), label="Long-Term ST archive member")
+                if member_path.name.lower().endswith(".hea"):
+                    header_members[member_path.name] = (archive_path, member_path.as_posix())
 
     for record_id in sorted(headers):
         header_name = f"{record_id}.hea"
         member = header_members.get(header_name)
         if member is None:
             continue
-        _copy_zip_member(member, target_root=source_dir, target_name=header_name)
+        _copy_zip_member(member, target_root=absolute_source_dir, target_name=header_name)
 
     for dat_name in sorted({name for header in headers.values() for name in header.dat_names}):
         member = dat_members.get(dat_name)
         if member is None:
             missing_dat_names.append(str(dat_name))
             continue
-        _copy_zip_member(member, target_root=source_dir, target_name=dat_name)
+        _copy_zip_member(member, target_root=absolute_source_dir, target_name=dat_name)
     return missing_dat_names
 
 
@@ -384,6 +402,14 @@ def _split_long_term_st_groups(group_ids: Sequence[str], train_frac: float, val_
         else:
             split_by_group[group_id] = "test"
     return split_by_group
+
+
+def _is_relative_to_path(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def _iter_manifest_strings(value: Any) -> Iterable[str]:
@@ -413,27 +439,34 @@ def _looks_like_local_path(value: str) -> bool:
         "/" + "users/",
         "/" + "mnt/",
         "/" + "tmp/",
+        "py" + "charmprojects",
     )
     return any(marker in lowered for marker in markers)
 
 
 def _validate_long_term_st_series_file_name(file_name: Any, prepared_dir: Path) -> Path:
-    text = str(file_name or "")
-    posix = portable_relative_path(text, label="Long-Term ST manifest series file")
+    text = str(file_name or "").strip()
+    if not text:
+        raise ValueError("Long-Term ST manifest contains an empty series file name.")
+    if "\\" in text or "\x00" in text:
+        raise ValueError(f"Long-Term ST manifest contains an unsafe series file name: {text!r}.")
+
+    posix = PurePosixPath(text)
+    windows = PureWindowsPath(text)
+    if posix.is_absolute() or bool(windows.drive) or bool(windows.root):
+        raise ValueError(f"Long-Term ST manifest series file must be relative: {text!r}.")
+    if any(part in {"", ".", ".."} for part in posix.parts):
+        raise ValueError(f"Long-Term ST manifest series file may not traverse directories: {text!r}.")
     if not posix.parts or posix.parts[0] != "series" or posix.suffix != ".npy":
         raise ValueError(f"Long-Term ST manifest series file must live under series/*.npy: {text!r}.")
-    return resolve_portable_relative_path(
-        prepared_dir,
-        posix.as_posix(),
-        label="Long-Term ST manifest series file",
-        reject_links=True,
-    )
+
+    resolved = (prepared_dir / Path(*posix.parts)).resolve()
+    if not _is_relative_to_path(resolved, prepared_dir):
+        raise ValueError(f"Long-Term ST manifest series file escapes the prepared directory: {text!r}.")
+    return resolved
 
 
-def _validate_long_term_st_manifest_series_specs(
-    payload: Mapping[str, Any],
-    manifest_path: Path,
-) -> None:
+def _validate_long_term_st_manifest_series_specs(payload: Mapping[str, Any], manifest_path: Path) -> None:
     rows = payload.get("series_specs")
     if not isinstance(rows, list) or not rows:
         raise ValueError("Long-Term ST manifest must contain non-empty series_specs.")
@@ -441,9 +474,6 @@ def _validate_long_term_st_manifest_series_specs(
     prepared_dir = manifest_path.parent.resolve()
     group_split: Dict[str, str] = {}
     split_counts = {"train": 0, "val": 0, "test": 0}
-    seen_series_ids: set[str] = set()
-    managed_file_names: set[str] = set()
-    seen_file_identities: set[str] = set()
     known_group_by_record = {
         record_id: "_".join(group)
         for group in LONG_TERM_ST_PATIENT_GROUPS
@@ -452,18 +482,6 @@ def _validate_long_term_st_manifest_series_specs(
     for idx, row in enumerate(rows):
         if not isinstance(row, Mapping):
             raise ValueError(f"Long-Term ST series_specs[{idx}] must be an object.")
-        series_id = str(row.get("series_id", "") or "").strip()
-        if not series_id:
-            raise ValueError(f"Long-Term ST series_specs[{idx}] must include series_id.")
-        if series_id in seen_series_ids:
-            raise ValueError(f"Long-Term ST manifest contains duplicate series_id={series_id!r}.")
-        seen_series_ids.add(series_id)
-        file_name = str(row.get("file_name", "") or "")
-        file_identity = file_name.casefold()
-        if file_identity in seen_file_identities:
-            raise ValueError(f"Long-Term ST manifest contains duplicate file_name={file_name!r}.")
-        seen_file_identities.add(file_identity)
-        managed_file_names.add(file_name)
         split = str(row.get("split", "")).strip()
         if split not in split_counts:
             raise ValueError(f"Long-Term ST series_specs[{idx}] has invalid split={split!r}.")
@@ -487,712 +505,29 @@ def _validate_long_term_st_manifest_series_specs(
                 f"{prior_split!r} and {split!r}."
             )
 
-        resolved_file = _validate_long_term_st_series_file_name(file_name, prepared_dir)
-        if not resolved_file.is_file():
+        resolved_file = _validate_long_term_st_series_file_name(row.get("file_name"), prepared_dir)
+        if not resolved_file.exists():
             raise ValueError(f"Long-Term ST series file is missing: {row.get('file_name')!r}.")
 
     empty_splits = [split for split, count in split_counts.items() if int(count) <= 0]
     if empty_splits:
         raise ValueError(f"Long-Term ST manifest has empty split(s): {', '.join(empty_splits)}.")
 
-    managed_files = {manifest_path.name, *managed_file_names}
-    managed_directories: set[str] = set()
-    for file_name in managed_file_names:
-        parent = PurePosixPath(file_name).parent
-        while parent != PurePosixPath("."):
-            managed_directories.add(parent.as_posix())
-            parent = parent.parent
 
-    def raise_walk_error(error: OSError) -> None:
-        raise ValueError(
-            f"Could not inspect Long-Term ST prepared output safely: {error}."
-        ) from error
-
-    for root_text, directory_names, file_names in os.walk(
-        prepared_dir,
-        topdown=True,
-        followlinks=False,
-        onerror=raise_walk_error,
-    ):
-        root = Path(root_text)
-        for name in directory_names:
-            candidate = root / name
-            if is_link_or_reparse_point(candidate):
-                raise ValueError(
-                    "Long-Term ST prepared output may not contain symlinks, junctions, "
-                    f"or reparse points: {candidate}."
-                )
-            relative = candidate.relative_to(prepared_dir).as_posix()
-            if relative not in managed_directories:
-                raise ValueError(
-                    f"Long-Term ST prepared output contains an unmanaged directory: {relative!r}."
-                )
-        for name in file_names:
-            candidate = root / name
-            if is_link_or_reparse_point(candidate):
-                raise ValueError(
-                    "Long-Term ST prepared output may not contain symlinks, junctions, "
-                    f"or reparse points: {candidate}."
-                )
-            relative = candidate.relative_to(prepared_dir).as_posix()
-            if relative in managed_files:
-                continue
-            raise ValueError(
-                f"Long-Term ST prepared output contains an unmanaged file: {relative!r}."
-            )
-
-
-def _long_term_st_manifest_task_lengths(payload: Mapping[str, Any]) -> Tuple[int, int]:
-    values: list[int] = []
-    for field in ("history_len", "future_block_len"):
-        value = payload.get(field)
-        if isinstance(value, bool) or not isinstance(value, int) or int(value) <= 0:
-            raise ValueError(
-                f"Long-Term ST manifest {field} must be a positive integer, got {value!r}."
-            )
-        values.append(int(value))
-    return values[0], values[1]
-
-
-def _validate_long_term_st_manifest(
-    path: Path,
-    *,
-    history_len: int | None,
-    horizon: int | None,
-) -> Dict[str, Any]:
+def _validate_long_term_st_manifest(path: Path, *, history_len: int, horizon: int) -> Dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if str(payload.get("dataset_key")) != LONG_TERM_ST_DATASET_KEY:
         raise ValueError(f"Unexpected Long-Term ST manifest dataset_key={payload.get('dataset_key')!r}.")
-    declared_history_len, declared_horizon = _long_term_st_manifest_task_lengths(payload)
-    if (history_len is None) != (horizon is None):
-        raise ValueError("Long-Term ST manifest validation requires both task lengths or neither.")
-    expected_history_len = declared_history_len if history_len is None else int(history_len)
-    expected_horizon = declared_horizon if horizon is None else int(horizon)
-    if declared_history_len != expected_history_len or declared_horizon != expected_horizon:
+    if int(payload.get("history_len", -1)) != int(history_len) or int(payload.get("future_block_len", -1)) != int(horizon):
         raise ValueError(
             "Existing Long-Term ST manifest does not match requested task: "
             f"history_len={payload.get('history_len')}, future_block_len={payload.get('future_block_len')}, "
-            f"requested history_len={expected_history_len}, horizon={expected_horizon}."
+            f"requested history_len={int(history_len)}, horizon={int(horizon)}."
         )
     if any(_looks_like_local_path(value) for value in _iter_manifest_strings(payload)):
         raise ValueError("Existing Long-Term ST manifest contains local filesystem paths; regenerate it.")
     _validate_long_term_st_manifest_series_specs(payload, path)
     return payload
-
-
-def _validate_long_term_st_output_root(
-    prepared_dir: Path,
-    *,
-    force: bool,
-    history_len: int,
-    horizon: int,
-) -> Dict[str, Any] | None:
-    if not prepared_dir.exists():
-        return None
-    if is_link_or_reparse_point(prepared_dir) or not prepared_dir.is_dir():
-        raise ValueError(
-            "Long-Term ST prepared destination must be a regular directory, not a "
-            "symlink, junction, reparse point, or file: "
-            f"{prepared_dir}."
-        )
-    if not any(prepared_dir.iterdir()):
-        return None
-    manifest_path = long_term_st_manifest_path(prepared_dir)
-    if not manifest_path.is_file() or is_link_or_reparse_point(manifest_path):
-        raise ValueError(
-            "A non-empty Long-Term ST prepared destination requires an intact regular manifest."
-        )
-    return _validate_long_term_st_manifest(
-        manifest_path,
-        history_len=None if bool(force) else int(history_len),
-        horizon=None if bool(force) else int(horizon),
-    )
-
-
-def _is_sha256(value: object) -> bool:
-    text = str(value)
-    return len(text) == 64 and all(
-        character in "0123456789abcdef" for character in text
-    )
-
-
-def _sync_long_term_st_directory(directory: Path) -> None:
-    """Persist directory entries where stdlib directory fsync is supported.
-
-    POSIX directory fsync failures are surfaced because they weaken transaction
-    ordering. Windows does not expose portable directory handles through
-    ``os.open``; an attempted directory fsync is therefore best effort there.
-    """
-
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(directory, flags)
-    except OSError:
-        if os.name == "nt":
-            return
-        raise
-    try:
-        try:
-            os.fsync(descriptor)
-        except OSError:
-            if os.name != "nt":
-                raise
-    finally:
-        os.close(descriptor)
-
-
-def _replace_long_term_st_path(source: Path, destination: Path) -> None:
-    if source.is_dir():
-        os.rename(source, destination)
-    else:
-        os.replace(source, destination)
-    _sync_long_term_st_directory(destination.parent)
-
-
-def _unlink_long_term_st_path(path: Path) -> None:
-    path.unlink()
-    _sync_long_term_st_directory(path.parent)
-
-
-def _long_term_st_lock_path(prepared_dir: Path) -> Path:
-    return prepared_dir.with_name(f".{prepared_dir.name}.lock")
-
-
-def _open_long_term_st_lock(path: Path) -> int:
-    if is_link_or_reparse_point(path):
-        raise ValueError("Long-Term ST lock path must be a regular file.")
-    base_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-    base_flags |= getattr(os, "O_NOINHERIT", 0)
-    base_flags |= getattr(os, "O_NOFOLLOW", 0)
-    created = False
-    if path.exists():
-        if not path.is_file():
-            raise ValueError("Long-Term ST lock path must be a regular file.")
-        descriptor = os.open(path, base_flags)
-    else:
-        try:
-            descriptor = os.open(
-                path,
-                base_flags | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
-            created = True
-        except FileExistsError:
-            if is_link_or_reparse_point(path) or not path.is_file():
-                raise ValueError("Long-Term ST lock path must be a regular file.")
-            descriptor = os.open(path, base_flags)
-
-    try:
-        descriptor_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(descriptor_stat.st_mode):
-            raise ValueError("Long-Term ST lock path must be a regular file.")
-        if is_link_or_reparse_point(path) or not path.is_file():
-            raise ValueError("Long-Term ST lock path changed during acquisition.")
-        path_stat = path.stat(follow_symlinks=False)
-        if (
-            int(path_stat.st_dev),
-            int(path_stat.st_ino),
-        ) != (
-            int(descriptor_stat.st_dev),
-            int(descriptor_stat.st_ino),
-        ):
-            raise ValueError("Long-Term ST lock path changed during acquisition.")
-        os.set_inheritable(descriptor, False)
-        if created:
-            os.write(descriptor, b"\0")
-            os.fsync(descriptor)
-            _sync_long_term_st_directory(path.parent)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
-@contextmanager
-def _long_term_st_target_lock(prepared_dir: Path) -> Iterator[Path]:
-    """Hold an interprocess lock for one prepared Long-Term ST target."""
-
-    lock_path = _long_term_st_lock_path(prepared_dir)
-    descriptor = _open_long_term_st_lock(lock_path)
-    try:
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (ImportError, OSError) as exc:
-            raise RuntimeError(
-                f"Long-Term ST target {prepared_dir.name!r} is locked by another preparation process."
-            ) from exc
-        yield lock_path
-    finally:
-        os.close(descriptor)
-
-
-def _long_term_st_promotion_journal_path(prepared_dir: Path) -> Path:
-    return prepared_dir.with_name(f".{prepared_dir.name}.promotion.json")
-
-
-def _long_term_st_promotion_sibling(
-    prepared_dir: Path,
-    name: object,
-    *,
-    kind: str,
-) -> Path:
-    text = str(name)
-    expected_prefix = f".{prepared_dir.name}.{kind}-"
-    if not text or Path(text).name != text or not text.startswith(expected_prefix):
-        raise ValueError(
-            f"Long-Term ST promotion journal contains an invalid {kind} directory name."
-        )
-    path = prepared_dir.parent / text
-    if path == prepared_dir or path == _long_term_st_promotion_journal_path(prepared_dir):
-        raise ValueError(
-            f"Long-Term ST promotion journal contains an unsafe {kind} directory name."
-        )
-    return path
-
-
-def _managed_long_term_st_file_sha256(path: Path, *, sync: bool) -> str:
-    if is_link_or_reparse_point(path) or not path.is_file():
-        raise ValueError("Managed Long-Term ST artifact files must be regular files.")
-    flags = (os.O_RDWR if sync else os.O_RDONLY) | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOINHERIT", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        descriptor_stat = os.fstat(descriptor)
-        path_stat = path.stat(follow_symlinks=False)
-        if (
-            not stat.S_ISREG(descriptor_stat.st_mode)
-            or is_link_or_reparse_point(path)
-            or (int(path_stat.st_dev), int(path_stat.st_ino))
-            != (int(descriptor_stat.st_dev), int(descriptor_stat.st_ino))
-        ):
-            raise ValueError("Managed Long-Term ST artifact file changed during hashing.")
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-        if sync:
-            os.fsync(descriptor)
-        return digest.hexdigest()
-    finally:
-        os.close(descriptor)
-
-
-def _validated_long_term_st_artifact_sha256(
-    root: Path,
-    *,
-    sync: bool = False,
-) -> str:
-    if is_link_or_reparse_point(root) or not root.is_dir():
-        raise ValueError("Managed Long-Term ST artifact must be a regular directory.")
-    root = root.resolve(strict=True)
-    manifest_path = long_term_st_manifest_path(root)
-    if is_link_or_reparse_point(manifest_path) or not manifest_path.is_file():
-        raise ValueError(
-            "Safe Long-Term ST replacement requires an intact regular manifest."
-        )
-    payload = _validate_long_term_st_manifest(
-        manifest_path,
-        history_len=None,
-        horizon=None,
-    )
-    managed_paths = {
-        manifest_path.name: manifest_path,
-        **{
-            str(row["file_name"]): _validate_long_term_st_series_file_name(
-                row["file_name"],
-                root,
-            )
-            for row in payload["series_specs"]
-        },
-    }
-    file_records = [
-        {
-            "path": relative,
-            "sha256": _managed_long_term_st_file_sha256(path, sync=sync),
-        }
-        for relative, path in sorted(managed_paths.items())
-    ]
-    if sync:
-        managed_directories = {root}
-        for path in managed_paths.values():
-            parent = path.parent
-            while parent != root:
-                if root not in parent.parents:
-                    raise ValueError(
-                        "Managed Long-Term ST artifact file escapes its artifact root."
-                    )
-                managed_directories.add(parent)
-                parent = parent.parent
-        for directory in sorted(
-            managed_directories,
-            key=lambda value: len(value.parts),
-            reverse=True,
-        ):
-            _sync_long_term_st_directory(directory)
-        _sync_long_term_st_directory(root.parent)
-    encoded = json.dumps(
-        {
-            "protocol": "long_term_st_managed_artifact",
-            "files": file_records,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _write_long_term_st_promotion_journal(
-    path: Path,
-    record: Mapping[str, object],
-) -> None:
-    if is_link_or_reparse_point(path) or path.exists():
-        raise ValueError(
-            "Refusing to replace an existing Long-Term ST promotion journal "
-            "without recovering it first."
-        )
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(dict(record), handle, sort_keys=True, separators=(",", ":"))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        _replace_long_term_st_path(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _load_long_term_st_promotion_journal(
-    prepared_dir: Path,
-) -> Dict[str, object] | None:
-    path = _long_term_st_promotion_journal_path(prepared_dir)
-    if is_link_or_reparse_point(path):
-        raise ValueError("Long-Term ST promotion journal must be a regular file.")
-    if not path.exists():
-        return None
-    if not path.is_file():
-        raise ValueError("Long-Term ST promotion journal must be a regular file.")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"Could not read Long-Term ST promotion journal safely: {exc}"
-        ) from exc
-    if not isinstance(payload, Mapping) or set(payload) != _LONG_TERM_ST_PROMOTION_FIELDS:
-        raise ValueError("Long-Term ST promotion journal has an invalid schema.")
-    if (
-        payload.get("protocol") != _LONG_TERM_ST_PROMOTION_PROTOCOL
-        or type(payload.get("version")) is not int
-        or payload.get("version") != _LONG_TERM_ST_PROMOTION_VERSION
-        or payload.get("target_name") != prepared_dir.name
-    ):
-        raise ValueError(
-            "Long-Term ST promotion journal identity does not match the requested artifact."
-        )
-    previous_kind = payload.get("previous_kind")
-    if previous_kind not in {"absent", "empty", "artifact"}:
-        raise ValueError(
-            "Long-Term ST promotion journal contains an invalid previous artifact kind."
-        )
-    if not _is_sha256(payload.get("staging_artifact_sha256")):
-        raise ValueError(
-            "Long-Term ST promotion journal contains an invalid staging artifact hash."
-        )
-    _long_term_st_promotion_sibling(
-        prepared_dir,
-        payload.get("staging_name"),
-        kind="staging",
-    )
-    backup_name = payload.get("backup_name")
-    backup_hash = payload.get("backup_artifact_sha256")
-    if previous_kind == "absent":
-        if backup_name != "" or backup_hash != "":
-            raise ValueError(
-                "Long-Term ST promotion journal has an invalid absent-target backup."
-            )
-    else:
-        _long_term_st_promotion_sibling(
-            prepared_dir,
-            backup_name,
-            kind="backup",
-        )
-        if previous_kind == "artifact" and not _is_sha256(backup_hash):
-            raise ValueError(
-                "Long-Term ST promotion journal contains an invalid backup artifact hash."
-            )
-        if previous_kind == "empty" and backup_hash != "":
-            raise ValueError(
-                "Long-Term ST promotion journal has an invalid empty-directory backup hash."
-            )
-    return dict(payload)
-
-
-def _remove_verified_long_term_st_artifact(
-    root: Path,
-    expected_artifact_sha256: str,
-) -> None:
-    actual_hash = _validated_long_term_st_artifact_sha256(root)
-    if actual_hash != expected_artifact_sha256:
-        raise ValueError(
-            "Refusing to remove a Long-Term ST artifact with an unexpected hash."
-        )
-    shutil.rmtree(root)
-    _sync_long_term_st_directory(root.parent)
-
-
-def _discard_obsolete_long_term_st_artifact(
-    root: Path,
-    expected_artifact_sha256: str,
-) -> None:
-    """Remove a known obsolete artifact, preserving anything unexpected."""
-
-    if not root.exists() and not is_link_or_reparse_point(root):
-        return
-    try:
-        _remove_verified_long_term_st_artifact(root, expected_artifact_sha256)
-    except (OSError, ValueError):
-        return
-
-
-def _require_empty_long_term_st_directory(path: Path, *, label: str) -> None:
-    if is_link_or_reparse_point(path) or not path.is_dir() or any(path.iterdir()):
-        raise ValueError(
-            f"Long-Term ST promotion {label} must be an empty regular directory."
-        )
-
-
-def _discard_obsolete_empty_long_term_st_directory(path: Path) -> None:
-    if not path.exists() and not is_link_or_reparse_point(path):
-        return
-    try:
-        _require_empty_long_term_st_directory(path, label="backup")
-        path.rmdir()
-        _sync_long_term_st_directory(path.parent)
-    except (OSError, ValueError):
-        return
-
-
-def _remove_long_term_st_staging_after_failure(
-    staging_dir: Path,
-    prepared_dir: Path,
-) -> None:
-    _long_term_st_promotion_sibling(
-        prepared_dir,
-        staging_dir.name,
-        kind="staging",
-    )
-    if is_link_or_reparse_point(staging_dir) or not staging_dir.is_dir():
-        raise ValueError("Refusing to remove an unsafe Long-Term ST staging path.")
-    for path in staging_dir.rglob("*"):
-        if is_link_or_reparse_point(path):
-            raise ValueError(
-                "Refusing to remove a Long-Term ST staging directory containing links."
-            )
-    shutil.rmtree(staging_dir)
-    _sync_long_term_st_directory(staging_dir.parent)
-
-
-def _prepare_long_term_st_promotion_journal(
-    staging_dir: Path,
-    prepared_dir: Path,
-) -> Dict[str, object]:
-    staging_path = _long_term_st_promotion_sibling(
-        prepared_dir,
-        staging_dir.name,
-        kind="staging",
-    )
-    if staging_path != staging_dir:
-        raise ValueError(
-            "Long-Term ST staging directory must be an absolute sibling of the target."
-        )
-    staging_hash = _validated_long_term_st_artifact_sha256(
-        staging_dir,
-        sync=True,
-    )
-    if not prepared_dir.exists():
-        previous_kind = "absent"
-        backup_name = ""
-        backup_hash = ""
-    else:
-        if is_link_or_reparse_point(prepared_dir) or not prepared_dir.is_dir():
-            raise ValueError("Long-Term ST target must be a regular directory.")
-        backup_dir = prepared_dir.with_name(
-            f".{prepared_dir.name}.backup-{time.time_ns()}"
-        )
-        while backup_dir.exists() or is_link_or_reparse_point(backup_dir):
-            backup_dir = prepared_dir.with_name(
-                f".{prepared_dir.name}.backup-{time.time_ns()}"
-            )
-        backup_name = backup_dir.name
-        if any(prepared_dir.iterdir()):
-            previous_kind = "artifact"
-            backup_hash = _validated_long_term_st_artifact_sha256(prepared_dir)
-        else:
-            previous_kind = "empty"
-            backup_hash = ""
-    record: Dict[str, object] = {
-        "protocol": _LONG_TERM_ST_PROMOTION_PROTOCOL,
-        "version": _LONG_TERM_ST_PROMOTION_VERSION,
-        "target_name": prepared_dir.name,
-        "staging_name": staging_dir.name,
-        "staging_artifact_sha256": staging_hash,
-        "previous_kind": previous_kind,
-        "backup_name": backup_name,
-        "backup_artifact_sha256": backup_hash,
-    }
-    _write_long_term_st_promotion_journal(
-        _long_term_st_promotion_journal_path(prepared_dir),
-        record,
-    )
-    return record
-
-
-def _recover_long_term_st_promotion(prepared_dir: Path) -> None:
-    record = _load_long_term_st_promotion_journal(prepared_dir)
-    if record is None:
-        return
-    journal = _long_term_st_promotion_journal_path(prepared_dir)
-    staging_dir = _long_term_st_promotion_sibling(
-        prepared_dir,
-        record["staging_name"],
-        kind="staging",
-    )
-    staging_hash = str(record["staging_artifact_sha256"])
-    previous_kind = str(record["previous_kind"])
-    backup_dir = (
-        None
-        if previous_kind == "absent"
-        else _long_term_st_promotion_sibling(
-            prepared_dir,
-            record["backup_name"],
-            kind="backup",
-        )
-    )
-    backup_hash = str(record["backup_artifact_sha256"])
-
-    target_hash: str | None = None
-    target_is_empty = False
-    if prepared_dir.exists():
-        if is_link_or_reparse_point(prepared_dir) or not prepared_dir.is_dir():
-            raise ValueError(
-                "Cannot recover Long-Term ST promotion because the target is not a regular directory."
-            )
-        if any(prepared_dir.iterdir()):
-            target_hash = _validated_long_term_st_artifact_sha256(prepared_dir)
-        else:
-            target_is_empty = True
-
-    if target_hash == staging_hash:
-        if staging_dir.exists():
-            _discard_obsolete_long_term_st_artifact(staging_dir, staging_hash)
-        if backup_dir is not None and backup_dir.exists():
-            if previous_kind == "artifact":
-                _discard_obsolete_long_term_st_artifact(backup_dir, backup_hash)
-            else:
-                _discard_obsolete_empty_long_term_st_directory(backup_dir)
-        _unlink_long_term_st_path(journal)
-        return
-
-    target_matches_previous = (
-        previous_kind == "artifact"
-        and target_hash == backup_hash
-        or previous_kind == "empty"
-        and target_is_empty
-    )
-    if target_matches_previous:
-        if backup_dir is not None and backup_dir.exists():
-            raise ValueError(
-                "Cannot recover Long-Term ST promotion with both target and backup present."
-            )
-        if staging_dir.exists():
-            _discard_obsolete_long_term_st_artifact(staging_dir, staging_hash)
-        _unlink_long_term_st_path(journal)
-        return
-
-    if not prepared_dir.exists() and backup_dir is not None and backup_dir.exists():
-        if previous_kind == "artifact":
-            actual_backup_hash = _validated_long_term_st_artifact_sha256(backup_dir)
-            if actual_backup_hash != backup_hash:
-                raise ValueError(
-                    "Cannot recover Long-Term ST promotion from an unexpected backup artifact."
-                )
-        else:
-            _require_empty_long_term_st_directory(backup_dir, label="backup")
-        _replace_long_term_st_path(backup_dir, prepared_dir)
-        if previous_kind == "artifact":
-            restored_hash = _validated_long_term_st_artifact_sha256(prepared_dir)
-            if restored_hash != backup_hash:
-                raise ValueError(
-                    "Restored Long-Term ST artifact does not match the journaled backup."
-                )
-        else:
-            _require_empty_long_term_st_directory(prepared_dir, label="target")
-        if staging_dir.exists():
-            _discard_obsolete_long_term_st_artifact(staging_dir, staging_hash)
-        _unlink_long_term_st_path(journal)
-        return
-
-    if (
-        not prepared_dir.exists()
-        and previous_kind == "absent"
-        and backup_dir is None
-    ):
-        if staging_dir.exists():
-            _discard_obsolete_long_term_st_artifact(staging_dir, staging_hash)
-        _unlink_long_term_st_path(journal)
-        return
-
-    raise ValueError(
-        "Cannot recover Long-Term ST promotion because journaled paths do not match a safe state."
-    )
-
-
-def _promote_long_term_st_dataset(
-    staging_dir: Path,
-    prepared_dir: Path,
-) -> None:
-    record = _prepare_long_term_st_promotion_journal(staging_dir, prepared_dir)
-    previous_kind = str(record["previous_kind"])
-    backup_dir = (
-        None
-        if previous_kind == "absent"
-        else _long_term_st_promotion_sibling(
-            prepared_dir,
-            record["backup_name"],
-            kind="backup",
-        )
-    )
-    try:
-        if backup_dir is not None:
-            _replace_long_term_st_path(prepared_dir, backup_dir)
-        _replace_long_term_st_path(staging_dir, prepared_dir)
-        _recover_long_term_st_promotion(prepared_dir)
-    except BaseException as exc:
-        try:
-            _recover_long_term_st_promotion(prepared_dir)
-        except BaseException as recovery_error:
-            if hasattr(exc, "add_note"):
-                exc.add_note(
-                    f"Automatic Long-Term ST promotion recovery also failed: {recovery_error}"
-                )
-        raise
 
 
 def prepare_long_term_st_dataset(
@@ -1206,115 +541,23 @@ def prepare_long_term_st_dataset(
     train_frac: float = 0.7,
     val_frac: float = 0.1,
 ) -> Dict[str, Any]:
-    requested_prepared_dir = Path(
-        out_dir or long_term_st_data_path()
-    ).expanduser().absolute()
-    if is_link_or_reparse_point(requested_prepared_dir):
+    prepared_candidate = Path(out_dir or default_long_term_st_data_path()).expanduser().absolute()
+    if is_link_or_reparse_point(prepared_candidate):
         raise ValueError(
-            "Long-Term ST prepared destination may not be a symlink, junction, "
-            f"or reparse point: {requested_prepared_dir}."
+            "Long-Term ST prepared destination may not be a symlink, junction, or reparse point: "
+            f"{prepared_candidate}."
         )
-    anchor = Path(requested_prepared_dir.anchor)
-    indirect = first_link_or_reparse_component(
-        requested_prepared_dir,
-        root=anchor,
-    )
-    if indirect is not None:
-        raise ValueError(
-            "Long-Term ST prepared destination may not traverse a symlink, junction, "
-            f"or reparse point: {indirect}."
-        )
-    requested_prepared_dir.parent.mkdir(parents=True, exist_ok=True)
-    indirect = first_link_or_reparse_component(
-        requested_prepared_dir,
-        root=anchor,
-    )
-    if indirect is not None:
-        raise ValueError(
-            "Long-Term ST prepared destination may not traverse a symlink, junction, "
-            f"or reparse point: {indirect}."
-        )
-    prepared_dir = requested_prepared_dir.resolve()
-    with _long_term_st_target_lock(prepared_dir):
-        return _prepare_long_term_st_dataset_while_locked(
-            prepared_dir,
-            archive_paths=archive_paths,
-            force=bool(force),
-            expected_record_count=expected_record_count,
-            history_len=int(history_len),
-            horizon=int(horizon),
-            train_frac=float(train_frac),
-            val_frac=float(val_frac),
-        )
-
-
-def _prepare_long_term_st_dataset_while_locked(
-    prepared_dir: Path,
-    *,
-    archive_paths: Optional[Union[str, Path, Sequence[str | Path]]],
-    force: bool,
-    expected_record_count: Optional[int],
-    history_len: int,
-    horizon: int,
-    train_frac: float,
-    val_frac: float,
-) -> Dict[str, Any]:
-    _recover_long_term_st_promotion(prepared_dir)
-    existing = _validate_long_term_st_output_root(
-        prepared_dir,
-        force=force,
-        history_len=history_len,
-        horizon=horizon,
-    )
-    if existing is not None and not force:
-        return existing
-
-    staging_dir = Path(
-        tempfile.mkdtemp(
-            prefix=f".{prepared_dir.name}.staging-",
-            dir=prepared_dir.parent,
-        )
-    ).resolve()
-    try:
-        _prepare_long_term_st_dataset_into(
-            staging_dir,
-            archive_paths=archive_paths,
-            expected_record_count=expected_record_count,
-            history_len=history_len,
-            horizon=horizon,
-            train_frac=train_frac,
-            val_frac=val_frac,
-        )
-        _validate_long_term_st_manifest(
-            long_term_st_manifest_path(staging_dir),
-            history_len=history_len,
-            horizon=horizon,
-        )
-        _promote_long_term_st_dataset(staging_dir, prepared_dir)
-        return _validate_long_term_st_manifest(
-            long_term_st_manifest_path(prepared_dir),
-            history_len=history_len,
-            horizon=horizon,
-        )
-    finally:
-        if (
-            staging_dir.exists()
-            and not _long_term_st_promotion_journal_path(prepared_dir).exists()
-        ):
-            _remove_long_term_st_staging_after_failure(staging_dir, prepared_dir)
-
-
-def _prepare_long_term_st_dataset_into(
-    prepared_dir: Path,
-    *,
-    archive_paths: Optional[Union[str, Path, Sequence[str | Path]]],
-    expected_record_count: Optional[int],
-    history_len: int,
-    horizon: int,
-    train_frac: float,
-    val_frac: float,
-) -> Dict[str, Any]:
-    manifest_path = long_term_st_manifest_path(prepared_dir)
+    if prepared_candidate.exists() and not prepared_candidate.is_dir():
+        raise ValueError(f"Long-Term ST prepared destination must be a directory: {prepared_candidate}.")
+    # Canonicalize the selected destination after rejecting a direct link.
+    # Trusted mount aliases above it are valid on HPC systems; all generated
+    # members are still constrained beneath this canonical directory.
+    prepared_dir = prepared_candidate.resolve(strict=False)
+    manifest_path = default_long_term_st_manifest_path(prepared_dir)
+    if is_link_or_reparse_point(manifest_path):
+        raise ValueError(f"Long-Term ST prepared manifest may not be a symlink or reparse point: {manifest_path}.")
+    if manifest_path.exists() and not bool(force):
+        return _validate_long_term_st_manifest(manifest_path, history_len=int(history_len), horizon=int(horizon))
 
     _require_wfdb_for_long_term_st_preparation()
     resolved_archives = _coerce_archive_paths(archive_paths)
@@ -1341,21 +584,28 @@ def _prepare_long_term_st_dataset_into(
             "Install the medical extra with: python -m pip install -e .[medical]"
         ) from exc
 
-    prepared_series_dir = prepared_dir / "series"
-    if is_link_or_reparse_point(prepared_series_dir):
-        raise ValueError(
-            f"Long-Term ST series destination may not be a symlink, junction, or reparse point: {prepared_series_dir}."
-        )
+    prepared_dir.mkdir(parents=True, exist_ok=True)
+    prepared_series_dir = resolve_portable_relative_path(
+        prepared_dir,
+        "series",
+        label="Long-Term ST prepared series directory",
+        reject_links=True,
+    )
     prepared_series_dir.mkdir(parents=True, exist_ok=True)
     missing_dat_set = set(missing_dat_names)
     skipped_records: List[Dict[str, str]] = []
     series_rows: List[Dict[str, Any]] = []
     used_records: set[str] = set()
+    used_record_slugs: set[str] = set()
     min_prepared_length: Optional[int] = None
     max_prepared_length: Optional[int] = None
 
-    used_record_slugs: set[str] = set()
     for record_index, (record_id, header) in enumerate(sorted(headers.items())):
+        safe_record = _safe_record_name(
+            str(record_id),
+            record_index=int(record_index),
+            used_slugs=used_record_slugs,
+        )
         if any(dat_name in missing_dat_set for dat_name in header.dat_names):
             skipped_records.append({"record_id": str(record_id), "reason": "missing_referenced_dat"})
             continue
@@ -1366,83 +616,67 @@ def _prepare_long_term_st_dataset_into(
         try:
             tail_start = max(0, int(header.signal_length) - 1000)
             tail = wfdb.rdrecord(str(record_path), sampfrom=int(tail_start), sampto=int(header.signal_length), channels=[0])
-        except (OSError, ValueError, EOFError) as exc:
+            tail_values = np.asarray(tail.p_signal)
+            if tail_values.shape[0] != int(header.signal_length) - int(tail_start):
+                raise ValueError("tail_read_length_mismatch")
+        except Exception as exc:
             skipped_records.append({"record_id": str(record_id), "reason": f"unreadable_declared_tail:{type(exc).__name__}"})
-            continue
-        tail_values = np.asarray(tail.p_signal)
-        if tail_values.shape[0] != int(header.signal_length) - int(tail_start):
-            skipped_records.append({"record_id": str(record_id), "reason": "tail_read_length_mismatch"})
             continue
 
         record_had_series = False
         group_id = _long_term_st_group_id(str(record_id))
-        record_slug = _safe_record_name(
-            str(record_id),
-            record_index=int(record_index),
-            used_slugs=used_record_slugs,
-        )
         used_channel_slugs: set[str] = set()
         for channel_index, channel_name in enumerate(header.channel_names):
-            try:
-                record = wfdb.rdrecord(str(record_path), channels=[int(channel_index)])
-            except (OSError, ValueError, EOFError) as exc:
-                skipped_records.append(
-                    {
-                        "record_id": str(record_id),
-                        "reason": f"unreadable_channel_{int(channel_index)}:{type(exc).__name__}",
-                    }
-                )
-                continue
-            values = np.asarray(record.p_signal, dtype=np.float32)
-            if values.ndim == 2:
-                values = values[:, 0]
-            values = values.astype(np.float32, copy=False).reshape(-1)
-            if values.shape[0] != int(header.signal_length):
-                skipped_records.append(
-                    {"record_id": str(record_id), "reason": f"channel_{int(channel_index)}:full_read_length_mismatch"}
-                )
-                continue
-            if not np.all(np.isfinite(values)):
-                skipped_records.append(
-                    {"record_id": str(record_id), "reason": f"channel_{int(channel_index)}:nonfinite_signal_values"}
-                )
-                continue
-            downsampled = resample_poly(values, 2, 5).astype(np.float32)
-            if downsampled.shape[0] < int(history_len) + int(horizon):
-                skipped_records.append(
-                    {"record_id": str(record_id), "reason": f"channel_{int(channel_index)}:prepared_series_too_short"}
-                )
-                continue
             safe_channel = _safe_channel_name(
                 str(channel_name),
                 channel_index=int(channel_index),
                 used_slugs=used_channel_slugs,
             )
-            file_name = f"series/{record_slug}__ch{int(channel_index)}_{safe_channel}.npy"
-            output_path = resolve_portable_relative_path(
+            file_name = f"series/{safe_record}__ch{int(channel_index)}_{safe_channel}.npy"
+            series_target = resolve_portable_relative_path(
                 prepared_dir,
                 file_name,
                 label="Long-Term ST prepared series file",
                 reject_links=True,
             )
-            np.save(str(output_path), downsampled.astype(np.float32, copy=False))
-            total_length = int(downsampled.shape[0])
-            min_prepared_length = total_length if min_prepared_length is None else min(min_prepared_length, total_length)
-            max_prepared_length = total_length if max_prepared_length is None else max(max_prepared_length, total_length)
-            series_rows.append(
-                {
-                    "series_id": f"{record_id}::ch{int(channel_index)}::{safe_channel}",
-                    "record_id": str(record_id),
-                    "group_id": str(group_id),
-                    "channel_index": int(channel_index),
-                    "channel_name": str(channel_name),
-                    "file_name": str(file_name).replace("\\", "/"),
-                    "split": "",
-                    "total_length": int(total_length),
-                    "source_total_length": int(header.signal_length),
-                }
-            )
-            record_had_series = True
+            try:
+                record = wfdb.rdrecord(str(record_path), channels=[int(channel_index)])
+                values = np.asarray(record.p_signal, dtype=np.float32)
+                if values.ndim == 2:
+                    values = values[:, 0]
+                values = values.astype(np.float32, copy=False).reshape(-1)
+                if values.shape[0] != int(header.signal_length):
+                    raise ValueError("full_read_length_mismatch")
+                if not np.all(np.isfinite(values)):
+                    raise ValueError("nonfinite_signal_values")
+                downsampled = resample_poly(values, 2, 5).astype(np.float32)
+                if downsampled.shape[0] < int(history_len) + int(horizon):
+                    raise ValueError("prepared_series_too_short")
+                np.save(str(series_target), downsampled.astype(np.float32, copy=False))
+                total_length = int(downsampled.shape[0])
+                min_prepared_length = total_length if min_prepared_length is None else min(min_prepared_length, total_length)
+                max_prepared_length = total_length if max_prepared_length is None else max(max_prepared_length, total_length)
+                series_rows.append(
+                    {
+                        "series_id": f"{safe_record}::ch{int(channel_index)}::{safe_channel}",
+                        "record_id": str(record_id),
+                        "group_id": str(group_id),
+                        "channel_index": int(channel_index),
+                        "channel_name": str(channel_name),
+                        "file_name": file_name,
+                        "split": "",
+                        "total_length": int(total_length),
+                        "source_total_length": int(header.signal_length),
+                    }
+                )
+                record_had_series = True
+            except Exception as exc:
+                skipped_records.append(
+                    {
+                        "record_id": str(record_id),
+                        "reason": f"channel_{int(channel_index)}:{type(exc).__name__}",
+                    }
+                )
         if record_had_series:
             used_records.add(str(record_id))
 
@@ -1464,16 +698,10 @@ def _prepare_long_term_st_dataset_into(
         if row["split"] != "train":
             continue
         arr = np.load(str(prepared_dir / str(row["file_name"])), mmap_mode="r")
-        memory_map = getattr(arr, "_mmap", None)
-        try:
-            arr64 = np.asarray(arr, dtype=np.float64)
-            sum_x += float(np.sum(arr64))
-            sum_x2 += float(np.sum(arr64 * arr64))
-            count += int(arr64.size)
-        finally:
-            if memory_map is not None:
-                memory_map.close()
-            del arr
+        arr64 = np.asarray(arr, dtype=np.float64)
+        sum_x += float(np.sum(arr64))
+        sum_x2 += float(np.sum(arr64 * arr64))
+        count += int(arr64.size)
     if count <= 0:
         raise ValueError("Long-Term ST train split is empty after strict validation.")
     mean = float(sum_x / float(count))
@@ -1597,8 +825,8 @@ class LazyLongTermSTConditionalDataset(torch.utils.data.Dataset):
         self.params = _LongTermSTParamsView(self)
         self.sampler_replacement = bool(self.split_name == "train")
         if self.split_name == "train" and len(self.start_indices) > 0:
-            bounded_sample_count = min(int(len(self.start_indices)), 16_384)
-            self.sampler_num_samples = int(sampler_num_samples or bounded_sample_count)
+            default_samples = min(int(len(self.start_indices)), 16_384)
+            self.sampler_num_samples = int(sampler_num_samples or default_samples)
         else:
             self.sampler_num_samples = None
 
@@ -1718,8 +946,8 @@ def build_dataset_splits_from_long_term_st(
     path: str,
     cfg: OTFlowConfig,
     *,
-    stride_train: int = LONG_TERM_ST_STRIDE,
-    stride_eval: int = LONG_TERM_ST_STRIDE,
+    stride_train: int = LONG_TERM_ST_DEFAULT_STRIDE,
+    stride_eval: int = LONG_TERM_ST_DEFAULT_STRIDE,
     train_frac: float = 0.7,
     val_frac: float = 0.1,
     test_frac: Optional[float] = None,
@@ -1740,8 +968,8 @@ def build_dataset_splits_from_long_term_st(
             f"Long-Term ST is a univariate ECG task; levels*token_dim must equal 1, got {int(cfg.snapshot_dim)}."
         )
     cfg.apply_overrides(use_cond_features=False, cond_standardize=False, cond_dim=0)
-    prepared_dir = Path(path or long_term_st_data_path()).expanduser().resolve()
-    manifest_path = long_term_st_manifest_path(prepared_dir)
+    prepared_dir = Path(path or default_long_term_st_data_path()).expanduser().resolve()
+    manifest_path = default_long_term_st_manifest_path(prepared_dir)
     if not manifest_path.exists():
         prepare_long_term_st_dataset(
             prepared_dir,
@@ -1801,8 +1029,16 @@ def build_dataset_splits_from_long_term_st(
 
 
 __all__ = [
+    "LONG_TERM_ST_DATASET_KEY",
+    "LONG_TERM_ST_DEFAULT_STRIDE",
+    "LONG_TERM_ST_FREQUENCY_LABEL",
+    "LONG_TERM_ST_HISTORY_LEN",
+    "LONG_TERM_ST_HORIZON_LEN",
+    "LONG_TERM_ST_SAMPLING_RATE_HZ",
     "LazyLongTermSTConditionalDataset",
     "build_dataset_splits_from_long_term_st",
+    "default_long_term_st_data_path",
+    "default_long_term_st_manifest_path",
     "long_term_st_raw_archive_dir",
     "long_term_st_source_dir",
     "prepare_long_term_st_dataset",

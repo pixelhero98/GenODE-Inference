@@ -13,7 +13,10 @@ import zipfile
 
 import numpy as np
 
-from genode.checkpoint_validation import validate_strict_integer
+from genode.checkpoint_validation import (
+    normalize_strict_solver_nfe_fields as normalize_solver_nfe_fields,
+    validate_strict_integer,
+)
 from genode.data.otflow_paths import resolve_project_path
 from genode.distillation.artifacts import (
     context_fingerprint,
@@ -27,12 +30,12 @@ from genode.distillation.measurement_protocol import (
     read_quality_measurement_protocol,
     validate_quality_measurement_protocol,
 )
-from genode.experiment_layout import (
+from genode.canonical_experiment_layout import (
     density_source_key_for_schedule,
     scenario_family_for_key,
 )
-from genode.gipo.models import validate_time_grid
-from genode.gipo.objectives import (
+from genode.gico.models import validate_time_grid
+from genode.gico.objectives import (
     METRIC_DIRECTION_HIGHER,
     METRIC_DIRECTION_LOWER,
     teacher_objective_specs_for_scenario,
@@ -42,27 +45,26 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
     EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
     build_schedule_grid,
 )
-from genode.solver_protocol import normalize_solver_nfe_fields
 
 
 VALIDATION_PHASE = "validation_tuning"
 LOCKED_TEST_PHASE = "locked_test"
 FLOW_MAP_METHOD = "flow_map"
-GIPO_METHOD = "gipo"
+GICO_METHOD = "gico"
 FIXED_METHOD = "fixed"
-SUPPORTED_METHODS = (FLOW_MAP_METHOD, GIPO_METHOD, FIXED_METHOD)
+SUPPORTED_METHODS = (FLOW_MAP_METHOD, GICO_METHOD, FIXED_METHOD)
 MINIMUM_PAIRED_CONTEXTS = 20
 ARTIFACT_BINDING_FIELDS = (
     "scenario_key",
     "flow_map_checkpoint_sha256",
     "backbone_checkpoint_sha256",
-    "gipo_checkpoint_sha256",
+    "gico_checkpoint_sha256",
 )
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 QUALITY_CONTEXT_PROTOCOL = "flow_map_quality_contexts"
 QUALITY_SAMPLE_PANEL_PROTOCOL = "flow_map_quality_sample_panel"
 FLOW_MAP_EXECUTION_KIND = "endpoint_flow_map"
-GIPO_EXECUTION_KIND = "gipo_ode_rollout"
+GICO_EXECUTION_KIND = "gico_ode_rollout"
 FIXED_EXECUTION_KIND = "fixed_time_grid"
 
 
@@ -226,30 +228,30 @@ def _normalize_candidate_execution(
         }
         if normalized != {
             "kind": FLOW_MAP_EXECUTION_KIND,
-            "density_source": "bound_gipo_checkpoint",
+            "density_source": "bound_gico_checkpoint",
         }:
             raise ValueError(
                 "Flow-map claim candidates must use the endpoint map with the bound "
-                "GIPO checkpoint as their density source."
+                "GICO checkpoint as their density source."
             )
         return normalized
-    if method == GIPO_METHOD:
+    if method == GICO_METHOD:
         required = {"kind", "policy_sha256"}
         if set(raw) != required:
             missing = sorted(required - set(raw))
             extra = sorted(set(raw) - required)
             raise ValueError(
-                f"GIPO candidate execution fields are invalid; missing={missing}, extra={extra}."
+                f"GICO candidate execution fields are invalid; missing={missing}, extra={extra}."
             )
         normalized = {
             "kind": str(raw["kind"]).strip(),
             "policy_sha256": str(raw["policy_sha256"]).strip(),
         }
-        if normalized["kind"] != GIPO_EXECUTION_KIND or _SHA256_PATTERN.fullmatch(
+        if normalized["kind"] != GICO_EXECUTION_KIND or _SHA256_PATTERN.fullmatch(
             normalized["policy_sha256"]
         ) is None:
             raise ValueError(
-                "GIPO claim candidates require kind='gipo_ode_rollout' and a "
+                "GICO claim candidates require kind='gico_ode_rollout' and a "
                 "lowercase policy SHA-256."
             )
         return normalized
@@ -391,7 +393,7 @@ def _normalize_candidate_catalog(
     methods = {candidate.method for candidate in normalized}
     if methods != set(SUPPORTED_METHODS):
         raise ValueError(
-            "Candidate catalog must contain flow_map, gipo, and fixed candidates."
+            "Candidate catalog must contain flow_map, gico, and fixed candidates."
         )
     candidates_by_method = {
         method: [candidate for candidate in normalized if candidate.method == method]
@@ -1546,12 +1548,12 @@ def evaluate_quality_gate(
     catalog = _normalize_candidate_catalog(candidate_catalog)
     for candidate in catalog:
         if (
-            candidate.method == GIPO_METHOD
+            candidate.method == GICO_METHOD
             and candidate.execution["policy_sha256"]
-            != binding["gipo_checkpoint_sha256"]
+            != binding["gico_checkpoint_sha256"]
         ):
             raise ValueError(
-                "GIPO candidate policy provenance does not match the bound checkpoint."
+                "GICO candidate policy provenance does not match the bound checkpoint."
             )
     context_binding_payload = validate_quality_context_binding(
         quality_context_binding
@@ -1705,7 +1707,7 @@ def evaluate_quality_gate(
 
     comparisons: list[dict[str, Any]] = []
     raw_p_values: list[float] = []
-    for comparator_method in (GIPO_METHOD, FIXED_METHOD):
+    for comparator_method in (GICO_METHOD, FIXED_METHOD):
         for metric_index, spec in enumerate(specs):
             differences, context_ids = _paired_differences(
                 normalized,
@@ -1906,7 +1908,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--metrics-json", default="")
     parser.add_argument("--flow-map-checkpoint", required=True)
     parser.add_argument("--backbone-checkpoint", required=True)
-    parser.add_argument("--gipo-checkpoint", required=True)
+    parser.add_argument("--gico-checkpoint", required=True)
     parser.add_argument("--demonstration-manifest", default="")
     parser.add_argument("--bootstrap-samples", type=int, default=10_000)
     parser.add_argument("--familywise-alpha", type=float, default=0.05)
@@ -1927,7 +1929,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise ValueError("--scenario-key is required to bind the quality report.")
     flow_map_path = resolve_project_path(args.flow_map_checkpoint)
     backbone_path = resolve_project_path(args.backbone_checkpoint)
-    gipo_path = resolve_project_path(args.gipo_checkpoint)
+    gico_path = resolve_project_path(args.gico_checkpoint)
     output_path = resolve_project_path(args.output_json)
     if output_path.exists() and not output_path.is_file():
         raise ValueError("Quality report output path must be a file.")
@@ -1970,7 +1972,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         if str(args.quality_protocol_json).strip()
         else None
     )
-    protected_inputs = {flow_map_path, backbone_path, gipo_path}
+    protected_inputs = {flow_map_path, backbone_path, gico_path}
     if rows_path is not None:
         protected_inputs.add(rows_path)
     if candidate_catalog_path is not None:
@@ -1990,7 +1992,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     input_paths = {
         "backbone_checkpoint": backbone_path,
         "flow_map_checkpoint": flow_map_path,
-        "gipo_checkpoint": gipo_path,
+        "gico_checkpoint": gico_path,
     }
     for name, path in (
         ("candidate_catalog", candidate_catalog_path),
@@ -2007,13 +2009,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     _, checkpoint_payload = load_flow_map_checkpoint(
         flow_map_path,
         backbone_checkpoint=backbone_path,
-        gipo_checkpoint=gipo_path,
+        gico_checkpoint=gico_path,
     )
     artifact_binding = {
         "scenario_key": scenario_key,
         "flow_map_checkpoint_sha256": input_hashes["flow_map_checkpoint"],
         "backbone_checkpoint_sha256": str(checkpoint_payload["backbone_checkpoint_sha256"]),
-        "gipo_checkpoint_sha256": str(checkpoint_payload["gipo_checkpoint_sha256"]),
+        "gico_checkpoint_sha256": str(checkpoint_payload["gico_checkpoint_sha256"]),
     }
     checkpoint_scenario = str(checkpoint_payload.get("scenario_key", "")).strip()
     if checkpoint_scenario and checkpoint_scenario != scenario_key:

@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import hashlib
 import stat
+import shutil
 import tempfile
 import urllib.request
 import zipfile
 
 from genode.data.otflow_experiment_plan import FORECAST_FAMILY
-from genode.path_safety import is_link_or_reparse_point, resolve_portable_relative_path
-from genode.provenance import file_sha256
+from genode.path_safety import (
+    first_link_or_reparse_component,
+    is_link_or_reparse_point,
+    portable_relative_path,
+    resolve_portable_relative_path,
+)
 
 
 MONASH_ARCHIVE_URL = "https://forecastingdata.org/"
@@ -100,7 +105,6 @@ MONASH_REFERENCE_DATASETS: Tuple[MonashDatasetSpec, ...] = (
     ),
 )
 
-
 def monash_reference_dataset_keys() -> Tuple[str, ...]:
     return tuple(spec.key for spec in MONASH_REFERENCE_DATASETS)
 
@@ -110,30 +114,45 @@ def get_monash_dataset_spec(dataset_key: str) -> MonashDatasetSpec:
     for spec in MONASH_REFERENCE_DATASETS:
         if spec.key == key:
             return spec
-    raise KeyError(f"Unknown Monash reference dataset: {dataset_key}")
+    raise KeyError(f"Unknown Monash paper dataset: {dataset_key}")
 
 
-def monash_manifest_path(dataset_root: str | Path, dataset_key: str) -> Path:
+def default_manifest_path(dataset_root: str | Path, dataset_key: str) -> Path:
     spec = get_monash_dataset_spec(dataset_key)
     return Path(dataset_root).resolve() / spec.data_subdir / "manifest.json"
 
 
-def monash_dataset_dir(dataset_root: str | Path, dataset_key: str) -> Path:
+def default_dataset_dir(dataset_root: str | Path, dataset_key: str) -> Path:
     spec = get_monash_dataset_spec(dataset_key)
     return Path(dataset_root).resolve() / spec.data_subdir
 
 
-def monash_raw_dir(dataset_root: str | Path, dataset_key: str) -> Path:
-    return monash_dataset_dir(dataset_root, dataset_key) / "raw"
+def default_raw_dir(dataset_root: str | Path, dataset_key: str) -> Path:
+    return default_dataset_dir(dataset_root, dataset_key) / "raw"
 
 
-def monash_source_dir(dataset_root: str | Path, dataset_key: str) -> Path:
-    return monash_dataset_dir(dataset_root, dataset_key) / "source"
+def default_source_dir(dataset_root: str | Path, dataset_key: str) -> Path:
+    return default_dataset_dir(dataset_root, dataset_key) / "source"
 
 
-def monash_archive_path(dataset_root: str | Path, dataset_key: str) -> Path:
+def default_audit_path(dataset_root: str | Path, dataset_key: str) -> Path:
+    return default_dataset_dir(dataset_root, dataset_key) / "audit.json"
+
+
+def default_archive_path(dataset_root: str | Path, dataset_key: str) -> Path:
     spec = get_monash_dataset_spec(dataset_key)
-    return monash_raw_dir(dataset_root, dataset_key) / spec.archive_name
+    return default_raw_dir(dataset_root, dataset_key) / spec.archive_name
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _md5_file(path: str | Path) -> str:
@@ -146,7 +165,8 @@ def _md5_file(path: str | Path) -> str:
 
 def _verified_archive(path: Path, *, expected_size: int, expected_md5: str) -> bool:
     return (
-        path.is_file()
+        not is_link_or_reparse_point(path)
+        and path.is_file()
         and int(path.stat().st_size) == int(expected_size)
         and _md5_file(path) == str(expected_md5).lower()
     )
@@ -159,7 +179,16 @@ def _download_file(
     expected_size: int,
     expected_md5: str,
 ) -> Path:
-    if _verified_archive(destination, expected_size=expected_size, expected_md5=expected_md5):
+    if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size <= 0:
+        raise ValueError(f"expected_size must be a positive integer, got {expected_size!r}.")
+    md5 = str(expected_md5).strip().lower()
+    if len(md5) != 32 or any(character not in "0123456789abcdef" for character in md5):
+        raise ValueError(f"expected_md5 must be a hexadecimal MD5 digest, got {expected_md5!r}.")
+    if is_link_or_reparse_point(destination):
+        raise ValueError(f"Download destination may not be a symlink, junction, or reparse point: {destination}.")
+    if destination.exists() and not destination.is_file():
+        raise ValueError(f"Download destination must be a regular file path: {destination}.")
+    if _verified_archive(destination, expected_size=expected_size, expected_md5=md5):
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
@@ -180,19 +209,17 @@ def _download_file(
                     if not chunk:
                         break
                     total += len(chunk)
-                    if total > int(expected_size):
+                    if total > expected_size:
                         raise ValueError(
-                            f"Download from {url} exceeded the expected size of {int(expected_size)} bytes."
+                            f"Download from {url} exceeded the expected size of {expected_size} bytes."
                         )
                     digest.update(chunk)
                     out_fh.write(chunk)
-        if total != int(expected_size):
-            raise ValueError(f"Download from {url} has size {total}; expected {int(expected_size)} bytes.")
+        if total != expected_size:
+            raise ValueError(f"Download from {url} has size {total}; expected {expected_size} bytes.")
         observed_md5 = digest.hexdigest()
-        if observed_md5 != str(expected_md5).lower():
-            raise ValueError(
-                f"Download from {url} has MD5 {observed_md5}; expected {str(expected_md5).lower()}."
-            )
+        if observed_md5 != md5:
+            raise ValueError(f"Download from {url} has MD5 {observed_md5}; expected {md5}.")
         temporary.replace(destination)
         temporary = None
     finally:
@@ -201,27 +228,84 @@ def _download_file(
     return destination
 
 
-def _extract_zip(archive_path: Path, destination_dir: Path) -> Path:
-    if is_link_or_reparse_point(destination_dir):
+def _safe_extraction_root(destination_dir: Path) -> Path:
+    absolute = destination_dir.expanduser().absolute()
+    if is_link_or_reparse_point(absolute):
         raise ValueError(
-            f"Archive destination may not be a symlink, junction, or reparse point: {destination_dir}."
+            "Archive destination may not be a symlink, junction, or reparse point: "
+            f"{absolute}."
         )
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    destination_root = destination_dir.resolve()
+    if absolute.exists() and not absolute.is_dir():
+        raise ValueError(f"Archive destination must be a directory: {absolute}.")
+    absolute.mkdir(parents=True, exist_ok=True)
+    if is_link_or_reparse_point(absolute):
+        raise ValueError(
+            "Archive destination may not be a symlink, junction, or reparse point: "
+            f"{absolute}."
+        )
+    # Resolve only after accepting the caller-selected destination.  This
+    # permits trusted platform mount aliases (for example /projects -> /lfs)
+    # above the destination while giving member extraction a canonical root.
+    # Link/reparse components created *beneath* this root remain forbidden.
+    return absolute.resolve(strict=True)
+
+
+def _extract_zip(archive_path: Path, destination_dir: Path) -> Path:
+    destination_root = _safe_extraction_root(destination_dir)
     with zipfile.ZipFile(archive_path, "r") as archive:
+        extraction_plan: List[Tuple[zipfile.ZipInfo, Path]] = []
+        seen_paths: set[str] = set()
         for member in archive.infolist():
-            if stat.S_ISLNK(member.external_attr >> 16):
-                raise ValueError(f"Archive contains an unsupported symbolic link: {member.filename!r}")
-            member_path = str(member.filename).rstrip("/")
-            if not member_path:
-                raise ValueError("Archive contains an empty member path.")
-            resolve_portable_relative_path(
+            unix_mode = int(member.external_attr) >> 16
+            if stat.S_ISLNK(unix_mode):
+                raise ValueError(f"Archive contains an unsupported symbolic link: {member.filename!r}.")
+            file_type = stat.S_IFMT(unix_mode)
+            if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                raise ValueError(f"Archive contains an unsupported special file: {member.filename!r}.")
+            member_name = str(member.filename).rstrip("/")
+            relative = portable_relative_path(member_name, label="Archive member")
+            identity = relative.as_posix().casefold()
+            if identity in seen_paths:
+                raise ValueError(f"Archive contains a duplicate member path: {member.filename!r}.")
+            seen_paths.add(identity)
+            target = resolve_portable_relative_path(
                 destination_root,
-                member_path,
+                relative.as_posix(),
                 label="Archive member",
                 reject_links=True,
             )
-        archive.extractall(destination_root)
+            if member.is_dir():
+                continue
+            extraction_plan.append((member, target))
+
+        for member, target in extraction_plan:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            indirect = first_link_or_reparse_component(target.parent, root=destination_root)
+            if indirect is not None:
+                raise ValueError(f"Archive member traverses a symlink, junction, or reparse point: {indirect}.")
+            if is_link_or_reparse_point(target):
+                raise ValueError(f"Archive member target may not be a symlink or reparse point: {target}.")
+            if target.exists() and not target.is_file():
+                raise ValueError(f"Archive member target must be a regular file: {target}.")
+            temporary: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    dir=target.parent,
+                    prefix=f".{target.name}.",
+                    suffix=".extract",
+                    delete=False,
+                ) as out_fh:
+                    temporary = Path(out_fh.name)
+                    with archive.open(member, "r") as source:
+                        shutil.copyfileobj(source, out_fh, length=1024 * 1024)
+                if temporary.stat().st_size != int(member.file_size):
+                    raise zipfile.BadZipFile(f"Archive member size mismatch: {member.filename!r}.")
+                temporary.replace(target)
+                temporary = None
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
     return destination_dir
 
 
@@ -306,7 +390,7 @@ def iter_tsf_series(tsf_path: str | Path) -> Iterator[Tuple[int, Dict[str, str],
             yield int(line_number), metadata, series_values
 
 
-def _context_length(official_horizon: int, min_series_length: int) -> int:
+def _default_context_length(official_horizon: int, min_series_length: int) -> int:
     horizon = int(official_horizon)
     max_allowed = max(1, int(min_series_length) - 2 * int(horizon))
     return int(max(4, min(max_allowed, max(4 * horizon, 64))))
@@ -314,14 +398,15 @@ def _context_length(official_horizon: int, min_series_length: int) -> int:
 
 def download_monash_dataset(dataset_root: str | Path, dataset_key: str) -> Dict[str, Any]:
     spec = get_monash_dataset_spec(dataset_key)
-    source_dir = monash_source_dir(dataset_root, dataset_key)
-    archive_path = monash_archive_path(dataset_root, dataset_key)
+    source_dir = default_source_dir(dataset_root, dataset_key)
+    archive_path = default_archive_path(dataset_root, dataset_key)
     _download_file(
         spec.download_url,
         archive_path,
         expected_size=int(spec.archive_size_bytes),
         expected_md5=str(spec.archive_md5),
     )
+    _safe_extraction_root(source_dir)
     if not any(source_dir.rglob("*.tsf")):
         _extract_zip(archive_path, source_dir)
     tsf_path = find_tsf_file(source_dir)
@@ -349,7 +434,7 @@ def download_monash_dataset(dataset_root: str | Path, dataset_key: str) -> Dict[
         "dataset_key": spec.key,
         "display_name": spec.display_name,
         "official_horizon": int(official_horizon),
-        "context_length": int(_context_length(int(official_horizon), int(min_series_length))),
+        "context_length": int(_default_context_length(int(official_horizon), int(min_series_length))),
         "frequency": str(header.frequency or spec.source_frequency_label),
         "n_series": int(n_series),
         "min_series_length": int(min_series_length),
@@ -362,7 +447,7 @@ def download_monash_dataset(dataset_root: str | Path, dataset_key: str) -> Dict[
         "archive_name": str(spec.archive_name),
         "archive_size_bytes": int(archive_path.stat().st_size),
         "archive_md5": _md5_file(archive_path),
-        "archive_sha256": file_sha256(archive_path),
+        "archive_sha256": _sha256_file(archive_path),
         "source_tsf_name": str(tsf_path.name),
         "header_horizon": int(header.horizon),
         "horizon_source": str(spec.horizon_source),
@@ -370,14 +455,14 @@ def download_monash_dataset(dataset_root: str | Path, dataset_key: str) -> Dict[
         "missing_header": bool(header.missing),
         "context_length_policy": "4xhorizon_clipped_to_min_length",
     }
-    monash_manifest_path(dataset_root, dataset_key).write_text(
+    default_manifest_path(dataset_root, dataset_key).write_text(
         json.dumps(manifest_payload, indent=2),
         encoding="utf-8",
     )
     return manifest_payload
 
 
-def download_monash_reference_datasets(dataset_root: str | Path, dataset_keys: Optional[Tuple[str, ...]] = None) -> List[Dict[str, Any]]:
+def download_monash_paper_datasets(dataset_root: str | Path, dataset_keys: Optional[Tuple[str, ...]] = None) -> List[Dict[str, Any]]:
     keys = monash_reference_dataset_keys() if dataset_keys is None else tuple(str(key) for key in dataset_keys)
     return [download_monash_dataset(dataset_root, key) for key in keys]
 
@@ -396,19 +481,79 @@ def load_monash_manifest(path: str | Path) -> MonashDatasetManifest:
     )
 
 
+def build_single_tail_holdout_plan(
+    *,
+    series_length: int,
+    official_horizon: int,
+    context_length: int,
+) -> Dict[str, int]:
+    total = int(series_length)
+    horizon = int(official_horizon)
+    context = int(context_length)
+    min_required = context + 2 * horizon
+    if total < min_required:
+        raise ValueError(
+            f"Series length {total} is too short for context={context} and two horizon blocks of size {horizon}."
+        )
+    test_start = total - horizon
+    val_start = test_start - horizon
+    return {
+        "context_length": context,
+        "official_horizon": horizon,
+        "validation_start": val_start,
+        "validation_stop": test_start,
+        "test_start": test_start,
+        "test_stop": total,
+    }
+
+
+def dataset_prep_stub(dataset_root: str | Path, dataset_key: str) -> Dict[str, Any]:
+    spec = get_monash_dataset_spec(dataset_key)
+    manifest_path = default_manifest_path(dataset_root, dataset_key)
+    status = "ready" if manifest_path.exists() else "missing_manifest"
+    manifest_payload = None
+    holdout_plan = None
+    if manifest_path.exists():
+        manifest = load_monash_manifest(manifest_path)
+        manifest_payload = asdict(manifest)
+        holdout_plan = build_single_tail_holdout_plan(
+            series_length=int(manifest.min_series_length),
+            official_horizon=int(manifest.official_horizon),
+            context_length=int(manifest.context_length),
+        )
+    return {
+        "dataset_key": spec.key,
+        "display_name": spec.display_name,
+        "source_url": spec.source_url,
+        "data_subdir": spec.data_subdir,
+        "manifest_path": str(manifest_path),
+        "status": status,
+        "manifest": manifest_payload,
+        "single_tail_holdout": holdout_plan,
+    }
+
+
+def all_dataset_prep_stubs(dataset_root: str | Path) -> List[Dict[str, Any]]:
+    return [dataset_prep_stub(dataset_root, spec.key) for spec in MONASH_REFERENCE_DATASETS]
+
+
 __all__ = [
     "MONASH_ARCHIVE_URL",
     "MONASH_REFERENCE_DATASETS",
     "MonashDatasetManifest",
     "MonashDatasetSpec",
     "TsfHeader",
-    "monash_archive_path",
-    "monash_dataset_dir",
-    "monash_manifest_path",
-    "monash_raw_dir",
-    "monash_source_dir",
+    "all_dataset_prep_stubs",
+    "build_single_tail_holdout_plan",
+    "default_archive_path",
+    "default_audit_path",
+    "default_dataset_dir",
+    "dataset_prep_stub",
+    "default_manifest_path",
+    "default_raw_dir",
+    "default_source_dir",
     "download_monash_dataset",
-    "download_monash_reference_datasets",
+    "download_monash_paper_datasets",
     "find_tsf_file",
     "get_monash_dataset_spec",
     "iter_tsf_series",

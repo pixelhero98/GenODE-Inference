@@ -2,40 +2,36 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from genode.data.otflow_experiment_plan import (
-    REFERENCE_CONDITIONAL_GENERATION_DATASETS,
-    REFERENCE_FORECAST_DATASETS,
+    CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS,
+    CANONICAL_FORECAST_PAPER_DATASETS,
     CONDITIONAL_GENERATION_FAMILY,
     FORECAST_FAMILY,
     experiment_plan_by_key,
 )
 from genode.data.otflow_medical_constants import (
     LONG_TERM_ST_DATASET_KEY,
-    long_term_st_manifest_path,
+    default_long_term_st_manifest_path,
 )
 from genode.data.molecule_xyz import (
     MOLECULE_GROUP_DATASET_KEYS,
+    default_molecule_group_root,
     load_molecule_group_manifest,
-    molecule_group_root as project_molecule_group_root,
 )
 from genode.data.otflow_paths import (
-    backbone_manifest_path,
-    lobster_synthetic_profile_path,
+    default_lobster_synthetic_profile_path,
     display_project_path,
-    project_backbone_matrix_root,
+    normalize_project_relative_path,
+    project_backbone_matrix_root as default_project_backbone_matrix_root,
     project_data_root,
     project_outputs_root,
-    project_dataset_root,
-)
-from genode.path_safety import (
-    MANIFEST_PARENT_PATH_BASE,
-    resolve_manifest_path_base,
-    resolve_portable_relative_path,
+    project_paper_dataset_root,
 )
 
 MOLECULE_FAMILY = "molecule_3d_coordinate_generation"
@@ -44,21 +40,13 @@ BACKBONE_NAME_OTFLOW_MOLECULE = "otflow_molecule_3d"
 DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE = "transformer"
 DEFAULT_MOLECULE_VARIANT = "ar_h1"
 DEFAULT_SEED = 0
-TEMPORAL_ROLLOUT_MODE = "non_ar"
-MOLECULE_ROLLOUT_MODE = "autoregressive"
+CANONICAL_TEMPORAL_ROLLOUT_MODE = "non_ar"
+CANONICAL_MOLECULE_ROLLOUT_MODE = "autoregressive"
 TRAIN_BUDGET_STEPS: Tuple[int, ...] = (4000, 8000, 12000, 16000, 20000)
 STANDARD_ARTIFACT_SUMMARY_NAME = "artifact_summary.json"
 MANIFEST_VERSION = "fm_backbone_manifest"
 AUDIT_VERSION = "fm_backbone_manifest_check"
 IMPORTED_EXTERNAL_SOURCE_KIND = "imported_external"
-_MANIFEST_ARTIFACT_PATH_FIELDS = ("checkpoint_path", "summary_path", "metadata_path")
-_MANIFEST_ROOT_PATH_FIELDS = (
-    "matrix_root",
-    "otflow_reuse_root",
-    "imported_backbone_root",
-    "molecule_group_root",
-    "molecule_backbone_root",
-)
 
 ACTIVE_FORECAST_BACKBONE_BUDGETS: Mapping[str, Tuple[int, ...]] = {
     "solar_energy_10m": (4000, 8000, 12000, 16000, 20000),
@@ -131,37 +119,24 @@ def _metadata_str(metadata: Mapping[str, Any] | None, key: str) -> Optional[str]
     return value or None
 
 
-def project_otflow_reuse_root() -> Path:
+def project_backbone_matrix_root() -> Path:
+    return default_project_backbone_matrix_root()
+
+
+def default_backbone_manifest_path() -> Path:
+    return project_backbone_matrix_root() / "backbone_manifest.json"
+
+
+def default_otflow_reuse_root() -> Path:
     return project_outputs_root() / "shared_backbones" / "otflow_fullhorizon_seed0"
 
 
-def project_imported_otflow_backbone_root() -> Path:
+def default_imported_otflow_backbone_root() -> Path:
     return project_outputs_root() / "imported_backbones" / "otflow"
 
 
-def _project_display_path(path: str | Path, *, path_base: Path | None = None) -> str:
-    if path_base is not None:
-        try:
-            relative = Path(path).resolve().relative_to(Path(path_base).resolve())
-        except ValueError as exc:
-            raise ValueError(
-                "Refusing to serialize manifest path outside the validated path base: "
-                f"{display_project_path(path)}"
-            ) from exc
-        return PurePosixPath(*relative.parts).as_posix()
+def _project_display_path(path: str | Path) -> str:
     return display_project_path(path)
-
-
-def _manifest_path_base(target_path: Path, roots: Sequence[Path]) -> Path:
-    resolved_target_parent = target_path.parent.resolve()
-    resolved_roots = tuple(Path(root).resolve() for root in roots)
-    outside = [root for root in resolved_roots if not root.is_relative_to(resolved_target_parent)]
-    if outside:
-        raise ValueError(
-            "Backbone manifest roots must be contained by the manifest parent; "
-            f"outside roots={[display_project_path(path) for path in outside]}."
-        )
-    return resolved_target_parent
 
 
 def build_backbone_checkpoint_id(
@@ -192,6 +167,14 @@ def build_backbone_checkpoint_id(
     return "_".join(parts)
 
 
+def _active_budget_map(benchmark_family: str) -> Mapping[str, Tuple[int, ...]]:
+    if str(benchmark_family) == FORECAST_FAMILY:
+        return ACTIVE_FORECAST_BACKBONE_BUDGETS
+    if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
+        return ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS
+    raise ValueError(f"Unsupported benchmark_family={benchmark_family}")
+
+
 def _forecast_artifact_root(matrix_root: Path, backbone_name: str, dataset_key: str, train_steps: int) -> Path:
     return matrix_root / str(backbone_name) / FORECAST_FAMILY / train_budget_label(int(train_steps)) / str(dataset_key)
 
@@ -207,7 +190,7 @@ def _conditional_generation_artifact_root(matrix_root: Path, backbone_name: str,
     )
 
 
-def project_molecule_backbone_root() -> Path:
+def default_molecule_backbone_root() -> Path:
     return project_outputs_root() / "molecule_3d_backbones"
 
 
@@ -250,7 +233,7 @@ def expected_artifact_root(
     if str(benchmark_family) == MOLECULE_FAMILY:
         if not str(member_key) or not str(stratum):
             raise ValueError("Molecule artifact roots require non-empty member_key and stratum.")
-        molecule_root = Path(molecule_backbone_root or project_molecule_backbone_root()).resolve()
+        molecule_root = Path(molecule_backbone_root or default_molecule_backbone_root()).resolve()
         return _molecule_artifact_root(
             molecule_root,
             dataset_key=str(dataset_key),
@@ -375,9 +358,6 @@ def _otflow_artifact_compatibility(
         ("dataset_key", str(dataset_key), str),
         ("benchmark_family", str(benchmark_family), str),
         ("train_steps", int(train_steps), int),
-        ("checkpoint_budget_steps", int(train_steps), int),
-        ("effective_train_steps", int(train_steps), int),
-        ("checkpoint_export_protocol", "exact_budget_step_state", str),
         ("history_len", int(spec.history_len), int),
         ("future_block_len", int(spec.future_block_len), int),
     )
@@ -412,9 +392,9 @@ def _otflow_artifact_compatibility(
         errors.append(
             f"checkpoint future_block_len={int(signature['future_block_len'])} != expected {int(spec.future_block_len)}"
         )
-    if str(signature.get("rollout_mode", "")).strip().lower() != TEMPORAL_ROLLOUT_MODE:
+    if str(signature.get("rollout_mode", "")).strip().lower() != CANONICAL_TEMPORAL_ROLLOUT_MODE:
         errors.append(
-            f"checkpoint rollout_mode={str(signature.get('rollout_mode', ''))!r} != expected {TEMPORAL_ROLLOUT_MODE!r}"
+            f"checkpoint rollout_mode={str(signature.get('rollout_mode', ''))!r} != expected {CANONICAL_TEMPORAL_ROLLOUT_MODE!r}"
         )
     if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY and str(signature["field_network_type"]) != str(
         field_network_type or DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE
@@ -445,11 +425,7 @@ def _molecule_manifest_members(
 ) -> List[Dict[str, Any]]:
     members: List[Dict[str, Any]] = []
     for dataset_key in tuple(str(key) for key in dataset_keys):
-        manifest_path = (
-            project_molecule_group_root()
-            if molecule_group_root is None
-            else Path(molecule_group_root).expanduser().resolve()
-        ) / dataset_key / "group_manifest.json"
+        manifest_path = (default_molecule_group_root() if molecule_group_root is None else Path(molecule_group_root).expanduser().resolve()) / dataset_key / "group_manifest.json"
         if not manifest_path.exists():
             continue
         manifest = load_molecule_group_manifest(dataset_key, manifest_path.parent.parent)
@@ -480,7 +456,6 @@ def _molecule_manifest_members(
 
 def _molecule_artifact_compatibility(
     metadata: Optional[Mapping[str, Any]],
-    checkpoint_path: Path,
     *,
     dataset_key: str,
     member_key: str,
@@ -494,17 +469,6 @@ def _molecule_artifact_compatibility(
     if not metadata:
         return "invalid", "Missing checkpoint metadata."
     errors: List[str] = []
-    try:
-        from genode.evaluation.molecule_metrics import load_molecule_checkpoint_payload
-
-        load_molecule_checkpoint_payload(
-            checkpoint_path,
-            expected_identity=f"molecule backbone artifact {dataset_key}/{member_key}/{train_steps}",
-            expected_dataset_key=str(dataset_key),
-            expected_stratum=str(stratum),
-        )
-    except Exception as exc:
-        errors.append(f"Unable to load molecule checkpoint: {type(exc).__name__}: {exc}")
     required_checks = (
         ("dataset_key", str(dataset_key), str),
         ("member_key", str(member_key), str),
@@ -527,9 +491,9 @@ def _molecule_artifact_compatibility(
     cfg = dict(metadata.get("cfg", {}) or {})
     model_cfg = dict(cfg.get("model", {}) or {})
     observed_rollout = str(metadata.get("rollout_mode", model_cfg.get("rollout_mode", "")))
-    if observed_rollout.strip().lower() != MOLECULE_ROLLOUT_MODE:
+    if observed_rollout.strip().lower() != CANONICAL_MOLECULE_ROLLOUT_MODE:
         errors.append(
-            f"metadata.rollout_mode={observed_rollout!r} != expected {MOLECULE_ROLLOUT_MODE!r}"
+            f"metadata.rollout_mode={observed_rollout!r} != expected {CANONICAL_MOLECULE_ROLLOUT_MODE!r}"
         )
     split_stats = dict(metadata.get("split_stats", {}) or {})
     if int(split_stats.get("atom_count", atom_count)) != int(atom_count):
@@ -551,7 +515,6 @@ def _existing_matrix_artifact(
     dataset_key: str,
     train_steps: int,
     seed: int,
-    path_base: Path | None = None,
 ) -> Optional[BackboneArtifactSpec]:
     paths = _expected_materialized_paths(
         matrix_root,
@@ -601,15 +564,15 @@ def _existing_matrix_artifact(
                 field_network_type=field_network_type if field_network_type else None,
             )
         ),
-        checkpoint_path=_project_display_path(paths["checkpoint_path"], path_base=path_base),
-        summary_path=_project_display_path(summary_path, path_base=path_base),
+        checkpoint_path=_project_display_path(paths["checkpoint_path"]),
+        summary_path=_project_display_path(summary_path),
         status=str(status),
         seed=int(seed),
         checkpoint_budget_steps=_metadata_int(metadata, "checkpoint_budget_steps"),
         effective_train_steps=_metadata_int(metadata, "effective_train_steps"),
         checkpoint_export_protocol=_metadata_str(metadata, "checkpoint_export_protocol"),
         source_kind="matrix_output",
-        metadata_path=_project_display_path(paths["metadata_path"], path_base=path_base),
+        metadata_path=_project_display_path(paths["metadata_path"]),
         field_network_type=None if field_network_type is None else str(field_network_type),
         notes=compatibility_error,
         model_cond_dim=model_cond_dim,
@@ -625,7 +588,6 @@ def _existing_molecule_artifact(
     train_steps: int,
     seed: int,
     variant: str = DEFAULT_MOLECULE_VARIANT,
-    path_base: Path | None = None,
 ) -> Optional[BackboneArtifactSpec]:
     dataset_key = str(member["dataset_key"])
     stratum = str(member["stratum"])
@@ -646,7 +608,6 @@ def _existing_molecule_artifact(
     metadata = _safe_json(paths["metadata_path"])
     status, compatibility_error = _molecule_artifact_compatibility(
         metadata,
-        paths["checkpoint_path"],
         dataset_key=dataset_key,
         member_key=member_key,
         stratum=stratum,
@@ -657,7 +618,7 @@ def _existing_molecule_artifact(
         variant=str(variant),
     )
     if not paths["summary_path"].exists():
-        summary_error = f"Missing required {STANDARD_ARTIFACT_SUMMARY_NAME}."
+        summary_error = f"Missing canonical {STANDARD_ARTIFACT_SUMMARY_NAME}."
         compatibility_error = summary_error if not compatibility_error else f"{compatibility_error}; {summary_error}"
         status = "invalid"
     checkpoint_id = None if metadata is None else metadata.get("checkpoint_id")
@@ -679,15 +640,15 @@ def _existing_molecule_artifact(
                 stratum=stratum,
             )
         ),
-        checkpoint_path=_project_display_path(paths["checkpoint_path"], path_base=path_base),
-        summary_path=_project_display_path(paths["summary_path"], path_base=path_base),
+        checkpoint_path=_project_display_path(paths["checkpoint_path"]),
+        summary_path=_project_display_path(paths["summary_path"]),
         status=status,
         seed=int(seed),
         checkpoint_budget_steps=_metadata_int(metadata, "checkpoint_budget_steps"),
         effective_train_steps=_metadata_int(metadata, "effective_train_steps"),
         checkpoint_export_protocol=_metadata_str(metadata, "checkpoint_export_protocol"),
         source_kind="molecule_backbone_output",
-        metadata_path=_project_display_path(paths["metadata_path"], path_base=path_base),
+        metadata_path=_project_display_path(paths["metadata_path"]),
         notes=compatibility_error,
         compatibility_error=compatibility_error,
         member_key=member_key,
@@ -707,7 +668,6 @@ def _existing_otflow_reuse_artifact(
     dataset_key: str,
     train_steps: int,
     seed: int,
-    path_base: Path | None = None,
 ) -> Optional[BackboneArtifactSpec]:
     if int(train_steps) != 20000:
         return None
@@ -758,18 +718,15 @@ def _existing_otflow_reuse_artifact(
             seed=int(seed),
             field_network_type=field_network_type,
         ),
-        checkpoint_path=_project_display_path(checkpoint_path, path_base=path_base),
-        summary_path=_project_display_path(
-            summary_path if summary_path.exists() else metadata_path,
-            path_base=path_base,
-        ),
+        checkpoint_path=_project_display_path(checkpoint_path),
+        summary_path=_project_display_path(summary_path if summary_path.exists() else metadata_path),
         status=str(status),
         seed=int(seed),
         checkpoint_budget_steps=_metadata_int(metadata, "checkpoint_budget_steps"),
         effective_train_steps=_metadata_int(metadata, "effective_train_steps"),
         checkpoint_export_protocol=_metadata_str(metadata, "checkpoint_export_protocol"),
         source_kind="reused_shared_20k",
-        metadata_path=_project_display_path(metadata_path, path_base=path_base),
+        metadata_path=_project_display_path(metadata_path),
         field_network_type=field_network_type,
         notes=compatibility_error,
         model_cond_dim=model_cond_dim,
@@ -911,7 +868,7 @@ def normalize_imported_backbone_artifacts(
     budget_steps: Sequence[int] = TRAIN_BUDGET_STEPS,
 ) -> Dict[str, Any]:
     resolved_matrix_root = Path(matrix_root or project_backbone_matrix_root()).resolve()
-    resolved_import_root = Path(imported_root or project_imported_otflow_backbone_root()).resolve()
+    resolved_import_root = Path(imported_root or default_imported_otflow_backbone_root()).resolve()
     normalized: List[Dict[str, Any]] = []
     if not resolved_import_root.exists():
         return {
@@ -960,7 +917,6 @@ def _planned_artifact(
     dataset_key: str,
     train_steps: int,
     seed: int,
-    path_base: Path | None = None,
 ) -> BackboneArtifactSpec:
     paths = _expected_materialized_paths(
         matrix_root,
@@ -988,12 +944,12 @@ def _planned_artifact(
             seed=int(seed),
             field_network_type=field_network_type,
         ),
-        checkpoint_path=_project_display_path(paths["checkpoint_path"], path_base=path_base),
-        summary_path=_project_display_path(paths["summary_path"], path_base=path_base),
+        checkpoint_path=_project_display_path(paths["checkpoint_path"]),
+        summary_path=_project_display_path(paths["summary_path"]),
         status="missing",
         seed=int(seed),
         source_kind="planned",
-        metadata_path=_project_display_path(paths["metadata_path"], path_base=path_base),
+        metadata_path=_project_display_path(paths["metadata_path"]),
         field_network_type=field_network_type,
     )
 
@@ -1006,7 +962,6 @@ def _planned_molecule_artifact(
     train_steps: int,
     seed: int,
     variant: str = DEFAULT_MOLECULE_VARIANT,
-    path_base: Path | None = None,
 ) -> BackboneArtifactSpec:
     dataset_key = str(member["dataset_key"])
     stratum = str(member["stratum"])
@@ -1037,12 +992,12 @@ def _planned_molecule_artifact(
             member_key=member_key,
             stratum=stratum,
         ),
-        checkpoint_path=_project_display_path(paths["checkpoint_path"], path_base=path_base),
-        summary_path=_project_display_path(paths["summary_path"], path_base=path_base),
+        checkpoint_path=_project_display_path(paths["checkpoint_path"]),
+        summary_path=_project_display_path(paths["summary_path"]),
         status="missing",
         seed=int(seed),
         source_kind="planned",
-        metadata_path=_project_display_path(paths["metadata_path"], path_base=path_base),
+        metadata_path=_project_display_path(paths["metadata_path"]),
         member_key=member_key,
         stratum=stratum,
         atom_count=int(member["atom_count"]),
@@ -1060,10 +1015,9 @@ def _iter_target_specs(
     molecule_group_root: str | Path | None,
     seed: int,
     budget_steps: Sequence[int],
-    path_base: Path | None = None,
 ) -> Iterable[BackboneArtifactSpec]:
     requested_steps = {int(value) for value in budget_steps}
-    for dataset_key in tuple(REFERENCE_FORECAST_DATASETS):
+    for dataset_key in tuple(CANONICAL_FORECAST_PAPER_DATASETS):
         for train_steps in ACTIVE_FORECAST_BACKBONE_BUDGETS.get(str(dataset_key), ()):
             if int(train_steps) not in requested_steps:
                 continue
@@ -1074,9 +1028,8 @@ def _iter_target_specs(
                 dataset_key=str(dataset_key),
                 train_steps=int(train_steps),
                 seed=int(seed),
-                path_base=path_base,
             )
-    for dataset_key in tuple(REFERENCE_CONDITIONAL_GENERATION_DATASETS):
+    for dataset_key in tuple(CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS):
         for train_steps in ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS.get(str(dataset_key), ()):
             if int(train_steps) not in requested_steps:
                 continue
@@ -1087,7 +1040,6 @@ def _iter_target_specs(
                 dataset_key=str(dataset_key),
                 train_steps=int(train_steps),
                 seed=int(seed),
-                path_base=path_base,
             )
     for member in _molecule_manifest_members(molecule_group_root=molecule_group_root):
         for train_steps in TRAIN_BUDGET_STEPS:
@@ -1099,10 +1051,7 @@ def _iter_target_specs(
                 member=member,
                 train_steps=int(train_steps),
                 seed=int(seed),
-                path_base=path_base,
             )
-
-
 def materialize_backbone_manifest(
     *,
     matrix_root: str | Path | None = None,
@@ -1114,39 +1063,11 @@ def materialize_backbone_manifest(
     seed: int = DEFAULT_SEED,
     write_path: str | Path | None = None,
 ) -> Dict[str, Any]:
-    explicit_write_path = str(write_path or "").strip()
-    target_path = Path(explicit_write_path or backbone_manifest_path()).resolve()
-    manifest_root = target_path.parent if explicit_write_path else None
-    resolved_matrix_root = Path(
-        matrix_root
-        or (manifest_root / "matrix" if manifest_root is not None else project_backbone_matrix_root())
-    ).resolve()
-    resolved_reuse_root = Path(
-        otflow_reuse_root
-        or (manifest_root / "shared_backbones" if manifest_root is not None else project_otflow_reuse_root())
-    ).resolve()
-    resolved_import_root = Path(
-        imported_backbone_root
-        or (manifest_root / "imported_backbones" if manifest_root is not None else project_imported_otflow_backbone_root())
-    ).resolve()
-    resolved_molecule_backbone_root = Path(
-        molecule_backbone_root
-        or (manifest_root / "molecule_3d_backbones" if manifest_root is not None else project_molecule_backbone_root())
-    ).resolve()
-    resolved_molecule_group_root = Path(
-        molecule_group_root
-        or (manifest_root / "molecule_3d" if manifest_root is not None else project_molecule_group_root())
-    ).resolve()
-    manifest_path_base = _manifest_path_base(
-        target_path,
-        (
-            resolved_matrix_root,
-            resolved_reuse_root,
-            resolved_import_root,
-            resolved_molecule_backbone_root,
-            resolved_molecule_group_root,
-        ),
-    )
+    resolved_matrix_root = Path(matrix_root or project_backbone_matrix_root()).resolve()
+    resolved_reuse_root = Path(otflow_reuse_root or default_otflow_reuse_root()).resolve()
+    resolved_import_root = Path(imported_backbone_root or default_imported_otflow_backbone_root()).resolve()
+    resolved_molecule_backbone_root = Path(molecule_backbone_root or default_molecule_backbone_root()).resolve()
+    resolved_molecule_group_root = Path(molecule_group_root or default_molecule_group_root()).resolve()
     artifacts: List[Dict[str, Any]] = []
     ready_count = 0
     molecule_member_by_key = {
@@ -1159,7 +1080,6 @@ def materialize_backbone_manifest(
         molecule_group_root=resolved_molecule_group_root,
         seed=int(seed),
         budget_steps=budget_steps,
-        path_base=manifest_path_base,
     ):
         if str(planned.benchmark_family) == MOLECULE_FAMILY:
             member = molecule_member_by_key[
@@ -1171,7 +1091,6 @@ def materialize_backbone_manifest(
                 member=member,
                 train_steps=int(planned.train_steps),
                 seed=int(seed),
-                path_base=manifest_path_base,
             )
         else:
             resolved = _existing_matrix_artifact(
@@ -1181,7 +1100,6 @@ def materialize_backbone_manifest(
                 dataset_key=str(planned.dataset_key),
                 train_steps=int(planned.train_steps),
                 seed=int(seed),
-                path_base=manifest_path_base,
             )
             if resolved is None and str(planned.backbone_name) == BACKBONE_NAME_OTFLOW:
                 resolved = _existing_otflow_reuse_artifact(
@@ -1190,7 +1108,6 @@ def materialize_backbone_manifest(
                     dataset_key=str(planned.dataset_key),
                     train_steps=int(planned.train_steps),
                     seed=int(seed),
-                    path_base=manifest_path_base,
                 )
         artifact = planned if resolved is None else resolved
         if str(artifact.status) == "ready":
@@ -1198,17 +1115,13 @@ def materialize_backbone_manifest(
         artifacts.append(artifact.to_dict())
     payload = {
         "version": MANIFEST_VERSION,
-        "path_base": MANIFEST_PARENT_PATH_BASE,
         "seed": int(seed),
         "train_budget_steps": [int(value) for value in budget_steps],
-        "matrix_root": _project_display_path(resolved_matrix_root, path_base=manifest_path_base),
-        "otflow_reuse_root": _project_display_path(resolved_reuse_root, path_base=manifest_path_base),
-        "imported_backbone_root": _project_display_path(resolved_import_root, path_base=manifest_path_base),
-        "molecule_group_root": _project_display_path(resolved_molecule_group_root, path_base=manifest_path_base),
-        "molecule_backbone_root": _project_display_path(
-            resolved_molecule_backbone_root,
-            path_base=manifest_path_base,
-        ),
+        "matrix_root": _project_display_path(resolved_matrix_root),
+        "otflow_reuse_root": _project_display_path(resolved_reuse_root),
+        "imported_backbone_root": _project_display_path(resolved_import_root),
+        "molecule_group_root": _project_display_path(resolved_molecule_group_root),
+        "molecule_backbone_root": _project_display_path(resolved_molecule_backbone_root),
         "temporal_artifact_count": int(
             sum(1 for row in artifacts if str(row.get("benchmark_family")) in {FORECAST_FAMILY, CONDITIONAL_GENERATION_FAMILY})
         ),
@@ -1221,38 +1134,44 @@ def materialize_backbone_manifest(
         "missing_count": int(len(artifacts) - ready_count),
         "artifacts": artifacts,
     }
+    target_path = Path(write_path or default_backbone_manifest_path()).resolve()
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
 
 
-def _validated_manifest_path_base(manifest_path: Path, path_base: str) -> Path:
-    return resolve_manifest_path_base(manifest_path, path_base)
-
-
 def _resolve_manifest_relative_path(manifest_path: Path, value: Any, *, path_base: str) -> Any:
     if not isinstance(value, str) or not value.strip():
         return value
-    base = _validated_manifest_path_base(manifest_path, path_base)
-    return str(resolve_portable_relative_path(base, value, label="Backbone manifest path"))
+    raw = normalize_project_relative_path(value)
+    if raw.is_absolute():
+        return os.path.abspath(os.fspath(raw))
+    base = os.path.abspath(os.fspath(manifest_path.parent / str(path_base)))
+    return os.path.abspath(os.path.join(base, os.fspath(raw)))
 
 
 def load_backbone_manifest(path: str | Path) -> Dict[str, Any]:
-    resolved = Path(path).resolve()
-    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    manifest_path = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     path_base = str(payload.get("path_base", "") or "").strip()
-    if not path_base:
-        raise ValueError("Backbone manifest requires path_base='manifest_parent'.")
-    _validated_manifest_path_base(resolved, path_base)
-    for artifact in payload.get("artifacts", []):
-        if not isinstance(artifact, dict):
-            continue
-        for field in _MANIFEST_ARTIFACT_PATH_FIELDS:
-            if field in artifact:
-                artifact[field] = _resolve_manifest_relative_path(resolved, artifact[field], path_base=path_base)
-    for field in _MANIFEST_ROOT_PATH_FIELDS:
-        if field in payload:
-            payload[field] = _resolve_manifest_relative_path(resolved, payload[field], path_base=path_base)
+    if path_base:
+        for artifact in payload.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            for field in ("checkpoint_path", "summary_path", "metadata_path"):
+                if field in artifact:
+                    artifact[field] = _resolve_manifest_relative_path(
+                        manifest_path,
+                        artifact[field],
+                        path_base=path_base,
+                    )
+        for field in ("matrix_root", "otflow_reuse_root", "imported_backbone_root", "molecule_group_root", "molecule_backbone_root"):
+            if field in payload:
+                payload[field] = _resolve_manifest_relative_path(
+                    manifest_path,
+                    payload[field],
+                    path_base=path_base,
+                )
     return payload
 
 
@@ -1296,14 +1215,14 @@ def find_backbone_artifact(
 def build_runtime_probe(
     *,
     dataset_root: str | Path | None = None,
-    lobster_profile_path: str | Path | None = None,
+    lobster_synthetic_profile_path: str | Path | None = None,
     long_term_st_path: str | Path | None = None,
     molecule_group_root: str | Path | None = None,
 ) -> Dict[str, Any]:
-    resolved_dataset_root = Path(dataset_root or project_dataset_root()).resolve()
-    resolved_lobster_profile_path = Path(lobster_profile_path or lobster_synthetic_profile_path()).resolve()
-    resolved_long_term_st_path = Path(long_term_st_path or long_term_st_manifest_path().parent).resolve()
-    resolved_molecule_group_root = Path(molecule_group_root or project_molecule_group_root()).resolve()
+    resolved_dataset_root = Path(dataset_root or project_paper_dataset_root()).resolve()
+    resolved_lobster_profile_path = Path(lobster_synthetic_profile_path or default_lobster_synthetic_profile_path()).resolve()
+    resolved_long_term_st_path = Path(long_term_st_path or default_long_term_st_manifest_path().parent).resolve()
+    resolved_molecule_group_root = Path(molecule_group_root or default_molecule_group_root()).resolve()
     monash_root = resolved_dataset_root / "monash"
     import_names = ("numpy", "torch", "wfdb")
     imports = {
@@ -1312,11 +1231,11 @@ def build_runtime_probe(
     }
     forecast_dataset_presence = {
         str(dataset_key): bool((monash_root / str(dataset_key) / "manifest.json").exists())
-        for dataset_key in REFERENCE_FORECAST_DATASETS
+        for dataset_key in CANONICAL_FORECAST_PAPER_DATASETS
     }
     dataset_presence = {
         "monash_manifests": forecast_dataset_presence,
-        LONG_TERM_ST_DATASET_KEY: bool(long_term_st_manifest_path(resolved_long_term_st_path).exists()),
+        LONG_TERM_ST_DATASET_KEY: bool(default_long_term_st_manifest_path(resolved_long_term_st_path).exists()),
         "cryptos_npz": bool((project_data_root() / "cryptos_binance_spot_monthly_1s_l10.npz").exists()),
         "lobster_synthetic_profile": bool(resolved_lobster_profile_path.exists()),
         "molecule_group_manifests": {
@@ -1342,7 +1261,7 @@ def build_backbone_readiness_audit(
     molecule_group_root: str | Path | None = None,
     molecule_backbone_root: str | Path | None = None,
     dataset_root: str | Path | None = None,
-    lobster_profile_path: str | Path | None = None,
+    lobster_synthetic_profile_path: str | Path | None = None,
     long_term_st_path: str | Path | None = None,
     budget_steps: Sequence[int] = TRAIN_BUDGET_STEPS,
     seed: int = DEFAULT_SEED,
@@ -1365,12 +1284,12 @@ def build_backbone_readiness_audit(
     )
     readiness = {
         "version": AUDIT_VERSION,
-        "manifest_path": _project_display_path(Path(write_path or backbone_manifest_path()).resolve()),
+        "manifest_path": _project_display_path(Path(write_path or default_backbone_manifest_path()).resolve()),
         "manifest": manifest,
         "normalization": normalization,
         "runtime_probe": build_runtime_probe(
             dataset_root=dataset_root,
-            lobster_profile_path=lobster_profile_path,
+            lobster_synthetic_profile_path=lobster_synthetic_profile_path,
             long_term_st_path=long_term_st_path,
             molecule_group_root=molecule_group_root,
         ),
@@ -1384,10 +1303,12 @@ __all__ = [
     "AUDIT_VERSION",
     "BACKBONE_NAME_OTFLOW",
     "BACKBONE_NAME_OTFLOW_MOLECULE",
-    "MOLECULE_ROLLOUT_MODE",
+    "CANONICAL_MOLECULE_ROLLOUT_MODE",
+    "CONDITIONAL_GENERATION_FAMILY",
     "DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE",
     "DEFAULT_MOLECULE_VARIANT",
     "DEFAULT_SEED",
+    "FORECAST_FAMILY",
     "IMPORTED_EXTERNAL_SOURCE_KIND",
     "MANIFEST_VERSION",
     "MOLECULE_FAMILY",
@@ -1396,13 +1317,15 @@ __all__ = [
     "BackboneArtifactSpec",
     "build_backbone_checkpoint_id",
     "build_backbone_readiness_audit",
+    "default_backbone_manifest_path",
+    "default_imported_otflow_backbone_root",
+    "default_molecule_backbone_root",
+    "default_otflow_reuse_root",
     "expected_artifact_root",
     "find_backbone_artifact",
     "load_backbone_manifest",
     "materialize_backbone_manifest",
     "normalize_imported_backbone_artifacts",
-    "project_imported_otflow_backbone_root",
-    "project_molecule_backbone_root",
-    "project_otflow_reuse_root",
+    "project_backbone_matrix_root",
     "train_budget_label",
 ]

@@ -14,13 +14,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.stats import spearmanr
 
-from genode.cli import parse_csv, parse_int_csv
-from genode.experiment_layout import REFERENCE_SEEN_NFES
-from genode.data.otflow_paths import display_project_path, project_root
-from genode.gipo.schema import reject_retired_evaluation_keys
-from genode.solver_protocol import normalize_solver_key, solver_macro_steps, target_nfe_for_macro_steps
+from genode.canonical_experiment_layout import CANONICAL_SEEN_NFES
+from genode.data.otflow_paths import project_root
+from genode.schedule_transfer.diffusion_flow_schedules import (
+    TRANSFER_SCHEDULE_KEYS,
+    schedule_display_name,
+)
 
 PROJECT_ROOT = project_root()
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs"
@@ -34,6 +34,8 @@ DEFAULT_ZIP_PATH = DEFAULT_OUTPUT_ROOT / "20k.zip"
 DEFAULT_FIGURE_DIR = DEFAULT_OUTPUT_ROOT / "figures"
 DEFAULT_PNG = DEFAULT_FIGURE_DIR / "ptg_vs_observed_gain_forecast_20k_times_600dpi.png"
 DEFAULT_PDF = DEFAULT_FIGURE_DIR / "ptg_vs_observed_gain_forecast_20k_times_600dpi.pdf"
+DEFAULT_DIAGNOSTIC_PNG = DEFAULT_FIGURE_DIR / "ptg_vs_observed_gain_forecast_20k_times_600dpi_diagnostic.png"
+DEFAULT_DIAGNOSTIC_PDF = DEFAULT_FIGURE_DIR / "ptg_vs_observed_gain_forecast_20k_times_600dpi_diagnostic.pdf"
 
 RELATIVE_STATS_NAME = "20k/seed_stats/forecast_baseline_relative_seed_stats.csv"
 NATIVE_TRACE_KEY = "info_growth_hardness_by_step"
@@ -66,14 +68,11 @@ SOLVER_LABELS: Dict[str, str] = {
     "midpoint_rk2": "Midpoint RK2",
     "dpmpp2m": "DPM++2M",
 }
-TARGET_NFES: Tuple[int, ...] = REFERENCE_SEEN_NFES
-TRANSFER_SCHEDULES: Tuple[str, ...] = ("ays", "gits", "ots")
+TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
+TRANSFER_SCHEDULES: Tuple[str, ...] = TRANSFER_SCHEDULE_KEYS
 INTEGRATION_SCHEDULES: Tuple[str, ...] = ("uniform", *TRANSFER_SCHEDULES)
 SCHEDULE_LABELS: Dict[str, str] = {
-    "uniform": "uniform",
-    "ays": "AYS",
-    "gits": "GITS",
-    "ots": "OTS",
+    key: schedule_display_name(key) for key in INTEGRATION_SCHEDULES
 }
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2, 3, 4)
 DEFAULT_REFERENCE_MACRO_FACTOR = 4.0
@@ -101,6 +100,14 @@ class PtgResult:
     ptg_percent: float
     kappa_integral: float
     rho_integral: float
+
+
+def parse_csv(text: str) -> List[str]:
+    return [part.strip() for part in str(text).split(",") if part.strip()]
+
+
+def parse_int_csv(text: str) -> List[int]:
+    return [int(part) for part in parse_csv(text)]
 
 
 def _json_default(value: Any) -> Any:
@@ -311,7 +318,7 @@ def _project_relative_path(raw_path: str) -> Path:
 def _runner_cli_args(args: argparse.Namespace) -> argparse.Namespace:
     from genode.evaluation.diffusion_flow_time_reparameterization import build_argparser
 
-    datasets = parse_csv(str(getattr(args, "scenario_keys", ",".join(DATASET_ORDER))))
+    datasets = parse_csv(str(getattr(args, "datasets", ",".join(DATASET_ORDER))))
     solvers = parse_csv(str(getattr(args, "solvers", ",".join(SOLVER_ORDER))))
     target_nfes = parse_int_csv(str(getattr(args, "target_nfes", ",".join(str(nfe) for nfe in TARGET_NFES))))
     seeds = parse_int_csv(str(getattr(args, "seeds", ",".join(str(seed) for seed in DEFAULT_SEEDS))))
@@ -330,7 +337,7 @@ def _runner_cli_args(args: argparse.Namespace) -> argparse.Namespace:
         ",".join(str(seed) for seed in seeds),
         "--device",
         str(getattr(args, "device", "cuda")),
-        "--checkpoint_steps",
+        "--otflow_train_steps",
         "20000",
         "--num_eval_samples",
         "1",
@@ -339,20 +346,29 @@ def _runner_cli_args(args: argparse.Namespace) -> argparse.Namespace:
         "--eval_windows_val",
         str(int(getattr(args, "val_windows", DEFAULT_VALIDATION_WINDOWS))),
     ]
-    backbone_manifest = str(getattr(args, "backbone_manifest", "backbone_manifest.json"))
+    backbone_manifest = str(getattr(args, "backbone_manifest", "outputs/backbone_matrix/backbone_manifest.json"))
     if backbone_manifest.strip():
         argv.extend(["--backbone_manifest", str(_project_relative_path(backbone_manifest))])
     return build_argparser().parse_args(argv)
 
 
-def build_fixed_schedule_grid(schedule_key: str, macro_steps: int) -> List[float]:
-    from genode.schedule_transfer.diffusion_flow_schedules import build_schedule_grid
+def solver_runtime_name(solver_key: str) -> str:
+    from genode.evaluation.otflow_evaluation_support import SOLVER_RUNTIME_NAMES
 
-    grid = build_schedule_grid(str(schedule_key), int(macro_steps))
+    key = str(solver_key)
+    if key not in SOLVER_RUNTIME_NAMES:
+        raise ValueError(f"Unsupported solver key {solver_key!r}.")
+    return str(SOLVER_RUNTIME_NAMES[key])
+
+
+def build_fixed_schedule_grid(schedule_key: str, runtime_nfe: int) -> List[float]:
+    from genode.schedule_transfer.otflow_paper_registry import build_schedule_grid
+
+    grid = build_schedule_grid(str(schedule_key), int(runtime_nfe))
     if grid is None:
         raise ValueError(f"Unable to build schedule grid for {schedule_key!r}.")
     arr = validate_time_grid(grid, name=f"{schedule_key}_grid")
-    expected_len = int(macro_steps) + 1
+    expected_len = int(runtime_nfe) + 1
     if arr.size != expected_len:
         raise ValueError(f"{schedule_key} grid must contain {expected_len} nodes, got {arr.size}.")
     return [float(x) for x in arr.tolist()]
@@ -373,8 +389,9 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
         collect_forecast_calibration,
         load_forecast_checkpoint_splits,
         resolve_reference_macro_steps,
+        solver_macro_steps,
     )
-    from genode.data.otflow_paths import project_dataset_root
+    from genode.data.otflow_paths import project_paper_dataset_root
     from genode.runtime import resolve_torch_device
 
     datasets = parse_csv(str(args.datasets))
@@ -400,7 +417,7 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
     cli_args = _runner_cli_args(args)
     device = resolve_torch_device(str(args.device))
     cells: List[Dict[str, Any]] = []
-    dataset_root = project_dataset_root()
+    dataset_root = project_paper_dataset_root()
     for dataset in datasets:
         dataset_idx = DATASET_ORDER.index(str(dataset))
         checkpoint = load_forecast_checkpoint_splits(
@@ -415,13 +432,13 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
         splits = checkpoint["splits"]
         with torch.no_grad():
             for solver_key in solvers:
-                runtime_solver = normalize_solver_key(str(solver_key))
+                runtime_solver = solver_runtime_name(str(solver_key))
                 for target_nfe in target_nfes:
-                    macro_steps = int(solver_macro_steps(str(solver_key), int(target_nfe)))
+                    runtime_nfe = int(solver_macro_steps(str(solver_key), int(target_nfe)))
                     reference_macro_steps = int(
                         resolve_reference_macro_steps(
                             0,
-                            macro_steps,
+                            runtime_nfe,
                             reference_macro_factor=float(args.reference_macro_factor),
                         )
                     )
@@ -497,12 +514,12 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
                         )
                     cells.append(
                         {
-                            "scenario_key": str(dataset),
-                            "scenario_label": DATASET_LABELS[str(dataset)],
+                            "dataset": str(dataset),
+                            "dataset_label": DATASET_LABELS[str(dataset)],
                             "solver_key": str(solver_key),
                             "solver_label": SOLVER_LABELS[str(solver_key)],
                             "target_nfe": int(target_nfe),
-                            "macro_steps": int(macro_steps),
+                            "runtime_nfe": int(runtime_nfe),
                             "reference_macro_steps": int(reference_macro_steps),
                             "reference_time_grid": reference_time_grid,
                             "validation_hardness_trace": mean_local_defect,
@@ -510,9 +527,8 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
                             "validation_oracle_local_error_trace": mean_oracle,
                             "validation_local_defect_trace": mean_local_defect,
                             "per_seed": per_seed,
-                            "checkpoint_path": display_project_path(str(checkpoint["checkpoint_path"])),
+                            "checkpoint_path": str(checkpoint["checkpoint_path"]),
                             "checkpoint_id": str(checkpoint["checkpoint_id"]),
-                            "checkpoint_step": int(checkpoint["checkpoint_step"]),
                             "train_budget_label": str(checkpoint["train_budget_label"]),
                             "backbone_name": str(checkpoint["backbone_name"]),
                         }
@@ -525,7 +541,7 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "artifact": "ptg_observed_gain_inputs",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "project_root": "project_root",
-        "scenario_keys": datasets,
+        "datasets": datasets,
         "solvers": solvers,
         "target_nfes": [int(x) for x in target_nfes],
         "seeds": [int(x) for x in seeds],
@@ -533,7 +549,7 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "reference_macro_factor": float(args.reference_macro_factor),
         "calibration_trace_samples": int(args.calibration_trace_samples),
         "signal_trace_key": NATIVE_TRACE_KEY,
-        "report_trace_key": LOCAL_DEFECT_TRACE_KEY,
+        "paper_facing_trace_key": LOCAL_DEFECT_TRACE_KEY,
         "oracle_local_error_trace_key": ORACLE_LOCAL_ERROR_TRACE_KEY,
         "density_floor_eta": float(DEFAULT_DENSITY_FLOOR_ETA),
         "main_ptg_key": DEFAULT_MAIN_PTG_KEY,
@@ -559,43 +575,42 @@ def _sample_forecast_endpoints_norm(
     cfg: Any,
     *,
     solver_name: str,
-    macro_steps: int,
+    runtime_nfe: int,
     time_grid: Sequence[float],
     seed: int,
     batch_size: int = 64,
 ) -> Tuple[List[np.ndarray], float]:
     import torch
+    from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _restore_sample_overrides
     from genode.models.otflow_train_val import seed_all
 
     device = cfg.train.device
     endpoints: List[np.ndarray] = []
     elapsed = 0.0
     effective_batch_size = max(1, int(batch_size))
-    target_nfe = target_nfe_for_macro_steps(str(solver_name), int(macro_steps))
-    for batch_start in range(0, int(len(ds)), effective_batch_size):
-        batch_end = min(int(len(ds)), int(batch_start) + effective_batch_size)
-        hist_rows = []
-        for example_idx in range(batch_start, batch_end):
-            hist_t, _, _, _ = ds[int(example_idx)]
-            hist_rows.append(hist_t)
-        hist = torch.stack(hist_rows, dim=0).to(device).float()
-        draw_seed = int(seed) + 1000 * int(batch_start)
-        seed_all(draw_seed)
-        if device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.synchronize(device)
-        start = time.perf_counter()
-        pred_norm = model.sample_future(
-            hist,
-            solver_key=str(solver_name),
-            target_nfe=target_nfe,
-            time_grid=time_grid,
-        )
-        if device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.synchronize(device)
-        elapsed += float(time.perf_counter() - start)
-        pred_arr = pred_norm.detach().cpu().numpy().astype(np.float64)
-        for batch_idx in range(int(pred_arr.shape[0])):
-            endpoints.append(pred_arr[batch_idx].reshape(-1))
+    backup = _apply_sample_overrides(model, cfg, solver=str(solver_name), time_grid=tuple(float(x) for x in time_grid))
+    try:
+        for batch_start in range(0, int(len(ds)), effective_batch_size):
+            batch_end = min(int(len(ds)), int(batch_start) + effective_batch_size)
+            hist_rows = []
+            for example_idx in range(batch_start, batch_end):
+                hist_t, _, _, _ = ds[int(example_idx)]
+                hist_rows.append(hist_t)
+            hist = torch.stack(hist_rows, dim=0).to(device).float()
+            draw_seed = int(seed) + 1000 * int(batch_start)
+            seed_all(draw_seed)
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            start = time.perf_counter()
+            pred_norm = model.sample_future(hist, steps=int(runtime_nfe), solver=str(solver_name))
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            elapsed += float(time.perf_counter() - start)
+            pred_arr = pred_norm.detach().cpu().numpy().astype(np.float64)
+            for batch_idx in range(int(pred_arr.shape[0])):
+                endpoints.append(pred_arr[batch_idx].reshape(-1))
+    finally:
+        _restore_sample_overrides(model, cfg, backup)
     return endpoints, elapsed
 
 
@@ -626,8 +641,9 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
     from genode.evaluation.otflow_evaluation_support import (
         load_forecast_checkpoint_splits,
         resolve_reference_macro_steps,
+        solver_macro_steps,
     )
-    from genode.data.otflow_paths import project_dataset_root
+    from genode.data.otflow_paths import project_paper_dataset_root
     from genode.runtime import resolve_torch_device
 
     datasets = parse_csv(str(args.datasets))
@@ -659,24 +675,23 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
 
     cli_args = _runner_cli_args(args)
     device = resolve_torch_device(str(args.device))
-    dataset_root = project_dataset_root()
+    dataset_root = project_paper_dataset_root()
     rows: List[Dict[str, Any]] = []
     completed_seed_keys = set()
     rows_csv = Path(args.rows_csv) if getattr(args, "rows_csv", None) is not None else None
     if bool(getattr(args, "resume", False)) and rows_csv is not None and rows_csv.exists():
         with rows_csv.open("r", newline="", encoding="utf-8") as handle:
             rows = [dict(row) for row in csv.DictReader(handle)]
-        reject_retired_evaluation_keys(rows, source=f"Integration-error rows from {rows_csv.name}")
         grouped_schedules: Dict[Tuple[str, str, int, int], set] = defaultdict(set)
         for row in rows:
             grouped_schedules[
                 (
-                    str(row["scenario_key"]),
+                    str(row["dataset"]),
                     str(row["solver_key"]),
                     int(row["target_nfe"]),
                     int(row["evaluation_seed"]),
                 )
-            ].add(str(row["scheduler_key"]))
+            ].add(str(row["schedule_key"]))
         required = set(schedules)
         completed_seed_keys = {key for key, seen in grouped_schedules.items() if required.issubset(seen)}
     total_seed_cells = int(len(datasets) * len(solvers) * len(target_nfes) * len(seeds))
@@ -699,19 +714,19 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
         )
         with torch.no_grad():
             for solver_key in solvers:
-                runtime_solver = normalize_solver_key(str(solver_key))
+                runtime_solver = solver_runtime_name(str(solver_key))
                 for target_nfe in target_nfes:
-                    macro_steps = int(solver_macro_steps(str(solver_key), int(target_nfe)))
+                    runtime_nfe = int(solver_macro_steps(str(solver_key), int(target_nfe)))
                     dense_reference_steps = int(
                         resolve_reference_macro_steps(
                             0,
-                            macro_steps,
+                            runtime_nfe,
                             reference_macro_factor=float(args.dense_reference_macro_factor),
                         )
                     )
                     dense_reference_grid = _dense_uniform_grid(dense_reference_steps)
                     schedule_grids = {
-                        schedule_key: build_fixed_schedule_grid(str(schedule_key), int(macro_steps))
+                        schedule_key: build_fixed_schedule_grid(str(schedule_key), int(runtime_nfe))
                         for schedule_key in schedules
                     }
                     for seed in seeds:
@@ -722,7 +737,7 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
                                 json.dumps(
                                     {
                                         "progress": f"{completed_seed_cells}/{total_seed_cells}",
-                                        "scenario_key": str(dataset),
+                                        "dataset": str(dataset),
                                         "solver_key": str(solver_key),
                                         "target_nfe": int(target_nfe),
                                         "seed": int(seed),
@@ -739,7 +754,7 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
                             test_ds,
                             cfg,
                             solver_name=runtime_solver,
-                            macro_steps=int(dense_reference_steps),
+                            runtime_nfe=int(dense_reference_steps),
                             time_grid=dense_reference_grid,
                             seed=int(seed),
                             batch_size=int(args.integration_batch_size),
@@ -752,7 +767,7 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
                                 test_ds,
                                 cfg,
                                 solver_name=runtime_solver,
-                                macro_steps=int(macro_steps),
+                                runtime_nfe=int(runtime_nfe),
                                 time_grid=schedule_grids[str(schedule_key)],
                                 seed=int(seed),
                                 batch_size=int(args.integration_batch_size),
@@ -770,22 +785,22 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
                             gain = 100.0 * (1.0 - integration_error / uniform_error)
                             rows.append(
                                 {
-                                    "scenario_key": str(dataset),
+                                    "dataset": str(dataset),
                                     "split_phase": "locked_test",
                                     "checkpoint_id": str(checkpoint["checkpoint_id"]),
-                                    "checkpoint_path": display_project_path(str(checkpoint["checkpoint_path"])),
+                                    "checkpoint_path": str(checkpoint["checkpoint_path"]),
                                     "backbone_name": str(checkpoint["backbone_name"]),
                                     "train_budget_label": str(checkpoint["train_budget_label"]),
-                                    "checkpoint_step": int(checkpoint["checkpoint_step"]),
+                                    "train_steps": int(checkpoint["train_steps"]),
                                     "target_nfe": int(target_nfe),
-                                    "macro_steps": int(macro_steps),
+                                    "runtime_nfe": int(runtime_nfe),
                                     "dense_reference_macro_steps": int(dense_reference_steps),
                                     "dense_reference_macro_factor": float(args.dense_reference_macro_factor),
                                     "evaluation_seed": int(seed),
                                     "solver_key": str(solver_key),
                                     "solver_name": str(runtime_solver),
-                                    "scheduler_key": str(schedule_key),
-                                    "scheduler_name": SCHEDULE_LABELS[str(schedule_key)],
+                                    "schedule_key": str(schedule_key),
+                                    "schedule_name": SCHEDULE_LABELS[str(schedule_key)],
                                     "integration_error": float(integration_error),
                                     "uniform_integration_error": float(uniform_error),
                                     "integration_gain_percent": float(gain),
@@ -804,7 +819,7 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
                             json.dumps(
                                 {
                                     "progress": f"{completed_seed_cells}/{total_seed_cells}",
-                                    "scenario_key": str(dataset),
+                                    "dataset": str(dataset),
                                     "solver_key": str(solver_key),
                                     "target_nfe": int(target_nfe),
                                     "seed": int(seed),
@@ -821,10 +836,9 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
 
 
 def aggregate_integration_error_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    reject_retired_evaluation_keys(rows, source="Integration-error rows")
     groups: Dict[Tuple[str, int, str, str], List[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
-        key = (str(row["scenario_key"]), int(row["target_nfe"]), str(row["solver_key"]), str(row["scheduler_key"]))
+        key = (str(row["dataset"]), int(row["target_nfe"]), str(row["solver_key"]), str(row["schedule_key"]))
         groups[key].append(row)
     stats_rows: List[Dict[str, Any]] = []
     for key in sorted(groups):
@@ -836,20 +850,20 @@ def aggregate_integration_error_rows(rows: Sequence[Mapping[str, Any]]) -> List[
         gains = np.asarray([float(row["integration_gain_percent"]) for row in group], dtype=np.float64)
         stats_rows.append(
             {
-                "scenario_key": str(first["scenario_key"]),
+                "dataset": str(first["dataset"]),
                 "split_phase": str(first["split_phase"]),
                 "checkpoint_id": str(first["checkpoint_id"]),
                 "backbone_name": str(first["backbone_name"]),
                 "train_budget_label": str(first["train_budget_label"]),
-                "checkpoint_step": int(first["checkpoint_step"]),
+                "train_steps": int(first["train_steps"]),
                 "target_nfe": int(first["target_nfe"]),
-                "macro_steps": int(first["macro_steps"]),
+                "runtime_nfe": int(first["runtime_nfe"]),
                 "dense_reference_macro_steps": int(first["dense_reference_macro_steps"]),
                 "dense_reference_macro_factor": float(first["dense_reference_macro_factor"]),
                 "solver_key": str(first["solver_key"]),
                 "solver_name": str(first["solver_name"]),
-                "scheduler_key": str(first["scheduler_key"]),
-                "scheduler_name": str(first["scheduler_name"]),
+                "schedule_key": str(first["schedule_key"]),
+                "schedule_name": str(first["schedule_name"]),
                 "n_seeds": int(len(seeds)),
                 "seed_values": ";".join(str(seed) for seed in seeds),
                 "integration_error_mean": float(np.mean(errors)),
@@ -884,12 +898,11 @@ def write_csv_rows(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
 def load_integration_gain_rows(path: Path) -> Dict[Tuple[str, int, str, str], Dict[str, Any]]:
     with Path(path).open("r", newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    reject_retired_evaluation_keys(rows, source=f"Integration-gain rows from {Path(path).name}")
     selected: Dict[Tuple[str, int, str, str], Dict[str, Any]] = {}
     for row in rows:
-        dataset = str(row["scenario_key"])
+        dataset = str(row["dataset"])
         solver_key = str(row["solver_key"])
-        schedule_key = str(row["scheduler_key"])
+        schedule_key = str(row["schedule_key"])
         target_nfe = int(row["target_nfe"])
         if dataset not in DATASET_ORDER or solver_key not in SOLVER_ORDER:
             continue
@@ -899,13 +912,11 @@ def load_integration_gain_rows(path: Path) -> Dict[Tuple[str, int, str, str], Di
         if key in selected:
             raise ValueError(f"Duplicate integration gain row for {key}.")
         selected[key] = {
-            "scenario_key": dataset,
-            "checkpoint_id": str(row["checkpoint_id"]),
-            "checkpoint_step": int(row["checkpoint_step"]),
+            "dataset": dataset,
             "target_nfe": int(target_nfe),
-            "macro_steps": int(row["macro_steps"]),
+            "runtime_nfe": int(row["runtime_nfe"]),
             "solver_key": solver_key,
-            "scheduler_key": schedule_key,
+            "schedule_key": schedule_key,
             "n_seeds": int(row["n_seeds"]),
             "seed_values": str(row["seed_values"]),
             "integration_error_mean": float(row["integration_error_mean"]),
@@ -942,12 +953,11 @@ def observed_gain_from_relative_row(row: Mapping[str, str]) -> Dict[str, float]:
 
 def load_observed_gain_rows(zip_path: Path) -> Dict[Tuple[str, int, str, str], Dict[str, Any]]:
     rows = _load_zip_csv(Path(zip_path), RELATIVE_STATS_NAME)
-    reject_retired_evaluation_keys(rows, source=f"Observed-gain rows from {Path(zip_path).name}")
     selected: Dict[Tuple[str, int, str, str], Dict[str, Any]] = {}
     for row in rows:
-        dataset = str(row["scenario_key"])
+        dataset = str(row["dataset"])
         solver_key = str(row["solver_key"])
-        schedule_key = str(row["scheduler_key"])
+        schedule_key = str(row["schedule_key"])
         target_nfe = int(row["target_nfe"])
         if dataset not in DATASET_ORDER or solver_key not in SOLVER_ORDER:
             continue
@@ -958,12 +968,10 @@ def load_observed_gain_rows(zip_path: Path) -> Dict[Tuple[str, int, str, str], D
             raise ValueError(f"Duplicate observed gain row for {key}.")
         gains = observed_gain_from_relative_row(row)
         selected[key] = {
-            "scenario_key": dataset,
-            "checkpoint_id": str(row["checkpoint_id"]),
-            "checkpoint_step": int(row["checkpoint_step"]),
+            "dataset": dataset,
             "target_nfe": int(target_nfe),
             "solver_key": solver_key,
-            "scheduler_key": schedule_key,
+            "schedule_key": schedule_key,
             "relative_crps_vs_uniform_mean": float(row["relative_crps_vs_uniform_mean"]),
             "relative_mase_vs_uniform_mean": float(row["relative_mase_vs_uniform_mean"]),
             "relative_crps_vs_uniform_std": float(row["relative_crps_vs_uniform_std"]),
@@ -978,23 +986,16 @@ def load_observed_gain_rows(zip_path: Path) -> Dict[Tuple[str, int, str, str], D
 
 
 def validate_input_payload(payload: Mapping[str, Any]) -> None:
-    reject_retired_evaluation_keys(payload, source="PTG input payload")
     cells = list(payload.get("cells", []))
-    expected = len(payload.get("scenario_keys", [])) * len(payload.get("solvers", [])) * len(payload.get("target_nfes", []))
+    expected = len(payload.get("datasets", [])) * len(payload.get("solvers", [])) * len(payload.get("target_nfes", []))
     if len(cells) != expected:
         raise ValueError(f"Expected {expected} input cells, got {len(cells)}.")
     seen = set()
     for cell in cells:
-        key = (str(cell["scenario_key"]), int(cell["target_nfe"]), str(cell["solver_key"]))
+        key = (str(cell["dataset"]), int(cell["target_nfe"]), str(cell["solver_key"]))
         if key in seen:
             raise ValueError(f"Duplicate input cell {key}.")
         seen.add(key)
-        checkpoint_id = str(cell.get("checkpoint_id", "")).strip()
-        if not checkpoint_id:
-            raise ValueError(f"{key} is missing checkpoint_id.")
-        checkpoint_step = int(cell.get("checkpoint_step", 0) or 0)
-        if checkpoint_step <= 0:
-            raise ValueError(f"{key} requires a positive checkpoint_step.")
         reference_grid = validate_time_grid(cell["reference_time_grid"], name=f"{key}_reference_time_grid")
         required_trace_keys = (
             INFO_GROWTH_TRACE_KEY,
@@ -1035,16 +1036,16 @@ def build_points(
     validate_input_payload(payload)
     points: List[Dict[str, Any]] = []
     for cell in payload["cells"]:
-        dataset = str(cell["scenario_key"])
+        dataset = str(cell["dataset"])
         solver_key = str(cell["solver_key"])
         target_nfe = int(cell["target_nfe"])
-        macro_steps = int(cell["macro_steps"])
+        runtime_nfe = int(cell["runtime_nfe"])
         reference_grid = [float(x) for x in cell["reference_time_grid"]]
         info_growth = [float(x) for x in cell[INFO_GROWTH_TRACE_KEY]]
         local_defect = [float(x) for x in cell[LOCAL_DEFECT_TRACE_KEY]]
         kappa, _widths, eps_h, kappa_integral = normalize_hardness_for_ptg(local_defect, reference_grid)
         for schedule_key in TRANSFER_SCHEDULES:
-            schedule_grid = build_fixed_schedule_grid(schedule_key, macro_steps)
+            schedule_grid = build_fixed_schedule_grid(schedule_key, runtime_nfe)
             solver_p = solver_order_for_ptg(solver_key)
             info_growth_raw = _ptg_variant(
                 info_growth,
@@ -1078,20 +1079,16 @@ def build_points(
             if obs_key not in integration_rows:
                 raise ValueError(f"Missing integration gain row for {obs_key}.")
             observed = dict(integration_rows[obs_key])
-            if str(observed.get("checkpoint_id", "")).strip() != str(cell["checkpoint_id"]):
-                raise ValueError(f"Checkpoint ID mismatch for {obs_key}.")
-            if int(observed.get("checkpoint_step", 0) or 0) != int(cell["checkpoint_step"]):
-                raise ValueError(f"Checkpoint step mismatch for {obs_key}.")
             points.append(
                 {
-                    "scenario_key": dataset,
-                    "scenario_label": DATASET_LABELS[dataset],
+                    "dataset": dataset,
+                    "dataset_label": DATASET_LABELS[dataset],
                     "solver_key": solver_key,
                     "solver_label": SOLVER_LABELS[solver_key],
                     "target_nfe": int(target_nfe),
-                    "macro_steps": int(macro_steps),
-                    "scheduler_key": schedule_key,
-                    "scheduler_label": SCHEDULE_LABELS[schedule_key],
+                    "runtime_nfe": int(runtime_nfe),
+                    "schedule_key": schedule_key,
+                    "schedule_label": SCHEDULE_LABELS[schedule_key],
                     "solver_order_p": float(solver_p),
                     "reference_macro_steps": int(cell["reference_macro_steps"]),
                     "ptg_percent": float(local_defect_eta.ptg_percent),
@@ -1120,14 +1117,12 @@ def build_points(
             )
     expected = len(DATASET_ORDER) * len(SOLVER_ORDER) * len(TARGET_NFES) * len(TRANSFER_SCHEDULES)
     if (
-        tuple(payload.get("scenario_keys", [])) == DATASET_ORDER
+        tuple(payload.get("datasets", [])) == DATASET_ORDER
         and tuple(payload.get("solvers", [])) == SOLVER_ORDER
         and tuple(int(x) for x in payload.get("target_nfes", [])) == TARGET_NFES
         and len(points) != expected
     ):
         raise ValueError(f"Expected {expected} PTG points, got {len(points)}.")
-    if any(str(point["scheduler_key"]) == "late_power_3" for point in points):
-        raise ValueError("late_power_3 must be excluded from PTG points.")
     return points
 
 
@@ -1143,13 +1138,38 @@ def write_points_csv(points: Sequence[Mapping[str, Any]], path: Path) -> None:
             writer.writerow(point)
 
 
+def _rankdata_average(values: Sequence[float]) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    order = np.argsort(arr, kind="mergesort")
+    ranks = np.empty(arr.size, dtype=np.float64)
+    sorted_values = arr[order]
+    start = 0
+    while start < arr.size:
+        end = start + 1
+        while end < arr.size and sorted_values[end] == sorted_values[start]:
+            end += 1
+        avg_rank = 0.5 * (float(start + 1) + float(end))
+        ranks[order[start:end]] = avg_rank
+        start = end
+    return ranks
+
+
 def spearman_correlation(x: Sequence[float], y: Sequence[float]) -> Tuple[float, Optional[float]]:
     x_arr = np.asarray(x, dtype=np.float64)
     y_arr = np.asarray(y, dtype=np.float64)
     if x_arr.size != y_arr.size or x_arr.size < 2:
         return float("nan"), None
-    result = spearmanr(x_arr, y_arr)
-    return float(result.statistic), float(result.pvalue)
+    try:
+        from scipy.stats import spearmanr
+
+        result = spearmanr(x_arr, y_arr)
+        return float(result.statistic), float(result.pvalue)
+    except Exception:
+        xr = _rankdata_average(x_arr)
+        yr = _rankdata_average(y_arr)
+        if float(np.std(xr)) <= 0.0 or float(np.std(yr)) <= 0.0:
+            return float("nan"), None
+        return float(np.corrcoef(xr, yr)[0, 1]), None
 
 
 def _axis_limits(values: np.ndarray, *, pad_fraction: float = 0.08) -> Tuple[float, float]:
@@ -1196,6 +1216,10 @@ def summarize_ptg_points(points: Sequence[Mapping[str, Any]], *, main_ptg_key: s
     }
 
 
+def diagnostic_figure_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}_diagnostic{path.suffix}")
+
+
 def build_figure(points: Sequence[Mapping[str, Any]], *, x_key: str = DEFAULT_MAIN_PTG_KEY):
     import matplotlib
 
@@ -1229,16 +1253,19 @@ def build_figure(points: Sequence[Mapping[str, Any]], *, x_key: str = DEFAULT_MA
         "weather_daily": "o",
     }
     schedule_colors = {
-        "ays": "#0072B2",
-        "gits": "#D55E00",
-        "ots": "#009E73",
+        "ays_sd15_native": "#0072B2",
+        "ays_sd15_log_sigma": "#56B4E9",
+        "gits_cifar10_native": "#D55E00",
+        "gits_cifar10_log_sigma": "#E69F00",
+        "ots_vp_linear_native": "#009E73",
+        "ots_vp_linear_log_sigma": "#66C2A5",
     }
     for dataset in DATASET_ORDER:
         for schedule_key in TRANSFER_SCHEDULES:
             selected = [
                 point
                 for point in points
-                if str(point["scenario_key"]) == dataset and str(point["scheduler_key"]) == schedule_key
+                if str(point["dataset"]) == dataset and str(point["schedule_key"]) == schedule_key
             ]
             if not selected:
                 continue
@@ -1348,7 +1375,7 @@ def plot_points(
     import matplotlib.pyplot as plt
 
     plt.close(fig)
-    return {"png": display_project_path(png_path), "pdf": display_project_path(pdf_path)}
+    return {"png": str(png_path), "pdf": str(pdf_path)}
 
 
 def plot_points_with_diagnostics(
@@ -1368,17 +1395,13 @@ def plot_points_with_diagnostics(
         dpi=int(dpi),
         x_key=str(main_ptg_key),
     )
-    diagnostics["report_written"] = True
-    diagnostics["figure_mode"] = "report"
+    diagnostics["paper_facing_written"] = True
+    diagnostics["figure_mode"] = "paper_facing"
     diagnostics["figure_outputs"] = dict(outputs)
-    diagnostics["report_outputs"] = dict(outputs)
+    diagnostics["paper_facing_outputs"] = {"png": str(png_path), "pdf": str(pdf_path)}
     diagnostics_json_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(diagnostics, diagnostics_json_path)
-    return {
-        **outputs,
-        "diagnostics_json": display_project_path(diagnostics_json_path),
-        "report_written": True,
-    }
+    return {**outputs, "diagnostics_json": str(diagnostics_json_path), "paper_facing_written": True}
 
 
 def synthetic_payload() -> Dict[str, Any]:
@@ -1386,8 +1409,8 @@ def synthetic_payload() -> Dict[str, Any]:
     for dataset_idx, dataset in enumerate(DATASET_ORDER):
         for solver_idx, solver_key in enumerate(SOLVER_ORDER):
             for target_nfe in TARGET_NFES:
-                macro_steps = target_nfe if solver_key in {"euler", "dpmpp2m"} else target_nfe // 2
-                reference_steps = max(32, int(round(DEFAULT_REFERENCE_MACRO_FACTOR * macro_steps)))
+                runtime_nfe = target_nfe if solver_key in {"euler", "dpmpp2m"} else target_nfe // 2
+                reference_steps = max(32, int(round(DEFAULT_REFERENCE_MACRO_FACTOR * runtime_nfe)))
                 reference_grid = [float(i) / float(reference_steps) for i in range(reference_steps + 1)]
                 trace = [
                     0.8
@@ -1410,12 +1433,12 @@ def synthetic_payload() -> Dict[str, Any]:
                 )
                 cells.append(
                     {
-                        "scenario_key": dataset,
-                        "scenario_label": DATASET_LABELS[dataset],
+                        "dataset": dataset,
+                        "dataset_label": DATASET_LABELS[dataset],
                         "solver_key": solver_key,
                         "solver_label": SOLVER_LABELS[solver_key],
                         "target_nfe": int(target_nfe),
-                        "macro_steps": int(macro_steps),
+                        "runtime_nfe": int(runtime_nfe),
                         "reference_macro_steps": int(reference_steps),
                         "reference_time_grid": reference_grid,
                         "validation_hardness_trace": local_defect_trace,
@@ -1423,14 +1446,12 @@ def synthetic_payload() -> Dict[str, Any]:
                         "validation_oracle_local_error_trace": oracle_trace,
                         "validation_local_defect_trace": local_defect_trace,
                         "per_seed": [],
-                        "checkpoint_id": "synthetic_checkpoint",
-                        "checkpoint_step": 20000,
                     }
                 )
     return {
         "artifact": "ptg_observed_gain_inputs",
         "generated_at_utc": "synthetic",
-        "scenario_keys": list(DATASET_ORDER),
+        "datasets": list(DATASET_ORDER),
         "solvers": list(SOLVER_ORDER),
         "target_nfes": list(TARGET_NFES),
         "seeds": list(DEFAULT_SEEDS),
@@ -1438,7 +1459,7 @@ def synthetic_payload() -> Dict[str, Any]:
         "reference_macro_factor": DEFAULT_REFERENCE_MACRO_FACTOR,
         "calibration_trace_samples": DEFAULT_CALIBRATION_TRACE_SAMPLES,
         "signal_trace_key": NATIVE_TRACE_KEY,
-        "report_trace_key": LOCAL_DEFECT_TRACE_KEY,
+        "paper_facing_trace_key": LOCAL_DEFECT_TRACE_KEY,
         "oracle_local_error_trace_key": ORACLE_LOCAL_ERROR_TRACE_KEY,
         "density_floor_eta": DEFAULT_DENSITY_FLOOR_ETA,
         "main_ptg_key": DEFAULT_MAIN_PTG_KEY,
@@ -1455,13 +1476,11 @@ def synthetic_observed_rows() -> Dict[Tuple[str, int, str, str], Dict[str, Any]]
                 for schedule_idx, schedule_key in enumerate(TRANSFER_SCHEDULES):
                     gain = -2.0 + 0.7 * dataset_idx + 0.4 * solver_idx + 0.5 * nfe_idx + 0.6 * schedule_idx
                     rows[(dataset, int(target_nfe), solver_key, schedule_key)] = {
-                        "scenario_key": dataset,
-                        "checkpoint_id": "synthetic_checkpoint",
-                        "checkpoint_step": 20000,
+                        "dataset": dataset,
                         "target_nfe": int(target_nfe),
-                        "macro_steps": int(target_nfe if solver_key in {"euler", "dpmpp2m"} else target_nfe // 2),
+                        "runtime_nfe": int(target_nfe if solver_key in {"euler", "dpmpp2m"} else target_nfe // 2),
                         "solver_key": solver_key,
-                        "scheduler_key": schedule_key,
+                        "schedule_key": schedule_key,
                         "n_seeds": 5,
                         "seed_values": "0;1;2;3;4",
                         "integration_error_mean": 1.0 - gain / 100.0,
@@ -1490,7 +1509,7 @@ def build_argparser() -> argparse.ArgumentParser:
     collect.add_argument("--val-windows", type=int, default=DEFAULT_VALIDATION_WINDOWS)
     collect.add_argument("--reference-macro-factor", type=float, default=DEFAULT_REFERENCE_MACRO_FACTOR)
     collect.add_argument("--calibration-trace-samples", type=int, default=DEFAULT_CALIBRATION_TRACE_SAMPLES)
-    collect.add_argument("--backbone-manifest", type=str, default="backbone_manifest.json")
+    collect.add_argument("--backbone-manifest", type=str, default="outputs/backbone_matrix/backbone_manifest.json")
     collect.add_argument("--device", type=str, default="auto")
     collect.add_argument("--smoke", action="store_true", help="Collect the first dataset/solver/NFE/seed with a tiny window cap.")
 
@@ -1508,7 +1527,7 @@ def build_argparser() -> argparse.ArgumentParser:
     integration.add_argument("--test-windows", type=int, default=DEFAULT_TEST_WINDOWS)
     integration.add_argument("--integration-batch-size", type=int, default=64)
     integration.add_argument("--dense-reference-macro-factor", type=float, default=DEFAULT_DENSE_REFERENCE_MACRO_FACTOR)
-    integration.add_argument("--backbone-manifest", type=str, default="backbone_manifest.json")
+    integration.add_argument("--backbone-manifest", type=str, default="outputs/backbone_matrix/backbone_manifest.json")
     integration.add_argument("--device", type=str, default="auto")
     integration.add_argument("--resume", action="store_true", help="Skip seed cells already present in --rows-csv.")
     integration.add_argument("--smoke", action="store_true", help="Collect one tiny integration-error cell.")
@@ -1538,14 +1557,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         payload = collect_payload(args)
         validate_input_payload(payload)
         write_json(payload, Path(args.out_json))
-        print(display_project_path(Path(args.out_json)))
+        print(str(Path(args.out_json).resolve()))
         return
     if args.command == "collect-integration-error":
         rows = collect_integration_error_rows(args)
         stats_rows = aggregate_integration_error_rows(rows)
         write_csv_rows(rows, Path(args.rows_csv))
         write_csv_rows(stats_rows, Path(args.seed_stats_csv))
-        print(json.dumps({"rows_csv": display_project_path(Path(args.rows_csv)), "seed_stats_csv": display_project_path(Path(args.seed_stats_csv)), "rows": len(rows), "seed_stats_rows": len(stats_rows)}, indent=2, sort_keys=True))
+        print(json.dumps({"rows_csv": str(Path(args.rows_csv)), "seed_stats_csv": str(Path(args.seed_stats_csv)), "rows": len(rows), "seed_stats_rows": len(stats_rows)}, indent=2, sort_keys=True))
         return
     if args.command == "plot":
         payload = load_json(Path(args.input_json))
@@ -1559,7 +1578,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             diagnostics_json_path=Path(args.diagnostics_json),
             dpi=int(args.dpi),
         )
-        outputs["points_csv"] = display_project_path(Path(args.points_csv))
+        outputs["points_csv"] = str(Path(args.points_csv))
         print(json.dumps(outputs, indent=2, sort_keys=True))
         return
     if args.command == "plot-synthetic":
@@ -1572,7 +1591,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             diagnostics_json_path=Path(args.diagnostics_json),
             dpi=int(args.dpi),
         )
-        outputs["points_csv"] = display_project_path(Path(args.points_csv))
+        outputs["points_csv"] = str(Path(args.points_csv))
         print(json.dumps(outputs, indent=2, sort_keys=True))
         return
     raise ValueError(f"Unsupported command {args.command!r}.")

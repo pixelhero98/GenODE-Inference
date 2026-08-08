@@ -40,6 +40,7 @@ from genode.distillation.demonstrations import (
     DEFAULT_DISTILLATION_NFES,
     DistillationContexts,
     DistillationSetting,
+    SUPPORTED_SOLVER_KEYS,
     collect_flow_map_demonstrations,
     default_distillation_settings,
     load_distillation_contexts,
@@ -63,10 +64,11 @@ from genode.distillation.evaluation import (
     validate_quality_context_binding,
     validate_quality_sample_panel_binding,
 )
-from genode.distillation.gipo_policy import (
-    GIPOSchedule,
-    GIPOSchedulePolicy,
-    load_gipo_schedule_policy,
+from genode.distillation.gico_policy import (
+    GICOSchedule,
+    GICOSchedulePolicy,
+    build_gico_student_model,
+    load_gico_schedule_policy,
 )
 from genode.distillation.model import (
     EndpointFlowMap,
@@ -85,26 +87,28 @@ from genode.distillation.training import (
     train_endpoint_flow_map,
     validate_flow_map_bundle,
 )
-from genode.gipo.density_representation import (
-    DENSITY_BIN_COUNT,
+from genode.gico.density_representation import (
+    DEFAULT_DENSITY_BIN_COUNT as DENSITY_BIN_COUNT,
     DENSITY_PROTOCOL,
     uniform_reference_grid,
 )
-from genode.gipo.models import build_setting_encoder_config, setting_feature_dim
-from genode.gipo.policy import (
+from genode.gico.models import build_setting_encoder_config, setting_feature_dim
+from genode.gico.policy import (
     ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
-    GIPO_PROTOCOL,
+    GICO_PROTOCOL,
     MODEL_PAYLOAD_VERSION,
     EmbeddingNormalizer,
-    build_gipo_student_model,
-    normalize_gipo_checkpoint_payload,
 )
-from genode.models.conditioning import ConditioningState
+from genode.models.conditioning import (
+    FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+    ConditioningCache,
+    ConditioningState,
+    frozen_backbone_policy_context_from_cache,
+)
 from genode.models.config import OTFlowConfig
 from genode.models.otflow_model import OTFlow
 from genode.provenance import file_sha256
 from genode.schedule_transfer.diffusion_flow_schedules import build_schedule_grid
-from genode.solver_protocol import SUPPORTED_SOLVER_KEYS
 
 
 def _hold_demonstration_collection_lock(
@@ -164,6 +168,15 @@ def _test_context_fingerprint(label: str) -> str:
     return context_fingerprint(values)
 
 
+def _training_summary(**values: object) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "locked_test_used_for_selection": False,
+        "context_embedding_protocol": FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+    }
+    summary.update(values)
+    return summary
+
+
 def _manifest_metadata(*, context_count: int, split_phase: str = "train") -> dict[str, object]:
     return {
         "artifact_version": 1,
@@ -175,13 +188,13 @@ def _manifest_metadata(*, context_count: int, split_phase: str = "train") -> dic
         "rollouts_per_context": 1,
         "density_bin_count": DENSITY_BIN_COUNT,
         "density_reference_time_grid": list(uniform_reference_grid()),
-        "context_embedding_kind": "ctx_summary",
+        "context_embedding_protocol": FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
         "collection_seed": 0,
         "sample_state_dim": 4,
         "settings": [{"solver_key": "euler", "target_nfe": 2}],
         "setting_encoder_config": _setting_config().to_payload(),
         "backbone_checkpoint_sha256": "a" * 64,
-        "gipo_checkpoint_sha256": "b" * 64,
+        "gico_checkpoint_sha256": "b" * 64,
     }
 
 
@@ -196,7 +209,7 @@ def _write_minimal_manifest(root: Path, *, split_phase: str = "train") -> Path:
                 [_test_context_fingerprint("context-0-physical")],
                 dtype=np.str_,
             ),
-            "ctx_summary": np.zeros((1, 8), dtype=np.float32),
+            "summary": np.zeros((1, 8), dtype=np.float32),
         },
     )
     trajectory = write_npz_shard(
@@ -232,7 +245,6 @@ def _write_training_manifest(root: Path, *, duplicate_context_ids: bool = False)
                 dtype=np.str_,
             ),
             "ctx_tokens": np.zeros((2, 2, 8), dtype=np.float32),
-            "ctx_summary": np.zeros((2, 8), dtype=np.float32),
             "summary": np.zeros((2, 8), dtype=np.float32),
         },
     )
@@ -274,7 +286,7 @@ def _quality_binding() -> dict[str, str]:
         "scenario_key": "cryptos",
         "flow_map_checkpoint_sha256": "c" * 64,
         "backbone_checkpoint_sha256": "d" * 64,
-        "gipo_checkpoint_sha256": "e" * 64,
+        "gico_checkpoint_sha256": "e" * 64,
     }
 
 
@@ -289,26 +301,26 @@ def _quality_candidate_catalog() -> list[dict[str, object]]:
                 "target_nfe": target_nfe,
                 "execution": {
                     "kind": "endpoint_flow_map",
-                    "density_source": "bound_gipo_checkpoint",
+                    "density_source": "bound_gico_checkpoint",
                 },
             }
         )
-    for candidate_key, target_nfe in (("gipo-selected", 4), ("gipo-decoy", 6)):
+    for candidate_key, target_nfe in (("gico-selected", 4), ("gico-decoy", 6)):
         candidates.append(
             {
-                "method": "gipo",
+                "method": "gico",
                 "candidate_key": candidate_key,
                 "solver_key": "euler",
                 "target_nfe": target_nfe,
                 "execution": {
-                    "kind": "gipo_ode_rollout",
+                    "kind": "gico_ode_rollout",
                     "policy_sha256": "e" * 64,
                 },
             }
         )
     for candidate_key, target_nfe, scheduler_key in (
         ("fixed-selected", 4, "uniform"),
-        ("fixed-decoy", 6, "late_power_3"),
+        ("fixed-decoy", 6, "late_p_2"),
     ):
         time_grid = build_schedule_grid(scheduler_key, target_nfe)
         assert time_grid is not None
@@ -397,7 +409,7 @@ def _quality_rows() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     candidates = {
         "flow_map": (("flow-selected", 4, 1.0, 9.0), ("flow-decoy", 6, 2.0, 8.0)),
-        "gipo": (("gipo-selected", 4, 1.0, 9.0), ("gipo-decoy", 6, 2.0, 8.0)),
+        "gico": (("gico-selected", 4, 1.0, 9.0), ("gico-decoy", 6, 2.0, 8.0)),
         "fixed": (("fixed-selected", 4, 1.0, 9.0), ("fixed-decoy", 6, 2.0, 8.0)),
     }
     normalized_candidates = {
@@ -457,7 +469,7 @@ def _quality_rows() -> list[dict[str, object]]:
                 )
     locked_values = {
         "flow_map": ("flow-selected", 0.0, 10.0),
-        "gipo": ("gipo-selected", 1.0, 9.0),
+        "gico": ("gico-selected", 1.0, 9.0),
         "fixed": ("fixed-selected", 2.0, 8.0),
     }
     for method, (candidate_key, error, score) in locked_values.items():
@@ -514,7 +526,7 @@ def _quality_measurement_protocol(
             for name in (
                 "flow_map_checkpoint_sha256",
                 "backbone_checkpoint_sha256",
-                "gipo_checkpoint_sha256",
+                "gico_checkpoint_sha256",
             )
         },
         primary_metrics=[
@@ -769,61 +781,61 @@ def test_flow_map_checkpoint_round_trip_and_source_hash_compatibility(tmp_path: 
     torch.manual_seed(11)
     flow_map = _flow_map()
     backbone_checkpoint = tmp_path / "backbone.pt"
-    gipo_checkpoint = tmp_path / "gipo.pt"
-    incompatible_gipo = tmp_path / "other-gipo.pt"
+    gico_checkpoint = tmp_path / "gico.pt"
+    incompatible_gico = tmp_path / "other-gico.pt"
     backbone_checkpoint.write_bytes(b"backbone checkpoint")
-    gipo_checkpoint.write_bytes(b"gipo checkpoint")
-    incompatible_gipo.write_bytes(b"different checkpoint")
+    gico_checkpoint.write_bytes(b"gico checkpoint")
+    incompatible_gico.write_bytes(b"different checkpoint")
     checkpoint = tmp_path / "flow-map.pt"
 
     save_flow_map_checkpoint(
         checkpoint,
         flow_map,
         backbone_checkpoint=backbone_checkpoint,
-        gipo_checkpoint=gipo_checkpoint,
+        gico_checkpoint=gico_checkpoint,
         setting_encoder_config=_setting_config(),
-        training_summary={"locked_test_used_for_selection": False, "epochs": 1},
+        training_summary=_training_summary(epochs=1),
         demonstration_manifest_sha256="a" * 64,
     )
     loaded, payload = load_flow_map_checkpoint(
         checkpoint,
         backbone_checkpoint=backbone_checkpoint,
-        gipo_checkpoint=gipo_checkpoint,
+        gico_checkpoint=gico_checkpoint,
     )
 
     assert payload["quality_gate"]["status"] == QUALITY_STATUS_NOT_EVALUATED
     assert payload["backbone_checkpoint_sha256"]
-    assert payload["gipo_checkpoint_sha256"]
+    assert payload["gico_checkpoint_sha256"]
     assert "backbone_checkpoint" not in payload
-    assert "gipo_checkpoint" not in payload
+    assert "gico_checkpoint" not in payload
     assert loaded.model_config() == flow_map.model_config()
     for name, expected in flow_map.state_dict().items():
         assert torch.equal(loaded.state_dict()[name], expected)
 
-    with pytest.raises(ValueError, match="not compatible.*GIPO"):
-        load_flow_map_checkpoint(checkpoint, gipo_checkpoint=incompatible_gipo)
+    with pytest.raises(ValueError, match="not compatible.*GICO"):
+        load_flow_map_checkpoint(checkpoint, gico_checkpoint=incompatible_gico)
 
 
 def test_flow_map_checkpoint_rejects_changed_expected_source(tmp_path: Path) -> None:
     backbone_checkpoint = tmp_path / "backbone.pt"
-    gipo_checkpoint = tmp_path / "gipo.pt"
+    gico_checkpoint = tmp_path / "gico.pt"
     backbone_checkpoint.write_bytes(b"backbone")
-    gipo_checkpoint.write_bytes(b"original gipo")
-    expected_gipo_hash = file_sha256(gipo_checkpoint)
-    gipo_checkpoint.write_bytes(b"replacement gipo")
+    gico_checkpoint.write_bytes(b"original gico")
+    expected_gico_hash = file_sha256(gico_checkpoint)
+    gico_checkpoint.write_bytes(b"replacement gico")
     output = tmp_path / "flow-map.pt"
 
-    with pytest.raises(ValueError, match="GIPO checkpoint changed"):
+    with pytest.raises(ValueError, match="GICO checkpoint changed"):
         save_flow_map_checkpoint(
             output,
             _flow_map(),
             backbone_checkpoint=backbone_checkpoint,
-            gipo_checkpoint=gipo_checkpoint,
+            gico_checkpoint=gico_checkpoint,
             setting_encoder_config=_setting_config(),
-            training_summary={"locked_test_used_for_selection": False},
+            training_summary=_training_summary(),
             demonstration_manifest_sha256="b" * 64,
             expected_backbone_checkpoint_sha256=file_sha256(backbone_checkpoint),
-            expected_gipo_checkpoint_sha256=expected_gipo_hash,
+            expected_gico_checkpoint_sha256=expected_gico_hash,
         )
 
     assert not output.exists()
@@ -834,11 +846,11 @@ def test_flow_map_checkpoint_rejects_lexical_link_without_touching_referent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backbone_checkpoint = tmp_path / "backbone.pt"
-    gipo_checkpoint = tmp_path / "gipo.pt"
+    gico_checkpoint = tmp_path / "gico.pt"
     referent = tmp_path / "referent.pt"
     output = tmp_path / "flow-map.pt"
     backbone_checkpoint.write_bytes(b"backbone")
-    gipo_checkpoint.write_bytes(b"gipo")
+    gico_checkpoint.write_bytes(b"gico")
     referent.write_bytes(b"referent must remain unchanged")
     try:
         output.symlink_to(referent)
@@ -854,9 +866,9 @@ def test_flow_map_checkpoint_rejects_lexical_link_without_touching_referent(
             output,
             _flow_map(),
             backbone_checkpoint=backbone_checkpoint,
-            gipo_checkpoint=gipo_checkpoint,
+            gico_checkpoint=gico_checkpoint,
             setting_encoder_config=_setting_config(),
-            training_summary={"locked_test_used_for_selection": False},
+            training_summary=_training_summary(),
             demonstration_manifest_sha256="b" * 64,
         )
 
@@ -890,10 +902,10 @@ def test_flow_map_checkpoint_no_overwrite_preserves_concurrent_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backbone_checkpoint = tmp_path / "backbone.pt"
-    gipo_checkpoint = tmp_path / "gipo.pt"
+    gico_checkpoint = tmp_path / "gico.pt"
     output = tmp_path / "flow-map.pt"
     backbone_checkpoint.write_bytes(b"backbone")
-    gipo_checkpoint.write_bytes(b"gipo")
+    gico_checkpoint.write_bytes(b"gico")
     real_link = checkpoint_module.os.link
 
     def create_concurrent_output(source, destination, **kwargs):
@@ -908,9 +920,9 @@ def test_flow_map_checkpoint_no_overwrite_preserves_concurrent_creation(
             output,
             _flow_map(),
             backbone_checkpoint=backbone_checkpoint,
-            gipo_checkpoint=gipo_checkpoint,
+            gico_checkpoint=gico_checkpoint,
             setting_encoder_config=_setting_config(),
-            training_summary={"locked_test_used_for_selection": False},
+            training_summary=_training_summary(),
             demonstration_manifest_sha256="b" * 64,
         )
 
@@ -920,16 +932,16 @@ def test_flow_map_checkpoint_no_overwrite_preserves_concurrent_creation(
 
 def test_flow_map_checkpoint_rejects_locked_test_selection(tmp_path: Path) -> None:
     backbone_checkpoint = tmp_path / "backbone.pt"
-    gipo_checkpoint = tmp_path / "gipo.pt"
+    gico_checkpoint = tmp_path / "gico.pt"
     backbone_checkpoint.write_bytes(b"backbone")
-    gipo_checkpoint.write_bytes(b"gipo")
+    gico_checkpoint.write_bytes(b"gico")
 
     with pytest.raises(ValueError, match="locked_test_used_for_selection"):
         save_flow_map_checkpoint(
             tmp_path / "flow-map.pt",
             _flow_map(),
             backbone_checkpoint=backbone_checkpoint,
-            gipo_checkpoint=gipo_checkpoint,
+            gico_checkpoint=gico_checkpoint,
             setting_encoder_config=_setting_config(),
             training_summary={"locked_test_used_for_selection": True},
             demonstration_manifest_sha256="b" * 64,
@@ -940,7 +952,7 @@ def test_flow_map_checkpoint_rejects_locked_test_selection(tmp_path: Path) -> No
             tmp_path / "nested-flow-map.pt",
             _flow_map(),
             backbone_checkpoint=backbone_checkpoint,
-            gipo_checkpoint=gipo_checkpoint,
+            gico_checkpoint=gico_checkpoint,
             setting_encoder_config=_setting_config(),
             training_summary={
                 "locked_test_used_for_selection": False,
@@ -954,17 +966,17 @@ def test_flow_map_checkpoint_rejects_fractional_config_and_model_dimensions(
     tmp_path: Path,
 ) -> None:
     backbone_checkpoint = tmp_path / "backbone.pt"
-    gipo_checkpoint = tmp_path / "gipo.pt"
+    gico_checkpoint = tmp_path / "gico.pt"
     checkpoint = tmp_path / "flow-map.pt"
     backbone_checkpoint.write_bytes(b"backbone")
-    gipo_checkpoint.write_bytes(b"gipo")
+    gico_checkpoint.write_bytes(b"gico")
     save_flow_map_checkpoint(
         checkpoint,
         _flow_map(),
         backbone_checkpoint=backbone_checkpoint,
-        gipo_checkpoint=gipo_checkpoint,
+        gico_checkpoint=gico_checkpoint,
         setting_encoder_config=_setting_config(),
-        training_summary={"locked_test_used_for_selection": False},
+        training_summary=_training_summary(),
         demonstration_manifest_sha256="b" * 64,
     )
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
@@ -1011,10 +1023,10 @@ def test_flow_map_checkpoint_rejects_fractional_config_and_model_dimensions(
         load_flow_map_checkpoint(checkpoint)
 
 
-def _uniform_gipo_policy(*, context_dim: int = 8) -> GIPOSchedulePolicy:
+def _uniform_gico_policy(*, context_dim: int = 8) -> GICOSchedulePolicy:
     encoder_config = _setting_config()
     setting_dim = setting_feature_dim(config=encoder_config)
-    student = build_gipo_student_model(
+    student = build_gico_student_model(
         setting_dim=setting_dim,
         density_dim=DENSITY_BIN_COUNT,
         context_dim=context_dim,
@@ -1028,7 +1040,7 @@ def _uniform_gipo_policy(*, context_dim: int = 8) -> GIPOSchedulePolicy:
     with torch.no_grad():
         student.head.weight.zero_()
         student.head.bias.zero_()
-    return GIPOSchedulePolicy(
+    return GICOSchedulePolicy(
         student,
         embedding_normalizer=EmbeddingNormalizer(
             mean=np.zeros(context_dim, dtype=np.float32),
@@ -1036,18 +1048,21 @@ def _uniform_gipo_policy(*, context_dim: int = 8) -> GIPOSchedulePolicy:
         ),
         reference_time_grid=uniform_reference_grid(),
         setting_encoder_config=encoder_config,
-        checkpoint_payload={"protocol": "synthetic-test"},
+        checkpoint_payload={
+            "protocol": "synthetic-test",
+            "context_embedding_protocol": FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+        },
     )
 
 
-def _write_gipo_checkpoint(path: Path, policy: GIPOSchedulePolicy) -> None:
+def _write_gico_checkpoint(path: Path, policy: GICOSchedulePolicy) -> None:
     torch.save(
         {
-            "protocol": GIPO_PROTOCOL,
+            "protocol": GICO_PROTOCOL,
             "model_payload_version": MODEL_PAYLOAD_VERSION,
             "student_policy_type": "continuous_density",
             "locked_test_used_for_selection": False,
-            "context_embedding_kind": "ctx_summary",
+            "context_embedding_protocol": FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
             "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
             "density_representation": {
                 "density_protocol": DENSITY_PROTOCOL,
@@ -1080,12 +1095,12 @@ def _write_gipo_checkpoint(path: Path, policy: GIPOSchedulePolicy) -> None:
     "solver_key, target_nfe, expected_macro_steps",
     [("euler", 4, 4), ("heun", 4, 2)],
 )
-def test_gipo_schedule_policy_returns_normalized_setting_specific_schedules(
+def test_gico_schedule_policy_returns_normalized_setting_specific_schedules(
     solver_key: str,
     target_nfe: int,
     expected_macro_steps: int,
 ) -> None:
-    policy = _uniform_gipo_policy()
+    policy = _uniform_gico_policy()
 
     schedule = policy.predict(
         torch.zeros(2, 8),
@@ -1105,16 +1120,16 @@ def test_gipo_schedule_policy_returns_normalized_setting_specific_schedules(
     assert torch.all(torch.diff(schedule.time_grid, dim=-1) > 0)
 
 
-def test_gipo_schedule_policy_rejects_incompatible_context_width() -> None:
-    policy = _uniform_gipo_policy(context_dim=8)
+def test_gico_schedule_policy_rejects_incompatible_context_width() -> None:
+    policy = _uniform_gico_policy(context_dim=8)
 
     with pytest.raises(ValueError, match="normalizer is incompatible"):
         policy.predict(torch.zeros(1, 7), solver_key="euler", target_nfe=4)
 
 
-def test_gipo_schedule_loader_rejects_nested_locked_test_selection(tmp_path: Path) -> None:
-    checkpoint = tmp_path / "gipo.pt"
-    _write_gipo_checkpoint(checkpoint, _uniform_gipo_policy())
+def test_gico_schedule_loader_rejects_nested_locked_test_selection(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "gico.pt"
+    _write_gico_checkpoint(checkpoint, _uniform_gico_policy())
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     payload["teacher_training"]["teacher_checkpoint_selection"][
         "locked_test_used_for_selection"
@@ -1122,14 +1137,14 @@ def test_gipo_schedule_loader_rejects_nested_locked_test_selection(tmp_path: Pat
     torch.save(payload, checkpoint)
 
     with pytest.raises(ValueError, match="locked_test_used_for_selection"):
-        load_gipo_schedule_policy(checkpoint)
+        load_gico_schedule_policy(checkpoint)
 
 
-def test_gipo_schedule_loader_requires_nested_locked_test_selection_flag(
+def test_gico_schedule_loader_requires_nested_locked_test_selection_flag(
     tmp_path: Path,
 ) -> None:
-    checkpoint = tmp_path / "gipo.pt"
-    _write_gipo_checkpoint(checkpoint, _uniform_gipo_policy())
+    checkpoint = tmp_path / "gico.pt"
+    _write_gico_checkpoint(checkpoint, _uniform_gico_policy())
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     payload["teacher_training"]["teacher_checkpoint_selection"].pop(
         "locked_test_used_for_selection"
@@ -1137,33 +1152,33 @@ def test_gipo_schedule_loader_requires_nested_locked_test_selection_flag(
     torch.save(payload, checkpoint)
 
     with pytest.raises(ValueError, match="locked_test_used_for_selection"):
-        load_gipo_schedule_policy(checkpoint)
+        load_gico_schedule_policy(checkpoint)
 
 
-def test_gipo_schedule_loader_requires_explicit_context_embedding_kind(
+def test_gico_schedule_loader_requires_current_context_embedding_protocol(
     tmp_path: Path,
 ) -> None:
-    checkpoint = tmp_path / "gipo.pt"
-    _write_gipo_checkpoint(checkpoint, _uniform_gipo_policy())
+    checkpoint = tmp_path / "gico.pt"
+    _write_gico_checkpoint(checkpoint, _uniform_gico_policy())
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    payload.pop("context_embedding_kind")
+    payload.pop("context_embedding_protocol")
     torch.save(payload, checkpoint)
 
-    with pytest.raises(ValueError, match="explicit context_embedding_kind"):
-        load_gipo_schedule_policy(checkpoint)
+    with pytest.raises(ValueError, match="context_embedding_protocol"):
+        load_gico_schedule_policy(checkpoint)
 
 
-def test_gipo_schedule_loader_requires_complete_setting_encoder_config(
+def test_gico_schedule_loader_requires_complete_setting_encoder_config(
     tmp_path: Path,
 ) -> None:
-    checkpoint = tmp_path / "gipo.pt"
-    _write_gipo_checkpoint(checkpoint, _uniform_gipo_policy())
+    checkpoint = tmp_path / "gico.pt"
+    _write_gico_checkpoint(checkpoint, _uniform_gico_policy())
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     payload["setting_encoder_config"].pop("rope_frequencies")
     torch.save(payload, checkpoint)
 
     with pytest.raises(ValueError, match="missing=.*rope_frequencies"):
-        load_gipo_schedule_policy(checkpoint)
+        load_gico_schedule_policy(checkpoint)
 
 
 @pytest.mark.parametrize(
@@ -1175,22 +1190,22 @@ def test_gipo_schedule_loader_requires_complete_setting_encoder_config(
         lambda config: config.update({"dropout": float("nan")}),
     ),
 )
-def test_gipo_schedule_loader_requires_complete_student_model_config(
+def test_gico_schedule_loader_requires_complete_student_model_config(
     tmp_path: Path,
     mutation,
 ) -> None:
-    checkpoint = tmp_path / "gipo.pt"
-    _write_gipo_checkpoint(checkpoint, _uniform_gipo_policy())
+    checkpoint = tmp_path / "gico.pt"
+    _write_gico_checkpoint(checkpoint, _uniform_gico_policy())
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     mutation(payload["student_model_config"])
     torch.save(payload, checkpoint)
 
     with pytest.raises(ValueError, match="model configuration|model_config"):
-        load_gipo_schedule_policy(checkpoint)
+        load_gico_schedule_policy(checkpoint)
 
 
-def test_gipo_schedule_policy_rejects_overflowing_normalization() -> None:
-    policy = _uniform_gipo_policy()
+def test_gico_schedule_policy_rejects_overflowing_normalization() -> None:
+    policy = _uniform_gico_policy()
 
     with pytest.raises(ValueError, match="normalization produced non-finite"):
         policy.predict(
@@ -1200,10 +1215,10 @@ def test_gipo_schedule_policy_rejects_overflowing_normalization() -> None:
         )
 
 
-def test_gipo_schedule_policy_rejects_invalid_student_density(
+def test_gico_schedule_policy_rejects_invalid_student_density(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    policy = _uniform_gipo_policy()
+    policy = _uniform_gico_policy()
     monkeypatch.setattr(
         policy.student,
         "density_mass",
@@ -1219,146 +1234,40 @@ def test_gipo_schedule_policy_rejects_invalid_student_density(
         policy.predict(torch.zeros(1, 8), solver_key="euler", target_nfe=4)
 
 
-def test_gipo_schedule_loader_migrates_compatible_student(tmp_path: Path) -> None:
-    policy = _uniform_gipo_policy()
-    model_config = dict(policy.student.model_config())
-    model_config["hidden_layers"] = model_config.pop("num_layers")
-    model_config.update(
-        {
-            "num_series": 0,
-            "series_feature_dim": 0,
-            "series_conditioning": "none_context_only",
-        }
-    )
-    checkpoint = tmp_path / "gipo-compatibility.pt"
-    torch.save(
-        {
-            "protocol": GIPO_PROTOCOL,
-            "model_payload_version": 6,
-            "student_policy_type": "continuous_density",
-            "locked_test_used_for_selection": False,
-            "context_embedding_kind": "ctx_summary",
-            "student_architecture": ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
-            "density_representation": {
-                "density_protocol": DENSITY_PROTOCOL,
-                "reference_time_grid": list(policy.reference_time_grid),
-            },
-            "density_dim": policy.density_dim,
-            "setting_dim": policy.setting_dim,
-            "setting_encoder_config": policy.setting_encoder_config.to_payload(),
-            "embedding_normalizer": policy.embedding_normalizer.to_payload(),
-            "context_dim": 8,
-            "student_model_config": model_config,
-            "student_state": policy.student.state_dict(),
-            "pseudo_target_nfe_values": [6, 10],
-            "student_training_mode": "seen_plus_unseen_pseudo",
-            "student_pseudo_distillation": {
-                "enabled": True,
-                "pseudo_target_weight": 0.25,
-                "student_teacher_score_include_pseudo": True,
-                "locked_test_used_for_pseudo": False,
-            },
-            "student_objective_settings": {
-                "student_teacher_score_include_pseudo": True,
-            },
-            "nfe_sequence_diagnostics": {"student_pseudo_rows": {"row_count": 2}},
-            "teacher_training": {
-                "series_conditioning": "none_context_only",
-                "teacher_target": "metric_vector",
-                "teacher_metric_targets": ["u_comp_uniform"],
-                "teacher_metric_target_protocol": "family_metric_utility_vector",
-                "teacher_metric_mask_protocol": "row_valid_component_mask",
-                "teacher_scalarization": "weighted_metric_average",
-                "teacher_checkpoint_selection": {
-                    "selection_protocol": "weighted_normalized_regret",
-                    "locked_test_used_for_selection": False,
-                },
-            },
-            "student_target_summary": {"series_conditioning": "none_context_only"},
-            "student_training": {
-                "series_conditioning": "none_context_only",
-                "student_pseudo_target_summary": {
-                    "pseudo_distillation_used": True,
-                    "pseudo_target_weight": 0.25,
-                    "pseudo_context_setting_count": 2,
-                    "pseudo_target_nfes": [6, 10],
-                    "pseudo_split_phases": ["train_tuning"],
-                    "series_conditioning": "none_context_only",
-                },
-                "pseudo_distillation_used": True,
-                "pseudo_target_weight": 0.25,
-                "student_teacher_score_include_pseudo": True,
-                "student_target_summary": {"series_conditioning": "none_context_only"},
-                "student_validation_target_summary": {
-                    "series_conditioning": "none_context_only"
-                },
-                "student_optimizer": {"student_teacher_score_include_pseudo": True},
-                "losses": [
-                    {
-                        "student_pseudo_kl_ce_loss": 0.1,
-                        "student_pseudo_weighted_loss": 0.025,
-                        "student_pseudo_teacher_score_z_mean": 0.2,
-                        "student_pseudo_teacher_score_mean": 0.3,
-                    }
-                ],
-            },
-            "series_conditioning": "none_context_only",
-            "series_index_map": {"unused": 0},
-        },
-        checkpoint,
-    )
+@pytest.mark.parametrize(
+    "mutation, error",
+    [
+        (
+            lambda payload: payload.update(
+                {"model_payload_version": MODEL_PAYLOAD_VERSION - 1}
+            ),
+            "expected current schema version",
+        ),
+        (
+            lambda payload: payload["student_model_config"].update(
+                {"hidden_layers": payload["student_model_config"].pop("num_layers")}
+            ),
+            "retired keys",
+        ),
+        (
+            lambda payload: payload.update({"context_embedding_kind": "ctx_summary"}),
+            "retired context_embedding_kind",
+        ),
+    ],
+)
+def test_gico_schedule_loader_rejects_retired_checkpoint_schemas(
+    tmp_path: Path,
+    mutation,
+    error: str,
+) -> None:
+    checkpoint = tmp_path / "gico-retired.pt"
+    _write_gico_checkpoint(checkpoint, _uniform_gico_policy())
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    mutation(payload)
+    torch.save(payload, checkpoint)
 
-    loaded = load_gipo_schedule_policy(checkpoint)
-    expected = policy.predict(torch.zeros(2, 8), solver_key="euler", target_nfe=4)
-    actual = loaded.predict(torch.zeros(2, 8), solver_key="euler", target_nfe=4)
-
-    metadata = loaded.checkpoint_payload
-    assert metadata["source_model_payload_version"] == 6
-    assert metadata["student_training_mode"] == "seen_plus_unseen_target"
-    assert metadata["unseen_target_nfe_values"] == [6, 10]
-    assert metadata["student_unseen_target_distillation"]["unseen_target_weight"] == 0.25
-    assert metadata["nfe_sequence_diagnostics"]["student_unseen_target_rows"] == {
-        "row_count": 2
-    }
-    unseen_summary = metadata["student_training"]["student_unseen_target_summary"]
-    assert unseen_summary["unseen_context_setting_count"] == 2
-    assert metadata["student_training"]["losses"][0][
-        "student_unseen_target_weighted_loss"
-    ] == 0.025
-    assert "pseudo" not in json.dumps(metadata, sort_keys=True)
-    assert "series_conditioning" not in json.dumps(metadata, sort_keys=True)
-    assert torch.equal(actual.density_mass, expected.density_mass)
-    assert torch.equal(actual.time_grid, expected.time_grid)
-
-
-def test_gipo_compatibility_migration_rejects_ambiguous_or_invalid_fields() -> None:
-    base = {
-        "model_payload_version": 6,
-        "student_model_config": {
-            "hidden_layers": 1,
-            "num_series": 0,
-            "series_feature_dim": 0,
-            "series_conditioning": "none_context_only",
-        },
-    }
-    with pytest.raises(ValueError, match="both"):
-        normalize_gipo_checkpoint_payload(
-            {
-                **base,
-                "pseudo_target_nfe_values": [6],
-                "unseen_target_nfe_values": [6],
-            }
-        )
-    with pytest.raises(ValueError, match="integer"):
-        normalize_gipo_checkpoint_payload(
-            {
-                **base,
-                "student_model_config": {
-                    **base["student_model_config"],
-                    "hidden_layers": True,
-                },
-            }
-        )
+    with pytest.raises(ValueError, match=error):
+        load_gico_schedule_policy(checkpoint)
 
 
 class _UniformSchedulePolicy:
@@ -1367,13 +1276,14 @@ class _UniformSchedulePolicy:
         self.density_dim = DENSITY_BIN_COUNT
         self.reference_time_grid = uniform_reference_grid()
         self.setting_encoder_config = _setting_config()
-        self.context_embedding_kind = "ctx_summary"
+        self.context_embedding_protocol = FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
         self.context_summaries: list[torch.Tensor] = []
 
-    def context_embedding_from_cache(self, cache):
-        if isinstance(cache, dict):
-            return cache[self.context_embedding_kind]
-        return getattr(cache, self.context_embedding_kind)
+    def context_embedding_from_cache(self, cache: ConditioningCache) -> torch.Tensor:
+        return frozen_backbone_policy_context_from_cache(
+            cache,
+            protocol=self.context_embedding_protocol,
+        )
 
     def predict(
         self,
@@ -1381,7 +1291,7 @@ class _UniformSchedulePolicy:
         *,
         solver_key: str,
         target_nfe: int,
-    ) -> GIPOSchedule:
+    ) -> GICOSchedule:
         self.context_summaries.append(context_summary.detach().clone())
         setting = DistillationSetting(solver_key, target_nfe)
         macro_steps = target_nfe if solver_key not in {"heun", "midpoint_rk2"} else target_nfe // 2
@@ -1399,7 +1309,7 @@ class _UniformSchedulePolicy:
             device=context_summary.device,
             dtype=context_summary.dtype,
         ).unsqueeze(0).expand(batch, -1)
-        return GIPOSchedule(
+        return GICOSchedule(
             solver_key=setting.solver_key,
             target_nfe=setting.target_nfe,
             macro_steps=macro_steps,
@@ -1427,7 +1337,7 @@ def test_collect_flow_map_demonstrations_with_tiny_frozen_models(tmp_path: Path)
         scenario_key="synthetic",
         benchmark_family="synthetic",
         backbone_checkpoint_sha256="c" * 64,
-        gipo_checkpoint_sha256="d" * 64,
+        gico_checkpoint_sha256="d" * 64,
         rollouts_per_context=1,
         context_batch_size=1,
         shard_contexts=1,
@@ -1459,7 +1369,7 @@ def test_collect_flow_map_demonstrations_with_tiny_frozen_models(tmp_path: Path)
             scenario_key="synthetic",
             benchmark_family="synthetic",
             backbone_checkpoint_sha256="c" * 64,
-            gipo_checkpoint_sha256="d" * 64,
+            gico_checkpoint_sha256="d" * 64,
             rollouts_per_context=1,
             context_batch_size=1,
             shard_contexts=1,
@@ -1489,7 +1399,7 @@ def test_collection_uses_common_noise_across_settings_and_builds_store(
         scenario_key="synthetic",
         benchmark_family="synthetic",
         backbone_checkpoint_sha256="c" * 64,
-        gipo_checkpoint_sha256="d" * 64,
+        gico_checkpoint_sha256="d" * 64,
         rollouts_per_context=2,
         context_batch_size=1,
         shard_contexts=1,
@@ -1533,7 +1443,7 @@ def test_demonstration_collection_rejects_locked_test_before_writing(tmp_path: P
             scenario_key="synthetic",
             benchmark_family="synthetic",
             backbone_checkpoint_sha256="c" * 64,
-            gipo_checkpoint_sha256="d" * 64,
+            gico_checkpoint_sha256="d" * 64,
         )
     assert not output_dir.exists()
 
@@ -1547,7 +1457,7 @@ def test_flow_map_sampler_reports_exactly_one_map_evaluation() -> None:
         backbone,
         flow_map,
         setting_encoder_config=_setting_config(),
-        gipo_policy=policy,  # type: ignore[arg-type]
+        gico_policy=policy,  # type: ignore[arg-type]
     )
     initial = torch.randn(2, backbone.cfg.sample_state_dim)
     history = torch.randn(2, backbone.cfg.history_len, backbone.cfg.context_dim)
@@ -1564,8 +1474,7 @@ def test_flow_map_sampler_reports_exactly_one_map_evaluation() -> None:
     assert result.model_evaluations == 1
     assert result.teacher_realized_nfe == 4
     assert len(policy.context_summaries) == 1
-    assert torch.equal(policy.context_summaries[0], expected_cache.ctx_summary)
-    assert not torch.equal(policy.context_summaries[0], expected_cache.summary)
+    assert torch.equal(policy.context_summaries[0], expected_cache.summary)
 
     manual_density = torch.full(
         (2, DENSITY_BIN_COUNT),
@@ -1581,7 +1490,7 @@ def test_flow_map_sampler_reports_exactly_one_map_evaluation() -> None:
     assert len(policy.context_summaries) == 1
 
 
-def test_load_flow_map_sampler_binds_and_runs_verified_gipo(tmp_path: Path) -> None:
+def test_load_flow_map_sampler_binds_and_runs_verified_gico(tmp_path: Path) -> None:
     torch.manual_seed(191)
     backbone = OTFlow(_tiny_config()).eval()
     backbone_checkpoint = tmp_path / "backbone.pt"
@@ -1589,24 +1498,24 @@ def test_load_flow_map_sampler_binds_and_runs_verified_gipo(tmp_path: Path) -> N
         {"cfg": backbone.cfg.to_dict(), "model_state": backbone.state_dict()},
         backbone_checkpoint,
     )
-    policy = _uniform_gipo_policy()
-    gipo_checkpoint = tmp_path / "gipo.pt"
-    _write_gipo_checkpoint(gipo_checkpoint, policy)
+    policy = _uniform_gico_policy()
+    gico_checkpoint = tmp_path / "gico.pt"
+    _write_gico_checkpoint(gico_checkpoint, policy)
     flow_map_checkpoint = tmp_path / "flow-map.pt"
     save_flow_map_checkpoint(
         flow_map_checkpoint,
         _flow_map().eval(),
         backbone_checkpoint=backbone_checkpoint,
-        gipo_checkpoint=gipo_checkpoint,
+        gico_checkpoint=gico_checkpoint,
         setting_encoder_config=_setting_config(),
-        training_summary={"locked_test_used_for_selection": False},
+        training_summary=_training_summary(),
         demonstration_manifest_sha256="a" * 64,
     )
 
     sampler, metadata = load_flow_map_sampler(
         flow_map_checkpoint,
         backbone_checkpoint=backbone_checkpoint,
-        gipo_checkpoint=gipo_checkpoint,
+        gico_checkpoint=gico_checkpoint,
     )
     future = sampler.sample_future(
         torch.randn(2, backbone.cfg.history_len, backbone.cfg.context_dim),
@@ -1614,9 +1523,9 @@ def test_load_flow_map_sampler_binds_and_runs_verified_gipo(tmp_path: Path) -> N
         target_nfe=4,
     )
 
-    assert sampler.gipo_policy is not None
+    assert sampler.gico_policy is not None
     assert future.shape == (2, 1, backbone.cfg.snapshot_dim)
-    assert metadata["gipo_checkpoint_sha256"]
+    assert metadata["gico_checkpoint_sha256"]
     assert "model_state" not in metadata
 
 
@@ -1745,21 +1654,36 @@ def test_context_npz_rejects_non_floating_conditions(tmp_path: Path) -> None:
         load_distillation_contexts(path)
 
 
-def test_demonstration_output_rejects_indirect_destination(
+def test_demonstration_output_rejects_link_destination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    indirect = tmp_path / "junction"
+    indirect = tmp_path / "junction" / "demonstrations"
     monkeypatch.setattr(
         demonstration_module,
-        "first_link_or_reparse_component",
-        lambda path, *, root: indirect,
+        "is_link_or_reparse_point",
+        lambda path: Path(path) == indirect,
     )
 
     with pytest.raises(ValueError, match="symlink, junction, or reparse"):
-        demonstration_module._validate_output_root(
-            indirect / "demonstrations", overwrite=False
-        )
+        demonstration_module._validate_output_root(indirect, overwrite=False)
+
+
+def test_demonstration_output_allows_trusted_symlinked_mount_ancestor(
+    tmp_path: Path,
+) -> None:
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    mount = tmp_path / "mount"
+    try:
+        mount.symlink_to(storage, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    demonstration_module._validate_output_root(
+        mount / "demonstrations",
+        overwrite=False,
+    )
 
 
 def test_demonstration_collection_lock_rejects_concurrent_process(
@@ -1787,7 +1711,7 @@ def test_demonstration_collection_lock_rejects_concurrent_process(
                 scenario_key="synthetic",
                 benchmark_family="synthetic",
                 backbone_checkpoint_sha256="c" * 64,
-                gipo_checkpoint_sha256="d" * 64,
+                gico_checkpoint_sha256="d" * 64,
             )
     finally:
         release.set()
@@ -2141,15 +2065,18 @@ def test_flow_map_bundle_rolls_back_checkpoint_when_summary_promotion_fails(
         torch.save(
             {
                 "label": "old checkpoint",
-                "training_summary": {"locked_test_used_for_selection": False},
+                "training_summary": _training_summary(),
             },
             checkpoint,
         )
         summary.write_text(
             json.dumps(
-                {
-                    "locked_test_used_for_selection": False,
-                    "status": "completed",
+                    {
+                        "locked_test_used_for_selection": False,
+                        "context_embedding_protocol": (
+                            FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
+                        ),
+                        "status": "completed",
                     "checkpoint_name": checkpoint.name,
                     "checkpoint_sha256": file_sha256(checkpoint),
                 }
@@ -2164,7 +2091,7 @@ def test_flow_map_bundle_rolls_back_checkpoint_when_summary_promotion_fails(
         torch.save(
             {
                 "label": "new checkpoint",
-                "training_summary": {"locked_test_used_for_selection": False},
+                "training_summary": _training_summary(),
             },
             path,
         )
@@ -2185,7 +2112,7 @@ def test_flow_map_bundle_rolls_back_checkpoint_when_summary_promotion_fails(
         _write_flow_map_bundle(
             checkpoint_path=checkpoint,
             summary_path=summary,
-            training_summary={"locked_test_used_for_selection": False},
+            training_summary=_training_summary(),
             checkpoint_writer=write_checkpoint,
             overwrite=preexisting,
         )
@@ -2212,7 +2139,7 @@ def test_flow_map_bundle_restart_finishes_committed_cleanup(
 
     def write_checkpoint(path: Path) -> Path:
         torch.save(
-            {"training_summary": {"locked_test_used_for_selection": False}},
+            {"training_summary": _training_summary()},
             path,
         )
         return path
@@ -2229,7 +2156,7 @@ def test_flow_map_bundle_restart_finishes_committed_cleanup(
         _write_flow_map_bundle(
             checkpoint_path=checkpoint,
             summary_path=summary,
-            training_summary={"locked_test_used_for_selection": False},
+            training_summary=_training_summary(),
             checkpoint_writer=write_checkpoint,
         )
 
@@ -2252,7 +2179,7 @@ def test_flow_map_bundle_rejects_edited_summary_semantics(tmp_path: Path) -> Non
 
     def write_checkpoint(path: Path) -> Path:
         torch.save(
-            {"training_summary": {"locked_test_used_for_selection": False}},
+            {"training_summary": _training_summary()},
             path,
         )
         return path
@@ -2260,7 +2187,7 @@ def test_flow_map_bundle_rejects_edited_summary_semantics(tmp_path: Path) -> Non
     _write_flow_map_bundle(
         checkpoint_path=checkpoint,
         summary_path=summary,
-        training_summary={"locked_test_used_for_selection": False},
+        training_summary=_training_summary(),
         checkpoint_writer=write_checkpoint,
     )
     edited = json.loads(summary.read_text(encoding="utf-8"))
@@ -2285,7 +2212,7 @@ def test_flow_map_bundle_cleans_owned_partial_stage_before_journaling(
         _write_flow_map_bundle(
             checkpoint_path=checkpoint,
             summary_path=summary,
-            training_summary={"locked_test_used_for_selection": False},
+            training_summary=_training_summary(),
             checkpoint_writer=fail_checkpoint_write,
         )
 
@@ -2298,15 +2225,15 @@ def test_flow_map_bundle_rechecks_source_identity_before_commit(
 ) -> None:
     checkpoint = tmp_path / "flow-map.pt"
     summary = tmp_path / "flow-map-training.json"
-    source = tmp_path / "gipo.pt"
-    replacement = tmp_path / "gipo-replacement.pt"
+    source = tmp_path / "gico.pt"
+    replacement = tmp_path / "gico-replacement.pt"
     source.write_bytes(b"source used for training")
     replacement.write_bytes(b"concurrent replacement")
     expected_hash = file_sha256(source)
 
     def write_checkpoint(path: Path) -> Path:
         torch.save(
-            {"training_summary": {"locked_test_used_for_selection": False}},
+            {"training_summary": _training_summary()},
             path,
         )
         os.replace(replacement, source)
@@ -2314,13 +2241,13 @@ def test_flow_map_bundle_rechecks_source_identity_before_commit(
 
     def validate_source() -> None:
         if file_sha256(source) != expected_hash:
-            raise ValueError("GIPO source checkpoint changed before commit")
+            raise ValueError("GICO source checkpoint changed before commit")
 
-    with pytest.raises(ValueError, match="GIPO source checkpoint changed"):
+    with pytest.raises(ValueError, match="GICO source checkpoint changed"):
         _write_flow_map_bundle(
             checkpoint_path=checkpoint,
             summary_path=summary,
-            training_summary={"locked_test_used_for_selection": False},
+            training_summary=_training_summary(),
             checkpoint_writer=write_checkpoint,
             precommit_validator=validate_source,
         )
@@ -2335,7 +2262,7 @@ def test_flow_map_bundle_rechecks_source_identity_before_commit(
 @pytest.mark.parametrize(
     ("source_kind", "error_pattern"),
     (
-        ("gipo", "GIPO source checkpoint changed"),
+        ("gico", "GICO source checkpoint changed"),
         ("demonstration_manifest", "Demonstration manifest changed"),
         ("demonstration_shard", "Demonstration shard .* changed"),
     ),
@@ -2350,14 +2277,14 @@ def test_flow_map_training_aborts_when_bound_source_is_replaced(
     manifest.parent.mkdir()
     manifest.write_text("{}", encoding="utf-8")
     backbone = tmp_path / "backbone.pt"
-    gipo = tmp_path / "gipo.pt"
-    replacement = tmp_path / "replacement-gipo.pt"
+    gico = tmp_path / "gico.pt"
+    replacement = tmp_path / "replacement-gico.pt"
     manifest_replacement = tmp_path / "replacement-manifest.json"
     shard = manifest.parent / "contexts.npz"
     shard_replacement = tmp_path / "replacement-contexts.npz"
     backbone.write_bytes(b"validated backbone")
-    gipo.write_bytes(b"validated gipo")
-    replacement.write_bytes(b"replacement gipo")
+    gico.write_bytes(b"validated gico")
+    replacement.write_bytes(b"replacement gico")
     manifest_replacement.write_text('{"replacement":true}', encoding="utf-8")
     shard.write_bytes(b"validated demonstration shard")
     shard_replacement.write_bytes(b"replacement demonstration shard")
@@ -2372,8 +2299,8 @@ def test_flow_map_training_aborts_when_bound_source_is_replaced(
         },
         metadata={
             "backbone_checkpoint_sha256": file_sha256(backbone),
-            "gipo_checkpoint_sha256": file_sha256(gipo),
-            "context_embedding_kind": "ctx_summary",
+            "gico_checkpoint_sha256": file_sha256(gico),
+            "context_embedding_protocol": FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
             "context_binding": context_binding(("f" * 64,)),
             "scenario_key": "cryptos",
             "benchmark_family": "forecast",
@@ -2383,17 +2310,17 @@ def test_flow_map_training_aborts_when_bound_source_is_replaced(
         density_reference_time_grid=reference_grid,
         state_dim=4,
     )
-    gipo_policy = SimpleNamespace(
+    gico_policy = SimpleNamespace(
         setting_encoder_config=setting_config,
         density_dim=DENSITY_BIN_COUNT,
         reference_time_grid=reference_grid,
-        context_embedding_kind="ctx_summary",
+        context_embedding_protocol=FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
     )
     backbone_model = SimpleNamespace(cfg=SimpleNamespace(sample_state_dim=4))
 
     def replace_source_during_training(*args, **kwargs):
-        if source_kind == "gipo":
-            os.replace(replacement, gipo)
+        if source_kind == "gico":
+            os.replace(replacement, gico)
         elif source_kind == "demonstration_manifest":
             os.replace(manifest_replacement, manifest)
         else:
@@ -2409,8 +2336,8 @@ def test_flow_map_training_aborts_when_bound_source_is_replaced(
         lambda *args, **kwargs: store,
     )
     monkeypatch.setattr(
-        "genode.distillation.training.load_gipo_schedule_policy",
-        lambda *args, **kwargs: gipo_policy,
+        "genode.distillation.training.load_gico_schedule_policy",
+        lambda *args, **kwargs: gico_policy,
     )
     monkeypatch.setattr(
         "genode.distillation.training.load_checkpoint_model",
@@ -2429,8 +2356,8 @@ def test_flow_map_training_aborts_when_bound_source_is_replaced(
                 str(manifest),
                 "--backbone-checkpoint",
                 str(backbone),
-                "--gipo-checkpoint",
-                str(gipo),
+                "--gico-checkpoint",
+                str(gico),
                 "--output-checkpoint",
                 str(output),
                 "--summary-json",
@@ -2440,8 +2367,8 @@ def test_flow_map_training_aborts_when_bound_source_is_replaced(
             ]
         )
 
-    if source_kind == "gipo":
-        assert gipo.read_bytes() == b"replacement gipo"
+    if source_kind == "gico":
+        assert gico.read_bytes() == b"replacement gico"
     elif source_kind == "demonstration_manifest":
         assert manifest.read_text(encoding="utf-8") == '{"replacement":true}'
     else:
@@ -2485,7 +2412,7 @@ def test_flow_map_bundle_rejects_reserved_sidecar_target_without_writes(
         _write_flow_map_bundle(
             checkpoint_path=checkpoint,
             summary_path=summary,
-            training_summary={"locked_test_used_for_selection": False},
+            training_summary=_training_summary(),
             checkpoint_writer=write_checkpoint,
         )
 
@@ -2510,7 +2437,7 @@ def test_flow_map_bundle_rejects_nested_targets_without_writes(
         _write_flow_map_bundle(
             checkpoint_path=checkpoint,
             summary_path=summary,
-            training_summary={"locked_test_used_for_selection": False},
+            training_summary=_training_summary(),
             checkpoint_writer=write_checkpoint,
         )
 
@@ -2531,7 +2458,7 @@ def test_flow_map_bundle_restart_rolls_back_prepared_partial_install(
 
     def write_checkpoint(path: Path) -> Path:
         torch.save(
-            {"training_summary": {"locked_test_used_for_selection": False}},
+            {"training_summary": _training_summary()},
             path,
         )
         return path
@@ -2556,7 +2483,7 @@ def test_flow_map_bundle_restart_rolls_back_prepared_partial_install(
         _write_flow_map_bundle(
             checkpoint_path=checkpoint,
             summary_path=summary,
-            training_summary={"locked_test_used_for_selection": False},
+            training_summary=_training_summary(),
             checkpoint_writer=write_checkpoint,
         )
 
@@ -2607,7 +2534,7 @@ def test_flow_map_bundle_preserves_concurrent_unknown_target(
 
     def write_checkpoint(path: Path) -> Path:
         torch.save(
-            {"training_summary": {"locked_test_used_for_selection": False}},
+            {"training_summary": _training_summary()},
             path,
         )
         return path
@@ -2626,7 +2553,7 @@ def test_flow_map_bundle_preserves_concurrent_unknown_target(
         _write_flow_map_bundle(
             checkpoint_path=checkpoint,
             summary_path=summary,
-            training_summary={"locked_test_used_for_selection": False},
+            training_summary=_training_summary(),
             checkpoint_writer=write_checkpoint,
         )
 
@@ -2690,7 +2617,7 @@ def test_quality_gate_passes_only_with_familywise_evidence_on_every_primary_metr
     assert report["multiple_testing_correction"] == "holm"
     assert report["all_primary_metrics_required"] is True
     assert report["locked_test_used_for_selection"] is False
-    assert len(report["comparisons"]) == 4
+    assert len(report["comparisons"]) == 2 * len(metric_specs_for_scenario("cryptos"))
     assert all(comparison["paired_context_count"] == 20 for comparison in report["comparisons"])
     assert all(comparison["passed"] for comparison in report["comparisons"])
     assert all(
@@ -2830,7 +2757,7 @@ def test_quality_candidate_catalog_binds_registered_fixed_grid() -> None:
         _normalize_candidate_catalog(catalog)
 
 
-@pytest.mark.parametrize("method", ("flow_map", "gipo", "fixed"))
+@pytest.mark.parametrize("method", ("flow_map", "gico", "fixed"))
 def test_quality_candidate_catalog_requires_search_breadth(method: str) -> None:
     catalog = _quality_candidate_catalog()
     removed = False
@@ -2847,12 +2774,12 @@ def test_quality_candidate_catalog_requires_search_breadth(method: str) -> None:
 
 def test_quality_candidate_catalog_rejects_duplicate_solver_nfe_search() -> None:
     catalog = json.loads(json.dumps(_quality_candidate_catalog()))
-    second_gipo = next(
+    second_gico = next(
         candidate
         for candidate in catalog
-        if candidate["candidate_key"] == "gipo-decoy"
+        if candidate["candidate_key"] == "gico-decoy"
     )
-    second_gipo["target_nfe"] = 4
+    second_gico["target_nfe"] = 4
 
     with pytest.raises(ValueError, match="two solver/NFE settings"):
         _normalize_candidate_catalog(catalog)
@@ -3030,7 +2957,7 @@ def test_quality_gate_requires_selected_candidates_to_cover_bound_locked_panel()
     rows = _quality_rows()
     for method, candidate_key in (
         ("flow_map", "flow-decoy"),
-        ("gipo", "gipo-decoy"),
+        ("gico", "gico-decoy"),
         ("fixed", "fixed-decoy"),
     ):
         template = next(
@@ -3153,7 +3080,7 @@ def test_public_quality_gate_rejects_fabricated_pipeline_protocol_hash() -> None
         )
 
 
-def test_quality_gate_ignores_optional_tstr_applicability_mismatch() -> None:
+def test_quality_gate_rejects_primary_tstr_applicability_mismatch() -> None:
     rows = _quality_rows()
     changed = next(
         row
@@ -3165,25 +3092,18 @@ def test_quality_gate_ignores_optional_tstr_applicability_mismatch() -> None:
     )
     changed["temporal_tstr_f1_applicable"] = False
 
-    report = evaluate_quality_gate(
-        rows,
-        metric_specs=metric_specs_for_scenario("cryptos"),
-        candidate_catalog=_quality_candidate_catalog(),
-        artifact_binding=_quality_binding(),
-        demonstration_context_binding=context_binding(
-            (_test_context_fingerprint("training-0"),)
-        ),
-        quality_protocol=_quality_protocol(),
-        config=QualityGateConfig(bootstrap_samples=1_000, seed=40),
-    )
-
-    assert report["status"] == "passed"
-    assert all(
-        comparison["metric"] != "temporal_tstr_f1"
-        for comparison in report["comparisons"]
-    )
-
-
+    with pytest.raises(ValueError, match="applicability must be a shared context"):
+        evaluate_quality_gate(
+            rows,
+            metric_specs=metric_specs_for_scenario("cryptos"),
+            candidate_catalog=_quality_candidate_catalog(),
+            artifact_binding=_quality_binding(),
+            demonstration_context_binding=context_binding(
+                (_test_context_fingerprint("training-0"),)
+            ),
+            quality_protocol=_quality_protocol(),
+            config=QualityGateConfig(bootstrap_samples=1_000, seed=40),
+        )
 def test_read_quality_rows_parses_plain_csv_target_nfe(tmp_path: Path) -> None:
     path = tmp_path / "quality.csv"
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -3338,13 +3258,13 @@ def test_quality_gate_freezes_validation_choice_and_is_conservative_at_equality(
     assert report["selection"]["flow_map"]["candidate_key"] == "flow-selected"
     assert report["selection"]["flow_map"]["selection_split"] == "validation_tuning"
     assert report["selection"]["flow_map"]["locked_test_used_for_selection"] is False
-    gipo_comparisons = [
+    gico_comparisons = [
         comparison
         for comparison in report["comparisons"]
-        if comparison["comparator_method"] == "gipo"
+        if comparison["comparator_method"] == "gico"
     ]
-    assert all(comparison["mean_difference"] == pytest.approx(0.0) for comparison in gipo_comparisons)
-    assert all(not comparison["passed"] for comparison in gipo_comparisons)
+    assert all(comparison["mean_difference"] == pytest.approx(0.0) for comparison in gico_comparisons)
+    assert all(not comparison["passed"] for comparison in gico_comparisons)
 
 
 def test_quality_gate_requires_paired_locked_test_contexts() -> None:
@@ -3353,7 +3273,7 @@ def test_quality_gate_requires_paired_locked_test_contexts() -> None:
         for row in _quality_rows()
         if not (
             row["split_phase"] == "locked_test"
-            and row["method"] == "gipo"
+            and row["method"] == "gico"
             and row["context_id"] != "locked-0"
         )
     ]

@@ -18,8 +18,12 @@ from genode.distillation.artifacts import (
 )
 from genode.distillation.demonstrations import _noise_seed
 from genode.distillation.training import DemonstrationStore
-from genode.gipo.density_representation import DENSITY_BIN_COUNT, uniform_reference_grid
-from genode.gipo.models import build_setting_encoder_config
+from genode.gico.density_representation import (
+    DEFAULT_DENSITY_BIN_COUNT as DENSITY_BIN_COUNT,
+    uniform_reference_grid,
+)
+from genode.gico.models import build_setting_encoder_config
+from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
 from genode.provenance import file_sha256
 
 
@@ -41,7 +45,6 @@ def _write_training_artifact(
             "context_id": np.asarray(context_ids, dtype=np.str_),
             "context_fingerprint": np.asarray(context_fingerprints, dtype=np.str_),
             "ctx_tokens": np.zeros((2, 2, 8), dtype=np.float32),
-            "ctx_summary": np.zeros((2, 8), dtype=np.float32),
             "summary": np.zeros((2, 8), dtype=np.float32),
         },
     )
@@ -94,12 +97,12 @@ def _write_training_artifact(
             "collection_seed": 0,
             "density_bin_count": DENSITY_BIN_COUNT,
             "density_reference_time_grid": list(uniform_reference_grid()),
-            "context_embedding_kind": "ctx_summary",
+            "context_embedding_protocol": FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
             "sample_state_dim": 4,
             "settings": [{"solver_key": "euler", "target_nfe": 2}],
             "setting_encoder_config": _setting_encoder_payload(),
             "backbone_checkpoint_sha256": "a" * 64,
-            "gipo_checkpoint_sha256": "b" * 64,
+            "gico_checkpoint_sha256": "b" * 64,
         },
     )
 
@@ -183,10 +186,10 @@ def test_manifest_requires_context_source_provenance(
 
 def test_collection_cli_binds_the_context_npz_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     backbone_path = tmp_path / "backbone.pt"
-    gipo_path = tmp_path / "gipo.pt"
+    gico_path = tmp_path / "gico.pt"
     contexts_path = tmp_path / "contexts.npz"
     backbone_path.write_bytes(b"backbone")
-    gipo_path.write_bytes(b"gipo")
+    gico_path.write_bytes(b"gico")
     np.savez(
         contexts_path,
         context_ids=np.asarray(["context-0"], dtype=np.str_),
@@ -200,15 +203,15 @@ def test_collection_cli_binds_the_context_npz_file(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(demonstrations, "resolve_torch_device", lambda _value: torch.device("cpu"))
     monkeypatch.setattr(demonstrations, "load_checkpoint_model", lambda *_args: (object(), {}))
-    monkeypatch.setattr(demonstrations, "load_gipo_schedule_policy", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(demonstrations, "load_gico_schedule_policy", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(demonstrations, "collect_flow_map_demonstrations", fake_collect)
 
     result = demonstrations.main(
         [
             "--backbone-checkpoint",
             str(backbone_path),
-            "--gipo-checkpoint",
-            str(gipo_path),
+            "--gico-checkpoint",
+            str(gico_path),
             "--contexts-npz",
             str(contexts_path),
             "--output-dir",

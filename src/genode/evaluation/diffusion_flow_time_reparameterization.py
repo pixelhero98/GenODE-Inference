@@ -5,37 +5,33 @@ import copy
 import csv
 import hashlib
 import json
-from numbers import Integral
-import os
 from pathlib import Path
-import re
-import tempfile
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
-from genode.cli import parse_csv, parse_int_csv
-from genode.experiment_layout import (
-    REFERENCE_CHECKPOINT_STEPS,
-    TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
-    EXPERIMENT_LAYOUT_ID,
-    LOCKED_TEST_PREVIEW_CONTEXTS,
+from genode.canonical_experiment_layout import (
+    CANONICAL_CHECKPOINT_STEPS,
+    CANONICAL_CONTEXT_SAMPLE_COUNT,
+    CANONICAL_LAYOUT_VERSION,
+    CANONICAL_SEEN_NFES,
     NFE_ROLE_SEEN,
     NFE_ROLES,
-    target_nfes_for_role,
+    canonical_nfes_for_role,
     density_source_key_for_schedule,
     schedule_family_for_key,
     SCENARIO_FAMILY_MOLECULE,
 )
 from genode.data.molecule_xyz import (
     MOLECULE_GROUP_DATASET_KEYS,
-    molecule_group_manifest_path,
-    molecule_group_root,
+    default_molecule_group_manifest_path,
+    default_molecule_group_root,
     load_molecule_group_manifest,
     trainable_molecule_group_members,
 )
+from genode.data.otflow_monash_datasets import default_manifest_path
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
     EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
@@ -61,10 +57,16 @@ from genode.evaluation.molecule_metrics import (
 )
 from genode.evaluation.otflow_sampling_support import _choose_valid_windows
 from genode.evaluation.otflow_evaluation_support import (
+    ALL_SOLVER_ORDER,
+    CONDITIONAL_GENERATION_FAMILY,
+    DEFAULT_CONDITIONAL_GENERATION_DATASETS,
+    DEFAULT_FORECAST_DATASETS,
     DEFAULT_SHARED_BACKBONE_ROOT,
     DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION,
     DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION,
+    FORECAST_FAMILY,
     LOCKED_TEST_PHASE,
+    SOLVER_RUNTIME_NAMES,
     TRAIN_TUNING_PHASE,
     TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
     TRAIN_TUNING_SAMPLING_MODES,
@@ -76,86 +78,65 @@ from genode.evaluation.otflow_evaluation_support import (
     load_conditional_generation_checkpoint_splits,
     load_forecast_checkpoint_splits,
     parse_conditional_generation_datasets,
+    parse_csv,
     parse_forecast_datasets,
+    parse_int_csv,
     resolved_eval_horizon,
-    resolved_validation_windows,
+    resolved_eval_windows,
     selection_metric_for_family,
+    solver_eval_multiplier,
+    solver_experiment_scope,
+    solver_macro_steps,
     train_tuning_sampler_key,
     train_tuning_target_example_count,
     validate_execution_preflight,
 )
-from genode.gipo.objectives import (
+from genode.gico.objectives import (
     MOLECULE_METRIC_SPECS,
-    materialized_objective_specs_for_scenario,
     teacher_metric_profile_for_scenario,
+    teacher_objective_specs_for_scenario,
     uniform_anchored_objective_columns,
 )
-from genode.gipo.models import validate_time_grid
-from genode.solver_protocol import (
-    SUPPORTED_SOLVER_KEYS,
-    normalize_solver_key,
-    normalize_solver_keys,
-    normalize_solver_nfe_fields,
-    solver_eval_multiplier,
-    solver_experiment_scope,
-    solver_macro_steps,
-)
-from genode.data.otflow_experiment_plan import (
-    CONDITIONAL_GENERATION_FAMILY,
-    FORECAST_FAMILY,
-    REFERENCE_CONDITIONAL_GENERATION_DATASETS,
-    REFERENCE_FORECAST_DATASETS,
-)
-from genode.data.otflow_monash_datasets import monash_manifest_path
-from genode.schedule_transfer.otflow_reference_registry import METHOD_KEY
-from genode.schedule_transfer.otflow_reference_tables import augment_rows_with_relative_metrics
+from genode.gico.models import validate_time_grid
+from genode.solver_protocol import normalize_solver_keys, normalize_solver_nfe_fields
+from genode.schedule_transfer.otflow_paper_registry import METHOD_KEY
+from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
 from genode.data.otflow_paths import (
-    display_project_path,
-    backbone_manifest_path,
-    cryptos_data_path,
-    lobster_synthetic_profile_path,
-    long_term_st_data_path,
+    default_backbone_manifest_path,
+    default_cryptos_data_path,
+    default_lobster_synthetic_profile_path,
+    default_long_term_st_data_path,
     project_outputs_root,
-    project_dataset_root,
+    project_paper_dataset_root,
+    project_root,
     resolve_project_path,
 )
-from genode.provenance import fingerprint_identity, path_fingerprint
 from genode.path_safety import portable_relative_path, resolve_portable_relative_path
+from genode.provenance import fingerprint_identity, path_fingerprint
 from genode.models.otflow_train_val import _get_dataset_item_by_t, _parse_batch, save_json
+from genode.models.conditioning import (
+    FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+    frozen_backbone_policy_context,
+)
 from genode.runtime import resolve_torch_device
-from genode.gipo.policy import (
-    GIPO_PROTOCOL,
-    context_embedding_table_manifest_path,
-    load_context_embedding_table,
-    save_context_embedding_table,
-    validate_context_embedding_kind,
-)
-from genode.gipo.schedule_hash import schedule_grid_hash
-from genode.gipo.schema import (
-    consistent_metadata_value,
-    evaluation_row_signature,
-    reject_retired_evaluation_keys,
-)
+from genode.gico.policy import GICO_PROTOCOL, load_context_embedding_table, save_context_embedding_table
+from genode.gico.schedule_hash import schedule_grid_hash
+from genode.schedule_transfer.reference_clocks import reference_clock_provenance
 
-RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen_phase_context"
-CONTEXT_REWARD_PROTOCOL_VERSION = "conditional_primary_metric_context_rewards"
-SCHEDULE_OUTPUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
-REFERENCE_EVALUATION_SEEDS: Tuple[int, ...] = (0, 1, 2)
+RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen_phase_context_v4"
+CONTEXT_REWARD_PROTOCOL_VERSION = "conditional_primary_metric_context_rewards_v2"
+DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
+DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = CANONICAL_SEEN_NFES
+DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
 CONTEXT_EMBEDDING_EXPORT_MAX_BATCH_SIZE = 64
 CONTEXT_EMBEDDING_EXPORT_FALLBACK_BATCH_SIZE = 2
-CONTEXT_RECORD_FLUSH_WINDOW_COUNT = 16_384
-SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_evaluation_phase_context_selection"
-LOCKED_TEST_MODE_FULL = "full"
-LOCKED_TEST_MODE_PREVIEW = "preview"
-LOCKED_TEST_FULL_SELECTION_SOURCE = "locked_test_full"
-LOCKED_TEST_PREVIEW_SELECTION_SOURCE = "locked_test_preview_contexts"
-SELECTED_EXAMPLES_CAP_SCOPE_GLOBAL = "global"
-SELECTED_EXAMPLES_CAP_SCOPE_PER_SEED = "per_seed"
+DEFAULT_SCHEDULES: Tuple[str, ...] = EXPERIMENTAL_FIXED_SCHEDULE_KEYS
+SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_evaluation_phase_context_capped_v4"
 SUPPORTED_SPLIT_PHASES: Tuple[str, ...] = (LOCKED_TEST_PHASE, VALIDATION_PHASE, TRAIN_TUNING_PHASE)
 
 ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "benchmark_family",
-    "experiment_layout",
+    "canonical_layout_version",
     "scenario_key",
     "scenario_family",
     "nfe_role",
@@ -164,6 +145,7 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "checkpoint_maturity_index",
     "split_phase",
     "seed",
+    "dataset",
     "checkpoint_id",
     "checkpoint_path",
     "backbone_name",
@@ -171,29 +153,28 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "stratum",
     "formula",
     "source_zip_name",
-    "method_key",
-    "gipo_step_budget",
-    "mode",
-    "teacher_final_retrain",
+    "train_steps",
     "effective_train_steps",
     "checkpoint_export_protocol",
     "train_budget_label",
     "target_nfe",
+    "runtime_nfe",
     "macro_steps",
     "solver_key",
     "solver_name",
     "scheduler_key",
-    "scheduler_name",
+    "scheduler_variant_key",
+    "scheduler_variant_name",
+    "schedule_name",
     "schedule_family",
     "density_source_key",
-    "context_embedding_kind",
     "student_training_mode",
     "row_signature",
     "signal_trace_key",
     "signal_validation_spearman",
     "info_growth_scale",
     "reference_macro_factor",
-    "source_duplicate_count",
+    "paper_duplicate_count",
     "experiment_scope",
     "selection_metric",
     "selection_metric_value",
@@ -214,9 +195,6 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "temporal_cw1",
     "temporal_tstr_f1",
     "temporal_tstr_f1_applicable",
-    "temporal_tstr_f1_status",
-    "temporal_tstr_f1_train_class_count",
-    "temporal_tstr_f1_test_class_count",
     "u_l1",
     "c_l1",
     "spread_specific_error",
@@ -247,10 +225,6 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "selected_examples",
     "selected_examples_cap",
     "selected_examples_cap_source",
-    "selected_examples_cap_scope",
-    "locked_test_mode",
-    "locked_test_context_limit",
-    "locked_test_context_limit_scope",
     "uncapped_candidate_examples",
     "candidate_examples_after_initial_selection",
     "selection_was_capped",
@@ -275,31 +249,30 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
 
 CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "benchmark_family",
-    "experiment_layout",
+    "canonical_layout_version",
     "scenario_key",
     "scenario_family",
-    "method_key",
-    "gipo_step_budget",
-    "mode",
-    "teacher_final_retrain",
     "nfe_role",
     "checkpoint_step",
     "checkpoint_maturity_label",
     "checkpoint_maturity_index",
     "parent_row_signature",
     "protocol_hash",
+    "dataset",
     "split_phase",
     "seed",
     "logical_seed",
     "evaluation_seed",
     "solver_key",
     "target_nfe",
+    "runtime_nfe",
     "macro_steps",
     "realized_nfe",
     "scheduler_key",
     "schedule_family",
     "density_source_key",
     "context_schema",
+    "axis_dataset",
     "axis_series",
     "axis_time_bin",
     "axis_record",
@@ -321,13 +294,15 @@ CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "target_stop",
     "context_id",
     "context_embedding_id",
-    "context_embedding_kind",
     "checkpoint_id",
     "effective_train_steps",
     "checkpoint_export_protocol",
     "forecast_crps",
     "forecast_mase",
     "forecast_mse",
+    "crps",
+    "mase",
+    "mse",
     "forecast_mase_scale_kind",
     "forecast_mase_scale_period",
     "score_main",
@@ -350,17 +325,14 @@ CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "reward_metric_count",
     "reward_metric_weights_json",
     "reward_metric_directions_json",
-    "gipo_reward_protocol",
-    "reward_anchor_scheduler_key",
+    "gico_reward_protocol",
+    "reward_anchor_schedule_key",
     "reward_utility_transform",
     "reward_granularity",
     "temporal_uw1",
     "temporal_cw1",
     "temporal_tstr_f1",
     "temporal_tstr_f1_applicable",
-    "temporal_tstr_f1_status",
-    "temporal_tstr_f1_train_class_count",
-    "temporal_tstr_f1_test_class_count",
     "u_l1",
     "c_l1",
     "spread_specific_error",
@@ -381,28 +353,15 @@ CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
     "sample_seed_values_json",
     "chosen_examples_hash",
     "evaluation_protocol_hash",
-    "example_selection_protocol",
-    "context_sample_count",
-    "selected_examples",
-    "selected_examples_cap",
-    "selected_examples_cap_source",
-    "selected_examples_cap_scope",
-    "locked_test_mode",
-    "locked_test_context_limit",
-    "locked_test_context_limit_scope",
-    "uncapped_candidate_examples",
-    "candidate_examples_after_initial_selection",
-    "selection_was_capped",
-    "global_selected_examples",
-    "global_uncapped_candidate_examples",
-    "global_candidate_examples_after_initial_selection",
-    "global_selection_was_capped",
     "row_signature",
     "train_tuning_fraction",
     "train_tuning_seed",
     "train_tuning_strata",
     "train_tuning_sampler",
 )
+
+FORECAST_CONTEXT_ROW_FIELDS = CONTEXT_ROW_FIELDS
+
 
 def _assert_unique_fields(name: str, fields: Sequence[str]) -> None:
     duplicates = sorted({field for field in fields if fields.count(field) > 1})
@@ -424,12 +383,6 @@ def _optional_float(value: Any) -> Optional[float]:
     if not np.isfinite(cast):
         return None
     return cast
-
-
-def _bool_value(value: Any) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes"}
-    return bool(value)
 
 
 def _mean(values: Sequence[float]) -> Optional[float]:
@@ -468,24 +421,29 @@ def _safe_log_utility_gain(value: Any, baseline_value: Any, *, eps: float = 1e-1
 
 
 def _write_context_rows_enabled(cli_args: argparse.Namespace) -> bool:
+    if bool(getattr(cli_args, "write_forecast_context_rows", False)):
+        raise ValueError("--write_forecast_context_rows is retired; use --write_context_rows.")
     return bool(getattr(cli_args, "write_context_rows", False))
 
 
 def _context_row_csv_name(cli_args: argparse.Namespace) -> str:
+    if str(getattr(cli_args, "forecast_context_row_csv_name", "") or "").strip():
+        raise ValueError("--forecast_context_row_csv_name is retired; use --context_row_csv_name.")
     value = str(getattr(cli_args, "context_row_csv_name", "") or "context_rows.csv")
     return portable_relative_path(value, label="context row CSV name").as_posix()
 
 
 def _context_embeddings_npz_name(cli_args: argparse.Namespace) -> str:
+    if str(getattr(cli_args, "forecast_context_embeddings_npz_name", "") or "").strip():
+        raise ValueError("--forecast_context_embeddings_npz_name is retired; use --context_embeddings_npz_name.")
     value = str(getattr(cli_args, "context_embeddings_npz_name", "") or "context_embeddings.npz")
     return portable_relative_path(value, label="context embeddings NPZ name").as_posix()
 
 
 def _runner_output_path(out_root: Path, value: Any, *, default: str, label: str) -> Path:
-    name = str(value or default)
     return resolve_portable_relative_path(
         out_root,
-        name,
+        str(value or default),
         label=label,
         reject_links=True,
     )
@@ -514,7 +472,7 @@ def _validate_recorder_artifact_paths(
             ]
         )
     for path, suffix, label in suffix_checks:
-        if path.suffix.lower() != suffix:
+        if path.suffix.casefold() != suffix:
             raise ValueError(f"{label} must end in {suffix!r}.")
 
     artifacts: Dict[str, Path] = {
@@ -528,35 +486,30 @@ def _validate_recorder_artifact_paths(
             {
                 "context-row CSV": context_csv_path,
                 "context embeddings": context_embeddings_path,
-                "context-embedding manifest": context_embedding_table_manifest_path(
-                    context_embeddings_path
+                "context-embedding manifest": context_embeddings_path.with_suffix(
+                    context_embeddings_path.suffix + ".manifest.json"
                 ),
             }
         )
     names_by_path: Dict[Path, List[str]] = {}
     for name, path in artifacts.items():
         names_by_path.setdefault(path.resolve(strict=False), []).append(name)
-    collisions = {
-        str(path): names
-        for path, names in names_by_path.items()
-        if len(names) > 1
+    output_collisions = {
+        str(path): names for path, names in names_by_path.items() if len(names) > 1
     }
-    input_names_by_path: Dict[Path, List[str]] = {}
-    for name, path in (input_paths or {}).items():
-        input_names_by_path.setdefault(path.resolve(strict=False), []).append(str(name))
     input_output_collisions = {
-        str(path): {
-            "outputs": names_by_path[path],
-            "inputs": input_names,
+        str(path.resolve(strict=False)): {
+            "outputs": names_by_path[path.resolve(strict=False)],
+            "inputs": [str(name)],
         }
-        for path, input_names in input_names_by_path.items()
-        if path in names_by_path
+        for name, path in (input_paths or {}).items()
+        if path.resolve(strict=False) in names_by_path
     }
-    if collisions or input_output_collisions:
+    if output_collisions or input_output_collisions:
         raise ValueError(
-            "Evaluation artifact paths must be pairwise distinct, including reserved "
-            "outputs and implicit sidecars, and inputs may not collide with outputs: "
-            f"output_collisions={collisions}, "
+            "Evaluation artifact paths must be pairwise distinct, including reserved outputs and "
+            "implicit sidecars, and inputs may not collide with outputs: "
+            f"output_collisions={output_collisions}, "
             f"input/output_collisions={input_output_collisions}."
         )
 
@@ -571,46 +524,31 @@ def _runner_input_artifact_paths(cli_args: argparse.Namespace) -> Dict[str, Path
             inputs[label] = resolve_project_path(str(value))
 
     conditional_paths = {
-        "cryptos": str(getattr(cli_args, "cryptos_path", "")).strip()
-        or cryptos_data_path(),
-        "lobster_synthetic": str(
-            getattr(cli_args, "lobster_synthetic_profile_path", "")
-        ).strip()
-        or lobster_synthetic_profile_path(),
+        "cryptos": str(getattr(cli_args, "cryptos_path", "")).strip() or default_cryptos_data_path(),
+        "lobster_synthetic": str(getattr(cli_args, "lobster_synthetic_profile_path", "")).strip()
+        or default_lobster_synthetic_profile_path(),
         "long_term_st": str(getattr(cli_args, "long_term_st_path", "")).strip()
-        or long_term_st_data_path(),
+        or default_long_term_st_data_path(),
     }
-    for scenario_key in parse_conditional_generation_datasets(
-        str(cli_args.conditional_generation_datasets)
-    ):
-        inputs[f"conditional input {scenario_key}"] = resolve_project_path(
-            str(conditional_paths[scenario_key])
-        )
+    for scenario_key in parse_conditional_generation_datasets(str(cli_args.conditional_generation_datasets)):
+        inputs[f"conditional input {scenario_key}"] = resolve_project_path(conditional_paths[scenario_key])
 
     dataset_root = resolve_project_path(str(cli_args.dataset_root))
     for scenario_key in parse_forecast_datasets(str(cli_args.forecast_datasets)):
-        inputs[f"forecast manifest {scenario_key}"] = monash_manifest_path(
-            dataset_root,
-            str(scenario_key),
-        )
+        inputs[f"forecast manifest {scenario_key}"] = default_manifest_path(dataset_root, scenario_key)
 
     molecule_root = resolve_project_path(
-        str(getattr(cli_args, "molecule_group_root", molecule_group_root()))
+        str(getattr(cli_args, "molecule_group_root", default_molecule_group_root()))
     )
-    for scenario_key in parse_molecule_datasets(
-        str(getattr(cli_args, "molecule_datasets", ""))
-    ):
-        inputs[f"molecule manifest {scenario_key}"] = molecule_group_manifest_path(
-            str(scenario_key),
+    for scenario_key in parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", ""))):
+        inputs[f"molecule manifest {scenario_key}"] = default_molecule_group_manifest_path(
+            scenario_key,
             molecule_root,
         )
     return inputs
 
 
-def _resolve_recorder_artifact_paths(
-    out_root: Path,
-    cli_args: argparse.Namespace,
-) -> Dict[str, Path]:
+def _resolve_recorder_artifact_paths(out_root: Path, cli_args: argparse.Namespace) -> Dict[str, Path]:
     paths = {
         "jsonl": _runner_output_path(
             out_root,
@@ -654,7 +592,12 @@ def _resolve_recorder_artifact_paths(
 
 def _parse_schedule_names(text: str) -> List[str]:
     names = [name.strip().lower() for name in parse_csv(text)]
-    unknown = [name for name in names if name not in EXPERIMENTAL_FIXED_SCHEDULE_KEYS]
+    unknown: List[str] = []
+    for name in names:
+        try:
+            reference_clock_provenance(name)
+        except (KeyError, ValueError):
+            unknown.append(name)
     if unknown:
         raise ValueError(f"Unknown fixed diffusion-flow schedules: {unknown}")
     return names
@@ -692,77 +635,48 @@ def _load_schedule_summary_cases(path_text: str) -> List[Dict[str, Any]]:
     if not path.exists():
         raise FileNotFoundError(f"Schedule summary not found: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"Schedule summary {display_project_path(path)} must contain a JSON object.")
-    reject_retired_evaluation_keys(payload, source=f"Schedule summary {display_project_path(path)}")
     schedule_items = list(payload.get("schedules") or [])
     if not schedule_items:
         schedule_items = [
             {
-                "scheduler_key": str(payload.get("scheduler_key", "")),
+                "scheduler_key": str(payload.get("scheduler_key", payload.get("schedule_key", ""))),
                 "predictions": payload.get("predictions", []) or [],
             }
         ]
     for schedule in schedule_items:
-        scheduler_key = str(schedule.get("scheduler_key", "")).strip()
+        scheduler_key = str(schedule.get("scheduler_key", schedule.get("schedule_key", ""))).strip()
         if not scheduler_key:
             continue
         for item in list(schedule.get("predictions", []) or []):
-            if not isinstance(item, Mapping):
-                raise ValueError(f"Schedule summary {display_project_path(path)} predictions must be objects.")
-            metadata_sources = (item, schedule, payload)
             solver_key = str(item.get("solver_key", "")).strip()
             target_nfe = int(item.get("target_nfe", 0) or 0)
-            checkpoint_step = consistent_metadata_value(
-                metadata_sources,
-                "checkpoint_step",
-                source=f"Schedule summary {display_project_path(path)}",
-            )
+            checkpoint_step = item.get("checkpoint_step", schedule.get("checkpoint_step", payload.get("checkpoint_step", "")))
             if not solver_key or target_nfe <= 0:
                 continue
             nfe = normalize_solver_nfe_fields(
                 solver_key,
                 target_nfe,
                 macro_steps=item.get("macro_steps"),
+                runtime_nfe=item.get("runtime_nfe"),
                 realized_nfe=item.get("realized_nfe"),
                 source=f"schedule summary {path}",
             )
             grid = validate_time_grid(item["time_grid"], macro_steps=nfe.macro_steps)
-            metadata: Dict[str, Any] = {}
-            for key in (
-                "scenario_key",
-                "checkpoint_id",
-                "checkpoint_ids",
-                "gipo_step_budget",
-                "method_key",
-                "mode",
-                "teacher_final_retrain",
-            ):
-                value = consistent_metadata_value(
-                    metadata_sources,
-                    key,
-                    source=f"Schedule summary {display_project_path(path)}",
-                )
-                if value is not None:
-                    metadata[key] = value
-            metadata.setdefault("method_key", scheduler_key)
-            metadata.setdefault("mode", "")
-            metadata.setdefault("teacher_final_retrain", {})
             cases.append(
                 {
                     "scheduler_key": scheduler_key,
                     "solver_key": nfe.solver_key,
                     "target_nfe": int(target_nfe),
+                    "runtime_nfe": int(nfe.runtime_nfe),
                     "macro_steps": int(nfe.macro_steps),
                     "realized_nfe": int(nfe.realized_nfe),
                     "checkpoint_step": "" if checkpoint_step in (None, "") else int(checkpoint_step),
-                    **metadata,
                     "time_grid": [float(x) for x in grid],
                     "schedule_grid_hash": schedule_grid_hash(grid),
                     "reference_time_alignment": str(
                         item.get("reference_time_alignment", schedule.get("reference_time_alignment", "summary_density_time_grid"))
                     ),
-                    "source_duplicate_count": int(item.get("source_duplicate_count", 0) or 0),
+                    "paper_duplicate_count": int(item.get("paper_duplicate_count", 0) or 0),
                     "reference_macro_steps": int(item.get("reference_macro_steps", nfe.macro_steps) or nfe.macro_steps),
                     "schedule_summary_path": _logical_artifact_path(path),
                 }
@@ -783,14 +697,14 @@ def parse_molecule_datasets(text: str) -> Tuple[str, ...]:
 
 def _target_nfe_values_for_args(cli_args: argparse.Namespace) -> List[int]:
     role = str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN) or NFE_ROLE_SEEN)
-    expected = tuple(int(value) for value in target_nfes_for_role(role))
+    canonical = tuple(int(value) for value in canonical_nfes_for_role(role))
     raw = str(getattr(cli_args, "target_nfe_values", "") or "").strip()
-    values = parse_int_csv(raw) if raw else list(expected)
-    unknown = [int(value) for value in values if int(value) not in set(expected)]
+    values = parse_int_csv(raw) if raw else list(canonical)
+    unknown = [int(value) for value in values if int(value) not in set(canonical)]
     if unknown:
         raise ValueError(
-            f"target_nfe_values {unknown} are outside the reference protocol for nfe_role={role!r}; "
-            f"allowed values are {list(expected)}."
+            f"target_nfe_values {unknown} are not canonical for nfe_role={role!r}; "
+            f"allowed values are {list(canonical)}."
         )
     if not values:
         raise ValueError("At least one target NFE is required.")
@@ -799,12 +713,16 @@ def _target_nfe_values_for_args(cli_args: argparse.Namespace) -> List[int]:
 
 def _checkpoint_steps_for_args(cli_args: argparse.Namespace) -> List[int]:
     raw = str(getattr(cli_args, "checkpoint_steps", "") or "").strip()
-    values = parse_int_csv(raw) if raw else list(REFERENCE_CHECKPOINT_STEPS)
-    allowed = set(int(value) for value in REFERENCE_CHECKPOINT_STEPS)
+    if raw:
+        values = parse_int_csv(raw)
+    else:
+        fallback = int(getattr(cli_args, "otflow_train_steps", 0) or 0)
+        values = [fallback] if fallback > 0 else list(CANONICAL_CHECKPOINT_STEPS)
+    allowed = set(int(value) for value in CANONICAL_CHECKPOINT_STEPS)
     unknown = [int(value) for value in values if int(value) not in allowed]
     if unknown:
         raise ValueError(
-            f"checkpoint_steps {unknown} are outside the reference protocol; allowed values are {list(REFERENCE_CHECKPOINT_STEPS)}."
+            f"checkpoint_steps {unknown} are not canonical; allowed values are {list(CANONICAL_CHECKPOINT_STEPS)}."
         )
     if not values:
         raise ValueError("At least one checkpoint step is required.")
@@ -816,55 +734,65 @@ def _checkpoint_maturity_label(step: int) -> str:
 
 
 def _checkpoint_maturity_index(step: int) -> int:
-    steps = tuple(int(value) for value in REFERENCE_CHECKPOINT_STEPS)
+    steps = tuple(int(value) for value in CANONICAL_CHECKPOINT_STEPS)
     if int(step) not in steps:
-        raise ValueError(f"Unknown reference checkpoint step: {step}")
+        raise ValueError(f"Unknown canonical checkpoint step: {step}")
     return int(steps.index(int(step)))
 
 
 def _args_for_checkpoint_step(cli_args: argparse.Namespace, checkpoint_step: int) -> argparse.Namespace:
     copied = copy.copy(cli_args)
-    copied.checkpoint_step = int(checkpoint_step)
+    copied.otflow_train_steps = int(checkpoint_step)
+    copied.steps = int(checkpoint_step)
     return copied
 
 
+def _path_fingerprint(path: str | Path) -> Dict[str, Any]:
+    resolved = resolve_project_path(str(path))
+    payload = path_fingerprint(resolved)
+    payload["logical_path"] = _logical_artifact_path(resolved)
+    return payload
+
+
 def _logical_artifact_path(path: str | Path) -> str:
-    return display_project_path(resolve_project_path(str(path)))
+    resolved = resolve_project_path(str(path))
+    root = project_root().resolve()
+    try:
+        return str(resolved.relative_to(root)).replace("\\", "/")
+    except ValueError:
+        return str(resolved.name)
 
 
 def _data_path_fingerprints(cli_args: argparse.Namespace) -> Dict[str, Any]:
+    conditional_paths = {
+        "cryptos": str(cli_args.cryptos_path).strip() or default_cryptos_data_path(),
+        "lobster_synthetic": str(getattr(cli_args, "lobster_synthetic_profile_path", "")).strip()
+        or default_lobster_synthetic_profile_path(),
+        "long_term_st": str(getattr(cli_args, "long_term_st_path", "")).strip()
+        or default_long_term_st_data_path(),
+    }
     dataset_root = resolve_project_path(str(cli_args.dataset_root))
     molecule_root = resolve_project_path(
-        str(getattr(cli_args, "molecule_group_root", molecule_group_root()))
-    )
-    conditional_paths = {
-        "cryptos": str(cli_args.cryptos_path).strip() or cryptos_data_path(),
-        "lobster_synthetic": (
-            str(getattr(cli_args, "lobster_synthetic_profile_path", "")).strip()
-            or lobster_synthetic_profile_path()
-        ),
-        "long_term_st": (
-            str(getattr(cli_args, "long_term_st_path", "")).strip()
-            or long_term_st_data_path()
-        ),
-    }
-    selected_conditional = parse_conditional_generation_datasets(
-        str(cli_args.conditional_generation_datasets)
+        str(getattr(cli_args, "molecule_group_root", default_molecule_group_root()))
     )
     return {
         "conditional_generation_inputs": {
-            scenario_key: path_fingerprint(conditional_paths[scenario_key])
-            for scenario_key in selected_conditional
+            scenario_key: _path_fingerprint(conditional_paths[scenario_key])
+            for scenario_key in parse_conditional_generation_datasets(
+                str(cli_args.conditional_generation_datasets)
+            )
         },
         "forecast_manifests": {
-            str(scenario_key): path_fingerprint(monash_manifest_path(dataset_root, str(scenario_key)))
+            scenario_key: _path_fingerprint(default_manifest_path(dataset_root, scenario_key))
             for scenario_key in parse_forecast_datasets(str(cli_args.forecast_datasets))
         },
         "molecule_manifests": {
-            str(scenario_key): path_fingerprint(
-                molecule_group_manifest_path(str(scenario_key), molecule_root)
+            scenario_key: _path_fingerprint(
+                default_molecule_group_manifest_path(scenario_key, molecule_root)
             )
-            for scenario_key in parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", "")))
+            for scenario_key in parse_molecule_datasets(
+                str(getattr(cli_args, "molecule_datasets", ""))
+            )
         },
     }
 
@@ -895,7 +823,7 @@ def _sanitized_cli_args(cli_args: argparse.Namespace) -> Dict[str, Any]:
     for key, value in vars(cli_args).items():
         if key in path_fields:
             text = str(value).strip()
-            payload[key] = None if not text else display_project_path(resolve_project_path(text))
+            payload[key] = None if not text else _logical_artifact_path(text)
         else:
             payload[key] = value
     return payload
@@ -923,60 +851,22 @@ def _context_reward_protocol_payload(cli_args: argparse.Namespace) -> Dict[str, 
 
 
 def _context_sample_cap(cli_args: argparse.Namespace) -> int:
-    cap = int(getattr(cli_args, "context_sample_count", TRAIN_TUNING_CONTEXT_SAMPLE_COUNT))
+    cap = int(getattr(cli_args, "context_sample_count", CANONICAL_CONTEXT_SAMPLE_COUNT))
     if cap <= 0:
         raise ValueError(f"--context_sample_count must be positive, got {cap!r}.")
     return int(cap)
 
 
-def _locked_test_selection_settings(cli_args: argparse.Namespace, split_phase: str) -> Dict[str, Any]:
-    preview_enabled = bool(getattr(cli_args, "locked_test_preview", False))
-    requested_limit = getattr(cli_args, "locked_test_preview_contexts", None)
-    if requested_limit is not None and not preview_enabled:
-        raise ValueError("--locked_test_preview_contexts requires --locked_test_preview.")
-    if preview_enabled and str(split_phase) != LOCKED_TEST_PHASE:
-        raise ValueError("--locked_test_preview is only valid with --split_phase locked_test.")
-    if not preview_enabled:
-        return {
-            "mode": LOCKED_TEST_MODE_FULL,
-            "context_limit": None,
-            "context_limit_scope": "none",
-        }
-    context_limit = (
-        int(LOCKED_TEST_PREVIEW_CONTEXTS)
-        if requested_limit is None
-        else int(requested_limit)
-    )
-    if context_limit <= 0:
-        raise ValueError(
-            "--locked_test_preview_contexts must be positive when locked-test preview is enabled, "
-            f"got {context_limit!r}."
-        )
-    return {
-        "mode": LOCKED_TEST_MODE_PREVIEW,
-        "context_limit": int(context_limit),
-        "context_limit_scope": SELECTED_EXAMPLES_CAP_SCOPE_PER_SEED,
-    }
-
-
 def _split_example_cap(cli_args: argparse.Namespace, split_phase: str) -> Tuple[int | None, str]:
-    locked_test_settings = _locked_test_selection_settings(cli_args, split_phase)
     context_cap = _context_sample_cap(cli_args)
     if str(split_phase) == TRAIN_TUNING_PHASE:
-        return int(context_cap), "context_sample_count"
-    if str(split_phase) == LOCKED_TEST_PHASE:
-        context_limit = locked_test_settings["context_limit"]
-        return (
-            None if context_limit is None else int(context_limit),
-            LOCKED_TEST_FULL_SELECTION_SOURCE
-            if context_limit is None
-            else LOCKED_TEST_PREVIEW_SELECTION_SOURCE,
-        )
-    explicit = int(getattr(cli_args, "eval_windows_val", 0))
+        return int(context_cap), "train_tuning_context_sample_count"
+    attr = "eval_windows_val" if str(split_phase) == VALIDATION_PHASE else "eval_windows_test"
+    explicit = int(getattr(cli_args, attr, 0))
     if explicit < 0:
-        raise ValueError(f"--eval_windows_val must be nonnegative, got {explicit!r}.")
+        raise ValueError(f"--{attr} must be nonnegative, got {explicit!r}.")
     if explicit > 0:
-        return int(explicit), "eval_windows_val"
+        return int(explicit), attr
     return None, f"{split_phase}_default"
 
 
@@ -1058,6 +948,44 @@ def _train_tuning_metadata(
     }
 
 
+def _cap_context_indices(
+    indices: Sequence[int],
+    *,
+    cap: int,
+    seed: int,
+    salt: str,
+    uncapped_candidate_examples: int | None = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    candidate = [int(idx) for idx in indices]
+    selected_cap = int(cap)
+    if selected_cap <= 0:
+        raise ValueError(f"selected_examples_cap must be positive, got {selected_cap!r}.")
+    uncapped_count = int(len(candidate) if uncapped_candidate_examples is None else uncapped_candidate_examples)
+    if uncapped_count < len(candidate):
+        raise ValueError(
+            "uncapped_candidate_examples cannot be smaller than the selected candidate list "
+            f"({uncapped_count} < {len(candidate)})."
+        )
+    if len(candidate) <= selected_cap:
+        selected = list(candidate)
+        was_capped = uncapped_count > len(selected)
+    else:
+        token = f"{SCHEDULE_CONTEXT_SELECTION_PROTOCOL}|{salt}|{int(seed)}|{len(candidate)}|{selected_cap}"
+        local_seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
+        rng = np.random.default_rng(local_seed)
+        keep_positions = sorted(int(pos) for pos in rng.choice(np.arange(len(candidate)), size=selected_cap, replace=False).tolist())
+        selected = [candidate[pos] for pos in keep_positions]
+        was_capped = True
+    return np.asarray(selected, dtype=np.int64), {
+        "example_selection_protocol": SCHEDULE_CONTEXT_SELECTION_PROTOCOL,
+        "selected_examples": int(len(selected)),
+        "selected_examples_cap": int(selected_cap),
+        "uncapped_candidate_examples": int(uncapped_count),
+        "candidate_examples_after_initial_selection": int(len(candidate)),
+        "selection_was_capped": bool(was_capped),
+    }
+
+
 def _cap_context_index_groups(
     groups: Sequence[Mapping[str, Any]],
     *,
@@ -1127,7 +1055,6 @@ def _cap_context_index_groups(
                 "example_selection_protocol": SCHEDULE_CONTEXT_SELECTION_PROTOCOL,
                 "selected_examples": int(len(selected)),
                 "selected_examples_cap": int(selected_cap),
-                "selected_examples_cap_scope": SELECTED_EXAMPLES_CAP_SCOPE_GLOBAL,
                 "uncapped_candidate_examples": int(group["uncapped_candidate_examples"]),
                 "candidate_examples_after_initial_selection": int(len(group["candidate_indices"])),
                 "selection_was_capped": bool(was_capped or int(group["uncapped_candidate_examples"]) > len(selected)),
@@ -1141,79 +1068,9 @@ def _cap_context_index_groups(
     return [np.asarray(indices, dtype=np.int64) for indices in selected_by_group], records, {
         "selected_examples": int(selected_total),
         "selected_examples_cap": int(selected_cap),
-        "selected_examples_cap_scope": SELECTED_EXAMPLES_CAP_SCOPE_GLOBAL,
         "uncapped_candidate_examples": int(uncapped_total),
         "candidate_examples_after_initial_selection": int(len(flat_candidates)),
         "selection_was_capped": bool(was_capped),
-    }
-
-
-def _select_locked_test_context_groups(
-    groups: Sequence[Mapping[str, Any]],
-    *,
-    context_limit: int | None,
-    seed: int,
-    salt: str,
-) -> Tuple[List[np.ndarray], List[Dict[str, Any]], Dict[str, Any]]:
-    if context_limit is not None and int(context_limit) <= 0:
-        raise ValueError(f"locked_test_context_limit must be positive, got {int(context_limit)!r}.")
-    group_positions_by_seed: Dict[int, List[int]] = defaultdict(list)
-    for group_idx, group in enumerate(groups):
-        selection_record = dict(group.get("selection_record", {}))
-        if "seed" not in selection_record:
-            raise ValueError("Locked-test context selection requires a seed in every selection_record.")
-        group_positions_by_seed[int(selection_record["seed"])].append(int(group_idx))
-    selected_groups: List[np.ndarray | None] = [None] * len(groups)
-    records: List[Dict[str, Any] | None] = [None] * len(groups)
-    for seed_label, group_positions in sorted(group_positions_by_seed.items()):
-        seed_groups = [groups[position] for position in group_positions]
-        per_seed_cap = (
-            _selection_group_candidate_count(seed_groups)
-            if context_limit is None
-            else int(context_limit)
-        )
-        selected_for_seed, records_for_seed, _ = _cap_context_index_groups(
-            seed_groups,
-            cap=int(per_seed_cap),
-            seed=int(seed) + int(seed_label),
-            salt=f"{salt}|seed:{int(seed_label)}",
-        )
-        for position, selected, record in zip(group_positions, selected_for_seed, records_for_seed):
-            record["selected_examples_cap_scope"] = (
-                "none" if context_limit is None else SELECTED_EXAMPLES_CAP_SCOPE_PER_SEED
-            )
-            record["locked_test_mode"] = (
-                LOCKED_TEST_MODE_FULL if context_limit is None else LOCKED_TEST_MODE_PREVIEW
-            )
-            record["locked_test_context_limit"] = None if context_limit is None else int(context_limit)
-            record["locked_test_context_limit_scope"] = (
-                "none" if context_limit is None else SELECTED_EXAMPLES_CAP_SCOPE_PER_SEED
-            )
-            selected_groups[position] = selected
-            records[position] = record
-    if not groups or any(selected is None for selected in selected_groups) or any(record is None for record in records):
-        raise ValueError("Locked-test context selection requires at least one candidate group per seed.")
-    completed_selected_groups = [selected for selected in selected_groups if selected is not None]
-    completed_records = [record for record in records if record is not None]
-    selected_total = int(sum(len(selected) for selected in completed_selected_groups))
-    uncapped_total = int(sum(int(record["uncapped_candidate_examples"]) for record in completed_records))
-    candidate_total = int(sum(int(record["candidate_examples_after_initial_selection"]) for record in completed_records))
-    any_capped = bool(any(bool(record["selection_was_capped"]) for record in completed_records))
-    for record in completed_records:
-        record["global_selected_examples"] = int(selected_total)
-        record["global_uncapped_candidate_examples"] = int(uncapped_total)
-        record["global_candidate_examples_after_initial_selection"] = int(candidate_total)
-        record["global_selection_was_capped"] = bool(any_capped)
-    return completed_selected_groups, completed_records, {
-        "selected_examples": int(selected_total),
-        "selected_examples_cap": int(selected_total if context_limit is None else context_limit),
-        "selected_examples_cap_scope": "none" if context_limit is None else SELECTED_EXAMPLES_CAP_SCOPE_PER_SEED,
-        "uncapped_candidate_examples": int(uncapped_total),
-        "candidate_examples_after_initial_selection": int(candidate_total),
-        "selection_was_capped": bool(any_capped),
-        "locked_test_mode": LOCKED_TEST_MODE_FULL if context_limit is None else LOCKED_TEST_MODE_PREVIEW,
-        "locked_test_context_limit": None if context_limit is None else int(context_limit),
-        "locked_test_context_limit_scope": "none" if context_limit is None else SELECTED_EXAMPLES_CAP_SCOPE_PER_SEED,
     }
 
 
@@ -1224,7 +1081,6 @@ def _selection_metadata_row_fields(selection_meta: Mapping[str, Any], *, cap_sou
         "selected_examples": int(selection_meta["selected_examples"]),
         "selected_examples_cap": int(selection_meta["selected_examples_cap"]),
         "selected_examples_cap_source": str(cap_source),
-        "selected_examples_cap_scope": str(selection_meta.get("selected_examples_cap_scope", SELECTED_EXAMPLES_CAP_SCOPE_GLOBAL)),
         "uncapped_candidate_examples": int(selection_meta["uncapped_candidate_examples"]),
         "candidate_examples_after_initial_selection": int(selection_meta["candidate_examples_after_initial_selection"]),
         "selection_was_capped": bool(selection_meta["selection_was_capped"]),
@@ -1237,17 +1093,10 @@ def _selection_metadata_row_fields(selection_meta: Mapping[str, Any], *, cap_sou
     ):
         if key in selection_meta:
             fields[key] = bool(selection_meta[key]) if key.endswith("was_capped") else int(selection_meta[key])
-    for key in ("locked_test_mode", "locked_test_context_limit_scope"):
-        if key in selection_meta:
-            fields[key] = str(selection_meta[key])
-    if "locked_test_context_limit" in selection_meta:
-        value = selection_meta["locked_test_context_limit"]
-        fields["locked_test_context_limit"] = None if value is None else int(value)
     return fields
 
 
 def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
-    locked_test_settings = _locked_test_selection_settings(cli_args, str(cli_args.split_phase))
     payload = {
         "runner_signature": RUNNER_SIGNATURE_VERSION,
         "forecast_datasets": parse_forecast_datasets(str(cli_args.forecast_datasets)),
@@ -1256,13 +1105,17 @@ def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
         ),
         "molecule_datasets": parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", ""))),
         "seeds": parse_int_csv(str(cli_args.seeds)),
-        "experiment_layout": EXPERIMENT_LAYOUT_ID,
+        "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
         "nfe_role": str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN)),
         "target_nfe_values": _target_nfe_values_for_args(cli_args),
         "checkpoint_steps": _checkpoint_steps_for_args(cli_args),
         "solver_names": list(normalize_solver_keys(str(cli_args.solver_names))),
         "baseline_scheduler_names": _parse_schedule_names(str(cli_args.baseline_scheduler_names)),
-        "schedule_summary_json": fingerprint_identity(path_fingerprint(str(getattr(cli_args, "schedule_summary_json", "")))) if str(getattr(cli_args, "schedule_summary_json", "")).strip() else None,
+        "schedule_summary_json": fingerprint_identity(
+            _path_fingerprint(str(getattr(cli_args, "schedule_summary_json", "")))
+        )
+        if str(getattr(cli_args, "schedule_summary_json", "")).strip()
+        else None,
         "summary_scheduler_names": _parse_summary_schedule_names(str(getattr(cli_args, "summary_scheduler_names", ""))),
         "split_phase": str(cli_args.split_phase),
         "dataset_seed": int(cli_args.dataset_seed),
@@ -1272,14 +1125,12 @@ def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
         "molecule_stride_eval": int(getattr(cli_args, "molecule_stride_eval", 1)),
         "forecast_eval_batch_size": int(cli_args.forecast_eval_batch_size),
         "write_context_rows": _write_context_rows_enabled(cli_args),
-        "context_embedding_kind": str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
+        "context_embedding_protocol": FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
         "context_sample_count": _context_sample_cap(cli_args),
         "example_selection_protocol": SCHEDULE_CONTEXT_SELECTION_PROTOCOL,
         "eval_horizon": int(cli_args.eval_horizon),
         "eval_windows_val": int(cli_args.eval_windows_val),
-        "locked_test_mode": str(locked_test_settings["mode"]),
-        "locked_test_context_limit": locked_test_settings["context_limit"],
-        "locked_test_context_limit_scope": str(locked_test_settings["context_limit_scope"]),
+        "eval_windows_test": int(cli_args.eval_windows_test),
         "eval_train_fraction": float(cli_args.eval_train_fraction),
         "train_tuning_seed": int(cli_args.train_tuning_seed),
         "train_tuning_strata": int(cli_args.train_tuning_strata),
@@ -1288,7 +1139,9 @@ def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
         "train_tuning_train_split_fraction": float(cli_args.train_tuning_train_split_fraction),
         "train_tuning_val_split_fraction": float(cli_args.train_tuning_val_split_fraction),
         "calibration_trace_samples": int(cli_args.calibration_trace_samples),
-        "backbone_manifest": fingerprint_identity(path_fingerprint(str(cli_args.backbone_manifest))) if str(cli_args.backbone_manifest).strip() else None,
+        "backbone_manifest": fingerprint_identity(_path_fingerprint(str(cli_args.backbone_manifest)))
+        if str(cli_args.backbone_manifest).strip()
+        else None,
         "data_path_fingerprints": _fingerprint_identities(_data_path_fingerprints(cli_args)),
         "context_reward_protocol": _context_reward_protocol_payload(cli_args),
     }
@@ -1296,8 +1149,14 @@ def _protocol_config_fingerprint(cli_args: argparse.Namespace) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _realized_nfe_for_solver(solver_key: str, macro_steps: int) -> int:
-    return int(macro_steps) * int(solver_eval_multiplier(str(solver_key)))
+def _realized_nfe_for_solver(solver_key: str, runtime_nfe: int) -> int:
+    return int(runtime_nfe) * int(solver_eval_multiplier(str(solver_key)))
+
+
+def _row_signature(*, dataset: str, split_phase: str, seed: int, target_nfe: int, solver_key: str, scheduler_key: str, checkpoint_id: str) -> str:
+    return "|".join(
+        [str(dataset), str(split_phase), str(seed), str(target_nfe), str(solver_key), str(scheduler_key), str(checkpoint_id)]
+    )
 
 
 def _row_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
@@ -1306,7 +1165,7 @@ def _row_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
         row.get("benchmark_family"),
         row.get("split_phase"),
         int(row.get("seed", -1)),
-        row.get("scenario_key"),
+        row.get("dataset"),
         int(row.get("target_nfe", -1)),
         row.get("solver_key"),
         row.get("scheduler_key"),
@@ -1325,52 +1184,11 @@ def _write_row_csv(csv_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 def _write_row_jsonl(jsonl_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Optional[Path] = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            newline="\n",
-            dir=jsonl_path.parent,
-            prefix=f".{jsonl_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            tmp_path = Path(fh.name)
-            for row in rows:
-                fh.write(json.dumps(dict(row), sort_keys=True) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        tmp_path.replace(jsonl_path)
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
-
-
-def _iter_jsonl_rows(jsonl_path: Path) -> Iterable[Dict[str, Any]]:
-    """Yield JSONL objects, ignoring only an interrupted final record."""
-    with jsonl_path.open("r", encoding="utf-8") as fh:
-        line_number = 0
-        line = fh.readline()
-        while line:
-            line_number += 1
-            next_line = fh.readline()
-            stripped = line.strip()
-            if stripped:
-                try:
-                    row = json.loads(stripped)
-                except json.JSONDecodeError as exc:
-                    if not next_line and not line.endswith(("\n", "\r")):
-                        return
-                    raise ValueError(
-                        f"Invalid JSONL record in {jsonl_path} at line {line_number}."
-                    ) from exc
-                if not isinstance(row, dict):
-                    raise ValueError(
-                        f"JSONL record in {jsonl_path} at line {line_number} must be an object."
-                    )
-                yield row
-            line = next_line
+    tmp_path = jsonl_path.with_name(f"{jsonl_path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(dict(row), sort_keys=True) + "\n")
+    tmp_path.replace(jsonl_path)
 
 
 def _write_context_row_csv(csv_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -1388,7 +1206,6 @@ def _load_context_rows(csv_path: Path) -> Dict[str, Dict[str, Any]]:
         return rows
     with csv_path.open("r", newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            reject_retired_evaluation_keys(row, source=f"Context evaluation row in {csv_path}")
             signature = str(row.get("row_signature", "")).strip()
             if signature:
                 if signature in rows:
@@ -1413,21 +1230,22 @@ def _load_rows_with_duplicate_report(
     duplicate_extra_count = 0
     if not jsonl_path.exists():
         return rows, {"duplicate_key_count": 0, "duplicate_extra_count": 0, "duplicate_examples": []}
-    for row in _iter_jsonl_rows(jsonl_path):
-        reject_retired_evaluation_keys(row, source=f"Evaluation row in {jsonl_path}")
-        if str(row.get("protocol_hash", "")) != str(protocol_hash):
-            raise ValueError(
-                "Existing evaluation rows use a different protocol; choose a new "
-                "output directory or rerun with --no_resume to replace prior results."
-            )
-        key = _row_key(row)
-        if key in rows:
-            duplicate_extra_count += 1
-            if key not in duplicate_keys:
-                duplicate_keys.add(key)
-                if len(duplicate_examples) < 8:
-                    duplicate_examples.append(list(key))
-        rows[key] = row
+    with jsonl_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if str(row.get("protocol_hash", "")) != str(protocol_hash):
+                continue
+            key = _row_key(row)
+            if key in rows:
+                duplicate_extra_count += 1
+                if key not in duplicate_keys:
+                    duplicate_keys.add(key)
+                    if len(duplicate_examples) < 8:
+                        duplicate_examples.append(list(key))
+            rows[key] = row
     return rows, {
         "duplicate_key_count": int(len(duplicate_keys)),
         "duplicate_extra_count": int(duplicate_extra_count),
@@ -1443,27 +1261,16 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
     context_csv_path = artifact_paths["context_csv"]
     context_embeddings_path = artifact_paths["context_embeddings"]
     run_config_path = artifact_paths["run_config"]
+    for artifact_path in (jsonl_path, csv_path, context_csv_path, context_embeddings_path):
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_paths = _resolve_recorder_artifact_paths(out_root, cli_args)
+    jsonl_path = artifact_paths["jsonl"]
+    csv_path = artifact_paths["csv"]
+    context_csv_path = artifact_paths["context_csv"]
+    context_embeddings_path = artifact_paths["context_embeddings"]
     protocol_hash = _protocol_config_fingerprint(cli_args)
-    resume_requested = bool(getattr(cli_args, "resume", True))
-    if (
-        resume_requested
-        and not run_config_path.exists()
-        and jsonl_path.exists()
-        and jsonl_path.stat().st_size > 0
-    ):
-        raise ValueError(
-            "Cannot resume an existing evaluation journal without run_config.json; "
-            "choose a new output directory or rerun with --no_resume to replace prior results."
-        )
-    can_resume = resume_requested and run_config_path.exists()
-    if can_resume:
-        previous_config = json.loads(run_config_path.read_text(encoding="utf-8"))
-        previous_protocol_hash = str(previous_config.get("protocol_hash", ""))
-        if previous_protocol_hash != protocol_hash:
-            raise ValueError(
-                "Existing run_config.json uses a different protocol; choose a new "
-                "output directory or rerun with --no_resume to replace prior results."
-            )
+    previous_config = json.loads(run_config_path.read_text(encoding="utf-8")) if run_config_path.exists() else {}
+    can_resume = bool(getattr(cli_args, "resume", True)) and str(previous_config.get("protocol_hash", "")) == protocol_hash
     rows_by_key = _load_rows(jsonl_path, protocol_hash=str(protocol_hash)) if can_resume else {}
     save_json(
         {
@@ -1477,19 +1284,7 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
         str(run_config_path),
     )
     context_rows_by_signature = _load_context_rows(context_csv_path) if can_resume else {}
-    existing_context_embeddings: Dict[str, np.ndarray] = {}
-    if can_resume and context_embeddings_path.exists():
-        try:
-            existing_context_embeddings = load_context_embedding_table(
-                context_embeddings_path,
-                expected_context_embedding_kind=str(
-                    getattr(cli_args, "context_embedding_kind", "ctx_summary")
-                ),
-                require_manifest=True,
-                expected_context_rows=list(context_rows_by_signature.values()),
-            )
-        except ValueError:
-            existing_context_embeddings = {}
+    existing_context_embeddings = load_context_embedding_table(context_embeddings_path) if can_resume and context_embeddings_path.exists() else {}
     if can_resume and _write_context_rows_enabled(cli_args):
         rows_by_key = {
             key: row
@@ -1500,34 +1295,12 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
                 context_embeddings=existing_context_embeddings,
             )
         }
-        retained_parents = {
-            str(row.get("row_signature", "") or "").strip()
-            for row in rows_by_key.values()
-        }
-        context_rows_by_signature = {
-            signature: row
-            for signature, row in context_rows_by_signature.items()
-            if str(row.get("parent_row_signature", "") or "").strip()
-            in retained_parents
-        }
-        retained_embedding_ids = {
-            str(row.get("context_embedding_id", "") or "").strip()
-            for row in context_rows_by_signature.values()
-            if str(row.get("context_embedding_id", "") or "").strip()
-        }
-        existing_context_embeddings = {
-            key: value
-            for key, value in existing_context_embeddings.items()
-            if key in retained_embedding_ids
-        }
     if can_resume:
         compact_rows = list(rows_by_key.values())
         _write_row_jsonl(jsonl_path, compact_rows)
         _write_row_csv(csv_path, compact_rows)
     fh = jsonl_path.open("a" if can_resume else "w", encoding="utf-8")
-    # Keep the persisted CSV/NPZ/manifest generation intact until replacement
-    # context records are written by _append_context_records().
-    if _write_context_rows_enabled(cli_args) and not can_resume:
+    if context_rows_by_signature:
         _write_context_row_csv(context_csv_path, list(context_rows_by_signature.values()))
     return {
         "out_root": out_root,
@@ -1539,6 +1312,8 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
         "rows_by_key": rows_by_key,
         "context_rows_by_signature": context_rows_by_signature,
         "context_embeddings": existing_context_embeddings,
+        "context_embedding_metadata": {},
+        "context_embedding_coverage": {},
         "protocol_hash": protocol_hash,
     }
 
@@ -1549,23 +1324,13 @@ def _context_row_compatible(existing: Mapping[str, Any], new: Mapping[str, Any])
         "parent_row_signature",
         "context_id",
         "context_embedding_id",
-        "context_embedding_kind",
-        "scenario_key",
+        "dataset",
         "split_phase",
         "seed",
-        "evaluation_seed",
         "solver_key",
         "target_nfe",
         "scheduler_key",
         "checkpoint_id",
-        "example_idx",
-        "target_t",
-        "sample_seed_start",
-        "sample_seed_values_json",
-        "chosen_examples_hash",
-        "evaluation_protocol_hash",
-        "temporal_uw1",
-        "temporal_cw1",
     ):
         old_value = existing.get(field, "")
         new_value = new.get(field, "")
@@ -1574,11 +1339,6 @@ def _context_row_compatible(existing: Mapping[str, Any], new: Mapping[str, Any])
         if str(old_value) != str(new_value):
             return False
     return True
-
-
-def _identity_field_text(value: Any) -> str:
-    """Normalize persisted identity values without discarding numeric zero."""
-    return "" if value is None or value == "" else str(value)
 
 
 def _row_has_complete_context_artifacts(
@@ -1592,127 +1352,21 @@ def _row_has_complete_context_artifacts(
     parent = str(row.get("row_signature", "") or "").strip()
     if not parent:
         return False
+    protocol_hash = str(row.get("protocol_hash", "") or "")
     rows_for_parent = [
         context_row
         for context_row in context_rows_by_signature.values()
         if str(context_row.get("parent_row_signature", "") or "").strip() == parent
+        and str(context_row.get("protocol_hash", "") or "") == protocol_hash
     ]
     expected = _expected_context_rows_for_parent(row)
-    if expected is None or len(rows_for_parent) != expected:
+    if expected is None or len(rows_for_parent) < expected:
         return False
-    identity_fields = (
-        "benchmark_family",
-        "experiment_layout",
-        "scenario_key",
-        "scenario_family",
-        "method_key",
-        "nfe_role",
-        "checkpoint_step",
-        "checkpoint_id",
-        "protocol_hash",
-        "split_phase",
-        "seed",
-        "solver_key",
-        "target_nfe",
-        "scheduler_key",
-        "schedule_grid_hash",
-        "context_embedding_kind",
+    return all(
+        not str(context_row.get("context_embedding_id", "") or "").strip()
+        or str(context_row.get("context_embedding_id", "") or "").strip() in context_embeddings
+        for context_row in rows_for_parent
     )
-    parent_identity = {
-        field: _identity_field_text(row.get(field, "")) for field in identity_fields
-    }
-    context_ids: set[str] = set()
-    embedding_ids: set[str] = set()
-    for context_row in rows_for_parent:
-        if any(
-            _identity_field_text(context_row.get(field, "")) != value
-            for field, value in parent_identity.items()
-        ):
-            return False
-        context_id = str(context_row.get("context_id", "") or "").strip()
-        embedding_id = str(
-            context_row.get("context_embedding_id", "") or ""
-        ).strip()
-        if (
-            not context_id
-            or context_id in context_ids
-            or not embedding_id
-            or embedding_id in embedding_ids
-            or embedding_id not in context_embeddings
-        ):
-            return False
-        context_ids.add(context_id)
-        embedding_ids.add(embedding_id)
-    if str(row.get("benchmark_family", "")) == CONDITIONAL_GENERATION_FAMILY:
-        parent_chosen_hash = str(
-            row.get("chosen_t0s_hash") or row.get("chosen_examples_hash") or ""
-        ).strip()
-        parent_protocol_hash = str(
-            row.get("evaluation_protocol_hash", "") or ""
-        ).strip()
-        if any(
-            len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-            for value in (parent_chosen_hash, parent_protocol_hash)
-        ):
-            return False
-        try:
-            parent_uw1 = float(row["temporal_uw1"])
-            parent_cw1 = float(row["temporal_cw1"])
-            ordered_rows = sorted(
-                rows_for_parent,
-                key=lambda context_row: int(context_row["example_idx"]),
-            )
-            example_indices = [
-                int(context_row["example_idx"]) for context_row in ordered_rows
-            ]
-            target_t_values = [
-                int(context_row["target_t"]) for context_row in ordered_rows
-            ]
-        except (KeyError, TypeError, ValueError):
-            return False
-        if (
-            not np.isfinite(parent_uw1)
-            or not np.isfinite(parent_cw1)
-            or example_indices != list(range(int(expected)))
-            or len(set(target_t_values)) != int(expected)
-        ):
-            return False
-        observed_chosen_hash = hashlib.sha256(
-            json.dumps(target_t_values, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        if observed_chosen_hash != parent_chosen_hash:
-            return False
-        seed_bases: set[int] = set()
-        for context_row, example_idx in zip(ordered_rows, example_indices):
-            try:
-                evaluation_seed = int(context_row["evaluation_seed"])
-                sample_seed_start = int(context_row["sample_seed_start"])
-                sample_seed_values = json.loads(
-                    str(context_row["sample_seed_values_json"])
-                )
-                context_uw1 = float(context_row["temporal_uw1"])
-                context_cw1 = float(context_row["temporal_cw1"])
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                return False
-            if (
-                isinstance(sample_seed_values, bool)
-                or sample_seed_values != [evaluation_seed]
-                or sample_seed_start != evaluation_seed
-                or str(context_row.get("chosen_examples_hash", "")).strip()
-                != parent_chosen_hash
-                or str(context_row.get("evaluation_protocol_hash", "")).strip()
-                != parent_protocol_hash
-                or not np.isfinite(context_uw1)
-                or not np.isfinite(context_cw1)
-                or context_uw1 != parent_uw1
-                or context_cw1 != parent_cw1
-            ):
-                return False
-            seed_bases.add(int(evaluation_seed) - int(example_idx))
-        if len(seed_bases) != 1:
-            return False
-    return True
 
 
 def _append_row_record(row_recorder: Mapping[str, Any], row: Mapping[str, Any]) -> None:
@@ -1738,38 +1392,20 @@ def _append_context_records(
 ) -> None:
     if not rows and not context_embeddings:
         return
-    context_embedding_kind = validate_context_embedding_kind(
-        metadata.get("context_embedding_kind")
-    )
     rows_by_signature = row_recorder["context_rows_by_signature"]
+    added_row_count = 0
     for row in rows:
         signature = str(row.get("row_signature", "")).strip()
         if not signature:
             continue
-        context_row = {**dict(row), "context_embedding_kind": context_embedding_kind}
-        for field in (
-            "benchmark_family",
-            "scenario_key",
-            "split_phase",
-            "checkpoint_id",
-            "context_schema",
-        ):
-            metadata_value = metadata.get(field, "")
-            if metadata_value in (None, ""):
-                continue
-            row_value = context_row.get(field, "")
-            if row_value not in (None, "") and str(row_value) != str(metadata_value):
-                raise ValueError(
-                    f"Context row {signature!r} has {field}={row_value!r}, which conflicts "
-                    f"with artifact metadata {metadata_value!r}."
-                )
-            context_row[field] = metadata_value
         if signature in rows_by_signature:
-            if not _context_row_compatible(rows_by_signature[signature], context_row):
+            if not _context_row_compatible(rows_by_signature[signature], row):
                 raise ValueError(f"Context row collision for {signature!r} with different values/protocol.")
             continue
-        rows_by_signature[signature] = context_row
+        rows_by_signature[signature] = dict(row)
+        added_row_count += 1
     existing_embeddings = row_recorder["context_embeddings"]
+    added_embedding_count = 0
     for key, value in context_embeddings.items():
         key_text = str(key)
         new_vec = np.asarray(value, dtype=np.float32)
@@ -1779,6 +1415,7 @@ def _append_context_records(
                 raise ValueError(f"Context embedding collision for {key_text!r} with different vector/protocol.")
             continue
         existing_embeddings[key_text] = new_vec.astype(float).tolist()
+        added_embedding_count += 1
     missing_embeddings = sorted(
         {
             str(row.get("context_embedding_id", "") or "").strip()
@@ -1789,13 +1426,34 @@ def _append_context_records(
     )
     if missing_embeddings:
         raise KeyError(f"Context rows are missing embedding vectors: {missing_embeddings[:8]}")
+    coverage_key = "|".join(
+        str(metadata.get(field, ""))
+        for field in ("benchmark_family", "dataset", "checkpoint_id", "split_phase", "context_schema")
+    )
+    coverage = row_recorder["context_embedding_coverage"].setdefault(
+        coverage_key,
+        {
+            "benchmark_family": str(metadata.get("benchmark_family", "")),
+            "dataset": str(metadata.get("dataset", "")),
+            "checkpoint_id": str(metadata.get("checkpoint_id", "")),
+            "checkpoint_step": metadata.get("checkpoint_step", ""),
+            "split_phase": str(metadata.get("split_phase", "")),
+            "context_schema": str(metadata.get("context_schema", "")),
+            "row_count": 0,
+            "embedding_count": 0,
+        },
+    )
+    coverage["row_count"] = int(coverage.get("row_count", 0)) + int(added_row_count)
+    coverage["embedding_count"] = int(coverage.get("embedding_count", 0)) + int(added_embedding_count)
+    row_recorder["context_embedding_metadata"] = {
+        "coverage": sorted(row_recorder["context_embedding_coverage"].values(), key=lambda item: tuple(str(item.get(field, "")) for field in ("benchmark_family", "dataset", "checkpoint_id", "split_phase", "context_schema"))),
+    }
     _write_context_row_csv(Path(row_recorder["context_csv_path"]), list(rows_by_signature.values()))
     if row_recorder["context_embeddings"]:
         save_context_embedding_table(
             Path(row_recorder["context_embeddings_path"]),
             row_recorder["context_embeddings"],
-            metadata={"context_embedding_kind": context_embedding_kind},
-            context_rows=list(rows_by_signature.values()),
+            metadata=row_recorder["context_embedding_metadata"],
         )
 
 
@@ -1837,27 +1495,19 @@ def _context_embedding_export_batch_size(cfg: Any | None = None) -> int:
     return max(1, min(int(max_batch_size), int(requested_batch_size)))
 
 
-def _context_record_flush_window_count() -> int:
-    value = int(CONTEXT_RECORD_FLUSH_WINDOW_COUNT)
-    if value <= 0:
-        raise ValueError(f"CONTEXT_RECORD_FLUSH_WINDOW_COUNT must be positive, got {value!r}.")
-    return value
-
-
 def _extract_conditional_context_embeddings(
     *,
     model: Any,
     ds: Any,
     chosen_t0s: Sequence[int],
     device: torch.device,
-    context_embedding_kind: str,
     batch_size: int | None = None,
 ) -> Dict[int, List[float]]:
     if not chosen_t0s:
         return {}
     backbone = getattr(model, "backbone", None)
-    if backbone is None or not hasattr(backbone, "precompute"):
-        raise ValueError("context row export requires model.backbone.precompute(hist).")
+    if backbone is None:
+        raise ValueError("context row export requires model.backbone.")
     effective_batch_size = int(batch_size) if batch_size is not None else _context_embedding_export_batch_size()
     if effective_batch_size <= 0:
         raise ValueError(f"context embedding export batch_size must be positive, got {effective_batch_size!r}.")
@@ -1873,21 +1523,31 @@ def _extract_conditional_context_embeddings(
             for start in range(0, len(chosen), effective_batch_size):
                 batch_t0s = chosen[start : start + effective_batch_size]
                 hist_rows = []
+                cond_rows: List[torch.Tensor] = []
+                saw_unconditional_row = False
                 for t0 in batch_t0s:
-                    hist, _tgt, _fut, _cond, _meta = _parse_batch(_get_dataset_item_by_t(ds, int(t0)))
+                    hist, _tgt, _fut, cond, _meta = _parse_batch(_get_dataset_item_by_t(ds, int(t0)))
                     hist_rows.append(hist.float())
+                    if cond is None:
+                        saw_unconditional_row = True
+                    else:
+                        cond_rows.append(cond.float())
+                if cond_rows and saw_unconditional_row:
+                    raise ValueError("Conditional context export cannot mix conditioned and unconditioned rows.")
                 hist_batch = torch.stack(hist_rows, dim=0).to(device).float()
-                cache = backbone.precompute(hist_batch)
-                if not hasattr(cache, str(context_embedding_kind)):
-                    raise ValueError(f"Unknown context_embedding_kind={context_embedding_kind!r}.")
-                embedding_tensor = getattr(cache, str(context_embedding_kind))
-                if not torch.is_tensor(embedding_tensor) or embedding_tensor.ndim != 2:
-                    raise ValueError(f"Context embedding {context_embedding_kind!r} must be a rank-2 tensor.")
-                if int(embedding_tensor.shape[0]) != len(batch_t0s):
+                cond_batch = torch.stack(cond_rows, dim=0).to(device).float() if cond_rows else None
+                model_cfg = getattr(getattr(backbone, "cfg", None), "model", None)
+                configured_cond_dim = int(getattr(model_cfg, "cond_dim", 0) or 0)
+                if configured_cond_dim > 0 and cond_batch is None:
                     raise ValueError(
-                        f"Context embedding {context_embedding_kind!r} returned {int(embedding_tensor.shape[0])} "
-                        f"rows for {len(batch_t0s)} requested windows."
+                        "Conditional context export requires the auxiliary condition consumed by the frozen field."
                     )
+                embedding_tensor = frozen_backbone_policy_context(
+                    backbone,
+                    hist_batch,
+                    cond=cond_batch,
+                    protocol=FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+                )
                 arr = embedding_tensor.detach().cpu().numpy().astype(np.float32)
                 for idx, t0 in enumerate(batch_t0s):
                     out[int(t0)] = [float(x) for x in arr[idx].tolist()]
@@ -1906,7 +1566,7 @@ def _conditional_context_records(
     evaluation_seed: int,
     solver_key: str,
     target_nfe: int,
-    macro_steps: int,
+    runtime_nfe: int,
     scheduler_key: str,
     details: Mapping[str, Any],
     checkpoint: Mapping[str, Any],
@@ -1926,11 +1586,8 @@ def _conditional_context_records(
     evaluation_protocol_hash: str = "",
     chosen_t0s_hash: str = "",
     train_tuning_context_metadata: Mapping[str, Any] | None = None,
-    window_index_offset: int = 0,
-    axis_t0s: Sequence[int] | None = None,
 ) -> List[Dict[str, Any]]:
-    from genode.gipo.policy import stable_context_id
-    from genode.gipo.schedule_hash import schedule_grid_hash
+    from genode.gico.policy import schedule_grid_hash, stable_context_id
 
     rows: List[Dict[str, Any]] = []
     history_len = int(getattr(cfg, "history_len", 0) or 0)
@@ -1938,11 +1595,8 @@ def _conditional_context_records(
     uniform_aggregate_metrics = dict(uniform_metric_row or {})
     per_window = {int(key): dict(value) for key, value in dict(per_window_metrics_by_t0 or {}).items()}
     uniform_per_window = {int(key): dict(value) for key, value in dict(uniform_per_window_metrics_by_t0 or {}).items()}
-    materialized_specs = materialized_objective_specs_for_scenario(str(dataset))
-    axis_values = [int(x) for x in (chosen_t0s if axis_t0s is None else axis_t0s)]
-    for local_window_idx, t0 in enumerate([int(x) for x in chosen_t0s]):
-        window_idx = int(window_index_offset) + int(local_window_idx)
-        context_evaluation_seed = int(evaluation_seed) + int(window_idx)
+    teacher_specs = teacher_objective_specs_for_scenario(str(dataset))
+    for window_idx, t0 in enumerate([int(x) for x in chosen_t0s]):
         metrics_for_row = dict(per_window.get(int(t0), {}) or aggregate_metrics)
         if not metrics_for_row:
             raise ValueError(
@@ -1969,8 +1623,8 @@ def _conditional_context_records(
         reward_columns = uniform_anchored_objective_columns(
             {**reward_metric_row, "scheduler_key": scheduler_key},
             {**uniform_reward_metric_row, "scheduler_key": UNIFORM_SCHEDULER_KEY},
-            materialized_specs,
-            uniform_scheduler_key=UNIFORM_SCHEDULER_KEY,
+            teacher_specs,
+            uniform_schedule_key=UNIFORM_SCHEDULER_KEY,
         )
         if reward_columns.get("u_comp_uniform") in (None, ""):
             raise ValueError(
@@ -1978,7 +1632,7 @@ def _conditional_context_records(
                 f"target_t={int(t0)} scheduler={scheduler_key!r}."
             )
         raw_context_id = stable_context_id(
-            scenario_key=str(dataset),
+            dataset=str(dataset),
             split_phase=str(split_phase),
             example_idx=int(window_idx),
             series_id=str(dataset),
@@ -2005,17 +1659,9 @@ def _conditional_context_records(
         rows.append(
             {
                 "benchmark_family": str(benchmark_family),
-                "experiment_layout": EXPERIMENT_LAYOUT_ID,
+                "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
                 "scenario_key": str(dataset),
                 "scenario_family": str(benchmark_family),
-                "method_key": str(details.get("method_key") or METHOD_KEY),
-                "gipo_step_budget": details.get("gipo_step_budget", ""),
-                "mode": str(details.get("mode", "") or ""),
-                "teacher_final_retrain": json.dumps(
-                    details.get("teacher_final_retrain", {}), sort_keys=True, separators=(",", ":")
-                )
-                if isinstance(details.get("teacher_final_retrain"), Mapping)
-                else details.get("teacher_final_retrain", ""),
                 "nfe_role": str(nfe_role),
                 "checkpoint_step": int(checkpoint_step),
                 "checkpoint_maturity_label": _checkpoint_maturity_label(int(checkpoint_step)),
@@ -2024,20 +1670,23 @@ def _conditional_context_records(
                 "checkpoint_export_protocol": str(checkpoint.get("checkpoint_export_protocol", "")),
                 "parent_row_signature": str(parent_row_signature),
                 "protocol_hash": str(protocol_hash),
+                "dataset": str(dataset),
                 "split_phase": str(split_phase),
                 "seed": int(seed),
                 "logical_seed": int(seed),
-                "evaluation_seed": int(context_evaluation_seed),
+                "evaluation_seed": int(evaluation_seed),
                 "solver_key": str(solver_key),
                 "target_nfe": int(target_nfe),
-                "macro_steps": int(macro_steps),
-                "realized_nfe": _realized_nfe_for_solver(str(solver_key), int(macro_steps)),
+                "runtime_nfe": int(runtime_nfe),
+                "macro_steps": int(runtime_nfe),
+                "realized_nfe": _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)),
                 "scheduler_key": str(scheduler_key),
                 "schedule_family": schedule_family_for_key(str(scheduler_key)),
                 "density_source_key": density_source_key_for_schedule(str(scheduler_key)),
                 "context_schema": "conditional_generation_window",
+                "axis_dataset": str(dataset),
                 "axis_series": str(dataset),
-                "axis_time_bin": _time_bin_for_target(int(t0), axis_values),
+                "axis_time_bin": _time_bin_for_target(int(t0), chosen_t0s),
                 "axis_record": str(dataset),
                 "axis_window": str(t0),
                 "axis_stratum": "",
@@ -2063,15 +1712,6 @@ def _conditional_context_records(
                 "temporal_cw1": reward_metric_row.get("temporal_cw1", ""),
                 "temporal_tstr_f1": reward_metric_row.get("temporal_tstr_f1", ""),
                 "temporal_tstr_f1_applicable": reward_metric_row.get("temporal_tstr_f1_applicable", ""),
-                "temporal_tstr_f1_status": reward_metric_row.get(
-                    "temporal_tstr_f1_status", ""
-                ),
-                "temporal_tstr_f1_train_class_count": reward_metric_row.get(
-                    "temporal_tstr_f1_train_class_count", ""
-                ),
-                "temporal_tstr_f1_test_class_count": reward_metric_row.get(
-                    "temporal_tstr_f1_test_class_count", ""
-                ),
                 "u_l1": metrics_for_row.get("u_l1", ""),
                 "c_l1": metrics_for_row.get("c_l1", ""),
                 "spread_specific_error": metrics_for_row.get("spread_specific_error", ""),
@@ -2080,15 +1720,15 @@ def _conditional_context_records(
                 "impact_response_error": metrics_for_row.get("impact_response_error", ""),
                 "u_score_uniform": score_gain,
                 **reward_columns,
-                "gipo_reward_protocol": GIPO_PROTOCOL,
-                "reward_anchor_scheduler_key": UNIFORM_SCHEDULER_KEY,
+                "gico_reward_protocol": GICO_PROTOCOL,
+                "reward_anchor_schedule_key": UNIFORM_SCHEDULER_KEY,
                 "reward_utility_transform": "directional_log_uniform_anchor",
                 "reward_granularity": "aggregate_primary_metric_components",
                 "num_eval_samples": "",
                 "eval_horizon": int(eval_horizon),
                 "batch_size": "",
-                "sample_seed_start": int(context_evaluation_seed),
-                "sample_seed_values_json": json.dumps([int(context_evaluation_seed)], separators=(",", ":")),
+                "sample_seed_start": int(evaluation_seed),
+                "sample_seed_values_json": json.dumps([int(evaluation_seed) + int(window_idx)], separators=(",", ":")),
                 "chosen_examples_hash": str(chosen_t0s_hash),
                 "evaluation_protocol_hash": str(evaluation_protocol_hash),
                 "row_signature": str(row_signature),
@@ -2131,31 +1771,7 @@ def _pending_scheduler_cases(
         case_checkpoint_step = case.get("checkpoint_step", "")
         if case_checkpoint_step not in ("", None) and int(case_checkpoint_step) != int(checkpoint_step):
             continue
-        plural_checkpoint_ids = case.get("checkpoint_ids", []) or []
-        if isinstance(plural_checkpoint_ids, (str, bytes)):
-            plural_checkpoint_ids = [plural_checkpoint_ids]
-        declared_checkpoint_ids = {
-            str(value).strip()
-            for value in (
-                [case.get("checkpoint_id")]
-                + list(plural_checkpoint_ids)
-            )
-            if str(value or "").strip()
-        }
-        if declared_checkpoint_ids and str(checkpoint_id) not in declared_checkpoint_ids:
-            raise ValueError(
-                "Schedule summary checkpoint identity does not match the loaded backbone artifact: "
-                f"declared={sorted(declared_checkpoint_ids)}, loaded={str(checkpoint_id)!r}."
-            )
-        signature = evaluation_row_signature(
-            scenario_key=dataset,
-            split_phase=split_phase,
-            seed=seed,
-            target_nfe=target_nfe,
-            solver_key=solver_key,
-            scheduler_key=scheduler_key,
-            checkpoint_id=checkpoint_id,
-        )
+        signature = _row_signature(dataset=dataset, split_phase=split_phase, seed=seed, target_nfe=target_nfe, solver_key=solver_key, scheduler_key=scheduler_key, checkpoint_id=checkpoint_id)
         key = (row_recorder["protocol_hash"], benchmark_family, split_phase, int(seed), dataset, int(target_nfe), solver_key, scheduler_key, signature)
         row = _existing_complete_row(row_recorder, key)
         if row is None:
@@ -2214,7 +1830,7 @@ def _schedule_row_resume_identity(
 def _schedule_row_resume_identity_from_row(row: Mapping[str, Any]) -> Tuple[Any, ...]:
     return _schedule_row_resume_identity(
         benchmark_family=str(row.get("benchmark_family", "")),
-        dataset=str(row["scenario_key"]),
+        dataset=str(row.get("dataset", row.get("scenario_key", ""))),
         member_key=str(row.get("member_key", "") or ""),
         stratum=str(row.get("stratum", "") or ""),
         split_phase=str(row.get("split_phase", "")),
@@ -2301,7 +1917,7 @@ def _expected_schedule_row_identities(cli_args: argparse.Namespace) -> Tuple[Tup
             list(molecule_datasets),
             include_summary_cases=summary_requested,
         )
-        group_root = resolve_project_path(str(getattr(cli_args, "molecule_group_root", molecule_group_root())))
+        group_root = resolve_project_path(str(getattr(cli_args, "molecule_group_root", default_molecule_group_root())))
         for dataset in molecule_datasets:
             group_manifest = load_molecule_group_manifest(str(dataset), group_root)
             members = [dict(member) for member in trainable_molecule_group_members(group_manifest)]
@@ -2322,13 +1938,9 @@ def _positive_int_field(row: Mapping[str, Any], field: str) -> Optional[int]:
     value = row.get(field)
     if value in (None, ""):
         return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, Integral):
-        parsed = int(value)
-    elif isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value):
-        parsed = int(value)
-    else:
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
 
@@ -2366,42 +1978,46 @@ def _schedule_context_outputs_complete(
         return False, f"missing context row CSV: {context_csv_path}"
     if not context_embeddings_path.exists():
         return False, f"missing context embedding table: {context_embeddings_path}"
-    context_rows_by_signature = {
-        signature: row
-        for signature, row in _load_context_rows(context_csv_path).items()
+    context_rows = [
+        row
+        for row in _load_context_rows(context_csv_path).values()
         if str(row.get("protocol_hash", "")) == str(protocol_hash)
-    }
-    context_rows = list(context_rows_by_signature.values())
-    try:
-        embeddings = load_context_embedding_table(
-            context_embeddings_path,
-            expected_context_embedding_kind=str(
-                getattr(cli_args, "context_embedding_kind", "ctx_summary")
-            ),
-            require_manifest=True,
-            expected_context_rows=context_rows,
-        )
-    except ValueError as exc:
-        return False, f"invalid context embedding artifact: {exc}"
-    expected_parents = {
-        str(row.get("row_signature", "") or "").strip() for row in complete_rows
-    }
-    observed_parents = {
-        str(row.get("parent_row_signature", "") or "").strip()
-        for row in context_rows
-    }
-    if not expected_parents or "" in expected_parents or observed_parents != expected_parents:
-        return False, "context rows do not exactly match the complete parent-row set"
+    ]
+    context_rows_by_parent: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for row in context_rows:
+        parent = str(row.get("parent_row_signature", "") or "").strip()
+        if parent:
+            context_rows_by_parent[parent].append(row)
+    missing_parent_contexts: List[str] = []
+    short_parent_contexts: List[str] = []
     for row in complete_rows:
-        if not _row_has_complete_context_artifacts(
-            row,
-            context_rows_by_signature=context_rows_by_signature,
-            context_embeddings=embeddings,
-        ):
-            return False, (
-                "incomplete or identity-mismatched context artifacts for parent "
-                f"{str(row.get('row_signature', '') or '')}"
-            )
+        parent = str(row.get("row_signature", "") or "").strip()
+        if not parent:
+            return False, "complete row is missing row_signature"
+        rows_for_parent = context_rows_by_parent.get(parent, [])
+        if not rows_for_parent:
+            missing_parent_contexts.append(parent)
+            continue
+        expected = _expected_context_rows_for_parent(row)
+        if expected is None:
+            return False, f"cannot prove expected context row count for parent {parent}"
+        if len(rows_for_parent) < expected:
+            short_parent_contexts.append(f"{parent}:{len(rows_for_parent)}/{expected}")
+    if missing_parent_contexts:
+        return False, f"missing context rows for parents: {missing_parent_contexts[:8]}"
+    if short_parent_contexts:
+        return False, f"incomplete context rows for parents: {short_parent_contexts[:8]}"
+    embeddings = load_context_embedding_table(context_embeddings_path)
+    missing_embeddings = sorted(
+        {
+            str(row.get("context_embedding_id", "") or "").strip()
+            for row in context_rows
+            if str(row.get("context_embedding_id", "") or "").strip()
+            and str(row.get("context_embedding_id", "") or "").strip() not in embeddings
+        }
+    )
+    if missing_embeddings:
+        return False, f"missing context embeddings: {missing_embeddings[:8]}"
     return True, ""
 
 
@@ -2529,7 +2145,7 @@ def _molecule_context_records(
     evaluation_seed: int,
     solver_key: str,
     target_nfe: int,
-    macro_steps: int,
+    runtime_nfe: int,
     scheduler_key: str,
     details: Mapping[str, Any],
     checkpoint: Mapping[str, Any],
@@ -2547,14 +2163,17 @@ def _molecule_context_records(
     for metric_row in per_context_metrics:
         raw_context_id = str(metric_row["context_id"])
         context_id = raw_context_id
-        context_evaluation_seed = int(metric_row.get("evaluation_seed", evaluation_seed))
-        context_embedding_id = str(metric_row.get("context_embedding_id") or f"{checkpoint['checkpoint_id']}:{raw_context_id}")
+        context_embedding_id = str(metric_row.get("context_embedding_id", "") or "").strip()
+        if not context_embedding_id:
+            raise ValueError(
+                "Molecule metric rows must contain a checkpoint-scoped context_embedding_id."
+            )
         uniform_metric_row = metric_row if str(scheduler_key) == UNIFORM_SCHEDULER_KEY else uniform_by_context.get(context_id)
         reward_columns = uniform_anchored_objective_columns(
             dict(metric_row, scheduler_key=str(scheduler_key)),
             dict(uniform_metric_row or {}),
             MOLECULE_METRIC_SPECS,
-            uniform_scheduler_key=UNIFORM_SCHEDULER_KEY,
+            uniform_schedule_key=UNIFORM_SCHEDULER_KEY,
         ) if uniform_metric_row is not None else {"u_comp_uniform": None, "reward_metric_count": 0, "reward_metric_weights_json": "{}", "reward_metric_directions_json": "{}"}
         row_signature_payload = {
             "checkpoint_id": str(checkpoint["checkpoint_id"]),
@@ -2571,17 +2190,9 @@ def _molecule_context_records(
         rows.append(
             {
                 "benchmark_family": SCENARIO_FAMILY_MOLECULE,
-                "experiment_layout": EXPERIMENT_LAYOUT_ID,
+                "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
                 "scenario_key": str(dataset),
                 "scenario_family": SCENARIO_FAMILY_MOLECULE,
-                "method_key": str(details.get("method_key") or METHOD_KEY),
-                "gipo_step_budget": details.get("gipo_step_budget", ""),
-                "mode": str(details.get("mode", "") or ""),
-                "teacher_final_retrain": json.dumps(
-                    details.get("teacher_final_retrain", {}), sort_keys=True, separators=(",", ":")
-                )
-                if isinstance(details.get("teacher_final_retrain"), Mapping)
-                else details.get("teacher_final_retrain", ""),
                 "nfe_role": str(nfe_role),
                 "checkpoint_step": int(checkpoint_step),
                 "checkpoint_maturity_label": _checkpoint_maturity_label(int(checkpoint_step)),
@@ -2590,18 +2201,21 @@ def _molecule_context_records(
                 "checkpoint_export_protocol": str(checkpoint.get("checkpoint_export_protocol", "")),
                 "parent_row_signature": str(parent_row_signature),
                 "protocol_hash": str(protocol_hash),
+                "dataset": str(dataset),
                 "split_phase": str(split_phase),
                 "seed": int(seed),
                 "logical_seed": int(seed),
-                "evaluation_seed": int(context_evaluation_seed),
+                "evaluation_seed": int(evaluation_seed),
                 "solver_key": str(solver_key),
                 "target_nfe": int(target_nfe),
-                "macro_steps": int(macro_steps),
-                "realized_nfe": _realized_nfe_for_solver(str(solver_key), int(macro_steps)),
+                "runtime_nfe": int(runtime_nfe),
+                "macro_steps": int(runtime_nfe),
+                "realized_nfe": _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)),
                 "scheduler_key": str(scheduler_key),
                 "schedule_family": schedule_family_for_key(str(scheduler_key)),
                 "density_source_key": density_source_key_for_schedule(str(scheduler_key)),
                 "context_schema": MOLECULE_CONTEXT_SCHEMA,
+                "axis_dataset": str(dataset),
                 "axis_series": str(metric_row.get("axis_member", "")),
                 "axis_time_bin": _time_bin_for_target(int(metric_row.get("target_t", 0)), [int(row.get("target_t", 0)) for row in per_context_metrics]),
                 "axis_record": str(metric_row.get("axis_trajectory", "")),
@@ -2632,20 +2246,15 @@ def _molecule_context_records(
                 "molecule_coordinate_w1_mean": metric_row.get("molecule_coordinate_w1_mean"),
                 "molecule_pair_distance_w1": metric_row.get("molecule_pair_distance_w1"),
                 **reward_columns,
-                "gipo_reward_protocol": GIPO_PROTOCOL,
-                "reward_anchor_scheduler_key": UNIFORM_SCHEDULER_KEY,
+                "gico_reward_protocol": GICO_PROTOCOL,
+                "reward_anchor_schedule_key": UNIFORM_SCHEDULER_KEY,
                 "reward_utility_transform": "directional_log_uniform_anchor",
                 "reward_granularity": "context_window_metric_components",
                 "num_eval_samples": int(metric_row.get("num_eval_samples", 1) or 1),
                 "eval_horizon": int(rollout_steps),
                 "batch_size": "",
-                "sample_seed_start": int(metric_row.get("sample_seed_start", context_evaluation_seed)),
-                "sample_seed_values_json": str(
-                    metric_row.get(
-                        "sample_seed_values_json",
-                        json.dumps([int(context_evaluation_seed)], separators=(",", ":")),
-                    )
-                ),
+                "sample_seed_start": int(evaluation_seed),
+                "sample_seed_values_json": json.dumps([int(evaluation_seed)], separators=(",", ":")),
                 "row_signature": str(row_signature),
                 **dict(train_tuning_context_metadata or {}),
             }
@@ -2667,7 +2276,7 @@ def _existing_uniform_context_rows(
     for row in row_recorder.get("context_rows_by_signature", {}).values():
         if str(row.get("scheduler_key")) != UNIFORM_SCHEDULER_KEY:
             continue
-        if str(row.get("scenario_key")) != str(dataset) or str(row.get("split_phase")) != str(split_phase):
+        if str(row.get("dataset")) != str(dataset) or str(row.get("split_phase")) != str(split_phase):
             continue
         if str(row.get("solver_key")) != str(solver_key) or int(row.get("target_nfe", -1)) != int(target_nfe):
             continue
@@ -2681,8 +2290,8 @@ def _existing_uniform_context_rows(
     return out
 
 
-def _fixed_schedule_details(scheduler_key: str, macro_steps: int) -> Dict[str, Any]:
-    fixed_grid = build_schedule_grid(str(scheduler_key), int(macro_steps))
+def _fixed_schedule_details(scheduler_key: str, runtime_nfe: int) -> Dict[str, Any]:
+    fixed_grid = build_schedule_grid(str(scheduler_key), int(runtime_nfe))
     if fixed_grid is None:
         raise ValueError(f"Unable to build fixed grid for scheduler={scheduler_key}")
     grid_hash = schedule_grid_hash(fixed_grid)
@@ -2690,29 +2299,26 @@ def _fixed_schedule_details(scheduler_key: str, macro_steps: int) -> Dict[str, A
         "time_grid": [float(x) for x in fixed_grid],
         "schedule_grid_hash": str(grid_hash),
         "reference_time_alignment": schedule_time_alignment(str(scheduler_key)),
-        "source_duplicate_count": 0,
-        "reference_macro_steps": int(macro_steps),
+        "paper_duplicate_count": 0,
+        "reference_macro_steps": int(runtime_nfe),
     }
     details.update(fixed_schedule_shape_statistics(fixed_grid))
     return details
 
 
-def _schedule_details_from_case(case: Mapping[str, Any], macro_steps: int) -> Dict[str, Any]:
+def _schedule_details_from_case(case: Mapping[str, Any], runtime_nfe: int) -> Dict[str, Any]:
     if "time_grid" not in case:
-        return _fixed_schedule_details(str(case["scheduler_key"]), int(macro_steps))
-    grid = validate_time_grid(case["time_grid"], macro_steps=int(macro_steps))
+        return _fixed_schedule_details(str(case["scheduler_key"]), int(runtime_nfe))
+    grid = validate_time_grid(case["time_grid"], macro_steps=int(runtime_nfe))
     details: Dict[str, Any] = {
         "time_grid": [float(x) for x in grid],
         "schedule_grid_hash": str(case.get("schedule_grid_hash") or schedule_grid_hash(grid)),
         "reference_time_alignment": str(case.get("reference_time_alignment", "summary_density_time_grid")),
-        "source_duplicate_count": int(case.get("source_duplicate_count", 0) or 0),
-        "macro_steps": int(case.get("macro_steps", macro_steps) or macro_steps),
-        "realized_nfe": int(case.get("realized_nfe", _realized_nfe_for_solver(str(case.get("solver_key", "euler")), int(macro_steps)))),
-        "reference_macro_steps": int(case.get("reference_macro_steps", macro_steps) or macro_steps),
-        "method_key": str(case.get("method_key") or case.get("scheduler_key") or METHOD_KEY),
-        "gipo_step_budget": case.get("gipo_step_budget", ""),
-        "mode": str(case.get("mode", "") or ""),
-        "teacher_final_retrain": case.get("teacher_final_retrain", {}),
+        "paper_duplicate_count": int(case.get("paper_duplicate_count", 0) or 0),
+        "macro_steps": int(case.get("macro_steps", runtime_nfe) or runtime_nfe),
+        "runtime_nfe": int(case.get("runtime_nfe", runtime_nfe) or runtime_nfe),
+        "realized_nfe": int(case.get("realized_nfe", _realized_nfe_for_solver(str(case.get("solver_key", "euler")), int(runtime_nfe)))),
+        "reference_macro_steps": int(case.get("reference_macro_steps", runtime_nfe) or runtime_nfe),
     }
     details.update(fixed_schedule_shape_statistics(grid))
     if str(case.get("schedule_summary_path", "")).strip():
@@ -2730,18 +2336,19 @@ def _evaluation_protocol_fields(result_row: Mapping[str, Any], *, eval_horizon: 
     }
 
 
-def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: str, checkpoint: Mapping[str, Any], checkpoint_step: int, nfe_role: str, target_nfe: int, macro_steps: int, solver_key: str, scheduler_key: str, context_embedding_kind: str, details: Mapping[str, Any], metrics: Mapping[str, Any], row_signature: str, protocol_hash: str) -> Dict[str, Any]:
+def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: str, checkpoint: Mapping[str, Any], checkpoint_step: int, nfe_role: str, target_nfe: int, runtime_nfe: int, solver_key: str, scheduler_key: str, details: Mapping[str, Any], metrics: Mapping[str, Any], row_signature: str, protocol_hash: str) -> Dict[str, Any]:
     selection_metric = selection_metric_for_family(str(benchmark_family))
     nfe = normalize_solver_nfe_fields(
         str(solver_key),
         int(target_nfe),
-        macro_steps=details.get("macro_steps", macro_steps),
+        macro_steps=details.get("macro_steps"),
+        runtime_nfe=runtime_nfe,
         realized_nfe=metrics.get("realized_nfe", details.get("realized_nfe")),
         source=f"{scheduler_key} row {solver_key}/{target_nfe}",
     )
     return {
         "benchmark_family": str(benchmark_family),
-        "experiment_layout": EXPERIMENT_LAYOUT_ID,
+        "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
         "scenario_key": str(dataset),
         "scenario_family": str(benchmark_family),
         "nfe_role": str(nfe_role),
@@ -2750,44 +2357,36 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "checkpoint_maturity_index": _checkpoint_maturity_index(int(checkpoint_step)),
         "split_phase": str(split_phase),
         "seed": int(seed),
+        "dataset": str(dataset),
         "checkpoint_id": str(checkpoint["checkpoint_id"]),
-        "method_key": str(details.get("method_key") or METHOD_KEY),
-        "gipo_step_budget": details.get("gipo_step_budget", ""),
-        "mode": str(details.get("mode", "") or ""),
-        "teacher_final_retrain": json.dumps(
-            details.get("teacher_final_retrain", {}),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        if isinstance(details.get("teacher_final_retrain"), Mapping)
-        else details.get("teacher_final_retrain", ""),
         "checkpoint_path": _logical_artifact_path(str(checkpoint["checkpoint_path"])),
         "backbone_name": str(checkpoint.get("backbone_name", "otflow")),
         "member_key": str(checkpoint.get("member_key", "")),
         "stratum": str(checkpoint.get("stratum", "")),
         "formula": str(checkpoint.get("formula", "")),
         "source_zip_name": str(checkpoint.get("source_zip_name", "")),
-        "effective_train_steps": int(checkpoint.get("effective_train_steps", checkpoint_step)),
+        "train_steps": int(checkpoint["train_steps"]),
+        "effective_train_steps": int(checkpoint.get("effective_train_steps", checkpoint["train_steps"])),
         "checkpoint_export_protocol": str(checkpoint.get("checkpoint_export_protocol", "")),
         "train_budget_label": str(checkpoint["train_budget_label"]),
         "target_nfe": int(target_nfe),
+        "runtime_nfe": int(nfe.runtime_nfe),
         "macro_steps": int(nfe.macro_steps),
         "solver_key": str(solver_key),
-        "solver_name": normalize_solver_key(solver_key),
+        "solver_name": str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
         "scheduler_key": str(scheduler_key),
-        "scheduler_name": schedule_display_name(str(scheduler_key)),
+        "scheduler_variant_key": str(scheduler_key),
+        "scheduler_variant_name": schedule_display_name(str(scheduler_key)),
+        "schedule_name": schedule_display_name(str(scheduler_key)),
         "schedule_family": schedule_family_for_key(str(scheduler_key)),
         "density_source_key": density_source_key_for_schedule(str(scheduler_key)),
-        "context_embedding_kind": validate_context_embedding_kind(
-            context_embedding_kind
-        ),
         "student_training_mode": "",
         "row_signature": str(row_signature),
         "signal_trace_key": None,
         "signal_validation_spearman": None,
         "info_growth_scale": None,
         "reference_macro_factor": None,
-        "source_duplicate_count": int(details.get("source_duplicate_count", 0) or 0),
+        "paper_duplicate_count": int(details.get("paper_duplicate_count", 0) or 0),
         "experiment_scope": solver_experiment_scope(str(solver_key)),
         "selection_metric": str(selection_metric),
         "selection_metric_value": metrics.get(selection_metric),
@@ -2808,13 +2407,6 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "temporal_cw1": metrics.get("temporal_cw1"),
         "temporal_tstr_f1": metrics.get("temporal_tstr_f1"),
         "temporal_tstr_f1_applicable": metrics.get("temporal_tstr_f1_applicable"),
-        "temporal_tstr_f1_status": metrics.get("temporal_tstr_f1_status"),
-        "temporal_tstr_f1_train_class_count": metrics.get(
-            "temporal_tstr_f1_train_class_count"
-        ),
-        "temporal_tstr_f1_test_class_count": metrics.get(
-            "temporal_tstr_f1_test_class_count"
-        ),
         "u_l1": metrics.get("u_l1"),
         "c_l1": metrics.get("c_l1"),
         "spread_specific_error": metrics.get("spread_specific_error"),
@@ -2856,75 +2448,11 @@ def _scheduler_cases_for_datasets(
     *,
     include_summary_cases: bool = True,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    dataset_keys = tuple(str(dataset) for dataset in datasets)
     schedule_names = _parse_schedule_names(str(cli_args.baseline_scheduler_names))
     _raise_if_duplicate_values(schedule_names, label="fixed diffusion-flow schedules")
     if UNIFORM_SCHEDULER_KEY in schedule_names:
         schedule_names = [UNIFORM_SCHEDULER_KEY] + [key for key in schedule_names if key != UNIFORM_SCHEDULER_KEY]
     summary_cases = _load_schedule_summary_cases(str(getattr(cli_args, "schedule_summary_json", ""))) if include_summary_cases else []
-    unmatched_scenarios = sorted(
-        {
-            str(case.get("scenario_key"))
-            for case in summary_cases
-            if str(case.get("scenario_key", "") or "").strip()
-            and str(case.get("scenario_key")) not in set(dataset_keys)
-        }
-    )
-    if unmatched_scenarios:
-        raise ValueError(
-            "Schedule summary scenarios are not selected for evaluation: "
-            f"{unmatched_scenarios}."
-        )
-    requested_checkpoint_steps = set(_checkpoint_steps_for_args(cli_args))
-    unmatched_checkpoint_steps = sorted(
-        {
-            int(case["checkpoint_step"])
-            for case in summary_cases
-            if case.get("checkpoint_step") not in (None, "")
-            and int(case["checkpoint_step"]) not in requested_checkpoint_steps
-        }
-    )
-    if unmatched_checkpoint_steps:
-        raise ValueError(
-            "Schedule summary checkpoint_step values are not selected for evaluation: "
-            f"{unmatched_checkpoint_steps}."
-        )
-    identity_cases = [
-        case
-        for case in summary_cases
-        if str(case.get("checkpoint_id", "") or "").strip()
-        or bool(case.get("checkpoint_ids", []) or [])
-    ]
-    if identity_cases:
-        manifest = load_backbone_manifest(resolve_project_path(str(cli_args.backbone_manifest)))
-        for case in identity_cases:
-            scenario_key = str(case.get("scenario_key", "") or "").strip()
-            checkpoint_step = case.get("checkpoint_step")
-            if not scenario_key or checkpoint_step in (None, ""):
-                raise ValueError(
-                    "Schedule summary checkpoint identity requires scenario_key and checkpoint_step."
-                )
-            plural_ids = case.get("checkpoint_ids", []) or []
-            if isinstance(plural_ids, (str, bytes)):
-                plural_ids = [plural_ids]
-            declared_ids = {
-                str(value).strip()
-                for value in [case.get("checkpoint_id"), *list(plural_ids)]
-                if str(value or "").strip()
-            }
-            expected_ids = {
-                str(artifact.get("checkpoint_id", "") or "").strip()
-                for artifact in manifest.get("artifacts", [])
-                if str(artifact.get("status", "")) == "ready"
-                and str(artifact.get("dataset_key", "")) == scenario_key
-                and int(artifact.get("train_steps", -1)) == int(checkpoint_step)
-            }
-            if not expected_ids or declared_ids != expected_ids:
-                raise ValueError(
-                    "Schedule summary checkpoint identity does not match the backbone manifest: "
-                    f"scenario_key={scenario_key!r}, checkpoint_step={int(checkpoint_step)}, "
-                    f"declared={sorted(declared_ids)}, expected={sorted(expected_ids)}."
-                )
     requested_summary_names = _parse_summary_schedule_names(str(getattr(cli_args, "summary_scheduler_names", "")))
     _raise_if_duplicate_values(requested_summary_names, label="summary diffusion-flow schedules")
     if requested_summary_names and include_summary_cases:
@@ -2938,7 +2466,7 @@ def _scheduler_cases_for_datasets(
     if overlap:
         raise ValueError(f"Summary-derived schedules duplicate fixed schedules: {overlap}")
     cases = [{"scheduler_key": key} for key in schedule_names] + summary_cases
-    case_keys: set[Tuple[str, str, str, str, str]] = set()
+    case_keys: set[Tuple[str, str, str, str]] = set()
     duplicate_case_keys: List[List[str]] = []
     for case in cases:
         case_key = (
@@ -2946,7 +2474,6 @@ def _scheduler_cases_for_datasets(
             str(case.get("solver_key", "") or ""),
             str(case.get("target_nfe", "") or ""),
             str(case.get("checkpoint_step", "") or ""),
-            str(case.get("scenario_key", "") or ""),
         )
         if case_key in case_keys:
             duplicate_case_keys.append(list(case_key))
@@ -2955,15 +2482,7 @@ def _scheduler_cases_for_datasets(
         raise ValueError(f"Duplicate scheduler cases: {duplicate_case_keys[:8]}")
     if not cases:
         raise ValueError("At least one fixed or summary-derived schedule is required.")
-    return {
-        str(dataset): [
-            dict(case)
-            for case in cases
-            if not str(case.get("scenario_key", "") or "").strip()
-            or str(case.get("scenario_key")) == str(dataset)
-        ]
-        for dataset in dataset_keys
-    }
+    return {str(dataset): [dict(case) for case in cases] for dataset in datasets}
 
 
 def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[str, Any], split_phase: str, seeds: Sequence[int], scheduler_cases_by_dataset: Mapping[str, Sequence[Mapping[str, Any]]]) -> List[Dict[str, Any]]:
@@ -3027,10 +2546,7 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                     )
                 else:
                     tuning_seed = int(seed) + 1_000 * dataset_idx
-                    if str(split_phase) == LOCKED_TEST_PHASE or selected_examples_cap is None:
-                        eval_examples = int(len(eval_ds))
-                    else:
-                        eval_examples = int(selected_examples_cap)
+                    eval_examples = int(selected_examples_cap) if selected_examples_cap is not None else int(len(eval_ds))
                     candidate_examples = choose_forecast_example_indices(
                         eval_ds,
                         n_examples=int(eval_examples),
@@ -3047,20 +2563,12 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                         },
                     }
                 )
-            if str(split_phase) == LOCKED_TEST_PHASE:
-                selected_groups, selection_records, _global_selection_meta = _select_locked_test_context_groups(
-                    selection_groups,
-                    context_limit=selected_examples_cap,
-                    seed=int(cli_args.train_tuning_seed) + 1_000 * dataset_idx + int(checkpoint_step),
-                    salt=f"forecast|{dataset}|{split_phase}|{checkpoint_step}",
-                )
-            else:
-                selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
-                    selection_groups,
-                    cap=_selection_cap_for_groups(selection_groups, selected_examples_cap),
-                    seed=int(cli_args.train_tuning_seed) + 1_000 * dataset_idx + int(checkpoint_step),
-                    salt=f"forecast|{dataset}|{split_phase}|{checkpoint_step}",
-                )
+            selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
+                selection_groups,
+                cap=_selection_cap_for_groups(selection_groups, selected_examples_cap),
+                seed=int(cli_args.train_tuning_seed) + 1_000 * dataset_idx + int(checkpoint_step),
+                salt=f"forecast|{dataset}|{split_phase}|{checkpoint_step}",
+            )
             selections_by_seed: Dict[int, Tuple[np.ndarray, Dict[str, Any], int]] = {}
             for selected, record in zip(selected_groups, selection_records):
                 selections_by_seed[int(record["seed"])] = (selected, record, int(record["tuning_seed"]))
@@ -3070,7 +2578,7 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                     continue
                 for target_idx, target_nfe in enumerate(target_nfes):
                     for solver_idx, solver_key in enumerate(normalize_solver_keys(str(cli_args.solver_names))):
-                        macro_steps = solver_macro_steps(str(solver_key), int(target_nfe))
+                        runtime_nfe = solver_macro_steps(str(solver_key), int(target_nfe))
                         scheduler_cases = list(scheduler_cases_by_dataset[str(dataset)])
                         existing_rows, pending_cases = _pending_scheduler_cases(
                             row_recorder,
@@ -3091,21 +2599,21 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                 cell_uniform_metrics = existing_row
                         for case in pending_cases:
                             scheduler_key = str(case["scheduler_key"])
-                            details = _schedule_details_from_case(case, int(macro_steps))
+                            details = _schedule_details_from_case(case, int(runtime_nfe))
                             eval_seed = int(seed) + 100_000 * dataset_idx + 1_000 * target_idx + solver_idx
                             metrics = evaluate_forecast_schedule(
                                 model,
                                 eval_ds,
                                 cfg,
-                                solver_name=normalize_solver_key(solver_key),
-                                macro_steps=int(macro_steps),
+                                solver_name=str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
+                                runtime_nfe=int(runtime_nfe),
                                 target_nfe=int(target_nfe),
                                 time_grid=details["time_grid"],
                                 num_eval_samples=int(cli_args.num_eval_samples),
                                 seed=int(eval_seed),
                                 logical_seed=int(seed),
                                 scheduler_key=str(scheduler_key),
-                                scenario_key=str(dataset),
+                                dataset_key=str(dataset),
                                 split_phase=str(split_phase),
                                 checkpoint_id=str(checkpoint["checkpoint_id"]),
                                 example_indices=chosen_examples,
@@ -3113,7 +2621,6 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                 progress_label=f"{split_phase} {dataset} {scheduler_key} step={checkpoint_step} seed={seed} {solver_key}/{target_nfe}",
                                 return_per_example_rows=_write_context_rows_enabled(cli_args),
                                 return_context_embeddings=_write_context_rows_enabled(cli_args),
-                                context_embedding_kind=str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
                             )
                             if scheduler_key != UNIFORM_SCHEDULER_KEY and cell_uniform_metrics is not None:
                                 metrics = dict(metrics)
@@ -3134,16 +2641,9 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                 checkpoint_step=int(checkpoint_step),
                                 nfe_role=nfe_role,
                                 target_nfe=int(target_nfe),
-                                macro_steps=int(macro_steps),
+                                runtime_nfe=int(runtime_nfe),
                                 solver_key=str(solver_key),
                                 scheduler_key=scheduler_key,
-                                context_embedding_kind=str(
-                                    getattr(
-                                        cli_args,
-                                        "context_embedding_kind",
-                                        "ctx_summary",
-                                    )
-                                ),
                                 details=details,
                                 metrics=metrics,
                                 row_signature=str(case["row_signature"]),
@@ -3179,19 +2679,9 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                     copied_detail.update(
                                         {
                                             "benchmark_family": FORECAST_FAMILY,
-                                            "experiment_layout": EXPERIMENT_LAYOUT_ID,
+                                            "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
                                             "scenario_key": str(dataset),
                                             "scenario_family": FORECAST_FAMILY,
-                                            "method_key": str(details.get("method_key") or METHOD_KEY),
-                                            "gipo_step_budget": details.get("gipo_step_budget", ""),
-                                            "mode": str(details.get("mode", "") or ""),
-                                            "teacher_final_retrain": json.dumps(
-                                                details.get("teacher_final_retrain", {}),
-                                                sort_keys=True,
-                                                separators=(",", ":"),
-                                            )
-                                            if isinstance(details.get("teacher_final_retrain"), Mapping)
-                                            else details.get("teacher_final_retrain", ""),
                                             "nfe_role": nfe_role,
                                             "checkpoint_step": int(checkpoint_step),
                                             "checkpoint_maturity_label": _checkpoint_maturity_label(int(checkpoint_step)),
@@ -3203,13 +2693,6 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                             "schedule_family": schedule_family_for_key(str(scheduler_key)),
                                             "density_source_key": density_source_key_for_schedule(str(scheduler_key)),
                                         }
-                                    )
-                                    copied_detail.update(
-                                        _selection_metadata_row_fields(
-                                            selection_meta,
-                                            cap_source=str(selected_examples_cap_source),
-                                            context_sample_count=_context_sample_cap(cli_args),
-                                        )
                                     )
                                     if str(split_phase) == TRAIN_TUNING_PHASE:
                                         copied_detail.update(
@@ -3229,10 +2712,10 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                         "benchmark_family": FORECAST_FAMILY,
                                         "checkpoint_id": str(checkpoint["checkpoint_id"]),
                                         "checkpoint_step": int(checkpoint_step),
-                                        "scenario_key": str(dataset),
+                                        "dataset": str(dataset),
                                         "split_phase": str(split_phase),
                                         "context_schema": "forecast_window",
-                                        "context_embedding_kind": str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
+                                        "context_embedding_protocol": FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
                                         "history_len": int(getattr(cfg, "history_len", 0)),
                                         "horizon": int(getattr(eval_ds, "horizon", 1)),
                                         "chosen_examples_hash": str(metrics.get("chosen_examples_hash", "")),
@@ -3271,10 +2754,13 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
             splits = checkpoint["splits"]
             if str(split_phase) == TRAIN_TUNING_PHASE:
                 eval_ds = splits["train"]
+                split_key = "train"
             elif str(split_phase) == VALIDATION_PHASE:
                 eval_ds = splits["val"]
+                split_key = "val"
             else:
                 eval_ds = splits["test"]
+                split_key = "test"
             eval_horizon = resolved_eval_horizon(step_args, str(dataset))
             selected_examples_cap, selected_examples_cap_source = _split_example_cap(cli_args, str(split_phase))
             available_windows = int(len(getattr(eval_ds, "start_indices", [])))
@@ -3286,14 +2772,19 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                     sampling_mode=TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
                     strata=int(cli_args.train_tuning_strata),
                 )
-            elif str(split_phase) == VALIDATION_PHASE:
-                requested_windows = int(getattr(cli_args, "eval_windows_val", 0))
+            else:
+                requested_attr = "eval_windows_val" if str(split_phase) == VALIDATION_PHASE else "eval_windows_test"
+                requested_windows = int(getattr(cli_args, requested_attr, 0))
                 if requested_windows < 0:
-                    raise ValueError(f"--eval_windows_val must be nonnegative, got {requested_windows!r}.")
+                    raise ValueError(f"--{requested_attr} must be nonnegative, got {requested_windows!r}.")
                 eval_windows = (
                     int(requested_windows)
                     if requested_windows > 0
-                    else int(resolved_validation_windows(step_args, str(dataset)))
+                    else (
+                        0
+                        if str(split_phase) == LOCKED_TEST_PHASE
+                        else int(resolved_eval_windows(step_args, str(dataset), split_key))
+                    )
                 )
             selection_groups: List[Dict[str, Any]] = []
             for seed in seeds:
@@ -3312,7 +2803,7 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                     uncapped_candidate_examples = int(target_examples)
                 else:
                     selection_seed = int(seed) + 1_000 * dataset_idx
-                    if str(split_phase) == LOCKED_TEST_PHASE:
+                    if selected_examples_cap is None and str(split_phase) == LOCKED_TEST_PHASE:
                         candidate_eval_t0s = _all_valid_conditional_window_starts(eval_ds, horizon=int(eval_horizon))
                         uncapped_candidate_examples = int(len(candidate_eval_t0s))
                     else:
@@ -3333,20 +2824,12 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                         },
                     }
                 )
-            if str(split_phase) == LOCKED_TEST_PHASE:
-                selected_groups, selection_records, _global_selection_meta = _select_locked_test_context_groups(
-                    selection_groups,
-                    context_limit=selected_examples_cap,
-                    seed=1_000 * int(dataset_idx) + int(checkpoint_step),
-                    salt=f"conditional|{dataset}|{split_phase}|{checkpoint_step}",
-                )
-            else:
-                selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
-                    selection_groups,
-                    cap=_selection_cap_for_groups(selection_groups, selected_examples_cap),
-                    seed=1_000 * int(dataset_idx) + int(checkpoint_step),
-                    salt=f"conditional|{dataset}|{split_phase}|{checkpoint_step}",
-                )
+            selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
+                selection_groups,
+                cap=_selection_cap_for_groups(selection_groups, selected_examples_cap),
+                seed=1_000 * int(dataset_idx) + int(checkpoint_step),
+                salt=f"conditional|{dataset}|{split_phase}|{checkpoint_step}",
+            )
             selections_by_seed: Dict[int, Tuple[np.ndarray, Dict[str, Any], int]] = {}
             for selected, record in zip(selected_groups, selection_records):
                 selections_by_seed[int(record["seed"])] = (selected, record, int(record["selection_seed"]))
@@ -3356,7 +2839,7 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                     continue
                 for target_idx, target_nfe in enumerate(target_nfes):
                     for solver_idx, solver_key in enumerate(normalize_solver_keys(str(cli_args.solver_names))):
-                        macro_steps = solver_macro_steps(str(solver_key), int(target_nfe))
+                        runtime_nfe = solver_macro_steps(str(solver_key), int(target_nfe))
                         existing_rows, pending_cases = _pending_scheduler_cases(
                             row_recorder,
                             benchmark_family=CONDITIONAL_GENERATION_FAMILY,
@@ -3389,18 +2872,25 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                             if str(row.get("context_schema")) == "conditional_generation_window"
                             and row.get("target_t", "") not in ("", None)
                         }
-                        chosen_eval_t0_list = [int(x) for x in chosen_eval_t0s.tolist()]
+                        conditional_embeddings_by_t0: Dict[int, List[float]] = {}
+                        if _write_context_rows_enabled(cli_args):
+                            conditional_embeddings_by_t0 = _extract_conditional_context_embeddings(
+                                model=model,
+                                ds=eval_ds,
+                                chosen_t0s=[int(x) for x in chosen_eval_t0s.tolist()],
+                                device=device,
+                                batch_size=_context_embedding_export_batch_size(cfg),
+                            )
                         for case in pending_cases:
                             scheduler_key = str(case["scheduler_key"])
-                            details = _schedule_details_from_case(case, int(macro_steps))
+                            details = _schedule_details_from_case(case, int(runtime_nfe))
                             grid_spec = {
                                 "grid_name": scheduler_key,
                                 "grid_kind": "fixed_diffusion_flow_time_grid",
                                 "selection_group": scheduler_key,
                                 "comparison_role": "transferred" if scheduler_key in TRANSFER_SCHEDULE_KEYS else "baseline",
-                                "solver_name": normalize_solver_key(solver_key),
-                                "target_nfe": int(target_nfe),
-                                "macro_steps": int(macro_steps),
+                                "solver_name": str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
+                                "nfe": int(runtime_nfe),
                                 "time_grid": details["time_grid"],
                             }
                             metrics_seed = int(seed) + 1_000_000 * dataset_idx + 10_000 * target_idx + solver_idx
@@ -3425,15 +2915,6 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 "score_main": result_row.get("score_main"),
                                 "temporal_tstr_f1": result_row.get("temporal_tstr_f1"),
                                 "temporal_tstr_f1_applicable": result_row.get("temporal_tstr_f1_applicable"),
-                                "temporal_tstr_f1_status": result_row.get(
-                                    "temporal_tstr_f1_status"
-                                ),
-                                "temporal_tstr_f1_train_class_count": result_row.get(
-                                    "temporal_tstr_f1_train_class_count"
-                                ),
-                                "temporal_tstr_f1_test_class_count": result_row.get(
-                                    "temporal_tstr_f1_test_class_count"
-                                ),
                                 "disc_auc": result_row.get("disc_auc"),
                                 "disc_auc_gap": result_row.get("disc_auc_gap"),
                                 "temporal_uw1": result_row.get("temporal_uw1"),
@@ -3446,7 +2927,7 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 "impact_response_error": result_row.get("impact_response_error"),
                                 "efficiency_ms_per_sample": result_row.get("efficiency_ms_per_sample"),
                                 "eval_windows": int(len(chosen_eval_t0s)),
-                                "realized_nfe": _realized_nfe_for_solver(str(solver_key), int(macro_steps)),
+                                "realized_nfe": _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)),
                                 **_evaluation_protocol_fields(result_row, eval_horizon=int(eval_horizon)),
                             }
                             if scheduler_key != UNIFORM_SCHEDULER_KEY and cell_uniform_metrics is not None:
@@ -3460,16 +2941,9 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 checkpoint_step=int(checkpoint_step),
                                 nfe_role=nfe_role,
                                 target_nfe=int(target_nfe),
-                                macro_steps=int(macro_steps),
+                                runtime_nfe=int(runtime_nfe),
                                 solver_key=str(solver_key),
                                 scheduler_key=scheduler_key,
-                                context_embedding_kind=str(
-                                    getattr(
-                                        cli_args,
-                                        "context_embedding_kind",
-                                        "ctx_summary",
-                                    )
-                                ),
                                 details=details,
                                 metrics=metrics,
                                 row_signature=str(case["row_signature"]),
@@ -3496,102 +2970,69 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 uniform_score = row.get("score_main") if scheduler_key == UNIFORM_SCHEDULER_KEY else (
                                     cell_uniform_metrics.get("score_main") if cell_uniform_metrics is not None else None
                                 )
-                                context_metadata = {
-                                    "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
-                                    "checkpoint_id": str(checkpoint["checkpoint_id"]),
-                                    "checkpoint_step": int(checkpoint_step),
-                                    "scenario_key": str(dataset),
-                                    "split_phase": str(split_phase),
-                                    "context_schema": "conditional_generation_window",
-                                    "context_embedding_kind": str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
-                                    "history_len": int(getattr(cfg, "history_len", 0)),
-                                    "horizon": int(eval_horizon),
-                                }
-                                context_flush_size = _context_record_flush_window_count()
-                                for context_start in range(0, len(chosen_eval_t0_list), context_flush_size):
-                                    context_t0s = chosen_eval_t0_list[context_start : context_start + context_flush_size]
-                                    context_rows = _conditional_context_records(
-                                        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-                                        dataset=str(dataset),
-                                        split_phase=str(split_phase),
-                                        seed=int(seed),
-                                        evaluation_seed=int(metrics_seed),
-                                        solver_key=str(solver_key),
-                                        target_nfe=int(target_nfe),
-                                        macro_steps=int(macro_steps),
-                                        scheduler_key=scheduler_key,
-                                        details=details,
-                                        checkpoint=checkpoint,
-                                        checkpoint_step=int(checkpoint_step),
-                                        nfe_role=nfe_role,
-                                        parent_row_signature=str(case["row_signature"]),
-                                        protocol_hash=str(row_recorder["protocol_hash"]),
-                                        cfg=cfg,
-                                        eval_horizon=int(eval_horizon),
-                                        chosen_t0s=context_t0s,
-                                        score_main=row.get("score_main"),
-                                        uniform_score_main=uniform_score,
-                                        per_window_metrics_by_t0=per_window_metrics_by_t0,
-                                        uniform_per_window_metrics_by_t0=(
-                                            per_window_metrics_by_t0
-                                            if scheduler_key == UNIFORM_SCHEDULER_KEY
-                                            else cell_uniform_per_window_metrics_by_t0
-                                        ),
-                                        metric_row=row,
-                                        uniform_metric_row=row if scheduler_key == UNIFORM_SCHEDULER_KEY else cell_uniform_metrics,
-                                        evaluation_protocol_hash=str(row.get("evaluation_protocol_hash", "")),
-                                        chosen_t0s_hash=str(row.get("chosen_t0s_hash", "")),
-                                        train_tuning_context_metadata=(
-                                            {
-                                                "train_tuning_fraction": float(cli_args.eval_train_fraction),
-                                                "train_tuning_seed": int(selection_seed),
-                                                "train_tuning_strata": int(cli_args.train_tuning_strata),
-                                                "train_tuning_sampler": train_tuning_sampler_key(TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION),
-                                            }
-                                            if str(split_phase) == TRAIN_TUNING_PHASE
-                                            else None
-                                        ),
-                                        window_index_offset=int(context_start),
-                                        axis_t0s=chosen_eval_t0_list,
-                                    )
-                                    context_selection_fields = _selection_metadata_row_fields(
-                                        selection_meta,
-                                        cap_source=str(selected_examples_cap_source),
-                                        context_sample_count=_context_sample_cap(cli_args),
-                                    )
-                                    for context_row in context_rows:
-                                        context_row.update(context_selection_fields)
-                                    missing_embedding_t0s = [
-                                        int(context_row["target_t"])
-                                        for context_row in context_rows
-                                        if str(context_row.get("context_embedding_id", "") or "").strip()
-                                        and str(context_row.get("context_embedding_id", "") or "").strip()
-                                        not in row_recorder["context_embeddings"]
-                                    ]
-                                    embeddings_by_t0 = (
-                                        _extract_conditional_context_embeddings(
-                                            model=model,
-                                            ds=eval_ds,
-                                            chosen_t0s=missing_embedding_t0s,
-                                            device=device,
-                                            context_embedding_kind=str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
-                                            batch_size=_context_embedding_export_batch_size(cfg),
-                                        )
-                                        if missing_embedding_t0s
-                                        else {}
-                                    )
-                                    context_embeddings: Dict[str, List[float]] = {}
-                                    for context_row in context_rows:
-                                        t0 = int(context_row["target_t"])
-                                        embedding_id = str(context_row.get("context_embedding_id", "") or "").strip()
-                                        if embedding_id and t0 in embeddings_by_t0:
-                                            context_embeddings[embedding_id] = list(embeddings_by_t0[t0])
-                                    _append_context_records(
-                                        row_recorder,
-                                        context_rows,
-                                        context_embeddings=context_embeddings,
-                                        metadata=context_metadata,
-                                    )
+                                context_rows = _conditional_context_records(
+                                    benchmark_family=CONDITIONAL_GENERATION_FAMILY,
+                                    dataset=str(dataset),
+                                    split_phase=str(split_phase),
+                                    seed=int(seed),
+                                    evaluation_seed=int(metrics_seed),
+                                    solver_key=str(solver_key),
+                                    target_nfe=int(target_nfe),
+                                    runtime_nfe=int(runtime_nfe),
+                                    scheduler_key=scheduler_key,
+                                    details=details,
+                                    checkpoint=checkpoint,
+                                    checkpoint_step=int(checkpoint_step),
+                                    nfe_role=nfe_role,
+                                    parent_row_signature=str(case["row_signature"]),
+                                    protocol_hash=str(row_recorder["protocol_hash"]),
+                                    cfg=cfg,
+                                    eval_horizon=int(eval_horizon),
+                                    chosen_t0s=[int(x) for x in chosen_eval_t0s.tolist()],
+                                    score_main=row.get("score_main"),
+                                    uniform_score_main=uniform_score,
+                                    per_window_metrics_by_t0=per_window_metrics_by_t0,
+                                    uniform_per_window_metrics_by_t0=(
+                                        per_window_metrics_by_t0
+                                        if scheduler_key == UNIFORM_SCHEDULER_KEY
+                                        else cell_uniform_per_window_metrics_by_t0
+                                    ),
+                                    metric_row=row,
+                                    uniform_metric_row=row if scheduler_key == UNIFORM_SCHEDULER_KEY else cell_uniform_metrics,
+                                    evaluation_protocol_hash=str(row.get("evaluation_protocol_hash", "")),
+                                    chosen_t0s_hash=str(row.get("chosen_t0s_hash", "")),
+                                    train_tuning_context_metadata=(
+                                        {
+                                            "train_tuning_fraction": float(cli_args.eval_train_fraction),
+                                            "train_tuning_seed": int(selection_seed),
+                                            "train_tuning_strata": int(cli_args.train_tuning_strata),
+                                            "train_tuning_sampler": train_tuning_sampler_key(TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION),
+                                        }
+                                        if str(split_phase) == TRAIN_TUNING_PHASE
+                                        else None
+                                    ),
+                                )
+                                context_embeddings: Dict[str, List[float]] = {}
+                                for context_row in context_rows:
+                                    t0 = int(context_row["target_t"])
+                                    if t0 in conditional_embeddings_by_t0:
+                                        context_embeddings[str(context_row["context_embedding_id"])] = list(conditional_embeddings_by_t0[t0])
+                                _append_context_records(
+                                    row_recorder,
+                                    context_rows,
+                                    context_embeddings=context_embeddings,
+                                    metadata={
+                                        "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
+                                        "checkpoint_id": str(checkpoint["checkpoint_id"]),
+                                        "checkpoint_step": int(checkpoint_step),
+                                        "dataset": str(dataset),
+                                        "split_phase": str(split_phase),
+                                        "context_schema": "conditional_generation_window",
+                                        "context_embedding_protocol": FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+                                        "history_len": int(getattr(cfg, "history_len", 0)),
+                                        "horizon": int(eval_horizon),
+                                    },
+                                )
                             rows.append(row)
                             if scheduler_key == UNIFORM_SCHEDULER_KEY:
                                 cell_uniform_metrics = row
@@ -3611,7 +3052,7 @@ def _run_molecule_phase(
     if not manifest_path.exists():
         raise FileNotFoundError(f"Molecule schedule evaluation requires backbone manifest: {manifest_path}")
     backbone_manifest = load_backbone_manifest(manifest_path)
-    group_root = resolve_project_path(str(getattr(cli_args, "molecule_group_root", molecule_group_root())))
+    group_root = resolve_project_path(str(getattr(cli_args, "molecule_group_root", default_molecule_group_root())))
     device = resolve_torch_device(str(cli_args.device))
     rows: List[Dict[str, Any]] = []
     datasets = parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", "")))
@@ -3678,10 +3119,7 @@ def _run_molecule_phase(
                         uncapped_candidate_examples = int(target_examples)
                     else:
                         selection_seed = int(seed) + 10_000 * dataset_idx + 1_000 * member_idx
-                        if str(split_phase) == LOCKED_TEST_PHASE or selected_examples_cap is None:
-                            eval_count = int(len(ds))
-                        else:
-                            eval_count = int(selected_examples_cap)
+                        eval_count = int(selected_examples_cap) if selected_examples_cap is not None else int(len(ds))
                         candidate_indices = _choose_molecule_indices(
                             ds,
                             count=int(eval_count),
@@ -3714,20 +3152,12 @@ def _run_molecule_phase(
                             "seed": int(seed),
                         }
                     )
-            if str(split_phase) == LOCKED_TEST_PHASE:
-                selected_groups, selection_records, _global_selection_meta = _select_locked_test_context_groups(
-                    selection_groups,
-                    context_limit=selected_examples_cap,
-                    seed=10_000 * int(dataset_idx) + int(checkpoint_step),
-                    salt=f"molecule|{dataset}|{split_phase}|{checkpoint_step}",
-                )
-            else:
-                selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
-                    selection_groups,
-                    cap=_selection_cap_for_groups(selection_groups, selected_examples_cap),
-                    seed=10_000 * int(dataset_idx) + int(checkpoint_step),
-                    salt=f"molecule|{dataset}|{split_phase}|{checkpoint_step}",
-                )
+            selected_groups, selection_records, _global_selection_meta = _cap_context_index_groups(
+                selection_groups,
+                cap=_selection_cap_for_groups(selection_groups, selected_examples_cap),
+                seed=10_000 * int(dataset_idx) + int(checkpoint_step),
+                salt=f"molecule|{dataset}|{split_phase}|{checkpoint_step}",
+            )
             for selected_indices, selection_meta, work_item in zip(selected_groups, selection_records, work_items):
                 indices = [int(idx) for idx in selected_indices.tolist()]
                 if not indices:
@@ -3741,10 +3171,23 @@ def _run_molecule_phase(
                 ds = work_item["ds"]
                 checkpoint = work_item["checkpoint"]
                 seed = int(work_item["seed"])
-                molecule_context_embeddings: Dict[str, List[float]] | None = None
+                if _write_context_rows_enabled(cli_args):
+                    context_embeddings = molecule_context_embeddings_for_indices(
+                        model=model,
+                        ds=ds,
+                        example_indices=indices,
+                        checkpoint_id=str(checkpoint["checkpoint_id"]),
+                        dataset_key=str(dataset),
+                        member_key=member_key,
+                        stratum=stratum,
+                        split_phase=str(split_phase),
+                        device=device,
+                    )
+                else:
+                    context_embeddings = {}
                 for target_idx, target_nfe in enumerate(target_nfes):
                     for solver_idx, solver_key in enumerate(normalize_solver_keys(str(cli_args.solver_names))):
-                        macro_steps = solver_macro_steps(str(solver_key), int(target_nfe))
+                        runtime_nfe = solver_macro_steps(str(solver_key), int(target_nfe))
                         existing_rows, pending_cases = _pending_scheduler_cases(
                             row_recorder,
                             benchmark_family=SCENARIO_FAMILY_MOLECULE,
@@ -3769,7 +3212,7 @@ def _run_molecule_phase(
                         )
                         for case in pending_cases:
                             scheduler_key = str(case["scheduler_key"])
-                            details = _schedule_details_from_case(case, int(macro_steps))
+                            details = _schedule_details_from_case(case, int(runtime_nfe))
                             eval_seed = int(seed) + 1_000_000 * dataset_idx + 100_000 * member_idx + 10_000 * target_idx + solver_idx
                             metrics = evaluate_molecule_rollout_schedule(
                                 model=model,
@@ -3778,7 +3221,7 @@ def _run_molecule_phase(
                                 scheduler_key=scheduler_key,
                                 solver_key=str(solver_key),
                                 target_nfe=int(target_nfe),
-                                macro_steps=int(macro_steps),
+                                runtime_nfe=int(runtime_nfe),
                                 time_grid=details["time_grid"],
                                 example_indices=indices,
                                 sample_count=int(getattr(cli_args, "molecule_sample_count", 1)),
@@ -3811,7 +3254,7 @@ def _run_molecule_phase(
                                     "eval_windows": int(metrics.get("eval_windows", len(indices))),
                                     "eval_examples": int(metrics.get("eval_windows", len(indices))),
                                     "eval_horizon": int(getattr(cli_args, "molecule_rollout_steps", 16)),
-                                    "realized_nfe": int(metrics.get("realized_nfe", _realized_nfe_for_solver(str(solver_key), int(macro_steps)))),
+                                    "realized_nfe": int(metrics.get("realized_nfe", _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)))),
                                 }
                             )
                             row = _build_row(
@@ -3823,16 +3266,9 @@ def _run_molecule_phase(
                                 checkpoint_step=int(checkpoint_step),
                                 nfe_role=nfe_role,
                                 target_nfe=int(target_nfe),
-                                macro_steps=int(macro_steps),
+                                runtime_nfe=int(runtime_nfe),
                                 solver_key=str(solver_key),
                                 scheduler_key=scheduler_key,
-                                context_embedding_kind=str(
-                                    getattr(
-                                        cli_args,
-                                        "context_embedding_kind",
-                                        "ctx_summary",
-                                    )
-                                ),
                                 details=details,
                                 metrics=row_metrics,
                                 row_signature=str(case["row_signature"]),
@@ -3869,19 +3305,6 @@ def _run_molecule_phase(
                                     for ctx in list(metrics.get("per_context_rows", []) or [])
                                 }
                             if _write_context_rows_enabled(cli_args):
-                                if molecule_context_embeddings is None:
-                                    molecule_context_embeddings = molecule_context_embeddings_for_indices(
-                                        model=model,
-                                        ds=ds,
-                                        example_indices=indices,
-                                        checkpoint_id=str(checkpoint["checkpoint_id"]),
-                                        dataset_key=str(dataset),
-                                        member_key=member_key,
-                                        stratum=stratum,
-                                        split_phase=str(split_phase),
-                                        device=device,
-                                        context_embedding_kind=str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
-                                    )
                                 context_rows = _molecule_context_records(
                                     dataset=str(dataset),
                                     split_phase=str(split_phase),
@@ -3889,7 +3312,7 @@ def _run_molecule_phase(
                                     evaluation_seed=int(eval_seed),
                                     solver_key=str(solver_key),
                                     target_nfe=int(target_nfe),
-                                    macro_steps=int(macro_steps),
+                                    runtime_nfe=int(runtime_nfe),
                                     scheduler_key=scheduler_key,
                                     details=details,
                                     checkpoint=checkpoint,
@@ -3914,25 +3337,18 @@ def _run_molecule_phase(
                                         else None
                                     ),
                                 )
-                                context_selection_fields = _selection_metadata_row_fields(
-                                    selection_meta,
-                                    cap_source=str(selected_examples_cap_source),
-                                    context_sample_count=_context_sample_cap(cli_args),
-                                )
-                                for context_row in context_rows:
-                                    context_row.update(context_selection_fields)
                                 _append_context_records(
                                     row_recorder,
                                     context_rows,
-                                    context_embeddings=molecule_context_embeddings,
+                                    context_embeddings=context_embeddings,
                                     metadata={
                                         "benchmark_family": SCENARIO_FAMILY_MOLECULE,
                                         "checkpoint_id": str(checkpoint["checkpoint_id"]),
                                         "checkpoint_step": int(checkpoint_step),
-                                        "scenario_key": str(dataset),
+                                        "dataset": str(dataset),
                                         "split_phase": str(split_phase),
                                         "context_schema": MOLECULE_CONTEXT_SCHEMA,
-                                        "context_embedding_kind": str(getattr(cli_args, "context_embedding_kind", "ctx_summary")),
+                                        "context_embedding_protocol": FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
                                         "member_key": member_key,
                                         "stratum": stratum,
                                     },
@@ -3960,7 +3376,7 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
     for row in rows:
         key = (
             row.get("benchmark_family"),
-            row.get("scenario_key"),
+            row.get("scenario_key", row.get("dataset")),
             row.get("nfe_role"),
             row.get("checkpoint_step"),
             row.get("target_nfe"),
@@ -4004,18 +3420,18 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
         family, dataset, nfe_role, checkpoint_step, target_nfe, solver_key, scheduler_key, budget = key
         summary: Dict[str, Any] = {
             "benchmark_family": family,
-            "experiment_layout": EXPERIMENT_LAYOUT_ID,
+            "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
             "scenario_key": dataset,
             "scenario_family": family,
-            "method_key": METHOD_KEY,
             "nfe_role": nfe_role,
             "checkpoint_step": int(checkpoint_step),
             "checkpoint_maturity_label": _checkpoint_maturity_label(int(checkpoint_step)),
             "checkpoint_maturity_index": _checkpoint_maturity_index(int(checkpoint_step)),
+            "dataset": dataset,
             "target_nfe": int(target_nfe),
             "solver_key": solver_key,
             "scheduler_key": scheduler_key,
-            "scheduler_name": schedule_display_name(str(scheduler_key)),
+            "schedule_name": schedule_display_name(str(scheduler_key)),
             "schedule_family": schedule_family_for_key(str(scheduler_key)),
             "density_source_key": density_source_key_for_schedule(str(scheduler_key)),
             "train_budget_label": budget,
@@ -4048,17 +3464,15 @@ def _aggregate_main_table(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "method_key": METHOD_KEY,
         "row_count": int(len(rows)),
         "summary_row_count": int(len(augmented)),
-        "scheduler_keys": sorted({str(row.get("scheduler_key")) for row in rows}),
-        "baseline_scheduler_keys": list(BASELINE_SCHEDULE_KEYS),
-        "experimental_fixed_scheduler_keys": list(EXPERIMENTAL_FIXED_SCHEDULE_KEYS),
+        "schedule_keys": sorted({str(row.get("scheduler_key")) for row in rows}),
+        "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
+        "experimental_fixed_schedule_keys": list(EXPERIMENTAL_FIXED_SCHEDULE_KEYS),
         "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS),
         "seed_summaries": augmented,
     }
 
 
 def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
-    locked_test_settings = _locked_test_selection_settings(cli_args, str(cli_args.split_phase))
-    _, selected_examples_cap_source = _split_example_cap(cli_args, str(cli_args.split_phase))
     schedules = _parse_schedule_names(str(cli_args.baseline_scheduler_names))
     summary_schedules = _parse_summary_schedule_names(str(getattr(cli_args, "summary_scheduler_names", "")))
     solvers = list(normalize_solver_keys(str(cli_args.solver_names)))
@@ -4076,13 +3490,13 @@ def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
     return {
         "runner_mode": "diffusion_flow_time_reparameterization",
         "runner_signature": RUNNER_SIGNATURE_VERSION,
-        "experiment_layout": EXPERIMENT_LAYOUT_ID,
+        "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
         "method_key": METHOD_KEY,
-        "baseline_scheduler_keys": list(BASELINE_SCHEDULE_KEYS),
-        "experimental_fixed_scheduler_keys": list(EXPERIMENTAL_FIXED_SCHEDULE_KEYS),
+        "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
+        "experimental_fixed_schedule_keys": list(EXPERIMENTAL_FIXED_SCHEDULE_KEYS),
         "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS),
-        "evaluated_scheduler_keys": schedules,
-        "summary_scheduler_keys": summary_schedules,
+        "scheduled_evaluation_keys": schedules,
+        "summary_schedule_keys": summary_schedules,
         "solver_names": solvers,
         "nfe_role": str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN)),
         "target_nfe_values": nfes,
@@ -4093,12 +3507,6 @@ def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
         ),
         "molecule_datasets": list(parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", "")))),
         "split_phase": str(cli_args.split_phase),
-        "locked_test_mode": str(locked_test_settings["mode"]),
-        "locked_test_context_limit": locked_test_settings["context_limit"],
-        "locked_test_context_limit_scope": str(locked_test_settings["context_limit_scope"]),
-        "selected_examples_cap_source": str(selected_examples_cap_source),
-        "selection_was_capped": False,
-        "global_selection_was_capped": False,
         "backbone_manifest": manifest_summary,
         "allow_execute": bool(getattr(cli_args, "allow_execute", False)),
     }
@@ -4106,29 +3514,31 @@ def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
 
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Run diffusion-flow time reparameterization fixed-schedule evaluations.")
-    ap.add_argument("--out_root", type=str, default=str(SCHEDULE_OUTPUT_ROOT))
-    ap.add_argument("--dataset_root", type=str, default=str(project_dataset_root()))
+    ap.add_argument("--out_root", type=str, default=str(DEFAULT_OUT_ROOT))
+    ap.add_argument("--dataset_root", type=str, default=str(project_paper_dataset_root()))
     ap.add_argument("--shared_backbone_root", type=str, default=str(DEFAULT_SHARED_BACKBONE_ROOT))
-    ap.add_argument("--backbone_manifest", type=str, default=str(backbone_manifest_path()))
-    ap.add_argument("--checkpoint_steps", type=str, default=",".join(str(x) for x in REFERENCE_CHECKPOINT_STEPS))
-    ap.add_argument("--forecast_datasets", type=str, default=",".join(REFERENCE_FORECAST_DATASETS))
+    ap.add_argument("--backbone_manifest", type=str, default=str(default_backbone_manifest_path()))
+    ap.add_argument("--checkpoint_steps", type=str, default=",".join(str(x) for x in CANONICAL_CHECKPOINT_STEPS))
+    ap.add_argument("--otflow_train_steps", type=int, default=0)
+    ap.add_argument("--steps", type=int, default=0)
+    ap.add_argument("--forecast_datasets", type=str, default=",".join(DEFAULT_FORECAST_DATASETS))
     ap.add_argument(
         "--conditional_generation_datasets",
         type=str,
-        default=",".join(REFERENCE_CONDITIONAL_GENERATION_DATASETS),
+        default=",".join(DEFAULT_CONDITIONAL_GENERATION_DATASETS),
     )
     ap.add_argument("--molecule_datasets", type=str, default="")
-    ap.add_argument("--molecule_group_root", type=str, default=str(molecule_group_root()))
+    ap.add_argument("--molecule_group_root", type=str, default=str(default_molecule_group_root()))
     ap.add_argument("--cryptos_path", type=str, default="")
     ap.add_argument("--lobster_synthetic_profile_path", type=str, default="")
     ap.add_argument("--long_term_st_path", type=str, default="")
-    ap.add_argument("--solver_names", type=str, default=",".join(SUPPORTED_SOLVER_KEYS))
+    ap.add_argument("--solver_names", type=str, default=",".join(ALL_SOLVER_ORDER))
     ap.add_argument("--nfe_role", type=str, choices=NFE_ROLES, default=NFE_ROLE_SEEN)
     ap.add_argument("--target_nfe_values", type=str, default="")
-    ap.add_argument("--baseline_scheduler_names", type=str, default=",".join(BASELINE_SCHEDULE_KEYS))
+    ap.add_argument("--baseline_scheduler_names", type=str, default=",".join(DEFAULT_SCHEDULES))
     ap.add_argument("--schedule_summary_json", type=str, default="")
     ap.add_argument("--summary_scheduler_names", type=str, default="")
-    ap.add_argument("--seeds", type=str, default=",".join(str(x) for x in REFERENCE_EVALUATION_SEEDS))
+    ap.add_argument("--seeds", type=str, default=",".join(str(x) for x in DEFAULT_SEEDS))
     ap.add_argument("--split_phase", type=str, choices=SUPPORTED_SPLIT_PHASES, default=LOCKED_TEST_PHASE)
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--dataset_seed", type=int, default=0)
@@ -4141,15 +3551,16 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--context_row_csv_name", type=str, default="context_rows.csv")
     ap.add_argument("--context_embeddings_npz_name", type=str, default="context_embeddings.npz")
     ap.add_argument(
+        "--train_tuning_context_sample_count",
         "--context_sample_count",
+        dest="context_sample_count",
         type=int,
-        default=TRAIN_TUNING_CONTEXT_SAMPLE_COUNT,
-        help=(
-            "Train-tuning context budget for GIPO supervision rows. Validation uses --eval_windows_val; "
-            "locked test evaluates the full split unless --locked_test_preview is enabled."
-        ),
+        default=CANONICAL_CONTEXT_SAMPLE_COUNT,
+        help="Train-tuning context budget for GICO supervision rows; validation/locked-test use eval-window options.",
     )
-    ap.add_argument("--context_embedding_kind", type=str, choices=("ctx_summary", "summary"), default="ctx_summary")
+    ap.add_argument("--write_forecast_context_rows", action="store_true", default=False)
+    ap.add_argument("--forecast_context_row_csv_name", type=str, default="")
+    ap.add_argument("--forecast_context_embeddings_npz_name", type=str, default="")
     ap.add_argument("--calibration_trace_samples", type=int, default=1)
     ap.add_argument("--eval_horizon", type=int, default=0)
     ap.add_argument("--eval_train_fraction", type=float, default=0.20)
@@ -4159,26 +3570,16 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--train_tuning_train_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION)
     ap.add_argument("--train_tuning_val_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION)
     ap.add_argument("--eval_windows_val", type=int, default=0)
-    ap.add_argument(
-        "--locked_test_preview",
-        action="store_true",
-        default=False,
-        help=(
-            "Evaluate a deterministic per-seed subset of locked-test contexts. "
-            f"When enabled without an explicit context count, the preview limit is {LOCKED_TEST_PREVIEW_CONTEXTS}."
-        ),
-    )
-    ap.add_argument(
-        "--locked_test_preview_contexts",
-        type=int,
-        default=None,
-        help=(
-            "Per-seed context limit for --locked_test_preview. The option is invalid unless preview mode is enabled. "
-            f"Omitting the count while enabling preview uses {LOCKED_TEST_PREVIEW_CONTEXTS}."
-        ),
-    )
+    ap.add_argument("--eval_windows_test", type=int, default=0)
+    ap.add_argument("--sigma_eps", type=float, default=1e-6)
+    ap.add_argument("--hidden_dim", type=int, default=160)
+    ap.add_argument("--fu_net_layers", type=int, default=3)
+    ap.add_argument("--fu_net_heads", type=int, default=4)
     ap.add_argument("--rollout_mode", type=str, default="non_ar")
     ap.add_argument("--future_block_len", type=int, default=0)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--row_jsonl_name", type=str, default="rows.jsonl")
     ap.add_argument("--row_csv_name", type=str, default="rows.csv")
     ap.add_argument("--resume", action="store_true", default=True)
@@ -4191,17 +3592,12 @@ def build_argparser() -> argparse.ArgumentParser:
 def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> Dict[str, Any]:
     out_root = resolve_project_path(str(cli_args.out_root))
     out_root.mkdir(parents=True, exist_ok=True)
-    _resolve_recorder_artifact_paths(out_root, cli_args)
+    artifact_paths = _resolve_recorder_artifact_paths(out_root, cli_args)
     prep_payload = _prep_summary(cli_args)
     if bool(getattr(cli_args, "diagnose_locked_forecast_only", False)):
         rows = list(
             _load_rows(
-                _runner_output_path(
-                    out_root,
-                    getattr(cli_args, "row_jsonl_name", "rows.jsonl"),
-                    default="rows.jsonl",
-                    label="row JSONL name",
-                ),
+                artifact_paths["jsonl"],
                 protocol_hash=_protocol_config_fingerprint(cli_args),
             ).values()
         )
@@ -4287,29 +3683,7 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
         for row in _candidate_rows_by_phase(list(row_recorder["rows_by_key"].values()), active_split_phase)
         if int(row.get("seed", -1)) in selected_seed_set
     ]
-    summary_selection_provenance: Dict[str, Any] = {}
-    if active_split_phase == LOCKED_TEST_PHASE:
-        locked_settings = _locked_test_selection_settings(cli_args, active_split_phase)
-        _, configured_cap_source = _split_example_cap(cli_args, active_split_phase)
-        cap_sources = {
-            str(row.get("selected_examples_cap_source", "") or "").strip()
-            for row in phase_rows
-            if str(row.get("selected_examples_cap_source", "") or "").strip()
-        }
-        if len(cap_sources) > 1:
-            raise ValueError(f"Locked-test rows contain conflicting cap sources: {sorted(cap_sources)}.")
-        summary_selection_provenance = {
-            "locked_test_mode": str(locked_settings["mode"]),
-            "locked_test_context_limit": locked_settings["context_limit"],
-            "locked_test_context_limit_scope": str(locked_settings["context_limit_scope"]),
-            "selected_examples_cap_source": next(iter(cap_sources), str(configured_cap_source)),
-            "selection_was_capped": any(_bool_value(row.get("selection_was_capped", False)) for row in phase_rows),
-            "global_selection_was_capped": any(
-                _bool_value(row.get("global_selection_was_capped", False)) for row in phase_rows
-            ),
-        }
     main_table_summary = _aggregate_main_table(phase_rows)
-    main_table_summary.update(summary_selection_provenance)
     seed_summaries = main_table_summary.pop("seed_summaries")
     seed_summary_payload = {"split_phase": active_split_phase, "seed_summaries": seed_summaries}
     seed_summary_key = f"{active_split_phase}_seed_summary"
@@ -4317,26 +3691,20 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
     save_json(dict(main_table_summary), str(out_root / "main_table_summary.json"))
     schedule_selection = {
         "method_key": METHOD_KEY,
-        "experiment_layout": EXPERIMENT_LAYOUT_ID,
+        "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
         "nfe_role": str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN)),
         "target_nfe_values": _target_nfe_values_for_args(cli_args),
         "checkpoint_steps": _checkpoint_steps_for_args(cli_args),
-        "baseline_scheduler_keys": list(BASELINE_SCHEDULE_KEYS),
-        "experimental_fixed_scheduler_keys": list(EXPERIMENTAL_FIXED_SCHEDULE_KEYS),
+        "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
+        "experimental_fixed_schedule_keys": list(EXPERIMENTAL_FIXED_SCHEDULE_KEYS),
         "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS),
-        "evaluated_scheduler_keys": _parse_schedule_names(str(cli_args.baseline_scheduler_names))
+        "scheduled_evaluation_keys": _parse_schedule_names(str(cli_args.baseline_scheduler_names))
         + _parse_summary_schedule_names(str(getattr(cli_args, "summary_scheduler_names", ""))),
-        "fixed_scheduler_keys": _parse_schedule_names(str(cli_args.baseline_scheduler_names)),
-        "summary_scheduler_keys": _parse_summary_schedule_names(str(getattr(cli_args, "summary_scheduler_names", ""))),
+        "fixed_schedule_keys": _parse_schedule_names(str(cli_args.baseline_scheduler_names)),
+        "summary_schedule_keys": _parse_summary_schedule_names(str(getattr(cli_args, "summary_scheduler_names", ""))),
     }
     save_json(dict(schedule_selection), str(out_root / "schedule_selection_summary.json"))
-    combined = {
-        "prep": dict(prep_payload),
-        "schedule_selection_summary": dict(schedule_selection),
-        seed_summary_key: dict(seed_summary_payload),
-        "main_table_summary": dict(main_table_summary),
-        **summary_selection_provenance,
-    }
+    combined = {"prep": dict(prep_payload), "schedule_selection_summary": dict(schedule_selection), seed_summary_key: dict(seed_summary_payload), "main_table_summary": dict(main_table_summary)}
     save_json(dict(combined), str(out_root / "combined_summary.json"))
     return combined
 

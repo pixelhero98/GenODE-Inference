@@ -9,11 +9,8 @@ from zipfile import ZipFile
 
 import torch
 
-from genode.data.experiment_common import (
-    DATASET_PLANS,
-    OTFLOW_REFERENCE_BACKBONE_PRESETS,
-    OTFLOW_REFERENCE_DATASET_CHOICES,
-)
+from genode.data import experiment_common, otflow_datasets
+from genode.data.experiment_common import DATASET_PLANS, OTFLOW_PAPER_BACKBONE_PRESETS, OTFLOW_PAPER_DATASET_CHOICES
 from genode.data.molecule_xyz import (
     MOLECULE_GROUP_DATASET_KEYS,
     build_balanced_molecule_stratum_groups,
@@ -27,8 +24,8 @@ from genode.data.otflow_datasets import (
     validate_lobster_synth_profile,
 )
 from genode.data.otflow_experiment_plan import (
-    conditional_generation_dataset_keys,
-    forecast_dataset_keys,
+    canonical_conditional_generation_paper_dataset_keys,
+    canonical_forecast_paper_dataset_keys,
     experiment_plan_by_key,
 )
 from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
@@ -93,10 +90,29 @@ def _write_xyz_zip(path: Path, entries: dict[str, tuple[int, int]], *, frames: i
 
 
 class NineDatasetMatrixTests(unittest.TestCase):
-    def test_exact_reference_dataset_lists_and_retired_parser_rejection(self) -> None:
-        self.assertEqual(forecast_dataset_keys(), ("solar_energy_10m", "traffic_hourly", "weather_daily"))
-        self.assertEqual(conditional_generation_dataset_keys(), ("cryptos", "lobster_synthetic", "long_term_st"))
-        self.assertEqual(OTFLOW_REFERENCE_DATASET_CHOICES, ("cryptos", "lobster_synthetic", "long_term_st"))
+    def test_retired_l2_dataset_entry_points_are_removed(self) -> None:
+        self.assertFalse(hasattr(experiment_common, "DATASET_CHOICES"))
+        self.assertEqual(tuple(experiment_common.OTFLOW_QUALITY_PRESETS), OTFLOW_PAPER_DATASET_CHOICES)
+
+        for name in (
+            "DEFAULT_OPTIVER_NPZ",
+            "build_dataset_synthetic",
+            "build_dataset_splits_from_optiver",
+            "build_dataset_splits_synthetic",
+            "default_optiver_npz_path",
+        ):
+            self.assertFalse(hasattr(otflow_datasets, name))
+
+        self.assertTrue(callable(otflow_datasets.build_dataset_splits_from_npz_l2))
+        cfg = OTFlowConfig(device=torch.device("cpu"))
+        for retired_dataset in ("npz_l2", "optiver", "synthetic"):
+            with self.assertRaisesRegex(ValueError, f"Unknown dataset={retired_dataset}"):
+                experiment_common.build_dataset_splits(SimpleNamespace(dataset=retired_dataset), cfg)
+
+    def test_exact_canonical_dataset_lists_and_retired_parser_rejection(self) -> None:
+        self.assertEqual(canonical_forecast_paper_dataset_keys(), ("solar_energy_10m", "traffic_hourly", "weather_daily"))
+        self.assertEqual(canonical_conditional_generation_paper_dataset_keys(), ("cryptos", "lobster_synthetic", "long_term_st"))
+        self.assertEqual(OTFLOW_PAPER_DATASET_CHOICES, ("cryptos", "lobster_synthetic", "long_term_st"))
         self.assertEqual(monash_reference_dataset_keys(), ("solar_energy_10m", "traffic_hourly", "weather_daily"))
 
         for retired in ("san_francisco_traffic", "wind_farms_wo_missing", "london_smart_meters_wo_missing", "electricity"):
@@ -106,7 +122,7 @@ class NineDatasetMatrixTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Unknown conditional-generation datasets"):
                 parse_conditional_generation_datasets(retired)
 
-    def test_reference_temporal_context_horizon_table_is_locked(self) -> None:
+    def test_canonical_temporal_context_horizon_table_is_locked(self) -> None:
         expected = {
             "solar_energy_10m": (1008, 1008),
             "traffic_hourly": (336, 168),
@@ -121,25 +137,25 @@ class NineDatasetMatrixTests(unittest.TestCase):
             self.assertEqual((spec.history_len, spec.future_block_len), (history_len, future_block_len))
             self.assertEqual(spec.experiment_horizon, future_block_len)
 
-    def test_conditional_presets_and_plans_use_required_non_ar_horizons(self) -> None:
+    def test_conditional_presets_and_plans_use_canonical_non_ar_horizons(self) -> None:
         for dataset_key in ("cryptos", LOBSTER_SYNTHETIC_DATASET_KEY):
-            preset = OTFLOW_REFERENCE_BACKBONE_PRESETS[dataset_key]
+            preset = OTFLOW_PAPER_BACKBONE_PRESETS[dataset_key]
             self.assertEqual(preset["rollout_mode"], "non_ar")
             self.assertEqual(preset["future_block_len"], 128)
             self.assertEqual(preset["history_len"], 256)
             self.assertEqual(DATASET_PLANS[dataset_key].horizons, (128, 128, 128))
 
-    def test_strict_temporal_overrides_reject_nonreference_lengths_and_rollout(self) -> None:
+    def test_strict_temporal_overrides_reject_noncanonical_lengths_and_rollout(self) -> None:
         args = SimpleNamespace(eval_horizon=167, future_block_len=0, rollout_mode="non_ar")
-        with self.assertRaisesRegex(ValueError, "Non-reference --eval_horizon"):
+        with self.assertRaisesRegex(ValueError, "Non-canonical --eval_horizon"):
             eval_support.resolved_eval_horizon(args, "traffic_hourly")
 
         args = SimpleNamespace(eval_horizon=0, future_block_len=127, rollout_mode="non_ar")
-        with self.assertRaisesRegex(ValueError, "Non-reference --future_block_len"):
+        with self.assertRaisesRegex(ValueError, "Non-canonical --future_block_len"):
             eval_support.resolved_future_block_len(args, "cryptos")
 
         args = SimpleNamespace(eval_horizon=0, future_block_len=0, rollout_mode="autoregressive")
-        with self.assertRaisesRegex(ValueError, "Non-reference --rollout_mode"):
+        with self.assertRaisesRegex(ValueError, "Non-canonical --rollout_mode"):
             eval_support.resolved_rollout_mode(args, "weather_daily")
 
     def test_conditional_checkpoint_validation_rejects_ar_rollout_even_when_lengths_match(self) -> None:
@@ -224,7 +240,7 @@ class NineDatasetMatrixTests(unittest.TestCase):
             self.assertIn("t_global", meta)
 
     def test_long_term_st_is_active_conditional_generation(self) -> None:
-        self.assertIn(LONG_TERM_ST_DATASET_KEY, conditional_generation_dataset_keys())
+        self.assertIn(LONG_TERM_ST_DATASET_KEY, canonical_conditional_generation_paper_dataset_keys())
         self.assertEqual(parse_conditional_generation_datasets(LONG_TERM_ST_DATASET_KEY), [LONG_TERM_ST_DATASET_KEY])
 
     def test_molecule_group_discovery_balances_and_preserves_fixed_shape_strata(self) -> None:

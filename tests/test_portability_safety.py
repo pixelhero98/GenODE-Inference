@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import stat
 import sys
 import tempfile
 import types
@@ -15,6 +16,7 @@ from unittest import mock
 import numpy as np
 
 from genode.backbone_packages import _contains_local_marker, _validate_file_record
+from genode.benchmarks.image import artifact_paths as image_artifact_paths
 from genode.data import molecule_xyz, otflow_datasets, otflow_medical_datasets, otflow_monash_datasets
 from genode.evaluation import diffusion_flow_time_reparameterization as evaluation_runner
 from genode.path_safety import portable_relative_path, resolve_portable_relative_path
@@ -56,6 +58,41 @@ class PortablePathTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "escapes its declared root"):
                 resolve_portable_relative_path(root, "linked/file.npy")
+
+    def test_image_artifact_path_allows_trusted_symlinked_mount_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            storage = root / "storage"
+            storage.mkdir()
+            mount = root / "mount"
+            try:
+                mount.symlink_to(storage, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks are unavailable: {exc}")
+
+            target = image_artifact_paths.managed_image_leaf_directory(
+                mount / "policy",
+                label="image policy directory",
+            )
+
+            self.assertEqual(target, storage.resolve() / "policy")
+
+    def test_image_artifact_path_rejects_leaf_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            storage = root / "storage"
+            storage.mkdir()
+            target = root / "policy"
+            try:
+                target.symlink_to(storage, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks are unavailable: {exc}")
+
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                image_artifact_paths.managed_image_leaf_directory(
+                    target,
+                    label="image policy directory",
+                )
 
 
 class MoleculeManifestPathTests(unittest.TestCase):
@@ -184,6 +221,87 @@ class VerifiedDownloadTests(unittest.TestCase):
                 "weather_daily": (38_820_451, "57155594af0883ccd5e63a5948976796"),
             },
         )
+
+
+class SafeZipExtractionTests(unittest.TestCase):
+    def test_monash_zip_is_copied_member_by_member(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            archive_path = root / "dataset.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("nested/data.tsf", "@data\nseries:1,2,3\n")
+
+            destination = root / "source"
+            otflow_monash_datasets._extract_zip(archive_path, destination)
+
+            self.assertEqual(
+                (destination / "nested" / "data.tsf").read_text(encoding="utf-8"),
+                "@data\nseries:1,2,3\n",
+            )
+
+    def test_monash_zip_allows_trusted_symlinked_mount_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            storage = root / "storage"
+            storage.mkdir()
+            mount = root / "mount"
+            try:
+                mount.symlink_to(storage, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks are unavailable: {exc}")
+
+            archive_path = root / "dataset.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("nested/data.tsf", "@data\nseries:1,2,3\n")
+
+            destination = mount / "source"
+            otflow_monash_datasets._extract_zip(archive_path, destination)
+
+            self.assertEqual(
+                (storage / "source" / "nested" / "data.tsf").read_text(encoding="utf-8"),
+                "@data\nseries:1,2,3\n",
+            )
+
+    def test_monash_zip_rejects_destination_that_is_itself_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            archive_path = root / "dataset.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("nested/data.tsf", "@data\nseries:1,2,3\n")
+
+            storage = root / "storage"
+            storage.mkdir()
+            destination = root / "source"
+            try:
+                destination.symlink_to(storage, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks are unavailable: {exc}")
+
+            with self.assertRaisesRegex(ValueError, "destination may not be a symlink"):
+                otflow_monash_datasets._extract_zip(archive_path, destination)
+            self.assertEqual(list(storage.iterdir()), [])
+
+    def test_monash_zip_rejects_traversal_and_symbolic_links_before_copying(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for unsafe_name, symbolic_link in (("../outside.tsf", False), ("link.tsf", True)):
+                with self.subTest(unsafe_name=unsafe_name, symbolic_link=symbolic_link):
+                    archive_path = root / f"unsafe-{int(symbolic_link)}.zip"
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        archive.writestr("safe/data.tsf", "preserve")
+                        if symbolic_link:
+                            info = zipfile.ZipInfo(unsafe_name)
+                            info.create_system = 3
+                            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                            archive.writestr(info, "safe/data.tsf")
+                        else:
+                            archive.writestr(unsafe_name, "escape")
+
+                    destination = root / f"source-{int(symbolic_link)}"
+                    with self.assertRaises(ValueError):
+                        otflow_monash_datasets._extract_zip(archive_path, destination)
+                    self.assertFalse((root / "outside.tsf").exists())
+                    self.assertFalse((destination / "safe" / "data.tsf").exists())
 
 
 class MedicalChannelPathTests(unittest.TestCase):
@@ -344,6 +462,7 @@ class PackageAttestationTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertTrue(_contains_local_marker(value))
         self.assertFalse(_contains_local_marker("loaded packaged checkpoint successfully"))
+        self.assertFalse(_contains_local_marker("source https://github.com/example/project/blob/main/model.py"))
 
 
 class RunnerOutputPathTests(unittest.TestCase):

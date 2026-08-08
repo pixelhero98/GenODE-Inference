@@ -14,7 +14,6 @@ from genode.models.otflow_train_val import (
     crop_history_window,
     resolve_context_length,
 )
-from genode.solver_protocol import FlowDiagnostics, target_nfe_for_macro_steps, uniform_time_grid
 
 
 def _prediction_horizon(model) -> int:
@@ -29,31 +28,27 @@ def _sample_eval_trace(
     cond_t: Optional[torch.Tensor],
     steps: int,
     solver: str,
-    time_grid: Sequence[float],
     oracle_local_error: bool = False,
-) -> Tuple[torch.Tensor, FlowDiagnostics, int]:
+) -> Tuple[torch.Tensor, Dict[str, Any], int]:
     prediction_horizon = _prediction_horizon(model)
-    target_nfe = target_nfe_for_macro_steps(str(solver), int(steps))
-    if prediction_horizon > 1:
-        x_block, diagnostics = model.sample_future_with_diagnostics(
+    if prediction_horizon > 1 and hasattr(model, "sample_future_trace"):
+        x_block, trace = model.sample_future_trace(
             hist_t,
             cond=cond_t,
-            solver_key=solver,
-            target_nfe=target_nfe,
-            time_grid=time_grid,
-            include_local_error=oracle_local_error,
+            steps=int(steps),
+            solver=solver,
+            oracle_local_error=oracle_local_error,
         )
-        return x_block, diagnostics, int(x_block.shape[1])
+        return x_block, trace, int(x_block.shape[1])
 
-    x_next, diagnostics = model.sample_with_diagnostics(
+    x_next, trace = model.sample_trace(
         hist_t,
         cond=cond_t,
-        solver_key=solver,
-        target_nfe=target_nfe,
-        time_grid=time_grid,
-        include_local_error=oracle_local_error,
+        steps=int(steps),
+        solver=solver,
+        oracle_local_error=oracle_local_error,
     )
-    return x_next[:, None, :], diagnostics, 1
+    return x_next[:, None, :], trace, 1
 
 
 def _append_rollout_context_features(
@@ -115,7 +110,6 @@ def _collect_rollout_diagnostics(
     n_windows: int,
     seed: int,
     solver: str,
-    time_grid: Optional[Sequence[float]] = None,
     chosen_t0s: Optional[Sequence[int]] = None,
     generation_seed_base: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -126,17 +120,8 @@ def _collect_rollout_diagnostics(
     if chosen.ndim != 1 or chosen.size == 0:
         raise ValueError("chosen_t0s must be a non-empty 1D sequence of valid window starts.")
     seed_base = int(seed if generation_seed_base is None else generation_seed_base)
-    resolved_time_grid = (
-        uniform_time_grid(
-            str(solver),
-            target_nfe_for_macro_steps(str(solver), int(macro_steps)),
-        )
-        if time_grid is None
-        else tuple(float(value) for value in time_grid)
-    )
     field_eval_rows = []
     d_rows = []
-    residual_rows = []
     sample_total_evals = []
 
     for window_idx, t0 in enumerate(chosen.tolist()):
@@ -158,18 +143,16 @@ def _collect_rollout_diagnostics(
             cond_t = cond_seq[:, cursor, :] if cond_seq is not None else None
             call_seed = seed_base + int(window_idx) * int(horizon) + int(cursor)
             with _temporary_eval_seed(call_seed):
-                x_block, diagnostics, block_len = _sample_eval_trace(
+                x_block, trace, block_len = _sample_eval_trace(
                     model,
                     x_hist,
                     cond_t=cond_t,
                     steps=int(macro_steps),
                     solver=solver,
-                    time_grid=resolved_time_grid,
                 )
-            field_eval_rows.append(diagnostics.field_evals_by_step.cpu().numpy()[0])
-            d_rows.append(diagnostics.disagreement.cpu().numpy()[0])
-            residual_rows.append(diagnostics.residual_norm.cpu().numpy()[0])
-            sample_total_evals.append(float(diagnostics.mean_total_field_evals_per_rollout))
+            field_eval_rows.append(trace["field_evals_by_step"].cpu().numpy()[0])
+            d_rows.append(trace["disagreement"].cpu().numpy()[0])
+            sample_total_evals.append(float(trace["mean_total_field_evals_per_rollout"]))
             take = min(int(block_len), int(horizon) - int(cursor))
             hist_block = _append_rollout_context_features(
                 x_block[:, :take, :],
@@ -184,16 +167,19 @@ def _collect_rollout_diagnostics(
 
     field_evals = np.asarray(field_eval_rows, dtype=np.float32)
     d_vals = np.asarray(d_rows, dtype=np.float32)
-    residual_vals = np.asarray(residual_rows, dtype=np.float32)
+
     return {
         "n_rollout_calls": int(field_evals.shape[0]),
         "macro_steps": int(macro_steps),
         "field_evals_by_step": [float(x) for x in field_evals.mean(axis=0)],
         "disagreement_by_step": [float(x) for x in d_vals.mean(axis=0)],
-        "residual_norm_by_step": [float(x) for x in residual_vals.mean(axis=0)],
         "mean_field_evals_per_step": float(field_evals.mean()),
         "mean_total_field_evals_per_rollout": float(np.mean(sample_total_evals)),
     }
 
 
-__all__: list[str] = []
+__all__ = [
+    "_append_rollout_context_features",
+    "_collect_rollout_diagnostics",
+    "_sample_eval_trace",
+]

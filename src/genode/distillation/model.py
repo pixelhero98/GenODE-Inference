@@ -7,20 +7,22 @@ from typing import TYPE_CHECKING, Any, Dict, Mapping
 import torch
 import torch.nn as nn
 
-from genode.checkpoint_validation import validate_tensor_state_dict
-from genode.gipo.models import (
+from genode.checkpoint_validation import (
+    normalize_strict_solver_nfe_fields as normalize_solver_nfe_fields,
+    validate_tensor_state_dict,
+)
+from genode.gico.models import (
     SettingEncoderConfig,
-    setting_encoder_config_from_payload,
     setting_feature_dim,
     setting_features,
 )
+from genode.distillation.validation import setting_encoder_config_from_payload
 from genode.models.conditioning import ConditioningCache, ConditioningState
 from genode.models.config import OTFlowConfig
 from genode.models.modules import TransformerFUNet, build_mlp
-from genode.solver_protocol import normalize_solver_nfe_fields
 
 if TYPE_CHECKING:
-    from genode.distillation.gipo_policy import GIPOSchedulePolicy
+    from genode.distillation.gico_policy import GICOSchedulePolicy
 
 
 DEFAULT_DENSITY_DIM = 64
@@ -229,7 +231,7 @@ class FlowMapSampler:
         flow_map: EndpointFlowMap,
         *,
         setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig,
-        gipo_policy: "GIPOSchedulePolicy | None" = None,
+        gico_policy: "GICOSchedulePolicy | None" = None,
     ):
         conditioner = getattr(backbone_model, "backbone", backbone_model)
         if not hasattr(conditioner, "build_conditioning"):
@@ -237,7 +239,7 @@ class FlowMapSampler:
         self.conditioner = conditioner
         self.flow_map = flow_map
         self.setting_encoder_config = setting_encoder_config_from_payload(setting_encoder_config)
-        self.gipo_policy = gipo_policy
+        self.gico_policy = gico_policy
         expected_setting_dim = setting_feature_dim(
             self.setting_encoder_config.mode,
             config=self.setting_encoder_config,
@@ -246,23 +248,23 @@ class FlowMapSampler:
             raise ValueError(
                 "Flow-map setting dimension is incompatible with the supplied setting encoder."
             )
-        if self.gipo_policy is not None:
-            if int(self.gipo_policy.density_dim) != int(flow_map.density_dim):
-                raise ValueError("GIPO and flow-map density dimensions are incompatible.")
+        if self.gico_policy is not None:
+            if int(self.gico_policy.density_dim) != int(flow_map.density_dim):
+                raise ValueError("GICO and flow-map density dimensions are incompatible.")
             if (
-                self.gipo_policy.setting_encoder_config.to_payload()
+                self.gico_policy.setting_encoder_config.to_payload()
                 != self.setting_encoder_config.to_payload()
             ):
-                raise ValueError("GIPO and flow-map setting encoders are incompatible.")
+                raise ValueError("GICO and flow-map setting encoders are incompatible.")
         for module in (self.conditioner, self.flow_map):
             for parameter in module.parameters():
                 parameter.requires_grad_(False)
         self.conditioner.eval()
         self.flow_map.eval()
-        if self.gipo_policy is not None:
-            for parameter in self.gipo_policy.student.parameters():
+        if self.gico_policy is not None:
+            for parameter in self.gico_policy.student.parameters():
                 parameter.requires_grad_(False)
-            self.gipo_policy.student.eval()
+            self.gico_policy.student.eval()
 
     @torch.no_grad()
     def map_state(
@@ -321,12 +323,12 @@ class FlowMapSampler:
         )
         self.flow_map.eval()
         if density_mass is None:
-            if self.gipo_policy is None:
+            if self.gico_policy is None:
                 raise ValueError(
-                    "density_mass is required when the sampler has no bound GIPO policy."
+                    "density_mass is required when the sampler has no bound GICO policy."
                 )
-            schedule = self.gipo_policy.predict(
-                self.gipo_policy.context_embedding_from_cache(cache),
+            schedule = self.gico_policy.predict(
+                self.gico_policy.context_embedding_from_cache(cache),
                 solver_key=nfe.solver_key,
                 target_nfe=nfe.target_nfe,
             )

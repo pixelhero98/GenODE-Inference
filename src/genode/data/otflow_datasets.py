@@ -1,9 +1,18 @@
-"""Level-2 limit-order-book representations and reference dataset builders.
+"""otflow_datasets.py
 
-The module provides valid-by-construction L2 encoding, chronological train-only
-normalization, prepared crypto loading, and LOBSTER-calibrated synthetic data.
-Derived conditioning features include spread, returns, microprice deviation,
-multi-depth imbalance, best-size changes, and rolling volatility.
+Data + representation utilities for Level-2 (L2) limit order books.
+
+Contains:
+- L2FeatureMap: valid-by-construction encoding/decoding (raw L2 <-> unconstrained params)
+- Standardization helpers
+- WindowedParamSequenceDataset (history->target windows; optional future horizon for rollout)
+- Builders for prepared NPZ, crypto, and LOBSTER-calibrated synthetic sequences
+- Basic raw-space metrics
+- NEW: chronological split builders with train-only normalization (anti-leakage)
+
+Also includes derived microstructure conditioning features (cond) computed from the
+parameter sequence: spread, returns, abs returns, microprice deviation, multi-depth
+imbalance, Δbest sizes, rolling vol.
 """
 
 from __future__ import annotations
@@ -21,9 +30,12 @@ import numpy as np
 import torch
 
 from genode.models.config import OTFlowConfig
-from genode.data.otflow_paths import cryptos_data_path, lobster_synthetic_profile_path
+from genode.data.otflow_paths import default_lobster_synthetic_profile_path, project_data_root
+from genode.path_safety import is_link_or_reparse_point
 
+ArrayLike = Union[np.ndarray, torch.Tensor]
 DEFAULT_SYNTHETIC_LENGTH = 2_000_000
+DEFAULT_CRYPTOS_NPZ = str(project_data_root() / "cryptos_binance_spot_monthly_1s_l10.npz")
 LOBIFLOW_REVISION = "2d33cfd6b5e27d2483e2095b22d340813389cd0c"
 LOBIFLOW_CRYPTOS_NPZ_URL = (
     f"https://huggingface.co/datasets/mpstoryfans/lobiflow/resolve/{LOBIFLOW_REVISION}/"
@@ -31,6 +43,7 @@ LOBIFLOW_CRYPTOS_NPZ_URL = (
 )
 LOBIFLOW_CRYPTOS_NPZ_SIZE_BYTES = 1_962_160_259
 LOBIFLOW_CRYPTOS_NPZ_SHA256 = "124fff5767387373323fcb0ec17cc8b8030fe945d037909786127de6d3942e67"
+DEFAULT_LOBSTER_SYNTH_PROFILE = default_lobster_synthetic_profile_path()
 LOBSTER_SYNTHETIC_DATASET_KEY = "lobster_synthetic"
 LOBIFLOW_SYNTHETIC_PROFILE_URL = (
     f"https://huggingface.co/datasets/mpstoryfans/lobiflow/resolve/{LOBIFLOW_REVISION}/"
@@ -110,17 +123,9 @@ class L2FeatureMap:
         `delta_mid[t]` is interpreted as `mid[t] - mid[t-1]`. Therefore, `init_mid`
         should be the previous mid (at t-1 for the first decoded row).
         """
-        params = np.asarray(params)
-        if params.ndim != 2:
-            raise ValueError(f"Expected a two-dimensional parameter sequence, got shape={params.shape}.")
-        if not np.all(np.isfinite(params)):
-            raise FloatingPointError("Cannot decode a parameter sequence containing non-finite values.")
-        if not np.isfinite(float(init_mid)):
-            raise FloatingPointError(f"Cannot decode with non-finite init_mid={init_mid!r}.")
         T, D = params.shape
         L = self.L
-        if D != 4 * L:
-            raise ValueError(f"Expected D={4 * L}, got {D}.")
+        assert D == 4 * L, f"Expected D={4*L}, got {D}"
 
         delta_mid = params[:, 0]
         log_spread = params[:, 1]
@@ -135,15 +140,7 @@ class L2FeatureMap:
             prev_mid = prev_mid + float(delta_mid[t])
             mid[t] = prev_mid
 
-        try:
-            with np.errstate(over="raise", invalid="raise"):
-                spread = np.exp(log_spread)
-                ask_gaps = np.exp(log_ask_gaps)
-                bid_gaps = np.exp(log_bid_gaps)
-                ask_v = np.exp(log_ask_v).astype(np.float32)
-                bid_v = np.exp(log_bid_v).astype(np.float32)
-        except FloatingPointError as exc:
-            raise FloatingPointError("L2 parameter decoding overflowed or produced an invalid exponential.") from exc
+        spread = np.exp(log_spread)
         ask1 = mid + 0.5 * spread
         bid1 = mid - 0.5 * spread
 
@@ -152,14 +149,15 @@ class L2FeatureMap:
         ask_p[:, 0] = ask1
         bid_p[:, 0] = bid1
 
+        ask_gaps = np.exp(log_ask_gaps)
+        bid_gaps = np.exp(log_bid_gaps)
         for i in range(1, L):
             ask_p[:, i] = ask_p[:, i - 1] + ask_gaps[:, i - 1]
             bid_p[:, i] = bid_p[:, i - 1] - bid_gaps[:, i - 1]
 
-        decoded = (ask_p, ask_v, bid_p, bid_v)
-        if not all(np.all(np.isfinite(values)) for values in decoded):
-            raise FloatingPointError("L2 parameter decoding produced non-finite prices or volumes.")
-        return decoded
+        ask_v = np.exp(log_ask_v).astype(np.float32)
+        bid_v = np.exp(log_bid_v).astype(np.float32)
+        return ask_p, ask_v, bid_p, bid_v
 
 # -----------------------------
 # Standardization helpers
@@ -173,6 +171,16 @@ def fit_standardizer(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 def apply_standardizer(x: np.ndarray, mu: np.ndarray, sig: np.ndarray) -> np.ndarray:
     return ((x - mu[None, :]) / sig[None, :]).astype(np.float32)
+
+
+def standardize_params(params: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mu, sig = fit_standardizer(params)
+    return apply_standardizer(params, mu, sig), mu, sig
+
+
+def standardize_cond(cond: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mu, sig = fit_standardizer(cond)
+    return apply_standardizer(cond, mu, sig), mu, sig
 
 
 def _future_horizon_from_cfg(cfg: OTFlowConfig) -> int:
@@ -193,6 +201,10 @@ def _time_feature_mode(cfg: OTFlowConfig) -> str:
     if use_gap_only:
         return "gap_only"
     return "none"
+
+
+def _use_time_features_enabled(cfg: OTFlowConfig) -> bool:
+    return _time_feature_mode(cfg) != "none"
 
 
 def _time_feature_dim(mode: str) -> int:
@@ -442,7 +454,7 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
         valid_start_mask: Optional[np.ndarray] = None,
         dataset_kind: Optional[str] = None,
         dataset_metadata: Optional[Dict[str, object]] = None,
-        global_offset: int = 0,
+        global_offset: int = 0,  # NEW: maps local t -> original/global t
     ):
         super().__init__()
         self.params = params.astype(np.float32)
@@ -548,7 +560,7 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
 
         meta = {
             "t": int(t),  # local
-            "t_global": int(t_global),
+            "t_global": int(t_global),  # NEW
             "mid_prev": float(self.mids[t - 1]),
             "init_mid_for_window": float(self.mids[t - self.H]),
         }
@@ -587,11 +599,82 @@ def load_l2_npz(path: str) -> Dict[str, np.ndarray]:
       - ts : [T] timestamps
     """
     with np.load(path, allow_pickle=False) as data:
-        out = {key: data[key] for key in data.files}
+        out = {k: data[k] for k in data.files}
     for k in ("ask_p", "ask_v", "bid_p", "bid_v", "mids", "params_raw"):
         if k in out:
             out[k] = out[k].astype(np.float32)
     return out
+
+
+def _build_windowed_dataset(
+    params_raw: np.ndarray,
+    mids: np.ndarray,
+    cfg: OTFlowConfig,
+    stride: int,
+    *,
+    timestamps: Optional[np.ndarray] = None,
+) -> WindowedParamSequenceDataset:
+    """Build a windowed LOB dataset from one parameterized array bundle."""
+    # params
+    if cfg.standardize:
+        params, mu, sig = standardize_params(params_raw)
+    else:
+        params, mu, sig = params_raw.astype(np.float32), None, None
+
+    # cond features
+    cond = None
+    c_mu = c_sig = None
+    if cfg.use_cond_features:
+        cond_raw = build_cond_features(params_raw, mids, cfg)
+        if cfg.cond_standardize:
+            cond, c_mu, c_sig = standardize_cond(cond_raw)
+        else:
+            cond = cond_raw
+
+        _set_model_cond_dim(cfg, int(cond.shape[1]))
+
+    time_features = None
+    time_gap_scale = None
+    time_feature_source = "none"
+    time_feature_mode = _time_feature_mode(cfg)
+    if time_feature_mode != "none":
+        time_gap_scale = _fit_time_gap_scale(
+            None if timestamps is None else np.asarray(timestamps, dtype=np.int64),
+            train_end=len(params_raw),
+            segment_ends=None,
+        )
+        time_features = _build_time_features(
+            None if timestamps is None else np.asarray(timestamps, dtype=np.int64),
+            gap_scale=float(time_gap_scale),
+            segment_ends=None,
+            include_elapsed=bool(time_feature_mode == "gap_elapsed"),
+        )
+        if time_features is None:
+            time_features = np.zeros((len(params_raw), _time_feature_dim(time_feature_mode)), dtype=np.float32)
+            time_feature_source = "missing_timestamps_zero_fill"
+        else:
+            time_feature_source = "timestamps"
+
+    return WindowedParamSequenceDataset(
+        params=params,
+        mids=mids,
+        history_len=cfg.history_len,
+        stride=stride,
+        params_mean=mu,
+        params_std=sig,
+        future_horizon=_future_horizon_from_cfg(cfg),
+        cond=cond,
+        cond_mean=c_mu,
+        cond_std=c_sig,
+        time_features=time_features,
+        time_gap_scale=time_gap_scale,
+        time_feature_source=time_feature_source,
+        global_offset=0,
+    )
+
+
+def default_lobster_synth_profile_path() -> str:
+    return DEFAULT_LOBSTER_SYNTH_PROFILE
 
 
 def validate_lobster_synth_profile(profile: Dict[str, object], *, source: str = "") -> Dict[str, object]:
@@ -633,7 +716,7 @@ def validate_lobster_synth_profile(profile: Dict[str, object], *, source: str = 
 
 @lru_cache(maxsize=None)
 def load_lobster_synth_profile(path: Optional[str] = None) -> Dict[str, object]:
-    resolved = os.fspath(path or lobster_synthetic_profile_path())
+    resolved = path or default_lobster_synth_profile_path()
     with open(resolved, "r", encoding="utf-8") as f:
         profile = json.load(f)
     return validate_lobster_synth_profile(profile, source=str(resolved))
@@ -645,7 +728,7 @@ def download_lobster_synthetic_profile(
     url: str = LOBIFLOW_SYNTHETIC_PROFILE_URL,
     force: bool = False,
 ) -> Dict[str, object]:
-    resolved = os.fspath(path or lobster_synthetic_profile_path())
+    resolved = os.fspath(path or default_lobster_synth_profile_path())
     if force or not _verified_file(
         resolved,
         expected_size=LOBIFLOW_SYNTHETIC_PROFILE_SIZE_BYTES,
@@ -817,7 +900,7 @@ def _generate_synthetic_l2(
 
 
 # -----------------------------
-# Split-aware builders
+# Split-aware builders (NEW)
 # -----------------------------
 def _resolve_split_bounds(
     T: int,
@@ -1230,7 +1313,7 @@ def build_dataset_splits_from_arrays(
 
 
 
-def _build_dataset_splits_from_npz_l2(
+def build_dataset_splits_from_npz_l2(
     path: str,
     cfg: OTFlowConfig,
     *,
@@ -1278,6 +1361,10 @@ def _build_dataset_splits_from_npz_l2(
     )
 
 
+def default_cryptos_npz_path() -> str:
+    return DEFAULT_CRYPTOS_NPZ
+
+
 def _sha256_path(path: str | os.PathLike[str]) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -1294,7 +1381,8 @@ def _verified_file(
 ) -> bool:
     resolved = os.fspath(path)
     return (
-        os.path.isfile(resolved)
+        not is_link_or_reparse_point(resolved)
+        and os.path.isfile(resolved)
         and os.path.getsize(resolved) == int(expected_size)
         and _sha256_path(resolved) == str(expected_sha256).lower()
     )
@@ -1307,7 +1395,16 @@ def _download_url_to_path(
     expected_size: int,
     expected_sha256: str,
 ) -> str:
+    if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size <= 0:
+        raise ValueError(f"expected_size must be a positive integer, got {expected_size!r}.")
+    sha256 = str(expected_sha256).strip().lower()
+    if len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256):
+        raise ValueError(f"expected_sha256 must be a lowercase hexadecimal SHA-256 digest, got {expected_sha256!r}.")
     resolved = os.fspath(destination)
+    if is_link_or_reparse_point(resolved):
+        raise ValueError(f"Download destination may not be a symlink, junction, or reparse point: {resolved}.")
+    if os.path.exists(resolved) and not os.path.isfile(resolved):
+        raise ValueError(f"Download destination must be a regular file path: {resolved}.")
     destination_dir = os.path.dirname(os.path.abspath(resolved))
     os.makedirs(destination_dir, exist_ok=True)
     temporary = ""
@@ -1328,18 +1425,18 @@ def _download_url_to_path(
                     if not chunk:
                         break
                     total += len(chunk)
-                    if total > int(expected_size):
+                    if total > expected_size:
                         raise ValueError(
-                            f"Download from {url} exceeded the expected size of {int(expected_size)} bytes."
+                            f"Download from {url} exceeded the expected size of {expected_size} bytes."
                         )
                     digest.update(chunk)
                     out_fh.write(chunk)
-        if total != int(expected_size):
-            raise ValueError(f"Download from {url} has size {total}; expected {int(expected_size)} bytes.")
+        if total != expected_size:
+            raise ValueError(f"Download from {url} has size {total}; expected {expected_size} bytes.")
         observed_sha256 = digest.hexdigest()
-        if observed_sha256 != str(expected_sha256).lower():
+        if observed_sha256 != sha256:
             raise ValueError(
-                f"Download from {url} has SHA-256 {observed_sha256}; expected {str(expected_sha256).lower()}."
+                f"Download from {url} has SHA-256 {observed_sha256}; expected {sha256}."
             )
         os.replace(temporary, resolved)
         temporary = ""
@@ -1355,7 +1452,7 @@ def download_cryptos_npz(
     url: str = LOBIFLOW_CRYPTOS_NPZ_URL,
     force: bool = False,
 ) -> str:
-    resolved = os.fspath(path or cryptos_data_path())
+    resolved = os.fspath(path or default_cryptos_npz_path())
     if force or not _verified_file(
         resolved,
         expected_size=LOBIFLOW_CRYPTOS_NPZ_SIZE_BYTES,
@@ -1383,10 +1480,10 @@ def build_dataset_splits_from_cryptos(
     val_end: Optional[int] = None,
 ) -> Dict[str, object]:
     """Named dataset helper for the prepared Tardis crypto L2 archive."""
-    resolved_path = os.fspath(path or cryptos_data_path())
+    resolved_path = path or default_cryptos_npz_path()
     if not os.path.exists(resolved_path):
         download_cryptos_npz(resolved_path)
-    return _build_dataset_splits_from_npz_l2(
+    return build_dataset_splits_from_npz_l2(
         path=resolved_path,
         cfg=cfg,
         stride_train=stride_train,
@@ -1413,7 +1510,7 @@ def build_dataset_splits_from_lobster_synthetic(
     train_end: Optional[int] = None,
     val_end: Optional[int] = None,
 ) -> Dict[str, object]:
-    resolved_profile = os.fspath(profile_path or lobster_synthetic_profile_path())
+    resolved_profile = profile_path or default_lobster_synth_profile_path()
     if not os.path.exists(resolved_profile):
         download_lobster_synthetic_profile(resolved_profile)
     validate_lobster_synth_profile(load_lobster_synth_profile(resolved_profile), source=resolved_profile)
@@ -1470,22 +1567,28 @@ __all__ = [
     "WindowedParamSequenceDataset",
     "build_dataset_splits_from_arrays",
     "build_dataset_splits_from_lobster_synthetic",
+    "build_dataset_splits_from_npz_l2",
+    "default_cryptos_npz_path",
     "download_cryptos_npz",
+    "default_lobster_synth_profile_path",
+    "default_lobster_synthetic_profile_path",
     "download_lobster_synthetic_profile",
     "load_lobster_synth_profile",
     "validate_lobster_synth_profile",
+    "standardize_params",
+    "standardize_cond",
     "load_l2_npz",
     "fit_standardizer",
     "apply_standardizer",
     "build_cond_features",
     "compute_basic_l2_metrics",
     "DEFAULT_SYNTHETIC_LENGTH",
-    "LOBIFLOW_CRYPTOS_NPZ_SHA256",
-    "LOBIFLOW_CRYPTOS_NPZ_SIZE_BYTES",
-    "LOBIFLOW_CRYPTOS_NPZ_URL",
     "LOBIFLOW_REVISION",
-    "LOBIFLOW_SYNTHETIC_PROFILE_SHA256",
-    "LOBIFLOW_SYNTHETIC_PROFILE_SIZE_BYTES",
+    "LOBIFLOW_CRYPTOS_NPZ_URL",
+    "LOBIFLOW_CRYPTOS_NPZ_SIZE_BYTES",
+    "LOBIFLOW_CRYPTOS_NPZ_SHA256",
     "LOBIFLOW_SYNTHETIC_PROFILE_URL",
+    "LOBIFLOW_SYNTHETIC_PROFILE_SIZE_BYTES",
+    "LOBIFLOW_SYNTHETIC_PROFILE_SHA256",
     "LOBSTER_SYNTHETIC_DATASET_KEY",
 ]

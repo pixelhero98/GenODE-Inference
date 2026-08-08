@@ -1,9 +1,19 @@
-"""Training, sampling, and reference-metric evaluation for OTFlow backbones."""
+"""otflow_train_val.py
+
+Training and evaluation utilities for OTFlow backbones.
+
+Adds evaluation helpers:
+- Real-vs-real comparison metrics (distribution + temporal + validity)
+- Horizon-wise rollout stability
+- NFE speed/quality benchmarking
+- Generic ablation runner
+"""
 
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from contextlib import contextmanager
+import copy
 import hashlib
 import json
 import random
@@ -20,9 +30,7 @@ from genode.models.modules import EMAModel
 from genode.models.otflow_model import OTFlow
 from genode.data.otflow_datasets import L2FeatureMap, WindowedParamSequenceDataset, compute_basic_l2_metrics
 from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
-from genode.data.otflow_paths import display_project_path
 from genode.models.otflow_utils import flatten_dict, unflatten_to_nested, microstructure_series
-from genode.solver_protocol import uniform_time_grid
 
 
 SUPPORTED_MODEL_NAMES = ("otflow",)
@@ -52,15 +60,16 @@ def seed_all(seed: int = 0):
 
 def capture_rng_state() -> Dict[str, Any]:
     """Capture RNG state for restart checkpoints."""
-    numpy_kind, numpy_keys, numpy_position, numpy_has_gauss, numpy_cached_gaussian = np.random.get_state()
+    numpy_state = np.random.get_state()
     return {
         "python": random.getstate(),
         "numpy": {
-            "kind": str(numpy_kind),
-            "keys": numpy_keys.tolist(),
-            "position": int(numpy_position),
-            "has_gauss": int(numpy_has_gauss),
-            "cached_gaussian": float(numpy_cached_gaussian),
+            "protocol": "numpy_random_state_v1",
+            "bit_generator": str(numpy_state[0]),
+            "keys": [int(value) for value in numpy_state[1].tolist()],
+            "position": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
         },
         "torch": torch.random.get_rng_state(),
         "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -78,12 +87,24 @@ def restore_rng_state(state: Optional[Mapping[str, Any]]) -> None:
     if python_state is not None:
         random.setstate(python_state)
     if numpy_state is not None:
-        if not isinstance(numpy_state, Mapping):
-            raise ValueError("Restart checkpoint NumPy RNG state must be a mapping.")
+        if not isinstance(numpy_state, Mapping) or set(numpy_state) != {
+            "protocol",
+            "bit_generator",
+            "keys",
+            "position",
+            "has_gauss",
+            "cached_gaussian",
+        }:
+            raise ValueError("Restart checkpoint contains an invalid NumPy RNG state.")
+        if numpy_state.get("protocol") != "numpy_random_state_v1":
+            raise ValueError("Restart checkpoint contains an unsupported NumPy RNG protocol.")
+        keys = np.asarray(numpy_state.get("keys"), dtype=np.uint32)
+        if keys.ndim != 1 or keys.size == 0:
+            raise ValueError("Restart checkpoint contains invalid NumPy RNG keys.")
         np.random.set_state(
             (
-                str(numpy_state["kind"]),
-                np.asarray(numpy_state["keys"], dtype=np.uint32),
+                str(numpy_state["bit_generator"]),
+                keys,
                 int(numpy_state["position"]),
                 int(numpy_state["has_gauss"]),
                 float(numpy_state["cached_gaussian"]),
@@ -376,8 +397,6 @@ def evaluate_average_loss(
             )
             batch_size = int(hist.shape[0])
             loss_value = float(logs.get("loss", float(loss.detach())))
-            if not np.isfinite(loss_value):
-                raise ValueError(f"Evaluation loss must be finite, got {loss_value!r}.")
             total_loss += loss_value * float(batch_size)
             total_examples += batch_size
             batches += 1
@@ -389,11 +408,8 @@ def evaluate_average_loss(
 
     if total_examples <= 0:
         raise ValueError("Evaluation produced no examples.")
-    mean_loss = float(total_loss / float(total_examples))
-    if not np.isfinite(mean_loss):
-        raise ValueError(f"Evaluation mean loss must be finite, got {mean_loss!r}.")
     return {
-        "loss": mean_loss,
+        "loss": float(total_loss / float(total_examples)),
         "examples": int(total_examples),
         "batches": int(batches),
     }
@@ -631,9 +647,6 @@ def generate_continuation(
     steps: int,
     nfe: int,
     future_context_seq: Optional[torch.Tensor] = None,
-    *,
-    solver_key: str = "euler",
-    time_grid: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
     """Continuation in normalized param space.
 
@@ -678,11 +691,6 @@ def generate_continuation(
         return torch.cat([block, extra], dim=-1)
 
     prediction_horizon = _model_prediction_horizon(model)
-    resolved_grid = (
-        uniform_time_grid(solver_key, int(nfe))
-        if time_grid is None
-        else tuple(float(value) for value in time_grid)
-    )
     if prediction_horizon > 1:
         cursor = 0
         while cursor < int(steps):
@@ -690,21 +698,10 @@ def generate_continuation(
             if isinstance(model, OTFlow):
                 if not hasattr(model, "sample_future"):
                     raise RuntimeError("Non-autoregressive OTFlow requires sample_future(...).")
-                x_block = model.sample_future(
-                    x_hist,
-                    cond=cond_t,
-                    solver_key=solver_key,
-                    target_nfe=int(nfe),
-                    time_grid=resolved_grid,
-                )
+                x_block = model.sample_future(x_hist, cond=cond_t, steps=nfe)
             else:
                 raise RuntimeError("Non-autoregressive continuation is currently implemented for OTFlow only.")
 
-            if not bool(torch.isfinite(x_block).all()):
-                raise FloatingPointError(
-                    f"Non-finite generated block at rollout cursor={int(cursor)} "
-                    f"solver={solver_key!r} target_nfe={int(nfe)}."
-                )
             take = min(int(prediction_horizon), int(steps) - int(cursor))
             block_slice = x_block[:, :take, :]
             out.append(block_slice)
@@ -718,21 +715,10 @@ def generate_continuation(
         cond_t = cond_seq[:, k, :] if cond_seq is not None else None
 
         if isinstance(model, OTFlow):
-            x_next = model.sample(
-                x_hist,
-                cond=cond_t,
-                solver_key=solver_key,
-                target_nfe=int(nfe),
-                time_grid=resolved_grid,
-            )
+            x_next = model.sample(x_hist, cond=cond_t, steps=nfe)
         else:
             raise RuntimeError("Generation is implemented for OTFlow only.")
 
-        if not bool(torch.isfinite(x_next).all()):
-            raise FloatingPointError(
-                f"Non-finite generated state at rollout step={int(k)} "
-                f"solver={solver_key!r} target_nfe={int(nfe)}."
-            )
         out.append(x_next[:, None, :])
         hist_step = _append_context_features(x_next[:, None, :], cursor=k, take=1)
         x_hist = torch.cat([x_hist, hist_step], dim=1)
@@ -769,17 +755,10 @@ def _wasserstein_1d(x: np.ndarray, y: np.ndarray) -> float:
     n = min(x.size, y.size)
     if n == 0:
         return float("nan")
-    if not np.all(np.isfinite(x)):
-        raise FloatingPointError("Wasserstein input x contains non-finite values.")
-    if not np.all(np.isfinite(y)):
-        raise FloatingPointError("Wasserstein input y contains non-finite values.")
     q = (np.arange(n, dtype=np.float64) + 0.5) / float(n)
     xq = np.quantile(x, q)
     yq = np.quantile(y, q)
-    value = float(np.mean(np.abs(xq - yq)))
-    if not np.isfinite(value):
-        raise FloatingPointError("Wasserstein computation produced a non-finite value.")
-    return value
+    return float(np.mean(np.abs(xq - yq)))
 
 
 def _acf(x: np.ndarray, max_lag: int = 20) -> np.ndarray:
@@ -815,15 +794,8 @@ def _normalized_mae(x: np.ndarray, y: np.ndarray) -> float:
     n = min(x.size, y.size)
     if n == 0:
         return float("nan")
-    if not np.all(np.isfinite(x[:n])):
-        raise FloatingPointError("Normalized MAE input x contains non-finite values.")
-    if not np.all(np.isfinite(y[:n])):
-        raise FloatingPointError("Normalized MAE input y contains non-finite values.")
     scale = float(np.std(y[:n]) + 1e-6)
-    value = float(np.mean(np.abs(x[:n] - y[:n])) / scale)
-    if not np.isfinite(value):
-        raise FloatingPointError("Normalized MAE computation produced a non-finite value.")
-    return value
+    return float(np.mean(np.abs(x[:n] - y[:n])) / scale)
 
 
 def _hist_l1(x: np.ndarray, y: np.ndarray, bins: int = 64) -> float:
@@ -831,12 +803,10 @@ def _hist_l1(x: np.ndarray, y: np.ndarray, bins: int = 64) -> float:
     y = np.asarray(y, dtype=np.float64).ravel()
     if x.size == 0 or y.size == 0:
         return float("nan")
-    if not np.all(np.isfinite(x)):
-        raise FloatingPointError("Histogram L1 input x contains non-finite values.")
-    if not np.all(np.isfinite(y)):
-        raise FloatingPointError("Histogram L1 input y contains non-finite values.")
     lo = float(min(np.min(x), np.min(y)))
     hi = float(max(np.max(x), np.max(y)))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return float("nan")
     if hi <= lo:
         return 0.0
     edges = np.linspace(lo, hi, int(bins) + 1, dtype=np.float64)
@@ -904,10 +874,6 @@ def _downstream_device(cfg: OTFlowConfig) -> torch.device:
 
 
 def _standardize_pair(train_x: np.ndarray, test_x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    if not np.all(np.isfinite(train_x)):
-        raise FloatingPointError("Cannot standardize non-finite training features.")
-    if not np.all(np.isfinite(test_x)):
-        raise FloatingPointError("Cannot standardize non-finite test features.")
     mu = train_x.mean(axis=0, keepdims=True).astype(np.float32)
     sig = (train_x.std(axis=0, keepdims=True) + 1e-6).astype(np.float32)
     return ((train_x - mu) / sig).astype(np.float32), ((test_x - mu) / sig).astype(np.float32)
@@ -1015,22 +981,12 @@ def _train_small_multiclass_mlp_f1(
     batch_size: int = 512,
     num_classes: Optional[int] = None,
 ) -> float:
-    train_y = np.asarray(train_y, dtype=np.int64)
     test_x = np.asarray(test_x, dtype=np.float32)
     test_y = np.asarray(test_y, dtype=np.int64)
-    if len(train_x) == 0 or len(test_x) == 0:
+    if len(test_x) == 0:
         return float("nan")
-    class_count = int(
-        num_classes
-        if num_classes is not None
-        else max(int(np.max(train_y)) if train_y.size else 0, int(np.max(test_y)) if test_y.size else 0) + 1
-    )
-    train_classes = np.unique(train_y)
-    if train_classes.size == 1:
-        constant_pred = np.full(test_y.shape, int(train_classes[0]), dtype=np.int64)
-        return _macro_f1_score(test_y, constant_pred, num_classes=class_count)
     try:
-        model, fitted_class_count = _train_small_multiclass_mlp(
+        model, class_count = _train_small_multiclass_mlp(
             train_x,
             train_y,
             device=device,
@@ -1038,12 +994,12 @@ def _train_small_multiclass_mlp_f1(
             hidden_dim=hidden_dim,
             epochs=epochs,
             batch_size=batch_size,
-            num_classes=class_count,
+            num_classes=num_classes,
         )
     except ValueError:
         return float("nan")
     pred = _predict_small_multiclass_mlp(model, test_x, device=device)
-    return _macro_f1_score(test_y, pred, num_classes=fitted_class_count)
+    return _macro_f1_score(test_y, pred, num_classes=class_count)
 
 
 def _train_small_discriminator_auc(
@@ -1553,9 +1509,6 @@ def _evaluate_generation_main_metrics(
         return {
             "temporal_tstr_f1": None,
             "temporal_tstr_f1_applicable": False,
-            "temporal_tstr_f1_status": "not_applicable",
-            "temporal_tstr_f1_train_class_count": 0,
-            "temporal_tstr_f1_test_class_count": 0,
             "disc_auc": float(disc_auc),
             "disc_auc_gap": float(disc_auc_gap),
             "temporal_uw1": float(w1_metrics["unconditional_w1"]),
@@ -1574,93 +1527,54 @@ def _evaluate_generation_main_metrics(
             "threshold_abs_move": float("nan"),
         }
     label_horizon = int(max(1, min(10, max(1, horizon // 10))))
-    w1_metrics = _aggregate_core_l2_distribution_metrics(rows)
-    real_x = np.zeros((0, 1), dtype=np.float32)
-    real_y = np.zeros(0, dtype=np.int64)
-    gen_x = np.zeros((0, 1), dtype=np.float32)
-    gen_y = np.zeros(0, dtype=np.int64)
-    threshold = float("nan")
+    downstream = _collect_downstream_examples(
+        rows,
+        label_horizon=label_horizon,
+        max_examples_per_split=max_examples_per_split,
+        seed=seed,
+    )
+    device = _downstream_device(cfg)
+
+    real_x = downstream["real_x"]
+    real_moves = downstream["real_moves"]
+    gen_x = downstream["gen_x"]
+    gen_moves = downstream["gen_moves"]
+
+    threshold = float(np.quantile(np.abs(real_moves), 1.0 / 3.0)) if len(real_moves) > 0 else float("nan")
+    real_y = _ternary_labels(real_moves, threshold) if np.isfinite(threshold) else np.zeros(0, dtype=np.int64)
+    gen_y = _ternary_labels(gen_moves, threshold) if np.isfinite(threshold) else np.zeros(0, dtype=np.int64)
+
     tstr_macro_f1 = float("nan")
-    tstr_train_class_count = 0
-    tstr_test_class_count = 0
-    tstr_status = "failed"
-    device: torch.device | None = None
-    try:
-        downstream = _collect_downstream_examples(
-            rows,
-            label_horizon=label_horizon,
-            max_examples_per_split=max_examples_per_split,
-            seed=seed,
+    if len(gen_x) > 0 and len(real_x) > 0 and np.unique(gen_y).size >= 2 and np.unique(real_y).size >= 2:
+        x_train, x_test = _standardize_pair(gen_x, real_x)
+        tstr_macro_f1 = _train_small_multiclass_mlp_f1(
+            x_train,
+            gen_y,
+            x_test,
+            real_y,
+            device=device,
+            seed=seed + 31,
         )
-        device = _downstream_device(cfg)
-        real_x = downstream["real_x"]
-        real_moves = downstream["real_moves"]
-        gen_x = downstream["gen_x"]
-        gen_moves = downstream["gen_moves"]
-        threshold = (
-            float(np.quantile(np.abs(real_moves), 1.0 / 3.0))
-            if len(real_moves) > 0
-            else float("nan")
-        )
-        real_y = (
-            _ternary_labels(real_moves, threshold)
-            if np.isfinite(threshold)
-            else np.zeros(0, dtype=np.int64)
-        )
-        gen_y = (
-            _ternary_labels(gen_moves, threshold)
-            if np.isfinite(threshold)
-            else np.zeros(0, dtype=np.int64)
-        )
-        tstr_train_class_count = int(np.unique(gen_y).size)
-        tstr_test_class_count = int(np.unique(real_y).size)
-        tstr_status = "no_examples"
-        if len(gen_x) > 0 and len(real_x) > 0:
-            x_train, x_test = _standardize_pair(gen_x, real_x)
-            tstr_macro_f1 = _train_small_multiclass_mlp_f1(
-                x_train,
-                gen_y,
-                x_test,
-                real_y,
-                device=device,
-                seed=seed + 31,
-                num_classes=3,
-            )
-            if np.isfinite(tstr_macro_f1):
-                tstr_status = (
-                    "constant_train_class_fallback"
-                    if tstr_train_class_count == 1
-                    else "trained"
-                )
-            else:
-                tstr_status = "failed"
-    except Exception:
-        tstr_macro_f1 = float("nan")
-        tstr_status = "failed"
 
     disc_auc = float("nan")
-    try:
-        if device is not None and len(gen_x) > 1 and len(real_x) > 1:
-            train_x, train_y, test_x, test_y = _pairwise_split(
-                real_x,
-                gen_x,
-                seed=seed + 17,
+    if len(gen_x) > 1 and len(real_x) > 1:
+        train_x, train_y, test_x, test_y = _pairwise_split(real_x, gen_x, seed=seed + 17)
+        if len(train_x) > 0 and len(test_x) > 0:
+            train_x, test_x = _standardize_pair(train_x, test_x)
+            disc_auc = _train_small_discriminator_auc(
+                train_x,
+                train_y.astype(np.float32),
+                test_x,
+                test_y,
+                device=device,
+                seed=seed + 47,
             )
-            if len(train_x) > 0 and len(test_x) > 0:
-                train_x, test_x = _standardize_pair(train_x, test_x)
-                disc_auc = _train_small_discriminator_auc(
-                    train_x,
-                    train_y.astype(np.float32),
-                    test_x,
-                    test_y,
-                    device=device,
-                    seed=seed + 47,
-                )
-    except Exception:
-        disc_auc = float("nan")
     disc_auc_gap = float(abs(disc_auc - 0.5)) if np.isfinite(disc_auc) else float("nan")
 
+    w1_metrics = _aggregate_core_l2_distribution_metrics(rows)
+
     score_terms = [
+        1.0 - tstr_macro_f1 if np.isfinite(tstr_macro_f1) else np.nan,
         disc_auc_gap,
         np.log1p(w1_metrics["unconditional_w1"]) if np.isfinite(w1_metrics["unconditional_w1"]) else np.nan,
         np.log1p(w1_metrics["conditional_w1"]) if np.isfinite(w1_metrics["conditional_w1"]) else np.nan,
@@ -1671,9 +1585,6 @@ def _evaluate_generation_main_metrics(
     return {
         "temporal_tstr_f1": float(tstr_macro_f1) if np.isfinite(tstr_macro_f1) else None,
         "temporal_tstr_f1_applicable": True,
-        "temporal_tstr_f1_status": str(tstr_status),
-        "temporal_tstr_f1_train_class_count": int(tstr_train_class_count),
-        "temporal_tstr_f1_test_class_count": int(tstr_test_class_count),
         "disc_auc": float(disc_auc),
         "disc_auc_gap": float(disc_auc_gap),
         "temporal_uw1": float(w1_metrics["unconditional_w1"]),
@@ -1846,35 +1757,16 @@ def select_eval_window_starts(ds: WindowedParamSequenceDataset, horizon: int, n_
 
 
 def _denorm_params_seq(ds: WindowedParamSequenceDataset, x_norm: np.ndarray) -> np.ndarray:
-    x_norm = np.asarray(x_norm)
-    if not np.all(np.isfinite(x_norm)):
-        raise FloatingPointError("Cannot denormalize non-finite generated parameters.")
     if ds.params_mean is not None and ds.params_std is not None:
-        if not np.all(np.isfinite(ds.params_mean)) or not np.all(np.isfinite(ds.params_std)):
-            raise FloatingPointError("Dataset parameter normalization statistics contain non-finite values.")
-        result = (x_norm * ds.params_std[None, :] + ds.params_mean[None, :]).astype(np.float32)
-    else:
-        result = x_norm.astype(np.float32)
-    if not np.all(np.isfinite(result)):
-        raise FloatingPointError("Parameter denormalization produced non-finite values.")
-    return result
+        return (x_norm * ds.params_std[None, :] + ds.params_mean[None, :]).astype(np.float32)
+    return x_norm.astype(np.float32)
 
 
 def _get_dataset_item_by_t(ds: WindowedParamSequenceDataset, t0: int):
-    starts_ref = ds.start_indices
-    lookup = getattr(ds, "_start_index_lookup", None)
-    lookup_source = getattr(ds, "_start_index_lookup_source", None)
-    if lookup is None or lookup_source is not starts_ref:
-        built_lookup: Dict[int, int] = {}
-        for idx, start in enumerate(np.asarray(starts_ref, dtype=np.int64)):
-            built_lookup.setdefault(int(start), int(idx))
-        setattr(ds, "_start_index_lookup", built_lookup)
-        setattr(ds, "_start_index_lookup_source", starts_ref)
-        lookup = built_lookup
-    idx = lookup.get(int(t0))
-    if idx is None:
+    idxs = np.where(np.asarray(ds.start_indices) == int(t0))[0]
+    if len(idxs) == 0:
         raise IndexError(f"t={t0} not in dataset start_indices.")
-    return ds[int(idx)]
+    return ds[int(idxs[0])]
 
 
 @torch.no_grad()
@@ -1889,8 +1781,6 @@ def eval_one_window(
     horizons_eval: Sequence[int] = (1, 10, 50, 100, 200),
     return_sequences: bool = False,
     main_metrics_only: bool = False,
-    solver_key: str = "euler",
-    time_grid: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     horizon = int(horizon)
     dataset_kind = str(getattr(ds, "dataset_kind", "l2"))
@@ -1928,8 +1818,6 @@ def eval_one_window(
             steps=horizon,
             nfe=nfe,
             future_context_seq=future_context_seq,
-            solver_key=solver_key,
-            time_grid=time_grid,
         )
     _torch_sync(cfg.device)
     latency_s = time.perf_counter() - t_start
@@ -2166,12 +2054,8 @@ def eval_many_windows(
     horizons_eval: Sequence[int] = (1, 10, 50, 100, 200),
     chosen_t0s: Optional[Sequence[int]] = None,
     generation_seed_base: Optional[int] = None,
-    generation_seed_values: Optional[Sequence[int]] = None,
     metrics_seed: Optional[int] = None,
     main_metrics_only: bool = False,
-    solver_key: str = "euler",
-    time_grid: Optional[Sequence[float]] = None,
-    time_grids: Optional[Sequence[Sequence[float]]] = None,
 ) -> Dict[str, Any]:
     dataset_kind = str(getattr(ds, "dataset_kind", "l2"))
     dataset_metadata = dict(getattr(ds, "dataset_metadata", {}) or {})
@@ -2191,45 +2075,15 @@ def eval_many_windows(
     else:
         chosen = select_eval_window_starts(ds, horizon=int(horizon), n_windows=int(n_windows), seed=int(seed))
 
-    if generation_seed_base is not None and generation_seed_values is not None:
-        raise ValueError("Specify generation_seed_base or generation_seed_values, not both.")
-    if time_grid is not None and time_grids is not None:
-        raise ValueError("Specify time_grid or time_grids, not both.")
-    if generation_seed_values is not None:
-        resolved_generation_seeds = [int(value) for value in generation_seed_values]
-        if len(resolved_generation_seeds) != int(chosen.size):
-            raise ValueError(
-                "generation_seed_values must match the number of chosen windows: "
-                f"{len(resolved_generation_seeds)} != {int(chosen.size)}."
-            )
-    else:
-        resolved_generation_seeds = []
-    if time_grids is not None:
-        resolved_time_grids = [tuple(float(value) for value in grid) for grid in time_grids]
-        if len(resolved_time_grids) != int(chosen.size):
-            raise ValueError(
-                "time_grids must match the number of chosen windows: "
-                f"{len(resolved_time_grids)} != {int(chosen.size)}."
-            )
-    else:
-        resolved_time_grids = []
-
     metrics_seed_value = int(seed if metrics_seed is None else metrics_seed)
 
     rows = []
-    used_generation_seeds: List[int] = []
     for window_idx, t0 in enumerate(chosen.tolist()):
         window_seed = (
-            int(resolved_generation_seeds[window_idx])
-            if resolved_generation_seeds
-            else (
-                int(generation_seed_base) + int(window_idx)
-                if generation_seed_base is not None
-                else int(rng.integers(0, 1_000_000))
-            )
+            int(generation_seed_base) + int(window_idx)
+            if generation_seed_base is not None
+            else int(rng.integers(0, 1_000_000))
         )
-        used_generation_seeds.append(int(window_seed))
-        window_time_grid = resolved_time_grids[window_idx] if resolved_time_grids else time_grid
         rows.append(
             eval_one_window(
                 ds, model, cfg,
@@ -2239,8 +2093,6 @@ def eval_many_windows(
                 horizons_eval=horizons_eval,
                 return_sequences=True,
                 main_metrics_only=bool(main_metrics_only),
-                solver_key=solver_key,
-                time_grid=window_time_grid,
             )
         )
 
@@ -2258,9 +2110,6 @@ def eval_many_windows(
     cmp["main"] = {
         "temporal_tstr_f1": _wrap_optional_scalar_as_mean_std(main_metrics["temporal_tstr_f1"]),
         "temporal_tstr_f1_applicable": bool(main_metrics["temporal_tstr_f1_applicable"]),
-        "temporal_tstr_f1_status": str(main_metrics["temporal_tstr_f1_status"]),
-        "temporal_tstr_f1_train_class_count": int(main_metrics["temporal_tstr_f1_train_class_count"]),
-        "temporal_tstr_f1_test_class_count": int(main_metrics["temporal_tstr_f1_test_class_count"]),
         "disc_auc": _wrap_scalar_as_mean_std(main_metrics["disc_auc"]),
         "disc_auc_gap": _wrap_scalar_as_mean_std(main_metrics["disc_auc_gap"]),
         "temporal_uw1": _wrap_scalar_as_mean_std(main_metrics["temporal_uw1"]),
@@ -2330,14 +2179,216 @@ def eval_many_windows(
                 json.dumps([int(t0) for t0 in chosen.tolist()], separators=(",", ":")).encode("utf-8")
             ).hexdigest(),
             "generation_seed_base": None if generation_seed_base is None else int(generation_seed_base),
-            "generation_seed_values": used_generation_seeds,
             "metrics_seed": int(metrics_seed_value),
             "main_metrics_only": bool(main_metrics_only),
             "dataset_kind": dataset_kind,
-            "time_grid_mode": "per_window" if resolved_time_grids else "shared",
             "per_window_metric_rows": _per_window_metric_rows(rows, dataset_kind),
         },
     }
+
+
+@torch.no_grad()
+def eval_rollout_horizons(
+    ds: WindowedParamSequenceDataset,
+    model: torch.nn.Module,
+    cfg: OTFlowConfig,
+    horizons: Sequence[int] = (1, 10, 50, 100, 200),
+    nfe: int = 1,
+    n_windows: int = 50,
+    seed: int = 0,
+) -> Dict[int, Dict[str, Any]]:
+    out = {}
+    for h in horizons:
+        out[int(h)] = eval_many_windows(ds, model, cfg, horizon=int(h), nfe=nfe, n_windows=n_windows, seed=seed, horizons_eval=horizons)
+    return out
+
+
+# -----------------------------
+# Speed benchmarking (B)
+# -----------------------------
+@torch.no_grad()
+def benchmark_sampling_latency(
+    ds: WindowedParamSequenceDataset,
+    model: torch.nn.Module,
+    cfg: OTFlowConfig,
+    horizon: int = 200,
+    nfe: int = 1,
+    n_trials: int = 20,
+    warmup: int = 3,
+    seed: int = 0,
+) -> Dict[str, float]:
+    rng = np.random.default_rng(seed)
+    valid_ts = _valid_eval_indices(ds, horizon)
+    if len(valid_ts) == 0:
+        raise ValueError(f"No valid windows for horizon={horizon}.")
+    t0 = int(valid_ts[int(rng.integers(0, len(valid_ts)))])
+
+    hist, _, _, _, _ = _parse_batch(_get_dataset_item_by_t(ds, t0))
+    hist = hist[None].to(cfg.device).float()
+    context_len = resolve_context_length(hist.shape[1], horizon=horizon, cfg=cfg)
+
+    cond_seq = None
+    if ds.cond is not None:
+        cond_seq = torch.from_numpy(ds.cond[t0 : t0 + horizon]).to(cfg.device).float()[None]
+    future_context_seq = None
+    future_context = _future_time_context_seq(ds, int(t0), int(horizon))
+    if future_context is not None:
+        future_context_seq = future_context.to(cfg.device).float()[None]
+
+    for __ in range(max(0, warmup)):
+        generate_continuation(model, hist, cond_seq, steps=horizon, nfe=nfe, future_context_seq=future_context_seq)
+    _torch_sync(cfg.device)
+
+    times = []
+    for _ in range(max(1, n_trials)):
+        _torch_sync(cfg.device)
+        t1 = time.perf_counter()
+        _ = generate_continuation(model, hist, cond_seq, steps=horizon, nfe=nfe, future_context_seq=future_context_seq)
+        _torch_sync(cfg.device)
+        times.append(time.perf_counter() - t1)
+
+    arr = np.asarray(times, dtype=np.float64)
+    return {
+        "latency_s_mean": float(arr.mean()),
+        "latency_s_std": float(arr.std()),
+        "latency_ms_per_sample_mean": float(1000.0 * arr.mean()),
+        "latency_ms_per_step_mean": float(1000.0 * arr.mean() / max(1, horizon)),
+        "throughput_steps_per_s_mean": float(horizon / max(arr.mean(), 1e-12)),
+        "n_trials": int(n_trials),
+        "warmup": int(warmup),
+        "nfe": int(nfe),
+        "horizon": int(horizon),
+        "context_len": int(context_len),
+    }
+
+
+@torch.no_grad()
+def eval_speed_quality_nfe(
+    ds: WindowedParamSequenceDataset,
+    model: torch.nn.Module,
+    cfg: OTFlowConfig,
+    nfe_list: Sequence[int] = (1, 2, 4, 8, 16, 32),
+    horizon: int = 200,
+    n_windows: int = 30,
+    seed: int = 0,
+    n_trials_latency: int = 10,
+) -> Dict[int, Dict[str, Any]]:
+    results = {}
+    for nfe in nfe_list:
+        q = eval_many_windows(ds, model, cfg, horizon=horizon, nfe=int(nfe), n_windows=n_windows, seed=seed)
+        t = benchmark_sampling_latency(ds, model, cfg, horizon=horizon, nfe=int(nfe), n_trials=n_trials_latency, seed=seed)
+        results[int(nfe)] = {"quality": q, "latency": t}
+    return results
+
+
+# -----------------------------
+# Ablations (C)
+# -----------------------------
+def clone_cfg_with_overrides(cfg: OTFlowConfig, overrides: Dict[str, Any]) -> OTFlowConfig:
+    cfg2 = copy.deepcopy(cfg)
+    cfg2.apply_overrides(**overrides)
+    return cfg2
+
+
+def run_ablation_grid(
+    ds_train: WindowedParamSequenceDataset,
+    ds_eval: WindowedParamSequenceDataset,
+    base_cfg: OTFlowConfig,
+    ablations: Sequence[Tuple[str, Dict[str, Any]]],
+    model_name: str = "otflow",
+    train_steps: int = 10_000,
+    stage2_steps_nf: Optional[int] = None,
+    eval_horizon: int = 200,
+    eval_nfe: int = 1,
+    n_windows: int = 30,
+    seed: int = 0,
+    log_every: int = 200,
+) -> Dict[str, Any]:
+    rng = np.random.default_rng(seed)
+    suite = {}
+    model_name = _normalize_model_name(model_name)
+
+    for name, overrides in ablations:
+        cfg_i = clone_cfg_with_overrides(base_cfg, dict(overrides))
+        print(f"\n=== Ablation: {name} | overrides={overrides} ===")
+
+        model = train_loop(ds_train, cfg_i, model_name=model_name, steps=train_steps, log_every=log_every)
+
+        res = eval_many_windows(
+            ds_eval, model, cfg_i,
+            horizon=eval_horizon, nfe=eval_nfe,
+            n_windows=n_windows, seed=int(rng.integers(0, 1_000_000)),
+        )
+
+        suite[name] = {
+            "overrides": dict(overrides),
+            "model_name": model_name,
+            "train_steps": int(train_steps),
+            "eval": res,
+        }
+    return suite
+
+
+def summarize_ablation_for_table(
+    ablation_results: Dict[str, Any],
+    keys: Sequence[str] = (
+        "eval.cmp.score_main.mean",
+        "eval.cmp.main.temporal_tstr_f1.mean",
+        "eval.cmp.main.disc_auc_gap.mean",
+        "eval.cmp.main.temporal_uw1.mean",
+        "eval.cmp.main.temporal_cw1.mean",
+        "eval.cmp.extra.u_l1.mean",
+        "eval.cmp.extra.c_l1.mean",
+        "eval.cmp.extra.spread_specific_error.mean",
+        "eval.cmp.extra.imbalance_specific_error.mean",
+        "eval.cmp.extra.ret_vol_acf_error.mean",
+        "eval.cmp.extra.impact_response_error.mean",
+        "eval.cmp.extra.efficiency_ms_per_sample.mean",
+    ),
+):
+    rows = []
+    for name, payload in ablation_results.items():
+        row = {"name": name}
+        flat = flatten_dict(payload)
+        for k in keys:
+            if k in flat:
+                row[k] = flat[k]
+        rows.append(row)
+    rows = sorted(rows, key=lambda r: r.get("eval.cmp.score_main.mean", float("inf")))
+    return rows
+
+
+# -----------------------------
+# Qualitative bundle export (for separate viz script)
+# -----------------------------
+@torch.no_grad()
+def save_qualitative_window_npz(
+    save_path: str,
+    ds: WindowedParamSequenceDataset,
+    model: torch.nn.Module,
+    cfg: OTFlowConfig,
+    horizon: int = 200,
+    nfe: int = 1,
+    seed: int = 0,
+    t0: Optional[int] = None,
+):
+    res = eval_one_window(ds, model, cfg, horizon=horizon, nfe=nfe, seed=seed, t0=t0, return_sequences=True)
+    seq = res["seq"]
+    meta = res["meta"]
+    np.savez_compressed(
+        save_path,
+        gen_params_raw=seq["gen_params_raw"],
+        true_params_raw=seq["true_params_raw"],
+        gen_ask_p=seq["gen"]["ask_p"], gen_ask_v=seq["gen"]["ask_v"],
+        gen_bid_p=seq["gen"]["bid_p"], gen_bid_v=seq["gen"]["bid_v"],
+        true_ask_p=seq["true"]["ask_p"], true_ask_v=seq["true"]["ask_v"],
+        true_bid_p=seq["true"]["bid_p"], true_bid_v=seq["true"]["bid_v"],
+        meta_t=np.int64(meta["t"]),
+        meta_init_mid_prev=np.float32(meta["init_mid_prev"]),
+        horizon=np.int64(horizon),
+        nfe=np.int64(nfe),
+    )
+    print(f"Saved qualitative window to {save_path}")
 
 
 def save_json(obj: Dict[str, Any], path: str):
@@ -2355,7 +2406,7 @@ def save_json(obj: Dict[str, Any], path: str):
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, default=_conv)
     tmp_path.replace(path_obj)
-    print(f"Saved JSON -> {display_project_path(path_obj)}")
+    print(f"Saved JSON -> {path_obj}")
 
 
 __all__ = [
@@ -2371,6 +2422,12 @@ __all__ = [
     "select_eval_window_starts",
     "eval_one_window",
     "eval_many_windows",
+    "eval_rollout_horizons",
+    "benchmark_sampling_latency",
+    "eval_speed_quality_nfe",
+    "run_ablation_grid",
+    "summarize_ablation_for_table",
+    "save_qualitative_window_npz",
     "save_json",
     "compare_l2_sequences",
 ]

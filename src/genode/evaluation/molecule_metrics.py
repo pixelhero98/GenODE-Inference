@@ -9,29 +9,34 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from genode.cli import parse_int_csv
 from genode.data.molecule_xyz import (
     ATOM_COVALENT_RADIUS,
     DEFAULT_MOLECULE_DATASET_KEY,
     build_molecule_dataset_splits,
-    molecule_processed_path,
+    default_molecule_processed_dir,
     kabsch_aligned_rmsd,
     load_molecule_group_manifest,
     molecule_stats_from_mapping,
 )
-from genode.experiment_layout import NFE_ROLE_SEEN, SCENARIO_FAMILY_MOLECULE, target_nfes_for_role
-from genode.data.otflow_paths import display_project_path, resolve_project_path
-from genode.evaluation.otflow_evaluation_support import load_checkpoint_model, load_otflow_checkpoint_payload
-from genode.gipo.models import validate_time_grid
+from genode.canonical_experiment_layout import NFE_ROLE_SEEN, SCENARIO_FAMILY_MOLECULE, canonical_nfes_for_role
+from genode.data.otflow_paths import project_root, resolve_project_path
+from genode.evaluation.otflow_evaluation_support import (
+    load_checkpoint_model,
+    load_otflow_checkpoint_payload,
+)
+from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _restore_sample_overrides
+from genode.gico.models import validate_time_grid
+from genode.models.conditioning import (
+    FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+    frozen_backbone_policy_context,
+)
 from genode.models.otflow_train_val import _temporary_eval_seed, evaluate_average_loss, save_json
 from genode.runtime import resolve_torch_device
 from genode.solver_protocol import (
-    SUPPORTED_SOLVER_KEYS,
-    expected_realized_nfe,
-    normalize_solver_key,
+    CANONICAL_SOLVER_KEYS,
     normalize_solver_keys,
+    normalize_solver_nfe_fields,
     solver_macro_steps,
-    uniform_time_grid,
 )
 
 MOLECULE_CONTEXT_SCHEMA = "molecule_3d_window"
@@ -44,47 +49,17 @@ MOLECULE_PRIMARY_METRICS: Tuple[str, ...] = (
 )
 
 
-def load_molecule_checkpoint_payload(
-    checkpoint_path: str | Path,
-    *,
-    expected_identity: str = "molecule OTFlow checkpoint",
-    expected_dataset_key: str = "",
-    expected_stratum: str = "",
-) -> Mapping[str, Any]:
-    try:
-        payload = load_otflow_checkpoint_payload(
-            checkpoint_path,
-            expected_identity=expected_identity,
-        )
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise RuntimeError(f"Invalid molecule checkpoint at {Path(checkpoint_path)}: {exc}") from exc
-    if not isinstance(payload.get("molecule_stats"), Mapping):
-        raise RuntimeError(
-            f"Invalid molecule checkpoint at {Path(checkpoint_path)}: molecule_stats must be a mapping "
-            f"for {expected_identity}."
-        )
-    try:
-        molecule_stats_from_mapping(payload["molecule_stats"])
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(
-            f"Invalid molecule checkpoint at {Path(checkpoint_path)}: malformed molecule_stats "
-            f"for {expected_identity}: {exc}"
-        ) from exc
-    for field, expected in (("dataset_key", expected_dataset_key), ("stratum", expected_stratum)):
-        if not str(expected or "").strip():
-            continue
-        observed = str(payload.get(field, "") or "")
-        if observed != str(expected):
-            raise RuntimeError(
-                f"Invalid molecule checkpoint at {Path(checkpoint_path)}: {field}={observed!r} "
-                f"does not match expected {str(expected)!r}."
-            )
-    return payload
-
-
 def _pairwise_distances(coords: np.ndarray) -> np.ndarray:
     diff = coords[:, None, :] - coords[None, :, :]
     return np.sqrt(np.maximum(np.sum(diff * diff, axis=-1), 0.0))
+
+
+def _project_display_path(path: str | Path) -> str:
+    resolved = Path(path).expanduser().resolve()
+    try:
+        return resolved.relative_to(project_root()).as_posix()
+    except ValueError:
+        return resolved.name
 
 
 def _safe_mean(values: Sequence[Any]) -> float:
@@ -253,9 +228,8 @@ def _sample_molecule_ar_rollout(
     ds,
     history_coords: np.ndarray,
     rollout_steps: int,
-    target_nfe: int,
+    nfe: int,
     solver: str,
-    time_grid: Sequence[float],
     device: torch.device,
     seed: int,
 ) -> np.ndarray:
@@ -268,9 +242,8 @@ def _sample_molecule_ar_rollout(
         with _temporary_eval_seed(int(seed) + int(step_idx)):
             pred_norm = model.sample_future(
                 hist_t,
-                solver_key=str(solver),
-                target_nfe=int(target_nfe),
-                time_grid=time_grid,
+                steps=int(nfe),
+                solver=str(solver),
             )
         residual = ds.denormalize_target(pred_norm.detach().cpu().numpy()[0])[0]
         next_coords = history[-1] + residual.reshape(ds.data.atom_count, 3)
@@ -364,20 +337,21 @@ def _molecule_context_embedding(
     ds,
     item: Mapping[str, Any],
     device: torch.device,
-    context_embedding_kind: str,
 ) -> List[float]:
     backbone = getattr(model, "backbone", None)
-    if backbone is None or not hasattr(backbone, "precompute"):
-        raise ValueError("Molecule context export requires model.backbone.precompute(hist).")
+    if backbone is None:
+        raise ValueError("Molecule context export requires model.backbone.")
+    if not hasattr(model, "eval"):
+        raise ValueError("Molecule context export requires an evaluable frozen model.")
+    model.eval()
     context = np.asarray(item["context"], dtype=np.float32)
     hist = (context - ds.stats.context_mean[None, :]) / ds.stats.context_std[None, :]
     hist_t = torch.from_numpy(hist[None].astype(np.float32)).to(device)
-    cache = backbone.precompute(hist_t.float())
-    if not hasattr(cache, str(context_embedding_kind)):
-        raise ValueError(f"Unknown molecule context_embedding_kind={context_embedding_kind!r}.")
-    embedding = getattr(cache, str(context_embedding_kind))
-    if not torch.is_tensor(embedding) or embedding.ndim != 2 or int(embedding.shape[0]) != 1:
-        raise ValueError(f"Molecule context embedding {context_embedding_kind!r} must have shape [1, dim].")
+    embedding = frozen_backbone_policy_context(
+        backbone,
+        hist_t.float(),
+        protocol=FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+    )
     return [float(x) for x in embedding.detach().cpu().numpy().astype(np.float32)[0].tolist()]
 
 
@@ -392,7 +366,6 @@ def molecule_context_embeddings_for_indices(
     stratum: str,
     split_phase: str,
     device: torch.device,
-    context_embedding_kind: str = "ctx_summary",
 ) -> Dict[str, List[float]]:
     embeddings: Dict[str, List[float]] = {}
     for example_idx in [int(idx) for idx in example_indices]:
@@ -410,7 +383,6 @@ def molecule_context_embeddings_for_indices(
             ds=ds,
             item=item,
             device=device,
-            context_embedding_kind=str(context_embedding_kind),
         )
     return embeddings
 
@@ -452,9 +424,8 @@ def _molecule_window_metrics(
     bond_pairs: np.ndarray,
     rollout_steps: int,
     sample_count: int,
-    target_nfe: int,
+    runtime_nfe: int,
     solver_key: str,
-    time_grid: Sequence[float],
     device: torch.device,
     seed: int,
 ) -> Dict[str, Any]:
@@ -471,11 +442,10 @@ def _molecule_window_metrics(
             ds=ds,
             history_coords=history_coords,
             rollout_steps=int(rollout_steps),
-            target_nfe=int(target_nfe),
+            nfe=int(runtime_nfe),
             solver=str(solver_key),
-            time_grid=time_grid,
             device=device,
-            seed=int(seed) + 1_000_000 * int(sample_idx),
+            seed=int(seed) + int(sample_idx),
         )
         sample_rollouts.append(pred_future)
         if pred_future.shape[0] > 0 and true_future.shape[0] > 0:
@@ -520,7 +490,7 @@ def evaluate_molecule_rollout_schedule(
     scheduler_key: str,
     solver_key: str,
     target_nfe: int,
-    macro_steps: int,
+    runtime_nfe: int,
     time_grid: Sequence[float],
     example_indices: Sequence[int],
     sample_count: int,
@@ -539,85 +509,93 @@ def evaluate_molecule_rollout_schedule(
     indices = [int(idx) for idx in example_indices]
     if not indices:
         raise ValueError("Molecule schedule evaluation requires at least one example index.")
-    grid = validate_time_grid(time_grid, macro_steps=int(macro_steps))
+    nfe = normalize_solver_nfe_fields(
+        solver_key,
+        target_nfe,
+        runtime_nfe=runtime_nfe,
+        source="molecule rollout schedule",
+    )
+    grid = validate_time_grid(time_grid, macro_steps=nfe.macro_steps)
     atom_symbols = ds.data.atom_symbols
     bond_pairs = _bond_pairs(ds.stats.reference_coords, atom_symbols)
+    backup = _apply_sample_overrides(model, cfg, time_grid=tuple(float(x) for x in grid))
     per_context: List[Dict[str, Any]] = []
-    for context_index, example_idx in enumerate(indices):
-        context_seed = int(seed) + int(context_index)
-        item = ds.eval_item(int(example_idx))
-        metrics = _molecule_window_metrics(
-            model=model,
-            ds=ds,
-            item=item,
-            atom_symbols=atom_symbols,
-            bond_pairs=bond_pairs,
-            rollout_steps=int(rollout_steps),
-            sample_count=int(sample_count),
-            target_nfe=int(target_nfe),
-            solver_key=str(solver_key),
-            time_grid=grid,
-            device=dev,
-            seed=int(context_seed),
-        )
-        target_idx = int(item.get("target_idx", example_idx))
-        flags = {
-            "transition": bool(item.get("transition", False)),
-            "transition_window": bool(item.get("transition_window", False)),
-            "discontinuity": bool(item.get("discontinuity", False)),
-            "discontinuity_window": bool(item.get("discontinuity_window", False)),
-            "duplicate": bool(item.get("duplicate", False)),
-        }
-        context_id = molecule_context_id(
-            dataset_key=str(dataset_key),
-            member_key=str(member_key),
-            stratum=str(stratum),
-            split_phase=str(split_phase),
-            item=item,
-            example_idx=int(example_idx),
-        )
-        per_context.append(
-            {
-                **metrics,
-                "context_schema": MOLECULE_CONTEXT_SCHEMA,
-                "context_id": context_id,
-                "context_embedding_id": molecule_context_embedding_id(str(checkpoint_id), context_id),
-                "example_idx": int(example_idx),
-                "target_t": int(target_idx),
-                "history_start": int(target_idx) - int(getattr(ds, "H", 0)),
-                "history_stop": int(target_idx),
-                "target_stop": int(target_idx) + int(rollout_steps),
-                "axis_member": str(member_key),
-                "axis_stratum": str(stratum),
-                "axis_formula": str(formula),
-                "axis_atom_count": int(ds.data.atom_count),
-                "axis_trajectory": str(item.get("trajectory_key", item.get("trajectory_id", ""))),
-                "axis_iso_id": str(item.get("iso_id", "")),
-                "axis_window": str(target_idx),
-                "axis_flags": json.dumps(flags, sort_keys=True, separators=(",", ":")),
-                "member_key": str(member_key),
-                "stratum": str(stratum),
-                "formula": str(formula),
-                "source_zip_name": str(source_zip_name),
-                "num_eval_samples": int(sample_count),
-                "evaluation_seed": int(context_seed),
-                "sample_seed_start": int(context_seed),
-                "sample_seed_values_json": json.dumps(
-                    [int(context_seed) + 1_000_000 * int(sample_idx) for sample_idx in range(int(sample_count))],
-                    separators=(",", ":"),
-                ),
+    try:
+        for example_idx in indices:
+            item = ds.eval_item(int(example_idx))
+            metrics = _molecule_window_metrics(
+                model=model,
+                ds=ds,
+                item=item,
+                atom_symbols=atom_symbols,
+                bond_pairs=bond_pairs,
+                rollout_steps=int(rollout_steps),
+                sample_count=int(sample_count),
+                runtime_nfe=nfe.runtime_nfe,
+                solver_key=nfe.solver_key,
+                device=dev,
+                seed=int(seed) + 10_000 * int(example_idx),
+            )
+            target_idx = int(item.get("target_idx", example_idx))
+            flags = {
+                "transition": bool(item.get("transition", False)),
+                "transition_window": bool(item.get("transition_window", False)),
+                "discontinuity": bool(item.get("discontinuity", False)),
+                "discontinuity_window": bool(item.get("discontinuity_window", False)),
+                "duplicate": bool(item.get("duplicate", False)),
             }
-        )
+            context_id = molecule_context_id(
+                dataset_key=str(dataset_key),
+                member_key=str(member_key),
+                stratum=str(stratum),
+                split_phase=str(split_phase),
+                item=item,
+                example_idx=int(example_idx),
+            )
+            per_context.append(
+                {
+                    **metrics,
+                    "context_schema": MOLECULE_CONTEXT_SCHEMA,
+                    "context_id": context_id,
+                    "context_embedding_id": molecule_context_embedding_id(str(checkpoint_id), context_id),
+                    "example_idx": int(example_idx),
+                    "target_t": int(target_idx),
+                    "history_start": int(target_idx) - int(getattr(ds, "H", 0)),
+                    "history_stop": int(target_idx),
+                    "target_stop": int(target_idx) + int(rollout_steps),
+                    "axis_dataset": str(dataset_key),
+                    "axis_member": str(member_key),
+                    "axis_stratum": str(stratum),
+                    "axis_formula": str(formula),
+                    "axis_atom_count": int(ds.data.atom_count),
+                    "axis_trajectory": str(item.get("trajectory_key", item.get("trajectory_id", ""))),
+                    "axis_iso_id": str(item.get("iso_id", "")),
+                    "axis_window": str(target_idx),
+                    "axis_flags": json.dumps(flags, sort_keys=True, separators=(",", ":")),
+                    "member_key": str(member_key),
+                    "stratum": str(stratum),
+                    "formula": str(formula),
+                    "source_zip_name": str(source_zip_name),
+                    "num_eval_samples": int(sample_count),
+                    "sample_seed_start": int(seed) + 10_000 * int(example_idx),
+                    "sample_seed_values_json": json.dumps(
+                        [int(seed) + 10_000 * int(example_idx) + int(sample_idx) for sample_idx in range(int(sample_count))],
+                        separators=(",", ":"),
+                    ),
+                }
+            )
+    finally:
+        _restore_sample_overrides(model, cfg, backup)
     summary: Dict[str, Any] = {
         "benchmark_family": SCENARIO_FAMILY_MOLECULE,
-        "scenario_key": str(dataset_key),
+        "dataset_key": str(dataset_key),
         "member_key": str(member_key),
         "stratum": str(stratum),
         "scheduler_key": str(scheduler_key),
-        "solver_key": str(solver_key),
-        "target_nfe": int(target_nfe),
-        "macro_steps": int(macro_steps),
-        "realized_nfe": int(expected_realized_nfe(str(solver_key), int(target_nfe))),
+        "solver_key": nfe.solver_key,
+        "target_nfe": nfe.target_nfe,
+        "runtime_nfe": nfe.runtime_nfe,
+        "realized_nfe": nfe.realized_nfe,
         "num_eval_samples": int(sample_count),
         "eval_windows": int(len(indices)),
         "rollout_steps": int(rollout_steps),
@@ -640,16 +618,17 @@ def load_molecule_checkpoint_splits(
     device: torch.device,
 ) -> Dict[str, Any]:
     resolved_checkpoint = resolve_project_path(str(checkpoint_path))
-    checkpoint_payload = load_molecule_checkpoint_payload(
+    checkpoint_payload = load_otflow_checkpoint_payload(
         resolved_checkpoint,
-        expected_dataset_key=str(dataset_key),
-        expected_stratum=str(stratum),
+        expected_identity="molecule OTFlow checkpoint",
     )
+    if "molecule_stats" not in checkpoint_payload:
+        raise RuntimeError("Molecule checkpoint is missing molecule_stats; refusing to rebuild normalization for evaluation.")
     checkpoint_stats = molecule_stats_from_mapping(checkpoint_payload["molecule_stats"])
     resolved_dataset_key = str(dataset_key or checkpoint_payload.get("dataset_key", "") or DEFAULT_MOLECULE_DATASET_KEY)
     resolved_stratum = str(stratum or checkpoint_payload.get("stratum", "") or "")
     resolved_processed_dir = (
-        molecule_processed_path(resolved_dataset_key, resolved_stratum)
+        default_molecule_processed_dir(resolved_dataset_key, resolved_stratum)
         if processed_dir in (None, "")
         else resolve_project_path(str(processed_dir))
     )
@@ -755,23 +734,30 @@ def aggregate_molecule_group_evaluation(
 
 @torch.no_grad()
 def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
+    nfe = normalize_solver_nfe_fields(
+        str(getattr(args, "solver_key", getattr(args, "solver", "euler"))),
+        getattr(args, "target_nfe", getattr(args, "nfe", 16)),
+        runtime_nfe=getattr(args, "runtime_nfe", None),
+        realized_nfe=getattr(args, "realized_nfe", None),
+        source="molecule checkpoint evaluation",
+    )
     device = resolve_torch_device(str(args.device))
     checkpoint_path = resolve_project_path(str(args.checkpoint))
-    checkpoint_payload = load_molecule_checkpoint_payload(
+    checkpoint_payload = load_otflow_checkpoint_payload(
         checkpoint_path,
-        expected_dataset_key=str(getattr(args, "scenario_key", "") or ""),
-        expected_stratum=str(getattr(args, "stratum", "") or ""),
+        expected_identity="molecule OTFlow checkpoint",
     )
+    if "molecule_stats" not in checkpoint_payload:
+        raise RuntimeError("Molecule checkpoint is missing molecule_stats; refusing to rebuild normalization for evaluation.")
     checkpoint_stats = molecule_stats_from_mapping(checkpoint_payload["molecule_stats"])
-    scenario_key = str(
-        getattr(args, "scenario_key", "")
+    dataset_key = str(
+        getattr(args, "dataset_key", "")
         or checkpoint_payload.get("dataset_key", "")
         or DEFAULT_MOLECULE_DATASET_KEY
     )
-    dataset_key = scenario_key
     stratum = str(getattr(args, "stratum", "") or checkpoint_payload.get("stratum", "") or "")
     processed_dir = (
-        molecule_processed_path(dataset_key, stratum)
+        default_molecule_processed_dir(dataset_key, stratum)
         if getattr(args, "processed_dir", None) in (None, "")
         else resolve_project_path(str(args.processed_dir))
     )
@@ -787,11 +773,8 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
         dataset_key=dataset_key,
         stratum=stratum,
     )
-    solver_key = normalize_solver_key(str(args.solver_key))
-    target_nfe = int(args.target_nfe)
-    macro_steps = int(args.macro_steps)
-    realized_nfe = int(expected_realized_nfe(solver_key, target_nfe))
     nfe_role = str(getattr(args, "nfe_role", NFE_ROLE_SEEN))
+    scenario_key = str(getattr(args, "scenario_key", "") or dataset_key)
     rollout_steps = max(1, int(getattr(args, "rollout_steps", 16)))
     splits = build_molecule_dataset_splits(
         processed_dir=processed_dir,
@@ -845,7 +828,6 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
         history_coords = np.asarray(item.get("history_coords", []), dtype=np.float32)
         previous = history_coords[-2] if history_coords.ndim == 3 and history_coords.shape[0] >= 2 else None
         sample_metrics: List[Dict[str, float]] = []
-        first_horizon_metrics: List[Dict[str, float]] = []
         sample_kabsch: List[float] = []
         sample_rollouts: List[np.ndarray] = []
         for sample_idx in range(int(args.sample_count)):
@@ -854,9 +836,8 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
                 ds=ds,
                 history_coords=history_coords,
                 rollout_steps=rollout_steps,
-                target_nfe=int(target_nfe),
-                solver=str(solver_key),
-                time_grid=uniform_time_grid(solver_key, target_nfe),
+                nfe=nfe.runtime_nfe,
+                solver=nfe.solver_key,
                 device=device,
                 seed=int(args.seed) + 10_000 * int(dataset_idx) + int(sample_idx),
             )
@@ -874,7 +855,6 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
                 horizon_rows.setdefault(h + 1, []).append(metrics)
                 sample_kabsch.append(float(metrics["molecule_kabsch_rmsd_3d"]))
                 if h == 0:
-                    first_horizon_metrics.append(metrics)
                     is_transition = bool(item.get("transition_window", item["transition"]))
                     scopes = ["all_first_horizon", "transition_first_horizon" if is_transition else "clean_first_horizon"]
                     for scope in scopes:
@@ -904,12 +884,13 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
                 rollout_acceleration_horizon_rows.setdefault(int(horizon_key), []).append(
                     {"molecule_rollout_acceleration_norm_w1": float(value)}
                 )
-        if first_horizon_metrics:
-            all_rows.extend(first_horizon_metrics)
+        if sample_metrics:
+            first_sample = sample_metrics[0]
+            all_rows.append(first_sample)
             if bool(item.get("transition_window", item["transition"])):
-                transition_rows.extend(first_horizon_metrics)
+                transition_rows.append(first_sample)
             else:
-                clean_rows.extend(first_horizon_metrics)
+                clean_rows.append(first_sample)
             distribution_rows.append(
                 {
                     "molecule_kabsch_rmsd_3d_sample_mean": float(np.mean(sample_kabsch)),
@@ -931,16 +912,17 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
             np.stack(arrays["previous"], axis=0) if len(arrays["previous"]) == len(arrays["pred"]) else None,
         )
     summary: Dict[str, Any] = {
-        "checkpoint": display_project_path(checkpoint_path),
+        "checkpoint": _project_display_path(checkpoint_path),
+        "dataset_key": dataset_key,
         "scenario_key": scenario_key,
         "benchmark_family": SCENARIO_FAMILY_MOLECULE,
         "stratum": stratum,
         "split": split,
         "nfe_role": nfe_role,
-        "solver_key": solver_key,
-        "target_nfe": int(target_nfe),
-        "macro_steps": int(macro_steps),
-        "realized_nfe": int(realized_nfe),
+        "solver_key": nfe.solver_key,
+        "target_nfe": nfe.target_nfe,
+        "runtime_nfe": nfe.runtime_nfe,
+        "realized_nfe": nfe.realized_nfe,
         "examples": int(len(indices)),
         "sample_count": int(args.sample_count),
         "rollout_steps": int(rollout_steps),
@@ -966,38 +948,48 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
     return summary
 
 
+def _parse_csv(text: str) -> List[str]:
+    return [part.strip() for part in str(text).split(",") if part.strip()]
+
+
+def _parse_int_csv(text: str) -> List[int]:
+    return [int(part) for part in _parse_csv(text)]
+
+
 def _molecule_solver_cases(args: argparse.Namespace) -> List[Tuple[str, int, int]]:
-    solvers = normalize_solver_keys(str(args.solver_names))
+    solvers = normalize_solver_keys(str(getattr(args, "solver_names", "") or getattr(args, "solver", "euler")))
     role = str(getattr(args, "nfe_role", NFE_ROLE_SEEN) or NFE_ROLE_SEEN)
     raw_nfes = str(getattr(args, "target_nfe_values", "") or "").strip()
     if raw_nfes:
-        target_nfes = parse_int_csv(raw_nfes)
+        target_nfes = _parse_int_csv(raw_nfes)
+    elif str(getattr(args, "solver_names", "") or "").strip():
+        target_nfes = list(canonical_nfes_for_role(role))
     else:
-        target_nfes = list(target_nfes_for_role(role))
+        target_nfes = [int(getattr(args, "target_nfe", getattr(args, "nfe", 16)))]
     cases: List[Tuple[str, int, int]] = []
     for solver in solvers:
         for target_nfe in target_nfes:
-            macro_steps = solver_macro_steps(solver, int(target_nfe))
-            cases.append((solver, int(target_nfe), int(macro_steps)))
+            runtime_nfe = solver_macro_steps(solver, int(target_nfe))
+            cases.append((solver, int(target_nfe), int(runtime_nfe)))
     return cases
 
 
 def evaluate_molecule_checkpoint_grid(args: argparse.Namespace) -> Dict[str, Any]:
     cases = _molecule_solver_cases(args)
     evaluations: List[Dict[str, Any]] = []
-    for solver_key, target_nfe, macro_steps in cases:
+    for solver_key, target_nfe, runtime_nfe in cases:
         case_args = argparse.Namespace(**vars(args))
         case_args.solver_key = str(solver_key)
         case_args.target_nfe = int(target_nfe)
-        case_args.macro_steps = int(macro_steps)
+        case_args.runtime_nfe = int(runtime_nfe)
         evaluations.append(evaluate_molecule_checkpoint(case_args))
     if len(evaluations) == 1:
         return evaluations[0]
     return {
         "benchmark_family": SCENARIO_FAMILY_MOLECULE,
-        "scenario_key": str(args.scenario_key),
+        "scenario_key": str(getattr(args, "scenario_key", "") or getattr(args, "dataset_key", DEFAULT_MOLECULE_DATASET_KEY)),
         "nfe_role": str(getattr(args, "nfe_role", NFE_ROLE_SEEN) or NFE_ROLE_SEEN),
-        "solver_keys": sorted({str(row["solver_key"]) for row in evaluations}, key=SUPPORTED_SOLVER_KEYS.index),
+        "solver_keys": sorted({str(row["solver_key"]) for row in evaluations}, key=CANONICAL_SOLVER_KEYS.index),
         "target_nfe_values": sorted({int(row["target_nfe"]) for row in evaluations}),
         "evaluation_count": int(len(evaluations)),
         "evaluations": evaluations,
@@ -1008,7 +1000,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate molecule 3D coordinate OTFlow checkpoints.")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--processed_dir", default=None)
-    parser.add_argument("--scenario_key", default=DEFAULT_MOLECULE_DATASET_KEY)
+    parser.add_argument("--dataset_key", default=DEFAULT_MOLECULE_DATASET_KEY)
     parser.add_argument("--stratum", default="")
     parser.add_argument("--split", default="val", choices=("val", "val_clean", "test", "test_clean"))
     parser.add_argument("--device", default="auto")
@@ -1017,7 +1009,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout_steps", type=int, default=16)
     parser.add_argument("--nfe_role", default=NFE_ROLE_SEEN)
     parser.add_argument("--target_nfe_values", default="")
-    parser.add_argument("--solver_names", default=",".join(SUPPORTED_SOLVER_KEYS))
+    parser.add_argument("--solver_names", default=",".join(CANONICAL_SOLVER_KEYS))
+    parser.add_argument("--nfe", type=int, default=16, help=argparse.SUPPRESS)
+    parser.add_argument("--solver", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--scenario_key", default="")
     parser.add_argument("--stride_eval", type=int, default=1)
     parser.add_argument("--val_max_batches", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)

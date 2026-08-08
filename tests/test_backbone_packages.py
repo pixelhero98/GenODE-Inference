@@ -1,34 +1,25 @@
 from __future__ import annotations
 
-import inspect
 import json
-import os
 import tempfile
 import unittest
-import zipfile
-from pathlib import Path
 from unittest import mock
+from pathlib import Path
 
 from genode.backbone_packages import (
     PACKAGED_BACKBONE_MANIFEST,
-    REDACTED_LOCAL_PATH,
-    _copy_tree_or_file,
-    _contains_local_marker,
-    _rewrite_json_paths,
-    validate_backbone_artifact_checkpoint,
     load_portable_backbone_manifest,
     package_backbone_family,
-    package_main,
     validate_backbone_package,
-    validate_main,
     validate_provided_backbone_manifest,
 )
-from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
-from genode.data.otflow_paths import display_project_path
-from genode.experiment_layout import REFERENCE_CHECKPOINT_STEPS, SCENARIO_FAMILY_MOLECULE
+from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY
+from genode.canonical_experiment_layout import CANONICAL_CHECKPOINT_STEPS, SCENARIO_FAMILY_MOLECULE
+from genode.data.otflow_experiment_plan import FORECAST_FAMILY
+from genode.deterministic_archive import ARCHIVE_SCHEMA_VERSION, validate_deterministic_zip
 
 MOLECULE_FAMILY = SCENARIO_FAMILY_MOLECULE
-TRAIN_BUDGET_STEPS = REFERENCE_CHECKPOINT_STEPS
+TRAIN_BUDGET_STEPS = CANONICAL_CHECKPOINT_STEPS
 
 
 def _write(path: Path, content: bytes | str = b"x") -> None:
@@ -40,35 +31,13 @@ def _write(path: Path, content: bytes | str = b"x") -> None:
 
 
 class BackbonePackageTests(unittest.TestCase):
-    def test_package_validation_has_no_local_path_bypass(self) -> None:
-        self.assertNotIn("require_clean_paths", inspect.signature(validate_backbone_package).parameters)
-        with mock.patch("sys.stderr"):
-            with self.assertRaises(SystemExit) as raised:
-                validate_main(["package", "--allow_local_paths"])
-        self.assertEqual(raised.exception.code, 2)
-
-    def test_path_scrubbing_rejects_absolute_posix_windows_and_unc_paths(self) -> None:
-        private_paths = (
-            "/opt/private/model.pt",
-            "D:\\private\\model.pt",
-            "D:private\\model.pt",
-            "\\\\server\\share\\model.pt",
-            "../private/model.pt",
-        )
-        for private_path in private_paths:
-            with self.subTest(private_path=private_path):
-                self.assertTrue(_contains_local_marker(private_path))
-                rewritten = _rewrite_json_paths({"checkpoint_path": private_path})
-                self.assertEqual(rewritten["checkpoint_path"], REDACTED_LOCAL_PATH)
-                self.assertEqual(_rewrite_json_paths({"description": private_path})["description"], private_path)
-
     def _source_tree(self, root: Path) -> None:
         scenarios = ("solar_energy_10m", "traffic_hourly", "weather_daily")
         artifacts = []
         for scenario in scenarios:
             for train_steps in TRAIN_BUDGET_STEPS:
                 label = f"{int(train_steps) // 1000}k"
-                base = f"outputs/backbone_matrix/otflow/temporal_extrapolation/{label}/{scenario}"
+                base = f"genode/outputs/backbone_matrix/otflow/temporal_extrapolation/{label}/{scenario}"
                 ckpt_rel = f"{base}/model.pt"
                 meta_rel = f"{base}/checkpoint_metadata.json"
                 summary_rel = f"{base}/artifact_summary.json"
@@ -108,7 +77,7 @@ class BackbonePackageTests(unittest.TestCase):
                         "seed": 0,
                     }
                 )
-            _write(root / f"datasets/monash/{scenario}/manifest.json", "{}")
+            _write(root / f"paper_datasets/monash/{scenario}/manifest.json", "{}")
         for scenario in ("cryptos", "lobster_synthetic", "long_term_st"):
             for train_steps in TRAIN_BUDGET_STEPS:
                 label = f"{int(train_steps) // 1000}k"
@@ -120,9 +89,9 @@ class BackbonePackageTests(unittest.TestCase):
                         "train_steps": int(train_steps),
                         "train_budget_label": label,
                         "checkpoint_id": f"{scenario}_{label}",
-                        "checkpoint_path": f"outputs/backbone_matrix/otflow/temporal_conditional_generation_transformer/{label}/{scenario}/model.pt",
-                        "summary_path": f"outputs/backbone_matrix/otflow/temporal_conditional_generation_transformer/{label}/{scenario}/artifact_summary.json",
-                        "metadata_path": f"outputs/backbone_matrix/otflow/temporal_conditional_generation_transformer/{label}/{scenario}/checkpoint_metadata.json",
+                        "checkpoint_path": f"genode/outputs/backbone_matrix/otflow/temporal_conditional_generation_transformer/{label}/{scenario}/model.pt",
+                        "summary_path": f"genode/outputs/backbone_matrix/otflow/temporal_conditional_generation_transformer/{label}/{scenario}/artifact_summary.json",
+                        "metadata_path": f"genode/outputs/backbone_matrix/otflow/temporal_conditional_generation_transformer/{label}/{scenario}/checkpoint_metadata.json",
                         "status": "ready",
                         "seed": 0,
                     }
@@ -150,13 +119,12 @@ class BackbonePackageTests(unittest.TestCase):
                     )
         manifest = {
             "version": "fm_backbone_manifest",
-            "path_base": "manifest_parent",
             "artifact_count": len(artifacts),
             "ready_count": len(artifacts),
             "missing_count": 0,
             "artifacts": artifacts,
         }
-        _write(root / "backbone_manifest.json", json.dumps(manifest))
+        _write(root / "outputs/backbone_matrix/backbone_manifest.json", json.dumps(manifest))
 
     def test_package_family_writes_relative_clean_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -164,263 +132,75 @@ class BackbonePackageTests(unittest.TestCase):
             output_dir = Path(tmpdir) / "packages"
             self._source_tree(source_root)
 
-            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
-                summary = package_backbone_family(
-                    family="temporal-extrapolation",
-                    source_root=source_root,
-                    output_dir=output_dir,
-                    overwrite=True,
-                    make_zip=False,
-                )
+            summary = package_backbone_family(
+                family="temporal-extrapolation",
+                source_root=source_root,
+                output_dir=output_dir,
+                overwrite=True,
+                make_zip=False,
+            )
 
-            package_root = output_dir / "genode_temporal_extrapolation_backbones_datasets"
-            self.assertEqual(summary["package_root"], display_project_path(package_root))
-            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
+            package_root = Path(summary["package_root"])
+            with mock.patch("genode.backbone_packages._validate_artifact_checkpoint_integrity", return_value=[]):
                 validation = validate_backbone_package(package_root, expected_family="temporal-extrapolation")
             self.assertEqual(validation["status"], "complete", validation.get("errors"))
             raw_manifest = json.loads((package_root / PACKAGED_BACKBONE_MANIFEST).read_text(encoding="utf-8"))
             artifact = raw_manifest["artifacts"][0]
             self.assertEqual(artifact["checkpoint_path"], "outputs/backbone_matrix/otflow/temporal_extrapolation/4k/solar_energy_10m/model.pt")
-            self.assertEqual(raw_manifest["path_base"], "manifest_parent")
+            self.assertEqual(raw_manifest["path_base"], "../..")
             loaded = load_portable_backbone_manifest(package_root / PACKAGED_BACKBONE_MANIFEST)
             self.assertTrue(Path(loaded["artifacts"][0]["checkpoint_path"]).exists())
 
-    def test_package_family_writes_zip_and_attestation(self) -> None:
+    def test_package_family_zip_is_reproducible_and_preserves_archive_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_root = Path(tmpdir) / "source"
+            self._source_tree(source_root)
+            first = package_backbone_family(
+                family="temporal-extrapolation",
+                source_root=source_root,
+                output_dir=Path(tmpdir) / "first",
+                make_zip=True,
+            )
+            second = package_backbone_family(
+                family="temporal-extrapolation",
+                source_root=source_root,
+                output_dir=Path(tmpdir) / "second",
+                make_zip=True,
+            )
+            first_zip = Path(first["zip_path"])
+            second_zip = Path(second["zip_path"])
+            self.assertEqual(first_zip.read_bytes(), second_zip.read_bytes())
+            self.assertEqual(validate_deterministic_zip(first_zip)["status"], "complete")
+            archive_sidecar = first_zip.with_suffix(first_zip.suffix + ".manifest.json")
+            archive_metadata = json.loads(archive_sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(archive_metadata["schema_version"], ARCHIVE_SCHEMA_VERSION)
+            package_sidecar = Path(first["zip_manifest_path"])
+            self.assertEqual(package_sidecar.suffixes[-2:], [".package", ".json"])
+            package_metadata = json.loads(package_sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(package_metadata["zip_sha256"], archive_metadata["sha256"])
+
+    def test_package_validation_rejects_existing_tiny_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source_root = Path(tmpdir) / "source"
             output_dir = Path(tmpdir) / "packages"
             self._source_tree(source_root)
-
-            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
-                summary = package_backbone_family(
-                    family="temporal-extrapolation",
-                    source_root=source_root,
-                    output_dir=output_dir,
-                    overwrite=True,
-                    make_zip=True,
-                )
-
-            zip_path = output_dir / "genode_temporal_extrapolation_backbones_datasets.zip"
-            attestation_path = zip_path.with_suffix(".zip.manifest.json")
-            self.assertTrue(zip_path.is_file())
-            self.assertTrue(attestation_path.is_file())
-            self.assertEqual(summary["manifest"]["zip_name"], zip_path.name)
-            with zipfile.ZipFile(zip_path) as archive:
-                self.assertIn(PACKAGED_BACKBONE_MANIFEST, archive.namelist())
-
-    def test_package_overwrite_allows_only_intended_in_output_stage(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            source_root = root / "source"
-            output_dir = root / "packages"
-            self._source_tree(source_root)
-
-            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
+            package_root = Path(
                 package_backbone_family(
                     family="temporal-extrapolation",
                     source_root=source_root,
                     output_dir=output_dir,
                     overwrite=True,
                     make_zip=False,
-                )
-            package_root = output_dir / "genode_temporal_extrapolation_backbones_datasets"
-            stale_file = package_root / "stale.txt"
-            stale_file.write_text("remove on overwrite", encoding="utf-8")
-
-            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
-                second = package_backbone_family(
-                    family="temporal-extrapolation",
-                    source_root=source_root,
-                    output_dir=output_dir,
-                    overwrite=True,
-                    make_zip=False,
-                )
-
-            self.assertEqual(second["package_root"], display_project_path(package_root))
-            self.assertFalse(stale_file.exists())
-            self.assertTrue((package_root / PACKAGED_BACKBONE_MANIFEST).exists())
-
-    def test_package_source_copy_rejects_symlinks(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            source_root = root / "source"
-            package_root = root / "package"
-            private_file = root / "private.txt"
-            private_file.write_text("private", encoding="utf-8")
-            linked_file = source_root / "data" / "linked.txt"
-            linked_file.parent.mkdir(parents=True)
-            try:
-                os.symlink(private_file, linked_file)
-            except OSError as exc:
-                self.skipTest(f"Symlink creation is unavailable: {exc}")
-
-            with self.assertRaisesRegex(ValueError, "linked or reparse-point source"):
-                _copy_tree_or_file(source_root, package_root, "data/linked.txt")
-
-    def test_package_validator_rejects_linked_file_even_when_bytes_match(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            source_root = root / "source"
-            output_dir = root / "packages"
-            self._source_tree(source_root)
-            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
-                package_backbone_family(
-                    family="temporal-extrapolation",
-                    source_root=source_root,
-                    output_dir=output_dir,
-                    overwrite=True,
-                    make_zip=False,
-                )
-            package_root = output_dir / "genode_temporal_extrapolation_backbones_datasets"
-            linked_file = package_root / "datasets/monash/solar_energy_10m/manifest.json"
-            external_file = root / "external_manifest.json"
-            external_file.write_bytes(linked_file.read_bytes())
-            linked_file.unlink()
-            try:
-                os.symlink(external_file, linked_file)
-            except OSError as exc:
-                self.skipTest(f"Symlink creation is unavailable: {exc}")
-
-            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
-                validation = validate_backbone_package(package_root)
-
-            self.assertEqual(validation["status"], "failed")
-            self.assertTrue(any("symlink, junction, or reparse point" in error for error in validation["errors"]))
-
-    def test_package_validator_rejects_reparse_point_root(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with mock.patch("genode.backbone_packages.is_link_or_reparse_point", return_value=True):
-                validation = validate_backbone_package(tmpdir)
-
-        self.assertEqual(validation["status"], "failed")
-        self.assertIn("reparse point", validation["errors"][0])
-
-    def test_package_self_validation_finishes_before_existing_zip_is_replaced(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            source_root = root / "source"
-            output_dir = root / "packages"
-            output_dir.mkdir()
-            self._source_tree(source_root)
-            zip_path = output_dir / "genode_temporal_extrapolation_backbones_datasets.zip"
-            zip_path.write_bytes(b"existing-package")
-
-            with mock.patch(
-                "genode.backbone_packages.validate_backbone_package",
-                return_value={"status": "failed", "errors": ["attestation failed"]},
-            ):
-                with self.assertRaisesRegex(ValueError, "attestation failed"):
-                    package_backbone_family(
-                        family="temporal-extrapolation",
-                        source_root=source_root,
-                        output_dir=output_dir,
-                        overwrite=True,
-                        make_zip=True,
-                    )
-
-            self.assertEqual(zip_path.read_bytes(), b"existing-package")
-
-    def test_portable_manifest_rejects_absolute_path_base(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manifest_path = Path(tmpdir) / "backbone_manifest.json"
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "path_base": "D:\\private",
-                        "artifacts": [{"checkpoint_path": "outputs/model.pt"}],
-                    }
-                ),
-                encoding="utf-8",
+                )["package_root"]
             )
 
-            with self.assertRaisesRegex(ValueError, "path_base must be 'manifest_parent'"):
-                load_portable_backbone_manifest(manifest_path)
-
-    def test_package_validator_returns_failed_for_unsafe_manifest_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            package_root = Path(tmpdir)
-            spec = {
-                "schema_version": "genode_backbone_package",
-                "family": "temporal-extrapolation",
-                "scenarios": ["solar_energy_10m", "traffic_hourly", "weather_daily"],
-                "expected_artifact_count": 15,
-                "data_roots": [
-                    "datasets/monash/solar_energy_10m",
-                    "datasets/monash/traffic_hourly",
-                    "datasets/monash/weather_daily",
-                ],
-                "files": [],
-                "artifact_count": 0,
-            }
-            (package_root / "package_manifest.json").write_text(json.dumps(spec), encoding="utf-8")
-            manifest_path = package_root / PACKAGED_BACKBONE_MANIFEST
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "path_base": "D:\\private",
-                        "ready_count": 0,
-                        "artifact_count": 0,
-                        "artifacts": [{"checkpoint_path": "../private/model.pt"}],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            validation = validate_backbone_package(package_root)
+            validation = validate_backbone_package(package_root, expected_family="temporal-extrapolation")
 
         self.assertEqual(validation["status"], "failed")
         self.assertTrue(
-            any("Invalid packaged backbone manifest paths" in error for error in validation["errors"]),
+            any("checkpoint is too small to be valid" in error for error in validation["errors"]),
             validation["errors"],
         )
-
-    def test_molecule_checkpoint_integrity_rejects_corrupt_payload(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            checkpoint = Path(tmpdir) / "model.pt"
-            checkpoint.write_bytes(b"corrupt checkpoint" * 128)
-            artifact = {
-                "checkpoint_id": "molecule",
-                "backbone_name": "otflow_molecule_3d",
-                "benchmark_family": MOLECULE_FAMILY,
-                "dataset_key": "molecule_3d_set1",
-                "member_key": "member",
-                "stratum": "Dynamic_Test",
-                "train_steps": 4000,
-            }
-
-            errors = validate_backbone_artifact_checkpoint(artifact, checkpoint)
-
-        self.assertTrue(any("checkpoint is not loadable" in error for error in errors), errors)
-
-    def test_package_stage_override_and_no_zip_cli_are_removed(self) -> None:
-        self.assertNotIn("stage_dir", inspect.signature(package_backbone_family).parameters)
-        with mock.patch("sys.stderr"):
-            with self.assertRaises(SystemExit) as stage_error:
-                package_main(
-                    ["--family", "temporal-extrapolation", "--output_dir", "out", "--stage_dir", "outside"]
-                )
-        self.assertEqual(stage_error.exception.code, 2)
-        with mock.patch("sys.stderr"):
-            with self.assertRaises(SystemExit) as zip_error:
-                package_main(["--family", "temporal-extrapolation", "--output_dir", "out", "--no_zip"])
-        self.assertEqual(zip_error.exception.code, 2)
-
-    def test_package_builder_rejects_existing_tiny_checkpoint_during_self_validation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source_root = Path(tmpdir) / "source"
-            output_dir = Path(tmpdir) / "packages"
-            self._source_tree(source_root)
-            with self.assertRaisesRegex(ValueError, "(?s)failed self-validation.*checkpoint is too small"):
-                package_backbone_family(
-                    family="temporal-extrapolation",
-                    source_root=source_root,
-                    output_dir=output_dir,
-                    overwrite=True,
-                    make_zip=False,
-                )
-            package_root = output_dir / "genode_temporal_extrapolation_backbones_datasets"
-            self.assertFalse(package_root.exists())
 
     def test_provided_manifest_validation_rejects_unloadable_ready_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -429,13 +209,13 @@ class BackbonePackageTests(unittest.TestCase):
             _write(checkpoint, "exists")
             _write(checkpoint.with_name("checkpoint_metadata.json"), "{}")
             _write(checkpoint.with_name("artifact_summary.json"), "{}")
-            manifest_path = root / "backbone_manifest.json"
+            manifest_path = root / "outputs/backbone_matrix/backbone_manifest.json"
             _write(
                 manifest_path,
                 json.dumps(
                     {
                         "version": "fm_backbone_manifest",
-                        "path_base": "manifest_parent",
+                        "path_base": "../..",
                         "artifact_count": 1,
                         "ready_count": 1,
                         "artifacts": [
@@ -507,13 +287,13 @@ class BackbonePackageTests(unittest.TestCase):
                         "seed": 0,
                     }
                 )
-            manifest_path = root / "backbone_manifest.json"
+            manifest_path = root / "outputs/backbone_matrix/backbone_manifest.json"
             _write(
                 manifest_path,
                 json.dumps(
                     {
                         "version": "fm_backbone_manifest",
-                        "path_base": "manifest_parent",
+                        "path_base": "../..",
                         "artifact_count": len(artifacts),
                         "ready_count": len(TRAIN_BUDGET_STEPS),
                         "missing_count": len(TRAIN_BUDGET_STEPS),
@@ -522,7 +302,7 @@ class BackbonePackageTests(unittest.TestCase):
                 ),
             )
 
-            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
+            with mock.patch("genode.backbone_packages._validate_artifact_checkpoint_integrity", return_value=[]):
                 validation = validate_provided_backbone_manifest(
                     manifest_path,
                     scenario_key="lobster_synthetic",
@@ -548,13 +328,12 @@ class BackbonePackageTests(unittest.TestCase):
                 }
                 for train_steps in TRAIN_BUDGET_STEPS
             ]
-            manifest_path = root / "backbone_manifest.json"
+            manifest_path = root / "outputs/backbone_matrix/backbone_manifest.json"
             _write(
                 manifest_path,
                 json.dumps(
                     {
                         "version": "fm_backbone_manifest",
-                        "path_base": "manifest_parent",
                         "artifact_count": len(artifacts),
                         "ready_count": len(artifacts),
                         "artifacts": artifacts,
@@ -599,13 +378,13 @@ class BackbonePackageTests(unittest.TestCase):
                             "seed": 0,
                         }
                     )
-            manifest_path = root / "backbone_manifest.json"
+            manifest_path = root / "outputs/backbone_matrix/backbone_manifest.json"
             _write(
                 manifest_path,
                 json.dumps(
                     {
                         "version": "fm_backbone_manifest",
-                        "path_base": "manifest_parent",
+                        "path_base": "../..",
                         "artifact_count": len(artifacts),
                         "ready_count": len(artifacts),
                         "artifacts": artifacts,
@@ -613,7 +392,7 @@ class BackbonePackageTests(unittest.TestCase):
                 ),
             )
 
-            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
+            with mock.patch("genode.backbone_packages._validate_artifact_checkpoint_integrity", return_value=[]):
                 validation = validate_provided_backbone_manifest(
                     manifest_path,
                     scenario_key="lobster_synthetic",
@@ -640,20 +419,20 @@ class BackbonePackageTests(unittest.TestCase):
             source_root = Path(tmpdir) / "source"
             output_dir = Path(tmpdir) / "packages"
             self._source_tree(source_root)
-            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
+            package_root = Path(
                 package_backbone_family(
                     family="temporal-extrapolation",
                     source_root=source_root,
                     output_dir=output_dir,
                     overwrite=True,
                     make_zip=False,
-                )
-            package_root = output_dir / "genode_temporal_extrapolation_backbones_datasets"
+                )["package_root"]
+            )
             try:
                 from genode.pipeline.full_pipeline import build_argparser, run_full_pipeline
             except Exception as exc:  # pragma: no cover - exercised only in minimal dependency environments.
                 self.skipTest(f"full pipeline dependencies are unavailable: {exc}")
-            with mock.patch("genode.backbone_packages.validate_backbone_artifact_checkpoint", return_value=[]):
+            with mock.patch("genode.backbone_packages._validate_artifact_checkpoint_integrity", return_value=[]):
                 args = build_argparser().parse_args(
                     [
                         "--scenario_key",

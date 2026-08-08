@@ -13,7 +13,7 @@ from zipfile import ZipFile
 import numpy as np
 import torch
 
-from genode.data.otflow_paths import display_project_path, resolve_project_path
+from genode.data.otflow_paths import project_root, resolve_project_path
 from genode.models.config import OTFlowConfig
 from genode.path_safety import portable_relative_path, resolve_portable_relative_path
 
@@ -146,13 +146,21 @@ def _clean_optional_stratum(value: str | None) -> str:
     return text
 
 
-def molecule_raw_zip_path(dataset_key: str | None = None, stratum: str | None = None) -> Path:
+def _project_display_path(path: str | Path) -> str:
+    resolved = Path(path).expanduser().resolve()
+    try:
+        return resolved.relative_to(project_root()).as_posix()
+    except ValueError:
+        return resolved.name
+
+
+def default_molecule_raw_zip(dataset_key: str | None = None, stratum: str | None = None) -> Path:
     del stratum
     key = _clean_path_token(dataset_key, label="dataset_key", default=DEFAULT_MOLECULE_DATASET_KEY)
     return resolve_project_path(Path("data") / MOLECULE_BENCHMARK_FAMILY / key / "raw" / f"{key}.zip")
 
 
-def molecule_processed_path(dataset_key: str | None = None, stratum: str | None = None) -> Path:
+def default_molecule_processed_dir(dataset_key: str | None = None, stratum: str | None = None) -> Path:
     key = _clean_path_token(dataset_key, label="dataset_key", default=DEFAULT_MOLECULE_DATASET_KEY)
     root = resolve_project_path(Path("data") / MOLECULE_BENCHMARK_FAMILY / key / "processed")
     stratum_name = _clean_optional_stratum(stratum)
@@ -165,7 +173,7 @@ def molecule_processed_npz_path(
     dataset_key: str | None = None,
     stratum: str | None = None,
 ) -> Path:
-    root = molecule_processed_path(dataset_key, stratum) if processed_dir is None else resolve_project_path(processed_dir)
+    root = default_molecule_processed_dir(dataset_key, stratum) if processed_dir is None else resolve_project_path(processed_dir)
     return root / "molecule_3d_dataset.npz"
 
 
@@ -175,7 +183,7 @@ def molecule_processed_metadata_path(
     dataset_key: str | None = None,
     stratum: str | None = None,
 ) -> Path:
-    root = molecule_processed_path(dataset_key, stratum) if processed_dir is None else resolve_project_path(processed_dir)
+    root = default_molecule_processed_dir(dataset_key, stratum) if processed_dir is None else resolve_project_path(processed_dir)
     return root / "molecule_3d_metadata.json"
 
 
@@ -330,19 +338,19 @@ def discover_molecule_xyz_strata(zip_path: str | Path) -> Dict[str, Dict[str, An
     return summaries
 
 
-def molecule_group_root() -> Path:
+def default_molecule_group_root() -> Path:
     return resolve_project_path(Path("data") / MOLECULE_GROUP_ROOT_NAME)
 
 
-def molecule_group_manifest_path(dataset_key: str, group_root: str | Path | None = None) -> Path:
+def default_molecule_group_manifest_path(dataset_key: str, group_root: str | Path | None = None) -> Path:
     key = _clean_path_token(dataset_key, label="dataset_key")
-    root = molecule_group_root() if group_root is None else resolve_project_path(group_root)
+    root = default_molecule_group_root() if group_root is None else resolve_project_path(group_root)
     return root / key / "group_manifest.json"
 
 
 def _source_zip_display_name(zip_path: str | Path) -> str:
     name = Path(zip_path).expanduser().resolve().name
-    portable_relative_path(name, label="molecule source archive name")
+    _molecule_source_archive_name(name)
     return name
 
 
@@ -452,7 +460,7 @@ def write_molecule_group_manifests(
     dataset_keys: Sequence[str] = MOLECULE_GROUP_DATASET_KEYS,
 ) -> Dict[str, Any]:
     grouping = build_balanced_molecule_stratum_groups(zip_paths, dataset_keys=dataset_keys)
-    root = molecule_group_root() if group_root is None else resolve_project_path(group_root)
+    root = default_molecule_group_root() if group_root is None else resolve_project_path(group_root)
     manifest_paths: Dict[str, str] = {}
     for group in grouping["groups"]:
         dataset_key = str(group["dataset_key"])
@@ -473,7 +481,7 @@ def write_molecule_group_manifests(
             },
         }
         manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        manifest_paths[dataset_key] = display_project_path(manifest_path)
+        manifest_paths[dataset_key] = _project_display_path(manifest_path)
     return {
         "manifest_paths": manifest_paths,
         "grouping": grouping,
@@ -481,7 +489,7 @@ def write_molecule_group_manifests(
 
 
 def load_molecule_group_manifest(dataset_key: str, group_root: str | Path | None = None) -> Dict[str, Any]:
-    manifest_path = molecule_group_manifest_path(dataset_key, group_root)
+    manifest_path = default_molecule_group_manifest_path(dataset_key, group_root)
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     expected_key = _clean_path_token(dataset_key, label="dataset_key")
     if str(payload.get("dataset_key")) != expected_key:
@@ -490,14 +498,15 @@ def load_molecule_group_manifest(dataset_key: str, group_root: str | Path | None
     if not isinstance(rows, list):
         raise ValueError("Molecule group manifest strata must be a list.")
     dataset_root = manifest_path.parent.resolve()
-    for idx, row in enumerate(rows):
+    for row_index, row in enumerate(rows):
         if not isinstance(row, Mapping):
-            raise ValueError(f"Molecule group manifest strata[{idx}] must be an object.")
+            raise ValueError(f"Molecule group manifest strata[{row_index}] must be an object.")
         processed_dir = _molecule_processed_dir(row.get("processed_dir"))
         resolve_portable_relative_path(
             dataset_root,
             processed_dir.as_posix(),
             label="Molecule group manifest processed_dir",
+            reject_links=True,
         )
         _molecule_source_archive_name(row.get("source_zip_name"))
         _clean_path_token(str(row.get("member_key", "")), label="member_key")
@@ -511,7 +520,7 @@ def load_molecule_group_manifest(dataset_key: str, group_root: str | Path | None
 
 
 def trainable_molecule_group_members(manifest: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """Return validated fixed-shape trainable members from a group manifest."""
+    """Return canonical fixed-shape trainable members from a group manifest."""
 
     members: List[Dict[str, Any]] = []
     for raw_member in manifest.get("strata", []):
@@ -550,18 +559,24 @@ def prepare_molecule_xyz_group_datasets(
             raise ValueError(f"Duplicate molecule source archive name: {source_zip_name!r}.")
         zip_by_name[source_zip_name] = Path(path).expanduser().resolve()
     manifest_summary = write_molecule_group_manifests(zip_paths, group_root, dataset_keys=dataset_keys)
-    root = molecule_group_root() if group_root is None else resolve_project_path(group_root)
+    root = default_molecule_group_root() if group_root is None else resolve_project_path(group_root)
     prepared: Dict[str, Any] = {}
     for dataset_key in manifest_summary["grouping"]["dataset_keys"]:
         manifest = load_molecule_group_manifest(str(dataset_key), root)
         rows: Dict[str, Any] = {}
         for member_idx, member in enumerate(trainable_molecule_group_members(manifest)):
             source_zip = zip_by_name[str(member["source_zip_name"])]
-            dataset_root = resolve_portable_relative_path(root, str(dataset_key), label="molecule dataset_key")
+            dataset_root = resolve_portable_relative_path(
+                root,
+                str(dataset_key),
+                label="molecule dataset_key",
+                reject_links=True,
+            )
             processed_dir = resolve_portable_relative_path(
                 dataset_root,
                 str(member["processed_dir"]),
                 label="Molecule group manifest processed_dir",
+                reject_links=True,
             )
             rows[str(member["member_key"])] = prepare_molecule_xyz_zip(
                 source_zip,
@@ -573,7 +588,7 @@ def prepare_molecule_xyz_group_datasets(
             )
         prepared[str(dataset_key)] = {
             "dataset_key": str(dataset_key),
-            "manifest_path": display_project_path(molecule_group_manifest_path(str(dataset_key), root)),
+            "manifest_path": _project_display_path(default_molecule_group_manifest_path(str(dataset_key), root)),
             "prepared_strata": rows,
         }
     return {
@@ -759,7 +774,7 @@ def prepare_molecule_xyz_zip(
     zip_path = Path(zip_path).expanduser().resolve()
     if not zip_path.exists():
         raise FileNotFoundError(f"Missing molecule trajectory zip: {zip_path}")
-    out_dir = molecule_processed_path(key, stratum_name) if processed_dir is None else resolve_project_path(processed_dir)
+    out_dir = default_molecule_processed_dir(key, stratum_name) if processed_dir is None else resolve_project_path(processed_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_coords: List[np.ndarray] = []
@@ -897,7 +912,7 @@ def prepare_molecule_xyz_all_strata(
     split_seed: int = DEFAULT_MOLECULE_SPLIT_SEED,
 ) -> Dict[str, Any]:
     key = _clean_path_token(dataset_key, label="dataset_key", default=DEFAULT_MOLECULE_DATASET_KEY)
-    root = molecule_processed_path(key, None) if processed_root is None else resolve_project_path(processed_root)
+    root = default_molecule_processed_dir(key, None) if processed_root is None else resolve_project_path(processed_root)
     strata = discover_molecule_xyz_strata(zip_path)
     summaries: Dict[str, Any] = {}
     for stratum_key, summary in strata.items():
@@ -920,7 +935,7 @@ def prepare_molecule_xyz_all_strata(
         raise ValueError("No molecule strata matched the requested include/exclude patterns.")
     return {
         "dataset_key": key,
-        "processed_root": display_project_path(root),
+        "processed_root": _project_display_path(root),
         "strata": summaries,
     }
 
@@ -1012,7 +1027,7 @@ def ensure_molecule_processed(
             )
     if not prepare:
         raise FileNotFoundError(f"Missing processed molecule dataset: {npz_path}. Re-run with --prepare_data.")
-    raw_zip = molecule_raw_zip_path(dataset_key, stratum) if zip_path is None else zip_path
+    raw_zip = default_molecule_raw_zip(dataset_key, stratum) if zip_path is None else zip_path
     return prepare_molecule_xyz_zip(
         raw_zip,
         processed_dir,
@@ -1657,7 +1672,7 @@ def build_molecule_group_dataset_splits(
     stride_eval: int = 1,
 ) -> Dict[str, Any]:
     manifest = load_molecule_group_manifest(dataset_key, group_root)
-    root = molecule_group_root() if group_root is None else resolve_project_path(group_root)
+    root = default_molecule_group_root() if group_root is None else resolve_project_path(group_root)
     base_cfg = OTFlowConfig() if cfg is None else cfg
     strata: Dict[str, Any] = {}
     aggregate: Dict[str, Any] = {
@@ -1670,11 +1685,17 @@ def build_molecule_group_dataset_splits(
     }
     for member in manifest.get("strata", []):
         member_key = str(member["member_key"])
-        dataset_root = resolve_portable_relative_path(root, str(dataset_key), label="molecule dataset_key")
+        dataset_root = resolve_portable_relative_path(
+            root,
+            str(dataset_key),
+            label="molecule dataset_key",
+            reject_links=True,
+        )
         processed_dir = resolve_portable_relative_path(
             dataset_root,
             str(member["processed_dir"]),
             label="Molecule group manifest processed_dir",
+            reject_links=True,
         )
         atom_count = int(member["atom_count"])
         member_cfg = configure_molecule_otflow(
@@ -1728,10 +1749,10 @@ __all__ = [
     "build_molecule_dataset_splits",
     "build_molecule_group_dataset_splits",
     "configure_molecule_otflow",
-    "molecule_group_manifest_path",
-    "molecule_group_root",
-    "molecule_processed_path",
-    "molecule_raw_zip_path",
+    "default_molecule_group_manifest_path",
+    "default_molecule_group_root",
+    "default_molecule_processed_dir",
+    "default_molecule_raw_zip",
     "discover_trainable_molecule_strata",
     "discover_molecule_xyz_strata",
     "ensure_molecule_processed",

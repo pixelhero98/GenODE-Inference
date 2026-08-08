@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 from numbers import Integral
+import re
 from typing import Any, Mapping, Sequence
 
 import torch
+
+from genode.solver_protocol import (
+    SolverNFEFields,
+    normalize_solver_nfe_fields as _normalize_snapshot_solver_nfe_fields,
+)
+
+
+_INTEGER_TEXT = re.compile(r"[+-]?\d+")
 
 
 def validate_strict_integer(
@@ -23,6 +32,80 @@ def validate_strict_integer(
     if maximum is not None and integer > int(maximum):
         raise ValueError(f"{label} must be at most {int(maximum)}, got {integer}.")
     return integer
+
+
+def _strict_positive_solver_integer(
+    value: object,
+    *,
+    field: str,
+    source: str,
+    optional: bool,
+) -> int | None:
+    if value is None:
+        if optional:
+            return None
+        raise ValueError(f"{source} requires {field}.")
+    if isinstance(value, str):
+        text = value.strip()
+        if not text and optional:
+            return None
+        if _INTEGER_TEXT.fullmatch(text) is None:
+            raise ValueError(f"{source} has non-integer {field}={value!r}.")
+        parsed = int(text)
+    elif isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{source} has non-integer {field}={value!r}.")
+    else:
+        parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{source} requires positive {field}; got {parsed}.")
+    return parsed
+
+
+def normalize_strict_solver_nfe_fields(
+    solver_key: str,
+    target_nfe: object,
+    *,
+    macro_steps: object = None,
+    runtime_nfe: object = None,
+    realized_nfe: object = None,
+    source: str = "row",
+) -> SolverNFEFields:
+    """Apply strict integer validation before the snapshot solver normalizer."""
+
+    target = _strict_positive_solver_integer(
+        target_nfe,
+        field="target_nfe",
+        source=source,
+        optional=False,
+    )
+    if target is None:  # Narrow the helper's return type for type checkers.
+        raise RuntimeError("target_nfe unexpectedly became unavailable.")
+    parsed_macro = _strict_positive_solver_integer(
+        macro_steps,
+        field="macro_steps",
+        source=source,
+        optional=True,
+    )
+    parsed_runtime = _strict_positive_solver_integer(
+        runtime_nfe,
+        field="runtime_nfe",
+        source=source,
+        optional=True,
+    )
+    parsed_realized = _strict_positive_solver_integer(
+        realized_nfe,
+        field="realized_nfe",
+        source=source,
+        optional=True,
+    )
+    return _normalize_snapshot_solver_nfe_fields(
+        solver_key,
+        target,
+        macro_steps=parsed_macro,
+        runtime_nfe=parsed_runtime,
+        realized_nfe=parsed_realized,
+        source=source,
+    )
 
 
 def validate_tensor_state_dict(
@@ -124,6 +207,7 @@ def validate_locked_test_exclusion(
 
 
 __all__ = [
+    "normalize_strict_solver_nfe_fields",
     "validate_locked_test_exclusion",
     "validate_strict_integer",
     "validate_tensor_state_dict",

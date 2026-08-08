@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -14,23 +15,16 @@ from genode.data.molecule_xyz import (
     MoleculeWindowDataset,
     build_molecule_dataset_splits,
     configure_molecule_otflow,
-    molecule_processed_path,
+    default_molecule_processed_dir,
     ensure_molecule_processed,
 )
-from genode.data.otflow_paths import (
-    display_project_path,
-    project_outputs_root,
-    resolve_project_path,
-)
+from genode.data.otflow_paths import project_outputs_root, project_root, resolve_project_path
 from genode.evaluation.fm_backbone_registry import materialize_backbone_manifest
 from genode.models.config import OTFlowConfig
 from genode.models.otflow_train_val import evaluate_average_loss, save_json, seed_all, train_loop
 from genode.runtime import resolve_torch_device
-from genode.training.train_backbone import (
-    _clone_state_dict_cpu,
-    _json_ready_stats,
-    checkpoint_config_for_budget,
-)
+from genode.solver_protocol import CANONICAL_SOLVER_KEYS, normalize_solver_key
+from genode.training.train_backbone import _clone_state_dict_cpu, _json_ready_stats
 
 
 DEFAULT_HISTORY_LEN = 16
@@ -44,12 +38,12 @@ def molecule_artifact_root(
     out_dir: str | Path | None,
     variant: str,
     train_steps: int,
-    scenario_key: str = DEFAULT_MOLECULE_DATASET_KEY,
+    dataset_key: str = DEFAULT_MOLECULE_DATASET_KEY,
     member_key: str = "",
     stratum: str = "",
 ) -> Path:
     root = project_outputs_root() / "molecule_3d_backbones" if out_dir is None else resolve_project_path(out_dir)
-    parts = [root, Path(str(scenario_key))]
+    parts = [root, Path(str(dataset_key))]
     if str(member_key):
         parts.append(Path(str(member_key)))
     if str(stratum):
@@ -66,11 +60,25 @@ def _backbone_manifest_write_path(args: argparse.Namespace, molecule_backbone_ro
     if raw:
         return resolve_project_path(raw)
     resolved_root = Path(molecule_backbone_root).expanduser().resolve()
-    project_output_root = project_outputs_root().resolve()
-    if resolved_root.is_relative_to(project_output_root):
-        return project_output_root.parent / "backbone_manifest.json"
     manifest_base = resolved_root.parent if resolved_root.name == "molecule_3d_backbones" else resolved_root
-    return manifest_base / "backbone_manifest.json"
+    return manifest_base / "backbone_matrix" / "backbone_manifest.json"
+
+
+def _project_display_path(path: str | Path) -> str:
+    resolved = Path(path).expanduser().resolve()
+    try:
+        relative = resolved.relative_to(project_root())
+    except ValueError:
+        return resolved.name
+    if not relative.parts or relative.parts[0] not in {"data", "outputs", "paper_datasets", "reports"}:
+        return resolved.name
+    return relative.as_posix()
+
+
+def _checkpoint_cfg_for_budget(cfg: OTFlowConfig, train_steps: int) -> OTFlowConfig:
+    checkpoint_cfg = copy.deepcopy(cfg)
+    checkpoint_cfg.apply_overrides(steps=int(train_steps))
+    return checkpoint_cfg
 
 
 def build_molecule_cfg(args: argparse.Namespace, *, atom_count: int, context_feature_dim: int) -> OTFlowConfig:
@@ -105,6 +113,7 @@ def build_molecule_cfg(args: argparse.Namespace, *, atom_count: int, context_fea
         fu_net_layers=int(args.fu_net_layers),
         fu_net_heads=int(args.fu_net_heads),
         use_minibatch_ot=bool(args.use_minibatch_ot),
+        solver=normalize_solver_key(str(args.solver)),
         use_amp=bool(args.use_amp),
         grad_accum_steps=int(args.grad_accum_steps),
         ema_decay=float(args.ema_decay),
@@ -189,8 +198,8 @@ def _save_molecule_artifact(
 ) -> Dict[str, Any]:
     artifact_root.mkdir(parents=True, exist_ok=True)
     checkpoint_path = artifact_root / "model.pt"
-    checkpoint_cfg = checkpoint_config_for_budget(cfg, int(budget_steps))
-    scenario_key = str(split_stats.get("dataset_key", DEFAULT_MOLECULE_DATASET_KEY))
+    checkpoint_cfg = _checkpoint_cfg_for_budget(cfg, int(budget_steps))
+    dataset_key = str(split_stats.get("dataset_key", DEFAULT_MOLECULE_DATASET_KEY))
     stratum = str(split_stats.get("stratum", ""))
     member_key = str(split_stats.get("member_key", ""))
     source_zip_name = str(split_stats.get("source_zip_name", ""))
@@ -199,7 +208,7 @@ def _save_molecule_artifact(
     snapshot_dim = int(split_stats["snapshot_dim"])
     context_feature_dim = int(split_stats["context_feature_dim"])
     checkpoint_id = (
-        f"otflow_{MOLECULE_BENCHMARK_FAMILY}_{scenario_key}_{member_key or stratum}_"
+        f"otflow_{MOLECULE_BENCHMARK_FAMILY}_{dataset_key}_{member_key or stratum}_"
         f"{variant}_{int(budget_steps)}_steps_seed{int(seed)}"
     )
     torch.save(
@@ -207,14 +216,14 @@ def _save_molecule_artifact(
             "cfg": checkpoint_cfg.to_dict(),
             "model_state": dict(state_dict),
             "molecule_stats": dict(split_stats.get("stats", {})),
-            "dataset_key": scenario_key,
+            "dataset_key": dataset_key,
             "stratum": stratum,
         },
         checkpoint_path,
     )
     metadata: Dict[str, Any] = {
         "checkpoint_id": checkpoint_id,
-        "dataset_key": scenario_key,
+        "dataset_key": dataset_key,
         "stratum": stratum,
         "member_key": member_key,
         "benchmark_family": MOLECULE_BENCHMARK_FAMILY,
@@ -230,9 +239,9 @@ def _save_molecule_artifact(
         "source_zip_name": source_zip_name,
         "snapshot_dim": snapshot_dim,
         "context_feature_dim": context_feature_dim,
-        "checkpoint_path": display_project_path(checkpoint_path),
-        "metadata_path": display_project_path(artifact_root / "checkpoint_metadata.json"),
-        "summary_path": display_project_path(artifact_root / "artifact_summary.json"),
+        "checkpoint_path": _project_display_path(checkpoint_path),
+        "metadata_path": _project_display_path(artifact_root / "checkpoint_metadata.json"),
+        "summary_path": _project_display_path(artifact_root / "artifact_summary.json"),
         "split_stats": _json_ready_stats(dict(split_stats)),
         "cfg": checkpoint_cfg.to_dict(),
         "selection": dict(selection),
@@ -244,10 +253,10 @@ def _save_molecule_artifact(
 
 def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
     seed_all(int(args.seed))
-    scenario_key = str(getattr(args, "scenario_key", DEFAULT_MOLECULE_DATASET_KEY) or DEFAULT_MOLECULE_DATASET_KEY)
+    dataset_key = str(getattr(args, "dataset_key", DEFAULT_MOLECULE_DATASET_KEY) or DEFAULT_MOLECULE_DATASET_KEY)
     stratum = str(getattr(args, "stratum", "") or "")
     processed_dir = (
-        molecule_processed_path(scenario_key, stratum)
+        default_molecule_processed_dir(dataset_key, stratum)
         if args.processed_dir is None
         else resolve_project_path(str(args.processed_dir))
     )
@@ -256,7 +265,7 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         zip_path=zip_path,
         processed_dir=processed_dir,
         prepare=bool(args.prepare_data),
-        dataset_key=scenario_key,
+        dataset_key=dataset_key,
         stratum=stratum,
     )
     if not bool(metadata.get("trainable", True)) and not bool(getattr(args, "allow_non_trainable", False)):
@@ -273,7 +282,7 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         future_horizon=int(args.future_horizon),
         stride_train=int(args.stride_train),
         stride_eval=int(args.stride_eval),
-        dataset_key=scenario_key,
+        dataset_key=dataset_key,
         stratum=stratum,
     )
     val_every = int(args.val_every)
@@ -384,7 +393,7 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
             out_dir=args.out_dir,
             variant=variant,
             train_steps=int(budget),
-            scenario_key=scenario_key,
+            dataset_key=dataset_key,
             member_key=member_key,
             stratum=stratum,
         )
@@ -408,14 +417,14 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         )
         budget_summary = {
             "status": "ready",
-            "scenario_key": scenario_key,
+            "dataset": dataset_key,
             "member_key": member_key,
             "stratum": stratum,
             "variant": variant,
             "train_steps": int(args.steps),
             "export_step": int(budget),
-            "checkpoint_path": display_project_path(artifact_root / "model.pt"),
-            "metadata_path": display_project_path(artifact_root / "checkpoint_metadata.json"),
+            "checkpoint_path": _project_display_path(artifact_root / "model.pt"),
+            "metadata_path": _project_display_path(artifact_root / "checkpoint_metadata.json"),
             "selected_step": int(candidate["step"]),
             "selection_metric": "clean_validation_loss",
             "selection_score": float(candidate["score"]),
@@ -431,9 +440,9 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         }
         save_json(budget_summary, str(artifact_root / "training_summary.json"))
         budget_artifacts[str(int(budget))] = {
-            "checkpoint_path": display_project_path(artifact_root / "model.pt"),
-            "metadata_path": display_project_path(artifact_root / "checkpoint_metadata.json"),
-            "summary_path": display_project_path(artifact_root / "training_summary.json"),
+            "checkpoint_path": _project_display_path(artifact_root / "model.pt"),
+            "metadata_path": _project_display_path(artifact_root / "checkpoint_metadata.json"),
+            "summary_path": _project_display_path(artifact_root / "training_summary.json"),
             "selected_step": int(candidate["step"]),
             "selection_score": float(candidate["score"]),
         }
@@ -443,7 +452,7 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         out_dir=args.out_dir,
         variant=variant,
         train_steps=final_budget,
-        scenario_key=scenario_key,
+        dataset_key=dataset_key,
         member_key=member_key,
         stratum=stratum,
     )
@@ -459,19 +468,19 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
     )
     summary = {
         "status": "ready",
-        "scenario_key": scenario_key,
+        "dataset": dataset_key,
         "member_key": member_key,
         "stratum": stratum,
         "variant": variant,
         "train_steps": int(args.steps),
-        "checkpoint_path": display_project_path(final_artifact_root / "model.pt"),
-        "metadata_path": display_project_path(final_artifact_root / "checkpoint_metadata.json"),
+        "checkpoint_path": _project_display_path(final_artifact_root / "model.pt"),
+        "metadata_path": _project_display_path(final_artifact_root / "checkpoint_metadata.json"),
         "selected_step": int(final_candidate["step"]),
         "selection_metric": "clean_validation_loss",
         "selection_score": float(final_candidate["score"]),
         "validation": final_candidate["validation"],
         "budget_artifacts": budget_artifacts,
-        "manifest_path": display_project_path(manifest_path),
+        "manifest_path": _project_display_path(manifest_path),
         "manifest_ready_count": int(manifest.get("ready_count", 0)),
         "split_examples": {
             "train": int(len(splits["train"])),
@@ -487,7 +496,7 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train molecule 3D coordinate OTFlow backbones.")
-    parser.add_argument("--scenario_key", default=DEFAULT_MOLECULE_DATASET_KEY)
+    parser.add_argument("--dataset_key", default=DEFAULT_MOLECULE_DATASET_KEY)
     parser.add_argument("--stratum", default="")
     parser.add_argument("--zip_path", default=None)
     parser.add_argument("--processed_dir", default=None)
@@ -522,6 +531,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--budget_steps", default=",".join(str(value) for value in DEFAULT_BUDGET_STEPS))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument("--solver", choices=CANONICAL_SOLVER_KEYS, default="euler")
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--use_swa", action="store_true", default=False)
     parser.add_argument("--use_minibatch_ot", action="store_true", default=True)

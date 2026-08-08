@@ -12,6 +12,9 @@ from genode.models.config import OTFlowConfig
 from genode.models.modules import MLP
 
 
+FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL = "frozen_backbone_policy_context_v1"
+
+
 class FourierEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -252,9 +255,135 @@ class ConditioningState:
 @dataclass
 class ConditioningCache:
     ctx_tokens: torch.Tensor
-    ctx_summary: torch.Tensor
     summary: torch.Tensor
     cond_emb: Optional[torch.Tensor] = None
+
+
+def _validate_policy_context_tensor(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    batch_size: int,
+    width: int,
+) -> None:
+    if not torch.is_tensor(tensor) or tensor.ndim != 2:
+        raise ValueError(f"Frozen-backbone policy {name} must have shape [batch, width].")
+    if int(tensor.shape[0]) != int(batch_size):
+        raise ValueError(
+            f"Frozen-backbone policy {name} batch width mismatch: "
+            f"expected {int(batch_size)}, got {int(tensor.shape[0])}."
+        )
+    if int(tensor.shape[1]) != int(width):
+        raise ValueError(
+            f"Frozen-backbone policy {name} feature width mismatch: "
+            f"expected {int(width)}, got {int(tensor.shape[1])}."
+        )
+    if not tensor.is_floating_point() or not bool(torch.isfinite(tensor).all()):
+        raise ValueError(f"Frozen-backbone policy {name} must contain finite floating-point values.")
+
+
+def frozen_backbone_policy_context_from_cache(
+    cache: ConditioningCache,
+    *,
+    protocol: str = FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+    expected_width: Optional[int] = None,
+    require_cond_emb: bool = False,
+) -> torch.Tensor:
+    """Derive the canonical policy representation from one existing field cache.
+
+    Version 1 is the projected context summary consumed by the field, followed by
+    the field's own auxiliary-condition embedding when an auxiliary condition is
+    present. Raw encoder summaries are deliberately not part of this protocol.
+    """
+
+    if str(protocol) != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL:
+        raise ValueError(
+            "Unsupported frozen-backbone policy context protocol: "
+            f"expected {FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}, got {protocol!r}."
+        )
+    if not isinstance(cache, ConditioningCache):
+        raise TypeError("Frozen-backbone policy context requires a ConditioningCache.")
+    summary = cache.summary
+    if not torch.is_tensor(summary) or summary.ndim != 2 or int(summary.shape[1]) <= 0:
+        raise ValueError("Frozen-backbone policy summary must have shape [batch, width].")
+    batch_size = int(summary.shape[0])
+    hidden_dim = int(summary.shape[1])
+    _validate_policy_context_tensor(
+        summary,
+        name="summary",
+        batch_size=batch_size,
+        width=hidden_dim,
+    )
+    cond_emb = cache.cond_emb
+    if require_cond_emb and cond_emb is None:
+        raise ValueError("The frozen backbone omitted cond_emb for a supplied auxiliary condition.")
+    if cond_emb is None:
+        context = summary
+    else:
+        _validate_policy_context_tensor(
+            cond_emb,
+            name="cond_emb",
+            batch_size=batch_size,
+            width=hidden_dim,
+        )
+        if cond_emb.device != summary.device or cond_emb.dtype != summary.dtype:
+            raise ValueError("Frozen-backbone summary and cond_emb must share device and dtype.")
+        context = torch.cat([summary, cond_emb], dim=-1)
+    if expected_width is not None:
+        if isinstance(expected_width, bool) or int(expected_width) <= 0:
+            raise ValueError("expected_width must be a positive integer when provided.")
+        if int(context.shape[1]) != int(expected_width):
+            raise ValueError(
+                f"Frozen-backbone policy context width mismatch: expected {int(expected_width)}, "
+                f"got {int(context.shape[1])}."
+            )
+    return context.detach()
+
+
+@torch.no_grad()
+def frozen_backbone_policy_context(
+    backbone: nn.Module,
+    hist: torch.Tensor,
+    *,
+    cond: Optional[torch.Tensor] = None,
+    protocol: str = FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+    expected_width: Optional[int] = None,
+) -> torch.Tensor:
+    """Precompute once and export the canonical frozen-field policy context."""
+
+    if not torch.is_tensor(hist) or hist.ndim < 2:
+        raise ValueError("Frozen-backbone policy history must be a tensor with a batch dimension.")
+    if getattr(backbone, "training", None) is not False:
+        raise ValueError("Frozen-backbone policy context export requires the backbone in eval mode.")
+    precompute = getattr(backbone, "precompute", None)
+    if not callable(precompute):
+        raise ValueError("Frozen-backbone policy context export requires backbone.precompute(hist, cond=cond).")
+
+    cfg = getattr(backbone, "cfg", None)
+    model_cfg = getattr(cfg, "model", None)
+    hidden_dim = int(getattr(model_cfg, "hidden_dim", 0) or 0)
+    cond_dim = int(getattr(model_cfg, "cond_dim", 0) or 0)
+    if hidden_dim <= 0:
+        raise ValueError("Frozen-backbone policy context export requires a positive configured hidden width.")
+    batch_size = int(hist.shape[0])
+    if cond is not None:
+        if cond_dim <= 0:
+            raise ValueError("An auxiliary condition was supplied to a backbone with model.cond_dim=0.")
+        if not torch.is_tensor(cond) or cond.ndim != 2:
+            raise ValueError("Frozen-backbone auxiliary condition must have shape [batch, cond_dim].")
+        if int(cond.shape[0]) != batch_size or int(cond.shape[1]) != cond_dim:
+            raise ValueError(
+                "Frozen-backbone auxiliary condition shape mismatch: "
+                f"expected [{batch_size}, {cond_dim}], got {list(cond.shape)}."
+            )
+
+    cache = precompute(hist, cond=cond)
+    return frozen_backbone_policy_context_from_cache(
+        cache,
+        protocol=protocol,
+        expected_width=expected_width,
+        require_cond_emb=cond is not None,
+    )
 
 
 class SharedConditioningBackbone(nn.Module):
@@ -315,7 +444,6 @@ class SharedConditioningBackbone(nn.Module):
         cond_emb = self.conditioner.embed_cond(cond)
         return ConditioningCache(
             ctx_tokens=ctx_tokens,
-            ctx_summary=ctx_summary,
             summary=summary,
             cond_emb=cond_emb,
         )

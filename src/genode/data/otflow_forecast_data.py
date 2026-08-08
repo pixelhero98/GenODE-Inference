@@ -9,8 +9,8 @@ import torch
 
 from genode.models.config import OTFlowConfig
 from genode.data.otflow_monash_datasets import (
-    monash_manifest_path,
-    monash_source_dir,
+    default_manifest_path,
+    default_source_dir,
     find_tsf_file,
     iter_tsf_series,
     load_monash_manifest,
@@ -366,8 +366,8 @@ def build_monash_forecast_splits(
     time_feature_mode: str = "gap_elapsed",
 ) -> Dict[str, Any]:
     time_feature_mode = str(time_feature_mode)
-    manifest = load_monash_manifest(monash_manifest_path(dataset_root, dataset_key))
-    tsf_path = find_tsf_file(monash_source_dir(dataset_root, dataset_key))
+    manifest = load_monash_manifest(default_manifest_path(dataset_root, dataset_key))
+    tsf_path = find_tsf_file(default_source_dir(dataset_root, dataset_key))
     mase_seasonal_period = infer_mase_seasonal_period(str(manifest.frequency))
     records, record_stats = _build_series_records(
         dataset_key=str(dataset_key),

@@ -1,21 +1,39 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
-from genode.models.conditioning import ConditioningCache
+from genode.models.config import OTFlowConfig
 from genode.models.rectified_flow import RectifiedFlow
-from genode.solver_protocol import (
-    FlowDiagnostics,
-    FlowTrajectory,
-    normalize_solver_nfe_fields,
-    solver_eval_multiplier,
+from genode.solver_protocol import normalize_solver_key
+
+
+OTFLOW_TRACE_FIELDS: Tuple[str, ...] = (
+    "solver",
+    "steps",
+    "step_index",
+    "time",
+    "time_grid",
+    "disagreement",
+    "velocity_norm",
+    "ema_velocity_norm",
+    "residual_norm",
+    "hybrid_signal",
+    "u_disagreement",
+    "u_residual_norm",
+    "u_hybrid_signal",
+    "variance_scaled_signal",
+    "top_book_disagreement",
+    "top_book_residual_norm",
+    "top_book_hybrid_signal",
+    "oracle_local_error",
+    "field_evals_by_step",
+    "mean_field_evals_per_step",
+    "mean_total_field_evals_per_rollout",
 )
-
-
-DIAGNOSTIC_EMA_DECAY = 0.9
+_TRACE_EMA_DECAY = 0.9
 
 
 def _solve_linear_assignment(cost: torch.Tensor) -> torch.Tensor:
@@ -75,6 +93,10 @@ def _solve_linear_assignment(cost: torch.Tensor) -> torch.Tensor:
 
 
 class OTFlow(RectifiedFlow):
+
+    def __init__(self, cfg: OTFlowConfig):
+        super().__init__(cfg)
+
     @torch.no_grad()
     def _match_minibatch_ot(
         self,
@@ -100,38 +122,15 @@ class OTFlow(RectifiedFlow):
         self,
         x: torch.Tensor,
         t: torch.Tensor,
-        hist: Optional[torch.Tensor],
+        hist: torch.Tensor,
         *,
-        conditioning_cache: ConditioningCache,
-        unconditional_cache: Optional[ConditioningCache],
         cond: Optional[torch.Tensor],
         guidance: float,
     ) -> torch.Tensor:
-        if guidance == 1.0 or conditioning_cache.cond_emb is None:
-            return self.v_forward(
-                x,
-                t,
-                hist,
-                cond=cond,
-                conditioning_cache=conditioning_cache,
-            )
-
-        v_cond = self.v_forward(
-            x,
-            t,
-            hist,
-            cond=cond,
-            conditioning_cache=conditioning_cache,
-        )
-        if unconditional_cache is None:
-            raise RuntimeError("Classifier-free guidance requires an unconditional conditioning cache.")
-        v_uncond = self.v_forward(
-            x,
-            t,
-            hist,
-            cond=None,
-            conditioning_cache=unconditional_cache,
-        )
+        if guidance == 1.0 or cond is None:
+            return self.v_forward(x, t, hist, cond=cond)
+        v_cond = self.v_forward(x, t, hist, cond=cond)
+        v_uncond = self.v_forward(x, t, hist, cond=None)
         return v_uncond + guidance * (v_cond - v_uncond)
 
     def _prediction_horizon(self) -> int:
@@ -156,7 +155,7 @@ class OTFlow(RectifiedFlow):
             return tgt
         if fut is None:
             raise ValueError("Non-autoregressive OTFlow requires dataset batches with future trajectories.")
-        required_future = horizon - 1
+        required_future = max(0, horizon - 1)
         if int(fut.shape[1]) < required_future:
             raise ValueError(
                 f"Non-autoregressive OTFlow requires at least {required_future} future steps, "
@@ -205,498 +204,373 @@ class OTFlow(RectifiedFlow):
         }
         return loss, logs
 
-    def _prepare_conditioning_cache(
+    def _resolve_solver_name(self, solver: Optional[str]) -> str:
+        configured = getattr(self.cfg.sample, "solver", "euler") if solver is None else solver
+        return normalize_solver_key(str(configured))
+
+    def _resolved_time_grid(self, n_steps: int) -> Tuple[float, ...]:
+        raw_grid = tuple(float(x) for x in getattr(self.cfg.sample, "time_grid", ()) or ())
+        if len(raw_grid) == 0:
+            return tuple(float(i) / float(n_steps) for i in range(int(n_steps) + 1))
+        if len(raw_grid) != int(n_steps) + 1:
+            raise ValueError(
+                f"sample.time_grid must have length n_steps + 1 ({int(n_steps) + 1}), got {len(raw_grid)}."
+            )
+        if abs(float(raw_grid[0])) > 1e-8 or abs(float(raw_grid[-1]) - 1.0) > 1e-8:
+            raise ValueError("sample.time_grid must start at 0.0 and end at 1.0.")
+        for left, right in zip(raw_grid, raw_grid[1:]):
+            if float(right) <= float(left):
+                raise ValueError("sample.time_grid must be strictly increasing.")
+        return raw_grid
+
+    def _top_of_book_feature_weights(
         self,
-        hist: Optional[torch.Tensor],
-        cond: Optional[torch.Tensor],
-        conditioning_cache: Optional[ConditioningCache],
         *,
-        batch_size: int,
-    ) -> ConditioningCache:
-        cache_was_provided = conditioning_cache is not None
-        if cache_was_provided and hist is not None:
-            raise ValueError("Provide exactly one of hist or conditioning_cache.")
-        if conditioning_cache is None:
-            if hist is None:
-                raise ValueError("hist is required when conditioning_cache is not provided.")
-            conditioning_cache = self.backbone.precompute(hist, cond=cond)
-
-        if int(conditioning_cache.ctx_tokens.shape[0]) != batch_size:
-            raise ValueError(
-                "conditioning_cache batch size does not match initial_state: "
-                f"{int(conditioning_cache.ctx_tokens.shape[0])} != {batch_size}."
-            )
-        if cond is not None and int(cond.shape[0]) != batch_size:
-            raise ValueError(
-                f"cond batch size does not match initial_state: {int(cond.shape[0])} != {batch_size}."
-            )
-        if cond is not None and cache_was_provided:
-            cond_emb = self.backbone.conditioner.embed_cond(cond)
-            conditioning_cache = ConditioningCache(
-                ctx_tokens=conditioning_cache.ctx_tokens,
-                ctx_summary=conditioning_cache.ctx_summary,
-                summary=conditioning_cache.summary,
-                cond_emb=cond_emb,
-            )
-        return conditioning_cache
-
-    @staticmethod
-    def _validate_time_grid(
-        time_grid: Sequence[float] | torch.Tensor,
-        *,
-        initial_state: torch.Tensor,
-        macro_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> torch.Tensor:
-        if isinstance(time_grid, torch.Tensor):
-            grid = time_grid.to(device=initial_state.device, dtype=initial_state.dtype)
+        base_dim = self._snapshot_dim()
+        weights = torch.ones(base_dim, device=device, dtype=dtype)
+        levels = int(self.cfg.data.levels)
+        if int(weights.numel()) < 2:
+            return weights
+
+        weights[0] = 2.0
+        weights[1] = 2.0
+        ask_gap_start = 2
+        bid_gap_start = ask_gap_start + max(0, levels - 1)
+        size_start = bid_gap_start + max(0, levels - 1)
+
+        for depth in range(max(0, levels - 1)):
+            decay = 1.0 / float(depth + 1)
+            idx = ask_gap_start + depth
+            if idx < weights.numel():
+                weights[idx] = 1.5 * decay
+            idx = bid_gap_start + depth
+            if idx < weights.numel():
+                weights[idx] = 1.5 * decay
+
+        for depth in range(levels):
+            decay = 1.0 / float(depth + 1)
+            idx = size_start + depth
+            if idx < weights.numel():
+                weights[idx] = 2.0 * decay
+            idx = size_start + levels + depth
+            if idx < weights.numel():
+                weights[idx] = 2.0 * decay
+        if self._prediction_horizon() <= 1:
+            return weights
+        return weights.repeat(self._prediction_horizon())
+
+    def _oracle_local_error_proxy(
+        self,
+        x: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        hist: torch.Tensor,
+        cond: Optional[torch.Tensor],
+        guidance: float,
+        dt: float,
+        t_cur: float,
+    ) -> torch.Tensor:
+        batch_size = x.shape[0]
+        x_euler = x + dt * v
+        x_half = x + 0.5 * dt * v
+        t_mid = torch.full((batch_size, 1), t_cur + 0.5 * dt, device=x.device)
+        v_mid = self._guided_field(x_half, t_mid, hist, cond=cond, guidance=guidance)
+        x_two_half = x_half + 0.5 * dt * v_mid
+        return torch.sqrt((x_euler - x_two_half).reshape(batch_size, -1).square().sum(dim=-1) + 1e-12)
+
+    def _sample_impl(
+        self,
+        hist: torch.Tensor,
+        *,
+        cond: Optional[torch.Tensor],
+        steps: Optional[int],
+        cfg_scale: Optional[float],
+        solver: Optional[str],
+        record_trace: bool,
+        oracle_local_error: bool,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
+        batch_size = hist.shape[0]
+        state_dim = self._sample_state_dim()
+        x = torch.randn(batch_size, state_dim, device=hist.device)
+
+        default_steps = int(self.cfg.sample.steps)
+        n_steps = int(max(1, default_steps if steps is None else steps))
+
+        default_cfg_scale = float(self.cfg.sample.cfg_scale)
+        guidance = float(default_cfg_scale if cfg_scale is None else cfg_scale)
+        solver_name = self._resolve_solver_name(solver)
+        time_grid = self._resolved_time_grid(n_steps)
+        prev_dpm_v: Optional[torch.Tensor] = None
+        prev_dpm_dt: Optional[float] = None
+        ema_v: Optional[torch.Tensor] = None
+        ema_v_sq: Optional[torch.Tensor] = None
+        ema_u: Optional[torch.Tensor] = None
+        top_book_weights = self._top_of_book_feature_weights(device=hist.device, dtype=x.dtype)[None, :]
+
+        if record_trace:
+            trace_disagreement = []
+            trace_velocity_norm = []
+            trace_ema_velocity_norm = []
+            trace_residual_norm = []
+            trace_hybrid_signal = []
+            trace_u_disagreement = []
+            trace_u_residual_norm = []
+            trace_u_hybrid_signal = []
+            trace_variance_scaled_signal = []
+            trace_top_book_disagreement = []
+            trace_top_book_residual_norm = []
+            trace_top_book_hybrid_signal = []
+            trace_oracle_error = []
+            trace_field_evals = []
+            trace_time = []
         else:
-            grid = torch.as_tensor(time_grid, device=initial_state.device, dtype=initial_state.dtype)
-        if grid.ndim != 1:
-            raise ValueError(f"time_grid must be one-dimensional, got shape={tuple(grid.shape)}.")
-        expected_length = int(macro_steps) + 1
-        if int(grid.numel()) != expected_length:
-            raise ValueError(
-                f"time_grid must contain macro_steps + 1 values ({expected_length}), "
-                f"got {int(grid.numel())}."
-            )
-        if not bool(torch.isfinite(grid).all()):
-            raise ValueError("time_grid must contain only finite values.")
-        tolerance = 1e-6
-        if abs(float(grid[0].item())) > tolerance or abs(float(grid[-1].item()) - 1.0) > tolerance:
-            raise ValueError("time_grid must start at 0.0 and end at 1.0.")
-        if not bool(torch.all(torch.diff(grid) > 0)):
-            raise ValueError("time_grid must be strictly increasing.")
-        return grid
+            trace_disagreement = trace_velocity_norm = None
+            trace_ema_velocity_norm = None
+            trace_residual_norm = trace_hybrid_signal = trace_u_disagreement = None
+            trace_u_residual_norm = trace_u_hybrid_signal = trace_variance_scaled_signal = None
+            trace_top_book_disagreement = trace_top_book_residual_norm = trace_top_book_hybrid_signal = None
+            trace_oracle_error = trace_field_evals = None
+            trace_time = None
 
-    @torch.no_grad()
-    def solve(
-        self,
-        initial_state: torch.Tensor,
-        hist: Optional[torch.Tensor] = None,
-        conditioning_cache: Optional[ConditioningCache] = None,
-        cond: Optional[torch.Tensor] = None,
-        *,
-        solver_key: str,
-        target_nfe: int,
-        time_grid: Sequence[float] | torch.Tensor,
-        return_trajectory: bool = False,
-    ) -> torch.Tensor | FlowTrajectory:
-        """Integrate an explicit initial state over ``time_grid``.
+        for i in range(n_steps):
+            t_cur = float(time_grid[i])
+            t_next = float(time_grid[i + 1])
+            dt = float(t_next - t_cur)
+            t = torch.full((batch_size, 1), t_cur, device=hist.device, dtype=x.dtype)
+            v = self._guided_field(x, t, hist, cond=cond, guidance=guidance)
+            v_flat = v.reshape(batch_size, -1)
+            vel_norm = torch.sqrt(v_flat.square().sum(dim=-1) + 1e-12)
 
-        The solver key and target NFE are validated by the shared solver
-        protocol. Two-evaluation solvers therefore require half as many macro
-        intervals as their target NFE.
-        """
-        if not isinstance(initial_state, torch.Tensor):
-            raise TypeError("initial_state must be a torch.Tensor.")
-        if initial_state.ndim != 2:
-            raise ValueError(
-                "initial_state must have shape [batch, state_dim], "
-                f"got {tuple(initial_state.shape)}."
-            )
-        expected_state_dim = self._sample_state_dim()
-        if int(initial_state.shape[1]) != expected_state_dim:
-            raise ValueError(
-                f"initial_state has state_dim={int(initial_state.shape[1])}; "
-                f"expected {expected_state_dim}."
-            )
-        if not initial_state.is_floating_point():
-            raise TypeError("initial_state must use a floating-point dtype.")
-        if not bool(torch.isfinite(initial_state).all()):
-            raise FloatingPointError("OTFlow.solve received a non-finite initial_state.")
-        if hist is not None and not bool(torch.isfinite(hist).all()):
-            raise FloatingPointError("OTFlow.solve received non-finite history conditioning.")
-        if cond is not None and not bool(torch.isfinite(cond).all()):
-            raise FloatingPointError("OTFlow.solve received non-finite conditional features.")
+            if ema_v is None:
+                ema_v = v_flat.detach().clone()
+            if ema_v_sq is None:
+                ema_v_sq = v_flat.detach().square().clone()
+            ema_vel_norm = torch.sqrt(ema_v.square().sum(dim=-1) + 1e-12)
+            cos = F.cosine_similarity(v_flat, ema_v, dim=-1, eps=1e-8).clamp(-1.0, 1.0)
+            disagreement = 1.0 - cos
+            residual_flat = v_flat - ema_v
+            residual_norm = torch.sqrt(residual_flat.square().sum(dim=-1) + 1e-12)
+            hybrid_signal = residual_norm * disagreement
+            feature_var = torch.clamp(ema_v_sq - ema_v.square(), min=0.0)
+            variance_scale = torch.sqrt(feature_var + 1e-6)
+            scaled_v_flat = v_flat / variance_scale
+            scaled_ema_flat = ema_v / variance_scale
+            scaled_cos = F.cosine_similarity(scaled_v_flat, scaled_ema_flat, dim=-1, eps=1e-8).clamp(-1.0, 1.0)
+            variance_scaled_disagreement = 1.0 - scaled_cos
+            variance_scaled_residual_flat = residual_flat / variance_scale
+            variance_scaled_residual_norm = torch.sqrt(variance_scaled_residual_flat.square().sum(dim=-1) + 1e-12)
+            variance_scaled_signal = variance_scaled_residual_norm * variance_scaled_disagreement
+            weighted_v_flat = v_flat * top_book_weights
+            weighted_ema_flat = ema_v * top_book_weights
+            weighted_cos = F.cosine_similarity(weighted_v_flat, weighted_ema_flat, dim=-1, eps=1e-8).clamp(-1.0, 1.0)
+            top_book_disagreement = 1.0 - weighted_cos
+            top_book_residual_flat = weighted_v_flat - weighted_ema_flat
+            top_book_residual_norm = torch.sqrt(top_book_residual_flat.square().sum(dim=-1) + 1e-12)
+            top_book_hybrid_signal = top_book_residual_norm * top_book_disagreement
+            tail_cur = max(1e-12, 1.0 - t_cur)
+            u_flat = (x + tail_cur * v).reshape(batch_size, -1)
+            if ema_u is None:
+                ema_u = u_flat.detach().clone()
+            u_cos = F.cosine_similarity(u_flat, ema_u, dim=-1, eps=1e-8).clamp(-1.0, 1.0)
+            u_disagreement = 1.0 - u_cos
+            u_residual_flat = u_flat - ema_u
+            u_residual_norm = torch.sqrt(u_residual_flat.square().sum(dim=-1) + 1e-12)
+            u_hybrid_signal = u_residual_norm * u_disagreement
 
-        nfe = normalize_solver_nfe_fields(solver_key, target_nfe, source="OTFlow.solve")
-        grid = self._validate_time_grid(
-            time_grid,
-            initial_state=initial_state,
-            macro_steps=nfe.macro_steps,
-        )
-        batch_size = int(initial_state.shape[0])
-        if hist is not None and int(hist.shape[0]) != batch_size:
-            raise ValueError(
-                f"hist batch size does not match initial_state: {int(hist.shape[0])} != {batch_size}."
-            )
-        cache = self._prepare_conditioning_cache(
-            hist,
-            cond,
-            conditioning_cache,
-            batch_size=batch_size,
-        )
-        for cache_name in ("ctx_tokens", "ctx_summary", "summary", "cond_emb"):
-            cache_value = getattr(cache, cache_name)
-            if cache_value is not None and not bool(torch.isfinite(cache_value).all()):
-                raise FloatingPointError(f"OTFlow.solve received non-finite conditioning cache field {cache_name!r}.")
-        guidance = float(self.cfg.sample.cfg_scale)
-        if not torch.isfinite(torch.tensor(guidance)):
-            raise ValueError(f"sample.cfg_scale must be finite, got {guidance!r}.")
-        unconditional_cache = None
-        if guidance != 1.0 and cache.cond_emb is not None:
-            unconditional_cache = ConditioningCache(
-                ctx_tokens=cache.ctx_tokens,
-                ctx_summary=cache.ctx_summary,
-                summary=cache.summary,
-                cond_emb=None,
-            )
+            oracle_error = torch.zeros(batch_size, device=hist.device, dtype=x.dtype)
+            field_evals = torch.ones(batch_size, device=hist.device, dtype=x.dtype)
 
-        x = initial_state
-        states = [x] if return_trajectory else None
-        previous_velocity: Optional[torch.Tensor] = None
-        previous_dt: Optional[float] = None
-
-        def field(x_state: torch.Tensor, t_value: float) -> torch.Tensor:
-            if not bool(torch.isfinite(x_state).all()):
-                raise FloatingPointError(
-                    f"OTFlow solver={nfe.solver_key!r} received a non-finite field state at t={float(t_value):.9g}."
-                )
-            t = torch.full(
-                (batch_size, 1),
-                float(t_value),
-                device=x_state.device,
-                dtype=x_state.dtype,
-            )
-            velocity = self._guided_field(
-                x_state,
-                t,
-                None,
-                conditioning_cache=cache,
-                unconditional_cache=unconditional_cache,
-                cond=None,
-                guidance=guidance,
-            )
-            if velocity.shape != x_state.shape:
-                raise ValueError(
-                    f"Velocity field returned shape={tuple(velocity.shape)} for "
-                    f"state shape={tuple(x_state.shape)}."
-                )
-            if not bool(torch.isfinite(velocity).all()):
-                raise FloatingPointError(
-                    f"OTFlow solver={nfe.solver_key!r} produced a non-finite velocity at t={float(t_value):.9g}."
-                )
-            return velocity
-
-        for step_index in range(nfe.macro_steps):
-            t_current = float(grid[step_index].item())
-            t_next = float(grid[step_index + 1].item())
-            dt = t_next - t_current
-            velocity = field(x, t_current)
-
-            if nfe.solver_key == "euler":
-                x = x + dt * velocity
-            elif nfe.solver_key == "heun":
-                predicted = x + dt * velocity
-                if not bool(torch.isfinite(predicted).all()):
-                    raise FloatingPointError(
-                        f"OTFlow solver='heun' produced a non-finite predictor at step={step_index} "
-                        f"t={t_current:.9g} dt={dt:.9g}."
-                    )
-                next_velocity = field(predicted, t_next)
-                x = x + 0.5 * dt * (velocity + next_velocity)
-            elif nfe.solver_key == "midpoint_rk2":
-                midpoint = x + 0.5 * dt * velocity
-                if not bool(torch.isfinite(midpoint).all()):
-                    raise FloatingPointError(
-                        f"OTFlow solver='midpoint_rk2' produced a non-finite midpoint at step={step_index} "
-                        f"t={t_current:.9g} dt={dt:.9g}."
-                    )
-                midpoint_velocity = field(midpoint, t_current + 0.5 * dt)
-                x = x + dt * midpoint_velocity
-            elif nfe.solver_key == "dpmpp2m":
-                if previous_velocity is None or previous_dt is None:
-                    x = x + dt * velocity
-                else:
-                    step_ratio = dt / previous_dt
-                    x = x + dt * (
-                        (1.0 + 0.5 * step_ratio) * velocity
-                        - 0.5 * step_ratio * previous_velocity
-                    )
-                previous_velocity = velocity
-                previous_dt = dt
-            else:  # pragma: no cover - normalize_solver_nfe_fields is authoritative.
-                raise AssertionError(f"Unhandled solver_key={nfe.solver_key!r}.")
-
-            if not bool(torch.isfinite(x).all()):
-                raise FloatingPointError(
-                    f"OTFlow solver={nfe.solver_key!r} produced a non-finite state at step={step_index} "
-                    f"t={t_current:.9g} dt={dt:.9g} target_nfe={nfe.target_nfe}."
-                )
-            if states is not None:
-                states.append(x)
-
-        if states is None:
-            return x
-        stacked_states = torch.stack(states, dim=1)
-        return FlowTrajectory(
-            initial_state=stacked_states[:, 0],
-            time_grid=grid,
-            states=stacked_states,
-            final_state=stacked_states[:, -1],
-            solver_key=nfe.solver_key,
-            target_nfe=nfe.target_nfe,
-            macro_steps=nfe.macro_steps,
-            realized_nfe=nfe.realized_nfe,
-        )
-
-    def _sample_initial_state(self, hist: torch.Tensor) -> torch.Tensor:
-        if hist.ndim < 1:
-            raise ValueError(f"hist must include a batch dimension, got shape={tuple(hist.shape)}.")
-        return torch.randn(
-            int(hist.shape[0]),
-            self._sample_state_dim(),
-            device=hist.device,
-            dtype=hist.dtype,
-        )
-
-    @torch.no_grad()
-    def solve_with_diagnostics(
-        self,
-        initial_state: torch.Tensor,
-        hist: Optional[torch.Tensor] = None,
-        conditioning_cache: Optional[ConditioningCache] = None,
-        cond: Optional[torch.Tensor] = None,
-        *,
-        solver_key: str,
-        target_nfe: int,
-        time_grid: Sequence[float] | torch.Tensor,
-        include_local_error: bool = False,
-    ) -> FlowDiagnostics:
-        """Solve once and report fixed-schedule field diagnostics.
-
-        Diagnostics are intentionally separate from ``solve`` so ordinary
-        sampling does not pay for the additional field evaluations.
-        """
-
-        batch_size = int(initial_state.shape[0])
-        cache = self._prepare_conditioning_cache(
-            hist,
-            cond,
-            conditioning_cache,
-            batch_size=batch_size,
-        )
-        trajectory = self.solve(
-            initial_state,
-            conditioning_cache=cache,
-            solver_key=solver_key,
-            target_nfe=target_nfe,
-            time_grid=time_grid,
-            return_trajectory=True,
-        )
-        assert isinstance(trajectory, FlowTrajectory)
-        guidance = float(self.cfg.sample.cfg_scale)
-        unconditional_cache = None
-        if guidance != 1.0 and cache.cond_emb is not None:
-            unconditional_cache = ConditioningCache(
-                ctx_tokens=cache.ctx_tokens,
-                ctx_summary=cache.ctx_summary,
-                summary=cache.summary,
-                cond_emb=None,
-            )
-        ema_velocity: Optional[torch.Tensor] = None
-        disagreement_rows: list[torch.Tensor] = []
-        velocity_norm_rows: list[torch.Tensor] = []
-        ema_velocity_norm_rows: list[torch.Tensor] = []
-        residual_norm_rows: list[torch.Tensor] = []
-        local_error_rows: list[torch.Tensor] = []
-        field_eval_rows: list[torch.Tensor] = []
-
-        for step_index in range(trajectory.macro_steps):
-            state = trajectory.states[:, step_index]
-            t_current = float(trajectory.time_grid[step_index].item())
-            t_next = float(trajectory.time_grid[step_index + 1].item())
-            dt = t_next - t_current
-            t = torch.full(
-                (batch_size, 1),
-                t_current,
-                device=state.device,
-                dtype=state.dtype,
-            )
-            velocity = self._guided_field(
-                state,
-                t,
-                None,
-                conditioning_cache=cache,
-                unconditional_cache=unconditional_cache,
-                cond=None,
-                guidance=guidance,
-            )
-            flat_velocity = velocity.reshape(batch_size, -1)
-            if ema_velocity is None:
-                ema_velocity = flat_velocity.detach().clone()
-            residual = flat_velocity - ema_velocity
-            cosine = F.cosine_similarity(
-                flat_velocity,
-                ema_velocity,
-                dim=-1,
-                eps=1e-8,
-            ).clamp(-1.0, 1.0)
-            disagreement_rows.append(1.0 - cosine)
-            velocity_norm_rows.append(
-                torch.sqrt(flat_velocity.square().sum(dim=-1) + 1e-12)
-            )
-            ema_velocity_norm_rows.append(
-                torch.sqrt(ema_velocity.square().sum(dim=-1) + 1e-12)
-            )
-            residual_norm_rows.append(
-                torch.sqrt(residual.square().sum(dim=-1) + 1e-12)
-            )
-            if include_local_error:
-                half_state = state + 0.5 * dt * velocity
-                t_midpoint = torch.full(
-                    (batch_size, 1),
-                    t_current + 0.5 * dt,
-                    device=state.device,
-                    dtype=state.dtype,
-                )
-                midpoint_velocity = self._guided_field(
-                    half_state,
-                    t_midpoint,
-                    None,
-                    conditioning_cache=cache,
-                    unconditional_cache=unconditional_cache,
-                    cond=None,
+            if oracle_local_error:
+                oracle_error = self._oracle_local_error_proxy(
+                    x,
+                    v,
+                    hist=hist,
+                    cond=cond,
                     guidance=guidance,
+                    dt=dt,
+                    t_cur=t_cur,
                 )
-                euler_state = state + dt * velocity
-                two_half_state = half_state + 0.5 * dt * midpoint_velocity
-                local_error = torch.sqrt(
-                    (euler_state - two_half_state)
-                    .reshape(batch_size, -1)
-                    .square()
-                    .sum(dim=-1)
-                    + 1e-12
-                )
+
+            if solver_name == "heun":
+                x_pred = x + dt * v
+                t_next_tensor = torch.full((batch_size, 1), t_next, device=hist.device)
+                v_next = self._guided_field(x_pred, t_next_tensor, hist, cond=cond, guidance=guidance)
+                x = x + dt * 0.5 * (v + v_next)
+                field_evals = torch.full_like(field_evals, 2.0)
+            elif solver_name == "midpoint_rk2":
+                x_mid = x + 0.5 * dt * v
+                t_mid_tensor = torch.full((batch_size, 1), t_cur + 0.5 * dt, device=hist.device)
+                v_mid = self._guided_field(x_mid, t_mid_tensor, hist, cond=cond, guidance=guidance)
+                x = x + dt * v_mid
+                field_evals = torch.full_like(field_evals, 2.0)
+            elif solver_name == "euler":
+                x = x + dt * v
+            elif solver_name == "dpmpp2m":
+                if prev_dpm_v is None or prev_dpm_dt is None:
+                    x = x + dt * v
+                else:
+                    ratio = float(dt) / max(float(prev_dpm_dt), 1e-12)
+                    x = x + dt * ((1.0 + 0.5 * ratio) * v - 0.5 * ratio * prev_dpm_v)
+                prev_dpm_v = v
+                prev_dpm_dt = dt
             else:
-                local_error = torch.zeros(
-                    batch_size,
-                    device=state.device,
-                    dtype=state.dtype,
-                )
-            local_error_rows.append(local_error)
-            field_eval_rows.append(
-                torch.full(
-                    (batch_size,),
-                    float(solver_eval_multiplier(trajectory.solver_key)),
-                    device=state.device,
-                    dtype=state.dtype,
-                )
-            )
-            ema_velocity = (
-                DIAGNOSTIC_EMA_DECAY * ema_velocity
-                + (1.0 - DIAGNOSTIC_EMA_DECAY) * flat_velocity.detach()
-            )
+                raise ValueError(f"Unhandled sample solver={solver_name}")
 
-        disagreement = torch.stack(disagreement_rows, dim=1)
-        field_evals = torch.stack(field_eval_rows, dim=1)
-        return FlowDiagnostics(
-            trajectory=trajectory,
-            disagreement=disagreement,
-            velocity_norm=torch.stack(velocity_norm_rows, dim=1),
-            ema_velocity_norm=torch.stack(ema_velocity_norm_rows, dim=1),
-            residual_norm=torch.stack(residual_norm_rows, dim=1),
-            local_error=torch.stack(local_error_rows, dim=1),
-            field_evals_by_step=field_evals,
-            mean_field_evals_per_step=float(field_evals.mean().item()),
-            mean_total_field_evals_per_rollout=float(
-                field_evals.sum(dim=1).mean().item()
-            ),
-        )
+            ema_beta = _TRACE_EMA_DECAY
+            ema_v = ema_beta * ema_v + (1.0 - ema_beta) * v_flat.detach()
+            ema_v_sq = ema_beta * ema_v_sq + (1.0 - ema_beta) * v_flat.detach().square()
+            ema_u = ema_beta * ema_u + (1.0 - ema_beta) * u_flat.detach()
+
+            if record_trace:
+                trace_disagreement.append(disagreement.detach().cpu())
+                trace_velocity_norm.append(vel_norm.detach().cpu())
+                trace_ema_velocity_norm.append(ema_vel_norm.detach().cpu())
+                trace_residual_norm.append(residual_norm.detach().cpu())
+                trace_hybrid_signal.append(hybrid_signal.detach().cpu())
+                trace_u_disagreement.append(u_disagreement.detach().cpu())
+                trace_u_residual_norm.append(u_residual_norm.detach().cpu())
+                trace_u_hybrid_signal.append(u_hybrid_signal.detach().cpu())
+                trace_variance_scaled_signal.append(variance_scaled_signal.detach().cpu())
+                trace_top_book_disagreement.append(top_book_disagreement.detach().cpu())
+                trace_top_book_residual_norm.append(top_book_residual_norm.detach().cpu())
+                trace_top_book_hybrid_signal.append(top_book_hybrid_signal.detach().cpu())
+                trace_oracle_error.append(oracle_error.detach().cpu())
+                trace_field_evals.append(field_evals.detach().cpu())
+                trace_time.append(float(t_cur))
+
+        trace: Optional[Dict[str, Any]] = None
+        if record_trace:
+            disagreement_t = torch.stack(trace_disagreement, dim=1)
+            velocity_norm_t = torch.stack(trace_velocity_norm, dim=1)
+            ema_velocity_norm_t = torch.stack(trace_ema_velocity_norm, dim=1)
+            residual_norm_t = torch.stack(trace_residual_norm, dim=1)
+            hybrid_signal_t = torch.stack(trace_hybrid_signal, dim=1)
+            u_disagreement_t = torch.stack(trace_u_disagreement, dim=1)
+            u_residual_norm_t = torch.stack(trace_u_residual_norm, dim=1)
+            u_hybrid_signal_t = torch.stack(trace_u_hybrid_signal, dim=1)
+            variance_scaled_signal_t = torch.stack(trace_variance_scaled_signal, dim=1)
+            top_book_disagreement_t = torch.stack(trace_top_book_disagreement, dim=1)
+            top_book_residual_norm_t = torch.stack(trace_top_book_residual_norm, dim=1)
+            top_book_hybrid_signal_t = torch.stack(trace_top_book_hybrid_signal, dim=1)
+            oracle_error_t = torch.stack(trace_oracle_error, dim=1)
+            field_evals_t = torch.stack(trace_field_evals, dim=1)
+            trace = {
+                "solver": solver_name,
+                "steps": int(n_steps),
+                "step_index": torch.arange(n_steps, dtype=torch.long),
+                "time": torch.tensor(trace_time, dtype=disagreement_t.dtype),
+                "time_grid": torch.tensor(time_grid, dtype=disagreement_t.dtype),
+                "disagreement": disagreement_t,
+                "velocity_norm": velocity_norm_t,
+                "ema_velocity_norm": ema_velocity_norm_t,
+                "residual_norm": residual_norm_t,
+                "hybrid_signal": hybrid_signal_t,
+                "u_disagreement": u_disagreement_t,
+                "u_residual_norm": u_residual_norm_t,
+                "u_hybrid_signal": u_hybrid_signal_t,
+                "variance_scaled_signal": variance_scaled_signal_t,
+                "top_book_disagreement": top_book_disagreement_t,
+                "top_book_residual_norm": top_book_residual_norm_t,
+                "top_book_hybrid_signal": top_book_hybrid_signal_t,
+                "oracle_local_error": oracle_error_t,
+                "field_evals_by_step": field_evals_t,
+                "mean_field_evals_per_step": float(field_evals_t.mean().item()),
+                "mean_total_field_evals_per_rollout": float(field_evals_t.sum(dim=1).mean().item()),
+            }
+        return x, trace
 
     @torch.no_grad()
-    def sample_with_diagnostics(
+    def sample_trace(
         self,
         hist: torch.Tensor,
         cond: Optional[torch.Tensor] = None,
-        *,
-        solver_key: str,
-        target_nfe: int,
-        time_grid: Sequence[float] | torch.Tensor,
-        include_local_error: bool = False,
-    ) -> tuple[torch.Tensor, FlowDiagnostics]:
+        steps: Optional[int] = None,
+        cfg_scale: Optional[float] = None,
+        solver: Optional[str] = None,
+        oracle_local_error: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Sample a single next state and return per-solver-step trace statistics."""
         if self._is_non_autoregressive():
-            raise RuntimeError(
-                "Non-autoregressive OTFlow uses sample_future_with_diagnostics(...)."
-            )
-        diagnostics = self.solve_with_diagnostics(
-            self._sample_initial_state(hist),
+            raise RuntimeError("Non-autoregressive OTFlow uses sample_future_trace(...), not sample_trace(...).")
+        x, trace = self._sample_impl(
             hist,
             cond=cond,
-            solver_key=solver_key,
-            target_nfe=target_nfe,
-            time_grid=time_grid,
-            include_local_error=include_local_error,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            solver=solver,
+            record_trace=True,
+            oracle_local_error=oracle_local_error,
         )
-        return diagnostics.trajectory.final_state, diagnostics
-
-    @torch.no_grad()
-    def sample_future_with_diagnostics(
-        self,
-        hist: torch.Tensor,
-        cond: Optional[torch.Tensor] = None,
-        *,
-        solver_key: str,
-        target_nfe: int,
-        time_grid: Sequence[float] | torch.Tensor,
-        include_local_error: bool = False,
-    ) -> tuple[torch.Tensor, FlowDiagnostics]:
-        diagnostics = self.solve_with_diagnostics(
-            self._sample_initial_state(hist),
-            hist,
-            cond=cond,
-            solver_key=solver_key,
-            target_nfe=target_nfe,
-            time_grid=time_grid,
-            include_local_error=include_local_error,
-        )
-        return self._reshape_sample_block(diagnostics.trajectory.final_state), diagnostics
+        assert trace is not None
+        return x, trace
 
     @torch.no_grad()
     def sample(
         self,
         hist: torch.Tensor,
         cond: Optional[torch.Tensor] = None,
-        *,
-        solver_key: str,
-        target_nfe: int,
-        time_grid: Sequence[float] | torch.Tensor,
+        steps: Optional[int] = None,
+        cfg_scale: Optional[float] = None,
+        solver: Optional[str] = None,
     ) -> torch.Tensor:
-        """Draw an initial state and return one autoregressive sample."""
+        """Sampler with optional classifier-free guidance."""
         if self._is_non_autoregressive():
             raise RuntimeError("Non-autoregressive OTFlow uses sample_future(...), not sample(...).")
-        result = self.solve(
-            self._sample_initial_state(hist),
+        x, _ = self._sample_impl(
             hist,
             cond=cond,
-            solver_key=solver_key,
-            target_nfe=target_nfe,
-            time_grid=time_grid,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            solver=solver,
+            record_trace=False,
+            oracle_local_error=False,
         )
-        assert isinstance(result, torch.Tensor)
-        return result
+        return x
+
+    @torch.no_grad()
+    def sample_future_trace(
+        self,
+        hist: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+        steps: Optional[int] = None,
+        cfg_scale: Optional[float] = None,
+        solver: Optional[str] = None,
+        oracle_local_error: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        x, trace = self._sample_impl(
+            hist,
+            cond=cond,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            solver=solver,
+            record_trace=True,
+            oracle_local_error=oracle_local_error,
+        )
+        assert trace is not None
+        return self._reshape_sample_block(x), trace
 
     @torch.no_grad()
     def sample_future(
         self,
         hist: torch.Tensor,
         cond: Optional[torch.Tensor] = None,
-        *,
-        solver_key: str,
-        target_nfe: int,
-        time_grid: Sequence[float] | torch.Tensor,
+        steps: Optional[int] = None,
+        cfg_scale: Optional[float] = None,
+        solver: Optional[str] = None,
     ) -> torch.Tensor:
-        """Draw an initial state and return a future block."""
-        result = self.solve(
-            self._sample_initial_state(hist),
+        x, _ = self._sample_impl(
             hist,
             cond=cond,
-            solver_key=solver_key,
-            target_nfe=target_nfe,
-            time_grid=time_grid,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            solver=solver,
+            record_trace=False,
+            oracle_local_error=False,
         )
-        assert isinstance(result, torch.Tensor)
-        return self._reshape_sample_block(result)
+        return self._reshape_sample_block(x)
 
 
-__all__ = ["OTFlow"]
+__all__ = ["OTFLOW_TRACE_FIELDS", "OTFlow", "_solve_linear_assignment"]

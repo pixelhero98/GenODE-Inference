@@ -14,6 +14,7 @@ from genode.checkpoint_validation import (
     validate_locked_test_exclusion,
     validate_strict_integer,
 )
+from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
 from genode.path_safety import (
     MANIFEST_PARENT_PATH_BASE,
     portable_relative_path,
@@ -479,9 +480,17 @@ def _validate_demonstration_metadata(metadata: Mapping[str, Any]) -> None:
     for name in ("scenario_key", "benchmark_family"):
         if not str(metadata.get(name, "")).strip():
             raise ValueError(f"Demonstration metadata {name!r} may not be empty.")
-    if not str(metadata.get("context_embedding_kind", "") or "").strip():
+    if "context_embedding_kind" in metadata:
         raise ValueError(
-            "Demonstration metadata requires an explicit context_embedding_kind."
+            "Demonstration metadata may not contain the retired context_embedding_kind field."
+        )
+    if (
+        str(metadata.get("context_embedding_protocol", ""))
+        != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
+    ):
+        raise ValueError(
+            "Demonstration metadata context_embedding_protocol must be "
+            f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
         )
     integer_metadata = {
         name: validate_strict_integer(
@@ -519,7 +528,7 @@ def _validate_demonstration_metadata(metadata: Mapping[str, Any]) -> None:
         setting_keys.append((solver_key, target_nfe))
     if len(set(setting_keys)) != len(setting_keys):
         raise ValueError("Demonstration metadata settings may not contain duplicates.")
-    for name in ("backbone_checkpoint_sha256", "gipo_checkpoint_sha256"):
+    for name in ("backbone_checkpoint_sha256", "gico_checkpoint_sha256"):
         value = str(metadata.get(name, ""))
         if _SHA256_PATTERN.fullmatch(value) is None:
             raise ValueError(f"Demonstration metadata {name!r} must be a lowercase SHA-256 digest.")

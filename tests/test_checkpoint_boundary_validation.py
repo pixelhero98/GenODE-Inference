@@ -6,24 +6,28 @@ import numpy as np
 import pytest
 import torch
 
-from genode.checkpoint_validation import validate_tensor_state_dict
+from genode.checkpoint_validation import (
+    normalize_strict_solver_nfe_fields as normalize_solver_nfe_fields,
+    validate_tensor_state_dict,
+)
 from genode.distillation.model import EndpointFlowMap, FlowMapSampler
+from genode.distillation.gico_policy import (
+    build_gico_student_model,
+    validate_gico_teacher_training_metadata,
+)
 from genode.distillation.training import _validate_continuous_array
-from genode.gipo.models import (
+from genode.gico.models import (
     build_setting_encoder_config,
     setting_feature_dim,
 )
-from genode.gipo.policy import (
+from genode.gico.policy import (
     TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
     TEACHER_METRIC_MASK_PROTOCOL,
     TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
     TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
-    build_gipo_student_model,
-    validate_gipo_teacher_training_metadata,
 )
 from genode.models.config import OTFlowConfig
 from genode.models.otflow_model import OTFlow
-from genode.solver_protocol import normalize_solver_nfe_fields
 
 
 def _tiny_config() -> OTFlowConfig:
@@ -135,7 +139,7 @@ def test_tensor_state_validation_rejects_non_real_floating_tensors(dtype: torch.
         validate_tensor_state_dict(state, label="test state", target_module=module)
 
 
-def test_flow_map_and_gipo_loaders_reject_dtype_coercion() -> None:
+def test_flow_map_and_gico_boundaries_reject_dtype_coercion() -> None:
     config = _setting_config()
     flow_map = EndpointFlowMap(
         _tiny_config(),
@@ -150,7 +154,7 @@ def test_flow_map_and_gipo_loaders_reject_dtype_coercion() -> None:
     with pytest.raises(ValueError, match="has dtype"):
         flow_map.load_state_dict(flow_state)
 
-    student = build_gipo_student_model(
+    student = build_gico_student_model(
         setting_dim=setting_feature_dim(config=config),
         density_dim=8,
         context_dim=8,
@@ -167,7 +171,11 @@ def test_flow_map_and_gipo_loaders_reject_dtype_coercion() -> None:
     student_key = next(iter(student_state))
     student_state[student_key] = student_state[student_key].to(torch.float64)
     with pytest.raises(ValueError, match="has dtype"):
-        student.load_state_dict(student_state)
+        validate_tensor_state_dict(
+            student_state,
+            label="GICO student state",
+            target_module=student,
+        )
 
 
 def test_flow_map_sampler_rejects_nonfinite_model_output(
@@ -221,7 +229,7 @@ def test_teacher_training_metadata_requires_explicit_supported_protocols(
         metadata[field] = value
 
     with pytest.raises(ValueError, match=field):
-        validate_gipo_teacher_training_metadata(metadata)
+        validate_gico_teacher_training_metadata(metadata)
 
 
 @pytest.mark.parametrize(

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from genode.provenance import fingerprint_identity, path_fingerprint
-from genode.gipo.train_gipo import _artifact_input_summary
+from genode.gico.train_gico import _artifact_input_summary
 
 
 class ProvenanceTests(unittest.TestCase):
@@ -42,7 +42,7 @@ class ProvenanceTests(unittest.TestCase):
             self.assertEqual(fingerprint["kind"], "directory")
             self.assertEqual(fingerprint["manifests"][0]["name"], "manifest.json")
 
-    def test_gipo_input_summary_uses_content_not_location_or_mtime(self) -> None:
+    def test_gico_input_summary_uses_content_not_location_or_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
             first = Path(first_dir) / "rows.csv"
             second = Path(second_dir) / "rows.csv"

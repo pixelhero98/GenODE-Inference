@@ -19,13 +19,13 @@ from genode.distillation.measurement_protocol import (
 
 def test_quality_evaluator_binding_covers_behavior_dependencies() -> None:
     required = {
+        "canonical_experiment_layout.py",
         "checkpoint_validation.py",
         "distillation/artifacts.py",
         "distillation/evaluation.py",
         "distillation/measurement_protocol.py",
-        "experiment_layout.py",
-        "gipo/models.py",
-        "gipo/objectives.py",
+        "gico/models.py",
+        "gico/objectives.py",
         "schedule_transfer/diffusion_flow_schedules.py",
         "solver_protocol.py",
     }
@@ -67,7 +67,7 @@ def _payload() -> dict[str, object]:
         artifact_binding={
             "flow_map_checkpoint_sha256": "1" * 64,
             "backbone_checkpoint_sha256": "2" * 64,
-            "gipo_checkpoint_sha256": "3" * 64,
+            "gico_checkpoint_sha256": "3" * 64,
         },
         primary_metrics=_metrics(),
         runner={
@@ -105,7 +105,7 @@ def test_measurement_protocol_round_trip_binds_external_runner(tmp_path: Path) -
         (lambda payload: payload["runner"].update({"implementation_sha256": "bad"}), "SHA-256"),
         (
             lambda payload: payload["artifact_binding"].update(
-                {"gipo_checkpoint_sha256": "e" * 64}
+                {"gico_checkpoint_sha256": "e" * 64}
             ),
             "does not match",
         ),

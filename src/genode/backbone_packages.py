@@ -1,44 +1,38 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import os
 import re
 import shutil
 import subprocess
-import tempfile
-import uuid
-import zipfile
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
-from genode.experiment_layout import (
-    REFERENCE_CHECKPOINT_STEPS,
+from genode.canonical_experiment_layout import (
+    CANONICAL_CHECKPOINT_STEPS,
     CONDITIONAL_GENERATION_SCENARIO_KEYS,
     FORECAST_SCENARIO_KEYS,
     MOLECULE_SCENARIO_KEYS,
     SCENARIO_FAMILY_MOLECULE,
 )
 from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
-from genode.data.otflow_paths import display_project_path, project_root, resolve_project_path
-from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW, BACKBONE_NAME_OTFLOW_MOLECULE
-from genode.path_safety import (
-    MANIFEST_PARENT_PATH_BASE,
-    first_link_or_reparse_component,
-    is_link_or_reparse_point,
-    portable_relative_path,
-    resolve_manifest_path_base,
-    resolve_portable_relative_path,
+from genode.data.otflow_paths import project_root, resolve_project_path
+from genode.deterministic_archive import (
+    ArchiveEntry,
+    canonical_json_bytes,
+    write_deterministic_zip,
 )
-from genode.provenance import file_sha256
+from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW, BACKBONE_NAME_OTFLOW_MOLECULE
 
-PACKAGE_SCHEMA_VERSION = "genode_backbone_package"
+PACKAGE_SCHEMA_VERSION = "genode_backbone_package_v1"
 PACKAGE_MANIFEST_NAME = "package_manifest.json"
-PACKAGED_BACKBONE_MANIFEST = "backbone_manifest.json"
+PACKAGED_BACKBONE_MANIFEST = "outputs/backbone_matrix/backbone_manifest.json"
+PATH_BASE_FROM_BACKBONE_MANIFEST = "../.."
 MANIFEST_VERSION = "fm_backbone_manifest"
 MOLECULE_FAMILY = SCENARIO_FAMILY_MOLECULE
-TRAIN_BUDGET_STEPS = REFERENCE_CHECKPOINT_STEPS
+TRAIN_BUDGET_STEPS = CANONICAL_CHECKPOINT_STEPS
 
 PATH_FIELDS = ("checkpoint_path", "summary_path", "metadata_path")
 ROOT_FIELDS = (
@@ -48,14 +42,10 @@ ROOT_FIELDS = (
     "molecule_group_root",
     "molecule_backbone_root",
 )
-LOCAL_PATH_MARKERS = (
-    "C" + ":/",
-    "C" + ":\\",
-    "/" + "home" + "/",
-    "/" + "scratch" + "/",
-    "/" + "projects" + "/",
-    "/" + "Users" + "/",
+_EMBEDDED_WINDOWS_PATH = re.compile(
+    r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+)"
 )
+_EMBEDDED_POSIX_PATH = re.compile(r"(?<![:A-Za-z0-9/])/(?:[^/\s]+/)+[^/\s]+")
 REDACTED_LOCAL_PATH = "<local_path_redacted>"
 MIN_CHECKPOINT_SIZE_BYTES = 1024
 
@@ -76,7 +66,7 @@ FAMILY_SPECS: Mapping[str, BackbonePackageFamily] = {
         benchmark_family=FORECAST_FAMILY,
         scenarios=FORECAST_SCENARIO_KEYS,
         zip_name="genode_temporal_extrapolation_backbones_datasets.zip",
-        data_roots=tuple(f"datasets/monash/{scenario}" for scenario in FORECAST_SCENARIO_KEYS),
+        data_roots=tuple(f"paper_datasets/monash/{scenario}" for scenario in FORECAST_SCENARIO_KEYS),
         expected_artifact_count=len(FORECAST_SCENARIO_KEYS) * len(TRAIN_BUDGET_STEPS),
     ),
     "temporal-generation": BackbonePackageFamily(
@@ -108,15 +98,18 @@ def _as_posix(path: str | Path) -> str:
 
 
 def _safe_rel(path: str | Path) -> PurePosixPath:
-    return portable_relative_path(path, label="Package-relative path")
+    rel = PurePosixPath(_as_posix(path))
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts or rel.parts[0].endswith(":"):
+        raise ValueError(f"Unsafe package-relative path: {path!r}")
+    return rel
 
 
 def _strip_known_prefix(path_text: str) -> str:
     text = _as_posix(path_text)
     parts = PurePosixPath(text).parts
-    if len(parts) >= 2 and parts[0] == "genode" and parts[1] in {"outputs", "data", "datasets"}:
+    if len(parts) >= 2 and parts[0] == "genode" and parts[1] in {"outputs", "data", "paper_datasets"}:
         return PurePosixPath(*parts[1:]).as_posix()
-    for marker in ("outputs", "data", "datasets"):
+    for marker in ("outputs", "data", "paper_datasets"):
         if marker in parts:
             return PurePosixPath(*parts[parts.index(marker) :]).as_posix()
     return text
@@ -133,16 +126,7 @@ def _source_path(source_root: Path, path_text: str | Path) -> Path:
         candidates.append(source_root / stripped)
     for candidate in candidates:
         if candidate.exists():
-            try:
-                indirect = first_link_or_reparse_component(candidate, root=source_root)
-            except ValueError:
-                indirect = None
-            if indirect is not None:
-                raise ValueError(f"Refusing to package linked or reparse-point source path: {indirect}")
-            resolved = candidate.resolve()
-            if not resolved.is_relative_to(source_root.resolve()):
-                raise ValueError(f"Refusing to package source path outside source_root: {candidate}")
-            return resolved
+            return candidate.resolve()
     return candidates[-1].resolve()
 
 
@@ -152,30 +136,60 @@ def _package_rel_for_path(path_text: str | Path) -> str:
     return stripped
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _guard_package_delete(package_root: Path, output_dir: Path, expected_basename: str) -> None:
+    resolved = package_root.resolve()
+    resolved_output = output_dir.resolve()
+    if resolved == resolved.anchor or resolved.parent == resolved:
+        raise ValueError(f"Refusing to delete unsafe package staging directory: {resolved}")
+    if _is_relative_to(resolved, resolved_output):
+        return
+    if resolved.name == expected_basename:
+        return
+    raise ValueError(
+        f"Refusing to delete package staging directory outside output_dir without expected basename {expected_basename!r}: {resolved}"
+    )
+
+
 def _resolve_manifest_relative_path(manifest_path: Path, value: Any, *, path_base: str) -> Any:
     if not isinstance(value, str) or not value.strip():
         return value
-    base = resolve_manifest_path_base(manifest_path, path_base)
-    return str(resolve_portable_relative_path(base, value, label="Portable backbone manifest path"))
+    raw = Path(value)
+    if raw.is_absolute():
+        return str(raw)
+    base = (manifest_path.parent / str(path_base)).resolve()
+    return str((base / _strip_known_prefix(value)).resolve())
 
 
 def load_portable_backbone_manifest(path: str | Path) -> Dict[str, Any]:
     resolved = Path(path).resolve()
-    loaded = json.loads(resolved.read_text(encoding="utf-8"))
-    if not isinstance(loaded, Mapping):
-        raise ValueError("Portable backbone manifest root must be a JSON object.")
-    payload = dict(loaded)
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
     path_base = str(payload.get("path_base", "") or "").strip()
-    resolve_manifest_path_base(resolved, path_base)
-    for artifact in payload.get("artifacts", []):
-        if not isinstance(artifact, dict):
-            continue
-        for field in PATH_FIELDS:
-            if field in artifact:
-                artifact[field] = _resolve_manifest_relative_path(resolved, artifact[field], path_base=path_base)
-    for field in ROOT_FIELDS:
-        if field in payload:
-            payload[field] = _resolve_manifest_relative_path(resolved, payload[field], path_base=path_base)
+    if path_base:
+        for artifact in payload.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            for field in PATH_FIELDS:
+                if field in artifact:
+                    artifact[field] = _resolve_manifest_relative_path(resolved, artifact[field], path_base=path_base)
+        for field in ROOT_FIELDS:
+            if field in payload:
+                payload[field] = _resolve_manifest_relative_path(resolved, payload[field], path_base=path_base)
     return payload
 
 
@@ -189,24 +203,14 @@ def _copy_json_or_file(src: Path, dst: Path) -> None:
     dst.write_text(json.dumps(rewritten, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _is_json_path_field(key: str) -> bool:
-    normalized = str(key).strip().lower()
-    return (
-        normalized in {*PATH_FIELDS, *ROOT_FIELDS, "path", "manifest", "backbone_manifest"}
-        or normalized.endswith(("_path", "_root", "_dir", "_file"))
-    )
-
-
-def _rewrite_json_paths(value: Any, *, key: str = "") -> Any:
+def _rewrite_json_paths(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {str(item_key): _rewrite_json_paths(item, key=str(item_key)) for item_key, item in value.items()}
+        return {str(key): _rewrite_json_paths(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [_rewrite_json_paths(item, key=key) for item in value]
+        return [_rewrite_json_paths(item) for item in value]
     if isinstance(value, str):
-        if not _is_json_path_field(key):
-            return value
         text = _as_posix(value)
-        if any(marker in text for marker in ("outputs/", "data/", "datasets/", "genode/outputs/")):
+        if any(marker in text for marker in ("outputs/", "data/", "paper_datasets/", "genode/outputs/")):
             stripped = _strip_known_prefix(text)
             try:
                 _safe_rel(stripped)
@@ -232,19 +236,15 @@ def _copy_tree_or_file(source_root: Path, package_root: Path, rel_path: str) -> 
     copied: List[Dict[str, Any]] = []
     if src.is_file():
         dst = package_root / _safe_rel(rel_path)
-        _copy_json_or_file(src, dst)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
         copied.append(_file_record(package_root, dst, role="dataset"))
         return copied
-    entries = sorted(src.rglob("*"))
-    indirect_entries = [path for path in entries if is_link_or_reparse_point(path)]
-    if indirect_entries:
-        raise ValueError(f"Refusing to package linked or reparse-point source entry: {indirect_entries[0]}")
-    for file_path in (path for path in entries if path.is_file()):
-        if not file_path.resolve().is_relative_to(source_root.resolve()):
-            raise ValueError(f"Refusing to package source entry outside source_root: {file_path}")
+    for file_path in sorted(path for path in src.rglob("*") if path.is_file()):
         relative_tail = file_path.relative_to(src)
         dst = package_root / _safe_rel(rel_path) / relative_tail
-        _copy_json_or_file(file_path, dst)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file_path, dst)
         copied.append(_file_record(package_root, dst, role="dataset"))
     return copied
 
@@ -255,7 +255,7 @@ def _file_record(package_root: Path, path: Path, *, role: str) -> Dict[str, Any]
         "path": rel,
         "role": role,
         "size_bytes": int(path.stat().st_size),
-        "sha256": file_sha256(path),
+        "sha256": _sha256_file(path),
     }
 
 
@@ -368,7 +368,7 @@ def _normalize_manifest_for_package(
             "version": MANIFEST_VERSION,
             "package_schema_version": PACKAGE_SCHEMA_VERSION,
             "package_family": spec.key,
-            "path_base": MANIFEST_PARENT_PATH_BASE,
+            "path_base": PATH_BASE_FROM_BACKBONE_MANIFEST,
             "matrix_root": "outputs/backbone_matrix",
             "otflow_reuse_root": "outputs/shared_backbones/otflow_fullhorizon_seed0",
             "imported_backbone_root": "outputs/imported_backbones/otflow",
@@ -404,188 +404,133 @@ def _read_git_commit(source_root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def _remove_output_path(path: Path, *, output_dir: Path) -> None:
-    absolute = path.absolute()
-    if absolute.parent != output_dir.absolute():
-        raise ValueError(f"Refusing to remove package output outside output_dir: {absolute}")
-    if not path.exists() and not path.is_symlink():
-        return
-    if is_link_or_reparse_point(path):
-        raise ValueError(f"Refusing to remove linked or reparse-point package output: {path}")
-    if path.is_dir():
-        shutil.rmtree(path)
-    else:
-        path.unlink()
-
-
-def _commit_package_outputs(
-    replacements: Sequence[tuple[Path, Path]],
-    *,
-    removals: Sequence[Path] = (),
-    output_dir: Path,
-    token: str,
-) -> None:
-    backups: List[tuple[Path, Path]] = []
-    installed: List[Path] = []
-    try:
-        final_paths = [final_path for _, final_path in replacements]
-        for final_path in (*final_paths, *removals):
-            if not final_path.exists():
-                continue
-            if final_path.parent.absolute() != output_dir.absolute():
-                raise ValueError(f"Refusing to replace package output outside output_dir: {final_path}")
-            if is_link_or_reparse_point(final_path):
-                raise ValueError(f"Refusing to replace linked or reparse-point package output: {final_path}")
-            backup = output_dir / f".backup-{token}-{len(backups)}"
-            os.replace(final_path, backup)
-            backups.append((backup, final_path))
-        for temporary, final_path in replacements:
-            os.replace(temporary, final_path)
-            installed.append(final_path)
-    except Exception:
-        for final_path in reversed(installed):
-            _remove_output_path(final_path, output_dir=output_dir)
-        for backup, final_path in reversed(backups):
-            os.replace(backup, final_path)
-        raise
-    for backup, _ in backups:
-        _remove_output_path(backup, output_dir=output_dir)
-
-
 def package_backbone_family(
     *,
     family: str,
     source_root: str | Path | None = None,
     output_dir: str | Path,
+    stage_dir: str | Path | None = None,
     overwrite: bool = False,
     make_zip: bool = True,
 ) -> Dict[str, Any]:
     spec = FAMILY_SPECS[str(family)]
     resolved_source = Path(source_root or project_root()).expanduser().resolve()
     resolved_output = Path(output_dir).expanduser().resolve()
-    resolved_output.mkdir(parents=True, exist_ok=True)
-    package_root = resolved_output / spec.zip_name.removesuffix(".zip")
+    package_root = Path(stage_dir).expanduser().resolve() if stage_dir else resolved_output / spec.zip_name.removesuffix(".zip")
+    if package_root.exists():
+        if not overwrite:
+            raise FileExistsError(f"Package staging directory already exists: {package_root}")
+        _guard_package_delete(package_root, resolved_output, spec.zip_name.removesuffix(".zip"))
+        shutil.rmtree(package_root)
+    package_root.mkdir(parents=True, exist_ok=True)
+    source_manifest_path = _source_path(resolved_source, PACKAGED_BACKBONE_MANIFEST)
+    source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    if int(source_manifest.get("ready_count", -1)) != int(source_manifest.get("artifact_count", -2)):
+        raise ValueError(
+            "Source backbone manifest is not fully ready; expected ready_count == artifact_count before packaging."
+        )
+    if int(source_manifest.get("artifact_count", -1)) != int(EXPECTED_FULL_BACKBONE_ARTIFACT_COUNT):
+        raise ValueError(
+            f"Source backbone manifest has artifact_count={source_manifest.get('artifact_count')}; "
+            f"expected {EXPECTED_FULL_BACKBONE_ARTIFACT_COUNT} canonical artifacts before packaging."
+        )
+    artifacts = [row for row in source_manifest.get("artifacts", []) if _artifact_belongs_to_family(row, spec)]
+    if not artifacts:
+        raise ValueError(f"No ready artifacts found for package family {family!r}.")
+    artifact_grid_errors = _validate_artifact_grid(artifacts, spec)
+    if artifact_grid_errors:
+        raise ValueError("Source backbone manifest is incomplete for this family:\n- " + "\n- ".join(artifact_grid_errors))
+
+    records: List[Dict[str, Any]] = []
+    normalized_artifacts: List[Dict[str, Any]] = []
+    for artifact in artifacts:
+        normalized, artifact_records = _normalize_artifact_for_package(
+            artifact,
+            source_root=resolved_source,
+            package_root=package_root,
+        )
+        normalized_artifacts.append(normalized)
+        records.extend(artifact_records)
+    data_records: List[Dict[str, Any]] = []
+    for rel_path in spec.data_roots:
+        data_records.extend(_copy_tree_or_file(resolved_source, package_root, rel_path))
+    records.extend(data_records)
+
+    packaged_manifest = _normalize_manifest_for_package(source_manifest, normalized_artifacts, spec=spec)
+    backbone_manifest_path = package_root / PACKAGED_BACKBONE_MANIFEST
+    backbone_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    backbone_manifest_path.write_text(json.dumps(packaged_manifest, indent=2, sort_keys=True), encoding="utf-8")
+    records.append(_file_record(package_root, backbone_manifest_path, role="backbone_manifest"))
+
+    package_manifest = {
+        "schema_version": PACKAGE_SCHEMA_VERSION,
+        "family": spec.key,
+        "benchmark_family": spec.benchmark_family,
+        "scenarios": list(spec.scenarios),
+        "source_commit": _read_git_commit(resolved_source),
+        "backbone_manifest": PACKAGED_BACKBONE_MANIFEST,
+        "artifact_count": int(len(normalized_artifacts)),
+        "expected_artifact_count": int(spec.expected_artifact_count),
+        "artifacts_by_scenario": _scenario_artifact_counts(normalized_artifacts),
+        "data_roots": list(spec.data_roots),
+        "dataset_root_count": int(len(spec.data_roots)),
+        "files": sorted(records, key=lambda row: str(row["path"])),
+    }
+    package_manifest_path = package_root / PACKAGE_MANIFEST_NAME
+    package_manifest_path.write_text(json.dumps(package_manifest, indent=2, sort_keys=True), encoding="utf-8")
+
     zip_path = resolved_output / spec.zip_name
-    zip_manifest_path = zip_path.with_suffix(zip_path.suffix + ".manifest.json")
-    existing_outputs = [package_root, zip_path, zip_manifest_path]
-    if not overwrite:
-        existing = [path for path in existing_outputs if path.exists()]
-        if existing:
-            raise FileExistsError(f"Package output already exists: {existing[0]}")
-
-    token = uuid.uuid4().hex
-    build_root = Path(tempfile.mkdtemp(prefix=".pkg-", dir=resolved_output))
-    temporary_zip = resolved_output / f".archive-{token}.tmp"
-    temporary_zip_manifest = resolved_output / f".archive-manifest-{token}.tmp"
-    package_manifest: Dict[str, Any] = {}
-    try:
-        source_manifest_path = _source_path(resolved_source, PACKAGED_BACKBONE_MANIFEST)
-        source_manifest = load_portable_backbone_manifest(source_manifest_path)
-        if int(source_manifest.get("ready_count", -1)) != int(source_manifest.get("artifact_count", -2)):
-            raise ValueError(
-                "Source backbone manifest is not fully ready; expected ready_count == artifact_count before packaging."
-            )
-        if int(source_manifest.get("artifact_count", -1)) != int(EXPECTED_FULL_BACKBONE_ARTIFACT_COUNT):
-            raise ValueError(
-                f"Source backbone manifest has artifact_count={source_manifest.get('artifact_count')}; "
-                f"expected {EXPECTED_FULL_BACKBONE_ARTIFACT_COUNT} required artifacts before packaging."
-            )
-        artifacts = [row for row in source_manifest.get("artifacts", []) if _artifact_belongs_to_family(row, spec)]
-        if not artifacts:
-            raise ValueError(f"No ready artifacts found for package family {family!r}.")
-        artifact_grid_errors = _validate_artifact_grid(artifacts, spec)
-        if artifact_grid_errors:
-            raise ValueError("Source backbone manifest is incomplete for this family:\n- " + "\n- ".join(artifact_grid_errors))
-
-        records: List[Dict[str, Any]] = []
-        normalized_artifacts: List[Dict[str, Any]] = []
-        for artifact in artifacts:
-            normalized, artifact_records = _normalize_artifact_for_package(
-                artifact,
-                source_root=resolved_source,
-                package_root=build_root,
-            )
-            normalized_artifacts.append(normalized)
-            records.extend(artifact_records)
-        for rel_path in spec.data_roots:
-            records.extend(_copy_tree_or_file(resolved_source, build_root, rel_path))
-
-        packaged_manifest = _normalize_manifest_for_package(source_manifest, normalized_artifacts, spec=spec)
-        backbone_manifest_file = build_root / PACKAGED_BACKBONE_MANIFEST
-        backbone_manifest_file.write_text(json.dumps(packaged_manifest, indent=2, sort_keys=True), encoding="utf-8")
-        records.append(_file_record(build_root, backbone_manifest_file, role="backbone_manifest"))
-        package_manifest = {
-            "schema_version": PACKAGE_SCHEMA_VERSION,
-            "family": spec.key,
-            "benchmark_family": spec.benchmark_family,
-            "scenarios": list(spec.scenarios),
-            "source_commit": _read_git_commit(resolved_source),
-            "backbone_manifest": PACKAGED_BACKBONE_MANIFEST,
-            "artifact_count": int(len(normalized_artifacts)),
-            "expected_artifact_count": int(spec.expected_artifact_count),
-            "artifacts_by_scenario": _scenario_artifact_counts(normalized_artifacts),
-            "data_roots": list(spec.data_roots),
-            "dataset_root_count": int(len(spec.data_roots)),
-            "files": sorted(records, key=lambda row: str(row["path"])),
+    zip_manifest_path = zip_path.with_suffix(zip_path.suffix + ".package.json")
+    if make_zip:
+        resolved_output.mkdir(parents=True, exist_ok=True)
+        if zip_manifest_path.exists():
+            if not overwrite:
+                raise FileExistsError(f"Package zip manifest already exists: {zip_manifest_path}")
+        roles_by_path = {
+            str(record["path"]): str(record["role"])
+            for record in records
         }
-        (build_root / PACKAGE_MANIFEST_NAME).write_text(
-            json.dumps(package_manifest, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        validation = validate_backbone_package(build_root, expected_family=spec.key)
-        if validation["status"] != "complete":
-            raise ValueError("Generated backbone package failed self-validation:\n- " + "\n- ".join(validation["errors"]))
-
-        replacements: List[tuple[Path, Path]] = [(build_root, package_root)]
-        if make_zip:
-            with zipfile.ZipFile(temporary_zip, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-                for path in sorted(file_path for file_path in build_root.rglob("*") if file_path.is_file()):
-                    archive.write(path, path.relative_to(build_root).as_posix())
-            package_manifest = {
-                **package_manifest,
-                "zip_name": zip_path.name,
-                "zip_size_bytes": int(temporary_zip.stat().st_size),
-                "zip_sha256": file_sha256(temporary_zip),
-            }
-            temporary_zip_manifest.write_text(
-                json.dumps(package_manifest, indent=2, sort_keys=True),
-                encoding="utf-8",
+        archive_entries = [
+            ArchiveEntry(
+                source=path,
+                archive_path=path.relative_to(package_root).as_posix(),
+                role=roles_by_path.get(
+                    path.relative_to(package_root).as_posix(),
+                    "package_manifest" if path.name == PACKAGE_MANIFEST_NAME else "package_payload",
+                ),
             )
-            replacements.extend(((temporary_zip, zip_path), (temporary_zip_manifest, zip_manifest_path)))
-        removals = () if make_zip else (zip_path, zip_manifest_path)
-        _commit_package_outputs(
-            replacements,
-            removals=removals,
-            output_dir=resolved_output,
-            token=token,
+            for path in sorted(file_path for file_path in package_root.rglob("*") if file_path.is_file())
+        ]
+        archive_result = write_deterministic_zip(
+            archive_entries,
+            zip_path,
+            bundle_kind="frozen_backbone_family",
+            metadata={
+                "artifact_count": int(len(normalized_artifacts)),
+                "family": spec.key,
+                "package_schema_version": PACKAGE_SCHEMA_VERSION,
+            },
+            overwrite=overwrite,
         )
-    finally:
-        for temporary in (build_root, temporary_zip, temporary_zip_manifest):
-            if temporary.exists():
-                _remove_output_path(temporary, output_dir=resolved_output)
+        zip_manifest = {
+            **package_manifest,
+            "zip_name": zip_path.name,
+            "zip_size_bytes": int(zip_path.stat().st_size),
+            "zip_sha256": str(archive_result["sidecar"]["sha256"]),
+        }
+        zip_manifest_path.write_bytes(canonical_json_bytes(zip_manifest))
+        package_manifest = zip_manifest
     return {
         "status": "complete",
-        "package_root": display_project_path(package_root),
-        "zip_path": display_project_path(zip_path) if make_zip else "",
-        "zip_manifest_path": display_project_path(zip_manifest_path) if make_zip else "",
+        "package_root": str(package_root),
+        "zip_path": str(zip_path) if make_zip else "",
+        "zip_manifest_path": str(zip_manifest_path) if make_zip else "",
         "manifest": package_manifest,
     }
 
 
 def _contains_local_marker(value: str) -> bool:
-    text = value.replace("\\", "/")
-    windows_path = PureWindowsPath(value)
-    embedded_absolute = bool(
-        re.search(r"(?:^|[\s'\"(=])(?:[A-Za-z]:[/\\]|\\\\[^\s\\]+\\[^\s\\]+|/(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)", value)
-    )
-    return (
-        PurePosixPath(text).is_absolute()
-        or windows_path.is_absolute()
-        or bool(windows_path.drive)
-        or ".." in PurePosixPath(text).parts
-        or any(marker.lower().replace("\\", "/") in text.lower() for marker in LOCAL_PATH_MARKERS)
-        or embedded_absolute
-    )
+    return _EMBEDDED_WINDOWS_PATH.search(value) is not None or _EMBEDDED_POSIX_PATH.search(value) is not None
 
 
 def _iter_json_strings(value: Any) -> Iterable[str]:
@@ -603,32 +548,22 @@ def _validate_file_record(package_root: Path, record: Mapping[str, Any]) -> List
     errors: List[str] = []
     rel = str(record.get("path", ""))
     try:
-        path = resolve_portable_relative_path(
-            package_root,
-            rel,
-            label="Package manifest file path",
-            reject_links=True,
-        )
+        safe = _safe_rel(rel)
     except ValueError as exc:
         return [str(exc)]
+    path = package_root / safe
     if not path.exists():
         errors.append(f"Missing file listed in package manifest: {rel}")
         return errors
-    if not path.is_file():
-        errors.append(f"Package manifest entry is not a regular file: {rel}")
-        return errors
-    try:
-        expected_size = int(record.get("size_bytes", -1))
-    except (TypeError, ValueError):
-        expected_size = -1
-    if expected_size < 0:
+    raw_size = record.get("size_bytes")
+    if isinstance(raw_size, bool) or not isinstance(raw_size, int) or raw_size < 0:
         errors.append(f"Missing or invalid size_bytes for {rel}")
-    elif int(path.stat().st_size) != expected_size:
+    elif int(path.stat().st_size) != raw_size:
         errors.append(f"Size mismatch for {rel}")
-    expected_hash = str(record.get("sha256", "") or "")
-    if len(expected_hash) != 64 or any(character not in "0123456789abcdef" for character in expected_hash.lower()):
+    expected_hash = record.get("sha256")
+    if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
         errors.append(f"Missing or invalid SHA256 for {rel}")
-    elif file_sha256(path) != expected_hash.lower():
+    elif _sha256_file(path) != expected_hash:
         errors.append(f"SHA256 mismatch for {rel}")
     return errors
 
@@ -652,8 +587,7 @@ def _checkpoint_label(artifact: Mapping[str, Any]) -> str:
     return "/".join(part for part in parts if part)
 
 
-def validate_backbone_artifact_checkpoint(artifact: Mapping[str, Any], checkpoint_path: Path) -> List[str]:
-    """Return integrity errors for a declared backbone checkpoint artifact."""
+def _validate_artifact_checkpoint_integrity(artifact: Mapping[str, Any], checkpoint_path: Path) -> List[str]:
     label = _checkpoint_label(artifact)
     errors: List[str] = []
     if not checkpoint_path.exists():
@@ -685,21 +619,6 @@ def validate_backbone_artifact_checkpoint(artifact: Mapping[str, Any], checkpoin
             )
         except Exception as exc:
             errors.append(f"Provided artifact {label} checkpoint is not loadable: {exc}")
-    elif (
-        str(artifact.get("backbone_name", "")) == BACKBONE_NAME_OTFLOW_MOLECULE
-        and str(artifact.get("benchmark_family", "")) == MOLECULE_FAMILY
-    ):
-        try:
-            from genode.evaluation.molecule_metrics import load_molecule_checkpoint_payload
-
-            load_molecule_checkpoint_payload(
-                checkpoint_path,
-                expected_identity=f"provided molecule backbone artifact {label}",
-                expected_dataset_key=str(artifact.get("dataset_key", "")),
-                expected_stratum=str(artifact.get("stratum", "")),
-            )
-        except Exception as exc:
-            errors.append(f"Provided artifact {label} checkpoint is not loadable: {exc}")
     return errors
 
 
@@ -707,65 +626,17 @@ def validate_backbone_package(
     package_root: str | Path,
     *,
     expected_family: str | None = None,
+    require_clean_paths: bool = True,
 ) -> Dict[str, Any]:
-    requested_root = Path(package_root).expanduser().absolute()
+    root = Path(package_root).expanduser().resolve()
     errors: List[str] = []
-    if is_link_or_reparse_point(requested_root):
-        return {
-            "status": "failed",
-            "errors": [f"Package root may not be a symlink, junction, or reparse point: {requested_root}"],
-        }
-    root = requested_root.resolve()
-    try:
-        entries = sorted(root.rglob("*")) if root.exists() else []
-    except OSError as exc:
-        entries = []
-        errors.append(f"Unable to enumerate package contents safely: {exc}")
-    for entry in entries:
-        try:
-            resolved_entry = entry.resolve(strict=True)
-        except OSError as exc:
-            errors.append(f"Unable to resolve package entry {entry}: {exc}")
-            continue
-        if not resolved_entry.is_relative_to(root):
-            errors.append(
-                "Package entry resolves outside the package root: "
-                f"{entry.relative_to(root).as_posix()}"
-            )
-    indirect_entries = [path for path in entries if is_link_or_reparse_point(path)]
-    if indirect_entries:
-        errors.append(
-            "Package contains a symlink, junction, or reparse point: "
-            f"{indirect_entries[0].relative_to(root).as_posix()}"
-        )
     package_manifest_path = root / PACKAGE_MANIFEST_NAME
     if not package_manifest_path.exists():
         errors.append(f"Missing {PACKAGE_MANIFEST_NAME}")
         return {"status": "failed", "errors": errors}
-    if is_link_or_reparse_point(package_manifest_path):
-        errors.append(f"{PACKAGE_MANIFEST_NAME} may not be a symlink, junction, or reparse point.")
-        return {"status": "failed", "errors": errors}
-    try:
-        loaded_package_manifest = json.loads(package_manifest_path.read_text(encoding="utf-8"))
-        if not isinstance(loaded_package_manifest, Mapping):
-            raise ValueError("package manifest root must be a JSON object")
-        package_manifest = dict(loaded_package_manifest)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        errors.append(f"Invalid {PACKAGE_MANIFEST_NAME}: {exc}")
-        package_manifest = {}
+    package_manifest = json.loads(package_manifest_path.read_text(encoding="utf-8"))
     if str(package_manifest.get("schema_version")) != PACKAGE_SCHEMA_VERSION:
         errors.append("Unexpected package schema version.")
-    raw_file_records = package_manifest.get("files", [])
-    if not isinstance(raw_file_records, list):
-        errors.append("Package manifest files must be a list.")
-        file_records: List[Mapping[str, Any]] = []
-    else:
-        file_records = []
-        for index, record in enumerate(raw_file_records):
-            if not isinstance(record, Mapping):
-                errors.append(f"Package manifest files[{index}] must be an object.")
-                continue
-            file_records.append(record)
     family = str(package_manifest.get("family", ""))
     if expected_family and family != str(expected_family):
         errors.append(f"Package family {family!r} != expected {expected_family!r}.")
@@ -775,19 +646,19 @@ def validate_backbone_package(
     else:
         spec = FAMILY_SPECS[family]
         if list(package_manifest.get("scenarios", [])) != list(spec.scenarios):
-            errors.append("Package scenarios do not match the reference family scenarios.")
+            errors.append("Package scenarios do not match the canonical family scenarios.")
         if int(package_manifest.get("expected_artifact_count", -1)) != int(spec.expected_artifact_count):
-            errors.append("Package expected artifact count does not match the reference family.")
+            errors.append("Package expected artifact count does not match the canonical family.")
         if list(package_manifest.get("data_roots", [])) != list(spec.data_roots):
-            errors.append("Package data roots do not match the reference family data roots.")
-        file_paths = [str(record.get("path", "")) for record in file_records]
+            errors.append("Package data roots do not match the canonical family data roots.")
+        file_paths = [str(record.get("path", "")) for record in package_manifest.get("files", [])]
         if len(set(file_paths)) != len(file_paths):
             errors.append("Package manifest contains duplicate file records.")
         listed_paths = set(file_paths) | {PACKAGE_MANIFEST_NAME}
         actual_paths = {
             path.relative_to(root).as_posix()
-            for path in entries
-            if path.is_file() and not is_link_or_reparse_point(path)
+            for path in root.rglob("*")
+            if path.is_file()
         }
         unlisted_paths = sorted(actual_paths - listed_paths)
         if unlisted_paths:
@@ -795,21 +666,14 @@ def validate_backbone_package(
         for data_root in spec.data_roots:
             if not any(path == data_root or path.startswith(f"{data_root}/") for path in file_paths):
                 errors.append(f"Package data root has no listed files: {data_root}")
-    for record in file_records:
+    for record in package_manifest.get("files", []):
         errors.extend(_validate_file_record(root, record))
     backbone_manifest_path = root / PACKAGED_BACKBONE_MANIFEST
     if not backbone_manifest_path.exists():
         errors.append(f"Missing packaged backbone manifest: {PACKAGED_BACKBONE_MANIFEST}")
     else:
-        try:
-            loaded_raw_manifest = json.loads(backbone_manifest_path.read_text(encoding="utf-8"))
-            if not isinstance(loaded_raw_manifest, Mapping):
-                raise ValueError("backbone manifest root must be a JSON object")
-            raw_backbone_manifest = dict(loaded_raw_manifest)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            errors.append(f"Invalid packaged backbone manifest JSON: {exc}")
-            raw_backbone_manifest = {}
-        if str(raw_backbone_manifest.get("path_base", "")) != MANIFEST_PARENT_PATH_BASE:
+        raw_backbone_manifest = json.loads(backbone_manifest_path.read_text(encoding="utf-8"))
+        if str(raw_backbone_manifest.get("path_base", "")) != PATH_BASE_FROM_BACKBONE_MANIFEST:
             errors.append("Packaged backbone manifest has an unexpected path_base.")
         for artifact in raw_backbone_manifest.get("artifacts", []):
             if not isinstance(artifact, Mapping):
@@ -821,25 +685,11 @@ def validate_backbone_package(
                         _safe_rel(raw_path)
                     except ValueError as exc:
                         errors.append(f"Artifact {artifact.get('checkpoint_id', '')} has unsafe {field}: {exc}")
-        try:
-            backbone_manifest = load_portable_backbone_manifest(backbone_manifest_path)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            errors.append(f"Invalid packaged backbone manifest paths: {exc}")
-            backbone_manifest = {}
+        backbone_manifest = load_portable_backbone_manifest(backbone_manifest_path)
         if int(backbone_manifest.get("ready_count", -1)) != int(backbone_manifest.get("artifact_count", -2)):
             errors.append("Packaged backbone manifest is not fully ready.")
         if spec is not None:
-            raw_artifacts = backbone_manifest.get("artifacts", [])
-            if not isinstance(raw_artifacts, list):
-                errors.append("Packaged backbone manifest artifacts must be a list.")
-                artifacts: List[Mapping[str, Any]] = []
-            else:
-                artifacts = []
-                for index, artifact in enumerate(raw_artifacts):
-                    if not isinstance(artifact, Mapping):
-                        errors.append(f"Packaged backbone manifest artifacts[{index}] must be an object.")
-                        continue
-                    artifacts.append(artifact)
+            artifacts = list(backbone_manifest.get("artifacts", []))
             if int(package_manifest.get("artifact_count", -1)) != len(artifacts):
                 errors.append("Package artifact count does not match packaged backbone manifest.")
             errors.extend(_validate_artifact_grid(artifacts, spec))
@@ -855,47 +705,28 @@ def validate_backbone_package(
                     if not path_value:
                         continue
                     if Path(path_value).is_absolute():
-                        resolved = Path(path_value).resolve()
-                        if not resolved.is_relative_to(root):
-                            errors.append(
-                                f"Artifact {artifact.get('checkpoint_id', '')} has {field} outside package root: {path_value}"
-                            )
-                            continue
-                        indirect = first_link_or_reparse_component(Path(path_value), root=root)
-                        if indirect is not None:
-                            errors.append(
-                                f"Artifact {artifact.get('checkpoint_id', '')} has {field} through a link or reparse point: {path_value}"
-                            )
-                            continue
+                        resolved = Path(path_value)
                     else:
-                        try:
-                            resolved = resolve_portable_relative_path(
-                                root,
-                                _strip_known_prefix(path_value),
-                                label=f"Artifact {field}",
-                                reject_links=True,
-                            )
-                        except ValueError as exc:
-                            errors.append(f"Artifact {artifact.get('checkpoint_id', '')} has unsafe {field}: {exc}")
-                            continue
+                        resolved = root / _safe_rel(_strip_known_prefix(path_value))
                     if not resolved.exists():
                         errors.append(f"Artifact {artifact.get('checkpoint_id', '')} missing {field}: {path_value}")
                     elif field == "checkpoint_path":
-                        errors.extend(validate_backbone_artifact_checkpoint(artifact, resolved))
-    for json_path in (path for path in entries if path.suffix.lower() == ".json" and path.is_file() and not is_link_or_reparse_point(path)):
-        try:
-            payload = json.loads(json_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            errors.append(f"Invalid JSON {json_path.relative_to(root).as_posix()}: {exc}")
-            continue
-        for text in _iter_json_strings(payload):
-            if _contains_local_marker(text):
-                errors.append(f"Local path marker found in {json_path.relative_to(root).as_posix()}: {text}")
-                break
+                        errors.extend(_validate_artifact_checkpoint_integrity(artifact, resolved))
+    if require_clean_paths:
+        for json_path in sorted(root.rglob("*.json")):
+            try:
+                payload = json.loads(json_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                errors.append(f"Invalid JSON {json_path.relative_to(root).as_posix()}: {exc}")
+                continue
+            for text in _iter_json_strings(payload):
+                if _contains_local_marker(text):
+                    errors.append(f"Local path marker found in {json_path.relative_to(root).as_posix()}: {text}")
+                    break
     return {
         "status": "complete" if not errors else "failed",
         "family": family,
-        "package_root": display_project_path(root),
+        "package_root": str(root),
         "errors": errors,
         "artifact_count": int(package_manifest.get("artifact_count", 0) or 0),
         "file_count": int(len(package_manifest.get("files", []) or [])),
@@ -919,15 +750,7 @@ def validate_provided_backbone_manifest(
     errors: List[str] = []
     if not resolved_manifest.exists():
         return {"status": "failed", "errors": [f"Provided backbone manifest is missing: {resolved_manifest}"]}
-    try:
-        manifest = load_portable_backbone_manifest(resolved_manifest)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return {
-            "status": "failed",
-            "errors": [f"Provided backbone manifest is invalid: {exc}"],
-            "manifest_path": display_project_path(resolved_manifest),
-            "artifact_count": 0,
-        }
+    manifest = load_portable_backbone_manifest(resolved_manifest)
     candidate_artifacts = [
         artifact
         for artifact in manifest.get("artifacts", [])
@@ -1005,11 +828,11 @@ def validate_provided_backbone_manifest(
             if not resolved.exists():
                 errors.append(f"Provided artifact {artifact.get('checkpoint_id', '')} is missing {field}: {value}")
             elif field == "checkpoint_path":
-                errors.extend(validate_backbone_artifact_checkpoint(artifact, resolved))
+                errors.extend(_validate_artifact_checkpoint_integrity(artifact, resolved))
     return {
         "status": "complete" if not errors else "failed",
         "errors": errors,
-        "manifest_path": display_project_path(resolved_manifest),
+        "manifest_path": str(resolved_manifest),
         "artifact_count": int(len(matching_artifacts)),
     }
 
@@ -1024,12 +847,12 @@ def apply_backbone_package_to_args(args: argparse.Namespace) -> argparse.Namespa
         raise ValueError("Invalid backbone package:\n- " + "\n- ".join(validation["errors"]))
     family = str(validation.get("family", ""))
     spec = FAMILY_SPECS[family]
-    scenario = str(getattr(args, "scenario_key", ""))
+    scenario = str(getattr(args, "scenario_key", "") or getattr(args, "dataset", ""))
     if scenario and scenario not in set(spec.scenarios):
         raise ValueError(f"Scenario {scenario!r} is not included in backbone package family {family!r}.")
     args.backbone_manifest = str(package_root / PACKAGED_BACKBONE_MANIFEST)
     args.shared_backbone_root = str(package_root / "outputs" / "shared_backbones" / "otflow_fullhorizon_seed0")
-    args.dataset_root = str(package_root / "datasets")
+    args.dataset_root = str(package_root / "paper_datasets")
     args.cryptos_path = str(package_root / "data" / "cryptos_binance_spot_monthly_1s_l10.npz")
     args.lobster_synthetic_profile_path = str(package_root / "data" / "lobster_synthetic" / "lobster_free_sample_profile_10.json")
     args.long_term_st_path = str(package_root / "data" / "long_term_st_100hz_context_only")
@@ -1047,7 +870,7 @@ def backbone_package_protocol_payload(args: argparse.Namespace) -> Dict[str, Any
     payload = json.loads(package_manifest_path.read_text(encoding="utf-8"))
     return {
         "use_provided_backbones": True,
-        "backbone_package_root": display_project_path(package_root),
+        "backbone_package_root": str(package_root),
         "backbone_package_schema": str(payload.get("schema_version", "")),
         "backbone_package_family": str(payload.get("family", "")),
         "backbone_package_source_commit": str(payload.get("source_commit", "")),
@@ -1060,13 +883,17 @@ def package_main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--family", choices=tuple(FAMILY_SPECS), required=True)
     parser.add_argument("--source_root", default=str(project_root()))
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--stage_dir", default="")
     parser.add_argument("--overwrite", action="store_true", default=False)
+    parser.add_argument("--no_zip", action="store_true", default=False)
     args = parser.parse_args(argv)
     summary = package_backbone_family(
         family=str(args.family),
         source_root=str(args.source_root),
         output_dir=str(args.output_dir),
+        stage_dir=str(args.stage_dir) or None,
         overwrite=bool(args.overwrite),
+        make_zip=not bool(args.no_zip),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 
@@ -1075,10 +902,12 @@ def validate_main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Validate a portable GenODE backbone package.")
     parser.add_argument("package_root")
     parser.add_argument("--expected_family", choices=tuple(FAMILY_SPECS), default="")
+    parser.add_argument("--allow_local_paths", action="store_true", default=False)
     args = parser.parse_args(argv)
     summary = validate_backbone_package(
         args.package_root,
         expected_family=str(args.expected_family) or None,
+        require_clean_paths=not bool(args.allow_local_paths),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     if summary["status"] != "complete":
@@ -1095,6 +924,5 @@ __all__ = [
     "load_portable_backbone_manifest",
     "package_backbone_family",
     "validate_backbone_package",
-    "validate_backbone_artifact_checkpoint",
     "validate_provided_backbone_manifest",
 ]

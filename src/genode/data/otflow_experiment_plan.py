@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Locked reference experiment horizons and non-AR rollout chunk sizes."""
+"""Locked paper experiment horizons and non-AR rollout chunk sizes."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Mapping
 
 from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 
@@ -24,7 +26,7 @@ class DatasetExperimentSpec:
     rationale: str
 
 
-REFERENCE_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
+PAPER_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
     DatasetExperimentSpec(
         dataset_key="solar_energy_10m",
         benchmark_family=FORECAST_FAMILY,
@@ -90,43 +92,105 @@ REFERENCE_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
 EXPERIMENTAL_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = ()
 
 SUPPORTED_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
-    REFERENCE_EXPERIMENT_SPECS + EXPERIMENTAL_EXPERIMENT_SPECS
+    PAPER_EXPERIMENT_SPECS + EXPERIMENTAL_EXPERIMENT_SPECS
 )
 
-REFERENCE_FORECAST_DATASETS: tuple[str, ...] = tuple(
-    spec.dataset_key for spec in REFERENCE_EXPERIMENT_SPECS if spec.benchmark_family == FORECAST_FAMILY
+CANONICAL_FORECAST_PAPER_DATASETS: tuple[str, ...] = tuple(
+    spec.dataset_key for spec in PAPER_EXPERIMENT_SPECS if spec.benchmark_family == FORECAST_FAMILY
 )
-REFERENCE_CONDITIONAL_GENERATION_DATASETS: tuple[str, ...] = tuple(
-    spec.dataset_key for spec in REFERENCE_EXPERIMENT_SPECS if spec.benchmark_family == CONDITIONAL_GENERATION_FAMILY
+CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS: tuple[str, ...] = tuple(
+    spec.dataset_key for spec in PAPER_EXPERIMENT_SPECS if spec.benchmark_family == CONDITIONAL_GENERATION_FAMILY
+)
+CHECKPOINT_READY_FORECAST_DATASETS: tuple[str, ...] = tuple(CANONICAL_FORECAST_PAPER_DATASETS)
+CHECKPOINT_READY_CONDITIONAL_GENERATION_DATASETS: tuple[str, ...] = tuple(
+    CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS
 )
 SUPPORTED_CONDITIONAL_GENERATION_DATASETS: tuple[str, ...] = tuple(
     spec.dataset_key for spec in SUPPORTED_EXPERIMENT_SPECS if spec.benchmark_family == CONDITIONAL_GENERATION_FAMILY
 )
 
 
+def experiment_plan_specs() -> List[DatasetExperimentSpec]:
+    return list(PAPER_EXPERIMENT_SPECS)
+
+
 def experiment_plan_by_key() -> Dict[str, DatasetExperimentSpec]:
     return {spec.dataset_key: spec for spec in SUPPORTED_EXPERIMENT_SPECS}
 
 
-def forecast_dataset_keys() -> tuple[str, ...]:
-    return tuple(REFERENCE_FORECAST_DATASETS)
+def canonical_forecast_paper_dataset_keys() -> tuple[str, ...]:
+    return tuple(CANONICAL_FORECAST_PAPER_DATASETS)
 
 
-def conditional_generation_dataset_keys() -> tuple[str, ...]:
-    return tuple(REFERENCE_CONDITIONAL_GENERATION_DATASETS)
+def canonical_conditional_generation_paper_dataset_keys() -> tuple[str, ...]:
+    return tuple(CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS)
+
+
+def checkpoint_ready_forecast_dataset_keys() -> tuple[str, ...]:
+    return tuple(CHECKPOINT_READY_FORECAST_DATASETS)
+
+
+def checkpoint_ready_conditional_generation_dataset_keys() -> tuple[str, ...]:
+    return tuple(CHECKPOINT_READY_CONDITIONAL_GENERATION_DATASETS)
+
+
+def supported_conditional_generation_dataset_keys() -> tuple[str, ...]:
+    return tuple(SUPPORTED_CONDITIONAL_GENERATION_DATASETS)
+
+
+def validate_experiment_plan(specs: Iterable[DatasetExperimentSpec] | None = None) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for spec in PAPER_EXPERIMENT_SPECS if specs is None else list(specs):
+        divides = int(spec.experiment_horizon) % int(spec.future_block_len) == 0
+        rows.append(
+            {
+                "dataset_key": spec.dataset_key,
+                "benchmark_family": spec.benchmark_family,
+                "experiment_horizon": int(spec.experiment_horizon),
+                "future_block_len": int(spec.future_block_len),
+                "history_len": int(spec.history_len),
+                "n_chunks_per_rollout": int(spec.experiment_horizon) // int(spec.future_block_len) if divides else None,
+                "future_block_divides_horizon": bool(divides),
+            }
+        )
+    return rows
+
+
+def write_experiment_plan(out_root: str | Path) -> Mapping[str, object]:
+    out_path = Path(out_root).resolve() / "experiment_plan.json"
+    validation_rows = validate_experiment_plan()
+    payload = {
+        "locked": True,
+        "selection_policy": {
+            "horizon_rule": "Use reviewer-facing long horizons in physical time for forecasting and event-count horizons for conditional generation.",
+            "chunk_rule": "Use horizon-wise non-AR rollouts in the main experiments, i.e. future_block_len equals the experiment horizon.",
+        },
+        "datasets": [asdict(spec) for spec in PAPER_EXPERIMENT_SPECS],
+        "validation": validation_rows,
+    }
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
 
 
 __all__ = [
     "CONDITIONAL_GENERATION_FAMILY",
-    "REFERENCE_FORECAST_DATASETS",
-    "REFERENCE_CONDITIONAL_GENERATION_DATASETS",
+    "CANONICAL_FORECAST_PAPER_DATASETS",
+    "CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS",
+    "CHECKPOINT_READY_FORECAST_DATASETS",
+    "CHECKPOINT_READY_CONDITIONAL_GENERATION_DATASETS",
     "EXPERIMENTAL_EXPERIMENT_SPECS",
     "SUPPORTED_CONDITIONAL_GENERATION_DATASETS",
     "SUPPORTED_EXPERIMENT_SPECS",
     "DatasetExperimentSpec",
     "FORECAST_FAMILY",
-    "REFERENCE_EXPERIMENT_SPECS",
-    "forecast_dataset_keys",
-    "conditional_generation_dataset_keys",
+    "PAPER_EXPERIMENT_SPECS",
+    "canonical_forecast_paper_dataset_keys",
+    "canonical_conditional_generation_paper_dataset_keys",
+    "checkpoint_ready_forecast_dataset_keys",
+    "checkpoint_ready_conditional_generation_dataset_keys",
     "experiment_plan_by_key",
+    "experiment_plan_specs",
+    "supported_conditional_generation_dataset_keys",
+    "validate_experiment_plan",
+    "write_experiment_plan",
 ]

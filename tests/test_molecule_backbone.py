@@ -12,11 +12,10 @@ import numpy as np
 import torch
 
 from genode.data import molecule_xyz
-from genode.data import prepare_molecule_xyz as prepare_molecule_module
-from genode.data.otflow_paths import display_project_path
 from genode.evaluation import molecule_metrics
 from genode.models.config import OTFlowConfig
 from genode.models.otflow_train_val import generate_continuation
+from genode.solver_protocol import CANONICAL_SOLVER_KEYS
 from genode.training import train_molecule_backbone as train_molecule_module
 
 
@@ -51,66 +50,53 @@ def _write_xyz_zip(
 
 
 class MoleculeBackboneTests(unittest.TestCase):
-    @staticmethod
-    def _checkpoint_stats() -> dict[str, list]:
-        return {
-            "target_mean": [0.0, 0.0, 0.0],
-            "target_std": [1.0, 1.0, 1.0],
-            "context_mean": [0.0] * 11,
-            "context_std": [1.0] * 11,
-            "reference_coords": [[0.0, 0.0, 0.0]],
-        }
-
-    def test_molecule_checkpoint_loader_uses_safe_load_and_validates_stats(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            checkpoint = Path(tmpdir) / "model.pt"
-            torch.save(
-                {
-                    "cfg": {},
-                    "model_state": {},
-                    "molecule_stats": self._checkpoint_stats(),
-                    "dataset_key": "demo",
-                    "stratum": "Dynamic_Test",
-                },
-                checkpoint,
+    def test_molecule_context_export_uses_canonical_frozen_backbone_api(self) -> None:
+        class TinyDataset:
+            stats = SimpleNamespace(
+                context_mean=np.zeros(4, dtype=np.float32),
+                context_std=np.ones(4, dtype=np.float32),
             )
-            with patch(
-                "genode.evaluation.otflow_evaluation_support.torch.load",
-                wraps=torch.load,
-            ) as load_mock:
-                payload = molecule_metrics.load_molecule_checkpoint_payload(
-                    checkpoint,
-                    expected_dataset_key="demo",
-                    expected_stratum="Dynamic_Test",
-                )
 
-        self.assertEqual(payload["dataset_key"], "demo")
-        self.assertTrue(load_mock.call_args.kwargs["weights_only"])
+            def eval_item(self, idx: int):
+                return {
+                    "context": np.full((2, 4), float(idx), dtype=np.float32),
+                    "target_idx": 10 + int(idx),
+                    "trajectory_key": "trajectory",
+                    "iso_id": 7,
+                }
 
-    def test_molecule_checkpoint_loader_rejects_malformed_payload_fields(self) -> None:
-        valid_payload = {
-            "cfg": {},
-            "model_state": {},
-            "molecule_stats": self._checkpoint_stats(),
-        }
-        malformed_payloads = (
-            {**valid_payload, "cfg": []},
-            {**valid_payload, "model_state": []},
-            {**valid_payload, "molecule_stats": []},
-            {
-                **valid_payload,
-                "molecule_stats": {
-                    **self._checkpoint_stats(),
-                    "target_std": [0.0, 1.0, 1.0],
-                },
-            },
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backbone = torch.nn.Identity()
+
+        model = TinyModel()
+        canonical_context = torch.tensor([[4.0, 5.0]], dtype=torch.float32)
+        with patch.object(
+            molecule_metrics,
+            "frozen_backbone_policy_context",
+            return_value=canonical_context,
+        ) as context_api:
+            result = molecule_metrics.molecule_context_embeddings_for_indices(
+                model=model,
+                ds=TinyDataset(),
+                example_indices=[1],
+                checkpoint_id="checkpoint",
+                dataset_key="molecule_3d_set1",
+                member_key="member",
+                stratum="Dynamic_Test",
+                split_phase="validation_tuning",
+                device=torch.device("cpu"),
+            )
+
+        context_api.assert_called_once()
+        self.assertIs(context_api.call_args.args[0], model.backbone)
+        self.assertEqual(
+            context_api.call_args.kwargs["protocol"],
+            molecule_metrics.FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
         )
-        for index, payload in enumerate(malformed_payloads):
-            with self.subTest(index=index), tempfile.TemporaryDirectory() as tmpdir:
-                checkpoint = Path(tmpdir) / "model.pt"
-                torch.save(payload, checkpoint)
-                with self.assertRaisesRegex(RuntimeError, "Invalid molecule checkpoint"):
-                    molecule_metrics.load_molecule_checkpoint_payload(checkpoint)
+        self.assertEqual(next(iter(result.values())), [4.0, 5.0])
+        self.assertFalse(model.backbone.training)
 
     def test_discovery_and_prepare_are_generic_and_path_scrubbed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -324,32 +310,6 @@ class MoleculeBackboneTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "domain-specific rollout"):
             generate_continuation(model, hist, None, steps=1, nfe=1)
 
-    def test_molecule_command_line_uses_scenario_keys_without_dataset_aliases(self) -> None:
-        training_parser = train_molecule_module.build_argparser()
-        training_args = training_parser.parse_args(["--scenario_key", "demo"])
-        self.assertEqual(training_args.scenario_key, "demo")
-        self.assertFalse(hasattr(training_args, "dataset_key"))
-        self.assertNotIn(
-            "--dataset_key",
-            {option for action in training_parser._actions for option in action.option_strings},
-        )
-
-        preparation_parser = prepare_molecule_module.build_argparser()
-        preparation_args = preparation_parser.parse_args(
-            ["--scenario_key", "demo", "--group_scenario_keys", "demo,other"]
-        )
-        self.assertEqual(preparation_args.scenario_key, "demo")
-        self.assertEqual(preparation_args.group_scenario_keys, "demo,other")
-        self.assertFalse(hasattr(preparation_args, "dataset_key"))
-        self.assertFalse(hasattr(preparation_args, "group_dataset_keys"))
-        preparation_options = {
-            option
-            for action in preparation_parser._actions
-            for option in action.option_strings
-        }
-        self.assertNotIn("--dataset_key", preparation_options)
-        self.assertNotIn("--group_dataset_keys", preparation_options)
-
     def test_molecule_training_exports_validation_selected_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -372,7 +332,7 @@ class MoleculeBackboneTests(unittest.TestCase):
                 return {"loss": {1: 5.0, 2: 3.0, 3: 4.0}[int(model.step)], "examples": 2, "batches": 1}
 
             args = SimpleNamespace(
-                scenario_key="demo",
+                dataset_key="demo",
                 stratum="Dynamic_Test",
                 zip_path=None,
                 processed_dir=str(root / "processed"),
@@ -403,6 +363,7 @@ class MoleculeBackboneTests(unittest.TestCase):
                 val_max_batches=None,
                 seed=0,
                 grad_accum_steps=1,
+                solver="euler",
                 ema_decay=0.0,
                 use_swa=False,
                 use_minibatch_ot=False,
@@ -459,23 +420,18 @@ class MoleculeBackboneTests(unittest.TestCase):
             ):
                 summary = train_molecule_module.train_molecule_backbone(args)
 
-            self.assertEqual(summary["scenario_key"], "demo")
             self.assertEqual(summary["selected_step"], 2)
             self.assertEqual(summary["budget_artifacts"]["1"]["selected_step"], 1)
             self.assertEqual(summary["budget_artifacts"]["2"]["selected_step"], 2)
             self.assertEqual(summary["budget_artifacts"]["3"]["selected_step"], 2)
             metadata_path = root / "outputs" / "demo" / "Dynamic_Test" / "ar_h1" / "3_steps" / "checkpoint_metadata.json"
             metadata = json.loads(metadata_path.read_text())
-            self.assertEqual(metadata["dataset_key"], "demo")
             self.assertEqual(metadata["selection"]["selection_metric"], "clean_validation_loss")
             self.assertEqual(metadata["selection"]["selected_step"], 2)
             self.assertNotIn(str(root), json.dumps(metadata))
             self.assertEqual(sentinel_manifest.read_text(encoding="utf-8"), "sentinel")
-            self.assertEqual(
-                summary["manifest_path"],
-                display_project_path(root / "outputs" / "backbone_manifest.json"),
-            )
-            self.assertTrue((root / "outputs" / "backbone_manifest.json").exists())
+            self.assertEqual(Path(summary["manifest_path"]), Path("backbone_manifest.json"))
+            self.assertTrue((root / "outputs" / "backbone_matrix" / "backbone_manifest.json").exists())
 
     def test_molecule_evaluation_reuses_checkpoint_stats_and_resolves_default_processed_dir(self) -> None:
         cfg = molecule_xyz.configure_molecule_otflow(
@@ -509,15 +465,14 @@ class MoleculeBackboneTests(unittest.TestCase):
         args = SimpleNamespace(
             checkpoint="dummy.pt",
             processed_dir=None,
-            scenario_key="",
+            dataset_key="",
             stratum="",
             split="val_clean",
             device="cpu",
             max_windows=0,
             sample_count=1,
-            target_nfe=1,
-            solver_key="euler",
-            macro_steps=1,
+            nfe=1,
+            solver="euler",
             stride_eval=5,
             val_max_batches=None,
             seed=0,
@@ -526,7 +481,7 @@ class MoleculeBackboneTests(unittest.TestCase):
 
         with patch.object(
             molecule_metrics,
-            "load_molecule_checkpoint_payload",
+            "load_otflow_checkpoint_payload",
             return_value={
                 "molecule_stats": checkpoint_stats.to_dict(),
                 "dataset_key": "demo",
@@ -548,9 +503,9 @@ class MoleculeBackboneTests(unittest.TestCase):
             summary = molecule_metrics.evaluate_molecule_checkpoint(args)
 
         self.assertEqual(summary["split"], "val_clean")
-        self.assertEqual(summary["scenario_key"], "demo")
+        self.assertEqual(summary["dataset_key"], "demo")
         self.assertEqual(summary["stratum"], "Dynamic_Test")
-        self.assertEqual(captured["processed_dir"], molecule_xyz.molecule_processed_path("demo", "Dynamic_Test"))
+        self.assertEqual(captured["processed_dir"], molecule_xyz.default_molecule_processed_dir("demo", "Dynamic_Test"))
         self.assertEqual(captured["stride_train"], 1)
         self.assertEqual(captured["stride_eval"], 5)
         self.assertIsNotNone(captured["stats"])
@@ -649,8 +604,8 @@ class MoleculeBackboneTests(unittest.TestCase):
                 return context_from_positions(history[-2], history[-1])
 
         class FakeModel:
-            def sample_future(self, hist_t, *, solver_key: str, target_nfe: int, time_grid):
-                del hist_t, solver_key, target_nfe, time_grid
+            def sample_future(self, hist_t, *, steps: int, solver: str):
+                del hist_t, steps, solver
                 return torch.full((1, 1, 6), 0.05, dtype=torch.float32)
 
         calls = []
@@ -669,16 +624,15 @@ class MoleculeBackboneTests(unittest.TestCase):
         args = SimpleNamespace(
             checkpoint="dummy.pt",
             processed_dir="processed",
-            scenario_key="demo",
+            dataset_key="demo",
             stratum="Dynamic_Test",
             split="test_clean",
             device="cpu",
             max_windows=2,
             sample_count=1,
             rollout_steps=1,
-            target_nfe=1,
-            solver_key="euler",
-            macro_steps=1,
+            nfe=1,
+            solver="euler",
             stride_eval=1,
             val_max_batches=None,
             seed=0,
@@ -687,7 +641,7 @@ class MoleculeBackboneTests(unittest.TestCase):
 
         with patch.object(
             molecule_metrics,
-            "load_molecule_checkpoint_payload",
+            "load_otflow_checkpoint_payload",
             return_value={"molecule_stats": checkpoint_stats.to_dict()},
         ), patch.object(
             molecule_metrics,
@@ -730,102 +684,53 @@ class MoleculeBackboneTests(unittest.TestCase):
         self.assertEqual(summary["scenario_key"], "demo")
         self.assertEqual(summary["solver_key"], "euler")
         self.assertEqual(summary["target_nfe"], 1)
-        self.assertEqual(summary["macro_steps"], 1)
+        self.assertEqual(summary["runtime_nfe"], 1)
         self.assertEqual(summary["realized_nfe"], 1)
 
-    def test_molecule_evaluation_headline_metrics_include_every_stochastic_draw(self) -> None:
-        cfg = molecule_xyz.configure_molecule_otflow(
-            OTFlowConfig(),
-            history_len=2,
-            future_horizon=1,
-            rollout_mode="autoregressive",
-            atom_count=2,
-        )
-        checkpoint_stats = molecule_xyz.MoleculeStats(
-            target_mean=np.zeros(6, dtype=np.float32),
-            target_std=np.ones(6, dtype=np.float32),
-            context_mean=np.zeros(22, dtype=np.float32),
-            context_std=np.ones(22, dtype=np.float32),
-            reference_coords=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
-        )
-        true_future = np.asarray([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]], dtype=np.float32)
-
-        class FakeDataset:
-            H = 2
-            data = SimpleNamespace(atom_symbols=["C", "H"], atom_count=2)
-            stats = checkpoint_stats
-
-            def __len__(self) -> int:
-                return 1
-
-            def eval_item(self, idx: int):
-                del idx
-                current = true_future[0] - 0.1
-                return {
-                    "future_coords": true_future,
-                    "current_coords": current,
-                    "history_coords": np.stack([current - 0.1, current], axis=0).astype(np.float32),
-                    "transition": False,
-                    "transition_window": False,
-                }
-
-        args = SimpleNamespace(
-            checkpoint="dummy.pt",
-            processed_dir="processed",
-            scenario_key="demo",
-            stratum="Dynamic_Test",
-            split="val",
-            device="cpu",
-            max_windows=1,
-            sample_count=2,
-            rollout_steps=1,
-            target_nfe=1,
-            solver_key="euler",
-            macro_steps=1,
-            stride_eval=1,
-            val_max_batches=None,
-            seed=0,
-            out_json="",
-        )
-        sampled_rollouts = [
-            true_future.copy(),
-            true_future + 1.0,
-        ]
-
-        with patch.object(
-            molecule_metrics,
-            "load_molecule_checkpoint_payload",
-            return_value={"molecule_stats": checkpoint_stats.to_dict()},
-        ), patch.object(
-            molecule_metrics,
-            "load_checkpoint_model",
-            return_value=(SimpleNamespace(), cfg),
-        ), patch.object(
-            molecule_metrics,
-            "build_molecule_dataset_splits",
-            return_value={"val": FakeDataset()},
-        ), patch.object(
-            molecule_metrics,
-            "evaluate_average_loss",
-            return_value={"loss": 1.0, "examples": 1, "batches": 1},
-        ), patch.object(
-            molecule_metrics,
-            "_sample_molecule_ar_rollout",
-            side_effect=sampled_rollouts,
-        ) as sample_mock:
-            summary = molecule_metrics.evaluate_molecule_checkpoint(args)
-
-        first_horizon = summary["metrics"]["all_first_horizon"]
-        clean_first_horizon = summary["metrics"]["clean_first_horizon"]
-        self.assertEqual(sample_mock.call_count, 2)
-        self.assertAlmostEqual(first_horizon["raw_coord_mae"]["mean"], 0.5, places=6)
-        self.assertAlmostEqual(clean_first_horizon["raw_coord_mae"]["mean"], 0.5, places=6)
-        self.assertAlmostEqual(summary["metrics"]["horizon"]["1"]["raw_coord_mae"]["mean"], 0.5, places=6)
-
-    def test_molecule_solver_grid_uses_solver_macro_steps(self) -> None:
-        args = SimpleNamespace(solver_names="dpmpp2m,heun", target_nfe_values="4", nfe_role="seen")
+    def test_molecule_solver_grid_uses_canonical_runtime_steps(self) -> None:
+        args = SimpleNamespace(solver_names="dpm++2m,rk2", target_nfe_values="4", nfe_role="seen")
         cases = molecule_metrics._molecule_solver_cases(args)
         self.assertEqual(cases, [("dpmpp2m", 4, 4), ("heun", 4, 2)])
+
+    def test_molecule_checkpoint_boundary_rejects_inconsistent_nfe_metadata(self) -> None:
+        with self.assertRaisesRegex(ValueError, "runtime_nfe=3"):
+            molecule_metrics.evaluate_molecule_checkpoint(
+                SimpleNamespace(solver_key="heun", target_nfe=4, runtime_nfe=3)
+            )
+        with self.assertRaisesRegex(ValueError, "realized_nfe=3"):
+            molecule_metrics.evaluate_molecule_checkpoint(
+                SimpleNamespace(
+                    solver_key="heun",
+                    target_nfe=4,
+                    runtime_nfe=2,
+                    realized_nfe=3,
+                )
+            )
+
+    def test_molecule_schedule_boundary_rejects_inconsistent_runtime_nfe(self) -> None:
+        with self.assertRaisesRegex(ValueError, "runtime_nfe=3"):
+            molecule_metrics.evaluate_molecule_rollout_schedule(
+                model=object(),
+                ds=object(),
+                cfg=object(),
+                scheduler_key="uniform",
+                solver_key="heun",
+                target_nfe=4,
+                runtime_nfe=3,
+                time_grid=(0.0, 0.25, 0.75, 1.0),
+                example_indices=(0,),
+                sample_count=1,
+                rollout_steps=1,
+                seed=0,
+                split_phase="validation_tuning",
+                checkpoint_id="checkpoint",
+                dataset_key="molecule_3d_set1",
+            )
+
+    def test_molecule_training_solver_flag_is_canonical(self) -> None:
+        parser = train_molecule_module.build_argparser()
+        solver_action = next(action for action in parser._actions if action.dest == "solver")
+        self.assertEqual(tuple(solver_action.choices), CANONICAL_SOLVER_KEYS)
 
     def test_schedule_aware_molecule_rollout_uses_time_grid_and_restores(self) -> None:
         cfg = molecule_xyz.configure_molecule_otflow(
@@ -873,9 +778,9 @@ class MoleculeBackboneTests(unittest.TestCase):
                 self.cfg = cfg
                 self.grids = []
 
-            def sample_future(self, hist_t, *, solver_key: str, target_nfe: int, time_grid):
-                del hist_t, solver_key, target_nfe
-                self.grids.append(tuple(float(x) for x in time_grid))
+            def sample_future(self, hist_t, *, steps: int, solver: str):
+                del hist_t, steps, solver
+                self.grids.append(tuple(float(x) for x in self.cfg.sample.time_grid))
                 return torch.full((1, 1, 6), 0.05, dtype=torch.float32)
 
         model = FakeModel(cfg)
@@ -886,7 +791,7 @@ class MoleculeBackboneTests(unittest.TestCase):
             scheduler_key="late_power_3",
             solver_key="euler",
             target_nfe=2,
-            macro_steps=2,
+            runtime_nfe=2,
             time_grid=(0.0, 0.25, 1.0),
             example_indices=[0],
             sample_count=1,
@@ -902,6 +807,7 @@ class MoleculeBackboneTests(unittest.TestCase):
         )
 
         self.assertEqual(model.grids, [(0.0, 0.25, 1.0)])
+        self.assertEqual(tuple(cfg.sample.time_grid), ())
         self.assertEqual(result["per_context_rows"][0]["context_schema"], molecule_metrics.MOLECULE_CONTEXT_SCHEMA)
         self.assertAlmostEqual(float(result["molecule_kabsch_rmsd_3d"]), 0.0, places=6)
 

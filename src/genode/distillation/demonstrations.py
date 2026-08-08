@@ -17,7 +17,10 @@ from typing import Iterable, Iterator, Mapping, Sequence
 import numpy as np
 import torch
 
-from genode.checkpoint_validation import validate_strict_integer
+from genode.checkpoint_validation import (
+    normalize_strict_solver_nfe_fields as normalize_solver_nfe_fields,
+    validate_strict_integer,
+)
 from genode.distillation.artifacts import (
     DEMONSTRATION_ARTIFACT_VERSION,
     DEMONSTRATION_MANIFEST_NAME,
@@ -29,18 +32,188 @@ from genode.distillation.artifacts import (
     write_npz_shard,
 )
 from genode.data.otflow_paths import resolve_project_path
-from genode.distillation.gipo_policy import GIPOSchedulePolicy, load_gipo_schedule_policy
+from genode.distillation.gico_policy import GICOSchedulePolicy, load_gico_schedule_policy
 from genode.evaluation.otflow_evaluation_support import load_checkpoint_model
-from genode.gipo.density_representation import DENSITY_BIN_COUNT
+from genode.gico.density_representation import (
+    DEFAULT_DENSITY_BIN_COUNT as DENSITY_BIN_COUNT,
+)
 from genode.models.conditioning import ConditioningCache
 from genode.models.otflow_model import OTFlow
 from genode.provenance import file_sha256
-from genode.path_safety import (
-    first_link_or_reparse_component,
-    is_link_or_reparse_point,
-)
+from genode.path_safety import is_link_or_reparse_point
 from genode.runtime import resolve_torch_device
-from genode.solver_protocol import FlowTrajectory, SUPPORTED_SOLVER_KEYS, normalize_solver_nfe_fields
+from genode.solver_protocol import CANONICAL_SOLVER_KEYS
+
+
+SUPPORTED_SOLVER_KEYS = CANONICAL_SOLVER_KEYS
+
+
+@dataclass(frozen=True)
+class FlowTrajectory:
+    initial_state: torch.Tensor
+    time_grid: torch.Tensor
+    states: torch.Tensor
+    final_state: torch.Tensor
+    solver_key: str
+    target_nfe: int
+    macro_steps: int
+    realized_nfe: int
+
+
+@torch.no_grad()
+def _solve_snapshot_trajectory(
+    backbone_model: OTFlow,
+    initial_state: torch.Tensor,
+    *,
+    conditioning_cache: ConditioningCache,
+    solver_key: str,
+    target_nfe: int,
+    time_grid: Sequence[float] | torch.Tensor,
+) -> FlowTrajectory:
+    """Integrate an explicit state when the snapshot OTFlow lacks ``solve``."""
+
+    nfe = normalize_solver_nfe_fields(
+        solver_key,
+        target_nfe,
+        source="flow-map demonstration solve",
+    )
+    if initial_state.ndim != 2 or not initial_state.is_floating_point():
+        raise ValueError("initial_state must be a rank-two floating-point tensor.")
+    if not bool(torch.isfinite(initial_state).all()):
+        raise ValueError("initial_state must contain finite values.")
+    grid = torch.as_tensor(
+        time_grid,
+        device=initial_state.device,
+        dtype=initial_state.dtype,
+    )
+    if grid.ndim != 1 or int(grid.numel()) != nfe.macro_steps + 1:
+        raise ValueError(
+            "time_grid must be one-dimensional with macro_steps + 1 entries."
+        )
+    if (
+        not bool(torch.isfinite(grid).all())
+        or not bool((torch.diff(grid) > 0.0).all())
+        or float(grid[0].item()) != 0.0
+        or float(grid[-1].item()) != 1.0
+    ):
+        raise ValueError("time_grid must be finite, strictly increasing, and span [0, 1].")
+
+    guidance = float(backbone_model.cfg.sample.cfg_scale)
+    if not np.isfinite(guidance):
+        raise ValueError("sample.cfg_scale must be finite.")
+    unconditional_cache = None
+    if guidance != 1.0 and conditioning_cache.cond_emb is not None:
+        unconditional_cache = ConditioningCache(
+            ctx_tokens=conditioning_cache.ctx_tokens,
+            summary=conditioning_cache.summary,
+            cond_emb=None,
+        )
+
+    batch = int(initial_state.shape[0])
+
+    def field(state: torch.Tensor, time_value: float) -> torch.Tensor:
+        time = torch.full(
+            (batch, 1),
+            float(time_value),
+            device=state.device,
+            dtype=state.dtype,
+        )
+        conditional = backbone_model.v_forward(
+            state,
+            time,
+            None,  # type: ignore[arg-type]
+            cond=None,
+            conditioning_cache=conditioning_cache,
+        )
+        if unconditional_cache is None:
+            velocity = conditional
+        else:
+            unconditional = backbone_model.v_forward(
+                state,
+                time,
+                None,  # type: ignore[arg-type]
+                cond=None,
+                conditioning_cache=unconditional_cache,
+            )
+            velocity = unconditional + guidance * (conditional - unconditional)
+        if velocity.shape != state.shape or not bool(torch.isfinite(velocity).all()):
+            raise ValueError("Frozen OTFlow field returned an invalid velocity.")
+        return velocity
+
+    state = initial_state
+    states = [state]
+    previous_velocity: torch.Tensor | None = None
+    previous_dt: float | None = None
+    for step_index in range(nfe.macro_steps):
+        current_time = float(grid[step_index].item())
+        next_time = float(grid[step_index + 1].item())
+        dt = next_time - current_time
+        velocity = field(state, current_time)
+        if nfe.solver_key == "euler":
+            state = state + dt * velocity
+        elif nfe.solver_key == "heun":
+            predicted = state + dt * velocity
+            state = state + 0.5 * dt * (velocity + field(predicted, next_time))
+        elif nfe.solver_key == "midpoint_rk2":
+            midpoint = state + 0.5 * dt * velocity
+            state = state + dt * field(midpoint, current_time + 0.5 * dt)
+        elif nfe.solver_key == "dpmpp2m":
+            if previous_velocity is None or previous_dt is None:
+                state = state + dt * velocity
+            else:
+                step_ratio = dt / previous_dt
+                state = state + dt * (
+                    (1.0 + 0.5 * step_ratio) * velocity
+                    - 0.5 * step_ratio * previous_velocity
+                )
+            previous_velocity = velocity
+            previous_dt = dt
+        else:  # pragma: no cover - the solver protocol is authoritative.
+            raise AssertionError(f"Unhandled solver_key={nfe.solver_key!r}.")
+        if not bool(torch.isfinite(state).all()):
+            raise ValueError("Frozen OTFlow solve produced a non-finite state.")
+        states.append(state)
+
+    stacked = torch.stack(states, dim=1)
+    return FlowTrajectory(
+        initial_state=stacked[:, 0],
+        time_grid=grid,
+        states=stacked,
+        final_state=stacked[:, -1],
+        solver_key=nfe.solver_key,
+        target_nfe=nfe.target_nfe,
+        macro_steps=nfe.macro_steps,
+        realized_nfe=nfe.realized_nfe,
+    )
+
+
+def _solve_trajectory(
+    backbone_model: OTFlow,
+    initial_state: torch.Tensor,
+    *,
+    conditioning_cache: ConditioningCache,
+    solver_key: str,
+    target_nfe: int,
+    time_grid: Sequence[float] | torch.Tensor,
+) -> object:
+    solve = getattr(backbone_model, "solve", None)
+    if callable(solve):
+        return solve(
+            initial_state,
+            conditioning_cache=conditioning_cache,
+            solver_key=solver_key,
+            target_nfe=target_nfe,
+            time_grid=time_grid,
+            return_trajectory=True,
+        )
+    return _solve_snapshot_trajectory(
+        backbone_model,
+        initial_state,
+        conditioning_cache=conditioning_cache,
+        solver_key=solver_key,
+        target_nfe=target_nfe,
+        time_grid=time_grid,
+    )
 
 
 DEFAULT_DISTILLATION_NFES = (4, 6, 8, 10, 12, 14, 16, 20)
@@ -160,33 +333,40 @@ def parse_distillation_settings(value: str) -> tuple[DistillationSetting, ...]:
     return tuple(settings)
 
 
-def _cache_to_cpu(cache: ConditioningCache) -> dict[str, torch.Tensor | None]:
-    return {
-        "ctx_tokens": cache.ctx_tokens.detach().cpu(),
-        "ctx_summary": cache.ctx_summary.detach().cpu(),
-        "summary": cache.summary.detach().cpu(),
-        "cond_emb": None if cache.cond_emb is None else cache.cond_emb.detach().cpu(),
-    }
+def _cache_to_cpu(cache: ConditioningCache) -> ConditioningCache:
+    return ConditioningCache(
+        ctx_tokens=cache.ctx_tokens.detach().cpu(),
+        summary=cache.summary.detach().cpu(),
+        cond_emb=None if cache.cond_emb is None else cache.cond_emb.detach().cpu(),
+    )
 
 
-def _concatenate_caches(caches: Sequence[dict[str, torch.Tensor | None]]) -> dict[str, torch.Tensor | None]:
+def _concatenate_caches(caches: Sequence[ConditioningCache]) -> ConditioningCache:
     if not caches:
         raise ValueError("Cannot concatenate an empty context cache list.")
-    output: dict[str, torch.Tensor | None] = {}
-    for key in ("ctx_tokens", "ctx_summary", "summary", "cond_emb"):
-        values = [cache[key] for cache in caches]
+
+    def concatenated(name: str) -> torch.Tensor | None:
+        values = [getattr(cache, name) for cache in caches]
         if all(value is None for value in values):
-            output[key] = None
-            continue
+            return None
         if any(value is None for value in values):
-            raise ValueError(f"Context cache field {key!r} is inconsistently present.")
+            raise ValueError(f"Context cache field {name!r} is inconsistently present.")
         tensors = [value for value in values if value is not None]
-        output[key] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
-    return output
+        return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+
+    ctx_tokens = concatenated("ctx_tokens")
+    summary = concatenated("summary")
+    if ctx_tokens is None or summary is None:
+        raise ValueError("Context cache is missing required backbone fields.")
+    return ConditioningCache(
+        ctx_tokens=ctx_tokens,
+        summary=summary,
+        cond_emb=concatenated("cond_emb"),
+    )
 
 
 def _slice_cache(
-    cache: dict[str, torch.Tensor | None],
+    cache: ConditioningCache,
     index: int,
     *,
     repeats: int,
@@ -194,20 +374,18 @@ def _slice_cache(
     dtype: torch.dtype,
 ) -> ConditioningCache:
     def repeated(name: str) -> torch.Tensor | None:
-        value = cache[name]
+        value = getattr(cache, name)
         if value is None:
             return None
         selected = value[index : index + 1].to(device=device, dtype=dtype)
         return selected.expand(repeats, *selected.shape[1:]).contiguous()
 
     ctx_tokens = repeated("ctx_tokens")
-    ctx_summary = repeated("ctx_summary")
     summary = repeated("summary")
-    if ctx_tokens is None or ctx_summary is None or summary is None:
+    if ctx_tokens is None or summary is None:
         raise ValueError("Context cache is missing required backbone fields.")
     return ConditioningCache(
         ctx_tokens=ctx_tokens,
-        ctx_summary=ctx_summary,
         summary=summary,
         cond_emb=repeated("cond_emb"),
     )
@@ -227,13 +405,11 @@ def _repeat_cache(
         return selected.expand(repeats, *selected.shape[1:]).contiguous()
 
     ctx_tokens = repeated(cache.ctx_tokens)
-    ctx_summary = repeated(cache.ctx_summary)
     summary = repeated(cache.summary)
-    if ctx_tokens is None or ctx_summary is None or summary is None:
+    if ctx_tokens is None or summary is None:
         raise ValueError("Context cache is missing required backbone fields.")
     return ConditioningCache(
         ctx_tokens=ctx_tokens,
-        ctx_summary=ctx_summary,
         summary=summary,
         cond_emb=repeated(cache.cond_emb),
     )
@@ -543,12 +719,10 @@ def _fsync_managed_artifact(root: Path) -> str:
 
 
 def _validate_output_root(root: Path, *, overwrite: bool) -> None:
-    anchor = Path(root.anchor)
-    indirect = first_link_or_reparse_component(root, root=anchor)
-    if indirect is not None:
+    if is_link_or_reparse_point(root):
         raise ValueError(
-            "Refusing a demonstration output through a symlink, junction, or "
-            f"reparse point: {indirect}."
+            "Refusing a demonstration output that is a symlink, junction, or "
+            f"reparse point: {root}."
         )
     manifest_path = root / DEMONSTRATION_MANIFEST_NAME
     shards_path = root / "shards"
@@ -870,7 +1044,7 @@ def _promote_staged_artifact(
 @torch.no_grad()
 def _collect_flow_map_demonstrations_into(
     backbone_model: OTFlow,
-    gipo_policy: GIPOSchedulePolicy,
+    gico_policy: GICOSchedulePolicy,
     contexts: DistillationContexts,
     *,
     physical_fingerprints: Sequence[str],
@@ -880,7 +1054,7 @@ def _collect_flow_map_demonstrations_into(
     scenario_key: str,
     benchmark_family: str,
     backbone_checkpoint_sha256: str,
-    gipo_checkpoint_sha256: str,
+    gico_checkpoint_sha256: str,
     contexts_source_kind: str,
     contexts_source_sha256: str,
     rollouts_per_context: int = 4,
@@ -888,7 +1062,7 @@ def _collect_flow_map_demonstrations_into(
     shard_contexts: int = 8,
     seed: int = 0,
 ) -> Path:
-    """Collect frozen GIPO-guided teacher trajectories as portable NPZ shards."""
+    """Collect frozen GICO-guided teacher trajectories as portable NPZ shards."""
 
     contexts.validate()
     fingerprints = tuple(str(value) for value in physical_fingerprints)
@@ -911,9 +1085,9 @@ def _collect_flow_map_demonstrations_into(
     shard_size = int(shard_contexts)
     if cache_batch <= 0 or shard_size <= 0:
         raise ValueError("context_batch_size and shard_contexts must be positive.")
-    if gipo_policy.density_dim != DENSITY_BIN_COUNT:
+    if gico_policy.density_dim != DENSITY_BIN_COUNT:
         raise ValueError(
-            f"Flow-map distillation requires the {DENSITY_BIN_COUNT}-bin GIPO density representation."
+            f"Flow-map distillation requires the {DENSITY_BIN_COUNT}-bin GICO density representation."
         )
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -921,13 +1095,13 @@ def _collect_flow_map_demonstrations_into(
     device = next(backbone_model.parameters()).device
     dtype = next(backbone_model.parameters()).dtype
     backbone_model.eval()
-    gipo_policy.student.eval()
+    gico_policy.student.eval()
     context_shards: list[dict[str, object]] = []
     trajectory_shards: list[dict[str, object]] = []
     state_dim = int(backbone_model.cfg.sample_state_dim)
     for shard_index, shard_start in enumerate(range(0, len(contexts.context_ids), shard_size)):
         shard_stop = min(len(contexts.context_ids), shard_start + shard_size)
-        cache_parts: list[dict[str, torch.Tensor | None]] = []
+        cache_parts: list[ConditioningCache] = []
         for batch_start in range(shard_start, shard_stop, cache_batch):
             batch_stop = min(shard_stop, batch_start + cache_batch)
             histories = contexts.histories[batch_start:batch_stop].to(device=device, dtype=dtype)
@@ -941,12 +1115,7 @@ def _collect_flow_map_demonstrations_into(
                 _cache_to_cpu(backbone_model.backbone.precompute(histories, cond=conditions))
             )
         shard_cache = _concatenate_caches(cache_parts)
-        ctx_summary = shard_cache["ctx_summary"]
-        ctx_tokens = shard_cache["ctx_tokens"]
-        summary = shard_cache["summary"]
-        if ctx_summary is None or ctx_tokens is None or summary is None:
-            raise ValueError("Backbone context cache is missing required fields.")
-        context_embedding = gipo_policy.context_embedding_from_cache(shard_cache)
+        context_embedding = gico_policy.context_embedding_from_cache(shard_cache)
 
         arrays: dict[str, object] = {
             "context_index": np.arange(shard_start, shard_stop, dtype=np.int64),
@@ -955,12 +1124,11 @@ def _collect_flow_map_demonstrations_into(
                 fingerprints[shard_start:shard_stop],
                 dtype=np.str_,
             ),
-            "ctx_tokens": ctx_tokens.numpy(),
-            "ctx_summary": ctx_summary.numpy(),
-            "summary": summary.numpy(),
+            "ctx_tokens": shard_cache.ctx_tokens.numpy(),
+            "summary": shard_cache.summary.numpy(),
         }
-        if shard_cache["cond_emb"] is not None:
-            arrays["cond_emb"] = shard_cache["cond_emb"].numpy()  # type: ignore[union-attr]
+        if shard_cache.cond_emb is not None:
+            arrays["cond_emb"] = shard_cache.cond_emb.numpy()
         record = write_npz_shard(
             root,
             f"shards/contexts_{shard_index:05d}.npz",
@@ -1010,13 +1178,14 @@ def _collect_flow_map_demonstrations_into(
             state_rows: list[np.ndarray] = []
             density_rows: list[np.ndarray] = []
             for common in common_rollouts:
-                schedule = gipo_policy.predict(
+                schedule = gico_policy.predict(
                     common.context_embedding.to(device=device, dtype=dtype),
                     solver_key=setting.solver_key,
                     target_nfe=setting.target_nfe,
                 )
                 initial_state = common.initial_state.to(device=device, dtype=dtype)
-                trajectory = backbone_model.solve(
+                trajectory = _solve_trajectory(
+                    backbone_model,
                     initial_state.clone(),
                     conditioning_cache=_repeat_cache(
                         common.conditioning_cache,
@@ -1027,9 +1196,9 @@ def _collect_flow_map_demonstrations_into(
                     solver_key=setting.solver_key,
                     target_nfe=setting.target_nfe,
                     time_grid=schedule.time_grid[0],
-                    return_trajectory=True,
                 )
-                if not isinstance(trajectory, FlowTrajectory):
+                trajectory_states = getattr(trajectory, "states", None)
+                if not torch.is_tensor(trajectory_states):
                     raise RuntimeError("OTFlow.solve did not return a trajectory.")
                 context_index_rows.append(
                     np.full((rollout_count,), common.context_index, dtype=np.int64)
@@ -1039,7 +1208,7 @@ def _collect_flow_map_demonstrations_into(
                 grid_rows.append(
                     schedule.time_grid.expand(rollout_count, -1).detach().cpu().numpy()
                 )
-                state_rows.append(trajectory.states.detach().cpu().numpy())
+                state_rows.append(trajectory_states.detach().cpu().numpy())
                 density_rows.append(
                     schedule.density_mass.expand(rollout_count, -1).detach().cpu().numpy()
                 )
@@ -1077,16 +1246,16 @@ def _collect_flow_map_demonstrations_into(
         "context_count": int(len(contexts.context_ids)),
         "rollouts_per_context": rollout_count,
         "sample_state_dim": state_dim,
-        "density_bin_count": int(gipo_policy.density_dim),
-        "density_reference_time_grid": list(gipo_policy.reference_time_grid),
-        "context_embedding_kind": gipo_policy.context_embedding_kind,
-        "setting_encoder_config": gipo_policy.setting_encoder_config.to_payload(),
+        "density_bin_count": int(gico_policy.density_dim),
+        "density_reference_time_grid": list(gico_policy.reference_time_grid),
+        "context_embedding_protocol": gico_policy.context_embedding_protocol,
+        "setting_encoder_config": gico_policy.setting_encoder_config.to_payload(),
         "settings": [
             {"solver_key": item.solver_key, "target_nfe": int(item.target_nfe)}
             for item in requested_settings
         ],
         "backbone_checkpoint_sha256": str(backbone_checkpoint_sha256),
-        "gipo_checkpoint_sha256": str(gipo_checkpoint_sha256),
+        "gico_checkpoint_sha256": str(gico_checkpoint_sha256),
         "contexts_source_kind": str(contexts_source_kind),
         "contexts_source_sha256": str(contexts_source_sha256),
         "collection_seed": int(seed),
@@ -1103,7 +1272,7 @@ def _collect_flow_map_demonstrations_into(
 
 def collect_flow_map_demonstrations(
     backbone_model: OTFlow,
-    gipo_policy: GIPOSchedulePolicy,
+    gico_policy: GICOSchedulePolicy,
     contexts: DistillationContexts,
     *,
     settings: Sequence[DistillationSetting],
@@ -1112,7 +1281,7 @@ def collect_flow_map_demonstrations(
     scenario_key: str,
     benchmark_family: str,
     backbone_checkpoint_sha256: str,
-    gipo_checkpoint_sha256: str,
+    gico_checkpoint_sha256: str,
     contexts_source_kind: str = "in_memory",
     contexts_source_sha256: str = "",
     rollouts_per_context: int = 4,
@@ -1147,7 +1316,7 @@ def collect_flow_map_demonstrations(
         character not in "0123456789abcdef" for character in source_sha256
     ):
         raise ValueError("contexts_source_sha256 must be a lowercase SHA-256 digest.")
-    policy_metadata = getattr(gipo_policy, "checkpoint_payload", None)
+    policy_metadata = getattr(gico_policy, "checkpoint_payload", None)
     if isinstance(policy_metadata, Mapping):
         policy_scenario = str(policy_metadata.get("scenario_key", "") or "").strip()
         policy_family = str(
@@ -1155,24 +1324,28 @@ def collect_flow_map_demonstrations(
         ).strip()
         if not policy_scenario or not policy_family:
             raise ValueError(
-                "GIPO checkpoint requires scenario provenance for demonstration collection."
+                "GICO checkpoint requires scenario provenance for demonstration collection."
             )
         if (policy_scenario, policy_family) != (
             str(scenario_key).strip(),
             str(benchmark_family).strip(),
         ):
             raise ValueError(
-                "Requested demonstration scenario does not match the GIPO checkpoint."
+                "Requested demonstration scenario does not match the GICO checkpoint."
             )
-    target = Path(os.path.abspath(Path(output_dir).expanduser()))
-    anchor = Path(target.anchor)
-    indirect = first_link_or_reparse_component(target, root=anchor)
-    if indirect is not None:
+    requested_target = Path(os.path.abspath(Path(output_dir).expanduser()))
+    if is_link_or_reparse_point(requested_target):
         raise ValueError(
-            "Refusing a demonstration output through a symlink, junction, or "
-            f"reparse point: {indirect}."
+            "Refusing a demonstration output that is a symlink, junction, or "
+            f"reparse point: {requested_target}."
         )
-    target.parent.mkdir(parents=True, exist_ok=True)
+    requested_target.parent.mkdir(parents=True, exist_ok=True)
+    target = requested_target.parent.resolve(strict=True) / requested_target.name
+    if is_link_or_reparse_point(target):
+        raise ValueError(
+            "Refusing a demonstration output that is a symlink, junction, or "
+            f"reparse point: {target}."
+        )
     with _exclusive_collection_lock(target):
         _recover_interrupted_promotion(target)
         _validate_output_root(target, overwrite=bool(overwrite))
@@ -1185,7 +1358,7 @@ def collect_flow_map_demonstrations(
         try:
             _collect_flow_map_demonstrations_into(
                 backbone_model,
-                gipo_policy,
+                gico_policy,
                 contexts,
                 physical_fingerprints=physical_fingerprints,
                 settings=settings,
@@ -1194,7 +1367,7 @@ def collect_flow_map_demonstrations(
                 scenario_key=scenario_key,
                 benchmark_family=benchmark_family,
                 backbone_checkpoint_sha256=backbone_checkpoint_sha256,
-                gipo_checkpoint_sha256=gipo_checkpoint_sha256,
+                gico_checkpoint_sha256=gico_checkpoint_sha256,
                 contexts_source_kind=source_kind,
                 contexts_source_sha256=source_sha256,
                 rollouts_per_context=rollouts_per_context,
@@ -1246,10 +1419,10 @@ def load_distillation_contexts(path: str | Path) -> DistillationContexts:
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Collect frozen GIPO-guided OTFlow trajectories for endpoint-map distillation."
+        description="Collect frozen GICO-guided OTFlow trajectories for endpoint-map distillation."
     )
     parser.add_argument("--backbone-checkpoint", required=True)
-    parser.add_argument("--gipo-checkpoint", required=True)
+    parser.add_argument("--gico-checkpoint", required=True)
     parser.add_argument("--contexts-npz", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--split-phase", required=True)
@@ -1273,19 +1446,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = build_argparser().parse_args(list(argv) if argv is not None else None)
     device = resolve_torch_device(str(args.device))
     backbone_path = resolve_project_path(args.backbone_checkpoint)
-    gipo_path = resolve_project_path(args.gipo_checkpoint)
+    gico_path = resolve_project_path(args.gico_checkpoint)
     contexts_path = resolve_project_path(args.contexts_npz)
     output_dir = resolve_project_path(args.output_dir)
     output_manifest = (
         output_dir / DEMONSTRATION_MANIFEST_NAME
     )
-    if output_manifest in {backbone_path, gipo_path, contexts_path}:
+    if output_manifest in {backbone_path, gico_path, contexts_path}:
         raise ValueError("Demonstration output must differ from every input artifact path.")
     backbone_model, _ = load_checkpoint_model(backbone_path, device)
-    gipo_policy = load_gipo_schedule_policy(gipo_path, device=device)
+    gico_policy = load_gico_schedule_policy(gico_path, device=device)
     manifest = collect_flow_map_demonstrations(
         backbone_model,
-        gipo_policy,
+        gico_policy,
         load_distillation_contexts(contexts_path),
         settings=parse_distillation_settings(args.settings),
         output_dir=output_dir,
@@ -1293,7 +1466,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         scenario_key=args.scenario_key,
         benchmark_family=args.benchmark_family,
         backbone_checkpoint_sha256=file_sha256(backbone_path),
-        gipo_checkpoint_sha256=file_sha256(gipo_path),
+        gico_checkpoint_sha256=file_sha256(gico_path),
         contexts_source_kind="npz",
         contexts_source_sha256=file_sha256(contexts_path),
         rollouts_per_context=args.rollouts_per_context,

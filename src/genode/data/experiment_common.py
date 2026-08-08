@@ -1,25 +1,31 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
-from typing import Dict, Mapping
+from typing import Dict, List, Mapping
+
+import torch
 
 from genode.models.config import OTFlowConfig
 from genode.data.otflow_datasets import (
+    DEFAULT_SYNTHETIC_LENGTH,
     LOBSTER_SYNTHETIC_DATASET_KEY,
     build_dataset_splits_from_cryptos,
     build_dataset_splits_from_lobster_synthetic,
+    default_cryptos_npz_path,
+    default_lobster_synth_profile_path,
 )
 from genode.data.otflow_medical_constants import (
     LONG_TERM_ST_DATASET_KEY,
-    LONG_TERM_ST_STRIDE,
+    LONG_TERM_ST_DEFAULT_STRIDE,
     LONG_TERM_ST_HISTORY_LEN,
     LONG_TERM_ST_HORIZON_LEN,
+    default_long_term_st_data_path,
 )
-from genode.data.otflow_paths import cryptos_data_path, lobster_synthetic_profile_path, long_term_st_data_path
 
-OTFLOW_REFERENCE_DATASET_CHOICES = ("cryptos", LOBSTER_SYNTHETIC_DATASET_KEY, LONG_TERM_ST_DATASET_KEY)
-OTFLOW_REFERENCE_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
+OTFLOW_PAPER_DATASET_CHOICES = ("cryptos", LOBSTER_SYNTHETIC_DATASET_KEY, LONG_TERM_ST_DATASET_KEY)
+OTFLOW_PAPER_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
     "cryptos": {
         "levels": 10,
         "token_dim": 4,
@@ -61,6 +67,62 @@ OTFLOW_REFERENCE_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
         "rollout_mode": "non_ar",
         "future_block_len": LONG_TERM_ST_HORIZON_LEN,
     },
+}
+OTFLOW_PAPER_BACKBONE_PRESET: Mapping[str, object] = OTFLOW_PAPER_BACKBONE_PRESETS["cryptos"]
+
+OTFLOW_QUALITY_PRESETS: Mapping[str, Dict[str, object]] = {
+    "cryptos": {
+        "levels": 10,
+        "token_dim": 4,
+        "history_len": 256,
+        "eval_nfe": 1,
+        "solver": "dpmpp2m",
+        "ctx_encoder": "hybrid",
+        "ctx_causal": True,
+        "ctx_local_kernel": 7,
+        "ctx_pool_scales": "8,32",
+    },
+    LOBSTER_SYNTHETIC_DATASET_KEY: {
+        "levels": 10,
+        "token_dim": 4,
+        "history_len": 256,
+        "eval_nfe": 1,
+        "solver": "euler",
+        "ctx_encoder": "hybrid",
+        "ctx_causal": True,
+        "ctx_local_kernel": 7,
+        "ctx_pool_scales": "8,32",
+    },
+    LONG_TERM_ST_DATASET_KEY: {
+        "levels": 1,
+        "token_dim": 1,
+        "history_len": LONG_TERM_ST_HISTORY_LEN,
+        "eval_nfe": 1,
+        "solver": "euler",
+        "ctx_encoder": "hybrid",
+        "ctx_causal": True,
+        "ctx_local_kernel": 7,
+        "ctx_pool_scales": "8,32",
+        "use_cond_features": False,
+        "cond_standardize": False,
+        "use_time_features": False,
+        "use_time_gaps": False,
+        "rollout_mode": "non_ar",
+        "future_block_len": LONG_TERM_ST_HORIZON_LEN,
+    },
+}
+
+OTFLOW_SPEED_PRESETS: Mapping[str, Dict[str, object]] = {
+    dataset: {
+        **copy.deepcopy(dict(preset)),
+        "eval_nfe": 1,
+    }
+    for dataset, preset in OTFLOW_QUALITY_PRESETS.items()
+}
+
+OTFLOW_PRESET_VARIANTS: Mapping[str, Mapping[str, Dict[str, object]]] = {
+    "quality": OTFLOW_QUALITY_PRESETS,
+    "speed": OTFLOW_SPEED_PRESETS,
 }
 
 
@@ -110,7 +172,7 @@ DATASET_PLANS: Mapping[str, DatasetPlan] = {
         train_steps_final=12000,
         eval_windows_tune=10,
         eval_windows_final=20,
-        data_path=lobster_synthetic_profile_path(),
+        data_path=default_lobster_synth_profile_path(),
     ),
     LONG_TERM_ST_DATASET_KEY: DatasetPlan(
         name=LONG_TERM_ST_DATASET_KEY,
@@ -123,25 +185,137 @@ DATASET_PLANS: Mapping[str, DatasetPlan] = {
         train_steps_final=12000,
         eval_windows_tune=4,
         eval_windows_final=8,
-        data_path=long_term_st_data_path(),
-        stride_train=LONG_TERM_ST_STRIDE,
-        stride_eval=LONG_TERM_ST_STRIDE,
+        data_path=default_long_term_st_data_path(),
+        stride_train=LONG_TERM_ST_DEFAULT_STRIDE,
+        stride_eval=LONG_TERM_ST_DEFAULT_STRIDE,
         batch_size=2,
     ),
 }
 
-def get_otflow_reference_backbone_preset(dataset: str) -> Dict[str, object]:
+_OPTIONAL_CFG_OVERRIDES = (
+    "token_dim",
+    "hidden_dim",
+    "ctx_encoder",
+    "ctx_causal",
+    "ctx_local_kernel",
+    "diffusion_steps",
+    "fu_net_type",
+    "fu_net_layers",
+    "fu_net_heads",
+    "rollout_mode",
+    "future_block_len",
+    "adaptive_context",
+    "adaptive_context_ratio",
+    "adaptive_context_min",
+    "adaptive_context_max",
+    "train_variable_context",
+    "train_context_min",
+    "train_context_max",
+    "use_time_features",
+    "use_time_gaps",
+    "use_minibatch_ot",
+    "cfg_scale",
+    "solver",
+    "use_amp",
+    "grad_accum_steps",
+)
+
+
+def mkdir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def parse_int_list(text: str) -> List[int]:
+    if not text:
+        return []
+    return [int(part.strip()) for part in text.split(",") if part.strip()]
+
+
+def parse_float_list(text: str) -> List[float]:
+    if not text:
+        return []
+    return [float(part.strip()) for part in text.split(",") if part.strip()]
+
+
+def get_otflow_paper_backbone_preset(dataset: str) -> Dict[str, object]:
     dataset_key = str(dataset).strip()
-    if dataset_key not in OTFLOW_REFERENCE_BACKBONE_PRESETS:
-        raise ValueError(f"No OTFlow reference preset defined for dataset={dataset!r}")
-    return copy.deepcopy(dict(OTFLOW_REFERENCE_BACKBONE_PRESETS[dataset_key]))
+    if dataset_key not in OTFLOW_PAPER_BACKBONE_PRESETS:
+        raise ValueError(f"No OTFlow paper preset defined for dataset={dataset!r}")
+    return copy.deepcopy(dict(OTFLOW_PAPER_BACKBONE_PRESETS[dataset_key]))
+
+
+def get_otflow_dataset_preset(dataset: str, variant: str = "quality") -> Dict[str, object]:
+    variant_key = str(variant).strip().lower()
+    if variant_key not in OTFLOW_PRESET_VARIANTS:
+        raise ValueError(f"Unknown OTFlow preset variant={variant!r}")
+    dataset_key = str(dataset).strip()
+    presets = OTFLOW_PRESET_VARIANTS[variant_key]
+    if dataset_key not in presets:
+        raise ValueError(f"No OTFlow preset defined for dataset={dataset!r}")
+    return copy.deepcopy(dict(presets[dataset_key]))
+
+
+def apply_otflow_dataset_preset(args, variant: str | None = None):
+    dataset = getattr(args, "dataset", None)
+    if dataset not in OTFLOW_QUALITY_PRESETS:
+        return args
+    variant_name = str(
+        variant
+        or getattr(args, "otflow_variant", None)
+        or "quality"
+    ).strip().lower()
+    preset = get_otflow_dataset_preset(str(dataset), variant=variant_name)
+    for key, value in preset.items():
+        if not hasattr(args, key):
+            continue
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    if hasattr(args, "otflow_variant") and getattr(args, "otflow_variant") is None:
+        setattr(args, "otflow_variant", variant_name)
+    return args
+
+
+def build_cfg_from_args(args) -> OTFlowConfig:
+    cfg = OTFlowConfig()
+    cfg.apply_overrides(
+        device=torch.device(args.device),
+        levels=args.levels,
+        history_len=args.history_len,
+        steps=int(getattr(args, "steps", cfg.train.steps)),
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        standardize=args.standardize,
+        use_cond_features=args.use_cond_features,
+        cond_standardize=args.cond_standardize,
+    )
+
+    for name in _OPTIONAL_CFG_OVERRIDES:
+        value = getattr(args, name, None)
+        if value is not None:
+            cfg.apply_overrides(**{name: value})
+
+    ctx_pool_scales = getattr(args, "ctx_pool_scales", None)
+    if ctx_pool_scales:
+        cfg.apply_overrides(ctx_pool_scales=tuple(parse_int_list(ctx_pool_scales)))
+
+    cond_depths = getattr(args, "cond_depths", "")
+    if cond_depths:
+        cfg.apply_overrides(cond_depths=tuple(parse_int_list(cond_depths)))
+
+    cond_vol_window = getattr(args, "cond_vol_window", None)
+    if cond_vol_window is not None:
+        cfg.apply_overrides(cond_vol_window=cond_vol_window)
+
+    return cfg
 
 
 def build_dataset_splits(args, cfg: OTFlowConfig):
     dataset = args.dataset
     if dataset == "cryptos":
         return build_dataset_splits_from_cryptos(
-            path=args.data_path or cryptos_data_path(),
+            path=args.data_path or default_cryptos_npz_path(),
             cfg=cfg,
             stride_train=args.stride_train,
             stride_eval=args.stride_eval,
@@ -151,7 +325,7 @@ def build_dataset_splits(args, cfg: OTFlowConfig):
         )
     if dataset == LOBSTER_SYNTHETIC_DATASET_KEY:
         return build_dataset_splits_from_lobster_synthetic(
-            profile_path=args.data_path or lobster_synthetic_profile_path(),
+            profile_path=args.data_path or default_lobster_synth_profile_path(),
             cfg=cfg,
             length=args.synthetic_length,
             seed=args.seed,
@@ -165,7 +339,7 @@ def build_dataset_splits(args, cfg: OTFlowConfig):
         from genode.data.otflow_medical_datasets import build_dataset_splits_from_long_term_st
 
         return build_dataset_splits_from_long_term_st(
-            path=args.data_path or long_term_st_data_path(),
+            path=args.data_path or default_long_term_st_data_path(),
             cfg=cfg,
             stride_train=args.stride_train,
             stride_eval=args.stride_eval,
@@ -177,10 +351,20 @@ def build_dataset_splits(args, cfg: OTFlowConfig):
 
 
 __all__ = [
-    "OTFLOW_REFERENCE_DATASET_CHOICES",
-    "OTFLOW_REFERENCE_BACKBONE_PRESETS",
+    "OTFLOW_PAPER_DATASET_CHOICES",
+    "OTFLOW_PAPER_BACKBONE_PRESETS",
+    "OTFLOW_PAPER_BACKBONE_PRESET",
     "DATASET_PLANS",
     "DatasetPlan",
-    "get_otflow_reference_backbone_preset",
+    "DEFAULT_SYNTHETIC_LENGTH",
+    "OTFLOW_QUALITY_PRESETS",
+    "OTFLOW_SPEED_PRESETS",
+    "mkdir",
+    "parse_int_list",
+    "parse_float_list",
+    "get_otflow_paper_backbone_preset",
+    "get_otflow_dataset_preset",
+    "apply_otflow_dataset_preset",
+    "build_cfg_from_args",
     "build_dataset_splits",
 ]

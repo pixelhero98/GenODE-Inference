@@ -22,7 +22,10 @@ from genode.artifact_bundle import (
     validate_artifact_bundle,
     validate_artifact_bundle_layout,
 )
-from genode.checkpoint_validation import validate_strict_integer
+from genode.checkpoint_validation import (
+    normalize_strict_solver_nfe_fields as normalize_solver_nfe_fields,
+    validate_strict_integer,
+)
 from genode.data.otflow_paths import resolve_project_path
 from genode.distillation.artifacts import (
     DEMONSTRATION_TRAINING_SPLITS,
@@ -30,24 +33,26 @@ from genode.distillation.artifacts import (
     validate_context_binding,
 )
 from genode.distillation.checkpoint import save_flow_map_checkpoint
-from genode.distillation.gipo_policy import load_gipo_schedule_policy
+from genode.distillation.gico_policy import load_gico_schedule_policy
 from genode.distillation.model import EndpointFlowMap, endpoint_consistency_loss
+from genode.distillation.validation import setting_encoder_config_from_payload
 from genode.evaluation.otflow_evaluation_support import load_checkpoint_model
-from genode.gipo.models import (
-    setting_encoder_config_from_payload,
+from genode.gico.models import (
     setting_feature_dim,
     setting_features,
 )
-from genode.gipo.policy import validate_context_embedding_kind
-from genode.gipo.density_representation import (
+from genode.gico.density_representation import (
     density_mass_to_time_grid,
     validate_reference_grid,
 )
-from genode.models.conditioning import ConditioningCache, ConditioningState
+from genode.models.conditioning import (
+    FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+    ConditioningCache,
+    ConditioningState,
+)
 from genode.models.otflow_model import OTFlow
 from genode.provenance import file_sha256
 from genode.runtime import resolve_torch_device
-from genode.solver_protocol import normalize_solver_nfe_fields
 
 
 SplitName = Literal["train", "validation"]
@@ -201,7 +206,6 @@ class DemonstrationStore:
                     "context_id",
                     "context_fingerprint",
                     "ctx_tokens",
-                    "ctx_summary",
                     "summary",
                 }
                 missing = sorted(required - set(payload.files))
@@ -243,7 +247,7 @@ class DemonstrationStore:
                     self.context_fingerprints[integer_index] = text_fingerprint
                     self._context_locations[integer_index] = (record_index, row_index)
                     seen_context_ids.add(text_id)
-                for name in ("ctx_tokens", "ctx_summary", "summary"):
+                for name in ("ctx_tokens", "summary"):
                     value = np.asarray(payload[name])
                     _validate_continuous_array(
                         value,
@@ -358,7 +362,7 @@ class DemonstrationStore:
             record_index, row_index = location
             grouped.setdefault(record_index, []).append((output_index, row_index))
 
-        names = ["ctx_tokens", "ctx_summary", "summary"]
+        names = ["ctx_tokens", "summary"]
         if self._has_cond_emb:
             names.append("cond_emb")
         output: dict[str, np.ndarray] = {
@@ -380,7 +384,6 @@ class DemonstrationStore:
 
         return ConditioningCache(
             ctx_tokens=tensor("ctx_tokens"),
-            ctx_summary=tensor("ctx_summary"),
             summary=tensor("summary"),
             cond_emb=tensor("cond_emb") if self._has_cond_emb else None,
         )
@@ -552,7 +555,7 @@ class DemonstrationStore:
                     )
                 ):
                     raise ValueError(
-                        "A frozen GIPO policy must produce one deterministic schedule for "
+                        "A frozen GICO policy must produce one deterministic schedule for "
                         "each context and solver/NFE setting across rollout seeds."
                     )
                 state_key = (int(context_value), int(noise_seed))
@@ -906,6 +909,7 @@ def train_endpoint_flow_map(
         "loss": "pseudo_huber",
         "loss_delta": float(flow_map.loss_delta),
         "initialized_from_backbone_field": bool(initialize_from_backbone),
+        "context_embedding_protocol": store.metadata["context_embedding_protocol"],
         "best_step": int(best_step),
         "best_validation_loss": float(best_validation_loss),
         "last_training_loss": float(last_training_loss),
@@ -1089,7 +1093,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a one-evaluation endpoint flow map.")
     parser.add_argument("--demonstration-manifest", required=True)
     parser.add_argument("--backbone-checkpoint", required=True)
-    parser.add_argument("--gipo-checkpoint", required=True)
+    parser.add_argument("--gico-checkpoint", required=True)
     parser.add_argument("--output-checkpoint", required=True)
     parser.add_argument("--summary-json", default="")
     parser.add_argument("--steps", type=int, default=50_000)
@@ -1112,7 +1116,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = build_argparser().parse_args(list(argv) if argv is not None else None)
     device = resolve_torch_device(args.device)
     backbone_path = resolve_project_path(args.backbone_checkpoint)
-    gipo_path = resolve_project_path(args.gipo_checkpoint)
+    gico_path = resolve_project_path(args.gico_checkpoint)
     manifest_path = resolve_project_path(args.demonstration_manifest)
     output_path = resolve_project_path(args.output_checkpoint)
     summary_path = (
@@ -1123,7 +1127,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     named_paths = {
         "demonstration manifest": manifest_path,
         "backbone checkpoint": backbone_path,
-        "GIPO checkpoint": gipo_path,
+        "GICO checkpoint": gico_path,
         "flow-map checkpoint": output_path,
     }
     if summary_path is not None:
@@ -1170,7 +1174,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         ]
     )
     expected_backbone_hash = str(store.metadata.get("backbone_checkpoint_sha256", ""))
-    expected_gipo_hash = str(store.metadata.get("gipo_checkpoint_sha256", ""))
+    expected_gico_hash = str(store.metadata.get("gico_checkpoint_sha256", ""))
 
     def validate_training_source_identities() -> None:
         if file_sha256(manifest_path) != expected_demonstration_manifest_hash:
@@ -1186,36 +1190,41 @@ def main(argv: Iterable[str] | None = None) -> int:
             raise ValueError(
                 "Backbone source checkpoint changed after demonstration validation."
             )
-        if file_sha256(gipo_path) != expected_gipo_hash:
+        if file_sha256(gico_path) != expected_gico_hash:
             raise ValueError(
-                "GIPO source checkpoint changed after demonstration validation."
+                "GICO source checkpoint changed after demonstration validation."
             )
 
     validate_training_source_identities()
-    gipo_policy = load_gipo_schedule_policy(gipo_path, device=device)
+    gico_policy = load_gico_schedule_policy(gico_path, device=device)
     validate_training_source_identities()
     if (
-        gipo_policy.setting_encoder_config.to_payload()
+        gico_policy.setting_encoder_config.to_payload()
         != store.setting_encoder_config.to_payload()
     ):
         raise ValueError(
-            "Demonstration setting encoder is incompatible with the GIPO checkpoint."
+            "Demonstration setting encoder is incompatible with the GICO checkpoint."
         )
-    if gipo_policy.density_dim != store.density_dim or not np.allclose(
-        gipo_policy.reference_time_grid,
+    if gico_policy.density_dim != store.density_dim or not np.allclose(
+        gico_policy.reference_time_grid,
         store.density_reference_time_grid,
         atol=0.0,
         rtol=0.0,
     ):
         raise ValueError(
-            "Demonstration density representation is incompatible with the GIPO checkpoint."
+            "Demonstration density representation is incompatible with the GICO checkpoint."
         )
-    demonstration_embedding_kind = validate_context_embedding_kind(
-        store.metadata.get("context_embedding_kind")
+    demonstration_context_protocol = str(
+        store.metadata.get("context_embedding_protocol", "")
     )
-    if demonstration_embedding_kind != gipo_policy.context_embedding_kind:
+    if demonstration_context_protocol != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL:
         raise ValueError(
-            "Demonstration context embedding kind is incompatible with the GIPO checkpoint."
+            "Demonstration context_embedding_protocol must be "
+            f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
+        )
+    if demonstration_context_protocol != gico_policy.context_embedding_protocol:
+        raise ValueError(
+            "Demonstration context protocol is incompatible with the GICO checkpoint."
         )
     backbone_model, _ = load_checkpoint_model(backbone_path, device)
     validate_training_source_identities()
@@ -1241,13 +1250,13 @@ def main(argv: Iterable[str] | None = None) -> int:
             staged_path,
             flow_map,
             backbone_checkpoint=backbone_path,
-            gipo_checkpoint=gipo_path,
+            gico_checkpoint=gico_path,
             setting_encoder_config=store.setting_encoder_config,
             training_summary=training_summary,
             demonstration_manifest_sha256=expected_demonstration_manifest_hash,
             demonstration_metadata=store.metadata,
             expected_backbone_checkpoint_sha256=expected_backbone_hash,
-            expected_gipo_checkpoint_sha256=expected_gipo_hash,
+            expected_gico_checkpoint_sha256=expected_gico_hash,
             overwrite=False,
         )
 

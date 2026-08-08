@@ -19,7 +19,7 @@ from genode.distillation import evaluation as evaluation_module
 def test_candidate_catalog_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     path = tmp_path / "candidate-catalog.json"
     path.write_text(
-        '[{"method":"flow_map","method":"gipo"}]',
+        '[{"method":"flow_map","method":"gico"}]',
         encoding="utf-8",
     )
 
@@ -56,7 +56,7 @@ def test_quality_evaluation_rejects_input_changed_after_identity_capture(
 
 def test_quality_rows_reject_duplicate_csv_headers(tmp_path: Path) -> None:
     path = tmp_path / "quality-rows.csv"
-    path.write_text("split_phase,method,method\nlocked_test,gipo,fixed\n", encoding="utf-8")
+    path.write_text("split_phase,method,method\nlocked_test,gico,fixed\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="headers must be unique"):
         read_quality_rows(path)

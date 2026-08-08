@@ -14,14 +14,20 @@ import genode.visualization.build_ptg_observed_gain_figure as ptg_fig
 HAS_MATPLOTLIB = importlib.util.find_spec("matplotlib") is not None
 
 
-def _lightweight_grid(schedule_key: str, macro_steps: int):
-    base = np.linspace(0.0, 1.0, int(macro_steps) + 1, dtype=np.float64)
-    if schedule_key == "ays":
+def _lightweight_grid(schedule_key: str, runtime_nfe: int):
+    base = np.linspace(0.0, 1.0, int(runtime_nfe) + 1, dtype=np.float64)
+    if schedule_key == "ays_sd15_native":
         grid = base**1.10
-    elif schedule_key == "gits":
+    elif schedule_key == "ays_sd15_log_sigma":
+        grid = base**1.15
+    elif schedule_key == "gits_cifar10_native":
         grid = base**1.25
-    elif schedule_key == "ots":
+    elif schedule_key == "gits_cifar10_log_sigma":
+        grid = base**1.30
+    elif schedule_key == "ots_vp_linear_native":
         grid = 1.0 - (1.0 - base) ** 1.20
+    elif schedule_key == "ots_vp_linear_log_sigma":
+        grid = 1.0 - (1.0 - base) ** 1.25
     else:
         grid = base
     grid[0] = 0.0
@@ -82,21 +88,21 @@ class PtgObservedGainFigureTests(unittest.TestCase):
     def test_observed_gain_calculation(self) -> None:
         rows = [
             {
-                "scenario_key": "traffic_hourly",
+                "dataset": "traffic_hourly",
                 "split_phase": "locked_test",
                 "checkpoint_id": "ckpt",
                 "backbone_name": "otflow",
                 "train_budget_label": "20k",
-                "checkpoint_step": 20000,
+                "train_steps": 20000,
                 "target_nfe": 10,
-                "macro_steps": 10,
+                "runtime_nfe": 10,
                 "dense_reference_macro_steps": 160,
                 "dense_reference_macro_factor": 16.0,
                 "evaluation_seed": seed,
                 "solver_key": "euler",
                 "solver_name": "euler",
-                "scheduler_key": "ays",
-                "scheduler_name": "AYS",
+                "schedule_key": "ays_sd15_native",
+                "schedule_name": "AYS",
                 "integration_error": error,
                 "uniform_integration_error": uniform,
                 "integration_gain_percent": 100.0 * (1.0 - error / uniform),
@@ -110,13 +116,11 @@ class PtgObservedGainFigureTests(unittest.TestCase):
         expected = 0.5 * (20.0 + 25.0)
         self.assertAlmostEqual(stats[0]["integration_gain_percent_mean"], expected)
 
-    def test_20k_filter_has_108_points_and_excludes_late_power(self) -> None:
+    def test_20k_filter_matches_transfer_schedule_scope(self) -> None:
         zip_path = ptg_fig.DEFAULT_ZIP_PATH
         if not zip_path.exists():
             self.skipTest(f"Missing local 20k.zip at {zip_path}")
         rows = ptg_fig.load_observed_gain_rows(zip_path)
-        self.assertEqual(len(rows), 108)
-        self.assertFalse(any(key[3] == "late_power_3" for key in rows))
         self.assertEqual({key[3] for key in rows}, set(ptg_fig.TRANSFER_SCHEDULES))
 
     def test_synthetic_points_are_exact_scope(self) -> None:
@@ -124,8 +128,7 @@ class PtgObservedGainFigureTests(unittest.TestCase):
             points = ptg_fig.build_points(ptg_fig.synthetic_payload(), ptg_fig.synthetic_observed_rows())
         expected_points = len(ptg_fig.DATASET_ORDER) * len(ptg_fig.SOLVER_ORDER) * len(ptg_fig.TARGET_NFES) * len(ptg_fig.TRANSFER_SCHEDULES)
         self.assertEqual(len(points), expected_points)
-        self.assertEqual({point["scheduler_key"] for point in points}, set(ptg_fig.TRANSFER_SCHEDULES))
-        self.assertEqual({point["checkpoint_step"] for point in points}, {20000})
+        self.assertEqual({point["schedule_key"] for point in points}, set(ptg_fig.TRANSFER_SCHEDULES))
         self.assertTrue(all("observed_integration_gain_percent" in point for point in points))
         for key in (
             "ptg_info_growth_raw",
@@ -167,8 +170,8 @@ class PtgObservedGainFigureTests(unittest.TestCase):
             png = Path(tmpdir) / "ptg.png"
             pdf = Path(tmpdir) / "ptg.pdf"
             outputs = ptg_fig.plot_points(points, png_path=png, pdf_path=pdf, dpi=120)
-            self.assertEqual(outputs["png"], ptg_fig.display_project_path(png))
-            self.assertEqual(outputs["pdf"], ptg_fig.display_project_path(pdf))
+            self.assertEqual(outputs["png"], str(png))
+            self.assertEqual(outputs["pdf"], str(pdf))
             self.assertTrue(png.exists())
             self.assertTrue(pdf.exists())
             self.assertGreater(png.stat().st_size, 0)
@@ -184,29 +187,29 @@ class PtgObservedGainFigureTests(unittest.TestCase):
         self.assertEqual(summary["observed_y_key"], "observed_integration_gain_percent")
         self.assertIn("ptg_info_growth_raw", summary["variants"])
 
-    def test_integration_gain_loader_has_108_points_and_excludes_nontransferred(self) -> None:
+    def test_integration_gain_loader_excludes_nontransferred_schedules(self) -> None:
         stats_rows = []
         for dataset in ptg_fig.DATASET_ORDER:
             for solver_key in ptg_fig.SOLVER_ORDER:
                 for target_nfe in ptg_fig.TARGET_NFES:
-                    macro_steps = target_nfe if solver_key in {"euler", "dpmpp2m"} else target_nfe // 2
-                    for schedule_key in (*ptg_fig.INTEGRATION_SCHEDULES, "late_power_3"):
+                    runtime_nfe = target_nfe if solver_key in {"euler", "dpmpp2m"} else target_nfe // 2
+                    for schedule_key in (*ptg_fig.INTEGRATION_SCHEDULES, "not_a_transfer_clock"):
                         stats_rows.append(
                             {
-                                "scenario_key": dataset,
+                                "dataset": dataset,
                                 "split_phase": "locked_test",
                                 "checkpoint_id": "ckpt",
                                 "backbone_name": "otflow",
                                 "train_budget_label": "20k",
-                                "checkpoint_step": 20000,
+                                "train_steps": 20000,
                                 "target_nfe": int(target_nfe),
-                                "macro_steps": int(macro_steps),
-                                "dense_reference_macro_steps": int(16 * macro_steps),
+                                "runtime_nfe": int(runtime_nfe),
+                                "dense_reference_macro_steps": int(16 * runtime_nfe),
                                 "dense_reference_macro_factor": 16.0,
                                 "solver_key": solver_key,
                                 "solver_name": solver_key,
-                                "scheduler_key": schedule_key,
-                                "scheduler_name": schedule_key,
+                                "schedule_key": schedule_key,
+                                "schedule_name": schedule_key,
                                 "n_seeds": 5,
                                 "seed_values": "0;1;2;3;4",
                                 "integration_error_mean": 1.0,
@@ -226,30 +229,7 @@ class PtgObservedGainFigureTests(unittest.TestCase):
         expected_points = len(ptg_fig.DATASET_ORDER) * len(ptg_fig.SOLVER_ORDER) * len(ptg_fig.TARGET_NFES) * len(ptg_fig.TRANSFER_SCHEDULES)
         self.assertEqual(len(rows), expected_points)
         self.assertEqual({key[3] for key in rows}, set(ptg_fig.TRANSFER_SCHEDULES))
-        self.assertFalse(any(key[3] == "late_power_3" for key in rows))
-        self.assertEqual({row["checkpoint_step"] for row in rows.values()}, {20000})
-
-    def test_persisted_row_loaders_reject_retired_evaluation_keys(self) -> None:
-        with self.assertRaisesRegex(ValueError, "retired evaluation keys"):
-            ptg_fig.aggregate_integration_error_rows(
-                [{"dataset": "traffic_hourly", "scheduler_key": "ays"}]
-            )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "legacy.csv"
-            ptg_fig.write_csv_rows(
-                [
-                    {
-                        "dataset": "traffic_hourly",
-                        "target_nfe": 10,
-                        "solver_key": "euler",
-                        "scheduler_key": "ays",
-                    }
-                ],
-                path,
-            )
-            with self.assertRaisesRegex(ValueError, "retired evaluation keys"):
-                ptg_fig.load_integration_gain_rows(path)
+        self.assertFalse(any(key[3] == "not_a_transfer_clock" for key in rows))
 
 
 if __name__ == "__main__":

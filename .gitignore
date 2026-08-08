@@ -3,25 +3,18 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 pytest-of-*/
-torchinductor_*/
+.test-tmp/
+/src/pytest-of-*/
+/src/tmp????????/
 .mypy_cache/
 .ruff_cache/
-.coverage
-.coverage.*
-coverage.xml
-htmlcov/
-
-# Local environment configuration. Keep a sanitized template versioned if needed.
-.env
-.env.*
-!.env.example
 
 # Local datasets, checkpoints, and experiment outputs.
 /data/
-/datasets/
 /paper_datasets/
 /outputs/
 /reports/
+/release/
 
 # Build artifacts.
 build/
