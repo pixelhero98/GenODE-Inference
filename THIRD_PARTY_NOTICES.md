@@ -105,3 +105,34 @@ revisions. This repository does not vendor the upstream network implementation,
 datasets, or checkpoint weights. Their upstream licenses and dataset terms
 continue to apply; the registry records those constraints, and generated image
 checkpoint archives must not be redistributed without separate permission.
+
+The pinned RF++ integration records two distinct upstream declarations:
+
+- the RF++ repository is identified as `BSD-3-Clause-Clear`;
+- the network implementation is identified as
+  [`CC-BY-NC-SA-4.0`](https://creativecommons.org/licenses/by-nc-sa/4.0/),
+  which includes attribution, noncommercial-use, and share-alike conditions.
+
+No separate license notice was found for the referenced RF++ checkpoint files.
+Consequently, GenODE treats the referenced RF++ implementation and checkpoints
+as external, user-supplied dependencies and does not redistribute them. Users
+must review the pinned [RF++ repository](https://github.com/sangyun884/rfpp),
+the applicable network license, the checkpoint source, and the dataset terms
+before use or redistribution.
+
+## Image feature weights
+
+The image-quality protocol identifies `torch-fidelity` version `0.4.0` and the
+external Inception-v3-compatible feature weights
+`weights-inception-2015-12-05-6726825d.pth` by filename, URL, size, and SHA-256.
+The `torch-fidelity` package is distributed under Apache License 2.0. The weight
+file is hosted separately in the upstream `torch-fidelity` v0.2.0 release and
+was reuploaded from the `pytorch-fid` project. It is not included in this
+repository and GenODE neither downloads nor bundles it automatically. Users are
+responsible for reviewing the upstream package and underlying model/weight terms
+before downloading or redistributing that external file.
+
+- Project: [torch-fidelity](https://github.com/toshas/torch-fidelity)
+- External weight source: [torch-fidelity v0.2.0 release](https://github.com/toshas/torch-fidelity/releases/tag/v0.2.0)
+- Referenced implementation: [pytorch-fid](https://github.com/mseitzer/pytorch-fid)
+- Package license: Apache License 2.0

@@ -169,7 +169,11 @@ The verified image runtime registers exactly four external backbones:
 - class-conditional ImageNet-64 RF++ Config E and EDM VE as 1-RF.
 
 Upstream source, dataset, and checkpoint terms apply. Image checkpoints are
-user-supplied and are not redistributed by this repository.
+user-supplied and are not redistributed by this repository. In particular, the
+pinned RF++ registry identifies the network implementation as
+`CC-BY-NC-SA-4.0` and records that no separate checkpoint license notice was
+found. Review [the third-party notices](THIRD_PARTY_NOTICES.md) before obtaining
+or using external image code, datasets, checkpoints, or feature weights.
 
 ## Consistency distillation (secondary)
 

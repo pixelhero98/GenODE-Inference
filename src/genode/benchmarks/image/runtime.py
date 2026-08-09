@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import hashlib
 import math
 from numbers import Integral, Real
 import re
@@ -27,6 +28,7 @@ from genode.benchmarks.image.postprocess import (
     metric_uint8_images,
 )
 from genode.benchmarks.image.protocol import normalize_image_nfe
+from genode.schedule_transfer.reference_clocks import reference_clock_provenance
 from genode.schedules.density import density_mass_hash, time_grid_hash
 from genode.schedules.fixed import FixedSchedule
 from genode.schedules.policy import (
@@ -46,6 +48,10 @@ if TYPE_CHECKING:
 
 
 IMAGE_GENERATION_REQUEST_PROTOCOL = "image_euler_generation_request_v2"
+IMAGE_GICO_CLOCK_REALIZATION_REQUEST_PROTOCOL = "image_euler_generation_request_v3"
+IMAGE_GICO_CLOCK_REALIZATION_BINDING_PROTOCOL = (
+    "image_gico_clock_realization_binding_v1"
+)
 IMAGE_GENERATED_BATCH_PROTOCOL = "image_generated_batch_v2"
 IMAGE_GENERATED_BATCH_PROVENANCE_PROTOCOL = "image_generated_batch_provenance_v1"
 IMAGE_EULER_EXECUTION_DTYPE = "float32"
@@ -63,6 +69,22 @@ def _raw_sha256(value: object, *, field: str) -> str:
     if not isinstance(value, str) or _RAW_SHA256.fullmatch(value) is None:
         raise ValueError(f"{field} must be one lowercase SHA-256 digest.")
     return value
+
+
+def _clock_uniforms_sha256(uniforms: Tensor) -> str:
+    """Hash the exact caller-supplied uniforms used for a clock realization."""
+
+    values = uniforms.detach().to(device="cpu").contiguous().numpy()
+    return semantic_sha256(
+        {
+            "dtype": str(values.dtype),
+            "shape": [int(value) for value in values.shape],
+            "content_sha256": hashlib.sha256(
+                values.tobytes(order="C")
+            ).hexdigest(),
+        },
+        namespace="image-gico-clock-uniforms-v1",
+    )
 
 
 def execution_time_grid_sha256(time_grid: Tensor) -> str:
@@ -102,6 +124,232 @@ def _class_labels(
 
 
 @dataclass(frozen=True)
+class ImageGICOClockRealizationBinding:
+    """Canonical replay metadata for one stochastic complete-clock draw."""
+
+    realization_sha256: str
+    schedule_sha256: str
+    alpha: float
+    selected_schedule_indices: tuple[int | None, ...]
+    selected_schedule_keys: tuple[str | None, ...]
+    probability_sha256: str
+    uniforms_sha256: str | None
+    clock_library_sha256: str
+    policy_sha256: str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.alpha, bool) or not isinstance(self.alpha, Real):
+            raise TypeError("alpha must be a finite real in [0, 1].")
+        alpha = float(self.alpha)
+        if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be a finite real in [0, 1].")
+        indices = tuple(self.selected_schedule_indices)
+        keys = tuple(self.selected_schedule_keys)
+        if not indices or len(keys) != len(indices):
+            raise ValueError(
+                "Selected clock indices and keys must be nonempty and aligned."
+            )
+        normalized_indices: list[int | None] = []
+        normalized_keys: list[str | None] = []
+        if alpha == 0.0:
+            if (
+                any(index is not None for index in indices)
+                or any(key is not None for key in keys)
+                or self.uniforms_sha256 is not None
+            ):
+                raise ValueError(
+                    "alpha=0 clock bindings must not depend on uniforms or selections."
+                )
+            normalized_indices.extend(None for _ in indices)
+            normalized_keys.extend(None for _ in keys)
+            uniforms_sha256 = None
+        else:
+            for index, key in zip(indices, keys, strict=True):
+                if (
+                    isinstance(index, bool)
+                    or not isinstance(index, Integral)
+                    or int(index) < 0
+                ):
+                    raise ValueError(
+                        "Selected schedule indices must be nonnegative integers."
+                    )
+                if not isinstance(key, str):
+                    raise TypeError(
+                        "Selected schedule keys must be fixed-schedule keys."
+                    )
+                try:
+                    reference_clock_provenance(key)
+                except (KeyError, ValueError) as exc:
+                    raise ValueError(
+                        "Selected schedule keys must be supported fixed-schedule keys."
+                    ) from exc
+                normalized_indices.append(int(index))
+                normalized_keys.append(key)
+            uniforms_sha256 = _sha256_identity(
+                self.uniforms_sha256,
+                field="uniforms_sha256",
+            )
+        for field_name in (
+            "realization_sha256",
+            "schedule_sha256",
+            "probability_sha256",
+            "clock_library_sha256",
+            "policy_sha256",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _sha256_identity(getattr(self, field_name), field=field_name),
+            )
+        object.__setattr__(self, "alpha", alpha)
+        object.__setattr__(
+            self,
+            "selected_schedule_indices",
+            tuple(normalized_indices),
+        )
+        object.__setattr__(
+            self,
+            "selected_schedule_keys",
+            tuple(normalized_keys),
+        )
+        object.__setattr__(self, "uniforms_sha256", uniforms_sha256)
+        expected_realization_sha256 = semantic_sha256(
+            self.realization_identity_payload(),
+            namespace="image-gico-clock-realization-v1",
+        )
+        if self.realization_sha256 != expected_realization_sha256:
+            raise ValueError(
+                "Clock realization identity is inconsistent with its replay metadata."
+            )
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.selected_schedule_indices)
+
+    def realization_identity_payload(self) -> dict[str, object]:
+        from genode.gico.image_clock_mixture import (
+            IMAGE_GICO_CLOCK_MIXTURE_POLICY_PROTOCOL,
+        )
+
+        return {
+            "protocol": IMAGE_GICO_CLOCK_MIXTURE_POLICY_PROTOCOL,
+            "schedule_sha256": self.schedule_sha256,
+            "alpha": self.alpha,
+            "selected_schedule_indices": list(self.selected_schedule_indices),
+            "selected_schedule_keys": list(self.selected_schedule_keys),
+            "probability_sha256": self.probability_sha256,
+            "uniforms_sha256": self.uniforms_sha256,
+            "clock_library_sha256": self.clock_library_sha256,
+            "policy_sha256": self.policy_sha256,
+        }
+
+    def identity_payload(self) -> dict[str, object]:
+        return {
+            "protocol": IMAGE_GICO_CLOCK_REALIZATION_BINDING_PROTOCOL,
+            "realization_sha256": self.realization_sha256,
+            "schedule_sha256": self.schedule_sha256,
+            "alpha": self.alpha,
+            "selected_schedule_indices": list(self.selected_schedule_indices),
+            "selected_schedule_keys": list(self.selected_schedule_keys),
+            "probability_sha256": self.probability_sha256,
+            "uniforms_sha256": self.uniforms_sha256,
+            "clock_library_sha256": self.clock_library_sha256,
+            "policy_sha256": self.policy_sha256,
+        }
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "artifact": "image_gico_clock_realization_binding",
+            **self.identity_payload(),
+        }
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: object,
+    ) -> ImageGICOClockRealizationBinding:
+        if not isinstance(payload, Mapping):
+            raise TypeError("Clock realization binding payload must be a mapping.")
+        expected_fields = {
+            "artifact",
+            "protocol",
+            "realization_sha256",
+            "schedule_sha256",
+            "alpha",
+            "selected_schedule_indices",
+            "selected_schedule_keys",
+            "probability_sha256",
+            "uniforms_sha256",
+            "clock_library_sha256",
+            "policy_sha256",
+        }
+        if set(payload) != expected_fields:
+            raise ValueError(
+                "Clock realization binding fields must be exactly "
+                f"{sorted(expected_fields)}."
+            )
+        if (
+            payload["artifact"] != "image_gico_clock_realization_binding"
+            or payload["protocol"]
+            != IMAGE_GICO_CLOCK_REALIZATION_BINDING_PROTOCOL
+        ):
+            raise ValueError("Unsupported clock realization binding artifact.")
+        if type(payload["alpha"]) is not float:
+            raise TypeError(
+                "Clock realization binding alpha must be a JSON floating-point number."
+            )
+        raw_indices = payload["selected_schedule_indices"]
+        raw_keys = payload["selected_schedule_keys"]
+        if not isinstance(raw_indices, Sequence) or isinstance(
+            raw_indices,
+            (str, bytes, bytearray),
+        ):
+            raise TypeError("selected_schedule_indices must be a sequence.")
+        if not isinstance(raw_keys, Sequence) or isinstance(
+            raw_keys,
+            (str, bytes, bytearray),
+        ):
+            raise TypeError("selected_schedule_keys must be a sequence.")
+        binding = cls(
+            realization_sha256=payload["realization_sha256"],  # type: ignore[arg-type]
+            schedule_sha256=payload["schedule_sha256"],  # type: ignore[arg-type]
+            alpha=payload["alpha"],  # type: ignore[arg-type]
+            selected_schedule_indices=tuple(raw_indices),  # type: ignore[arg-type]
+            selected_schedule_keys=tuple(raw_keys),  # type: ignore[arg-type]
+            probability_sha256=payload["probability_sha256"],  # type: ignore[arg-type]
+            uniforms_sha256=payload["uniforms_sha256"],  # type: ignore[arg-type]
+            clock_library_sha256=payload["clock_library_sha256"],  # type: ignore[arg-type]
+            policy_sha256=payload["policy_sha256"],  # type: ignore[arg-type]
+        )
+        if dict(payload) != binding.as_payload():
+            raise ValueError("Clock realization binding payload is inconsistent.")
+        return binding
+
+    @classmethod
+    def from_realization(
+        cls,
+        realization: object,
+    ) -> ImageGICOClockRealizationBinding:
+        from genode.gico.image_clock_mixture import ImageGICOClockRealization
+
+        if type(realization) is not ImageGICOClockRealization:
+            raise TypeError(
+                "realization must be a canonical ImageGICOClockRealization."
+            )
+        return cls(
+            realization_sha256=realization.sha256,
+            schedule_sha256=realization.schedule.sha256,
+            alpha=realization.alpha,
+            selected_schedule_indices=realization.selected_schedule_indices,
+            selected_schedule_keys=realization.selected_schedule_keys,
+            probability_sha256=realization.probability_sha256,
+            uniforms_sha256=realization.uniforms_sha256,
+            clock_library_sha256=realization.clock_library_sha256,
+            policy_sha256=realization.policy_sha256,
+        )
+
+
+@dataclass(frozen=True)
 class ImageGenerationRequest:
     source_request_sha256: str
     backbone_manifest: ImageBackboneManifest
@@ -114,6 +362,7 @@ class ImageGenerationRequest:
     execution_time_grid_sha256: str
     density_mass_sha256: str
     execution_time_grid_dtype: str = IMAGE_EULER_EXECUTION_DTYPE
+    clock_realization: ImageGICOClockRealizationBinding | None = None
     request_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -145,6 +394,19 @@ class ImageGenerationRequest:
         }
         if self.execution_time_grid_dtype != IMAGE_EULER_EXECUTION_DTYPE:
             raise ValueError("Image Euler execution time grids must use float32.")
+        if self.clock_realization is not None:
+            if type(self.clock_realization) is not ImageGICOClockRealizationBinding:
+                raise TypeError(
+                    "clock_realization must be an ImageGICOClockRealizationBinding."
+                )
+            if self.clock_realization.sample_count != len(seeds):
+                raise ValueError(
+                    "Clock realization metadata must match the request batch size."
+                )
+            if labels is None:
+                raise ValueError(
+                    "Clock realization requests require class-conditional labels."
+                )
         object.__setattr__(
             self,
             "source_request_sha256",
@@ -173,8 +435,12 @@ class ImageGenerationRequest:
         return len(self.latent_seeds)
 
     def identity_payload(self) -> dict[str, object]:
-        return {
-            "protocol": IMAGE_GENERATION_REQUEST_PROTOCOL,
+        payload: dict[str, object] = {
+            "protocol": (
+                IMAGE_GENERATION_REQUEST_PROTOCOL
+                if self.clock_realization is None
+                else IMAGE_GICO_CLOCK_REALIZATION_REQUEST_PROTOCOL
+            ),
             "source_request_sha256": self.source_request_sha256,
             "dataset_key": self.dataset_key,
             "backbone_model_key": self.backbone_manifest.model_key,
@@ -192,6 +458,9 @@ class ImageGenerationRequest:
             "execution_time_grid_sha256": (self.execution_time_grid_sha256),
             "density_mass_sha256": self.density_mass_sha256,
         }
+        if self.clock_realization is not None:
+            payload["clock_realization"] = self.clock_realization.as_payload()
+        return payload
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -237,11 +506,20 @@ class ImageGenerationRequest:
             "execution_time_grid_sha256",
             "density_mass_sha256",
         }
+        protocol = identity.get("protocol")
+        clock_realization = None
+        if protocol == IMAGE_GICO_CLOCK_REALIZATION_REQUEST_PROTOCOL:
+            expected_identity_fields.add("clock_realization")
+            clock_realization = ImageGICOClockRealizationBinding.from_payload(
+                identity.get("clock_realization")
+            )
+        elif protocol != IMAGE_GENERATION_REQUEST_PROTOCOL:
+            raise ValueError("Image generation request uses an incompatible protocol.")
         if set(identity) != expected_identity_fields:
             raise ValueError(
                 f"Image generation request identity fields must be exactly {sorted(expected_identity_fields)}."
             )
-        if identity["protocol"] != IMAGE_GENERATION_REQUEST_PROTOCOL or identity["solver_key"] != "euler":
+        if identity["solver_key"] != "euler":
             raise ValueError("Image generation request uses an incompatible protocol.")
         raw_seeds = identity["latent_seeds"]
         raw_labels = identity["class_labels"]
@@ -268,6 +546,7 @@ class ImageGenerationRequest:
             execution_time_grid_sha256=identity["execution_time_grid_sha256"],  # type: ignore[arg-type]
             density_mass_sha256=identity["density_mass_sha256"],  # type: ignore[arg-type]
             execution_time_grid_dtype=identity["execution_time_grid_dtype"],  # type: ignore[arg-type]
+            clock_realization=clock_realization,
         )
         if dict(identity) != request.identity_payload() or payload["request_sha256"] != request.request_sha256:
             raise ValueError("Image generation request payload is inconsistent.")
@@ -285,6 +564,7 @@ class ScheduleExecutionBinding:
     target_nfe: int
     sample_count: int
     execution_time_grid_dtype: str = IMAGE_EULER_EXECUTION_DTYPE
+    clock_realization: ImageGICOClockRealizationBinding | None = None
     binding_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -314,6 +594,19 @@ class ScheduleExecutionBinding:
         target_nfe = normalize_image_nfe(self.target_nfe)
         if isinstance(self.sample_count, bool) or not isinstance(self.sample_count, int) or self.sample_count <= 0:
             raise ValueError("sample_count must be a positive integer.")
+        if self.clock_realization is not None:
+            if type(self.clock_realization) is not ImageGICOClockRealizationBinding:
+                raise TypeError(
+                    "clock_realization must be an ImageGICOClockRealizationBinding."
+                )
+            if self.source_kind == "fixed_schedule":
+                raise ValueError(
+                    "Fixed-schedule execution cannot carry a stochastic clock realization."
+                )
+            if self.clock_realization.sample_count != self.sample_count:
+                raise ValueError(
+                    "Clock realization metadata must match the execution batch size."
+                )
         object.__setattr__(self, "target_nfe", target_nfe)
         object.__setattr__(
             self,
@@ -325,7 +618,7 @@ class ScheduleExecutionBinding:
         )
 
     def identity_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "source_kind": self.source_kind,
             "schedule_policy_sha256": self.schedule_policy_sha256,
             "schedule_output_sha256": self.schedule_output_sha256,
@@ -337,6 +630,9 @@ class ScheduleExecutionBinding:
             "target_nfe": self.target_nfe,
             "sample_count": self.sample_count,
         }
+        if self.clock_realization is not None:
+            payload["clock_realization"] = self.clock_realization.as_payload()
+        return payload
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -363,6 +659,12 @@ class ScheduleExecutionBinding:
             "sample_count",
             "binding_sha256",
         }
+        clock_realization = None
+        if "clock_realization" in payload:
+            expected_fields.add("clock_realization")
+            clock_realization = ImageGICOClockRealizationBinding.from_payload(
+                payload["clock_realization"]
+            )
         if set(payload) != expected_fields:
             raise ValueError(f"Schedule execution fields must be exactly {sorted(expected_fields)}.")
         if payload["artifact"] != "image_schedule_execution" or payload["solver_key"] != "euler":
@@ -377,6 +679,7 @@ class ScheduleExecutionBinding:
             target_nfe=payload["target_nfe"],  # type: ignore[arg-type]
             sample_count=payload["sample_count"],  # type: ignore[arg-type]
             execution_time_grid_dtype=payload["execution_time_grid_dtype"],  # type: ignore[arg-type]
+            clock_realization=clock_realization,
         )
         if payload["binding_sha256"] != binding.binding_sha256:
             raise ValueError("Schedule execution hash is inconsistent.")
@@ -415,6 +718,7 @@ class GeneratedBatchProvenance:
             self.request.density_mass_sha256,
             self.request.target_nfe,
             self.request.sample_count,
+            self.request.clock_realization,
         )
         actual_schedule = (
             self.schedule.schedule_policy_sha256,
@@ -425,6 +729,7 @@ class GeneratedBatchProvenance:
             self.schedule.density_mass_sha256,
             self.schedule.target_nfe,
             self.schedule.sample_count,
+            self.schedule.clock_realization,
         )
         if actual_schedule != expected_schedule:
             raise ValueError("Generated-batch provenance schedule does not match its request.")
@@ -612,6 +917,7 @@ class GeneratedImageBatch:
             self.request.density_mass_sha256,
             self.request.target_nfe,
             self.request.sample_count,
+            self.request.clock_realization,
         )
         actual_schedule = (
             self.schedule.schedule_policy_sha256,
@@ -622,6 +928,7 @@ class GeneratedImageBatch:
             self.schedule.density_mass_sha256,
             self.schedule.target_nfe,
             self.schedule.sample_count,
+            self.schedule.clock_realization,
         )
         if actual_schedule != expected_schedule:
             raise ValueError("Generated batch schedule does not match its request.")
@@ -827,6 +1134,7 @@ def _policy_output_binding(
     request: ImageGenerationRequest,
     source_kind: str,
     schedule_policy_sha256: str,
+    clock_realization: ImageGICOClockRealizationBinding | None = None,
 ) -> ScheduleExecutionBinding:
     verified_policy_sha256 = _sha256_identity(
         schedule_policy_sha256,
@@ -838,6 +1146,17 @@ def _policy_output_binding(
         raise ValueError("Schedule output target_nfe does not match the request.")
     if schedule.batch_size != request.sample_count:
         raise ValueError("Schedule output batch size does not match the request.")
+    if request.clock_realization != clock_realization:
+        raise ValueError(
+            "Schedule clock-realization binding does not match the generation request."
+        )
+    if (
+        clock_realization is not None
+        and clock_realization.schedule_sha256 != schedule.sha256
+    ):
+        raise ValueError(
+            "Clock realization schedule identity does not match the executable schedule."
+        )
     expected = (
         request.schedule_output_sha256,
         request.time_grid_sha256,
@@ -866,6 +1185,7 @@ def _policy_output_binding(
         density_mass_sha256=actual[3],
         target_nfe=request.target_nfe,
         sample_count=request.sample_count,
+        clock_realization=clock_realization,
     )
 
 
@@ -959,9 +1279,20 @@ class ImageEulerSampler:
         self.device = execution_device
         self.execution_batch_size = int(execution_batch_size)
 
-    def _validate_request(self, request: ImageGenerationRequest) -> None:
+    def _validate_request(
+        self,
+        request: ImageGenerationRequest,
+        *,
+        allow_clock_realization: bool = False,
+    ) -> None:
         if not isinstance(request, ImageGenerationRequest):
             raise TypeError("request must be an ImageGenerationRequest.")
+        if not isinstance(allow_clock_realization, bool):
+            raise TypeError("allow_clock_realization must be a boolean.")
+        if request.clock_realization is not None and not allow_clock_realization:
+            raise ValueError(
+                "A realization-bound request must use sample_gico_clock_realization."
+            )
         if request.backbone_manifest.to_manifest_dict() != self.backbone.manifest.to_manifest_dict():
             raise ValueError("Generation request does not match the loaded backbone.")
 
@@ -969,12 +1300,17 @@ class ImageEulerSampler:
         self,
         request: ImageGenerationRequest,
         artifact: "BoundImageGICOClockMixtureArtifact",
+        *,
+        allow_clock_realization: bool = False,
     ) -> Tensor:
         from genode.gico.image_clock_mixture_artifacts import (
             BoundImageGICOClockMixtureArtifact,
         )
 
-        self._validate_request(request)
+        self._validate_request(
+            request,
+            allow_clock_realization=allow_clock_realization,
+        )
         if not isinstance(artifact, BoundImageGICOClockMixtureArtifact):
             raise TypeError(
                 "artifact must be a bound ImageNet GICO clock-mixture artifact."
@@ -1267,7 +1603,11 @@ class ImageEulerSampler:
         """Execute an explicit stochastic complete-clock realization."""
 
         from genode.gico.image_clock_mixture import ImageGICOClockRealization
-        labels = self._bound_gico_clock_labels(request, artifact)
+        labels = self._bound_gico_clock_labels(
+            request,
+            artifact,
+            allow_clock_realization=True,
+        )
         if not isinstance(uniforms, Tensor):
             raise TypeError("uniforms must be a torch.Tensor.")
         if uniforms.device.type != "cpu" or uniforms.dtype != torch.float64:
@@ -1286,11 +1626,19 @@ class ImageEulerSampler:
         if not math.isfinite(mixing) or not 0.0 <= mixing <= 1.0:
             raise ValueError("alpha must be a finite real in [0, 1].")
 
+        uniform_snapshot = uniforms.detach().clone(
+            memory_format=torch.contiguous_format
+        )
+        expected_uniforms_sha256 = (
+            None
+            if mixing == 0.0
+            else _clock_uniforms_sha256(uniform_snapshot)
+        )
         with torch.inference_mode():
             realization = artifact.realize_for_class_labels(
                 labels,
                 target_nfe=request.target_nfe,
-                uniforms=uniforms,
+                uniforms=uniform_snapshot,
                 alpha=mixing,
             )
         if not isinstance(realization, ImageGICOClockRealization):
@@ -1309,18 +1657,51 @@ class ImageEulerSampler:
             )
         if realization.alpha != mixing:
             raise ValueError("GICO clock realization does not match the requested alpha.")
+        realization_binding = ImageGICOClockRealizationBinding.from_realization(
+            realization
+        )
+        if realization_binding.uniforms_sha256 != expected_uniforms_sha256:
+            raise ValueError(
+                "GICO clock realization does not match the supplied uniforms."
+            )
+        for index, key in zip(
+            realization_binding.selected_schedule_indices,
+            realization_binding.selected_schedule_keys,
+            strict=True,
+        ):
+            if index is None:
+                continue
+            if (
+                index >= artifact.library.schedule_count
+                or artifact.library.schedule_keys[index] != key
+            ):
+                raise ValueError(
+                    "GICO clock realization selection does not match the bound library."
+                )
+        if request.clock_realization is None:
+            bound_request = replace(
+                request,
+                clock_realization=realization_binding,
+            )
+        elif request.clock_realization != realization_binding:
+            raise ValueError(
+                "Generation request is bound to a different clock realization."
+            )
+        else:
+            bound_request = request
         schedule_binding = _policy_output_binding(
             realization.schedule,
-            request=request,
+            request=bound_request,
             source_kind="schedule_policy",
             schedule_policy_sha256=artifact.artifact_sha256,
+            clock_realization=realization_binding,
         )
         noise = generate_seeded_image_noise(
-            request.dataset_key,
-            request.latent_seeds,
+            bound_request.dataset_key,
+            bound_request.latent_seeds,
         )
         return self._execute(
-            request,
+            bound_request,
             noise=noise,
             time_grid=realization.schedule.time_grid,
             schedule_binding=schedule_binding,
@@ -1332,8 +1713,11 @@ __all__ = [
     "IMAGE_GENERATED_BATCH_PROTOCOL",
     "IMAGE_GENERATED_BATCH_PROVENANCE_PROTOCOL",
     "IMAGE_GENERATION_REQUEST_PROTOCOL",
+    "IMAGE_GICO_CLOCK_REALIZATION_BINDING_PROTOCOL",
+    "IMAGE_GICO_CLOCK_REALIZATION_REQUEST_PROTOCOL",
     "GeneratedBatchProvenance",
     "GeneratedImageBatch",
+    "ImageGICOClockRealizationBinding",
     "ImageEulerSampler",
     "ImageGenerationRequest",
     "ScheduleExecutionBinding",

@@ -181,6 +181,12 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertFalse(hasattr(policy, helper_name))
         self.assertNotIn(helper_name, getattr(policy, "__all__", ()))
 
+    def test_gico_policy_public_exports_are_unique(self) -> None:
+        from genode.gico import policy
+
+        exports = tuple(policy.__all__)
+        self.assertEqual(len(exports), len(set(exports)))
+
     def test_no_private_paths_or_upstream_namespace_in_tracked_text(self) -> None:
         blocked = (
             "/" + "scratch/",

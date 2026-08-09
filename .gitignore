@@ -8,13 +8,45 @@ pytest-of-*/
 /src/tmp????????/
 .mypy_cache/
 .ruff_cache/
+/.coverage
+/htmlcov/
+
+# Local credentials and private configuration.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+credentials*.json
+secrets*.json
 
 # Local datasets, checkpoints, and experiment outputs.
 /data/
 /paper_datasets/
 /outputs/
 /reports/
+/results/
+/figures/
 /release/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.log
+
+# Experiment trackers, compiler caches, and transient files.
+/wandb/
+/mlruns/
+/tensorboard/
+/torchinductor_*/
+/tmp????????
 
 # Build artifacts.
 build/

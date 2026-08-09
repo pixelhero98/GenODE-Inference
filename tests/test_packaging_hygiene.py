@@ -43,6 +43,67 @@ class PackagingHygieneTests(unittest.TestCase):
         self.assertFalse(any(str(dep).startswith("pyedflib") for dep in dependencies))
         self.assertEqual(medical, ["wfdb>=4.1"])
 
+    def test_local_sensitive_and_generated_artifacts_are_ignored(self) -> None:
+        candidates = (
+            ".env",
+            ".env.local",
+            "credentials-private.json",
+            "secrets-local.json",
+            "private.key",
+            "private.pem",
+            "id_rsa",
+            "id_dsa",
+            "id_ecdsa",
+            "id_ed25519",
+            "model.pt",
+            "model.pth",
+            "model.ckpt",
+            "array.npy",
+            "array.npz",
+            "results/run.json",
+            "figures/plot.png",
+            "wandb/run.json",
+            "mlruns/experiment.json",
+            "tensorboard/events.out.tfevents",
+            "torchinductor_user/cache.bin",
+            "tmpabcdefgh",
+        )
+        completed = subprocess.run(
+            ["git", "check-ignore", "-z", "--stdin"],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            input="\0".join(candidates) + "\0",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual({value for value in completed.stdout.split("\0") if value}, set(candidates))
+
+        public_example = subprocess.run(
+            ["git", "check-ignore", ".env.example"],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        )
+        self.assertEqual(public_example.returncode, 1, public_example.stderr)
+        self.assertEqual(public_example.stdout, "")
+
+    def test_external_image_asset_terms_are_explicit(self) -> None:
+        notices = (REPO_ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+
+        for required_notice in (
+            "CC-BY-NC-SA-4.0",
+            "No separate license notice was found",
+            "external, user-supplied dependencies",
+            "weights-inception-2015-12-05-6726825d.pth",
+            "It is not included in this",
+            "GenODE neither downloads nor bundles it automatically",
+        ):
+            with self.subTest(required_notice=required_notice):
+                self.assertIn(required_notice, notices)
+
     def test_experiment_common_does_not_import_medical_dataset_builder(self) -> None:
         env = dict(os.environ)
         src_path = str(REPO_ROOT / "src")

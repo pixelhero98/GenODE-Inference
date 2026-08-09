@@ -12,6 +12,9 @@ import torch
 from genode.artifacts.identity import canonical_json_bytes, semantic_sha256
 from genode.backbones.protocol import ImageBackboneManifest
 from genode.benchmarks.image.runtime import (
+    GeneratedBatchProvenance,
+    GeneratedImageBatch,
+    ImageGICOClockRealizationBinding,
     ImageEulerSampler,
     ImageGenerationRequest,
     policy_schedule_request_hashes,
@@ -71,6 +74,19 @@ def _request(
         time_grid_sha256=grid_sha256,
         execution_time_grid_sha256=execution_sha256,
         density_mass_sha256=density_sha256,
+    )
+
+
+def _provenance(generated: GeneratedImageBatch) -> GeneratedBatchProvenance:
+    return GeneratedBatchProvenance(
+        request=generated.request,
+        noise_batch_sha256=generated.noise.batch_sha256,
+        schedule=generated.schedule,
+        field_evaluations=generated.field_evaluations,
+        shape=tuple(generated.images.shape),
+        content_sha256=generated.content_sha256,
+        metric_shape=tuple(generated.metric_images.shape),
+        metric_content_sha256=generated.metric_content_sha256,
     )
 
 
@@ -231,6 +247,134 @@ def test_complete_clock_sidecar_round_trip_is_source_bound_and_runtime_safe(
     )
     assert generated_clock.field_evaluations == 4
     assert generated_clock.schedule.source_kind == "contextual_schedule_policy"
+
+    same_clock_uniforms_a = torch.zeros(2, dtype=torch.float64)
+    same_clock_uniforms_b = torch.nextafter(
+        same_clock_uniforms_a,
+        torch.ones_like(same_clock_uniforms_a),
+    )
+    same_clock_realization_a = bound.realize_for_class_labels(
+        labels,
+        target_nfe=4,
+        uniforms=same_clock_uniforms_a,
+        alpha=1.0,
+    )
+    same_clock_realization_b = bound.realize_for_class_labels(
+        labels,
+        target_nfe=4,
+        uniforms=same_clock_uniforms_b,
+        alpha=1.0,
+    )
+    assert same_clock_realization_a.selected_schedule_indices == (0, 0)
+    assert (
+        same_clock_realization_b.selected_schedule_indices
+        == same_clock_realization_a.selected_schedule_indices
+    )
+    assert same_clock_realization_a.schedule.sha256 == (
+        same_clock_realization_b.schedule.sha256
+    )
+    assert same_clock_realization_a.sha256 != same_clock_realization_b.sha256
+    same_clock_request_a = _request(
+        artifact_sha256=bound.artifact_sha256,
+        backbone_manifest=backbone.manifest,
+        schedule=same_clock_realization_a.schedule,
+        label="same-clock-different-uniforms",
+    )
+    same_clock_request_b = _request(
+        artifact_sha256=bound.artifact_sha256,
+        backbone_manifest=backbone.manifest,
+        schedule=same_clock_realization_b.schedule,
+        label="same-clock-different-uniforms",
+    )
+    assert same_clock_request_a.request_sha256 == same_clock_request_b.request_sha256
+    generated_same_clock_a = sampler.sample_gico_clock_realization(
+        same_clock_request_a,
+        bound,
+        uniforms=same_clock_uniforms_a,
+        alpha=1.0,
+    )
+    generated_same_clock_b = sampler.sample_gico_clock_realization(
+        same_clock_request_b,
+        bound,
+        uniforms=same_clock_uniforms_b,
+        alpha=1.0,
+    )
+    assert torch.equal(
+        generated_same_clock_a.images,
+        generated_same_clock_b.images,
+    )
+    realization_binding_a = generated_same_clock_a.request.clock_realization
+    realization_binding_b = generated_same_clock_b.request.clock_realization
+    assert realization_binding_a is not None
+    assert realization_binding_b is not None
+    assert generated_same_clock_a.schedule.clock_realization == realization_binding_a
+    assert generated_same_clock_b.schedule.clock_realization == realization_binding_b
+    assert realization_binding_a.realization_sha256 == same_clock_realization_a.sha256
+    assert realization_binding_a.alpha == same_clock_realization_a.alpha
+    assert realization_binding_a.probability_sha256 == (
+        same_clock_realization_a.probability_sha256
+    )
+    assert realization_binding_a.uniforms_sha256 == (
+        same_clock_realization_a.uniforms_sha256
+    )
+    assert realization_binding_a.selected_schedule_indices == (
+        same_clock_realization_a.selected_schedule_indices
+    )
+    assert realization_binding_a.selected_schedule_keys == (
+        same_clock_realization_a.selected_schedule_keys
+    )
+    assert realization_binding_a != realization_binding_b
+    assert generated_same_clock_a.request.request_sha256 != (
+        generated_same_clock_b.request.request_sha256
+    )
+    assert generated_same_clock_a.schedule.binding_sha256 != (
+        generated_same_clock_b.schedule.binding_sha256
+    )
+    assert generated_same_clock_a.batch_sha256 != generated_same_clock_b.batch_sha256
+
+    generated_payload = generated_same_clock_a.as_payload()
+    generated_round_trip = GeneratedImageBatch.from_payload(
+        generated_payload,
+        images=generated_same_clock_a.images,
+    )
+    assert generated_round_trip.batch_sha256 == generated_same_clock_a.batch_sha256
+    assert generated_round_trip.request.clock_realization == realization_binding_a
+    request_identity = generated_payload["request"]["identity"]
+    persisted_binding = ImageGICOClockRealizationBinding.from_payload(
+        request_identity["clock_realization"]
+    )
+    assert persisted_binding == realization_binding_a
+    integer_alpha_payload = dict(realization_binding_a.as_payload())
+    integer_alpha_payload["alpha"] = 1
+    with pytest.raises(TypeError, match="JSON floating-point"):
+        ImageGICOClockRealizationBinding.from_payload(integer_alpha_payload)
+    assert semantic_sha256(
+        persisted_binding.realization_identity_payload(),
+        namespace="image-gico-clock-realization-v1",
+    ) == same_clock_realization_a.sha256
+    provenance_a = _provenance(generated_same_clock_a)
+    provenance_b = _provenance(generated_same_clock_b)
+    assert provenance_a.provenance_sha256 != provenance_b.provenance_sha256
+    provenance_round_trip = GeneratedBatchProvenance.from_payload(
+        provenance_a.as_payload()
+    )
+    assert provenance_round_trip.provenance_sha256 == provenance_a.provenance_sha256
+    assert provenance_round_trip.request.clock_realization == realization_binding_a
+
+    replayed_same_clock_a = sampler.sample_gico_clock_realization(
+        generated_round_trip.request,
+        bound,
+        uniforms=same_clock_uniforms_a,
+        alpha=1.0,
+    )
+    assert replayed_same_clock_a.batch_sha256 == generated_same_clock_a.batch_sha256
+    with pytest.raises(ValueError, match="different clock realization"):
+        sampler.sample_gico_clock_realization(
+            generated_round_trip.request,
+            bound,
+            uniforms=same_clock_uniforms_b,
+            alpha=1.0,
+        )
 
     zero_realization = bound.realize_for_class_labels(
         labels,

@@ -4277,7 +4277,6 @@ __all__ = [
     "validate_gico_support_schedule_keys",
     "validate_student_target_mixture_mode",
     "validate_density_family_holdout_schedule_keys",
-    "TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET",
     "validate_teacher_objective_hyperparameters",
     "validate_reference_grid",
 ]

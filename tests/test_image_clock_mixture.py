@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 import math
+import threading
 
 import numpy as np
 import pytest
@@ -22,6 +23,7 @@ from genode.gico.image_clock_mixture import (
 from genode.gico.image_clock_mixture_training import (
     ImageGICOClockMixtureTrainingConfig,
     _aggregate_groups,
+    _deterministic_training_scope,
     _grouped_cross_entropy,
     train_image_gico_clock_mixture,
 )
@@ -445,6 +447,83 @@ def test_clock_counter_rng_has_pinned_content_bound_vectors() -> None:
     assert values.device.type == "cpu"
     assert values.is_contiguous()
     assert values.tolist() == [0.2769573325576015, 0.2769573325576015]
+
+
+def test_complete_clock_training_scope_serializes_process_global_state() -> None:
+    device = torch.device("cpu")
+    torch.manual_seed(320)
+    rng_before = torch.random.get_rng_state().clone()
+    global_state_before = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.get_float32_matmul_precision(),
+        torch.backends.cudnn.benchmark,
+        torch.backends.cudnn.deterministic,
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cudnn.allow_tf32,
+    )
+    second_started = threading.Event()
+    second_entered = threading.Event()
+    release_second = threading.Event()
+    thread_errors: list[Exception] = []
+
+    def run_second_scope() -> None:
+        try:
+            second_started.set()
+            with (
+                _deterministic_training_scope(device),
+                torch.random.fork_rng(devices=[]),
+            ):
+                if not torch.are_deterministic_algorithms_enabled():
+                    raise AssertionError(
+                        "Deterministic algorithms were disabled inside the training scope."
+                    )
+                second_entered.set()
+                if not release_second.wait(timeout=5.0):
+                    raise TimeoutError(
+                        "Timed out waiting to leave the second training scope."
+                    )
+                torch.random.default_generator.manual_seed(202)
+        except Exception as exc:
+            thread_errors.append(exc)
+
+    worker = threading.Thread(
+        target=run_second_scope,
+        name="image-gico-determinism-regression",
+        daemon=True,
+    )
+    scopes_overlapped = False
+    try:
+        with (
+            _deterministic_training_scope(device),
+            torch.random.fork_rng(devices=[]),
+        ):
+            torch.random.default_generator.manual_seed(101)
+            worker.start()
+            assert second_started.wait(timeout=5.0)
+            scopes_overlapped = second_entered.wait(timeout=2.0)
+            assert torch.are_deterministic_algorithms_enabled()
+            assert not torch.is_deterministic_algorithms_warn_only_enabled()
+            assert torch.get_float32_matmul_precision() == "highest"
+    finally:
+        release_second.set()
+        if worker.ident is not None:
+            worker.join(timeout=5.0)
+
+    assert not scopes_overlapped
+    assert second_entered.is_set()
+    assert not worker.is_alive()
+    assert not thread_errors
+    assert torch.equal(rng_before, torch.random.get_rng_state())
+    assert global_state_before == (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.get_float32_matmul_precision(),
+        torch.backends.cudnn.benchmark,
+        torch.backends.cudnn.deterministic,
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cudnn.allow_tf32,
+    )
 
 
 def test_complete_clock_training_is_rng_isolated_and_reproducible() -> None:

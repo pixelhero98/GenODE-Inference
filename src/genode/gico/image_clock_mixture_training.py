@@ -7,6 +7,7 @@ import math
 from numbers import Integral, Real
 import os
 import re
+import threading
 from typing import Any, Iterator, Mapping
 
 import numpy as np
@@ -35,6 +36,8 @@ _CONTEXT_TABLE_PROTOCOL = "image-gico-normalized-context-training-table-v1"
 _DETERMINISM_PROTOCOL = "image_gico_clock_mixture_determinism_v1"
 _IDENTITY = re.compile(r"^[a-z0-9][a-z0-9-]*:[0-9a-f]{64}$")
 _CUDA_CUBLAS_WORKSPACE_CONFIGS = frozenset({":16:8", ":4096:8"})
+# PyTorch determinism switches and default generators are process-global.
+_DETERMINISTIC_TRAINING_LOCK = threading.Lock()
 
 
 def _positive_integer(value: object, *, field: str) -> int:
@@ -111,41 +114,42 @@ def _determinism_contract(
 def _deterministic_training_scope(
     device: torch.device,
 ) -> Iterator[str | None]:
-    cuda_workspace = None
-    if device.type == "cuda":
-        cuda_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
-        if cuda_workspace not in _CUDA_CUBLAS_WORKSPACE_CONFIGS:
-            raise RuntimeError(
-                "Deterministic CUDA clock-mixture training requires "
-                "CUBLAS_WORKSPACE_CONFIG=:4096:8 (or :16:8) before Python starts."
-            )
-
-    previous_algorithms = torch.are_deterministic_algorithms_enabled()
-    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
-    previous_precision = torch.get_float32_matmul_precision()
-    previous_cudnn_benchmark = torch.backends.cudnn.benchmark
-    previous_cudnn_deterministic = torch.backends.cudnn.deterministic
-    previous_cuda_tf32 = torch.backends.cuda.matmul.allow_tf32
-    previous_cudnn_tf32 = torch.backends.cudnn.allow_tf32
-    try:
-        torch.use_deterministic_algorithms(True, warn_only=False)
-        torch.set_float32_matmul_precision("highest")
+    with _DETERMINISTIC_TRAINING_LOCK:
+        cuda_workspace = None
         if device.type == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = False
-            torch.backends.cudnn.allow_tf32 = False
-            torch.backends.cudnn.benchmark = False
-            torch.backends.cudnn.deterministic = True
-        yield cuda_workspace
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = previous_cuda_tf32
-        torch.backends.cudnn.allow_tf32 = previous_cudnn_tf32
-        torch.backends.cudnn.benchmark = previous_cudnn_benchmark
-        torch.backends.cudnn.deterministic = previous_cudnn_deterministic
-        torch.set_float32_matmul_precision(previous_precision)
-        torch.use_deterministic_algorithms(
-            previous_algorithms,
-            warn_only=previous_warn_only,
-        )
+            cuda_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+            if cuda_workspace not in _CUDA_CUBLAS_WORKSPACE_CONFIGS:
+                raise RuntimeError(
+                    "Deterministic CUDA clock-mixture training requires "
+                    "CUBLAS_WORKSPACE_CONFIG=:4096:8 (or :16:8) before Python starts."
+                )
+
+        previous_algorithms = torch.are_deterministic_algorithms_enabled()
+        previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        previous_precision = torch.get_float32_matmul_precision()
+        previous_cudnn_benchmark = torch.backends.cudnn.benchmark
+        previous_cudnn_deterministic = torch.backends.cudnn.deterministic
+        previous_cuda_tf32 = torch.backends.cuda.matmul.allow_tf32
+        previous_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=False)
+            torch.set_float32_matmul_precision("highest")
+            if device.type == "cuda":
+                torch.backends.cuda.matmul.allow_tf32 = False
+                torch.backends.cudnn.allow_tf32 = False
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = True
+            yield cuda_workspace
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_cuda_tf32
+            torch.backends.cudnn.allow_tf32 = previous_cudnn_tf32
+            torch.backends.cudnn.benchmark = previous_cudnn_benchmark
+            torch.backends.cudnn.deterministic = previous_cudnn_deterministic
+            torch.set_float32_matmul_precision(previous_precision)
+            torch.use_deterministic_algorithms(
+                previous_algorithms,
+                warn_only=previous_warn_only,
+            )
 
 
 @dataclass(frozen=True, slots=True)
