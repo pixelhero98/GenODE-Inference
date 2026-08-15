@@ -1,5 +1,34 @@
 # GenODE Inference
 
+## 30-second entry point
+
+**Problem.** A uniform time grid can spend a small solver budget in the wrong
+parts of a frozen generative trajectory.
+
+**Method.** GICO learns a context- and budget-conditioned density over
+integration time, integrates that density into a monotone clock, and inverts it
+to obtain a strictly increasing solver grid. The generative backbone remains
+frozen.
+
+```mermaid
+flowchart LR
+  A["Frozen backbone context + NFE budget"] --> B["GICO density policy"]
+  B --> C["Monotone cumulative clock"]
+  C --> D["Strictly increasing time grid"]
+  D --> E["Frozen ODE / flow solver"]
+```
+
+**Verified public artifact.** This repository provides reference clocks,
+teacher/student training, strict checkpoint validation, locked-test reporting,
+and deterministic release archives. It does not make a public performance
+claim before the manuscript and final evaluation tables are released.
+
+```bash
+python -m pip install -e ".[test]"
+genode-run-full-pipeline --scenario_key traffic_hourly --dry_run
+python -m pytest -q
+```
+
 GenODE learns **GICO** (Generative Inference Clock Optimization) policies for
 frozen flow-matching and ODE backbones. GICO predicts a continuous-density
 integration clock from the solver budget and the frozen backbone's own context; the
