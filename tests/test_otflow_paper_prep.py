@@ -5,20 +5,20 @@ import json
 import re
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
-from pathlib import Path
 
 import torch
 
 import genode.evaluation.diffusion_flow_time_reparameterization as runner
+from genode.evaluation.fm_backbone_registry import materialize_backbone_manifest
 from genode.models.conditioning import ConditioningCache
 from genode.schedule_transfer.diffusion_flow_schedules import (
     EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
     EXPERIMENTAL_REVERSED_SCHEDULE_KEYS,
     build_schedule_grid,
 )
-from genode.evaluation.fm_backbone_registry import materialize_backbone_manifest
 from genode.schedule_transfer.otflow_paper_registry import (
     BASELINE_SCHEDULE_KEYS,
     MAIN_NFE_VALUES,
@@ -38,7 +38,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         snapshot = paper_registry_snapshot()
         self.assertEqual(METHOD_KEY, "diffusion_flow_time_reparameterization")
         self.assertEqual(snapshot["paper_method"], "diffusion_flow_time_reparameterization")
-        self.assertFalse(any(spec.comparison_role == "paper_method" and spec.key == "tvd" for spec in paper_schedule_specs()))
+        self.assertFalse(
+            any(spec.comparison_role == "paper_method" and spec.key == "tvd" for spec in paper_schedule_specs())
+        )
         self.assertIn("flowts_power_0p03", {spec.key for spec in paper_schedule_specs()})
         self.assertNotIn("atss", {spec.key for spec in paper_schedule_specs()})
 
@@ -112,7 +114,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             self.assertEqual(len(grid), 5)
             self.assertAlmostEqual(grid[0], 0.0)
             self.assertAlmostEqual(grid[-1], 1.0)
-            self.assertTrue(all(right > left for left, right in zip(grid, grid[1:])), key)
+            self.assertTrue(all(right > left for left, right in zip(grid, grid[1:], strict=False)), key)
 
     def test_active_schedule_grids_reject_non_positive_steps(self) -> None:
         for key in BASELINE_SCHEDULE_KEYS:
@@ -128,7 +130,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
     def test_scheduler_cases_include_canonical_reversed_keys_by_default(self) -> None:
         args = runner.build_argparser().parse_args(["--baseline_scheduler_names", "ays_sd15_native_reversed,uniform"])
         cases = runner._scheduler_cases_for_datasets(args, ["traffic_hourly"])
-        self.assertEqual([case["scheduler_key"] for case in cases["traffic_hourly"]], ["uniform", "ays_sd15_native_reversed"])
+        self.assertEqual(
+            [case["scheduler_key"] for case in cases["traffic_hourly"]], ["uniform", "ays_sd15_native_reversed"]
+        )
         default_args = runner.build_argparser().parse_args([])
         self.assertIn("ays_sd15_native_reversed", runner._parse_schedule_names(default_args.baseline_scheduler_names))
 
@@ -308,10 +312,14 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 ]
             )
             forecast_cases = runner._scheduler_cases_for_datasets(args, ["traffic_hourly"], include_summary_cases=True)
-            conditional_cases = runner._scheduler_cases_for_datasets(args, ["lobster_synthetic"], include_summary_cases=True)
+            conditional_cases = runner._scheduler_cases_for_datasets(
+                args, ["lobster_synthetic"], include_summary_cases=True
+            )
 
         self.assertEqual([case["scheduler_key"] for case in forecast_cases["traffic_hourly"]], ["uniform", "gico"])
-        self.assertEqual([case["scheduler_key"] for case in conditional_cases["lobster_synthetic"]], ["uniform", "gico"])
+        self.assertEqual(
+            [case["scheduler_key"] for case in conditional_cases["lobster_synthetic"]], ["uniform", "gico"]
+        )
 
     def test_aggregate_relative_gain_uses_fraction_units(self) -> None:
         rows = [
@@ -775,7 +783,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             )
             recorder = runner._init_row_recorder(Path(tmpdir), args)
             recorder["fh"].close()
-            (Path(tmpdir) / "combined_summary.json").write_text(json.dumps({"main_table_summary": {"row_count": 1}}), encoding="utf-8")
+            (Path(tmpdir) / "combined_summary.json").write_text(
+                json.dumps({"main_table_summary": {"row_count": 1}}), encoding="utf-8"
+            )
             status = runner.schedule_row_output_status(Path(tmpdir), args)
         self.assertFalse(status["complete"])
         self.assertIn("missing complete rows", status["reason"])
@@ -811,7 +821,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     str(data_b),
                 ]
             )
-            self.assertNotEqual(runner._protocol_config_fingerprint(args_a), runner._protocol_config_fingerprint(args_b))
+            self.assertNotEqual(
+                runner._protocol_config_fingerprint(args_a), runner._protocol_config_fingerprint(args_b)
+            )
 
     def test_protocol_hash_tracks_context_reward_protocol(self) -> None:
         manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
@@ -934,7 +946,6 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         )
         self.assertNotEqual(runner._protocol_config_fingerprint(args_a), runner._protocol_config_fingerprint(args_b))
 
-
     def test_protocol_hash_tracks_train_tuning_sampling_mode(self) -> None:
         manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
         args_legacy = runner.build_argparser().parse_args(
@@ -965,15 +976,19 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 "validation_normalized",
             ]
         )
-        self.assertNotEqual(runner._protocol_config_fingerprint(args_legacy), runner._protocol_config_fingerprint(args_valnorm))
+        self.assertNotEqual(
+            runner._protocol_config_fingerprint(args_legacy), runner._protocol_config_fingerprint(args_valnorm)
+        )
 
     def test_runner_default_split_phase_is_locked_test(self) -> None:
-        args = runner.build_argparser().parse_args([
-            "--forecast_datasets",
-            "",
-            "--conditional_generation_datasets",
-            "",
-        ])
+        args = runner.build_argparser().parse_args(
+            [
+                "--forecast_datasets",
+                "",
+                "--conditional_generation_datasets",
+                "",
+            ]
+        )
         self.assertEqual(args.split_phase, "locked_test")
 
     def test_protocol_hash_tracks_selected_split_phase(self) -> None:
@@ -1002,8 +1017,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 "validation_tuning",
             ]
         )
-        self.assertNotEqual(runner._protocol_config_fingerprint(args_locked), runner._protocol_config_fingerprint(args_val))
-
+        self.assertNotEqual(
+            runner._protocol_config_fingerprint(args_locked), runner._protocol_config_fingerprint(args_val)
+        )
 
     def test_train_tuning_forecast_only_skips_empty_conditional_generation_phase(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1028,11 +1044,15 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "--allow_execute",
                 ]
             )
-            with mock.patch.object(runner, "validate_execution_preflight"), mock.patch.object(runner, "_run_forecast_phase", return_value=[]), mock.patch.object(
-                runner,
-                "_run_conditional_generation_phase",
-                side_effect=AssertionError("conditional generation should not run for an empty dataset list"),
-            ) as conditional_phase:
+            with (
+                mock.patch.object(runner, "validate_execution_preflight"),
+                mock.patch.object(runner, "_run_forecast_phase", return_value=[]),
+                mock.patch.object(
+                    runner,
+                    "_run_conditional_generation_phase",
+                    side_effect=AssertionError("conditional generation should not run for an empty dataset list"),
+                ) as conditional_phase,
+            ):
                 payload = runner.run_diffusion_flow_time_reparameterization(args)
 
         conditional_phase.assert_not_called()
@@ -1061,11 +1081,17 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "--allow_execute",
                 ]
             )
-            with mock.patch.object(runner, "validate_execution_preflight"), mock.patch.object(runner, "_run_forecast_phase", return_value=[]), mock.patch.object(
-                runner,
-                "_run_conditional_generation_phase",
-                return_value=[{"benchmark_family": runner.CONDITIONAL_GENERATION_FAMILY, "split_phase": "train_tuning"}],
-            ) as conditional_phase:
+            with (
+                mock.patch.object(runner, "validate_execution_preflight"),
+                mock.patch.object(runner, "_run_forecast_phase", return_value=[]),
+                mock.patch.object(
+                    runner,
+                    "_run_conditional_generation_phase",
+                    return_value=[
+                        {"benchmark_family": runner.CONDITIONAL_GENERATION_FAMILY, "split_phase": "train_tuning"}
+                    ],
+                ) as conditional_phase,
+            ):
                 payload = runner.run_diffusion_flow_time_reparameterization(args)
 
         conditional_phase.assert_called_once()
@@ -1119,11 +1145,17 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                     "--allow_execute",
                 ]
             )
-            with mock.patch.object(runner, "validate_execution_preflight"), mock.patch.object(runner, "_run_forecast_phase", return_value=[]) as forecast_phase, mock.patch.object(
-                runner,
-                "_run_conditional_generation_phase",
-                return_value=[{"benchmark_family": runner.CONDITIONAL_GENERATION_FAMILY, "split_phase": "train_tuning"}],
-            ) as conditional_phase:
+            with (
+                mock.patch.object(runner, "validate_execution_preflight"),
+                mock.patch.object(runner, "_run_forecast_phase", return_value=[]) as forecast_phase,
+                mock.patch.object(
+                    runner,
+                    "_run_conditional_generation_phase",
+                    return_value=[
+                        {"benchmark_family": runner.CONDITIONAL_GENERATION_FAMILY, "split_phase": "train_tuning"}
+                    ],
+                ) as conditional_phase,
+            ):
                 payload = runner.run_diffusion_flow_time_reparameterization(args)
 
         forecast_phase.assert_not_called()
@@ -1180,6 +1212,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 )
                 recorder = runner._init_row_recorder(Path(tmpdir), args)
                 try:
+
                     def fake_eval(model, ds, cfg, **kwargs):
                         seen.append(ds.name)
                         return {
@@ -1195,7 +1228,10 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                             "realized_nfe": 4,
                         }
 
-                    with mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint), mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval):
+                    with (
+                        mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint),
+                        mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval),
+                    ):
                         runner._run_forecast_phase(
                             args,
                             row_recorder=recorder,
@@ -1272,7 +1308,10 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 }
 
             try:
-                with mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint), mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval):
+                with (
+                    mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint),
+                    mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval),
+                ):
                     runner._run_forecast_phase(
                         args,
                         row_recorder=recorder,
@@ -1350,7 +1389,10 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 }
 
             try:
-                with mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint), mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval):
+                with (
+                    mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint),
+                    mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval),
+                ):
                     rows = runner._run_forecast_phase(
                         args,
                         row_recorder=recorder,
@@ -1428,7 +1470,10 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 }
 
             try:
-                with mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint), mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval):
+                with (
+                    mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint),
+                    mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval),
+                ):
                     rows = runner._run_forecast_phase(
                         args,
                         row_recorder=recorder,
@@ -1512,7 +1557,10 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 }
 
             try:
-                with mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint), mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval):
+                with (
+                    mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint),
+                    mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval),
+                ):
                     rows = runner._run_forecast_phase(
                         args,
                         row_recorder=recorder,
@@ -1593,7 +1641,10 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 }
 
             try:
-                with mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint), mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval):
+                with (
+                    mock.patch.object(runner, "load_forecast_checkpoint_splits", return_value=fake_checkpoint),
+                    mock.patch.object(runner, "evaluate_forecast_schedule", side_effect=fake_eval),
+                ):
                     rows = runner._run_forecast_phase(
                         args,
                         row_recorder=recorder,
@@ -1675,18 +1726,22 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 }
 
             try:
-                with mock.patch.object(
-                    runner,
-                    "load_conditional_generation_checkpoint_splits",
-                    return_value=fake_checkpoint,
-                ), mock.patch.object(
-                    runner,
-                    "_choose_valid_windows",
-                    side_effect=AssertionError("train_tuning should use stratified train starts directly"),
-                ), mock.patch.object(
-                    runner,
-                    "run_fixed_schedule_variant",
-                    side_effect=fake_run_fixed_schedule_variant,
+                with (
+                    mock.patch.object(
+                        runner,
+                        "load_conditional_generation_checkpoint_splits",
+                        return_value=fake_checkpoint,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_choose_valid_windows",
+                        side_effect=AssertionError("train_tuning should use stratified train starts directly"),
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "run_fixed_schedule_variant",
+                        side_effect=fake_run_fixed_schedule_variant,
+                    ),
                 ):
                     rows = runner._run_conditional_generation_phase(
                         args,
@@ -1767,22 +1822,27 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 }
 
             try:
-                with mock.patch.object(
-                    runner,
-                    "load_conditional_generation_checkpoint_splits",
-                    return_value=fake_checkpoint,
-                ), mock.patch.object(
-                    runner,
-                    "resolved_eval_windows",
-                    side_effect=AssertionError("locked-test default should use every valid test window"),
-                ), mock.patch.object(
-                    runner,
-                    "_choose_valid_windows",
-                    side_effect=AssertionError("locked-test default should not sample/cap test windows"),
-                ), mock.patch.object(
-                    runner,
-                    "run_fixed_schedule_variant",
-                    side_effect=fake_run_fixed_schedule_variant,
+                with (
+                    mock.patch.object(
+                        runner,
+                        "load_conditional_generation_checkpoint_splits",
+                        return_value=fake_checkpoint,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "resolved_eval_windows",
+                        side_effect=AssertionError("locked-test default should use every valid test window"),
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_choose_valid_windows",
+                        side_effect=AssertionError("locked-test default should not sample/cap test windows"),
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "run_fixed_schedule_variant",
+                        side_effect=fake_run_fixed_schedule_variant,
+                    ),
                 ):
                     rows = runner._run_conditional_generation_phase(
                         args,
@@ -1824,7 +1884,9 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 self.batch_shapes.append(tuple(int(dim) for dim in hist_batch.shape))
                 self.grad_enabled.append(bool(torch.is_grad_enabled()))
                 if int(hist_batch.shape[0]) > 2:
-                    raise AssertionError("context embedding export must not precompute the full locked-test set at once")
+                    raise AssertionError(
+                        "context embedding export must not precompute the full locked-test set at once"
+                    )
                 if cond is None:
                     raise AssertionError("conditional export must preserve the frozen field condition")
                 self.condition_shapes.append(tuple(int(dim) for dim in cond.shape))
@@ -1941,18 +2003,23 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
                 }
 
             try:
-                with mock.patch.object(
-                    runner,
-                    "load_conditional_generation_checkpoint_splits",
-                    return_value=fake_checkpoint,
-                ), mock.patch.object(runner, "resolved_eval_windows", return_value=999), mock.patch.object(
-                    runner,
-                    "_choose_valid_windows",
-                    side_effect=fake_choose_valid_windows,
-                ), mock.patch.object(
-                    runner,
-                    "run_fixed_schedule_variant",
-                    side_effect=fake_run_fixed_schedule_variant,
+                with (
+                    mock.patch.object(
+                        runner,
+                        "load_conditional_generation_checkpoint_splits",
+                        return_value=fake_checkpoint,
+                    ),
+                    mock.patch.object(runner, "resolved_eval_windows", return_value=999),
+                    mock.patch.object(
+                        runner,
+                        "_choose_valid_windows",
+                        side_effect=fake_choose_valid_windows,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "run_fixed_schedule_variant",
+                        side_effect=fake_run_fixed_schedule_variant,
+                    ),
                 ):
                     rows = runner._run_conditional_generation_phase(
                         args,
@@ -2033,31 +2100,38 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             )
             recorder = runner._init_row_recorder(Path(tmpdir), args)
             try:
-                with mock.patch.object(runner, "load_backbone_manifest", return_value={}), mock.patch.object(
-                    runner,
-                    "load_molecule_group_manifest",
-                    return_value={},
-                ), mock.patch.object(
-                    runner,
-                    "trainable_molecule_group_members",
-                    return_value=[{"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"}],
-                ), mock.patch.object(
-                    runner,
-                    "find_backbone_artifact",
-                    return_value={
-                        "checkpoint_path": str(Path(tmpdir) / "model.pt"),
-                        "checkpoint_id": "molecule_ckpt",
-                        "train_steps": 20000,
-                        "train_budget_label": "20k",
-                    },
-                ), mock.patch.object(
-                    runner,
-                    "load_molecule_checkpoint_splits",
-                    return_value=loaded,
-                ), mock.patch.object(
-                    runner,
-                    "evaluate_molecule_rollout_schedule",
-                    side_effect=fake_eval,
+                with (
+                    mock.patch.object(runner, "load_backbone_manifest", return_value={}),
+                    mock.patch.object(
+                        runner,
+                        "load_molecule_group_manifest",
+                        return_value={},
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "trainable_molecule_group_members",
+                        return_value=[{"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"}],
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "find_backbone_artifact",
+                        return_value={
+                            "checkpoint_path": str(Path(tmpdir) / "model.pt"),
+                            "checkpoint_id": "molecule_ckpt",
+                            "train_steps": 20000,
+                            "train_budget_label": "20k",
+                        },
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "load_molecule_checkpoint_splits",
+                        return_value=loaded,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "evaluate_molecule_rollout_schedule",
+                        side_effect=fake_eval,
+                    ),
                 ):
                     rows = runner._run_molecule_phase(
                         args,
@@ -2152,33 +2226,41 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             )
             recorder = runner._init_row_recorder(Path(tempdir), args)
             try:
-                with mock.patch.object(runner, "load_backbone_manifest", return_value={}), mock.patch.object(
-                    runner,
-                    "load_molecule_group_manifest",
-                    return_value={},
-                ), mock.patch.object(
-                    runner,
-                    "trainable_molecule_group_members",
-                    return_value=[
-                        {"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"},
-                        {"member_key": "member_b", "stratum": "set1", "processed_dir": "member_b"},
-                    ],
-                ), mock.patch.object(
-                    runner,
-                    "find_backbone_artifact",
-                    side_effect=fake_artifact,
-                ), mock.patch.object(
-                    runner,
-                    "load_molecule_checkpoint_splits",
-                    return_value=loaded,
-                ), mock.patch.object(
-                    runner,
-                    "_choose_molecule_indices",
-                    side_effect=AssertionError("train_tuning should use stratified train indices directly"),
-                ), mock.patch.object(
-                    runner,
-                    "evaluate_molecule_rollout_schedule",
-                    side_effect=fake_eval,
+                with (
+                    mock.patch.object(runner, "load_backbone_manifest", return_value={}),
+                    mock.patch.object(
+                        runner,
+                        "load_molecule_group_manifest",
+                        return_value={},
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "trainable_molecule_group_members",
+                        return_value=[
+                            {"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"},
+                            {"member_key": "member_b", "stratum": "set1", "processed_dir": "member_b"},
+                        ],
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "find_backbone_artifact",
+                        side_effect=fake_artifact,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "load_molecule_checkpoint_splits",
+                        return_value=loaded,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_choose_molecule_indices",
+                        side_effect=AssertionError("train_tuning should use stratified train indices directly"),
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "evaluate_molecule_rollout_schedule",
+                        side_effect=fake_eval,
+                    ),
                 ):
                     rows = runner._run_molecule_phase(
                         args,
@@ -2274,29 +2356,36 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             )
             recorder = runner._init_row_recorder(Path(tempdir), args)
             try:
-                with mock.patch.object(runner, "load_backbone_manifest", return_value={}), mock.patch.object(
-                    runner,
-                    "load_molecule_group_manifest",
-                    return_value={},
-                ), mock.patch.object(
-                    runner,
-                    "trainable_molecule_group_members",
-                    return_value=[
-                        {"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"},
-                        {"member_key": "member_b", "stratum": "set1", "processed_dir": "member_b"},
-                    ],
-                ), mock.patch.object(
-                    runner,
-                    "find_backbone_artifact",
-                    side_effect=fake_artifact,
-                ), mock.patch.object(
-                    runner,
-                    "load_molecule_checkpoint_splits",
-                    return_value=loaded,
-                ), mock.patch.object(
-                    runner,
-                    "evaluate_molecule_rollout_schedule",
-                    side_effect=fake_eval,
+                with (
+                    mock.patch.object(runner, "load_backbone_manifest", return_value={}),
+                    mock.patch.object(
+                        runner,
+                        "load_molecule_group_manifest",
+                        return_value={},
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "trainable_molecule_group_members",
+                        return_value=[
+                            {"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"},
+                            {"member_key": "member_b", "stratum": "set1", "processed_dir": "member_b"},
+                        ],
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "find_backbone_artifact",
+                        side_effect=fake_artifact,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "load_molecule_checkpoint_splits",
+                        return_value=loaded,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "evaluate_molecule_rollout_schedule",
+                        side_effect=fake_eval,
+                    ),
                 ):
                     rows = runner._run_molecule_phase(
                         args,

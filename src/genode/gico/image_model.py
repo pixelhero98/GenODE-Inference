@@ -11,7 +11,6 @@ from torch import Tensor, nn
 from genode.artifacts.identity import semantic_sha256
 from genode.benchmarks.image.protocol import IMAGE_TARGET_NFES
 
-
 IMAGE_GICO_MODEL_PROTOCOL = "image_gico_nfe_logits_v2"
 DEFAULT_DENSITY_FLOOR = 1e-8
 

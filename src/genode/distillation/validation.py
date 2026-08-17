@@ -5,6 +5,8 @@ from typing import Any, Mapping
 from genode.checkpoint_validation import validate_strict_integer
 from genode.gico.models import (
     SettingEncoderConfig,
+)
+from genode.gico.models import (
     setting_encoder_config_from_payload as _load_setting_encoder_config,
 )
 
@@ -25,10 +27,7 @@ def setting_encoder_config_from_payload(
     missing = sorted(expected_fields - set(data)) if require_complete else []
     unknown = sorted(set(data) - expected_fields)
     if missing or unknown:
-        raise ValueError(
-            "Setting encoder configuration fields are invalid; "
-            f"missing={missing}, unknown={unknown}."
-        )
+        raise ValueError(f"Setting encoder configuration fields are invalid; missing={missing}, unknown={unknown}.")
     if "nfe_reference" in data:
         data["nfe_reference"] = validate_strict_integer(
             data["nfe_reference"],

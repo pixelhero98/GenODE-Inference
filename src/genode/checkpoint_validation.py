@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from numbers import Integral
 import re
+from numbers import Integral
 from typing import Any, Mapping, Sequence
 
 import torch
 
 from genode.solver_protocol import (
     SolverNFEFields,
+)
+from genode.solver_protocol import (
     normalize_solver_nfe_fields as _normalize_snapshot_solver_nfe_fields,
 )
-
 
 _INTEGER_TEXT = re.compile(r"[+-]?\d+")
 
@@ -126,11 +127,7 @@ def validate_tensor_state_dict(
         raise ValueError(f"{label} must be a tensor mapping.")
 
     for raw_name in state:
-        if (
-            not isinstance(raw_name, str)
-            or not raw_name
-            or raw_name != raw_name.strip()
-        ):
+        if not isinstance(raw_name, str) or not raw_name or raw_name != raw_name.strip():
             raise ValueError(f"{label} contains an invalid parameter name {raw_name!r}.")
 
     expected_state = None if target_module is None else target_module.state_dict()
@@ -139,8 +136,7 @@ def validate_tensor_state_dict(
         unexpected = sorted(set(state) - set(expected_state))
         if missing or unexpected:
             raise ValueError(
-                f"{label} keys do not match the target module; "
-                f"missing={missing}, unexpected={unexpected}."
+                f"{label} keys do not match the target module; missing={missing}, unexpected={unexpected}."
             )
 
     validated: dict[str, torch.Tensor] = {}
@@ -149,24 +145,17 @@ def validate_tensor_state_dict(
         if not torch.is_tensor(value):
             raise ValueError(f"{label} contains a non-tensor value at {name!r}.")
         if not value.is_floating_point():
-            raise ValueError(
-                f"{label} tensor {name!r} must use a real floating-point dtype, "
-                f"got {value.dtype}."
-            )
+            raise ValueError(f"{label} tensor {name!r} must use a real floating-point dtype, got {value.dtype}.")
         if not bool(torch.isfinite(value).all()):
             raise ValueError(f"{label} contains non-finite tensor values at {name!r}.")
         if expected_state is not None:
             expected = expected_state[name]
             if tuple(value.shape) != tuple(expected.shape):
                 raise ValueError(
-                    f"{label} tensor {name!r} has shape {tuple(value.shape)}; "
-                    f"expected {tuple(expected.shape)}."
+                    f"{label} tensor {name!r} has shape {tuple(value.shape)}; expected {tuple(expected.shape)}."
                 )
             if value.dtype != expected.dtype:
-                raise ValueError(
-                    f"{label} tensor {name!r} has dtype {value.dtype}; "
-                    f"expected {expected.dtype}."
-                )
+                raise ValueError(f"{label} tensor {name!r} has dtype {value.dtype}; expected {expected.dtype}.")
         validated[name] = value
     if not validated:
         raise ValueError(f"{label} may not be empty.")
@@ -195,9 +184,7 @@ def validate_locked_test_exclusion(
                 key = str(raw_key)
                 child_path = f"{path}.{key}" if path else key
                 if key.startswith("locked_test_used") and child is not False:
-                    raise ValueError(
-                        f"{label} requires {child_path}=false, got {child!r}."
-                    )
+                    raise ValueError(f"{label} requires {child_path}=false, got {child!r}.")
                 walk(child, child_path)
         elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
             for index, child in enumerate(value):

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
-from numbers import Integral, Real
 import re
+from dataclasses import dataclass
+from numbers import Integral, Real
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -25,16 +25,11 @@ from genode.schedules import (
     validate_fixed_schedule_keys,
 )
 
-
 IMAGE_GICO_FEATURE_GROUP_PROTOCOL = "image_gico_reward_feature_groups_v2"
 IMAGE_GICO_CONDITIONAL_REWARD_PROTOCOL = "image_gico_conditional_reward_v2"
 IMAGE_GICO_CONDITIONAL_TARGET_PROTOCOL = "image_gico_conditional_targets_v4"
-IMAGE_GICO_BACKBONE_CONTEXT_MODEL_PROTOCOL = (
-    "image_gico_backbone_context_nfe_residual_v3"
-)
-IMAGE_GICO_CONDITIONAL_POLICY_SPECIFICATION = ScheduleSpecification(
-    "image_gico_backbone_context_v3"
-)
+IMAGE_GICO_BACKBONE_CONTEXT_MODEL_PROTOCOL = "image_gico_backbone_context_nfe_residual_v3"
+IMAGE_GICO_CONDITIONAL_POLICY_SPECIFICATION = ScheduleSpecification("image_gico_backbone_context_v3")
 IMAGE_GICO_CLASS_COUNT = 1_000
 IMAGE_GICO_BACKBONE_CONTEXT_DIM = 768
 IMAGE_GICO_FEATURE_DIM = 64
@@ -80,18 +75,11 @@ def _raw_sha256_identity(value: object, *, field: str) -> str:
 
 def _feature_protocol_identity(value: object, *, field: str) -> str:
     if not isinstance(value, str):
-        raise ValueError(
-            f"{field} must be a namespaced lowercase SHA-256 identity."
-        )
+        raise ValueError(f"{field} must be a namespaced lowercase SHA-256 identity.")
     namespace, separator, digest = value.rpartition(":")
-    if (
-        separator != ":"
-        or namespace != _FEATURE_PROTOCOL_NAMESPACE
-        or _RAW_SHA256_PATTERN.fullmatch(digest) is None
-    ):
+    if separator != ":" or namespace != _FEATURE_PROTOCOL_NAMESPACE or _RAW_SHA256_PATTERN.fullmatch(digest) is None:
         raise ValueError(
-            f"{field} must use the {_FEATURE_PROTOCOL_NAMESPACE!r} namespace "
-            "and one lowercase SHA-256 digest."
+            f"{field} must use the {_FEATURE_PROTOCOL_NAMESPACE!r} namespace and one lowercase SHA-256 digest."
         )
     return value
 
@@ -110,10 +98,7 @@ def _validate_imagenet_target_binding(
         or backbone.conditioning != "class_conditional"
         or backbone.num_conditioning_classes != IMAGE_GICO_CLASS_COUNT
     ):
-        raise ValueError(
-            "Conditional targets require a registered class-conditional "
-            "ImageNet-64 backbone."
-        )
+        raise ValueError("Conditional targets require a registered class-conditional ImageNet-64 backbone.")
     _raw_sha256_identity(
         backbone_protocol_sha256,
         field="backbone_protocol_sha256",
@@ -199,10 +184,7 @@ def _deterministic_feature_clusters(
                 assignments[replacement] = group_index
                 assigned_distance[replacement] = -1.0
         centroids = np.stack(
-            [
-                coordinates[assignments == group_index].mean(axis=0)
-                for group_index in range(group_count)
-            ]
+            [coordinates[assignments == group_index].mean(axis=0) for group_index in range(group_count)]
         )
     else:
         raise RuntimeError("Deterministic feature grouping did not converge.")
@@ -257,9 +239,7 @@ class ImageGICOFeatureGroups:
             field="group_centroids",
             shape=(groups, IMAGE_GICO_FEATURE_DIM),
         )
-        expected_centroids = np.stack(
-            [coordinates[assignments == group].mean(axis=0) for group in range(groups)]
-        )
+        expected_centroids = np.stack([coordinates[assignments == group].mean(axis=0) for group in range(groups)])
         if not np.allclose(centroids, expected_centroids, rtol=1e-10, atol=1e-10):
             raise ValueError("group_centroids do not match the assigned class coordinates.")
         center = _finite_array(self.pca_center, field="pca_center")
@@ -532,39 +512,21 @@ class ImageGICOConditionalTargets:
         ):
             if np.any(values < 0.0):
                 raise ValueError(f"{field} must be nonnegative.")
-        if (
-            np.any(class_reliability > 1.0)
-            or np.any(group_reliability > 1.0)
-            or np.any(coefficients > 1.0)
-        ):
+        if np.any(class_reliability > 1.0) or np.any(group_reliability > 1.0) or np.any(coefficients > 1.0):
             raise ValueError("Shrinkage reliabilities and coefficients must be in [0, 1].")
         if not np.allclose(coefficients.sum(axis=-1), 1.0, rtol=1e-8, atol=1e-8):
             raise ValueError("Class/group/global shrinkage coefficients must sum to one.")
-        temperatures = tuple(
-            _finite_positive(value, field="temperature_by_nfe")
-            for value in self.temperature_by_nfe
-        )
+        temperatures = tuple(_finite_positive(value, field="temperature_by_nfe") for value in self.temperature_by_nfe)
         if len(temperatures) != 3:
             raise ValueError("temperature_by_nfe must contain exactly three values.")
-        schedule_hashes = tuple(
-            _identity(value, field="schedule_sha256s")
-            for value in self.schedule_sha256s
-        )
+        schedule_hashes = tuple(_identity(value, field="schedule_sha256s") for value in self.schedule_sha256s)
         if len(schedule_hashes) != schedule_count:
-            raise ValueError(
-                f"schedule_sha256s must contain {schedule_count} entries."
-            )
+            raise ValueError(f"schedule_sha256s must contain {schedule_count} entries.")
         density_hashes = tuple(
-            tuple(_identity(value, field="density_mass_sha256s") for value in row)
-            for row in self.density_mass_sha256s
+            tuple(_identity(value, field="density_mass_sha256s") for value in row) for row in self.density_mass_sha256s
         )
-        if len(density_hashes) != 3 or any(
-            len(row) != schedule_count for row in density_hashes
-        ):
-            raise ValueError(
-                "density_mass_sha256s must have shape "
-                f"[3, {schedule_count}]."
-            )
+        if len(density_hashes) != 3 or any(len(row) != schedule_count for row in density_hashes):
+            raise ValueError(f"density_mass_sha256s must have shape [3, {schedule_count}].")
         for field in (
             "feature_group_sha256",
             "reward_evidence_sha256",
@@ -667,8 +629,7 @@ class ImageGICOConditionalTargets:
         if (
             payload["artifact"] != "image_gico_conditional_targets"
             or payload["protocol"] != IMAGE_GICO_CONDITIONAL_TARGET_PROTOCOL
-            or payload["conditioning"]
-            != "classwise_rewards_independent_of_inference_context"
+            or payload["conditioning"] != "classwise_rewards_independent_of_inference_context"
             or payload["feature_group_usage"] != "reward_shrinkage_only_not_inference_context"
             or payload["class_count"] != IMAGE_GICO_CLASS_COUNT
             or isinstance(payload["schedule_count"], bool)
@@ -677,44 +638,25 @@ class ImageGICOConditionalTargets:
         ):
             raise ValueError("Unsupported conditional target artifact.")
         target = cls(
-            density_mass=tuple(
-                tuple(tuple(row) for row in nfe_rows)
-                for nfe_rows in payload["density_mass"]
-            ),
-            mixture_weights=tuple(
-                tuple(tuple(row) for row in nfe_rows)
-                for nfe_rows in payload["mixture_weights"]
-            ),
+            density_mass=tuple(tuple(tuple(row) for row in nfe_rows) for nfe_rows in payload["density_mass"]),
+            mixture_weights=tuple(tuple(tuple(row) for row in nfe_rows) for nfe_rows in payload["mixture_weights"]),
             normalized_rewards=tuple(
-                tuple(tuple(row) for row in nfe_rows)
-                for nfe_rows in payload["normalized_rewards"]
+                tuple(tuple(row) for row in nfe_rows) for nfe_rows in payload["normalized_rewards"]
             ),
             jackknife_standard_errors=tuple(
-                tuple(tuple(row) for row in nfe_rows)
-                for nfe_rows in payload["jackknife_standard_errors"]
+                tuple(tuple(row) for row in nfe_rows) for nfe_rows in payload["jackknife_standard_errors"]
             ),
-            class_reliability=tuple(
-                tuple(tuple(row) for row in nfe_rows)
-                for nfe_rows in payload["class_reliability"]
-            ),
-            group_reliability=tuple(
-                tuple(tuple(row) for row in nfe_rows)
-                for nfe_rows in payload["group_reliability"]
-            ),
+            class_reliability=tuple(tuple(tuple(row) for row in nfe_rows) for nfe_rows in payload["class_reliability"]),
+            group_reliability=tuple(tuple(tuple(row) for row in nfe_rows) for nfe_rows in payload["group_reliability"]),
             shrinkage_coefficients=tuple(
-                tuple(
-                    tuple(tuple(coefficients) for coefficients in class_rows)
-                    for class_rows in nfe_rows
-                )
+                tuple(tuple(tuple(coefficients) for coefficients in class_rows) for class_rows in nfe_rows)
                 for nfe_rows in payload["shrinkage_coefficients"]
             ),
             temperature_by_nfe=tuple(payload["temperature_by_nfe"]),
             target_nfes=tuple(payload["target_nfes"]),
             schedule_keys=tuple(raw_schedule_keys),
             schedule_sha256s=tuple(payload["schedule_sha256s"]),
-            density_mass_sha256s=tuple(
-                tuple(row) for row in payload["density_mass_sha256s"]
-            ),
+            density_mass_sha256s=tuple(tuple(row) for row in payload["density_mass_sha256s"]),
             feature_group_sha256=payload["feature_group_sha256"],
             reward_evidence_sha256=payload["reward_evidence_sha256"],
             fixed_support_sha256=payload["fixed_support_sha256"],
@@ -740,11 +682,7 @@ class ImageGICOConditionalTargets:
 def _jackknife_standard_error(jackknife_advantage: np.ndarray) -> np.ndarray:
     count = jackknife_advantage.shape[-1]
     center = jackknife_advantage.mean(axis=-1, keepdims=True)
-    variance = (
-        float(count - 1)
-        / float(count)
-        * np.sum((jackknife_advantage - center) ** 2, axis=-1)
-    )
+    variance = float(count - 1) / float(count) * np.sum((jackknife_advantage - center) ** 2, axis=-1)
     return np.sqrt(np.maximum(variance, 0.0))
 
 
@@ -778,13 +716,9 @@ def _hierarchical_shrinkage(
                 0.0,
             )
             between_observed = float(
-                np.sum(group_sizes * (group_means - global_mean) ** 2)
-                / float(IMAGE_GICO_CLASS_COUNT)
+                np.sum(group_sizes * (group_means - global_mean) ** 2) / float(IMAGE_GICO_CLASS_COUNT)
             )
-            between_noise = float(
-                np.sum(group_sizes * group_noise)
-                / float(IMAGE_GICO_CLASS_COUNT)
-            )
+            between_noise = float(np.sum(group_sizes * group_noise) / float(IMAGE_GICO_CLASS_COUNT))
             between_signal = max(between_observed - between_noise, 0.0)
             class_denominator = within_signal + variances
             class_weight = np.divide(
@@ -801,22 +735,13 @@ def _hierarchical_shrinkage(
                 where=group_denominator > 0.0,
             )
             group_weight = group_weight_by_group[assignments]
-            pooled = (
-                group_weight * group_means[assignments]
-                + (1.0 - group_weight) * global_mean
-            )
-            shrunk[nfe_index, schedule_index] = (
-                class_weight * values + (1.0 - class_weight) * pooled
-            )
+            pooled = group_weight * group_means[assignments] + (1.0 - group_weight) * global_mean
+            shrunk[nfe_index, schedule_index] = class_weight * values + (1.0 - class_weight) * pooled
             class_reliability[nfe_index, schedule_index] = class_weight
             group_reliability[nfe_index, schedule_index] = group_weight
             coefficients[nfe_index, schedule_index, :, 0] = class_weight
-            coefficients[nfe_index, schedule_index, :, 1] = (
-                (1.0 - class_weight) * group_weight
-            )
-            coefficients[nfe_index, schedule_index, :, 2] = (
-                (1.0 - class_weight) * (1.0 - group_weight)
-            )
+            coefficients[nfe_index, schedule_index, :, 1] = (1.0 - class_weight) * group_weight
+            coefficients[nfe_index, schedule_index, :, 2] = (1.0 - class_weight) * (1.0 - group_weight)
     return shrunk, class_reliability, group_reliability, coefficients
 
 
@@ -859,9 +784,7 @@ def build_image_gico_conditional_targets(
         raise ValueError("reward_scales must be strictly positive.")
     masses = _finite_array(fixed_density_mass, field="fixed_density_mass")
     if masses.ndim != 3 or masses.shape[:2] != (3, schedule_count):
-        raise ValueError(
-            f"fixed_density_mass must have shape [3, {schedule_count}, bins]."
-        )
+        raise ValueError(f"fixed_density_mass must have shape [3, {schedule_count}, bins].")
     if np.any(masses < 0.0) or not np.allclose(
         masses.sum(axis=-1),
         1.0,
@@ -878,19 +801,14 @@ def build_image_gico_conditional_targets(
         feature_protocol_sha256=feature_protocol_sha256,
     )
     if feature_groups.feature_protocol_sha256 != feature_protocol_sha256:
-        raise ValueError(
-            "Conditional targets and reward feature groups must use the same "
-            "feature protocol identity."
-        )
+        raise ValueError("Conditional targets and reward feature groups must use the same feature protocol identity.")
     uniform = keys.index("uniform")
     advantages = kids[:, uniform : uniform + 1, :] - kids
-    jackknife_advantage = (
-        jackknife[:, uniform : uniform + 1, :, :] - jackknife
-    )
+    jackknife_advantage = jackknife[:, uniform : uniform + 1, :, :] - jackknife
     standard_errors = _jackknife_standard_error(jackknife_advantage)
     assignments = np.asarray(feature_groups.group_assignments, dtype=np.int64)
-    shrunk, class_reliability, group_reliability, coefficients = (
-        _hierarchical_shrinkage(advantages, standard_errors, assignments)
+    shrunk, class_reliability, group_reliability, coefficients = _hierarchical_shrinkage(
+        advantages, standard_errors, assignments
     )
     normalized = np.clip(
         shrunk / scales[:, None, None],
@@ -903,13 +821,8 @@ def build_image_gico_conditional_targets(
     group_reliability[:, uniform, :] = 0.0
     coefficients[:, uniform, :, :] = (0.0, 0.0, 1.0)
     density_hashes = tuple(tuple(str(value) for value in row) for row in density_mass_sha256s)
-    if len(density_hashes) != 3 or any(
-        len(row) != schedule_count for row in density_hashes
-    ):
-        raise ValueError(
-            "density_mass_sha256s must have shape "
-            f"[3, {schedule_count}]."
-        )
+    if len(density_hashes) != 3 or any(len(row) != schedule_count for row in density_hashes):
+        raise ValueError(f"density_mass_sha256s must have shape [3, {schedule_count}].")
     schedule_weights = np.empty(
         (3, IMAGE_GICO_CLASS_COUNT, schedule_count),
         dtype=np.float64,
@@ -921,10 +834,7 @@ def build_image_gico_conditional_targets(
         unique_groups = tuple(groups_by_hash.values())
         for class_index in range(IMAGE_GICO_CLASS_COUNT):
             group_logits = np.asarray(
-                [
-                    float(np.mean(normalized[nfe_index, group, class_index]))
-                    for group in unique_groups
-                ],
+                [float(np.mean(normalized[nfe_index, group, class_index])) for group in unique_groups],
                 dtype=np.float64,
             )
             group_logits -= float(np.max(group_logits))
@@ -937,13 +847,9 @@ def build_image_gico_conditional_targets(
     density = np.einsum("ncs,nsb->ncb", schedule_weights, masses)
     density /= density.sum(axis=-1, keepdims=True)
     return ImageGICOConditionalTargets(
-        density_mass=tuple(
-            tuple(tuple(float(value) for value in row) for row in nfe_rows)
-            for nfe_rows in density
-        ),
+        density_mass=tuple(tuple(tuple(float(value) for value in row) for row in nfe_rows) for nfe_rows in density),
         mixture_weights=tuple(
-            tuple(tuple(float(value) for value in row) for row in nfe_rows)
-            for nfe_rows in schedule_weights
+            tuple(tuple(float(value) for value in row) for row in nfe_rows) for nfe_rows in schedule_weights
         ),
         normalized_rewards=tuple(
             tuple(tuple(float(value) for value in row) for row in nfe_rows)
@@ -963,10 +869,7 @@ def build_image_gico_conditional_targets(
         ),
         shrinkage_coefficients=tuple(
             tuple(
-                tuple(
-                    tuple(float(value) for value in coefficient)
-                    for coefficient in class_rows
-                )
+                tuple(tuple(float(value) for value in coefficient) for coefficient in class_rows)
                 for class_rows in nfe_rows
             )
             for nfe_rows in coefficients.transpose(0, 2, 1, 3)
@@ -1007,12 +910,8 @@ def validate_image_gico_backbone_context_tensor(
     else:
         raise TypeError(f"{field} must be a NumPy array or torch.Tensor.")
     if tensor.ndim != 2 or tensor.shape[1] != IMAGE_GICO_BACKBONE_CONTEXT_DIM:
-        raise ValueError(
-            f"{field} must have shape [batch, {IMAGE_GICO_BACKBONE_CONTEXT_DIM}]."
-        )
-    if tensor.shape[0] <= 0 or (
-        expected_rows is not None and tensor.shape[0] != expected_rows
-    ):
+        raise ValueError(f"{field} must have shape [batch, {IMAGE_GICO_BACKBONE_CONTEXT_DIM}].")
+    if tensor.shape[0] <= 0 or (expected_rows is not None and tensor.shape[0] != expected_rows):
         expected = "a nonempty batch" if expected_rows is None else str(expected_rows)
         raise ValueError(f"{field} must contain {expected} rows.")
     if not bool(torch.isfinite(tensor).all()):
@@ -1053,11 +952,7 @@ class ImageGICOBackboneContextModelConfig:
         if isinstance(self.density_floor, bool) or not isinstance(self.density_floor, Real):
             raise TypeError("density_floor must be a finite nonnegative real.")
         floor = float(self.density_floor)
-        if (
-            not math.isfinite(floor)
-            or floor < 0.0
-            or floor * self.density_bin_count >= 1.0
-        ):
+        if not math.isfinite(floor) or floor < 0.0 or floor * self.density_bin_count >= 1.0:
             raise ValueError("density_floor is incompatible with density_bin_count.")
         object.__setattr__(self, "density_floor", floor)
 
@@ -1115,9 +1010,7 @@ class ImageGICOBackboneContextDensityModel(nn.Module):
             nn.SiLU(),
             nn.Linear(config.hidden_dim, config.density_bin_count),
         )
-        self.global_logits_by_nfe = nn.Parameter(
-            torch.zeros(len(config.target_nfes), config.density_bin_count)
-        )
+        self.global_logits_by_nfe = nn.Parameter(torch.zeros(len(config.target_nfes), config.density_bin_count))
         final = self.context_network[-1]
         if not isinstance(final, nn.Linear):
             raise RuntimeError("Image GICO context network must end in a linear layer.")
@@ -1136,9 +1029,7 @@ class ImageGICOBackboneContextDensityModel(nn.Module):
         if contexts.device != self.global_logits_by_nfe.device:
             raise ValueError("contexts and the conditional model must share a device.")
         if contexts.ndim != 2 or contexts.shape[1] != self.config.context_dim:
-            raise ValueError(
-                f"contexts must have shape [batch, {self.config.context_dim}]."
-            )
+            raise ValueError(f"contexts must have shape [batch, {self.config.context_dim}].")
         if contexts.shape[0] <= 0:
             raise ValueError("contexts must contain at least one row.")
         if not bool(torch.isfinite(contexts).all()):
@@ -1180,9 +1071,7 @@ class ImageGICOBackboneContextDensityModel(nn.Module):
                 dtype=torch.int64,
                 device=self.global_logits_by_nfe.device,
             )
-            rows.append(
-                self._raw_residual(self.canonical_context_table, indices).mean(dim=0)
-            )
+            rows.append(self._raw_residual(self.canonical_context_table, indices).mean(dim=0))
         return torch.stack(rows)
 
     def centered_residual_table(self) -> Tensor:
@@ -1217,10 +1106,7 @@ class ImageGICOBackboneContextDensityModel(nn.Module):
         indices = self._nfe_indices(target_nfes)
         if validated_contexts.shape[0] != indices.shape[0]:
             raise ValueError("contexts and target_nfes must have the same batch size.")
-        residual = (
-            self._raw_residual(validated_contexts, indices)
-            - self._residual_centers()[indices]
-        )
+        residual = self._raw_residual(validated_contexts, indices) - self._residual_centers()[indices]
         probabilities = torch.softmax(
             self.global_logits_by_nfe[indices] + residual,
             dim=-1,

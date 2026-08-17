@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Mapping
 
 import torch
@@ -9,14 +9,16 @@ import torch.nn as nn
 
 from genode.checkpoint_validation import (
     normalize_strict_solver_nfe_fields as normalize_solver_nfe_fields,
+)
+from genode.checkpoint_validation import (
     validate_tensor_state_dict,
 )
+from genode.distillation.validation import setting_encoder_config_from_payload
 from genode.gico.models import (
     SettingEncoderConfig,
     setting_feature_dim,
     setting_features,
 )
-from genode.distillation.validation import setting_encoder_config_from_payload
 from genode.models.conditioning import ConditioningCache, ConditioningState
 from genode.models.config import OTFlowConfig
 from genode.models.modules import TransformerFUNet, build_mlp
@@ -245,16 +247,11 @@ class FlowMapSampler:
             config=self.setting_encoder_config,
         )
         if expected_setting_dim != int(flow_map.setting_dim):
-            raise ValueError(
-                "Flow-map setting dimension is incompatible with the supplied setting encoder."
-            )
+            raise ValueError("Flow-map setting dimension is incompatible with the supplied setting encoder.")
         if self.gico_policy is not None:
             if int(self.gico_policy.density_dim) != int(flow_map.density_dim):
                 raise ValueError("GICO and flow-map density dimensions are incompatible.")
-            if (
-                self.gico_policy.setting_encoder_config.to_payload()
-                != self.setting_encoder_config.to_payload()
-            ):
+            if self.gico_policy.setting_encoder_config.to_payload() != self.setting_encoder_config.to_payload():
                 raise ValueError("GICO and flow-map setting encoders are incompatible.")
         for module in (self.conditioner, self.flow_map):
             for parameter in module.parameters():
@@ -283,12 +280,9 @@ class FlowMapSampler:
             raise ValueError("Provide exactly one of hist or conditioning_cache.")
         if conditioning_cache is not None and cond is not None:
             raise ValueError("cond cannot be combined with a precomputed conditioning_cache.")
-        if initial_state.ndim != 2 or int(initial_state.shape[1]) != int(
-            self.flow_map.cfg.sample_state_dim
-        ):
+        if initial_state.ndim != 2 or int(initial_state.shape[1]) != int(self.flow_map.cfg.sample_state_dim):
             raise ValueError(
-                "initial_state must have shape [batch, sample_state_dim], got "
-                f"{tuple(initial_state.shape)}."
+                f"initial_state must have shape [batch, sample_state_dim], got {tuple(initial_state.shape)}."
             )
         if not initial_state.is_floating_point() or not torch.isfinite(initial_state).all():
             raise ValueError("initial_state must contain finite floating-point values.")
@@ -324,9 +318,7 @@ class FlowMapSampler:
         self.flow_map.eval()
         if density_mass is None:
             if self.gico_policy is None:
-                raise ValueError(
-                    "density_mass is required when the sampler has no bound GICO policy."
-                )
+                raise ValueError("density_mass is required when the sampler has no bound GICO policy.")
             schedule = self.gico_policy.predict(
                 self.gico_policy.context_embedding_from_cache(cache),
                 solver_key=nfe.solver_key,
@@ -345,11 +337,7 @@ class FlowMapSampler:
             density,
             validate_values=True,
         )
-        if (
-            not torch.is_tensor(output)
-            or not output.is_floating_point()
-            or not bool(torch.isfinite(output).all())
-        ):
+        if not torch.is_tensor(output) or not output.is_floating_point() or not bool(torch.isfinite(output).all()):
             raise ValueError("Flow-map output must contain finite floating-point values.")
         return FlowMapSample(
             sample=output,

@@ -42,9 +42,7 @@ ROOT_FIELDS = (
     "molecule_group_root",
     "molecule_backbone_root",
 )
-_EMBEDDED_WINDOWS_PATH = re.compile(
-    r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+)"
-)
+_EMBEDDED_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+)")
 _EMBEDDED_POSIX_PATH = re.compile(r"(?<![:A-Za-z0-9/])/(?:[^/\s]+/)+[^/\s]+")
 REDACTED_LOCAL_PATH = "<local_path_redacted>"
 MIN_CHECKPOINT_SIZE_BYTES = 1024
@@ -262,7 +260,7 @@ def _file_record(package_root: Path, path: Path, *, role: str) -> Dict[str, Any]
 def _artifact_belongs_to_family(artifact: Mapping[str, Any], spec: BackbonePackageFamily) -> bool:
     return (
         str(artifact.get("benchmark_family")) == str(spec.benchmark_family)
-        and str(artifact.get("dataset_key")) in set(str(scenario) for scenario in spec.scenarios)
+        and str(artifact.get("dataset_key")) in {str(scenario) for scenario in spec.scenarios}
         and str(artifact.get("status")) == "ready"
     )
 
@@ -304,7 +302,9 @@ def _validate_artifact_grid(artifacts: Sequence[Mapping[str, Any]], spec: Backbo
         errors.append(f"Package family {spec.key!r} contains duplicate artifact identities.")
     expected_steps = {int(step) for step in TRAIN_BUDGET_STEPS}
     if spec.benchmark_family == MOLECULE_FAMILY:
-        members_by_scenario: Dict[str, set[tuple[str, str, str]]] = {str(scenario): set() for scenario in spec.scenarios}
+        members_by_scenario: Dict[str, set[tuple[str, str, str]]] = {
+            str(scenario): set() for scenario in spec.scenarios
+        }
         steps_by_member: Dict[tuple[str, str, str, str], set[int]] = {}
         for artifact in artifacts:
             scenario = str(artifact.get("dataset_key", ""))
@@ -321,15 +321,21 @@ def _validate_artifact_grid(artifacts: Sequence[Mapping[str, Any]], spec: Backbo
                 errors.append(f"Scenario {scenario} has {member_count} molecule members; expected 6.")
         for member, observed_steps in sorted(steps_by_member.items()):
             if observed_steps != expected_steps:
-                errors.append(f"Molecule member {'/'.join(member)} has train steps {sorted(observed_steps)}; expected {sorted(expected_steps)}.")
+                errors.append(
+                    f"Molecule member {'/'.join(member)} has train steps {sorted(observed_steps)}; expected {sorted(expected_steps)}."
+                )
     else:
         steps_by_scenario: Dict[str, set[int]] = {str(scenario): set() for scenario in spec.scenarios}
         for artifact in artifacts:
-            steps_by_scenario.setdefault(str(artifact.get("dataset_key", "")), set()).add(int(artifact.get("train_steps", -1)))
+            steps_by_scenario.setdefault(str(artifact.get("dataset_key", "")), set()).add(
+                int(artifact.get("train_steps", -1))
+            )
         for scenario in spec.scenarios:
             observed_steps = steps_by_scenario.get(str(scenario), set())
             if observed_steps != expected_steps:
-                errors.append(f"Scenario {scenario} has train steps {sorted(observed_steps)}; expected {sorted(expected_steps)}.")
+                errors.append(
+                    f"Scenario {scenario} has train steps {sorted(observed_steps)}; expected {sorted(expected_steps)}."
+                )
     return errors
 
 
@@ -375,9 +381,15 @@ def _normalize_manifest_for_package(
             "molecule_group_root": "data/molecule_3d",
             "molecule_backbone_root": "outputs/molecule_3d_backbones",
             "temporal_artifact_count": int(
-                sum(1 for row in artifacts if str(row.get("benchmark_family")) in {FORECAST_FAMILY, CONDITIONAL_GENERATION_FAMILY})
+                sum(
+                    1
+                    for row in artifacts
+                    if str(row.get("benchmark_family")) in {FORECAST_FAMILY, CONDITIONAL_GENERATION_FAMILY}
+                )
             ),
-            "molecule_artifact_count": int(sum(1 for row in artifacts if str(row.get("benchmark_family")) == MOLECULE_FAMILY)),
+            "molecule_artifact_count": int(
+                sum(1 for row in artifacts if str(row.get("benchmark_family")) == MOLECULE_FAMILY)
+            ),
             "artifact_count": int(len(artifacts)),
             "ready_count": int(len(artifacts)),
             "missing_count": 0,
@@ -416,7 +428,9 @@ def package_backbone_family(
     spec = FAMILY_SPECS[str(family)]
     resolved_source = Path(source_root or project_root()).expanduser().resolve()
     resolved_output = Path(output_dir).expanduser().resolve()
-    package_root = Path(stage_dir).expanduser().resolve() if stage_dir else resolved_output / spec.zip_name.removesuffix(".zip")
+    package_root = (
+        Path(stage_dir).expanduser().resolve() if stage_dir else resolved_output / spec.zip_name.removesuffix(".zip")
+    )
     if package_root.exists():
         if not overwrite:
             raise FileExistsError(f"Package staging directory already exists: {package_root}")
@@ -439,7 +453,9 @@ def package_backbone_family(
         raise ValueError(f"No ready artifacts found for package family {family!r}.")
     artifact_grid_errors = _validate_artifact_grid(artifacts, spec)
     if artifact_grid_errors:
-        raise ValueError("Source backbone manifest is incomplete for this family:\n- " + "\n- ".join(artifact_grid_errors))
+        raise ValueError(
+            "Source backbone manifest is incomplete for this family:\n- " + "\n- ".join(artifact_grid_errors)
+        )
 
     records: List[Dict[str, Any]] = []
     normalized_artifacts: List[Dict[str, Any]] = []
@@ -483,13 +499,9 @@ def package_backbone_family(
     zip_manifest_path = zip_path.with_suffix(zip_path.suffix + ".package.json")
     if make_zip:
         resolved_output.mkdir(parents=True, exist_ok=True)
-        if zip_manifest_path.exists():
-            if not overwrite:
-                raise FileExistsError(f"Package zip manifest already exists: {zip_manifest_path}")
-        roles_by_path = {
-            str(record["path"]): str(record["role"])
-            for record in records
-        }
+        if zip_manifest_path.exists() and not overwrite:
+            raise FileExistsError(f"Package zip manifest already exists: {zip_manifest_path}")
+        roles_by_path = {str(record["path"]): str(record["role"]) for record in records}
         archive_entries = [
             ArchiveEntry(
                 source=path,
@@ -596,20 +608,17 @@ def _validate_artifact_checkpoint_integrity(artifact: Mapping[str, Any], checkpo
         return [f"Provided artifact {label} checkpoint path is not a regular file."]
     size_bytes = int(checkpoint_path.stat().st_size)
     if size_bytes < MIN_CHECKPOINT_SIZE_BYTES:
-        errors.append(
-            f"Provided artifact {label} checkpoint is too small to be valid: "
-            f"found {size_bytes} bytes."
-        )
+        errors.append(f"Provided artifact {label} checkpoint is too small to be valid: found {size_bytes} bytes.")
     with checkpoint_path.open("rb") as fh:
         header = fh.read(256)
     if _known_text_checkpoint_header(header):
         errors.append(f"Provided artifact {label} checkpoint looks like text or a pointer.")
     if errors:
         return errors
-    if (
-        str(artifact.get("backbone_name", "")) == "otflow"
-        and str(artifact.get("benchmark_family", "")) in {FORECAST_FAMILY, CONDITIONAL_GENERATION_FAMILY}
-    ):
+    if str(artifact.get("backbone_name", "")) == "otflow" and str(artifact.get("benchmark_family", "")) in {
+        FORECAST_FAMILY,
+        CONDITIONAL_GENERATION_FAMILY,
+    }:
         try:
             from genode.evaluation.otflow_evaluation_support import load_otflow_checkpoint_payload
 
@@ -618,9 +627,13 @@ def _validate_artifact_checkpoint_integrity(artifact: Mapping[str, Any], checkpo
                 expected_identity=f"provided backbone artifact {label}",
             )
         except Exception as exc:
-            detail = str(exc).replace(str(checkpoint_path), "checkpoint").replace(
-                checkpoint_path.as_posix(),
-                "checkpoint",
+            detail = (
+                str(exc)
+                .replace(str(checkpoint_path), "checkpoint")
+                .replace(
+                    checkpoint_path.as_posix(),
+                    "checkpoint",
+                )
             )
             if _contains_local_marker(detail):
                 detail = type(exc).__name__
@@ -663,11 +676,7 @@ def validate_backbone_package(
         if len(set(file_paths)) != len(file_paths):
             errors.append("Package manifest contains duplicate file records.")
         listed_paths = set(file_paths) | {PACKAGE_MANIFEST_NAME}
-        actual_paths = {
-            path.relative_to(root).as_posix()
-            for path in root.rglob("*")
-            if path.is_file()
-        }
+        actual_paths = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
         unlisted_paths = sorted(actual_paths - listed_paths)
         if unlisted_paths:
             errors.append(f"Package contains files missing from hash manifest: {unlisted_paths[:10]}")
@@ -772,7 +781,9 @@ def validate_provided_backbone_manifest(
         and (not scenario_key or str(artifact.get("dataset_key")) == str(scenario_key))
         and (not benchmark_family or str(artifact.get("benchmark_family")) == str(benchmark_family))
     ]
-    expected_backbone_name = BACKBONE_NAME_OTFLOW_MOLECULE if benchmark_family == MOLECULE_FAMILY else BACKBONE_NAME_OTFLOW
+    expected_backbone_name = (
+        BACKBONE_NAME_OTFLOW_MOLECULE if benchmark_family == MOLECULE_FAMILY else BACKBONE_NAME_OTFLOW
+    )
     wrong_backbone_names = sorted(
         {
             str(artifact.get("backbone_name", ""))
@@ -786,9 +797,7 @@ def validate_provided_backbone_manifest(
             f"use backbone names {wrong_backbone_names}; expected {expected_backbone_name!r}."
         )
     matching_artifacts = [
-        artifact
-        for artifact in candidate_artifacts
-        if str(artifact.get("backbone_name", "")) == expected_backbone_name
+        artifact for artifact in candidate_artifacts if str(artifact.get("backbone_name", "")) == expected_backbone_name
     ]
     if not matching_artifacts:
         errors.append(
@@ -798,7 +807,9 @@ def validate_provided_backbone_manifest(
     expected_steps = {int(step) for step in TRAIN_BUDGET_STEPS}
     observed_steps = {int(artifact.get("train_steps", -1)) for artifact in matching_artifacts}
     if matching_artifacts and not expected_steps.issubset(observed_steps):
-        errors.append(f"Provided backbone artifacts have train steps {sorted(observed_steps)}; expected at least {sorted(expected_steps)}.")
+        errors.append(
+            f"Provided backbone artifacts have train steps {sorted(observed_steps)}; expected at least {sorted(expected_steps)}."
+        )
     lookup_counts: Dict[tuple[Any, ...], int] = {}
     for artifact in matching_artifacts:
         key = (
@@ -818,7 +829,9 @@ def validate_provided_backbone_manifest(
         for step in sorted(expected_steps):
             count = sum(1 for artifact in matching_artifacts if int(artifact.get("train_steps", -1)) == int(step))
             if count != 1:
-                errors.append(f"Provided temporal scenario has {count} ready {expected_backbone_name} artifacts for train_steps={step}; expected 1.")
+                errors.append(
+                    f"Provided temporal scenario has {count} ready {expected_backbone_name} artifacts for train_steps={step}; expected 1."
+                )
     if benchmark_family == MOLECULE_FAMILY:
         members: Dict[tuple[str, str, str], set[int]] = {}
         for artifact in matching_artifacts:
@@ -832,7 +845,9 @@ def validate_provided_backbone_manifest(
             errors.append(f"Provided molecule scenario has {len(members)} members; expected 6.")
         for member, member_steps in sorted(members.items()):
             if member_steps != expected_steps:
-                errors.append(f"Provided molecule member {'/'.join(member)} has train steps {sorted(member_steps)}; expected {sorted(expected_steps)}.")
+                errors.append(
+                    f"Provided molecule member {'/'.join(member)} has train steps {sorted(member_steps)}; expected {sorted(expected_steps)}."
+                )
     for artifact in matching_artifacts:
         for field in PATH_FIELDS:
             value = str(artifact.get(field, "") or "")
@@ -868,7 +883,9 @@ def apply_backbone_package_to_args(args: argparse.Namespace) -> argparse.Namespa
     args.shared_backbone_root = str(package_root / "outputs" / "shared_backbones" / "otflow_fullhorizon_seed0")
     args.dataset_root = str(package_root / "paper_datasets")
     args.cryptos_path = str(package_root / "data" / "cryptos_binance_spot_monthly_1s_l10.npz")
-    args.lobster_synthetic_profile_path = str(package_root / "data" / "lobster_synthetic" / "lobster_free_sample_profile_10.json")
+    args.lobster_synthetic_profile_path = str(
+        package_root / "data" / "lobster_synthetic" / "lobster_free_sample_profile_10.json"
+    )
     args.long_term_st_path = str(package_root / "data" / "long_term_st_100hz_context_only")
     args.molecule_group_root = str(package_root / "data" / "molecule_3d")
     args.molecule_backbone_root = str(package_root / "outputs" / "molecule_3d_backbones")

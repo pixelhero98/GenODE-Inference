@@ -5,8 +5,8 @@ import copy
 import hashlib
 import json
 import math
-from numbers import Real
 import time
+from numbers import Real
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -173,9 +173,7 @@ def ensure_forecast_dataset(dataset_root: Path, dataset: str, *, prepare: bool) 
     if manifest.exists():
         return
     if not prepare:
-        raise FileNotFoundError(
-            f"Missing Monash manifest for {dataset}: {manifest}. Re-run with --prepare_data."
-        )
+        raise FileNotFoundError(f"Missing Monash manifest for {dataset}: {manifest}. Re-run with --prepare_data.")
     download_monash_dataset(dataset_root, dataset)
 
 
@@ -187,7 +185,9 @@ def _active_backbone_budgets(dataset: str, benchmark_family: str) -> Tuple[int, 
     return ()
 
 
-def _parse_checkpoint_steps(raw: str | Sequence[int] | None, *, dataset: str, benchmark_family: str, max_steps: int) -> Tuple[int, ...]:
+def _parse_checkpoint_steps(
+    raw: str | Sequence[int] | None, *, dataset: str, benchmark_family: str, max_steps: int
+) -> Tuple[int, ...]:
     if raw is None or str(raw).strip() == "":
         planned = _active_backbone_budgets(str(dataset), str(benchmark_family))
         steps = [int(value) for value in planned if int(value) <= int(max_steps)]
@@ -265,9 +265,7 @@ def _temporal_training_signature(
         "checkpoint_steps": [int(value) for value in checkpoint_steps],
         "checkpoint_export_mode": str(checkpoint_export_mode),
         "val_every": int(getattr(args, "val_every", 0) or 0),
-        "val_max_batches": None
-        if getattr(args, "val_max_batches", None) is None
-        else int(getattr(args, "val_max_batches")),
+        "val_max_batches": None if getattr(args, "val_max_batches", None) is None else int(args.val_max_batches),
         "cfg": cfg.to_dict(),
         "split_stats": _json_ready_stats(dict(split_stats)),
     }
@@ -298,14 +296,18 @@ def _resolve_training_state_path(
     explicit_resume = str(getattr(args, "resume_training_state", "") or "").strip()
     if explicit_resume:
         return resolve_project_path(explicit_resume)
-    return _default_training_state_path(args, benchmark_family=str(benchmark_family), signature_hash=str(signature_hash))
+    return _default_training_state_path(
+        args, benchmark_family=str(benchmark_family), signature_hash=str(signature_hash)
+    )
 
 
 def _load_compatible_training_state(path: Path, *, signature_hash: str) -> Dict[str, Any]:
     payload = _torch_load(path)
     version = str(payload.get("version", ""))
     if version != TEMPORAL_BACKBONE_TRAINING_STATE_VERSION:
-        raise ValueError(f"Training state {path} has version={version!r}, expected {TEMPORAL_BACKBONE_TRAINING_STATE_VERSION!r}.")
+        raise ValueError(
+            f"Training state {path} has version={version!r}, expected {TEMPORAL_BACKBONE_TRAINING_STATE_VERSION!r}."
+        )
     state_hash = str(payload.get("signature_hash", ""))
     if state_hash != str(signature_hash):
         raise ValueError(f"Training state {path} does not match this run signature.")
@@ -423,14 +425,16 @@ def _conditional_dataset_args(args: argparse.Namespace, cfg: OTFlowConfig) -> ar
     )
 
 
-def _train_temporal_backbone(args: argparse.Namespace, *, benchmark_family: str, spec: Any, cfg: OTFlowConfig, splits: Mapping[str, Any]) -> Dict[str, Any]:
+def _train_temporal_backbone(
+    args: argparse.Namespace, *, benchmark_family: str, spec: Any, cfg: OTFlowConfig, splits: Mapping[str, Any]
+) -> Dict[str, Any]:
     checkpoint_steps = _parse_checkpoint_steps(
         getattr(args, "checkpoint_steps", None),
         dataset=str(args.dataset),
         benchmark_family=str(benchmark_family),
         max_steps=int(args.steps),
     )
-    checkpoint_step_set = set(int(value) for value in checkpoint_steps)
+    checkpoint_step_set = {int(value) for value in checkpoint_steps}
     checkpoint_export_mode = _normalize_checkpoint_export_mode(getattr(args, "checkpoint_export_mode", ""))
     exact_budget_export = checkpoint_export_mode == CHECKPOINT_EXPORT_MODE_EXACT_BUDGET
     expected_protocol = (
@@ -648,11 +652,7 @@ def _train_temporal_backbone(args: argparse.Namespace, *, benchmark_family: str,
     def _on_step(step: int, model: torch.nn.Module, train_loss: float, logs: Dict[str, float]) -> None:
         del logs
         is_budget_step = int(step) in checkpoint_step_set
-        should_validate = is_budget_step or (
-            not exact_budget_export
-            and val_every > 0
-            and int(step) % val_every == 0
-        )
+        should_validate = is_budget_step or (not exact_budget_export and val_every > 0 and int(step) % val_every == 0)
         validation = None
         if should_validate:
             validation = evaluate_average_loss(

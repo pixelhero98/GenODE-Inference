@@ -10,12 +10,12 @@ import numpy as np
 import torch
 
 from genode.data.otflow_datasets import L2FeatureMap, build_dataset_splits_from_arrays
-from genode.models.config import OTFlowConfig
 from genode.evaluation.otflow_evaluation_support import (
     _forecast_example_detail_metadata,
     load_checkpoint_model,
     resolved_eval_windows,
 )
+from genode.models.config import OTFlowConfig
 from genode.models.otflow_model import OTFLOW_TRACE_FIELDS, OTFlow
 from genode.models.otflow_train_val import _temporary_eval_seed, seed_all
 
@@ -379,6 +379,7 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
 
         self.assertIsInstance(loaded, OTFlow)
         self.assertFalse(hasattr(loaded_cfg.model, "baseline_latent_dim"))
+
 
 if __name__ == "__main__":
     unittest.main()

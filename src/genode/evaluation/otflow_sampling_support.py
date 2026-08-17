@@ -7,7 +7,6 @@ import torch
 
 from genode.models.otflow_train_val import select_eval_window_starts
 
-
 PRIMARY_METRICS = (
     "score_main",
     "temporal_tstr_f1",

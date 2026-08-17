@@ -10,7 +10,6 @@ from genode.solvers.protocol import (
     validate_target_nfe,
 )
 
-
 __all__ = [
     "EULER_SOLVER_KEY",
     "EulerSolver",

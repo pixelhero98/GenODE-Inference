@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from genode.canonical_experiment_layout import NFE_ROLE_SEEN, SCENARIO_FAMILY_MOLECULE, canonical_nfes_for_role
 from genode.data.molecule_xyz import (
     ATOM_COVALENT_RADIUS,
     DEFAULT_MOLECULE_DATASET_KEY,
@@ -18,7 +19,6 @@ from genode.data.molecule_xyz import (
     load_molecule_group_manifest,
     molecule_stats_from_mapping,
 )
-from genode.canonical_experiment_layout import NFE_ROLE_SEEN, SCENARIO_FAMILY_MOLECULE, canonical_nfes_for_role
 from genode.data.otflow_paths import project_root, resolve_project_path
 from genode.evaluation.otflow_evaluation_support import (
     load_checkpoint_model,
@@ -127,7 +127,9 @@ def _bond_pairs(reference_coords: np.ndarray, atom_symbols: Sequence[str]) -> np
     return np.asarray(pairs, dtype=np.int64)
 
 
-def _validity_metrics(pred: np.ndarray, true: np.ndarray, atom_symbols: Sequence[str], bond_pairs: np.ndarray) -> Dict[str, float]:
+def _validity_metrics(
+    pred: np.ndarray, true: np.ndarray, atom_symbols: Sequence[str], bond_pairs: np.ndarray
+) -> Dict[str, float]:
     finite = float(np.isfinite(pred).all())
     pred_dist = _pairwise_distances(pred)
     clash_count = 0
@@ -140,10 +142,7 @@ def _validity_metrics(pred: np.ndarray, true: np.ndarray, atom_symbols: Sequence
                 clash_count += 1
     if len(bond_pairs) > 0:
         true_dist = _pairwise_distances(true)
-        bond_errors = [
-            abs(float(pred_dist[int(i), int(j)]) - float(true_dist[int(i), int(j)]))
-            for i, j in bond_pairs
-        ]
+        bond_errors = [abs(float(pred_dist[int(i), int(j)]) - float(true_dist[int(i), int(j)])) for i, j in bond_pairs]
         bond_violation = float(np.mean(np.asarray(bond_errors) > 0.20))
     else:
         bond_violation = 0.0
@@ -252,7 +251,9 @@ def _sample_molecule_ar_rollout(
     return np.stack(generated, axis=0).astype(np.float32)
 
 
-def _motion_norms_from_paths(paths: np.ndarray, previous_frame: Optional[np.ndarray]) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+def _motion_norms_from_paths(
+    paths: np.ndarray, previous_frame: Optional[np.ndarray]
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     arr = np.asarray(paths, dtype=np.float32)
     if arr.ndim != 4:
         raise ValueError(f"Expected coordinate paths [samples, frames, atoms, 3], got {arr.shape}.")
@@ -301,31 +302,38 @@ def molecule_rollout_motion_metrics(
         axis=1,
     )
     true_paths = np.concatenate(
-        [np.broadcast_to(current[None, None, :, :], (pred.shape[0], 1, true.shape[1], 3)), np.broadcast_to(true[None], pred.shape)],
+        [
+            np.broadcast_to(current[None, None, :, :], (pred.shape[0], 1, true.shape[1], 3)),
+            np.broadcast_to(true[None], pred.shape),
+        ],
         axis=1,
     )
     pred_velocity, pred_acceleration = _motion_norms_from_paths(pred_paths, previous)
     true_velocity, true_acceleration = _motion_norms_from_paths(true_paths, previous)
     velocity_by_horizon = {
-        str(h + 1): _wasserstein_1d(pred_velocity[:, h, :], true_velocity[:, h, :])
-        for h in range(steps)
+        str(h + 1): _wasserstein_1d(pred_velocity[:, h, :], true_velocity[:, h, :]) for h in range(steps)
     }
     if pred_acceleration is None or true_acceleration is None:
         acceleration_by_horizon: Dict[str, float] = {str(h + 1): float("nan") for h in range(steps)}
         acceleration_ensemble = float("nan")
     else:
         acceleration_by_horizon = {
-            str(h + 1): _wasserstein_1d(pred_acceleration[:, h, :], true_acceleration[:, h, :])
-            for h in range(steps)
+            str(h + 1): _wasserstein_1d(pred_acceleration[:, h, :], true_acceleration[:, h, :]) for h in range(steps)
         }
         acceleration_ensemble = _wasserstein_1d(pred_acceleration, true_acceleration)
-    velocity_values = np.asarray([value for value in velocity_by_horizon.values() if np.isfinite(value)], dtype=np.float64)
-    acceleration_values = np.asarray([value for value in acceleration_by_horizon.values() if np.isfinite(value)], dtype=np.float64)
+    velocity_values = np.asarray(
+        [value for value in velocity_by_horizon.values() if np.isfinite(value)], dtype=np.float64
+    )
+    acceleration_values = np.asarray(
+        [value for value in acceleration_by_horizon.values() if np.isfinite(value)], dtype=np.float64
+    )
     return {
         "molecule_ensemble_velocity_norm_w1": _wasserstein_1d(pred_velocity, true_velocity),
         "molecule_ensemble_acceleration_norm_w1": acceleration_ensemble,
         "molecule_rollout_velocity_norm_w1": float(np.mean(velocity_values)) if velocity_values.size else float("nan"),
-        "molecule_rollout_acceleration_norm_w1": float(np.mean(acceleration_values)) if acceleration_values.size else float("nan"),
+        "molecule_rollout_acceleration_norm_w1": float(np.mean(acceleration_values))
+        if acceleration_values.size
+        else float("nan"),
         "molecule_rollout_velocity_norm_w1_by_horizon": velocity_by_horizon,
         "molecule_rollout_acceleration_norm_w1_by_horizon": acceleration_by_horizon,
     }
@@ -474,9 +482,19 @@ def _molecule_window_metrics(
         "molecule_rollout_acceleration_norm_w1": motion.get("molecule_rollout_acceleration_norm_w1"),
         "molecule_coordinate_w1_mean": distributional.get("molecule_coordinate_w1_mean"),
         "molecule_pair_distance_w1": distributional.get("molecule_pair_distance_w1"),
-        "molecule_kabsch_rmsd_3d_sample_std": float(np.std(np.asarray(kabsch_values, dtype=np.float64))) if kabsch_values else float("nan"),
+        "molecule_kabsch_rmsd_3d_sample_std": float(np.std(np.asarray(kabsch_values, dtype=np.float64)))
+        if kabsch_values
+        else float("nan"),
     }
-    for key in ("raw_coord_mae", "raw_coord_rmse", "pairwise_distance_mae", "pairwise_distance_rmse", "finite_rate", "clash_rate", "bond_contact_violation_rate"):
+    for key in (
+        "raw_coord_mae",
+        "raw_coord_rmse",
+        "pairwise_distance_mae",
+        "pairwise_distance_rmse",
+        "finite_rate",
+        "clash_rate",
+        "bond_contact_violation_rate",
+    ):
         row[key] = _safe_mean([metrics.get(key) for metrics in first_horizon_metrics])
     return row
 
@@ -579,7 +597,10 @@ def evaluate_molecule_rollout_schedule(
                     "num_eval_samples": int(sample_count),
                     "sample_seed_start": int(seed) + 10_000 * int(example_idx),
                     "sample_seed_values_json": json.dumps(
-                        [int(seed) + 10_000 * int(example_idx) + int(sample_idx) for sample_idx in range(int(sample_count))],
+                        [
+                            int(seed) + 10_000 * int(example_idx) + int(sample_idx)
+                            for sample_idx in range(int(sample_count))
+                        ],
                         separators=(",", ":"),
                     ),
                 }
@@ -623,7 +644,9 @@ def load_molecule_checkpoint_splits(
         expected_identity="molecule OTFlow checkpoint",
     )
     if "molecule_stats" not in checkpoint_payload:
-        raise RuntimeError("Molecule checkpoint is missing molecule_stats; refusing to rebuild normalization for evaluation.")
+        raise RuntimeError(
+            "Molecule checkpoint is missing molecule_stats; refusing to rebuild normalization for evaluation."
+        )
     checkpoint_stats = molecule_stats_from_mapping(checkpoint_payload["molecule_stats"])
     resolved_dataset_key = str(dataset_key or checkpoint_payload.get("dataset_key", "") or DEFAULT_MOLECULE_DATASET_KEY)
     resolved_stratum = str(stratum or checkpoint_payload.get("stratum", "") or "")
@@ -748,12 +771,12 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
         expected_identity="molecule OTFlow checkpoint",
     )
     if "molecule_stats" not in checkpoint_payload:
-        raise RuntimeError("Molecule checkpoint is missing molecule_stats; refusing to rebuild normalization for evaluation.")
+        raise RuntimeError(
+            "Molecule checkpoint is missing molecule_stats; refusing to rebuild normalization for evaluation."
+        )
     checkpoint_stats = molecule_stats_from_mapping(checkpoint_payload["molecule_stats"])
     dataset_key = str(
-        getattr(args, "dataset_key", "")
-        or checkpoint_payload.get("dataset_key", "")
-        or DEFAULT_MOLECULE_DATASET_KEY
+        getattr(args, "dataset_key", "") or checkpoint_payload.get("dataset_key", "") or DEFAULT_MOLECULE_DATASET_KEY
     )
     stratum = str(getattr(args, "stratum", "") or checkpoint_payload.get("stratum", "") or "")
     processed_dir = (
@@ -856,7 +879,10 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
                 sample_kabsch.append(float(metrics["molecule_kabsch_rmsd_3d"]))
                 if h == 0:
                     is_transition = bool(item.get("transition_window", item["transition"]))
-                    scopes = ["all_first_horizon", "transition_first_horizon" if is_transition else "clean_first_horizon"]
+                    scopes = [
+                        "all_first_horizon",
+                        "transition_first_horizon" if is_transition else "clean_first_horizon",
+                    ]
                     for scope in scopes:
                         dist_inputs[scope]["pred"].append(pred_future[h].astype(np.float32))
                         dist_inputs[scope]["true"].append(true_future[h].astype(np.float32))
@@ -870,11 +896,7 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
                 history_coords,
             )
             motion_rows.append(
-                {
-                    key: float(value)
-                    for key, value in motion.items()
-                    if isinstance(value, (int, float, np.floating))
-                }
+                {key: float(value) for key, value in motion.items() if isinstance(value, (int, float, np.floating))}
             )
             for horizon_key, value in dict(motion["molecule_rollout_velocity_norm_w1_by_horizon"]).items():
                 rollout_velocity_horizon_rows.setdefault(int(horizon_key), []).append(
@@ -937,7 +959,9 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
             "motion_distribution": _aggregate(motion_rows),
             "rollout_stability_by_horizon": {
                 "velocity": {str(h): _aggregate(rows) for h, rows in sorted(rollout_velocity_horizon_rows.items())},
-                "acceleration": {str(h): _aggregate(rows) for h, rows in sorted(rollout_acceleration_horizon_rows.items())},
+                "acceleration": {
+                    str(h): _aggregate(rows) for h, rows in sorted(rollout_acceleration_horizon_rows.items())
+                },
             },
         },
     }
@@ -987,7 +1011,9 @@ def evaluate_molecule_checkpoint_grid(args: argparse.Namespace) -> Dict[str, Any
         return evaluations[0]
     return {
         "benchmark_family": SCENARIO_FAMILY_MOLECULE,
-        "scenario_key": str(getattr(args, "scenario_key", "") or getattr(args, "dataset_key", DEFAULT_MOLECULE_DATASET_KEY)),
+        "scenario_key": str(
+            getattr(args, "scenario_key", "") or getattr(args, "dataset_key", DEFAULT_MOLECULE_DATASET_KEY)
+        ),
         "nfe_role": str(getattr(args, "nfe_role", NFE_ROLE_SEEN) or NFE_ROLE_SEEN),
         "solver_keys": sorted({str(row["solver_key"]) for row in evaluations}, key=CANONICAL_SOLVER_KEYS.index),
         "target_nfe_values": sorted({int(row["target_nfe"]) for row in evaluations}),

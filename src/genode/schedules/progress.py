@@ -5,7 +5,6 @@ from numbers import Integral
 import torch
 from torch import Tensor
 
-
 PROGRESS_PROTOCOL = "noise_to_data_progress_v1"
 NOISE_ENDPOINT = 0.0
 DATA_ENDPOINT = 1.0

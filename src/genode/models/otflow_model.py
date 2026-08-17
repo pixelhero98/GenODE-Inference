@@ -9,7 +9,6 @@ from genode.models.config import OTFlowConfig
 from genode.models.rectified_flow import RectifiedFlow
 from genode.solver_protocol import normalize_solver_key
 
-
 OTFLOW_TRACE_FIELDS: Tuple[str, ...] = (
     "solver",
     "steps",
@@ -93,7 +92,6 @@ def _solve_linear_assignment(cost: torch.Tensor) -> torch.Tensor:
 
 
 class OTFlow(RectifiedFlow):
-
     def __init__(self, cfg: OTFlowConfig):
         super().__init__(cfg)
 
@@ -218,7 +216,7 @@ class OTFlow(RectifiedFlow):
             )
         if abs(float(raw_grid[0])) > 1e-8 or abs(float(raw_grid[-1]) - 1.0) > 1e-8:
             raise ValueError("sample.time_grid must start at 0.0 and end at 1.0.")
-        for left, right in zip(raw_grid, raw_grid[1:]):
+        for left, right in zip(raw_grid, raw_grid[1:], strict=False):
             if float(right) <= float(left):
                 raise ValueError("sample.time_grid must be strictly increasing.")
         return raw_grid

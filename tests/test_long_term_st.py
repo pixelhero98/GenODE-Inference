@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from genode.data.experiment_common import OTFLOW_PAPER_DATASET_CHOICES, get_otflow_paper_backbone_preset
 from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 from genode.data.otflow_medical_datasets import (
     LazyLongTermSTConditionalDataset,
@@ -18,7 +19,6 @@ from genode.data.otflow_medical_datasets import (
     _validate_long_term_st_manifest,
     prepare_long_term_st_dataset,
 )
-from genode.data.experiment_common import OTFLOW_PAPER_DATASET_CHOICES, get_otflow_paper_backbone_preset
 from genode.evaluation.otflow_evaluation_support import (
     DEFAULT_CONDITIONAL_GENERATION_DATASETS,
     parse_conditional_generation_datasets,

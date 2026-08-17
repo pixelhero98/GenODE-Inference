@@ -13,7 +13,6 @@ import numpy as np
 
 from genode.artifacts.identity import semantic_sha256
 
-
 AYS_SD15_TIMESTEPS: Tuple[int, ...] = (999, 850, 736, 645, 545, 455, 343, 233, 124, 24)
 AYS_SD15_SIGMAS: Tuple[float, ...] = (14.615, 6.475, 3.861, 2.697, 1.886, 1.396, 0.963, 0.652, 0.399, 0.152, 0.0)
 SD15_NUM_TRAIN_TIMESTEPS = 1000
@@ -383,8 +382,7 @@ OTS_VP_LINEAR_OFFICIAL_LAMBDAS: Mapping[int, Tuple[float, ...]] = MappingProxyTy
     }
 )
 OTS_VP_LINEAR_REALIZATION_ENVIRONMENT = (
-    "Python 3.13.5; NumPy 2.5.1; SciPy 1.18.0; Torch 2.13.0+cpu; "
-    "torch default dtype float32"
+    "Python 3.13.5; NumPy 2.5.1; SciPy 1.18.0; Torch 2.13.0+cpu; torch default dtype float32"
 )
 OTS_VP_LINEAR_TABLE_SHA256 = semantic_sha256(
     {
@@ -541,8 +539,7 @@ def _base_specs() -> Dict[str, ReferenceClockSpec]:
             realization_sha256=OTS_VP_LINEAR_TABLE_SHA256,
             realization_environment=OTS_VP_LINEAR_REALIZATION_ENVIRONMENT,
             notes=(
-                "The pinned official lambda_res nodes viewed in log(sigma/alpha), then normalized "
-                "to GenODE progress."
+                "The pinned official lambda_res nodes viewed in log(sigma/alpha), then normalized to GenODE progress."
             ),
         ),
         "flowts_power_0p03": ReferenceClockSpec(
@@ -771,9 +768,7 @@ def build_reference_clock_grid(key: str, n_steps: int) -> Tuple[float, ...]:
     if normalized not in registry:
         raise KeyError(f"Unknown reference clock {key!r}.")
     if normalized.endswith("_reversed"):
-        return reverse_reference_clock_grid(
-            build_reference_clock_grid(base_key, n_steps)
-        )
+        return reverse_reference_clock_grid(build_reference_clock_grid(base_key, n_steps))
     if normalized == "uniform":
         return _finalize(np.linspace(0.0, 1.0, n_steps + 1, dtype=np.float64))
     if normalized.startswith("late_p_"):

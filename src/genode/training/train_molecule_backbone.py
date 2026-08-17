@@ -26,7 +26,6 @@ from genode.runtime import resolve_torch_device
 from genode.solver_protocol import CANONICAL_SOLVER_KEYS, normalize_solver_key
 from genode.training.train_backbone import _clone_state_dict_cpu, _json_ready_stats
 
-
 DEFAULT_HISTORY_LEN = 16
 DEFAULT_STEPS = 20_000
 DEFAULT_VAL_EVERY = 200
@@ -151,7 +150,11 @@ def _evaluate_iso_balanced_loss(
         starts = ds.start_indices[ds.data.trajectory_ids[ds.start_indices] == int(group_id)]
         if len(starts) == 0:
             continue
-        key = str(ds.data.trajectory_keys[int(group_id)]) if int(group_id) < len(ds.data.trajectory_keys) else str(int(group_id))
+        key = (
+            str(ds.data.trajectory_keys[int(group_id)])
+            if int(group_id) < len(ds.data.trajectory_keys)
+            else str(int(group_id))
+        )
         sub_ds = MoleculeWindowDataset(
             ds.data,
             split=f"{ds.split}_trajectory_{int(group_id)}",
@@ -269,7 +272,9 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         stratum=stratum,
     )
     if not bool(metadata.get("trainable", True)) and not bool(getattr(args, "allow_non_trainable", False)):
-        raise ValueError(f"{metadata.get('dataset_key')}/{metadata.get('stratum')} is marked preprocess-only and is not queued for training.")
+        raise ValueError(
+            f"{metadata.get('dataset_key')}/{metadata.get('stratum')} is marked preprocess-only and is not queued for training."
+        )
     cfg = build_molecule_cfg(
         args,
         atom_count=int(metadata["atom_count"]),
@@ -456,14 +461,20 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
         member_key=member_key,
         stratum=stratum,
     )
-    molecule_backbone_root = project_outputs_root() / "molecule_3d_backbones" if args.out_dir is None else resolve_project_path(str(args.out_dir))
+    molecule_backbone_root = (
+        project_outputs_root() / "molecule_3d_backbones"
+        if args.out_dir is None
+        else resolve_project_path(str(args.out_dir))
+    )
     manifest_path = _backbone_manifest_write_path(args, molecule_backbone_root)
     manifest = materialize_backbone_manifest(
         matrix_root=manifest_path.parent,
         budget_steps=budget_steps,
         seed=int(args.seed),
         molecule_backbone_root=molecule_backbone_root,
-        molecule_group_root=None if getattr(args, "molecule_group_root", None) is None else resolve_project_path(str(args.molecule_group_root)),
+        molecule_group_root=None
+        if getattr(args, "molecule_group_root", None) is None
+        else resolve_project_path(str(args.molecule_group_root)),
         write_path=manifest_path,
     )
     summary = {

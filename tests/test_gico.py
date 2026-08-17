@@ -17,35 +17,40 @@ from genode.gico.density_representation import (
     grid_to_density_mass,
     uniform_reference_grid,
 )
-from genode.gico.models import SETTING_ENCODER_MODE_CONTINUOUS_V3, build_setting_encoder_config, setting_feature_dim, setting_features
+from genode.gico.models import (
+    SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    build_setting_encoder_config,
+    setting_feature_dim,
+    setting_features,
+)
 from genode.gico.policy import (
     ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
     ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
     CONDITIONING_STYLE_ADDITIVE_MLP,
     DENSITY_TOKEN_ATTENTION_ROPE,
     GICO_PROTOCOL,
-    GICODensityFormTeacherTransformer,
-    GICODensityQueryStudentTransformer,
     MODEL_PAYLOAD_VERSION,
     TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
-    TEACHER_METRIC_TARGET_KEYS,
     TEACHER_METRIC_MASK_PROTOCOL,
+    TEACHER_METRIC_TARGET_KEYS,
     TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
     TEACHER_OUTPUT_METRIC_VECTOR,
     TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
     DensityFeatureNormalizer,
+    GICODensityFormTeacherTransformer,
+    GICODensityQueryStudentTransformer,
+    _density_mass_to_normalized_log_features_torch,
+    _group_indices_by_pair_key,
+    _make_group_minibatch_sampler,
+    _make_index_minibatch_sampler,
+    _student_teacher_score_eta,
+    _student_teacher_score_objective,
     build_gico_student_model,
     build_gico_teacher_model,
     build_teacher_weighted_density_targets,
     complete_candidate_group_payload,
     density_mass_for_row,
     gico_teacher_diagnostics,
-    _density_mass_to_normalized_log_features_torch,
-    _group_indices_by_pair_key,
-    _make_group_minibatch_sampler,
-    _make_index_minibatch_sampler,
-    _student_teacher_score_objective,
-    _student_teacher_score_eta,
     nfe_sequence_diagnostic_summary,
     realized_nfe_from_row,
     teacher_selection_candidate_group_key,
@@ -83,7 +88,9 @@ class _FixedScoreTeacher(torch.nn.Module):
     def forward(self, setting_feature_batch, density_feature_batch, context_embedding_batch):
         batch = int(setting_feature_batch.shape[0])
         values = self.scores[:batch]
-        return torch.tensor(values, dtype=density_feature_batch.dtype, device=density_feature_batch.device).unsqueeze(-1)
+        return torch.tensor(values, dtype=density_feature_batch.dtype, device=density_feature_batch.device).unsqueeze(
+            -1
+        )
 
 
 class _TwoMetricFixedScoreTeacher(torch.nn.Module):
@@ -226,8 +233,12 @@ class GICOCanonicalTests(unittest.TestCase):
 
     def test_student_teacher_score_eta_late_ramps(self) -> None:
         self.assertEqual(_student_teacher_score_eta(step=0, steps=10, base_weight=0.05, warmup_fraction=0.6), 0.0)
-        self.assertAlmostEqual(_student_teacher_score_eta(step=6, steps=10, base_weight=0.05, warmup_fraction=0.6), 0.0125)
-        self.assertAlmostEqual(_student_teacher_score_eta(step=9, steps=10, base_weight=0.05, warmup_fraction=0.6), 0.05)
+        self.assertAlmostEqual(
+            _student_teacher_score_eta(step=6, steps=10, base_weight=0.05, warmup_fraction=0.6), 0.0125
+        )
+        self.assertAlmostEqual(
+            _student_teacher_score_eta(step=9, steps=10, base_weight=0.05, warmup_fraction=0.6), 0.05
+        )
 
     def test_teacher_score_objective_backpropagates_through_frozen_teacher_input(self) -> None:
         reference = uniform_reference_grid(4)
@@ -567,9 +578,11 @@ class GICOCanonicalTests(unittest.TestCase):
         )
         for builder in (build_gico_teacher_model, build_gico_student_model):
             for key in retired_keys:
-                with self.subTest(builder=builder.__name__, key=key):
-                    with self.assertRaisesRegex(ValueError, "retired keys"):
-                        builder(**dimensions, model_config={key: 1})
+                with (
+                    self.subTest(builder=builder.__name__, key=key),
+                    self.assertRaisesRegex(ValueError, "retired keys"),
+                ):
+                    builder(**dimensions, model_config={key: 1})
 
     def test_trainer_argparser_exposes_only_canonical_conditioning(self) -> None:
         parser = build_train_argparser()
@@ -626,10 +639,14 @@ class GICOCanonicalTests(unittest.TestCase):
                 loaded_student, _, _, loaded_payload = _load_student_checkpoint(checkpoint_path)
             self.assertTrue(mocked_load.call_args.kwargs["weights_only"])
             self.assertEqual(loaded_student.setting_dim, setting_dim)
-            self.assertEqual(loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP)
+            self.assertEqual(
+                loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP
+            )
             loaded_student, _, _, loaded_payload = _load_student_checkpoint(checkpoint_path)
             self.assertEqual(loaded_student.setting_dim, setting_dim)
-            self.assertEqual(loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP)
+            self.assertEqual(
+                loaded_payload["student_model_config"]["conditioning_style"], CONDITIONING_STYLE_ADDITIVE_MLP
+            )
 
             legacy_path = root / "legacy_student.pt"
             legacy_payload = dict(payload)

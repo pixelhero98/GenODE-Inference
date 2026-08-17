@@ -127,12 +127,14 @@ class MoleculeManifestPathTests(unittest.TestCase):
             ("processed/member", "folder/trajectory.zip"),
         )
         for processed_dir, source_zip_name in cases:
-            with self.subTest(processed_dir=processed_dir, source_zip_name=source_zip_name):
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    root = Path(tmpdir)
-                    self._write_manifest(root, processed_dir=processed_dir, source_zip_name=source_zip_name)
-                    with self.assertRaises(ValueError):
-                        molecule_xyz.load_molecule_group_manifest("molecule_3d_set1", root)
+            with (
+                self.subTest(processed_dir=processed_dir, source_zip_name=source_zip_name),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                self._write_manifest(root, processed_dir=processed_dir, source_zip_name=source_zip_name)
+                with self.assertRaises(ValueError):
+                    molecule_xyz.load_molecule_group_manifest("molecule_3d_set1", root)
 
 
 class VerifiedDownloadTests(unittest.TestCase):
@@ -170,14 +172,16 @@ class VerifiedDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             destination = Path(tmpdir) / "payload.bin"
             destination.write_bytes(b"known-good-existing")
-            with mock.patch("urllib.request.urlopen", return_value=io.BytesIO(b"too large")):
-                with self.assertRaisesRegex(ValueError, "exceeded the expected size"):
-                    otflow_datasets._download_url_to_path(
-                        "https://example.invalid/payload.bin",
-                        destination,
-                        expected_size=3,
-                        expected_sha256=hashlib.sha256(b"abc").hexdigest(),
-                    )
+            with (
+                mock.patch("urllib.request.urlopen", return_value=io.BytesIO(b"too large")),
+                self.assertRaisesRegex(ValueError, "exceeded the expected size"),
+            ):
+                otflow_datasets._download_url_to_path(
+                    "https://example.invalid/payload.bin",
+                    destination,
+                    expected_size=3,
+                    expected_sha256=hashlib.sha256(b"abc").hexdigest(),
+                )
             self.assertEqual(destination.read_bytes(), b"known-good-existing")
             self.assertEqual(list(destination.parent.glob(f".{destination.name}.*.download")), [])
 
@@ -197,14 +201,16 @@ class VerifiedDownloadTests(unittest.TestCase):
             self.assertEqual(result, destination)
             urlopen.assert_not_called()
 
-            with mock.patch("urllib.request.urlopen", return_value=io.BytesIO(b"wrong bytes")):
-                with self.assertRaisesRegex(ValueError, "MD5"):
-                    otflow_monash_datasets._download_file(
-                        "https://example.invalid/archive.zip",
-                        destination,
-                        expected_size=len(b"wrong bytes"),
-                        expected_md5=digest,
-                    )
+            with (
+                mock.patch("urllib.request.urlopen", return_value=io.BytesIO(b"wrong bytes")),
+                self.assertRaisesRegex(ValueError, "MD5"),
+            ):
+                otflow_monash_datasets._download_file(
+                    "https://example.invalid/archive.zip",
+                    destination,
+                    expected_size=len(b"wrong bytes"),
+                    expected_md5=digest,
+                )
             self.assertEqual(destination.read_bytes(), payload)
             self.assertEqual(list(destination.parent.glob(f".{destination.name}.*.download")), [])
 
@@ -342,8 +348,7 @@ class MedicalChannelPathTests(unittest.TestCase):
             with zipfile.ZipFile(archive_path, "w") as archive:
                 for record_id in ("record_a", "record_b", "record_c"):
                     signal_lines = "\n".join(
-                        f"{record_id}_{index}.dat 16 1/mV 16 0 0 0 {name}"
-                        for index, name in enumerate(channel_names)
+                        f"{record_id}_{index}.dat 16 1/mV 16 0 0 0 {name}" for index, name in enumerate(channel_names)
                     )
                     header = f"{record_id} {len(channel_names)} 250 10\n{signal_lines}\n"
                     archive.writestr(f"nested/{record_id}.hea", header)
@@ -403,13 +408,13 @@ class MedicalChannelPathTests(unittest.TestCase):
                     otflow_medical_datasets,
                     "medical_staging_root",
                 ) as staging_resolution,
+                self.assertRaisesRegex(ValueError, "prepared destination.*reparse point"),
             ):
-                with self.assertRaisesRegex(ValueError, "prepared destination.*reparse point"):
-                    otflow_medical_datasets.prepare_long_term_st_dataset(
-                        destination,
-                        archive_paths=[],
-                        force=True,
-                    )
+                otflow_medical_datasets.prepare_long_term_st_dataset(
+                    destination,
+                    archive_paths=[],
+                    force=True,
+                )
             archive_resolution.assert_not_called()
             staging_resolution.assert_not_called()
 

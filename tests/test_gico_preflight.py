@@ -9,8 +9,8 @@ import unittest
 from pathlib import Path
 
 from genode.canonical_experiment_layout import SCENARIO_FAMILY_FORECAST
-from genode.gico.preflight import build_argparser, main as preflight_main, preflight_gico_rows, validate_gico_support_preflight_report
-
+from genode.gico.preflight import build_argparser, preflight_gico_rows, validate_gico_support_preflight_report
+from genode.gico.preflight import main as preflight_main
 
 SUPPORT_SCHEDULES = ("uniform", "late_p_2")
 ROW_FIELDS = (
@@ -153,7 +153,10 @@ class GicoPreflightTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "issues_found")
         self.assertTrue(
-            any(conflict["type"] == "checkpoint_prefixed_context_id" for conflict in report["context_identity_conflicts"]),
+            any(
+                conflict["type"] == "checkpoint_prefixed_context_id"
+                for conflict in report["context_identity_conflicts"]
+            ),
             report["context_identity_conflicts"],
         )
 

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
+import importlib.util
 import tempfile
 import unittest
-import importlib.util
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 import genode.visualization.build_ptg_observed_gain_figure as ptg_fig
-
 
 HAS_MATPLOTLIB = importlib.util.find_spec("matplotlib") is not None
 
@@ -37,9 +36,11 @@ def _lightweight_grid(schedule_key: str, runtime_nfe: int):
 
 class PtgObservedGainFigureTests(unittest.TestCase):
     def test_spearman_does_not_hide_scipy_failures(self) -> None:
-        with mock.patch("scipy.stats.spearmanr", side_effect=RuntimeError("scipy failure")):
-            with self.assertRaisesRegex(RuntimeError, "scipy failure"):
-                ptg_fig.spearman_correlation([1.0, 2.0, 3.0], [3.0, 2.0, 1.0])
+        with (
+            mock.patch("scipy.stats.spearmanr", side_effect=RuntimeError("scipy failure")),
+            self.assertRaisesRegex(RuntimeError, "scipy failure"),
+        ):
+            ptg_fig.spearman_correlation([1.0, 2.0, 3.0], [3.0, 2.0, 1.0])
 
     def test_hardness_normalization_integrates_to_one(self) -> None:
         reference_grid = [0.0, 0.2, 0.5, 1.0]
@@ -88,7 +89,7 @@ class PtgObservedGainFigureTests(unittest.TestCase):
         reversed_grid = ptg_fig.reverse_schedule_grid([0.0, 0.05, 0.2, 0.55, 1.0])
         self.assertEqual(reversed_grid[0], 0.0)
         self.assertEqual(reversed_grid[-1], 1.0)
-        self.assertTrue(all(right > left for left, right in zip(reversed_grid, reversed_grid[1:])))
+        self.assertTrue(all(right > left for left, right in zip(reversed_grid, reversed_grid[1:], strict=False)))
 
     def test_observed_gain_calculation(self) -> None:
         rows = [
@@ -131,7 +132,12 @@ class PtgObservedGainFigureTests(unittest.TestCase):
     def test_synthetic_points_are_exact_scope(self) -> None:
         with mock.patch.object(ptg_fig, "build_fixed_schedule_grid", side_effect=_lightweight_grid):
             points = ptg_fig.build_points(ptg_fig.synthetic_payload(), ptg_fig.synthetic_observed_rows())
-        expected_points = len(ptg_fig.DATASET_ORDER) * len(ptg_fig.SOLVER_ORDER) * len(ptg_fig.TARGET_NFES) * len(ptg_fig.TRANSFER_SCHEDULES)
+        expected_points = (
+            len(ptg_fig.DATASET_ORDER)
+            * len(ptg_fig.SOLVER_ORDER)
+            * len(ptg_fig.TARGET_NFES)
+            * len(ptg_fig.TRANSFER_SCHEDULES)
+        )
         self.assertEqual(len(points), expected_points)
         self.assertEqual({point["schedule_key"] for point in points}, set(ptg_fig.TRANSFER_SCHEDULES))
         self.assertTrue(all("observed_integration_gain_percent" in point for point in points))
@@ -187,7 +193,12 @@ class PtgObservedGainFigureTests(unittest.TestCase):
             points = ptg_fig.build_points(ptg_fig.synthetic_payload(), ptg_fig.synthetic_observed_rows())
         summary = ptg_fig.summarize_ptg_points(points)
         self.assertEqual(summary["main_ptg_key"], "ptg_info_growth_raw")
-        expected_points = len(ptg_fig.DATASET_ORDER) * len(ptg_fig.SOLVER_ORDER) * len(ptg_fig.TARGET_NFES) * len(ptg_fig.TRANSFER_SCHEDULES)
+        expected_points = (
+            len(ptg_fig.DATASET_ORDER)
+            * len(ptg_fig.SOLVER_ORDER)
+            * len(ptg_fig.TARGET_NFES)
+            * len(ptg_fig.TRANSFER_SCHEDULES)
+        )
         self.assertEqual(summary["n_points"], expected_points)
         self.assertEqual(summary["observed_y_key"], "observed_integration_gain_percent")
         self.assertIn("ptg_info_growth_raw", summary["variants"])
@@ -231,7 +242,12 @@ class PtgObservedGainFigureTests(unittest.TestCase):
             path = Path(tmpdir) / "stats.csv"
             ptg_fig.write_csv_rows(stats_rows, path)
             rows = ptg_fig.load_integration_gain_rows(path)
-        expected_points = len(ptg_fig.DATASET_ORDER) * len(ptg_fig.SOLVER_ORDER) * len(ptg_fig.TARGET_NFES) * len(ptg_fig.TRANSFER_SCHEDULES)
+        expected_points = (
+            len(ptg_fig.DATASET_ORDER)
+            * len(ptg_fig.SOLVER_ORDER)
+            * len(ptg_fig.TARGET_NFES)
+            * len(ptg_fig.TRANSFER_SCHEDULES)
+        )
         self.assertEqual(len(rows), expected_points)
         self.assertEqual({key[3] for key in rows}, set(ptg_fig.TRANSFER_SCHEDULES))
         self.assertFalse(any(key[3] == "not_a_transfer_clock" for key in rows))

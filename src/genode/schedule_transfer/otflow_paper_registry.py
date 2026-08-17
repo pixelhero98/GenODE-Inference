@@ -74,7 +74,9 @@ def paper_solver_specs() -> List[SolverSpec]:
     return [
         SolverSpec("euler", "Euler", 1, "deterministic_ode", "available", "all_schedules", "euler"),
         SolverSpec("heun", "Heun / RK2", 2, "deterministic_ode", "available", "all_schedules", "heun"),
-        SolverSpec("midpoint_rk2", "Midpoint RK2", 2, "deterministic_ode", "available", "all_schedules", "midpoint_rk2"),
+        SolverSpec(
+            "midpoint_rk2", "Midpoint RK2", 2, "deterministic_ode", "available", "all_schedules", "midpoint_rk2"
+        ),
         SolverSpec("dpmpp2m", "DPM++2M", 2, "multistep_ode", "available", "all_schedules", "dpmpp2m"),
     ]
 

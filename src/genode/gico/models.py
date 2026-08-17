@@ -34,7 +34,7 @@ def validate_time_grid(grid: Sequence[float], *, macro_steps: int) -> Tuple[floa
         raise ValueError("Schedule grid must start at 0.0 and end at 1.0.")
     if not all(torch.isfinite(torch.tensor(values)).tolist()):
         raise ValueError("Schedule grid contains non-finite values.")
-    if not all(b > a for a, b in zip(values, values[1:])):
+    if not all(b > a for a, b in zip(values, values[1:], strict=False)):
         raise ValueError("Schedule grid must be strictly increasing.")
     return values
 
@@ -68,8 +68,7 @@ def validate_series_encoding(value: str | None = None) -> str:
     encoding = str(value or SERIES_ENCODING_NONE_CONTEXT_ONLY).strip()
     if encoding != SERIES_ENCODING_NONE_CONTEXT_ONLY:
         raise ValueError(
-            f"GICO setting encoder requires series_encoding={SERIES_ENCODING_NONE_CONTEXT_ONLY!r}; "
-            f"got {encoding!r}."
+            f"GICO setting encoder requires series_encoding={SERIES_ENCODING_NONE_CONTEXT_ONLY!r}; got {encoding!r}."
         )
     return encoding
 
@@ -111,7 +110,9 @@ def build_setting_encoder_config(
     solver_metadata_version: str = SOLVER_METADATA_VERSION,
 ) -> SettingEncoderConfig:
     encoder_mode = validate_setting_encoder_mode(mode)
-    observed = _positive_sorted_ints(TARGET_NFES if observed_target_nfes is None else observed_target_nfes, label="observed_target_nfes")
+    observed = _positive_sorted_ints(
+        TARGET_NFES if observed_target_nfes is None else observed_target_nfes, label="observed_target_nfes"
+    )
     reference = int(max(observed + (DEFAULT_NFE_REFERENCE,)) if nfe_reference is None else nfe_reference)
     if reference <= 0:
         raise ValueError("nfe_reference must be positive.")
@@ -131,7 +132,9 @@ def build_setting_encoder_config(
     )
 
 
-def setting_encoder_config_from_payload(payload: Mapping[str, Any] | SettingEncoderConfig | None) -> SettingEncoderConfig:
+def setting_encoder_config_from_payload(
+    payload: Mapping[str, Any] | SettingEncoderConfig | None,
+) -> SettingEncoderConfig:
     if isinstance(payload, SettingEncoderConfig):
         validate_series_encoding(payload.series_encoding)
         return payload
@@ -141,7 +144,7 @@ def setting_encoder_config_from_payload(payload: Mapping[str, Any] | SettingEnco
         mode,
         observed_target_nfes=data.get("observed_target_nfes", TARGET_NFES),
         nfe_reference=data.get("nfe_reference", DEFAULT_NFE_REFERENCE),
-        rope_frequencies=data.get("rope_frequencies", None),
+        rope_frequencies=data.get("rope_frequencies"),
         series_encoding=str(data.get("series_encoding", DEFAULT_SERIES_ENCODING)),
         solver_metadata_version=str(data.get("solver_metadata_version", SOLVER_METADATA_VERSION)),
     )
@@ -154,7 +157,9 @@ def setting_encoder_config_for_rows(
     series_encoding: str = DEFAULT_SERIES_ENCODING,
 ) -> SettingEncoderConfig:
     observed = sorted({int(row["target_nfe"]) for row in rows})
-    return build_setting_encoder_config(mode, observed_target_nfes=observed or TARGET_NFES, series_encoding=series_encoding)
+    return build_setting_encoder_config(
+        mode, observed_target_nfes=observed or TARGET_NFES, series_encoding=series_encoding
+    )
 
 
 def setting_feature_dim(

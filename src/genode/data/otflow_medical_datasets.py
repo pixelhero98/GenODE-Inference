@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
-import os
 import hashlib
 import importlib.util
+import json
+import os
 import re
 import shutil
 import stat
@@ -17,12 +17,6 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from genode.models.config import OTFlowConfig
-from genode.path_safety import (
-    is_link_or_reparse_point,
-    portable_relative_path,
-    resolve_portable_relative_path,
-)
 from genode.data.otflow_medical_constants import (
     LONG_TERM_ST_DATASET_KEY,
     LONG_TERM_ST_DEFAULT_STRIDE,
@@ -34,6 +28,12 @@ from genode.data.otflow_medical_constants import (
     default_long_term_st_data_path,
     default_long_term_st_manifest_path,
 )
+from genode.models.config import OTFlowConfig
+from genode.path_safety import (
+    is_link_or_reparse_point,
+    portable_relative_path,
+    resolve_portable_relative_path,
+)
 
 LONG_TERM_ST_EXPECTED_RECORDS = 86
 LONG_TERM_ST_PATIENT_GROUPS: Tuple[Tuple[str, ...], ...] = (
@@ -42,6 +42,7 @@ LONG_TERM_ST_PATIENT_GROUPS: Tuple[Tuple[str, ...], ...] = (
     ("s30741", "s30742"),
     ("s30751", "s30752"),
 )
+
 
 def medical_staging_root() -> Path:
     raw = str(os.environ.get("OTFLOW_MEDICAL_STAGING_ROOT", "") or "").strip()
@@ -240,7 +241,9 @@ def _parse_long_term_st_header(record_id: str, text: str) -> LongTermSTHeader:
     )
 
 
-def _scan_long_term_st_archives(archive_paths: Sequence[Path]) -> Tuple[Dict[str, LongTermSTHeader], Dict[str, Tuple[Path, str]], List[Dict[str, Any]]]:
+def _scan_long_term_st_archives(
+    archive_paths: Sequence[Path],
+) -> Tuple[Dict[str, LongTermSTHeader], Dict[str, Tuple[Path, str]], List[Dict[str, Any]]]:
     headers: Dict[str, LongTermSTHeader] = {}
     dat_members: Dict[str, Tuple[Path, str]] = {}
     archive_rows: List[Dict[str, Any]] = []
@@ -287,9 +290,7 @@ def _copy_zip_member(member: Tuple[Path, str], *, target_root: Path, target_name
             f"{absolute_target_root}."
         )
     if absolute_target_root.exists() and not absolute_target_root.is_dir():
-        raise ValueError(
-            f"Long-Term ST extraction destination must be a directory: {absolute_target_root}."
-        )
+        raise ValueError(f"Long-Term ST extraction destination must be a directory: {absolute_target_root}.")
     absolute_target_root.mkdir(parents=True, exist_ok=True)
     if is_link_or_reparse_point(absolute_target_root):
         raise ValueError(
@@ -345,9 +346,7 @@ def _extract_long_term_st_wfdb_members(
             f"{absolute_source_dir}."
         )
     if absolute_source_dir.exists() and not absolute_source_dir.is_dir():
-        raise ValueError(
-            f"Long-Term ST extraction destination must be a directory: {absolute_source_dir}."
-        )
+        raise ValueError(f"Long-Term ST extraction destination must be a directory: {absolute_source_dir}.")
     absolute_source_dir.mkdir(parents=True, exist_ok=True)
     if is_link_or_reparse_point(absolute_source_dir):
         raise ValueError(
@@ -384,7 +383,7 @@ def _extract_long_term_st_wfdb_members(
 
 
 def _split_long_term_st_groups(group_ids: Sequence[str], train_frac: float, val_frac: float) -> Dict[str, str]:
-    groups = sorted(set(str(group_id) for group_id in group_ids))
+    groups = sorted({str(group_id) for group_id in group_ids})
     if len(groups) < 3:
         raise ValueError("Long-Term ST requires at least 3 record groups for train/val/test splits.")
     train_count = max(1, int(round(len(groups) * float(train_frac))))
@@ -474,11 +473,7 @@ def _validate_long_term_st_manifest_series_specs(payload: Mapping[str, Any], man
     prepared_dir = manifest_path.parent.resolve()
     group_split: Dict[str, str] = {}
     split_counts = {"train": 0, "val": 0, "test": 0}
-    known_group_by_record = {
-        record_id: "_".join(group)
-        for group in LONG_TERM_ST_PATIENT_GROUPS
-        for record_id in group
-    }
+    known_group_by_record = {record_id: "_".join(group) for group in LONG_TERM_ST_PATIENT_GROUPS for record_id in group}
     for idx, row in enumerate(rows):
         if not isinstance(row, Mapping):
             raise ValueError(f"Long-Term ST series_specs[{idx}] must be an object.")
@@ -501,8 +496,7 @@ def _validate_long_term_st_manifest_series_specs(payload: Mapping[str, Any], man
         prior_split = group_split.setdefault(group_id, split)
         if prior_split != split:
             raise ValueError(
-                f"Long-Term ST manifest group {group_id!r} appears in multiple splits: "
-                f"{prior_split!r} and {split!r}."
+                f"Long-Term ST manifest group {group_id!r} appears in multiple splits: {prior_split!r} and {split!r}."
             )
 
         resolved_file = _validate_long_term_st_series_file_name(row.get("file_name"), prepared_dir)
@@ -518,7 +512,9 @@ def _validate_long_term_st_manifest(path: Path, *, history_len: int, horizon: in
     payload = json.loads(path.read_text(encoding="utf-8"))
     if str(payload.get("dataset_key")) != LONG_TERM_ST_DATASET_KEY:
         raise ValueError(f"Unexpected Long-Term ST manifest dataset_key={payload.get('dataset_key')!r}.")
-    if int(payload.get("history_len", -1)) != int(history_len) or int(payload.get("future_block_len", -1)) != int(horizon):
+    if int(payload.get("history_len", -1)) != int(history_len) or int(payload.get("future_block_len", -1)) != int(
+        horizon
+    ):
         raise ValueError(
             "Existing Long-Term ST manifest does not match requested task: "
             f"history_len={payload.get('history_len')}, future_block_len={payload.get('future_block_len')}, "
@@ -544,8 +540,7 @@ def prepare_long_term_st_dataset(
     prepared_candidate = Path(out_dir or default_long_term_st_data_path()).expanduser().absolute()
     if is_link_or_reparse_point(prepared_candidate):
         raise ValueError(
-            "Long-Term ST prepared destination may not be a symlink, junction, or reparse point: "
-            f"{prepared_candidate}."
+            f"Long-Term ST prepared destination may not be a symlink, junction, or reparse point: {prepared_candidate}."
         )
     if prepared_candidate.exists() and not prepared_candidate.is_dir():
         raise ValueError(f"Long-Term ST prepared destination must be a directory: {prepared_candidate}.")
@@ -615,12 +610,16 @@ def prepare_long_term_st_dataset(
         record_path = source_dir / str(record_id)
         try:
             tail_start = max(0, int(header.signal_length) - 1000)
-            tail = wfdb.rdrecord(str(record_path), sampfrom=int(tail_start), sampto=int(header.signal_length), channels=[0])
+            tail = wfdb.rdrecord(
+                str(record_path), sampfrom=int(tail_start), sampto=int(header.signal_length), channels=[0]
+            )
             tail_values = np.asarray(tail.p_signal)
             if tail_values.shape[0] != int(header.signal_length) - int(tail_start):
                 raise ValueError("tail_read_length_mismatch")
         except Exception as exc:
-            skipped_records.append({"record_id": str(record_id), "reason": f"unreadable_declared_tail:{type(exc).__name__}"})
+            skipped_records.append(
+                {"record_id": str(record_id), "reason": f"unreadable_declared_tail:{type(exc).__name__}"}
+            )
             continue
 
         record_had_series = False
@@ -654,8 +653,12 @@ def prepare_long_term_st_dataset(
                     raise ValueError("prepared_series_too_short")
                 np.save(str(series_target), downsampled.astype(np.float32, copy=False))
                 total_length = int(downsampled.shape[0])
-                min_prepared_length = total_length if min_prepared_length is None else min(min_prepared_length, total_length)
-                max_prepared_length = total_length if max_prepared_length is None else max(max_prepared_length, total_length)
+                min_prepared_length = (
+                    total_length if min_prepared_length is None else min(min_prepared_length, total_length)
+                )
+                max_prepared_length = (
+                    total_length if max_prepared_length is None else max(max_prepared_length, total_length)
+                )
                 series_rows.append(
                     {
                         "series_id": f"{safe_record}::ch{int(channel_index)}::{safe_channel}",
@@ -711,8 +714,7 @@ def prepare_long_term_st_dataset(
         std = 1.0
 
     split_counts = {
-        split: int(sum(1 for row in series_rows if row["split"] == split))
-        for split in ("train", "val", "test")
+        split: int(sum(1 for row in series_rows if row["split"] == split)) for split in ("train", "val", "test")
     }
     record_split_counts = {
         split: int(len({row["record_id"] for row in series_rows if row["split"] == split}))

@@ -26,7 +26,6 @@ from genode.schedules.density import (
 from genode.schedules.progress import validate_time_grid
 from genode.schedules.specification import ScheduleSpecification
 
-
 FIXED_SCHEDULE_PROTOCOL = "image_reference_clock_schedule_v2"
 FIXED_SCHEDULE_TARGET_NFES = (2, 4, 8)
 _EXECUTABLE_BINDING_ATOL = 1e-12
@@ -40,10 +39,7 @@ def _fixed_target_nfe(value: object) -> int:
         )
     parsed = int(value)
     if parsed not in FIXED_SCHEDULE_TARGET_NFES:
-        raise ValueError(
-            "Image reference-clock target_nfe must be one of "
-            f"{FIXED_SCHEDULE_TARGET_NFES}, got {parsed}."
-        )
+        raise ValueError(f"Image reference-clock target_nfe must be one of {FIXED_SCHEDULE_TARGET_NFES}, got {parsed}.")
     return parsed
 
 
@@ -60,9 +56,7 @@ def _normalize_fixed_specification(
     try:
         reference_clock_provenance(specification.schedule_key)
     except (KeyError, ValueError) as exc:
-        raise ValueError(
-            f"Unsupported image reference clock {specification.schedule_key!r}."
-        ) from exc
+        raise ValueError(f"Unsupported image reference clock {specification.schedule_key!r}.") from exc
     return specification
 
 
@@ -82,9 +76,7 @@ def validate_fixed_schedule_keys(
 
     keys = tuple(str(value) for value in schedule_keys)
     if not keys or len(keys) != len(set(keys)):
-        raise ValueError(
-            "Image reference-clock keys must be non-empty and unique."
-        )
+        raise ValueError("Image reference-clock keys must be non-empty and unique.")
     for key in keys:
         try:
             reference_clock_provenance(key)
@@ -106,10 +98,7 @@ def default_fixed_schedule_specifications(
 ) -> tuple[ScheduleSpecification, ...]:
     """Return the canonical 23-clock image support plus requested late-p pairs."""
 
-    return tuple(
-        ScheduleSpecification(key)
-        for key in reference_clock_keys(extra_late_p_values)
-    )
+    return tuple(ScheduleSpecification(key) for key in reference_clock_keys(extra_late_p_values))
 
 
 @dataclass(frozen=True)
@@ -130,17 +119,9 @@ class FixedSchedule:
             reference_time_grid=reference,
         )
         if grid.ndim != 1 or reference.ndim != 1 or mass.ndim != 1:
-            raise ValueError(
-                "FixedSchedule requires one time grid, reference grid, and "
-                "density vector."
-            )
-        if not (
-            grid.device == reference.device == mass.device
-            and grid.dtype == reference.dtype == mass.dtype
-        ):
-            raise ValueError(
-                "FixedSchedule tensors must share device and dtype."
-            )
+            raise ValueError("FixedSchedule requires one time grid, reference grid, and density vector.")
+        if not (grid.device == reference.device == mass.device and grid.dtype == reference.dtype == mass.dtype):
+            raise ValueError("FixedSchedule tensors must share device and dtype.")
         canonical_mass = time_grid_to_density_mass(
             grid,
             reference_time_grid=reference,
@@ -151,10 +132,7 @@ class FixedSchedule:
             rtol=0.0,
             atol=_EXECUTABLE_BINDING_ATOL,
         ):
-            raise ValueError(
-                "FixedSchedule density_mass does not correspond to its "
-                "time_grid and reference_time_grid."
-            )
+            raise ValueError("FixedSchedule density_mass does not correspond to its time_grid and reference_time_grid.")
         object.__setattr__(self, "specification", specification)
         object.__setattr__(self, "target_nfe", target_nfe)
         object.__setattr__(self, "density_mass", canonical_mass)
@@ -263,10 +241,7 @@ class FixedScheduleGridGroup:
 
     @property
     def schedule_keys(self) -> tuple[str, ...]:
-        return tuple(
-            schedule.specification.schedule_key
-            for schedule in self.schedules
-        )
+        return tuple(schedule.specification.schedule_key for schedule in self.schedules)
 
 
 def group_fixed_schedules_by_time_grid(

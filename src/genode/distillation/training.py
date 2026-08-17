@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
-from dataclasses import dataclass
 import hashlib
 import json
 import math
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping
 
@@ -24,6 +24,8 @@ from genode.artifact_bundle import (
 )
 from genode.checkpoint_validation import (
     normalize_strict_solver_nfe_fields as normalize_solver_nfe_fields,
+)
+from genode.checkpoint_validation import (
     validate_strict_integer,
 )
 from genode.data.otflow_paths import resolve_project_path
@@ -37,13 +39,13 @@ from genode.distillation.gico_policy import load_gico_schedule_policy
 from genode.distillation.model import EndpointFlowMap, endpoint_consistency_loss
 from genode.distillation.validation import setting_encoder_config_from_payload
 from genode.evaluation.otflow_evaluation_support import load_checkpoint_model
-from genode.gico.models import (
-    setting_feature_dim,
-    setting_features,
-)
 from genode.gico.density_representation import (
     density_mass_to_time_grid,
     validate_reference_grid,
+)
+from genode.gico.models import (
+    setting_feature_dim,
+    setting_features,
 )
 from genode.models.conditioning import (
     FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
@@ -53,7 +55,6 @@ from genode.models.conditioning import (
 from genode.models.otflow_model import OTFlow
 from genode.provenance import file_sha256
 from genode.runtime import resolve_torch_device
-
 
 SplitName = Literal["train", "validation"]
 
@@ -75,9 +76,7 @@ def _validate_continuous_array(
     rank: int,
 ) -> None:
     if value.dtype.kind != "f":
-        raise ValueError(
-            f"{name} must use a real floating-point dtype, got {value.dtype}."
-        )
+        raise ValueError(f"{name} must use a real floating-point dtype, got {value.dtype}.")
     if value.ndim != int(rank):
         raise ValueError(f"{name} must have rank {int(rank)}, got shape {value.shape}.")
     if any(int(size) <= 0 for size in value.shape):
@@ -104,19 +103,14 @@ def _context_split(
         raise ValueError("Context-disjoint validation requires at least two contexts.")
     ranked = sorted(
         context_fingerprints,
-        key=lambda index: hashlib.sha256(
-            f"{split_seed}\0{context_fingerprints[index]}".encode("utf-8")
-        ).digest(),
+        key=lambda index: hashlib.sha256(f"{split_seed}\0{context_fingerprints[index]}".encode("utf-8")).digest(),
     )
     validation_count = min(
         len(ranked) - 1,
         max(1, int(round(len(ranked) * fraction))),
     )
     validation_indices = set(ranked[:validation_count])
-    return {
-        index: ("validation" if index in validation_indices else "train")
-        for index in context_fingerprints
-    }
+    return {index: ("validation" if index in validation_indices else "train") for index in context_fingerprints}
 
 
 class DemonstrationStore:
@@ -134,13 +128,8 @@ class DemonstrationStore:
         self.metadata = dict(self.manifest["metadata"])
         split_phase = str(self.metadata.get("split_phase", "")).strip()
         if split_phase not in DEMONSTRATION_TRAINING_SPLITS:
-            raise ValueError(
-                "Flow-map training requires demonstrations from a training split; "
-                f"got {split_phase!r}."
-            )
-        self.context_binding = validate_context_binding(
-            self.metadata.get("context_binding", {})
-        )
+            raise ValueError(f"Flow-map training requires demonstrations from a training split; got {split_phase!r}.")
+        self.context_binding = validate_context_binding(self.metadata.get("context_binding", {}))
         self.setting_encoder_config = setting_encoder_config_from_payload(
             self.metadata.get("setting_encoder_config"), require_complete=True
         )
@@ -154,13 +143,9 @@ class DemonstrationStore:
             label="Demonstration sample_state_dim",
             minimum=1,
         )
-        self.density_reference_time_grid = validate_reference_grid(
-            self.metadata.get("density_reference_time_grid", ())
-        )
+        self.density_reference_time_grid = validate_reference_grid(self.metadata.get("density_reference_time_grid", ()))
         if len(self.density_reference_time_grid) != self.density_dim + 1:
-            raise ValueError(
-                "Demonstration density reference grid does not match density_bin_count."
-            )
+            raise ValueError("Demonstration density reference grid does not match density_bin_count.")
         self.rollouts_per_context = validate_strict_integer(
             self.metadata.get("rollouts_per_context"),
             label="Demonstration rollouts_per_context",
@@ -226,9 +211,7 @@ class DemonstrationStore:
                 ):
                     raise ValueError("Context shard identifiers must be aligned one-dimensional arrays.")
                 if ids.dtype.kind not in {"U", "S"} or fingerprints.dtype.kind not in {"U", "S"}:
-                    raise ValueError(
-                        "Context shard context_id and context_fingerprint must use string dtypes."
-                    )
+                    raise ValueError("Context shard context_id and context_fingerprint must use string dtypes.")
                 for row_index, (index, context_id, fingerprint) in enumerate(
                     zip(indices.tolist(), ids.tolist(), fingerprints.tolist(), strict=True)
                 ):
@@ -237,9 +220,7 @@ class DemonstrationStore:
                         raise ValueError(f"Duplicate context_index {integer_index} in demonstration artifact.")
                     text_id = context_id.decode("utf-8") if isinstance(context_id, bytes) else str(context_id)
                     text_fingerprint = (
-                        fingerprint.decode("utf-8")
-                        if isinstance(fingerprint, bytes)
-                        else str(fingerprint)
+                        fingerprint.decode("utf-8") if isinstance(fingerprint, bytes) else str(fingerprint)
                     )
                     if text_id in seen_context_ids:
                         raise ValueError(f"Duplicate context_id {text_id!r} in demonstration artifact.")
@@ -411,17 +392,11 @@ class DemonstrationStore:
             "density_mass",
         }
         split_counts: dict[SplitName, int] = {"train": 0, "validation": 0}
-        self._records_by_context_range: dict[
-            tuple[int, int], dict[tuple[str, int], int]
-        ] = {}
-        coverage: dict[tuple[str, int], list[tuple[int, int]]] = {
-            setting: [] for setting in self.expected_settings
-        }
+        self._records_by_context_range: dict[tuple[int, int], dict[tuple[str, int], int]] = {}
+        coverage: dict[tuple[str, int], list[tuple[int, int]]] = {setting: [] for setting in self.expected_settings}
         seed_signatures: dict[int, tuple[int, ...]] = {}
         initial_state_by_context_seed: dict[tuple[int, int], np.ndarray] = {}
-        schedule_by_context_setting: dict[
-            tuple[int, tuple[str, int]], tuple[np.ndarray, np.ndarray]
-        ] = {}
+        schedule_by_context_setting: dict[tuple[int, tuple[str, int]], tuple[np.ndarray, np.ndarray]] = {}
         for record_index, record in enumerate(self.trajectory_records):
             arrays = self._read_trajectory(record_index)
             missing = sorted(required - set(arrays))
@@ -491,9 +466,7 @@ class DemonstrationStore:
                 dtype=np.float64,
             )
             if not np.allclose(grids, reconstructed_grids, atol=2e-6, rtol=2e-5):
-                raise ValueError(
-                    "Trajectory time_grid does not match its paired density_mass."
-                )
+                raise ValueError("Trajectory time_grid does not match its paired density_mass.")
             setting = (nfe.solver_key, nfe.target_nfe)
             if setting not in self.expected_settings:
                 raise ValueError("Trajectory shard uses a setting not declared in metadata.")
@@ -518,18 +491,13 @@ class DemonstrationStore:
                 raise ValueError("Trajectory shard does not contain the declared rollouts per context.")
             for context_value in actual_contexts.tolist():
                 selected_seeds = tuple(
-                    sorted(
-                        int(value)
-                        for value in arrays["noise_seed"][context_index == context_value].tolist()
-                    )
+                    sorted(int(value) for value in arrays["noise_seed"][context_index == context_value].tolist())
                 )
                 if len(set(selected_seeds)) != self.rollouts_per_context:
                     raise ValueError("Trajectory noise seeds must be unique within each context.")
                 previous = seed_signatures.setdefault(int(context_value), selected_seeds)
                 if previous != selected_seeds:
-                    raise ValueError(
-                        "Every solver/NFE setting must use the same rollout seeds per context."
-                    )
+                    raise ValueError("Every solver/NFE setting must use the same rollout seeds per context.")
             for row_index, (context_value, noise_seed) in enumerate(
                 zip(context_index.tolist(), arrays["noise_seed"].tolist(), strict=True)
             ):
@@ -570,8 +538,7 @@ class DemonstrationStore:
                     rtol=1e-6,
                 ):
                     raise ValueError(
-                        "Every solver/NFE setting must use the same initial state for each "
-                        "context and rollout seed."
+                        "Every solver/NFE setting must use the same initial state for each context and rollout seed."
                     )
             coverage[setting].append((context_start, context_stop))
             range_records = self._records_by_context_range.setdefault(
@@ -596,9 +563,7 @@ class DemonstrationStore:
             cursor = 0
             for start, stop in sorted(ranges):
                 if start != cursor:
-                    raise ValueError(
-                        f"Trajectory shards for setting {setting!r} have overlapping or missing contexts."
-                    )
+                    raise ValueError(f"Trajectory shards for setting {setting!r} have overlapping or missing contexts.")
                 cursor = stop
             if cursor != self.expected_context_count:
                 raise ValueError(f"Trajectory shards for setting {setting!r} are incomplete.")
@@ -623,9 +588,7 @@ class DemonstrationStore:
                 complete_ranges.append((context_range, records))
         ranked = sorted(
             complete_ranges,
-            key=lambda item: hashlib.sha256(
-                f"{int(seed)}\0{item[0][0]}\0{item[0][1]}".encode("utf-8")
-            ).digest(),
+            key=lambda item: hashlib.sha256(f"{int(seed)}\0{item[0][0]}\0{item[0][1]}".encode("utf-8")).digest(),
         )
         if not ranked:
             raise ValueError("No validation context shards are available.")
@@ -665,9 +628,7 @@ class DemonstrationStore:
         else:
             selected_record = int(record_index)
             if selected_record not in candidates:
-                raise ValueError(
-                    f"Trajectory record {selected_record} is not eligible for the requested batch."
-                )
+                raise ValueError(f"Trajectory record {selected_record} is not eligible for the requested batch.")
         record_index = selected_record
         eligible = self._eligible_rows[(record_index, split)]
         selected = generator.choice(eligible, size=size, replace=int(eligible.size) < size).astype(np.int64)
@@ -887,10 +848,7 @@ def train_endpoint_flow_map(
             if value < best_validation_loss:
                 best_validation_loss = value
                 best_step = step
-                best_state = {
-                    name: tensor.detach().cpu().clone()
-                    for name, tensor in flow_map.state_dict().items()
-                }
+                best_state = {name: tensor.detach().cpu().clone() for name, tensor in flow_map.state_dict().items()}
     if best_state is None:
         raise RuntimeError("Flow-map training completed without a validation checkpoint.")
     flow_map.load_state_dict(best_state, strict=True)
@@ -957,9 +915,7 @@ def _validate_flow_map_bundle_identity(
         or summary.get("checkpoint_name") != targets["checkpoint"].name
         or summary.get("checkpoint_sha256") != file_sha256(checkpoint_path)
     ):
-        raise ValueError(
-            "Flow-map checkpoint and training summary do not form a complete bound bundle."
-        )
+        raise ValueError("Flow-map checkpoint and training summary do not form a complete bound bundle.")
     try:
         checkpoint = torch.load(
             checkpoint_path,
@@ -968,19 +924,13 @@ def _validate_flow_map_bundle_identity(
         )
     except (OSError, RuntimeError, ValueError, EOFError) as exc:
         raise ValueError(f"Could not read flow-map checkpoint: {exc}") from exc
-    if not isinstance(checkpoint, Mapping) or not isinstance(
-        checkpoint.get("training_summary"), Mapping
-    ):
+    if not isinstance(checkpoint, Mapping) or not isinstance(checkpoint.get("training_summary"), Mapping):
         raise ValueError("Flow-map checkpoint is missing its embedded training summary.")
     report_summary = {
-        key: value
-        for key, value in summary.items()
-        if key not in {"status", "checkpoint_name", "checkpoint_sha256"}
+        key: value for key, value in summary.items() if key not in {"status", "checkpoint_name", "checkpoint_sha256"}
     }
     if dict(checkpoint["training_summary"]) != report_summary:
-        raise ValueError(
-            "Flow-map checkpoint and JSON training summaries do not match."
-        )
+        raise ValueError("Flow-map checkpoint and JSON training summaries do not match.")
 
 
 def recover_flow_map_bundle(
@@ -988,9 +938,7 @@ def recover_flow_map_bundle(
     summary_path: str | Path | None,
 ) -> None:
     checkpoint = Path(checkpoint_path).expanduser().resolve()
-    summary = (
-        Path(summary_path).expanduser().resolve() if summary_path is not None else None
-    )
+    summary = Path(summary_path).expanduser().resolve() if summary_path is not None else None
     targets = _flow_map_bundle_targets(checkpoint, summary)
     recover_artifact_bundle(
         checkpoint,
@@ -1004,9 +952,7 @@ def validate_flow_map_bundle(
     summary_path: str | Path | None,
 ) -> None:
     checkpoint = Path(checkpoint_path).expanduser().resolve()
-    summary = (
-        Path(summary_path).expanduser().resolve() if summary_path is not None else None
-    )
+    summary = Path(summary_path).expanduser().resolve() if summary_path is not None else None
     targets = _flow_map_bundle_targets(checkpoint, summary)
     validate_artifact_bundle(
         checkpoint,
@@ -1119,11 +1065,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     gico_path = resolve_project_path(args.gico_checkpoint)
     manifest_path = resolve_project_path(args.demonstration_manifest)
     output_path = resolve_project_path(args.output_checkpoint)
-    summary_path = (
-        resolve_project_path(args.summary_json)
-        if str(args.summary_json).strip()
-        else None
-    )
+    summary_path = resolve_project_path(args.summary_json) if str(args.summary_json).strip() else None
     named_paths = {
         "demonstration manifest": manifest_path,
         "backbone checkpoint": backbone_path,
@@ -1146,12 +1088,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         ("flow-map checkpoint", output_path),
         ("training summary", summary_path),
     ):
-        if path is not None and (
-            path == demonstration_root or demonstration_root in path.parents
-        ):
-            raise ValueError(
-                f"{label} must be outside the managed demonstration artifact directory."
-            )
+        if path is not None and (path == demonstration_root or demonstration_root in path.parents):
+            raise ValueError(f"{label} must be outside the managed demonstration artifact directory.")
     _preflight_flow_map_bundle(
         output_path,
         summary_path,
@@ -1178,54 +1116,34 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     def validate_training_source_identities() -> None:
         if file_sha256(manifest_path) != expected_demonstration_manifest_hash:
-            raise ValueError(
-                "Demonstration manifest changed after its training identity was captured."
-            )
+            raise ValueError("Demonstration manifest changed after its training identity was captured.")
         for shard_path, expected_hash in demonstration_shard_identities:
             if file_sha256(shard_path) != expected_hash:
-                raise ValueError(
-                    f"Demonstration shard {shard_path.name!r} changed during flow-map training."
-                )
+                raise ValueError(f"Demonstration shard {shard_path.name!r} changed during flow-map training.")
         if file_sha256(backbone_path) != expected_backbone_hash:
-            raise ValueError(
-                "Backbone source checkpoint changed after demonstration validation."
-            )
+            raise ValueError("Backbone source checkpoint changed after demonstration validation.")
         if file_sha256(gico_path) != expected_gico_hash:
-            raise ValueError(
-                "GICO source checkpoint changed after demonstration validation."
-            )
+            raise ValueError("GICO source checkpoint changed after demonstration validation.")
 
     validate_training_source_identities()
     gico_policy = load_gico_schedule_policy(gico_path, device=device)
     validate_training_source_identities()
-    if (
-        gico_policy.setting_encoder_config.to_payload()
-        != store.setting_encoder_config.to_payload()
-    ):
-        raise ValueError(
-            "Demonstration setting encoder is incompatible with the GICO checkpoint."
-        )
+    if gico_policy.setting_encoder_config.to_payload() != store.setting_encoder_config.to_payload():
+        raise ValueError("Demonstration setting encoder is incompatible with the GICO checkpoint.")
     if gico_policy.density_dim != store.density_dim or not np.allclose(
         gico_policy.reference_time_grid,
         store.density_reference_time_grid,
         atol=0.0,
         rtol=0.0,
     ):
-        raise ValueError(
-            "Demonstration density representation is incompatible with the GICO checkpoint."
-        )
-    demonstration_context_protocol = str(
-        store.metadata.get("context_embedding_protocol", "")
-    )
+        raise ValueError("Demonstration density representation is incompatible with the GICO checkpoint.")
+    demonstration_context_protocol = str(store.metadata.get("context_embedding_protocol", ""))
     if demonstration_context_protocol != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL:
         raise ValueError(
-            "Demonstration context_embedding_protocol must be "
-            f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
+            f"Demonstration context_embedding_protocol must be {FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
         )
     if demonstration_context_protocol != gico_policy.context_embedding_protocol:
-        raise ValueError(
-            "Demonstration context protocol is incompatible with the GICO checkpoint."
-        )
+        raise ValueError("Demonstration context protocol is incompatible with the GICO checkpoint.")
     backbone_model, _ = load_checkpoint_model(backbone_path, device)
     validate_training_source_identities()
     if int(backbone_model.cfg.sample_state_dim) != store.state_dim:
@@ -1244,6 +1162,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         seed=args.seed,
         initialize_from_backbone=not bool(args.no_backbone_initialization),
     )
+
     def write_checkpoint(staged_path: Path) -> Path:
         validate_training_source_identities()
         return save_flow_map_checkpoint(

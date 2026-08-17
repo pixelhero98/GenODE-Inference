@@ -22,15 +22,15 @@ import json
 import math
 import os
 import tempfile
+import urllib.request
 from functools import lru_cache
 from typing import Dict, Optional, Tuple, Union
-import urllib.request
 
 import numpy as np
 import torch
 
-from genode.models.config import OTFlowConfig
 from genode.data.otflow_paths import default_lobster_synthetic_profile_path, project_data_root
+from genode.models.config import OTFlowConfig
 from genode.path_safety import is_link_or_reparse_point
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
@@ -112,9 +112,7 @@ class L2FeatureMap:
         expected_shape = ask_p.shape
         for label, matrix in matrices.items():
             if matrix.shape != expected_shape:
-                raise ValueError(
-                    f"{label} shape {matrix.shape} does not match the required L2 shape {expected_shape}."
-                )
+                raise ValueError(f"{label} shape {matrix.shape} does not match the required L2 shape {expected_shape}.")
         T, levels = expected_shape
         if levels != self.L:
             raise ValueError(f"L2 input has {levels} levels; expected {self.L}.")
@@ -160,7 +158,9 @@ class L2FeatureMap:
 
         return params_float32, mid_float32
 
-    def decode_sequence(self, params: np.ndarray, init_mid: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def decode_sequence(
+        self, params: np.ndarray, init_mid: float
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Decode params to raw L2 arrays using the mid immediately before the window.
 
         Notes
@@ -172,7 +172,7 @@ class L2FeatureMap:
         T, D = params.shape
         L = self.L
         expected_dim = 4 * L
-        if D != expected_dim:
+        if expected_dim != D:
             raise ValueError(f"params has width {D}; expected exactly 4 * levels = {expected_dim}.")
         if isinstance(init_mid, bool):
             raise ValueError(f"init_mid must be finite, got {init_mid!r}.")
@@ -222,6 +222,7 @@ class L2FeatureMap:
         if any(not bool(np.all(np.isfinite(value))) for value in decoded):
             raise ValueError("Decoded L2 values exceed the finite float32 representation.")
         return ask_p, ask_v, bid_p, bid_v
+
 
 # -----------------------------
 # Standardization helpers
@@ -318,7 +319,7 @@ def _fit_time_gap_scale(
     else:
         segment_ends = np.asarray(segment_ends, dtype=np.int64)
         seg_starts = _segment_starts_from_ends(segment_ends)
-        for seg_start, seg_end in zip(seg_starts, segment_ends):
+        for seg_start, seg_end in zip(seg_starts, segment_ends, strict=False):
             left = int(seg_start)
             right = min(int(seg_end), int(train_end))
             if right - left > 1:
@@ -390,7 +391,7 @@ def _build_elapsed_time_features(
             elapsed[1:] = np.cumsum(gaps[1:] / safe_scale)
     else:
         seg_starts = _segment_starts_from_ends(np.asarray(segment_ends, dtype=np.int64))
-        for seg_start, seg_end in zip(seg_starts, np.asarray(segment_ends, dtype=np.int64)):
+        for seg_start, seg_end in zip(seg_starts, np.asarray(segment_ends, dtype=np.int64), strict=False):
             start = int(seg_start)
             stop = int(seg_end)
             if stop - start <= 1:
@@ -559,7 +560,7 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
         else:
             starts = []
             seg_starts = np.concatenate(([0], self.segment_ends[:-1]))
-            for seg_start, seg_end in zip(seg_starts, self.segment_ends):
+            for seg_start, seg_end in zip(seg_starts, self.segment_ends, strict=False):
                 local_start = int(seg_start) + self.H
                 local_end = int(seg_end) - max(0, self.future_horizon)
                 if local_start < local_end:
@@ -822,7 +823,8 @@ def _generate_synthetic_l2(
     T = int(length)
     profile = load_lobster_synth_profile(profile_path)
     regimes = [
-        regime for regime in profile["profiles"]
+        regime
+        for regime in profile["profiles"]
         if len(regime["log_ask_vol_mean"]) >= L and len(regime["log_bid_vol_mean"]) >= L
     ]
     if not regimes:
@@ -893,7 +895,7 @@ def _generate_synthetic_l2(
 
         spread_phi = float(np.clip(current_regime["spread_phi"], 0.7, 0.995))
         spread_std = max(0.05, float(current_regime["log_spread_std"]))
-        spread_noise = spread_std * math.sqrt(max(1.0 - spread_phi ** 2, 1e-4))
+        spread_noise = spread_std * math.sqrt(max(1.0 - spread_phi**2, 1e-4))
         spread_log = (
             float(current_regime["log_spread_mean"])
             + spread_phi * (spread_log - float(current_regime["log_spread_mean"]))
@@ -903,7 +905,7 @@ def _generate_synthetic_l2(
 
         imb_phi = float(np.clip(current_regime["imb_phi"], 0.5, 0.995))
         imb_std = max(0.02, float(current_regime["imb_std"]))
-        imb_noise = imb_std * math.sqrt(max(1.0 - imb_phi ** 2, 1e-4))
+        imb_noise = imb_std * math.sqrt(max(1.0 - imb_phi**2, 1e-4))
         imbalance = (
             float(current_regime["imb_mean"])
             + imb_phi * (imbalance - float(current_regime["imb_mean"]))
@@ -929,9 +931,13 @@ def _generate_synthetic_l2(
             ask_gap_std = np.asarray(current_regime["log_ask_gap_std"][: L - 1], dtype=np.float64)
             bid_gap_mu = np.asarray(current_regime["log_bid_gap_mean"][: L - 1], dtype=np.float64)
             bid_gap_std = np.asarray(current_regime["log_bid_gap_std"][: L - 1], dtype=np.float64)
-            gap_scale = math.sqrt(max(1.0 - gap_rho ** 2, 1e-4))
-            ask_gap_state = ask_gap_mu + gap_rho * (ask_gap_state - ask_gap_mu) + gap_scale * ask_gap_std * rng.normal(size=L - 1)
-            bid_gap_state = bid_gap_mu + gap_rho * (bid_gap_state - bid_gap_mu) + gap_scale * bid_gap_std * rng.normal(size=L - 1)
+            gap_scale = math.sqrt(max(1.0 - gap_rho**2, 1e-4))
+            ask_gap_state = (
+                ask_gap_mu + gap_rho * (ask_gap_state - ask_gap_mu) + gap_scale * ask_gap_std * rng.normal(size=L - 1)
+            )
+            bid_gap_state = (
+                bid_gap_mu + gap_rho * (bid_gap_state - bid_gap_mu) + gap_scale * bid_gap_std * rng.normal(size=L - 1)
+            )
             ask_gap_ticks = np.maximum(1.0, np.round(np.exp(ask_gap_state)))
             bid_gap_ticks = np.maximum(1.0, np.round(np.exp(bid_gap_state)))
         else:
@@ -943,9 +949,13 @@ def _generate_synthetic_l2(
         ask_log_v_std = np.asarray(current_regime["log_ask_vol_std"][:L], dtype=np.float64)
         bid_log_v_mu = np.asarray(current_regime["log_bid_vol_mean"][:L], dtype=np.float64)
         bid_log_v_std = np.asarray(current_regime["log_bid_vol_std"][:L], dtype=np.float64)
-        vol_scale = math.sqrt(max(1.0 - vol_rho ** 2, 1e-4))
-        ask_log_v_state = ask_log_v_mu + vol_rho * (ask_log_v_state - ask_log_v_mu) + vol_scale * ask_log_v_std * rng.normal(size=L)
-        bid_log_v_state = bid_log_v_mu + vol_rho * (bid_log_v_state - bid_log_v_mu) + vol_scale * bid_log_v_std * rng.normal(size=L)
+        vol_scale = math.sqrt(max(1.0 - vol_rho**2, 1e-4))
+        ask_log_v_state = (
+            ask_log_v_mu + vol_rho * (ask_log_v_state - ask_log_v_mu) + vol_scale * ask_log_v_std * rng.normal(size=L)
+        )
+        bid_log_v_state = (
+            bid_log_v_mu + vol_rho * (bid_log_v_state - bid_log_v_mu) + vol_scale * bid_log_v_std * rng.normal(size=L)
+        )
 
         imbalance_tilt = 0.35 * imbalance * level_weights
         ask_v_row = np.exp(np.clip(ask_log_v_state - imbalance_tilt, math.log(eps), 16.0))
@@ -1400,7 +1410,6 @@ def build_dataset_splits_from_arrays(
     return {"train": ds_train, "val": ds_val, "test": ds_test, "stats": stats}
 
 
-
 def build_dataset_splits_from_npz_l2(
     path: str,
     cfg: OTFlowConfig,
@@ -1514,18 +1523,14 @@ def _download_url_to_path(
                         break
                     total += len(chunk)
                     if total > expected_size:
-                        raise ValueError(
-                            f"Download from {url} exceeded the expected size of {expected_size} bytes."
-                        )
+                        raise ValueError(f"Download from {url} exceeded the expected size of {expected_size} bytes.")
                     digest.update(chunk)
                     out_fh.write(chunk)
         if total != expected_size:
             raise ValueError(f"Download from {url} has size {total}; expected {expected_size} bytes.")
         observed_sha256 = digest.hexdigest()
         if observed_sha256 != sha256:
-            raise ValueError(
-                f"Download from {url} has SHA-256 {observed_sha256}; expected {sha256}."
-            )
+            raise ValueError(f"Download from {url} has SHA-256 {observed_sha256}; expected {sha256}.")
         os.replace(temporary, resolved)
         temporary = ""
     finally:
@@ -1637,7 +1642,9 @@ def build_dataset_splits_from_lobster_synthetic(
 # -----------------------------
 # Basic metrics (raw space) for quick checks
 # -----------------------------
-def compute_basic_l2_metrics(ask_p: np.ndarray, ask_v: np.ndarray, bid_p: np.ndarray, bid_v: np.ndarray) -> Dict[str, float]:
+def compute_basic_l2_metrics(
+    ask_p: np.ndarray, ask_v: np.ndarray, bid_p: np.ndarray, bid_v: np.ndarray
+) -> Dict[str, float]:
     spread = ask_p[:, 0] - bid_p[:, 0]
     depth = ask_v.sum(axis=1) + bid_v.sum(axis=1)
     imb = (bid_v.sum(axis=1) - ask_v.sum(axis=1)) / (depth + 1e-8)

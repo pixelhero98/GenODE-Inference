@@ -9,7 +9,12 @@ from typing import Any, Dict, List, Mapping, Sequence
 import numpy as np
 
 from genode.data.otflow_paths import project_root
-from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, TRANSFER_SCHEDULE_KEYS, build_schedule_grid, schedule_display_name
+from genode.schedule_transfer.diffusion_flow_schedules import (
+    BASELINE_SCHEDULE_KEYS,
+    TRANSFER_SCHEDULE_KEYS,
+    build_schedule_grid,
+    schedule_display_name,
+)
 from genode.schedule_transfer.otflow_signal_traces import NATIVE_INFO_GROWTH_TRACE_KEY
 
 PROJECT_ROOT = project_root()
@@ -108,13 +113,15 @@ def build_figure(payload: Mapping[str, Any]):
     if trace.size != ref_grid.size - 1:
         raise ValueError("native_info_growth_trace must have one value per reference interval.")
     mid = 0.5 * (ref_grid[:-1] + ref_grid[1:])
-    fig, (ax_trace, ax_nodes) = plt.subplots(2, 1, figsize=(7.2, 4.8), sharex=True, gridspec_kw={"height_ratios": [2.0, 1.2]})
+    fig, (ax_trace, ax_nodes) = plt.subplots(
+        2, 1, figsize=(7.2, 4.8), sharex=True, gridspec_kw={"height_ratios": [2.0, 1.2]}
+    )
     ax_trace.plot(mid, trace, color="#2F6B52", linewidth=2.0)
     ax_trace.set_ylabel("Info-growth")
     ax_trace.grid(True, axis="y", color="#DDDDDD", linewidth=0.8)
     rows = list(payload.get("schedule_nodes", []))
     y_positions = np.arange(len(rows), dtype=np.float64)
-    for y, row in zip(y_positions, rows):
+    for y, row in zip(y_positions, rows, strict=False):
         grid = validate_time_grid(row["time_grid"], name=f"{row['schedule_key']}_grid")
         color = "#1B4E9B" if bool(row.get("is_transfer_schedule")) else "#666666"
         ax_nodes.vlines(grid, y - 0.34, y + 0.34, color=color, linewidth=1.0)
@@ -127,7 +134,9 @@ def build_figure(payload: Mapping[str, Any]):
     return fig
 
 
-def plot_payload(payload: Mapping[str, Any], *, png_path: Path = DEFAULT_PNG, pdf_path: Path = DEFAULT_PDF, dpi: int = 300) -> Dict[str, str]:
+def plot_payload(
+    payload: Mapping[str, Any], *, png_path: Path = DEFAULT_PNG, pdf_path: Path = DEFAULT_PDF, dpi: int = 300
+) -> Dict[str, str]:
     fig = build_figure(payload)
     try:
         png_path.parent.mkdir(parents=True, exist_ok=True)
@@ -136,6 +145,7 @@ def plot_payload(payload: Mapping[str, Any], *, png_path: Path = DEFAULT_PNG, pd
         fig.savefig(pdf_path, bbox_inches="tight")
     finally:
         import matplotlib.pyplot as plt
+
         plt.close(fig)
     return {"png": str(png_path), "pdf": str(pdf_path)}
 

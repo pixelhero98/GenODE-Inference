@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import fields
 import math
-from numbers import Real
 import os
-from pathlib import Path
 import pickle
 import re
 import tempfile
+from dataclasses import fields
+from numbers import Real
+from pathlib import Path
 from typing import Any, Mapping, get_args, get_origin, get_type_hints
 
 import torch
 
+from genode.canonical_experiment_layout import scenario_family_for_key
 from genode.checkpoint_validation import (
     validate_locked_test_exclusion,
     validate_strict_integer,
@@ -20,16 +21,14 @@ from genode.checkpoint_validation import (
 from genode.distillation.artifacts import CHECKPOINT_PROTOCOL, validate_context_binding
 from genode.distillation.model import EndpointFlowMap, FlowMapSampler
 from genode.distillation.validation import setting_encoder_config_from_payload
-from genode.canonical_experiment_layout import scenario_family_for_key
 from genode.gico.models import (
     SettingEncoderConfig,
     setting_feature_dim,
 )
-from genode.models.config import OTFlowConfig
 from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
+from genode.models.config import OTFlowConfig
 from genode.path_safety import is_link_or_reparse_point
 from genode.provenance import file_sha256
-
 
 FLOW_MAP_ARTIFACT_VERSION = 1
 QUALITY_STATUS_NOT_EVALUATED = "not_evaluated"
@@ -59,9 +58,7 @@ def config_from_payload(
         section_type = type(section)
         raw_section_payload = payload[section_name]
         if not isinstance(raw_section_payload, Mapping):
-            raise ValueError(
-                f"Flow-map checkpoint config section {section_name!r} must be an object."
-            )
+            raise ValueError(f"Flow-map checkpoint config section {section_name!r} must be an object.")
         section_payload = dict(raw_section_payload)
         valid_fields = {field.name for field in fields(section_type)}
         missing = sorted(valid_fields - set(section_payload))
@@ -82,49 +79,33 @@ def config_from_payload(
                 )
             elif get_origin(annotation) is tuple and get_args(annotation) == (int, Ellipsis):
                 if not isinstance(value, (list, tuple)):
-                    raise ValueError(
-                        f"Flow-map otflow_config {section_name}.{field_name} must be an integer sequence."
-                    )
+                    raise ValueError(f"Flow-map otflow_config {section_name}.{field_name} must be an integer sequence.")
                 value = tuple(
                     validate_strict_integer(
                         item,
-                        label=(
-                            f"Flow-map otflow_config {section_name}.{field_name}[{index}]"
-                        ),
+                        label=(f"Flow-map otflow_config {section_name}.{field_name}[{index}]"),
                     )
                     for index, item in enumerate(value)
                 )
             elif annotation is bool:
                 if not isinstance(value, bool):
-                    raise ValueError(
-                        f"Flow-map otflow_config {section_name}.{field_name} must be a boolean."
-                    )
+                    raise ValueError(f"Flow-map otflow_config {section_name}.{field_name} must be a boolean.")
             elif annotation is float:
                 if isinstance(value, bool) or not isinstance(value, Real):
-                    raise ValueError(
-                        f"Flow-map otflow_config {section_name}.{field_name} must be numeric."
-                    )
+                    raise ValueError(f"Flow-map otflow_config {section_name}.{field_name} must be numeric.")
                 value = float(value)
                 if not math.isfinite(value):
-                    raise ValueError(
-                        f"Flow-map otflow_config {section_name}.{field_name} must be finite."
-                    )
+                    raise ValueError(f"Flow-map otflow_config {section_name}.{field_name} must be finite.")
             elif annotation is str:
                 if not isinstance(value, str):
-                    raise ValueError(
-                        f"Flow-map otflow_config {section_name}.{field_name} must be a string."
-                    )
+                    raise ValueError(f"Flow-map otflow_config {section_name}.{field_name} must be a string.")
             elif annotation is torch.device:
                 if not isinstance(value, str) or not value.strip():
-                    raise ValueError(
-                        f"Flow-map otflow_config {section_name}.{field_name} must be a device string."
-                    )
+                    raise ValueError(f"Flow-map otflow_config {section_name}.{field_name} must be a device string.")
                 try:
                     torch.device(value)
                 except (RuntimeError, TypeError) as exc:
-                    raise ValueError(
-                        f"Flow-map otflow_config {section_name}.{field_name} is invalid."
-                    ) from exc
+                    raise ValueError(f"Flow-map otflow_config {section_name}.{field_name} is invalid.") from exc
             values[field_name] = value
         if section_name == "train":
             values["device"] = target_device
@@ -134,10 +115,7 @@ def config_from_payload(
 
 
 def _cpu_state_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
-    state = {
-        str(name): value.detach().cpu().clone()
-        for name, value in module.state_dict().items()
-    }
+    state = {str(name): value.detach().cpu().clone() for name, value in module.state_dict().items()}
     return validate_tensor_state_dict(state, label="Flow-map model state")
 
 
@@ -163,9 +141,7 @@ def _atomic_torch_save(
             try:
                 os.link(temporary, path, follow_symlinks=False)
             except FileExistsError as exc:
-                raise FileExistsError(
-                    f"Refusing to overwrite existing flow-map checkpoint {path.name!r}."
-                ) from exc
+                raise FileExistsError(f"Refusing to overwrite existing flow-map checkpoint {path.name!r}.") from exc
             temporary.unlink()
     finally:
         temporary.unlink(missing_ok=True)
@@ -193,9 +169,7 @@ def save_flow_map_checkpoint(
 
     lexical_target = Path(path).expanduser()
     if is_link_or_reparse_point(lexical_target):
-        raise ValueError(
-            "Flow-map output checkpoint may not be a symlink, junction, or reparse point."
-        )
+        raise ValueError("Flow-map output checkpoint may not be a symlink, junction, or reparse point.")
     target = lexical_target.parent.resolve() / lexical_target.name
     backbone_path = Path(backbone_checkpoint).expanduser().resolve()
     gico_path = Path(gico_checkpoint).expanduser().resolve()
@@ -206,9 +180,7 @@ def save_flow_map_checkpoint(
     if target in {backbone_path, gico_path}:
         raise ValueError("Flow-map output checkpoint must differ from every source checkpoint.")
     if target.exists() and not bool(overwrite):
-        raise FileExistsError(
-            f"Refusing to overwrite existing flow-map checkpoint {target.name!r}."
-        )
+        raise FileExistsError(f"Refusing to overwrite existing flow-map checkpoint {target.name!r}.")
     source_hashes: dict[str, str] = {}
     for source_path, expected_hash, key, label in (
         (
@@ -228,13 +200,9 @@ def save_flow_map_checkpoint(
         if expected_hash is not None:
             expected = str(expected_hash)
             if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
-                raise ValueError(
-                    f"expected_{key} must be a lowercase SHA-256 digest."
-                )
+                raise ValueError(f"expected_{key} must be a lowercase SHA-256 digest.")
             if actual_hash != expected:
-                raise ValueError(
-                    f"{label} checkpoint changed after its training identity was captured."
-                )
+                raise ValueError(f"{label} checkpoint changed after its training identity was captured.")
             actual_hash = expected
         source_hashes[key] = actual_hash
     manifest_hash = str(demonstration_manifest_sha256)
@@ -247,16 +215,10 @@ def save_flow_map_checkpoint(
         required_root_keys=("locked_test_used_for_selection",),
     )
     if "context_embedding_kind" in summary:
+        raise ValueError("Flow-map training summary may not contain the retired context_embedding_kind field.")
+    if str(summary.get("context_embedding_protocol", "")) != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL:
         raise ValueError(
-            "Flow-map training summary may not contain the retired context_embedding_kind field."
-        )
-    if (
-        str(summary.get("context_embedding_protocol", ""))
-        != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
-    ):
-        raise ValueError(
-            "Flow-map training summary context_embedding_protocol must be "
-            f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
+            f"Flow-map training summary context_embedding_protocol must be {FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
         )
     encoder_config = setting_encoder_config_from_payload(
         setting_encoder_config,
@@ -267,10 +229,7 @@ def save_flow_map_checkpoint(
     demonstration_family = ""
     if demonstration_metadata is not None:
         metadata = dict(demonstration_metadata)
-        if (
-            str(metadata.get("context_embedding_protocol", ""))
-            != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
-        ):
+        if str(metadata.get("context_embedding_protocol", "")) != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL:
             raise ValueError(
                 "Demonstration metadata context_embedding_protocol must be "
                 f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
@@ -289,23 +248,17 @@ def save_flow_map_checkpoint(
             minimum=0,
         )
         if demonstration_binding["context_count"] != expected_context_count:
-            raise ValueError(
-                "Demonstration context binding does not match the training context counts."
-            )
+            raise ValueError("Demonstration context binding does not match the training context counts.")
         demonstration_scenario = str(metadata.get("scenario_key", "")).strip()
         demonstration_family = str(metadata.get("benchmark_family", "")).strip()
         if not demonstration_scenario or not demonstration_family:
-            raise ValueError(
-                "Demonstration metadata requires scenario_key and benchmark_family."
-            )
+            raise ValueError("Demonstration metadata requires scenario_key and benchmark_family.")
         try:
             expected_family = scenario_family_for_key(demonstration_scenario)
         except KeyError:
             expected_family = ""
         if expected_family and demonstration_family != expected_family:
-            raise ValueError(
-                "Demonstration benchmark_family does not match its scenario_key."
-            )
+            raise ValueError("Demonstration benchmark_family does not match its scenario_key.")
     payload = {
         "protocol": CHECKPOINT_PROTOCOL,
         "artifact_version": FLOW_MAP_ARTIFACT_VERSION,
@@ -351,11 +304,14 @@ def load_flow_map_checkpoint(
         raise ValueError(
             f"Unsupported flow-map protocol {payload.get('protocol')!r}; expected {CHECKPOINT_PROTOCOL!r}."
         )
-    if validate_strict_integer(
-        payload.get("artifact_version"),
-        label="Flow-map artifact_version",
-        minimum=1,
-    ) != FLOW_MAP_ARTIFACT_VERSION:
+    if (
+        validate_strict_integer(
+            payload.get("artifact_version"),
+            label="Flow-map artifact_version",
+            minimum=1,
+        )
+        != FLOW_MAP_ARTIFACT_VERSION
+    ):
         raise ValueError(
             f"Unsupported flow-map artifact_version {payload.get('artifact_version')!r}; "
             f"expected {FLOW_MAP_ARTIFACT_VERSION}."
@@ -377,13 +333,9 @@ def load_flow_map_checkpoint(
     )
     if "context_embedding_kind" in training_summary:
         raise ValueError(
-            "Flow-map checkpoint training_summary may not contain the retired "
-            "context_embedding_kind field."
+            "Flow-map checkpoint training_summary may not contain the retired context_embedding_kind field."
         )
-    if (
-        str(training_summary.get("context_embedding_protocol", ""))
-        != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
-    ):
+    if str(training_summary.get("context_embedding_protocol", "")) != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL:
         raise ValueError(
             "Flow-map checkpoint training_summary context_embedding_protocol must be "
             f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
@@ -393,12 +345,8 @@ def load_flow_map_checkpoint(
         if not isinstance(raw_context_binding, Mapping):
             raise ValueError("Flow-map checkpoint has an invalid demonstration context binding.")
         validated_binding = validate_context_binding(raw_context_binding)
-        if not str(payload.get("scenario_key", "")).strip() or not str(
-            payload.get("benchmark_family", "")
-        ).strip():
-            raise ValueError(
-                "Flow-map checkpoint context binding requires scenario and benchmark metadata."
-            )
+        if not str(payload.get("scenario_key", "")).strip() or not str(payload.get("benchmark_family", "")).strip():
+            raise ValueError("Flow-map checkpoint context binding requires scenario and benchmark metadata.")
         checkpoint_scenario = str(payload["scenario_key"]).strip()
         checkpoint_family = str(payload["benchmark_family"]).strip()
         try:
@@ -406,9 +354,7 @@ def load_flow_map_checkpoint(
         except KeyError:
             expected_family = ""
         if expected_family and checkpoint_family != expected_family:
-            raise ValueError(
-                "Flow-map checkpoint benchmark_family does not match its scenario_key."
-            )
+            raise ValueError("Flow-map checkpoint benchmark_family does not match its scenario_key.")
         expected_context_count = validate_strict_integer(
             training_summary.get("train_context_count"),
             label="Flow-map training_summary train_context_count",
@@ -419,9 +365,7 @@ def load_flow_map_checkpoint(
             minimum=0,
         )
         if validated_binding["context_count"] != expected_context_count:
-            raise ValueError(
-                "Flow-map checkpoint context binding does not match its training context counts."
-            )
+            raise ValueError("Flow-map checkpoint context binding does not match its training context counts.")
     quality_gate = payload.get("quality_gate")
     if (
         not isinstance(quality_gate, Mapping)
@@ -460,8 +404,7 @@ def load_flow_map_checkpoint(
     extra_model_fields = sorted(set(model_config) - expected_model_config_fields)
     if missing_model_fields or extra_model_fields:
         raise ValueError(
-            "Flow-map model_config fields are invalid; "
-            f"missing={missing_model_fields}, extra={extra_model_fields}."
+            f"Flow-map model_config fields are invalid; missing={missing_model_fields}, extra={extra_model_fields}."
         )
     if str(model_config.get("architecture", "")) != "endpoint_flow_map":
         raise ValueError("Flow-map checkpoint has an unsupported architecture.")
@@ -482,9 +425,7 @@ def load_flow_map_checkpoint(
     )
     if hidden_dim != int(cfg.model.hidden_dim):
         raise ValueError("Flow-map model_config hidden_dim does not match otflow_config.")
-    encoder_config = setting_encoder_config_from_payload(
-        payload.get("setting_encoder_config"), require_complete=True
-    )
+    encoder_config = setting_encoder_config_from_payload(payload.get("setting_encoder_config"), require_complete=True)
     expected_setting_dim = setting_feature_dim(encoder_config.mode, config=encoder_config)
     setting_dim = validate_strict_integer(
         model_config.get("setting_dim"),

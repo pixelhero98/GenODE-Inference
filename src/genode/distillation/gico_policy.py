@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+import pickle
+from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
-import pickle
 from typing import Any, Dict, Mapping
 
 import numpy as np
@@ -12,10 +12,13 @@ import torch
 
 from genode.checkpoint_validation import (
     normalize_strict_solver_nfe_fields as normalize_solver_nfe_fields,
+)
+from genode.checkpoint_validation import (
     validate_locked_test_exclusion,
     validate_strict_integer,
     validate_tensor_state_dict,
 )
+from genode.distillation.validation import setting_encoder_config_from_payload
 from genode.gico.density_representation import (
     DENSITY_PROTOCOL,
     validate_reference_grid,
@@ -25,13 +28,16 @@ from genode.gico.models import (
     setting_feature_dim,
     setting_features,
 )
-from genode.distillation.validation import setting_encoder_config_from_payload
 from genode.gico.policy import (
     ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
     GICO_PROTOCOL,
     EmbeddingNormalizer,
-    build_gico_student_model as _build_current_gico_student_model,
     require_current_gico_checkpoint_payload,
+)
+from genode.gico.policy import (
+    build_gico_student_model as _build_current_gico_student_model,
+)
+from genode.gico.policy import (
     validate_gico_teacher_training_metadata as _validate_current_teacher_training_metadata,
 )
 from genode.models.conditioning import (
@@ -39,7 +45,6 @@ from genode.models.conditioning import (
     ConditioningCache,
     frozen_backbone_policy_context_from_cache,
 )
-
 
 _CURRENT_STUDENT_MODEL_CONFIG_FIELDS = frozenset(
     {
@@ -71,17 +76,12 @@ def validate_gico_teacher_training_metadata(
     }
     for field, expected in required_protocols.items():
         if teacher_training.get(field) != expected:
-            raise ValueError(
-                f"GICO checkpoint {field} must be explicitly set to {expected!r}."
-            )
+            raise ValueError(f"GICO checkpoint {field} must be explicitly set to {expected!r}.")
     selection = teacher_training.get("teacher_checkpoint_selection")
     if not isinstance(selection, Mapping):
         raise ValueError("GICO teacher_checkpoint_selection must be an object.")
     if selection.get("locked_test_used_for_selection") is not False:
-        raise ValueError(
-            "GICO teacher_checkpoint_selection requires "
-            "locked_test_used_for_selection=false."
-        )
+        raise ValueError("GICO teacher_checkpoint_selection requires locked_test_used_for_selection=false.")
     return dict(_validate_current_teacher_training_metadata(teacher_training))
 
 
@@ -117,10 +117,7 @@ def _validate_student_model_config(
     if set(config) != _CURRENT_STUDENT_MODEL_CONFIG_FIELDS:
         missing = sorted(_CURRENT_STUDENT_MODEL_CONFIG_FIELDS - set(config))
         unknown = sorted(set(config) - _CURRENT_STUDENT_MODEL_CONFIG_FIELDS)
-        raise ValueError(
-            "GICO student model configuration must be complete; "
-            f"missing={missing}, unknown={unknown}."
-        )
+        raise ValueError(f"GICO student model configuration must be complete; missing={missing}, unknown={unknown}.")
     expected_dimensions = {
         "setting_dim": int(setting_dim),
         "density_dim": int(density_dim),
@@ -134,8 +131,7 @@ def _validate_student_model_config(
         )
         if actual != expected:
             raise ValueError(
-                f"GICO student model_config {field}={actual} does not match "
-                f"the checkpoint value {expected}."
+                f"GICO student model_config {field}={actual} does not match the checkpoint value {expected}."
             )
         config[field] = actual
     for field in ("hidden_dim", "num_layers", "attention_heads"):
@@ -152,13 +148,9 @@ def _validate_student_model_config(
         raise ValueError("GICO student model_config dropout must be finite and in [0, 1).")
     config["dropout"] = dropout
     if config["architecture"] != ARCHITECTURE_DENSITY_QUERY_TRANSFORMER:
-        raise ValueError(
-            "GICO student model_config architecture does not match the student architecture."
-        )
+        raise ValueError("GICO student model_config architecture does not match the student architecture.")
     if config["density_feature_mean"] is not None or config["density_feature_std"] is not None:
-        raise ValueError(
-            "GICO student model_config may not contain teacher density-feature statistics."
-        )
+        raise ValueError("GICO student model_config may not contain teacher density-feature statistics.")
     return config
 
 
@@ -192,14 +184,11 @@ class GICOSchedulePolicy:
         metadata.pop("student_state", None)
         self.checkpoint_payload = metadata
         if "context_embedding_kind" in metadata:
-            raise ValueError(
-                "GICO checkpoints may not contain the retired context_embedding_kind field."
-            )
+            raise ValueError("GICO checkpoints may not contain the retired context_embedding_kind field.")
         context_protocol = str(metadata.get("context_embedding_protocol", ""))
         if context_protocol != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL:
             raise ValueError(
-                "GICO checkpoint context_embedding_protocol must be "
-                f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
+                f"GICO checkpoint context_embedding_protocol must be {FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
             )
         self.context_embedding_protocol = context_protocol
         try:
@@ -303,8 +292,7 @@ class GICOSchedulePolicy:
     ) -> GICOSchedule:
         if context_embedding.ndim != 2:
             raise ValueError(
-                "context_embedding must have shape [batch, context_dim], "
-                f"got {tuple(context_embedding.shape)}."
+                f"context_embedding must have shape [batch, context_dim], got {tuple(context_embedding.shape)}."
             )
         if not context_embedding.is_floating_point():
             raise ValueError("context_embedding must use a floating-point dtype.")
@@ -342,10 +330,7 @@ class GICOSchedulePolicy:
             normalized_context,
         )
         if student_density.shape != (int(student_context.shape[0]), self.density_dim):
-            raise ValueError(
-                "GICO student returned an invalid density shape: "
-                f"{tuple(student_density.shape)}."
-            )
+            raise ValueError(f"GICO student returned an invalid density shape: {tuple(student_density.shape)}.")
         if (
             not student_density.is_floating_point()
             or not torch.isfinite(student_density).all()
@@ -361,9 +346,7 @@ class GICOSchedulePolicy:
                 rtol=1e-5,
             )
         ):
-            raise ValueError(
-                "GICO student density must be finite, nonnegative, and sum to one."
-            )
+            raise ValueError("GICO student density must be finite, nonnegative, and sum to one.")
         student_time_grid = self._time_grid(
             student_density,
             macro_steps=nfe.macro_steps,
@@ -388,9 +371,7 @@ class GICOSchedulePolicy:
                 rtol=density_tolerance,
             )
         ):
-            raise ValueError(
-                "GICO density is invalid in the requested output dtype."
-            )
+            raise ValueError("GICO density is invalid in the requested output dtype.")
         expected_grid_shape = (int(student_context.shape[0]), nfe.macro_steps + 1)
         if (
             time_grid.shape != expected_grid_shape
@@ -399,9 +380,7 @@ class GICOSchedulePolicy:
             or not bool((time_grid[:, 0] == 0.0).all())
             or not bool((time_grid[:, -1] == 1.0).all())
         ):
-            raise ValueError(
-                "GICO time grid must be finite, strictly increasing, and span [0, 1]."
-            )
+            raise ValueError("GICO time grid must be finite, strictly increasing, and span [0, 1].")
         return GICOSchedule(
             solver_key=nfe.solver_key,
             target_nfe=nfe.target_nfe,
@@ -429,9 +408,7 @@ def load_gico_schedule_policy(
         label="GICO checkpoint",
     )
     if str(payload.get("protocol", "")) != GICO_PROTOCOL:
-        raise ValueError(
-            f"Unsupported GICO protocol {payload.get('protocol')!r}; expected {GICO_PROTOCOL!r}."
-        )
+        raise ValueError(f"Unsupported GICO protocol {payload.get('protocol')!r}; expected {GICO_PROTOCOL!r}.")
     if str(payload.get("student_policy_type", "")) != "continuous_density":
         raise ValueError("GICO checkpoint must contain a continuous-density student policy.")
     validate_locked_test_exclusion(
@@ -440,16 +417,10 @@ def load_gico_schedule_policy(
         required_root_keys=("locked_test_used_for_selection",),
     )
     if "context_embedding_kind" in payload:
+        raise ValueError("GICO checkpoints may not contain the retired context_embedding_kind field.")
+    if str(payload.get("context_embedding_protocol", "")) != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL:
         raise ValueError(
-            "GICO checkpoints may not contain the retired context_embedding_kind field."
-        )
-    if (
-        str(payload.get("context_embedding_protocol", ""))
-        != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
-    ):
-        raise ValueError(
-            "GICO checkpoint context_embedding_protocol must be "
-            f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
+            f"GICO checkpoint context_embedding_protocol must be {FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
         )
     teacher_training = payload.get("teacher_training")
     if not isinstance(teacher_training, Mapping):
@@ -457,9 +428,7 @@ def load_gico_schedule_policy(
     validate_gico_teacher_training_metadata(teacher_training)
     architecture = str(payload.get("student_architecture", ""))
     if architecture != ARCHITECTURE_DENSITY_QUERY_TRANSFORMER:
-        raise ValueError(
-            f"GICO student architecture must be {ARCHITECTURE_DENSITY_QUERY_TRANSFORMER!r}."
-        )
+        raise ValueError(f"GICO student architecture must be {ARCHITECTURE_DENSITY_QUERY_TRANSFORMER!r}.")
     density_metadata = dict(payload.get("density_representation", {}))
     if str(density_metadata.get("density_protocol", "")) != DENSITY_PROTOCOL:
         raise ValueError("GICO checkpoint is missing density-mass metadata.")
@@ -521,9 +490,7 @@ def load_gico_schedule_policy(
         model_config=validated_model_config,
     ).to(device)
     if student.model_config() != validated_model_config:
-        raise ValueError(
-            "GICO student model configuration does not match the loaded model."
-        )
+        raise ValueError("GICO student model configuration does not match the loaded model.")
     validated_state = validate_tensor_state_dict(
         state,
         label="GICO student state",

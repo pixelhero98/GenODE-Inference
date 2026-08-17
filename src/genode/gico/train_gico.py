@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -11,15 +12,24 @@ import torch
 
 from genode.canonical_experiment_layout import (
     CANONICAL_CONTEXT_SAMPLE_COUNT,
-    CANONICAL_UNSEEN_TARGET_WEIGHT,
     CANONICAL_SEEN_NFES,
     CANONICAL_UNSEEN_NFES,
+    CANONICAL_UNSEEN_TARGET_WEIGHT,
     SCENARIO_FAMILY_CONDITIONAL_GENERATION,
     SCENARIO_FAMILY_FORECAST,
     SCENARIO_FAMILY_MOLECULE,
     STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
     STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS,
     scenario_family_for_key,
+)
+from genode.data.otflow_paths import resolve_project_path
+from genode.evaluation.otflow_evaluation_support import FORECAST_FAMILY, TRAIN_TUNING_SAMPLER_WINDOW_FRACTION
+from genode.gico.density_representation import density_metadata, reference_grid_hash, uniform_reference_grid
+from genode.gico.models import (
+    SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    setting_encoder_config_for_rows,
+    setting_feature_dim,
+    validate_setting_feature_mode,
 )
 from genode.gico.objectives import (
     UNIFORM_SCHEDULE_KEY,
@@ -28,32 +38,32 @@ from genode.gico.objectives import (
     teacher_objective_utility_keys_for_scenario,
 )
 from genode.gico.policy import (
-    GICO_PROTOCOL,
-    MODEL_PAYLOAD_VERSION,
-    DEFAULT_TEACHER_TARGET_TEMPERATURE,
+    ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
+    ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
+    CONDITIONING_STYLE_ADDITIVE_MLP,
+    DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS,
     DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
     DEFAULT_STUDENT_TARGET_ELITE_FRACTION,
     DEFAULT_STUDENT_TARGET_ELITE_K,
     DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT,
     DEFAULT_STUDENT_TARGET_MIXTURE_MODE,
     DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
-    DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT,
     DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION,
-    STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
-    STUDENT_TARGET_MIXTURE_MODES,
-    TEACHER_METRIC_MASK_PROTOCOL,
-    TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
-    TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
-    DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS,
-    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
-    STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE,
-    ARCHITECTURE_DENSITY_FORM_TRANSFORMER,
-    ARCHITECTURE_DENSITY_QUERY_TRANSFORMER,
+    DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT,
+    DEFAULT_TEACHER_TARGET_TEMPERATURE,
     DEFAULT_TRANSFORMER_DROPOUT,
     DEFAULT_TRANSFORMER_HEADS,
     DEFAULT_TRANSFORMER_HIDDEN_DIM,
     DEFAULT_TRANSFORMER_NUM_LAYERS,
-    CONDITIONING_STYLE_ADDITIVE_MLP,
+    GICO_PROTOCOL,
+    MODEL_PAYLOAD_VERSION,
+    STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE,
+    STUDENT_TARGET_MIXTURE_MODES,
+    STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE,
+    TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
+    TEACHER_METRIC_MASK_PROTOCOL,
+    TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
+    TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
     DensityFeatureNormalizer,
     EmbeddingNormalizer,
     attach_uniform_gico_rewards,
@@ -66,6 +76,7 @@ from genode.gico.policy import (
     density_mass_for_row,
     load_context_embedding_table,
     nfe_sequence_diagnostic_summary,
+    normalize_teacher_utility_weights,
     read_metric_rows_csv,
     recommended_context_calibration_count,
     sample_context_ids_stratified,
@@ -74,31 +85,21 @@ from genode.gico.policy import (
     split_rows_by_context_holdout,
     split_rows_by_density_family_holdout,
     teacher_rank_pair_diagnostics,
+    teacher_utility_weights_for_summary,
     train_gico_student,
     train_gico_teacher,
-    normalize_teacher_utility_weights,
-    teacher_utility_weights_for_summary,
     validate_gico_attention_heads,
     validate_gico_support_schedule_keys,
     validate_student_target_mixture_mode,
     validate_teacher_metric_target_keys,
     validate_teacher_objective_hyperparameters,
 )
-from genode.gico.density_representation import density_metadata, reference_grid_hash, uniform_reference_grid
 from genode.gico.preflight import (
     teacher_metric_target_coverage,
 )
 from genode.gico.schedule_grids import load_schedule_summary_grids, validate_schedule_grid_coverage
-from genode.gico.models import (
-    SETTING_ENCODER_MODE_CONTINUOUS_V3,
-    setting_encoder_config_for_rows,
-    setting_feature_dim,
-    validate_setting_feature_mode,
-)
-from genode.data.otflow_paths import resolve_project_path
-from genode.evaluation.otflow_evaluation_support import FORECAST_FAMILY, TRAIN_TUNING_SAMPLER_WINDOW_FRACTION
-from genode.models.otflow_train_val import seed_all
 from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
+from genode.models.otflow_train_val import seed_all
 from genode.runtime import resolve_torch_device
 from genode.schedule_transfer.reference_clocks import (
     canonical_late_p_key,
@@ -195,30 +196,36 @@ def _has_nonempty_value(row: Mapping[str, Any], key: str) -> bool:
     value = row.get(key, None)
     if value is None:
         return False
-    if isinstance(value, str) and value.strip() == "":
-        return False
-    return True
+    return not (isinstance(value, str) and value.strip() == "")
 
 
 def _infer_single_benchmark_family(rows: Sequence[Mapping[str, Any]]) -> str:
-    families = {str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()}
+    families = {
+        str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()
+    }
     if not families:
         dataset_families = set()
         for row in rows:
             dataset = str(row.get("dataset", row.get("dataset_key", ""))).strip()
             if not dataset:
                 continue
-            try:
+            with contextlib.suppress(KeyError, ValueError):
                 dataset_families.add(scenario_family_for_key(dataset))
-            except (KeyError, ValueError):
-                pass
         families = dataset_families
     if not families:
         if _rows_have_forecast_metrics(rows):
             return SCENARIO_FAMILY_FORECAST
-        if any(_has_nonempty_value(row, key) for row in rows for key in objective_utility_keys_for_family(SCENARIO_FAMILY_CONDITIONAL_GENERATION)):
+        if any(
+            _has_nonempty_value(row, key)
+            for row in rows
+            for key in objective_utility_keys_for_family(SCENARIO_FAMILY_CONDITIONAL_GENERATION)
+        ):
             return SCENARIO_FAMILY_CONDITIONAL_GENERATION
-        if any(_has_nonempty_value(row, key) for row in rows for key in objective_utility_keys_for_family(SCENARIO_FAMILY_MOLECULE)):
+        if any(
+            _has_nonempty_value(row, key)
+            for row in rows
+            for key in objective_utility_keys_for_family(SCENARIO_FAMILY_MOLECULE)
+        ):
             return SCENARIO_FAMILY_MOLECULE
         raise ValueError("Cannot infer benchmark_family for automatic GICO teacher target selection.")
     if len(families) != 1:
@@ -254,7 +261,9 @@ def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence
 
 
 def _rows_are_forecast_family(rows: Sequence[Mapping[str, Any]]) -> bool:
-    families = {str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()}
+    families = {
+        str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()
+    }
     return not families or families == {FORECAST_FAMILY}
 
 
@@ -276,10 +285,16 @@ def _needs_forecast_uniform_rewards(rows: Sequence[Mapping[str, Any]], target_ke
     reward_keys = {"u_comp_uniform", "u_crps_uniform", "u_mase_uniform"}
     if not any(key in reward_keys for key in target_keys):
         return False
-    return bool(_rows_are_forecast_family(rows) and _rows_have_forecast_metrics(rows) and _missing_target_value_keys(rows, target_keys))
+    return bool(
+        _rows_are_forecast_family(rows)
+        and _rows_have_forecast_metrics(rows)
+        and _missing_target_value_keys(rows, target_keys)
+    )
 
 
-def _rows_without_schedule_keys(rows: Sequence[Mapping[str, Any]], schedule_keys: Sequence[str]) -> List[Dict[str, Any]]:
+def _rows_without_schedule_keys(
+    rows: Sequence[Mapping[str, Any]], schedule_keys: Sequence[str]
+) -> List[Dict[str, Any]]:
     excluded = {str(value) for value in schedule_keys}
     return [dict(row) for row in rows if str(row["scheduler_key"]) not in excluded]
 
@@ -368,7 +383,10 @@ def _select_context_density_regret_step(
         "density_family": float(effective_weights["density_family"]),
     }
     selection = select_weighted_normalized_regret_checkpoint(
-        [{"step": int(step), "diagnostics": dict(entry.get("diagnostics", {}) or {})} for step, entry in sorted(context_history.items())],
+        [
+            {"step": int(step), "diagnostics": dict(entry.get("diagnostics", {}) or {})}
+            for step, entry in sorted(context_history.items())
+        ],
         required_split_names=required_splits,
         component_weights=split_weights,
     )
@@ -544,8 +562,7 @@ def _validate_teacher_metric_coverage(
         fraction = float(dict(item).get("coverage_fraction", 0.0))
         if valid_count < int(min_valid_rows) or fraction + 1e-12 < float(min_coverage_fraction):
             failures.append(
-                f"{key}: valid_rows={valid_count}/{int(coverage.get('row_count', 0))}, "
-                f"coverage={fraction:.6g}"
+                f"{key}: valid_rows={valid_count}/{int(coverage.get('row_count', 0))}, coverage={fraction:.6g}"
             )
     if failures:
         raise ValueError(
@@ -597,7 +614,7 @@ def _validate_support_group_counts(rows: Sequence[Mapping[str, Any]], support_sc
         schedule_key = str(row["scheduler_key"])
         if schedule_key not in support_set:
             raise ValueError(f"Supervision row {schedule_key!r} is outside support_schedule_keys.")
-        counts = grouped.setdefault(tuple(context_pair_key(row, pair_on_seed=True)), {key: 0 for key in support_keys})
+        counts = grouped.setdefault(tuple(context_pair_key(row, pair_on_seed=True)), dict.fromkeys(support_keys, 0))
         counts[schedule_key] = int(counts.get(schedule_key, 0)) + 1
     bad = {
         key: {schedule: count for schedule, count in counts.items() if count != 1}
@@ -664,8 +681,7 @@ def _validate_context_embedding_checkpoint_scope(rows: Sequence[Mapping[str, Any
             mismatches.append(f"{checkpoint_id}->{embedding_id}")
     if mismatches:
         raise ValueError(
-            f"{label} requires checkpoint-scoped context_embedding_id values; "
-            f"first mismatches: {mismatches[:8]}."
+            f"{label} requires checkpoint-scoped context_embedding_id values; first mismatches: {mismatches[:8]}."
         )
     if prefixed_context_ids:
         raise ValueError(
@@ -723,11 +739,7 @@ def _rows_for_context_keys(
     rows: Sequence[Mapping[str, Any]],
     selected: set[Tuple[str, str]],
 ) -> List[Dict[str, Any]]:
-    return [
-        dict(row)
-        for row in rows
-        if _checkpoint_context_key(row) in selected
-    ]
+    return [dict(row) for row in rows if _checkpoint_context_key(row) in selected]
 
 
 def _context_sampling_summary(
@@ -753,7 +765,9 @@ def _context_sampling_summary(
         "protocol": "checkpoint_maturity_stratified_context_sample_v1",
         "sample_count_per_checkpoint": int(sample_count),
         "checkpoint_count": int(len(available_by_checkpoint)),
-        "available_physical_context_count": int(len({context_id for values in available_by_checkpoint.values() for context_id in values})),
+        "available_physical_context_count": int(
+            len({context_id for values in available_by_checkpoint.values() for context_id in values})
+        ),
         "selected_physical_context_count": int(len({context_id for _checkpoint_id, context_id in selected})),
         "per_checkpoint": per_checkpoint,
     }
@@ -779,8 +793,7 @@ def _assert_embedding_overlap_compatible(
             bad.append((str(key), max_abs_diff))
     if bad:
         examples = [
-            f"{key} (shape mismatch)" if diff is None else f"{key} (max_abs_diff={diff:.3g})"
-            for key, diff in bad[:8]
+            f"{key} (shape mismatch)" if diff is None else f"{key} (max_abs_diff={diff:.3g})" for key, diff in bad[:8]
         ]
         raise ValueError(
             f"{label} context embeddings collide with different vectors; first incompatible IDs: {examples}"
@@ -809,9 +822,7 @@ def _raw_split_phase(row: Mapping[str, Any]) -> str:
 
 def _validate_train_tuning_rows(rows: Sequence[Mapping[str, Any]], *, label: str) -> None:
     locked_rows = [
-        row
-        for row in rows
-        if _source_split_phase(row) == "locked_test" or _raw_split_phase(row) == "locked_test"
+        row for row in rows if _source_split_phase(row) == "locked_test" or _raw_split_phase(row) == "locked_test"
     ]
     if locked_rows:
         raise ValueError(f"{label} refuses locked_test rows; found {len(locked_rows)} locked-test rows.")
@@ -883,7 +894,9 @@ def _validate_train_tuning_reward_provenance_metadata(
                 try:
                     weight = float(value)
                 except (TypeError, ValueError) as exc:
-                    raise ValueError(f"{label} row {row_idx} reward_metric_weights_json values must be numeric.") from exc
+                    raise ValueError(
+                        f"{label} row {row_idx} reward_metric_weights_json values must be numeric."
+                    ) from exc
                 if not math.isfinite(weight) or weight < 0.0:
                     raise ValueError(
                         f"{label} row {row_idx} reward_metric_weights_json values must be finite and nonnegative."
@@ -962,7 +975,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train GICO continuous-density from per-example fixed/SER rows.")
     parser.add_argument("--rows_csv", required=True, help="Per-example fixed/SER metric rows CSV.")
     parser.add_argument("--context_embeddings_npz", required=True, help="Frozen context embedding sidecar NPZ.")
-    parser.add_argument("--schedule_summary_json", default="", help="Comma-separated schedule summaries for non-fixed references such as SER.")
+    parser.add_argument(
+        "--schedule_summary_json",
+        default="",
+        help="Comma-separated schedule summaries for non-fixed references such as SER.",
+    )
     parser.add_argument("--out_dir", required=True)
     parser.add_argument(
         "--support_schedule_keys",
@@ -1033,13 +1050,21 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--student_unseen_target_weight", type=float, default=CANONICAL_UNSEEN_TARGET_WEIGHT)
     parser.add_argument("--student_teacher_score_weight", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT)
-    parser.add_argument("--student_teacher_score_warmup_fraction", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION)
+    parser.add_argument(
+        "--student_teacher_score_warmup_fraction", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION
+    )
     parser.add_argument("--student_teacher_score_include_unseen_targets", action="store_true", default=False)
-    parser.add_argument("--student_target_mixture_mode", choices=STUDENT_TARGET_MIXTURE_MODES, default=DEFAULT_STUDENT_TARGET_MIXTURE_MODE)
+    parser.add_argument(
+        "--student_target_mixture_mode",
+        choices=STUDENT_TARGET_MIXTURE_MODES,
+        default=DEFAULT_STUDENT_TARGET_MIXTURE_MODE,
+    )
     parser.add_argument("--student_target_elite_fraction", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_FRACTION)
     parser.add_argument("--student_target_elite_k", type=int, default=DEFAULT_STUDENT_TARGET_ELITE_K)
     parser.add_argument("--student_target_elite_min_count", type=int, default=DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT)
-    parser.add_argument("--student_target_elite_blend_all_weight", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT)
+    parser.add_argument(
+        "--student_target_elite_blend_all_weight", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT
+    )
     parser.add_argument("--student_steps", type=int, default=500)
     parser.add_argument("--student_log_every", type=int, default=0)
     parser.add_argument("--student_checkpoint_every", type=int, default=100)
@@ -1096,15 +1121,17 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
     if not rows:
         raise ValueError("rows_csv contains no rows.")
     locked_rows = [
-        row
-        for row in rows
-        if _source_split_phase(row) == "locked_test" or _raw_split_phase(row) == "locked_test"
+        row for row in rows if _source_split_phase(row) == "locked_test" or _raw_split_phase(row) == "locked_test"
     ]
     if locked_rows:
-        raise ValueError(f"GICO training refuses locked_test rows in rows_csv; found {len(locked_rows)} locked-test rows.")
+        raise ValueError(
+            f"GICO training refuses locked_test rows in rows_csv; found {len(locked_rows)} locked-test rows."
+        )
     observed_source_phases = sorted({_source_split_phase(row) for row in rows if _source_split_phase(row)})
     if observed_source_phases and observed_source_phases != ["train_tuning"]:
-        raise ValueError(f"GICO training rows_csv must contain only train_tuning source rows; found {observed_source_phases}.")
+        raise ValueError(
+            f"GICO training rows_csv must contain only train_tuning source rows; found {observed_source_phases}."
+        )
     _validate_unique_schedule_rows(rows, label="GICO training rows_csv")
     _validate_context_embedding_checkpoint_scope(rows, label="GICO training rows_csv")
     validate_teacher_objective_hyperparameters(
@@ -1165,7 +1192,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         target_keys=teacher_metric_target_keys,
         label="GICO training rows_csv",
     )
-    explicit_teacher_weights = _parse_float_mapping(str(args.teacher_utility_weights)) if str(args.teacher_utility_weights).strip() else None
+    explicit_teacher_weights = (
+        _parse_float_mapping(str(args.teacher_utility_weights)) if str(args.teacher_utility_weights).strip() else None
+    )
     if explicit_teacher_weights is None and teacher_metric_target_keys == ("u_crps_uniform", "u_mase_uniform"):
         explicit_teacher_weights = {
             "u_crps_uniform": float(args.teacher_utility_crps_weight),
@@ -1243,8 +1272,7 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
     }
     if bad_weights:
         raise ValueError(
-            "weighted_normalized_regret requires J_CDN weights "
-            "context=0.25,density_family=0.25,unseen_nfe=0.50."
+            "weighted_normalized_regret requires J_CDN weights context=0.25,density_family=0.25,unseen_nfe=0.50."
         )
     sampled_target_nfes = sorted({int(row["target_nfe"]) for row in sampled_rows})
     if sampled_target_nfes != seen_target_nfes:
@@ -1273,11 +1301,7 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
                 f"found {len(unseen_locked_rows)} locked-test rows."
             )
         bad_unseen_source_phases = sorted(
-            {
-                _source_split_phase(row)
-                for row in unseen_raw_rows
-                if _source_split_phase(row) != "train_tuning"
-            }
+            {_source_split_phase(row) for row in unseen_raw_rows if _source_split_phase(row) != "train_tuning"}
         )
         if bad_unseen_source_phases:
             raise ValueError(
@@ -1310,7 +1334,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         _validate_support_group_counts(unseen_rewarded_rows, support_keys)
         missing_unseen_columns = _missing_target_value_keys(unseen_rewarded_rows, teacher_metric_target_keys)
         if len(missing_unseen_columns) == len(teacher_metric_target_keys):
-            raise ValueError(f"Teacher unseen selection rows are missing all metric target columns: {missing_unseen_columns}")
+            raise ValueError(
+                f"Teacher unseen selection rows are missing all metric target columns: {missing_unseen_columns}"
+            )
         unseen_metric_coverage = _teacher_metric_coverage_summary(
             unseen_rewarded_rows,
             teacher_metric_target_keys,
@@ -1338,7 +1364,10 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("density-family holdout must not include uniform; uniform is the reward anchor.")
     support_set = set(support_keys)
     missing_density_holdout_keys = sorted(set(density_holdout_requested) - support_set)
-    if missing_density_holdout_keys and tuple(density_holdout_requested) == DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS:
+    if (
+        missing_density_holdout_keys
+        and tuple(density_holdout_requested) == DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS
+    ):
         present_default_keys = [key for key in density_holdout_requested if key in support_set]
         if not present_default_keys:
             raise ValueError(
@@ -1349,7 +1378,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             )
         density_holdout_keys: List[str] = present_default_keys
     elif missing_density_holdout_keys:
-        raise ValueError(f"density-family holdout keys must be in support_schedule_keys; unsupported={missing_density_holdout_keys}.")
+        raise ValueError(
+            f"density-family holdout keys must be in support_schedule_keys; unsupported={missing_density_holdout_keys}."
+        )
     else:
         density_holdout_keys = list(density_holdout_requested)
 
@@ -1377,7 +1408,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
     selector_fit_rows = density_selection_fit_rows
     final_fit_rows = [dict(row) for row in sampled_rows]
     if not selector_fit_rows:
-        raise ValueError("Teacher selection fitting requires at least one row after context, series, and density-family holdouts.")
+        raise ValueError(
+            "Teacher selection fitting requires at least one row after context, series, and density-family holdouts."
+        )
     if not final_fit_rows:
         raise ValueError("Final teacher fitting requires at least one eligible non-test calibration row.")
     setting_encoder_config = setting_encoder_config_for_rows(final_fit_rows, mode=setting_feature_mode)
@@ -1404,7 +1437,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
     if missing_selector_embeddings:
         raise KeyError(f"Selector context embeddings are missing sampled contexts: {missing_selector_embeddings[:8]}")
     if unseen_selection_rows:
-        unseen_embeddings_path = str(args.teacher_unseen_selection_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
+        unseen_embeddings_path = str(args.teacher_unseen_selection_context_embeddings_npz).strip() or str(
+            args.context_embeddings_npz
+        )
         unseen_raw_embeddings = _load_context_embedding_tables(unseen_embeddings_path)
         unseen_required_embeddings = _required_embedding_table(
             unseen_raw_embeddings,
@@ -1477,7 +1512,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         reference_time_grid=reference_time_grid,
     )
     density_normalizer = final_density_normalizer
-    student_teacher_score_weight = float(getattr(args, "student_teacher_score_weight", DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT))
+    student_teacher_score_weight = float(
+        getattr(args, "student_teacher_score_weight", DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT)
+    )
     if not np.isfinite(student_teacher_score_weight) or student_teacher_score_weight < 0.0:
         raise ValueError("student_teacher_score_weight must be finite and nonnegative.")
     student_teacher_score_warmup_fraction = float(
@@ -1495,9 +1532,13 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
     student_target_mixture_mode = validate_student_target_mixture_mode(
         str(getattr(args, "student_target_mixture_mode", DEFAULT_STUDENT_TARGET_MIXTURE_MODE))
     )
-    student_target_elite_fraction = float(getattr(args, "student_target_elite_fraction", DEFAULT_STUDENT_TARGET_ELITE_FRACTION))
+    student_target_elite_fraction = float(
+        getattr(args, "student_target_elite_fraction", DEFAULT_STUDENT_TARGET_ELITE_FRACTION)
+    )
     student_target_elite_k = int(getattr(args, "student_target_elite_k", DEFAULT_STUDENT_TARGET_ELITE_K))
-    student_target_elite_min_count = int(getattr(args, "student_target_elite_min_count", DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT))
+    student_target_elite_min_count = int(
+        getattr(args, "student_target_elite_min_count", DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT)
+    )
     student_target_elite_blend_all_weight = float(
         getattr(args, "student_target_elite_blend_all_weight", DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT)
     )
@@ -1515,7 +1556,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         if not raw_unseen_target_rows:
             raise ValueError("student_unseen_target_rows_csv contains no rows.")
         _validate_unique_schedule_rows(raw_unseen_target_rows, label="Student unseen target distillation rows")
-        _validate_context_embedding_checkpoint_scope(raw_unseen_target_rows, label="Student unseen target distillation rows")
+        _validate_context_embedding_checkpoint_scope(
+            raw_unseen_target_rows, label="Student unseen target distillation rows"
+        )
         _validate_train_tuning_rows(raw_unseen_target_rows, label="Student unseen target distillation")
         unseen_filtered_rows = _rows_for_target_nfes(raw_unseen_target_rows, unseen_target_nfes)
         if not unseen_filtered_rows:
@@ -1551,7 +1594,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         _validate_support_group_counts(unseen_target_source_rows, support_keys)
         missing_unseen_columns = _missing_target_value_keys(unseen_target_source_rows, teacher_metric_target_keys)
         if len(missing_unseen_columns) == len(teacher_metric_target_keys):
-            raise ValueError(f"Student unseen target rows are missing all metric target columns: {missing_unseen_columns}")
+            raise ValueError(
+                f"Student unseen target rows are missing all metric target columns: {missing_unseen_columns}"
+            )
         unseen_metric_coverage = _teacher_metric_coverage_summary(
             unseen_target_source_rows,
             teacher_metric_target_keys,
@@ -1574,14 +1619,18 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             unseen_context_keys,
             sample_count=sample_count,
         )
-        unseen_embeddings_path = str(args.student_unseen_target_context_embeddings_npz).strip() or str(args.context_embeddings_npz)
+        unseen_embeddings_path = str(args.student_unseen_target_context_embeddings_npz).strip() or str(
+            args.context_embeddings_npz
+        )
         raw_unseen_embeddings = _load_context_embedding_tables(unseen_embeddings_path)
         unseen_required_embeddings = _required_embedding_table(
             raw_unseen_embeddings,
             _embedding_ids(unseen_target_rows),
             label="Unseen target distillation",
         )
-        _assert_embedding_overlap_compatible(context_embeddings, unseen_required_embeddings, label="student_unseen_targets")
+        _assert_embedding_overlap_compatible(
+            context_embeddings, unseen_required_embeddings, label="student_unseen_targets"
+        )
         unseen_target_embeddings = embedding_normalizer.transform_table(unseen_required_embeddings)
         unseen_target_schedule_grids = dict(schedule_grids)
         unseen_schedule_summary_paths = _parse_csv(str(args.student_unseen_target_schedule_summary_json))
@@ -1612,7 +1661,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             seed=int(args.seed) + 20_000,
         )
         if not student_selector_fit_rows or not student_selector_validation_rows:
-            raise ValueError("student validation CE checkpoint selection requires non-empty selector fit and validation rows.")
+            raise ValueError(
+                "student validation CE checkpoint selection requires non-empty selector fit and validation rows."
+            )
 
     density_meta = density_metadata(reference_time_grid)
     base_transformer_model_config = {
@@ -1808,7 +1859,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             "unseen_target_weight": float(unseen_target_weight),
             "target_nfes": [int(value) for value in unseen_target_nfes],
             "raw_csv": _artifact_input_summary(str(args.student_unseen_target_rows_csv)),
-            "context_embeddings_npz": _artifact_input_summary(str(args.student_unseen_target_context_embeddings_npz or args.context_embeddings_npz)),
+            "context_embeddings_npz": _artifact_input_summary(
+                str(args.student_unseen_target_context_embeddings_npz or args.context_embeddings_npz)
+            ),
             "schedule_summary_json": _artifact_input_summary(str(args.student_unseen_target_schedule_summary_json)),
             "source_row_count": int(len(unseen_target_source_rows)),
             "selected_row_count": int(len(unseen_target_rows)),
@@ -1835,10 +1888,14 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             "enabled": bool(unseen_selection_rows),
             "target_nfes": [int(value) for value in unseen_selection_target_nfes],
             "raw_csv": _artifact_input_summary(str(args.teacher_unseen_selection_rows_csv)),
-            "context_embeddings_npz": _artifact_input_summary(str(args.teacher_unseen_selection_context_embeddings_npz or args.context_embeddings_npz)),
+            "context_embeddings_npz": _artifact_input_summary(
+                str(args.teacher_unseen_selection_context_embeddings_npz or args.context_embeddings_npz)
+            ),
             "schedule_summary_json": _artifact_input_summary(str(args.teacher_unseen_selection_schedule_summary_json)),
             "source_row_count": int(len(unseen_selection_rows)),
-            "selected_checkpoint_context_count": int(len({_checkpoint_context_key(row) for row in unseen_selection_rows})),
+            "selected_checkpoint_context_count": int(
+                len({_checkpoint_context_key(row) for row in unseen_selection_rows})
+            ),
             "context_sampling": unseen_context_sampling,
             "diagnostic": _split_counts(unseen_nfe_diagnostic_rows),
             "excluded_density_holdout_schedule_keys": list(density_holdout_keys),
@@ -1939,7 +1996,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
     if not context_holdout_diagnostic_rows:
         raise ValueError("weighted_normalized_regret selection requires non-empty context_disjoint diagnostic rows.")
     if not density_family_diagnostic_rows:
-        raise ValueError("weighted_normalized_regret selection requires non-empty density_family_holdout diagnostic rows.")
+        raise ValueError(
+            "weighted_normalized_regret selection requires non-empty density_family_holdout diagnostic rows."
+        )
     context_density_training = _train_teacher_pass(
         seed_offset=101,
         pass_name="context_density_selector",
@@ -2090,7 +2149,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         "selector_fit_row_count": int(len(student_selector_fit_rows)),
         "selector_fit_context_count": int(len({context_id_from_row(row) for row in student_selector_fit_rows})),
         "selector_validation_row_count": int(len(student_selector_validation_rows)),
-        "selector_validation_context_count": int(len({context_id_from_row(row) for row in student_selector_validation_rows})),
+        "selector_validation_context_count": int(
+            len({context_id_from_row(row) for row in student_selector_validation_rows})
+        ),
         "final_fit_source": "all_eligible_train_tuning_rows_after_teacher_selection",
         "final_fit_row_count": int(len(fit_rows)),
         "final_fit_context_count": int(len({context_id_from_row(row) for row in fit_rows})),
@@ -2108,7 +2169,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             "fit_row_count": int(len(student_selector_fit_rows)),
             "fit_context_count": int(len({context_id_from_row(row) for row in student_selector_fit_rows})),
             "validation_row_count": int(len(student_selector_validation_rows)),
-            "validation_context_count": int(len({context_id_from_row(row) for row in student_selector_validation_rows})),
+            "validation_context_count": int(
+                len({context_id_from_row(row) for row in student_selector_validation_rows})
+            ),
             "holdout_fraction": float(args.student_selection_holdout_fraction),
             "locked_test_used_for_selection": False,
         },
@@ -2165,7 +2228,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             "teacher_utility_weights": teacher_utility_weights,
             "teacher_metric_target_coverage": teacher_metric_target_coverage,
             "teacher_selection_nominal_axis_weights": dict(teacher_selection_weight_metadata["nominal_axis_weights"]),
-            "teacher_selection_effective_axis_weights": dict(teacher_selection_weight_metadata["effective_axis_weights"]),
+            "teacher_selection_effective_axis_weights": dict(
+                teacher_selection_weight_metadata["effective_axis_weights"]
+            ),
             "teacher_selection_inactive_axes": list(teacher_selection_weight_metadata["inactive_axes"]),
             "teacher_training": teacher_training,
             "student_objective_settings": student_objective_settings,
@@ -2179,7 +2244,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             "student_unseen_target_distillation": summary_base["student_unseen_target_distillation"],
             "student_final_retrain": student_training.get("student_final_retrain", {}),
             "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
-            "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
+            "final_teacher_retrain": teacher_training.get(
+                "final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})
+            ),
             "nfe_sequence_diagnostics": summary_base["nfe_sequence_diagnostics"],
             "locked_test_used_for_selection": False,
         },
@@ -2213,7 +2280,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             "teacher_utility_weights": teacher_utility_weights,
             "teacher_metric_target_coverage": teacher_metric_target_coverage,
             "teacher_selection_nominal_axis_weights": dict(teacher_selection_weight_metadata["nominal_axis_weights"]),
-            "teacher_selection_effective_axis_weights": dict(teacher_selection_weight_metadata["effective_axis_weights"]),
+            "teacher_selection_effective_axis_weights": dict(
+                teacher_selection_weight_metadata["effective_axis_weights"]
+            ),
             "teacher_selection_inactive_axes": list(teacher_selection_weight_metadata["inactive_axes"]),
             "teacher_checkpoint": teacher_path.name,
             "teacher_training": teacher_training,
@@ -2228,7 +2297,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             "student_unseen_target_distillation": summary_base["student_unseen_target_distillation"],
             "student_final_retrain": student_training.get("student_final_retrain", {}),
             "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
-            "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
+            "final_teacher_retrain": teacher_training.get(
+                "final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})
+            ),
             "nfe_sequence_diagnostics": summary_base["nfe_sequence_diagnostics"],
             "locked_test_used_for_selection": False,
         },
@@ -2268,11 +2339,16 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         "student_unseen_target_distillation": summary_base["student_unseen_target_distillation"],
         "student_final_retrain": student_training.get("student_final_retrain", {}),
         "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
-        "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
+        "final_teacher_retrain": teacher_training.get(
+            "final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})
+        ),
     }
-    policy_id = "gico_" + hashlib.sha256(
-        json.dumps(policy_id_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:24]
+    policy_id = (
+        "gico_"
+        + hashlib.sha256(
+            json.dumps(policy_id_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:24]
+    )
     summary = {
         **summary_base,
         "status": "completed",
@@ -2284,7 +2360,9 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         "student_checkpoint_selection": student_training.get("student_checkpoint_selection", {}),
         "student_final_retrain": student_training.get("student_final_retrain", {}),
         "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
-        "final_teacher_retrain": teacher_training.get("final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})),
+        "final_teacher_retrain": teacher_training.get(
+            "final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})
+        ),
         "student_objective_settings": student_objective_settings,
         "student_target_summary": student_training.get("student_target_summary", {}),
         "student_training": student_training,

@@ -13,6 +13,8 @@ import pytest
 import torch
 
 import genode.artifact_bundle as artifact_bundle_module
+import genode.distillation.checkpoint as checkpoint_module
+import genode.distillation.demonstrations as demonstration_module
 from genode.artifact_bundle import (
     bundle_journal_path,
     bundle_lock_path,
@@ -20,8 +22,6 @@ from genode.artifact_bundle import (
     recover_artifact_bundle,
     validate_artifact_bundle_layout,
 )
-import genode.distillation.demonstrations as demonstration_module
-import genode.distillation.checkpoint as checkpoint_module
 from genode.distillation.artifacts import (
     DEMONSTRATION_MANIFEST_NAME,
     context_binding,
@@ -38,9 +38,9 @@ from genode.distillation.checkpoint import (
 )
 from genode.distillation.demonstrations import (
     DEFAULT_DISTILLATION_NFES,
+    SUPPORTED_SOLVER_KEYS,
     DistillationContexts,
     DistillationSetting,
-    SUPPORTED_SOLVER_KEYS,
     collect_flow_map_demonstrations,
     default_distillation_settings,
     load_distillation_contexts,
@@ -53,7 +53,6 @@ from genode.distillation.evaluation import (
     _resolve_metric_specs,
     _time_grid_sha256,
     candidate_catalog_sha256,
-    evaluate_quality_gate as _evaluate_quality_gate_impl,
     metric_specs_for_scenario,
     not_evaluated_report,
     quality_protocol_binding,
@@ -64,31 +63,38 @@ from genode.distillation.evaluation import (
     validate_quality_context_binding,
     validate_quality_sample_panel_binding,
 )
+from genode.distillation.evaluation import (
+    evaluate_quality_gate as _evaluate_quality_gate_impl,
+)
 from genode.distillation.gico_policy import (
     GICOSchedule,
     GICOSchedulePolicy,
     build_gico_student_model,
     load_gico_schedule_policy,
 )
+from genode.distillation.measurement_protocol import (
+    measurement_protocol_sha256,
+    quality_measurement_protocol_payload,
+)
 from genode.distillation.model import (
     EndpointFlowMap,
     FlowMapSampler,
     endpoint_consistency_loss,
 )
-from genode.distillation.measurement_protocol import (
-    measurement_protocol_sha256,
-    quality_measurement_protocol_payload,
-)
 from genode.distillation.training import (
     DemonstrationStore,
     _write_flow_map_bundle,
-    main as train_flow_map_main,
     recover_flow_map_bundle,
     train_endpoint_flow_map,
     validate_flow_map_bundle,
 )
+from genode.distillation.training import (
+    main as train_flow_map_main,
+)
 from genode.gico.density_representation import (
     DEFAULT_DENSITY_BIN_COUNT as DENSITY_BIN_COUNT,
+)
+from genode.gico.density_representation import (
     DENSITY_PROTOCOL,
     uniform_reference_grid,
 )
@@ -358,9 +364,7 @@ def _quality_context_binding() -> dict[str, object]:
         }
         for context_id in (f"locked-{index}" for index in range(20))
     ]
-    contexts = sorted(
-        contexts, key=lambda row: (str(row["split_phase"]), str(row["context_id"]))
-    )
+    contexts = sorted(contexts, key=lambda row: (str(row["split_phase"]), str(row["context_id"])))
     return validate_quality_context_binding(
         {
             "protocol": "flow_map_quality_contexts",
@@ -379,9 +383,7 @@ def _quality_sample_panel_binding() -> dict[str, object]:
     panels = [
         {
             **row,
-            "sample_panel_sha256": _test_context_fingerprint(
-                f"sample-panel:{row['context_id']}"
-            ),
+            "sample_panel_sha256": _test_context_fingerprint(f"sample-panel:{row['context_id']}"),
             "replicate_count": 2,
         }
         for row in contexts["contexts"]
@@ -416,10 +418,7 @@ def _quality_rows() -> list[dict[str, object]]:
         (candidate.method, candidate.candidate_key): candidate
         for candidate in _normalize_candidate_catalog(_quality_candidate_catalog())
     }
-    sample_panels = {
-        (row["split_phase"], row["context_id"]): row
-        for row in _quality_sample_panel_binding()["panels"]
-    }
+    sample_panels = {(row["split_phase"], row["context_id"]): row for row in _quality_sample_panel_binding()["panels"]}
 
     def add_row(
         *,
@@ -490,22 +489,16 @@ def _quality_protocol() -> dict[str, object]:
     body = {
         "scenario_key": "cryptos",
         "flow_map": {
-            "quality_candidate_catalog_sha256": candidate_catalog_sha256(
-                _quality_candidate_catalog()
-            ),
+            "quality_candidate_catalog_sha256": candidate_catalog_sha256(_quality_candidate_catalog()),
             "quality_rows_sha256": "9" * 64,
             "quality_contexts_sha256": "1" * 64,
             "quality_sample_panel_sha256": "2" * 64,
-            "quality_measurement_protocol_sha256": (
-                _AUTO_MEASUREMENT_PROTOCOL
-            ),
+            "quality_measurement_protocol_sha256": (_AUTO_MEASUREMENT_PROTOCOL),
         },
     }
     return {
         **body,
-        "protocol_hash": hashlib.sha256(
-            json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
+        "protocol_hash": hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
     }
 
 
@@ -515,9 +508,7 @@ def _quality_measurement_protocol(
     binding = _quality_binding()
     return quality_measurement_protocol_payload(
         scenario_key=str(binding["scenario_key"]),
-        candidate_catalog_sha256=candidate_catalog_sha256(
-            _quality_candidate_catalog()
-        ),
+        candidate_catalog_sha256=candidate_catalog_sha256(_quality_candidate_catalog()),
         quality_contexts_sha256="1" * 64,
         quality_sample_panel_sha256="2" * 64,
         reference_data_sha256="f" * 64,
@@ -552,28 +543,15 @@ def _quality_measurement_protocol(
 
 def evaluate_quality_gate(rows, *args, **kwargs):
     config = kwargs.get("config") or QualityGateConfig()
-    protocol = kwargs.setdefault(
-        "measurement_protocol", _quality_measurement_protocol(config)
-    )
-    digest = kwargs.setdefault(
-        "measurement_protocol_sha256", measurement_protocol_sha256(protocol)
-    )
-    quality_protocol = json.loads(
-        json.dumps(kwargs.get("quality_protocol") or _quality_protocol())
-    )
+    protocol = kwargs.setdefault("measurement_protocol", _quality_measurement_protocol(config))
+    digest = kwargs.setdefault("measurement_protocol_sha256", measurement_protocol_sha256(protocol))
+    quality_protocol = json.loads(json.dumps(kwargs.get("quality_protocol") or _quality_protocol()))
     flow_map_protocol = quality_protocol.get("flow_map", {})
-    if (
-        flow_map_protocol.get("quality_measurement_protocol_sha256")
-        == _AUTO_MEASUREMENT_PROTOCOL
-    ):
+    if flow_map_protocol.get("quality_measurement_protocol_sha256") == _AUTO_MEASUREMENT_PROTOCOL:
         flow_map_protocol["quality_measurement_protocol_sha256"] = digest
         quality_protocol["protocol_hash"] = hashlib.sha256(
             json.dumps(
-                {
-                    name: value
-                    for name, value in quality_protocol.items()
-                    if name != "protocol_hash"
-                },
+                {name: value for name, value in quality_protocol.items() if name != "protocol_hash"},
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode()
@@ -587,9 +565,7 @@ def evaluate_quality_gate(rows, *args, **kwargs):
             row["measurement_protocol_sha256"] = digest
         bound_rows.append(row)
     kwargs.setdefault("quality_context_binding", _quality_context_binding())
-    kwargs.setdefault(
-        "quality_sample_panel_binding", _quality_sample_panel_binding()
-    )
+    kwargs.setdefault("quality_sample_panel_binding", _quality_sample_panel_binding())
     return _evaluate_quality_gate_impl(bound_rows, *args, **kwargs)
 
 
@@ -692,9 +668,7 @@ def test_distillation_setting_parser_covers_the_supported_matrix() -> None:
 
     assert len(defaults) == len(SUPPORTED_SOLVER_KEYS) * len(DEFAULT_DISTILLATION_NFES)
     assert {(setting.solver_key, setting.target_nfe) for setting in defaults} == {
-        (solver_key, target_nfe)
-        for solver_key in SUPPORTED_SOLVER_KEYS
-        for target_nfe in DEFAULT_DISTILLATION_NFES
+        (solver_key, target_nfe) for solver_key in SUPPORTED_SOLVER_KEYS for target_nfe in DEFAULT_DISTILLATION_NFES
     }
     assert parse_distillation_settings("euler:4,heun:6") == (
         DistillationSetting("euler", 4),
@@ -1131,9 +1105,7 @@ def test_gico_schedule_loader_rejects_nested_locked_test_selection(tmp_path: Pat
     checkpoint = tmp_path / "gico.pt"
     _write_gico_checkpoint(checkpoint, _uniform_gico_policy())
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    payload["teacher_training"]["teacher_checkpoint_selection"][
-        "locked_test_used_for_selection"
-    ] = True
+    payload["teacher_training"]["teacher_checkpoint_selection"]["locked_test_used_for_selection"] = True
     torch.save(payload, checkpoint)
 
     with pytest.raises(ValueError, match="locked_test_used_for_selection"):
@@ -1146,9 +1118,7 @@ def test_gico_schedule_loader_requires_nested_locked_test_selection_flag(
     checkpoint = tmp_path / "gico.pt"
     _write_gico_checkpoint(checkpoint, _uniform_gico_policy())
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    payload["teacher_training"]["teacher_checkpoint_selection"].pop(
-        "locked_test_used_for_selection"
-    )
+    payload["teacher_training"]["teacher_checkpoint_selection"].pop("locked_test_used_for_selection")
     torch.save(payload, checkpoint)
 
     with pytest.raises(ValueError, match="locked_test_used_for_selection"):
@@ -1238,9 +1208,7 @@ def test_gico_schedule_policy_rejects_invalid_student_density(
     "mutation, error",
     [
         (
-            lambda payload: payload.update(
-                {"model_payload_version": MODEL_PAYLOAD_VERSION - 1}
-            ),
+            lambda payload: payload.update({"model_payload_version": MODEL_PAYLOAD_VERSION - 1}),
             "expected current schema version",
         ),
         (
@@ -1302,13 +1270,17 @@ class _UniformSchedulePolicy:
             device=context_summary.device,
             dtype=context_summary.dtype,
         )
-        grid = torch.linspace(
-            0.0,
-            1.0,
-            macro_steps + 1,
-            device=context_summary.device,
-            dtype=context_summary.dtype,
-        ).unsqueeze(0).expand(batch, -1)
+        grid = (
+            torch.linspace(
+                0.0,
+                1.0,
+                macro_steps + 1,
+                device=context_summary.device,
+                dtype=context_summary.dtype,
+            )
+            .unsqueeze(0)
+            .expand(batch, -1)
+        )
         return GICOSchedule(
             solver_key=setting.solver_key,
             target_nfe=setting.target_nfe,
@@ -1423,9 +1395,7 @@ def test_collection_uses_common_noise_across_settings_and_builds_store(
         validation_fraction=0.5,
         split_seed=41,
     )
-    assert store.expected_settings == {
-        (setting.solver_key, setting.target_nfe) for setting in settings
-    }
+    assert store.expected_settings == {(setting.solver_key, setting.target_nfe) for setting in settings}
     assert store.split_context_count("train") == 1
     assert store.split_context_count("validation") == 1
 
@@ -1568,15 +1538,9 @@ def test_demonstration_store_uses_context_disjoint_splits_and_samples_trajectory
     assert store.split_context_count("train") == 1
     assert store.split_context_count("validation") == 1
     assert set(store.split_by_context.values()) == {"train", "validation"}
-    train_contexts = {
-        context_index
-        for context_index, split in store.split_by_context.items()
-        if split == "train"
-    }
+    train_contexts = {context_index for context_index, split in store.split_by_context.items() if split == "train"}
     validation_contexts = {
-        context_index
-        for context_index, split in store.split_by_context.items()
-        if split == "validation"
+        context_index for context_index, split in store.split_by_context.items() if split == "validation"
     }
     assert train_contexts.isdisjoint(validation_contexts)
 
@@ -1736,9 +1700,8 @@ def test_demonstration_collection_lock_preserves_unrecognized_sidecar(
     original = b"unmanaged lock contents\n"
     lock_path.write_bytes(original)
 
-    with pytest.raises(ValueError, match="unrecognized"):
-        with demonstration_module._exclusive_collection_lock(target):
-            pytest.fail("An unrecognized lock sidecar must fail closed.")
+    with pytest.raises(ValueError, match="unrecognized"), demonstration_module._exclusive_collection_lock(target):
+        pytest.fail("An unrecognized lock sidecar must fail closed.")
 
     assert lock_path.read_bytes() == original
 
@@ -1789,9 +1752,7 @@ def test_demonstration_promotion_syncs_complete_staging_before_journal(
         }
         assert staging / "shards" in synced_directories
         assert staging in synced_directories
-        assert synced_directories.index(staging / "shards") < synced_directories.index(
-            staging
-        )
+        assert synced_directories.index(staging / "shards") < synced_directories.index(staging)
         real_write_journal(path, record)
 
     monkeypatch.setattr(
@@ -1831,9 +1792,7 @@ def test_demonstration_promotion_recovers_previous_artifact_after_interruption(
 
     demonstration_module._recover_interrupted_promotion(target)
 
-    assert load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)[
-        "metadata"
-    ]["split_phase"] == "train"
+    assert load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)["metadata"]["split_phase"] == "train"
     assert not staging.exists()
     assert not backup.exists()
     assert not demonstration_module._promotion_journal_path(target).exists()
@@ -1854,9 +1813,10 @@ def test_demonstration_promotion_finishes_installed_artifact_after_interruption(
 
     demonstration_module._recover_interrupted_promotion(target)
 
-    assert load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)[
-        "metadata"
-    ]["split_phase"] == "validation_tuning"
+    assert (
+        load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)["metadata"]["split_phase"]
+        == "validation_tuning"
+    )
     assert not backup.exists()
     assert not demonstration_module._promotion_journal_path(target).exists()
 
@@ -1891,9 +1851,10 @@ def test_demonstration_promotion_finishes_install_when_prior_target_was_absent(
 
     demonstration_module._recover_interrupted_promotion(target)
 
-    assert load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)[
-        "metadata"
-    ]["split_phase"] == "validation_tuning"
+    assert (
+        load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)["metadata"]["split_phase"]
+        == "validation_tuning"
+    )
     assert not demonstration_module._promotion_journal_path(target).exists()
 
 
@@ -1937,9 +1898,10 @@ def test_demonstration_promotion_tolerates_partially_cleaned_obsolete_backup(
 
     assert backup.is_dir()
     assert not demonstration_module._promotion_journal_path(target).exists()
-    assert load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)[
-        "metadata"
-    ]["split_phase"] == "validation_tuning"
+    assert (
+        load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)["metadata"]["split_phase"]
+        == "validation_tuning"
+    )
 
 
 def test_demonstration_promotion_retains_journal_until_obsolete_cleanup_finishes(
@@ -1974,9 +1936,10 @@ def test_demonstration_promotion_retains_journal_until_obsolete_cleanup_finishes
 
     assert journal.exists()
     assert backup.is_dir()
-    assert load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)[
-        "metadata"
-    ]["split_phase"] == "validation_tuning"
+    assert (
+        load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)["metadata"]["split_phase"]
+        == "validation_tuning"
+    )
     monkeypatch.setattr(
         demonstration_module,
         "_cleanup_obsolete_artifact",
@@ -2011,9 +1974,7 @@ def test_demonstration_promotion_rolls_back_when_installation_fails(
             overwrite=True,
         )
 
-    assert load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)[
-        "metadata"
-    ]["split_phase"] == "train"
+    assert load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)["metadata"]["split_phase"] == "train"
     assert not staging.exists()
     assert not demonstration_module._promotion_journal_path(target).exists()
     assert not list(tmp_path.glob(".demonstrations.backup-*"))
@@ -2045,9 +2006,7 @@ def test_demonstration_promotion_without_overwrite_preserves_concurrent_target(
             overwrite=False,
         )
 
-    assert load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)[
-        "metadata"
-    ]["split_phase"] == "train"
+    assert load_demonstration_manifest(target / DEMONSTRATION_MANIFEST_NAME)["metadata"]["split_phase"] == "train"
     assert demonstration_module._promotion_journal_path(target).exists()
 
 
@@ -2071,12 +2030,10 @@ def test_flow_map_bundle_rolls_back_checkpoint_when_summary_promotion_fails(
         )
         summary.write_text(
             json.dumps(
-                    {
-                        "locked_test_used_for_selection": False,
-                        "context_embedding_protocol": (
-                            FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
-                        ),
-                        "status": "completed",
+                {
+                    "locked_test_used_for_selection": False,
+                    "context_embedding_protocol": (FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL),
+                    "status": "completed",
                     "checkpoint_name": checkpoint.name,
                     "checkpoint_sha256": file_sha256(checkpoint),
                 }
@@ -2148,9 +2105,7 @@ def test_flow_map_bundle_restart_finishes_committed_cleanup(
     monkeypatch.setattr(
         artifact_bundle,
         "_cleanup_finalized_transaction",
-        lambda **_: (_ for _ in ()).throw(
-            OSError("simulated interruption after commit")
-        ),
+        lambda **_: (_ for _ in ()).throw(OSError("simulated interruption after commit")),
     )
     with pytest.raises(OSError, match="interruption after commit"):
         _write_flow_map_bundle(
@@ -2292,9 +2247,7 @@ def test_flow_map_training_aborts_when_bound_source_is_replaced(
     reference_grid = uniform_reference_grid(DENSITY_BIN_COUNT)
     store = SimpleNamespace(
         manifest={
-            "context_shards": [
-                {"resolved_path": shard, "sha256": file_sha256(shard)}
-            ],
+            "context_shards": [{"resolved_path": shard, "sha256": file_sha256(shard)}],
             "trajectory_shards": [],
         },
         metadata={
@@ -2395,11 +2348,7 @@ def test_flow_map_bundle_rejects_reserved_sidecar_target_without_writes(
     sidecar_kind: str,
 ) -> None:
     checkpoint = tmp_path / "flow-map.pt"
-    summary = (
-        bundle_lock_path(checkpoint)
-        if sidecar_kind == "lock"
-        else bundle_journal_path(checkpoint)
-    )
+    summary = bundle_lock_path(checkpoint) if sidecar_kind == "lock" else bundle_journal_path(checkpoint)
     writer_called = False
 
     def write_checkpoint(path: Path) -> Path:
@@ -2604,9 +2553,7 @@ def test_quality_gate_passes_only_with_familywise_evidence_on_every_primary_metr
         metric_specs=metric_specs_for_scenario("cryptos"),
         candidate_catalog=_quality_candidate_catalog(),
         artifact_binding=_quality_binding(),
-        demonstration_context_binding=context_binding(
-            (_test_context_fingerprint("training-0"),)
-        ),
+        demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
         quality_protocol=_quality_protocol(),
         config=QualityGateConfig(bootstrap_samples=1_000, seed=37),
     )
@@ -2621,8 +2568,7 @@ def test_quality_gate_passes_only_with_familywise_evidence_on_every_primary_metr
     assert all(comparison["paired_context_count"] == 20 for comparison in report["comparisons"])
     assert all(comparison["passed"] for comparison in report["comparisons"])
     assert all(
-        comparison["holm_adjusted_p_value"] >= comparison["one_sided_p_value"]
-        for comparison in report["comparisons"]
+        comparison["holm_adjusted_p_value"] >= comparison["one_sided_p_value"] for comparison in report["comparisons"]
     )
 
 
@@ -2636,9 +2582,7 @@ def test_quality_gate_rejects_measurement_row_digest_tamper() -> None:
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=_quality_protocol(),
             config=QualityGateConfig(bootstrap_samples=1_000, seed=37),
         )
@@ -2646,9 +2590,7 @@ def test_quality_gate_rejects_measurement_row_digest_tamper() -> None:
 
 def test_quality_gate_rejects_measurement_protocol_artifact_substitution() -> None:
     config = QualityGateConfig(bootstrap_samples=1_000, seed=37)
-    measurement_protocol = json.loads(
-        json.dumps(_quality_measurement_protocol(config))
-    )
+    measurement_protocol = json.loads(json.dumps(_quality_measurement_protocol(config)))
     measurement_protocol["quality_contexts_sha256"] = "a" * 64
 
     with pytest.raises(ValueError, match="does not match"):
@@ -2657,14 +2599,10 @@ def test_quality_gate_rejects_measurement_protocol_artifact_substitution() -> No
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=_quality_protocol(),
             measurement_protocol=measurement_protocol,
-            measurement_protocol_sha256=measurement_protocol_sha256(
-                measurement_protocol
-            ),
+            measurement_protocol_sha256=measurement_protocol_sha256(measurement_protocol),
             config=config,
         )
 
@@ -2679,9 +2617,7 @@ def test_quality_gate_rejects_measurement_payload_digest_mismatch() -> None:
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=_quality_protocol(),
             measurement_protocol=measurement_protocol,
             measurement_protocol_sha256="0" * 64,
@@ -2697,9 +2633,7 @@ def test_quality_context_and_sample_artifacts_recompute_physical_bindings(
     np.savez_compressed(
         contexts_path,
         context_ids=np.asarray(context_ids, dtype=np.str_),
-        split_phases=np.asarray(
-            ["validation_tuning", "locked_test"], dtype=np.str_
-        ),
+        split_phases=np.asarray(["validation_tuning", "locked_test"], dtype=np.str_),
         histories=np.asarray([[[0.1]], [[0.2]]], dtype=np.float64),
     )
     contexts = read_quality_contexts(contexts_path)
@@ -2723,9 +2657,7 @@ def test_quality_context_and_sample_artifacts_recompute_physical_bindings(
     )
 
     assert contexts["artifact_sha256"]
-    assert contexts["contexts"][0]["context_fingerprint"] == context_fingerprint(
-        np.asarray([[0.2]], dtype=np.float32)
-    )
+    assert contexts["contexts"][0]["context_fingerprint"] == context_fingerprint(np.asarray([[0.2]], dtype=np.float32))
     assert sample_panel["replicate_count"] == 2
     assert sample_panel["sample_count"] == 4
 
@@ -2735,9 +2667,7 @@ def test_quality_context_ids_are_globally_unique_across_splits(tmp_path: Path) -
     np.savez_compressed(
         contexts_path,
         context_ids=np.asarray(["shared", "shared"], dtype=np.str_),
-        split_phases=np.asarray(
-            ["validation_tuning", "locked_test"], dtype=np.str_
-        ),
+        split_phases=np.asarray(["validation_tuning", "locked_test"], dtype=np.str_),
         histories=np.asarray([[[0.1]], [[0.2]]], dtype=np.float64),
     )
 
@@ -2749,9 +2679,7 @@ def test_quality_candidate_catalog_binds_registered_fixed_grid() -> None:
     catalog = _quality_candidate_catalog()
     fixed = next(candidate for candidate in catalog if candidate["method"] == "fixed")
     fixed["execution"]["time_grid"][1] = 0.123
-    fixed["execution"]["time_grid_sha256"] = _time_grid_sha256(
-        fixed["execution"]["time_grid"]
-    )
+    fixed["execution"]["time_grid_sha256"] = _time_grid_sha256(fixed["execution"]["time_grid"])
 
     with pytest.raises(ValueError, match="registered scheduler"):
         _normalize_candidate_catalog(catalog)
@@ -2774,11 +2702,7 @@ def test_quality_candidate_catalog_requires_search_breadth(method: str) -> None:
 
 def test_quality_candidate_catalog_rejects_duplicate_solver_nfe_search() -> None:
     catalog = json.loads(json.dumps(_quality_candidate_catalog()))
-    second_gico = next(
-        candidate
-        for candidate in catalog
-        if candidate["candidate_key"] == "gico-decoy"
-    )
+    second_gico = next(candidate for candidate in catalog if candidate["candidate_key"] == "gico-decoy")
     second_gico["target_nfe"] = 4
 
     with pytest.raises(ValueError, match="two solver/NFE settings"):
@@ -2787,11 +2711,7 @@ def test_quality_candidate_catalog_rejects_duplicate_solver_nfe_search() -> None
 
 def test_quality_candidate_catalog_requires_multiple_fixed_schedules() -> None:
     catalog = json.loads(json.dumps(_quality_candidate_catalog()))
-    second_fixed = next(
-        candidate
-        for candidate in catalog
-        if candidate["candidate_key"] == "fixed-decoy"
-    )
+    second_fixed = next(candidate for candidate in catalog if candidate["candidate_key"] == "fixed-decoy")
     time_grid = build_schedule_grid("uniform", 6)
     assert time_grid is not None
     second_fixed["execution"] = {
@@ -2816,9 +2736,7 @@ def test_quality_gate_requires_one_flow_map_evaluation_and_common_sample_panel()
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=_quality_protocol(),
             config=QualityGateConfig(bootstrap_samples=1_000, seed=38),
         )
@@ -2831,9 +2749,7 @@ def test_quality_gate_requires_one_flow_map_evaluation_and_common_sample_panel()
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=_quality_protocol(),
             config=QualityGateConfig(bootstrap_samples=1_000, seed=38),
         )
@@ -2873,9 +2789,7 @@ def test_quality_gate_public_api_rejects_unregistered_claim_metrics() -> None:
             metric_specs=(MetricSpec("easy_metric", "lower"),),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=_quality_protocol(),
             config=QualityGateConfig(bootstrap_samples=1_000, seed=39),
         )
@@ -2885,10 +2799,7 @@ def test_quality_gate_requires_exact_prespecified_candidate_coverage() -> None:
     rows = [
         row
         for row in _quality_rows()
-        if not (
-            row["split_phase"] == "validation_tuning"
-            and row["candidate_key"] == "fixed-decoy"
-        )
+        if not (row["split_phase"] == "validation_tuning" and row["candidate_key"] == "fixed-decoy")
     ]
 
     with pytest.raises(ValueError, match="exactly cover"):
@@ -2897,9 +2808,7 @@ def test_quality_gate_requires_exact_prespecified_candidate_coverage() -> None:
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=_quality_protocol(),
             config=QualityGateConfig(bootstrap_samples=1_000, seed=40),
         )
@@ -2913,9 +2822,7 @@ def test_quality_gate_requires_selected_candidates_to_cover_bound_locked_panel()
         "context_fingerprint": _test_context_fingerprint("locked-20"),
     }
     quality_contexts["contexts"].append(extra_context)
-    quality_contexts["contexts"].sort(
-        key=lambda row: (str(row["split_phase"]), str(row["context_id"]))
-    )
+    quality_contexts["contexts"].sort(key=lambda row: (str(row["split_phase"]), str(row["context_id"])))
     quality_contexts["context_count"] = len(quality_contexts["contexts"])
     quality_contexts["set_sha256"] = hashlib.sha256(
         json.dumps(
@@ -2929,19 +2836,13 @@ def test_quality_gate_requires_selected_candidates_to_cover_bound_locked_panel()
     quality_sample_panel = json.loads(json.dumps(_quality_sample_panel_binding()))
     extra_panel = {
         **extra_context,
-        "sample_panel_sha256": _test_context_fingerprint(
-            "sample-panel:locked-20"
-        ),
+        "sample_panel_sha256": _test_context_fingerprint("sample-panel:locked-20"),
         "replicate_count": 2,
     }
     quality_sample_panel["panels"].append(extra_panel)
-    quality_sample_panel["panels"].sort(
-        key=lambda row: (str(row["split_phase"]), str(row["context_id"]))
-    )
+    quality_sample_panel["panels"].sort(key=lambda row: (str(row["split_phase"]), str(row["context_id"])))
     quality_sample_panel["context_count"] = len(quality_sample_panel["panels"])
-    quality_sample_panel["sample_count"] = 2 * len(
-        quality_sample_panel["panels"]
-    )
+    quality_sample_panel["sample_count"] = 2 * len(quality_sample_panel["panels"])
     quality_sample_panel["set_sha256"] = hashlib.sha256(
         json.dumps(
             quality_sample_panel["panels"],
@@ -2981,9 +2882,7 @@ def test_quality_gate_requires_selected_candidates_to_cover_bound_locked_panel()
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_context_binding=quality_contexts,
             quality_sample_panel_binding=quality_sample_panel,
             quality_protocol=_quality_protocol(),
@@ -3002,9 +2901,7 @@ def test_quality_gate_rejects_post_hoc_candidate_catalog_substitution() -> None:
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=catalog,
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=_quality_protocol(),
             config=QualityGateConfig(bootstrap_samples=1_000, seed=40),
         )
@@ -3022,9 +2919,7 @@ def test_quality_protocol_binds_its_payload_rows_and_catalog(tmp_path: Path) -> 
             "quality_measurement_protocol_sha256": "3" * 64,
         },
     }
-    protocol_hash = hashlib.sha256(
-        json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    protocol_hash = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     path = tmp_path / "protocol.json"
     path.write_text(
         json.dumps({**body, "protocol_hash": protocol_hash}),
@@ -3059,9 +2954,7 @@ def test_public_quality_gate_rejects_fabricated_pipeline_protocol_hash() -> None
     measurement_protocol = _quality_measurement_protocol(config)
     measurement_digest = measurement_protocol_sha256(measurement_protocol)
     protocol = _quality_protocol()
-    protocol["flow_map"][
-        "quality_measurement_protocol_sha256"
-    ] = measurement_digest
+    protocol["flow_map"]["quality_measurement_protocol_sha256"] = measurement_digest
     protocol["protocol_hash"] = "0" * 64
 
     with pytest.raises(ValueError, match="hash does not match"):
@@ -3070,9 +2963,7 @@ def test_public_quality_gate_rejects_fabricated_pipeline_protocol_hash() -> None
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=protocol,
             measurement_protocol=measurement_protocol,
             measurement_protocol_sha256=measurement_digest,
@@ -3098,12 +2989,12 @@ def test_quality_gate_rejects_primary_tstr_applicability_mismatch() -> None:
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=_quality_protocol(),
             config=QualityGateConfig(bootstrap_samples=1_000, seed=40),
         )
+
+
 def test_read_quality_rows_parses_plain_csv_target_nfe(tmp_path: Path) -> None:
     path = tmp_path / "quality.csv"
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -3129,8 +3020,7 @@ def test_read_quality_rows_parses_plain_csv_target_nfe(tmp_path: Path) -> None:
     assert read_quality_rows(path)[0]["target_nfe"] == 4
 
     path.write_text(
-        "target_nfe,replicate_count,model_evaluations,method\n"
-        "4.0,2,1,flow_map\n",
+        "target_nfe,replicate_count,model_evaluations,method\n4.0,2,1,flow_map\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="plain positive decimal"):
@@ -3150,9 +3040,7 @@ def test_quality_gate_rejects_finite_values_whose_difference_overflows() -> None
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=_quality_protocol(),
             config=QualityGateConfig(bootstrap_samples=1_000, seed=40),
         )
@@ -3169,17 +3057,14 @@ def test_quality_gate_uses_overflow_safe_validation_means() -> None:
         metric_specs=metric_specs_for_scenario("cryptos"),
         candidate_catalog=_quality_candidate_catalog(),
         artifact_binding=_quality_binding(),
-        demonstration_context_binding=context_binding(
-            (_test_context_fingerprint("training-0"),)
-        ),
+        demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
         quality_protocol=_quality_protocol(),
         config=QualityGateConfig(bootstrap_samples=1_000, seed=40),
     )
 
     assert report["status"] == "passed"
     assert all(
-        np.isfinite(selection["primary_metric_means"]["temporal_uw1"])
-        for selection in report["selection"].values()
+        np.isfinite(selection["primary_metric_means"]["temporal_uw1"]) for selection in report["selection"].values()
     )
 
 
@@ -3194,9 +3079,7 @@ def test_quality_gate_rejects_renamed_demonstration_context() -> None:
         if row["context_id"] == "validation-0":
             row["context_fingerprint"] = training_fingerprint
     quality_contexts["set_sha256"] = hashlib.sha256(
-        json.dumps(
-            quality_contexts["contexts"], sort_keys=True, separators=(",", ":")
-        ).encode()
+        json.dumps(quality_contexts["contexts"], sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     quality_contexts = validate_quality_context_binding(quality_contexts)
     quality_sample_panel = json.loads(json.dumps(_quality_sample_panel_binding()))
@@ -3246,9 +3129,7 @@ def test_quality_gate_freezes_validation_choice_and_is_conservative_at_equality(
         metric_specs=metric_specs_for_scenario("cryptos"),
         candidate_catalog=_quality_candidate_catalog(),
         artifact_binding=_quality_binding(),
-        demonstration_context_binding=context_binding(
-            (_test_context_fingerprint("training-0"),)
-        ),
+        demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
         quality_protocol=_quality_protocol(),
         config=QualityGateConfig(bootstrap_samples=1_000, seed=41),
     )
@@ -3258,11 +3139,7 @@ def test_quality_gate_freezes_validation_choice_and_is_conservative_at_equality(
     assert report["selection"]["flow_map"]["candidate_key"] == "flow-selected"
     assert report["selection"]["flow_map"]["selection_split"] == "validation_tuning"
     assert report["selection"]["flow_map"]["locked_test_used_for_selection"] is False
-    gico_comparisons = [
-        comparison
-        for comparison in report["comparisons"]
-        if comparison["comparator_method"] == "gico"
-    ]
+    gico_comparisons = [comparison for comparison in report["comparisons"] if comparison["comparator_method"] == "gico"]
     assert all(comparison["mean_difference"] == pytest.approx(0.0) for comparison in gico_comparisons)
     assert all(not comparison["passed"] for comparison in gico_comparisons)
 
@@ -3271,11 +3148,7 @@ def test_quality_gate_requires_paired_locked_test_contexts() -> None:
     rows = [
         row
         for row in _quality_rows()
-        if not (
-            row["split_phase"] == "locked_test"
-            and row["method"] == "gico"
-            and row["context_id"] != "locked-0"
-        )
+        if not (row["split_phase"] == "locked_test" and row["method"] == "gico" and row["context_id"] != "locked-0")
     ]
 
     with pytest.raises(
@@ -3287,9 +3160,7 @@ def test_quality_gate_requires_paired_locked_test_contexts() -> None:
             metric_specs=metric_specs_for_scenario("cryptos"),
             candidate_catalog=_quality_candidate_catalog(),
             artifact_binding=_quality_binding(),
-            demonstration_context_binding=context_binding(
-                (_test_context_fingerprint("training-0"),)
-            ),
+            demonstration_context_binding=context_binding((_test_context_fingerprint("training-0"),)),
             quality_protocol=_quality_protocol(),
             config=QualityGateConfig(bootstrap_samples=1_000, seed=43),
         )

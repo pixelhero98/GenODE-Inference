@@ -66,20 +66,67 @@ class GicoAblationArm:
 _ALL_ARMS: Tuple[GicoAblationArm, ...] = (
     GicoAblationArm("A0_full_score000_seen_only", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "full", 0.00, "main"),
     GicoAblationArm("A1_full_score005_seen_only", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "full", 0.05, "main"),
-    GicoAblationArm("A2_full_score005_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "full", 0.05, "main"),
+    GicoAblationArm(
+        "A2_full_score005_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "full", 0.05, "main"
+    ),
     GicoAblationArm("A3_elite_score005_seen_only", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "elite", 0.05, "main"),
-    GicoAblationArm("A4_blend020_score005_seen_only", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "elite_blend", 0.05, "main", 0.20),
-    GicoAblationArm("A5_blend020_score005_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "elite_blend", 0.05, "main", 0.20),
+    GicoAblationArm(
+        "A4_blend020_score005_seen_only", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "elite_blend", 0.05, "main", 0.20
+    ),
+    GicoAblationArm(
+        "A5_blend020_score005_seen_plus_unseen",
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS,
+        "elite_blend",
+        0.05,
+        "main",
+        0.20,
+    ),
     GicoAblationArm("S0_full_score001_seen_only", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "full", 0.01, "appendix"),
     GicoAblationArm("S1_full_score010_seen_only", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "full", 0.10, "appendix"),
-    GicoAblationArm("S2_full_score000_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "full", 0.00, "appendix"),
-    GicoAblationArm("S3_full_score001_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "full", 0.01, "appendix"),
-    GicoAblationArm("S4_full_score010_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "full", 0.10, "appendix"),
-    GicoAblationArm("T0_elite_score005_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "elite", 0.05, "appendix"),
-    GicoAblationArm("B0_blend010_score005_seen_only", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "elite_blend", 0.05, "appendix", 0.10),
-    GicoAblationArm("B1_blend040_score005_seen_only", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "elite_blend", 0.05, "appendix", 0.40),
-    GicoAblationArm("B2_blend010_score005_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "elite_blend", 0.05, "appendix", 0.10),
-    GicoAblationArm("B3_blend040_score005_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "elite_blend", 0.05, "appendix", 0.40),
+    GicoAblationArm(
+        "S2_full_score000_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "full", 0.00, "appendix"
+    ),
+    GicoAblationArm(
+        "S3_full_score001_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "full", 0.01, "appendix"
+    ),
+    GicoAblationArm(
+        "S4_full_score010_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "full", 0.10, "appendix"
+    ),
+    GicoAblationArm(
+        "T0_elite_score005_seen_plus_unseen", STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, "elite", 0.05, "appendix"
+    ),
+    GicoAblationArm(
+        "B0_blend010_score005_seen_only",
+        STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
+        "elite_blend",
+        0.05,
+        "appendix",
+        0.10,
+    ),
+    GicoAblationArm(
+        "B1_blend040_score005_seen_only",
+        STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
+        "elite_blend",
+        0.05,
+        "appendix",
+        0.40,
+    ),
+    GicoAblationArm(
+        "B2_blend010_score005_seen_plus_unseen",
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS,
+        "elite_blend",
+        0.05,
+        "appendix",
+        0.10,
+    ),
+    GicoAblationArm(
+        "B3_blend040_score005_seen_plus_unseen",
+        STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS,
+        "elite_blend",
+        0.05,
+        "appendix",
+        0.40,
+    ),
 )
 
 _PRESETS: Mapping[str, Tuple[GicoAblationArm, ...]] = {

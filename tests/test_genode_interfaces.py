@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import importlib
 import subprocess
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
 
-import tomllib
-
 from genode.runtime import resolve_torch_device
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GENERATED_ROOTS = {
@@ -42,12 +40,10 @@ def _source_release_files() -> list[Path]:
             text=True,
         )
     except (OSError, subprocess.CalledProcessError):
-        return [
-            path
-            for path in PROJECT_ROOT.rglob("*")
-            if path.is_file() and not _is_generated_path(path)
-        ]
-    return [PROJECT_ROOT / line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return [path for path in PROJECT_ROOT.rglob("*") if path.is_file() and not _is_generated_path(path)]
+    return [
+        path for line in result.stdout.splitlines() if line.strip() and (path := PROJECT_ROOT / line.strip()).is_file()
+    ]
 
 
 class GenODEInterfaceTests(unittest.TestCase):
@@ -80,6 +76,7 @@ class GenODEInterfaceTests(unittest.TestCase):
             "genode-collect-flow-map-demonstrations",
             "genode-train-flow-map",
             "genode-evaluate-flow-map",
+            "genode-image-gico",
         }
         self.assertEqual(set(scripts), expected)
         for target in scripts.values():
@@ -94,14 +91,12 @@ class GenODEInterfaceTests(unittest.TestCase):
 
     def test_release_markdown_is_current_and_scoped(self) -> None:
         markdown_files = sorted(
-            path.relative_to(PROJECT_ROOT).as_posix()
-            for path in _source_release_files()
-            if path.suffix == ".md"
+            path.relative_to(PROJECT_ROOT).as_posix() for path in _source_release_files() if path.suffix == ".md"
         )
         self.assertEqual(markdown_files, ["README.md", "THIRD_PARTY_NOTICES.md"])
         text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("frozen_backbone_policy_context_v1", text)
-        self.assertIn("exactly 23 clocks", text)
+        self.assertIn("exactly 23 schedules", text)
         self.assertIn("genode-train-gico", text)
         self.assertIn("genode-report-gico-locked-test", text)
         self.assertNotIn("allow_noncanonical", text)
@@ -167,8 +162,14 @@ class GenODEInterfaceTests(unittest.TestCase):
         from genode.data import otflow_paths
 
         with mock.patch.object(otflow_paths, "project_root", return_value=PROJECT_ROOT):
-            self.assertEqual(otflow_paths.resolve_project_path("genode/outputs/example"), (PROJECT_ROOT / "genode" / "outputs" / "example").resolve())
-            self.assertEqual(otflow_paths.resolve_project_path("genode/data/example"), (PROJECT_ROOT / "genode" / "data" / "example").resolve())
+            self.assertEqual(
+                otflow_paths.resolve_project_path("genode/outputs/example"),
+                (PROJECT_ROOT / "genode" / "outputs" / "example").resolve(),
+            )
+            self.assertEqual(
+                otflow_paths.resolve_project_path("genode/data/example"),
+                (PROJECT_ROOT / "genode" / "data" / "example").resolve(),
+            )
             self.assertEqual(
                 otflow_paths.resolve_project_path("genode/paper_datasets/example"),
                 (PROJECT_ROOT / "genode" / "paper_datasets" / "example").resolve(),

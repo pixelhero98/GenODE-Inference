@@ -53,9 +53,7 @@ REVERSED_SCHEDULE_KEYS: Tuple[str, ...] = REFERENCE_CLOCK_REVERSED_KEYS
 AVERAGED_REVERSED_SCHEDULE_KEYS: Tuple[str, ...] = ()
 CANONICAL_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
 
-REVERSED_SCHEDULE_BASE: Mapping[str, str] = {
-    key: key.removesuffix("_reversed") for key in REVERSED_SCHEDULE_KEYS
-}
+REVERSED_SCHEDULE_BASE: Mapping[str, str] = {key: key.removesuffix("_reversed") for key in REVERSED_SCHEDULE_KEYS}
 AVERAGED_SCHEDULE_COMPONENTS: Mapping[str, Tuple[str, str]] = {}
 
 SCHEDULE_FAMILY_PHYSICAL = "physical"
@@ -79,12 +77,18 @@ class ScenarioSpec:
 
 def canonical_scenario_specs() -> Tuple[ScenarioSpec, ...]:
     return tuple(
-        [ScenarioSpec(key=key, family=SCENARIO_FAMILY_FORECAST, public_dataset_key=key) for key in FORECAST_SCENARIO_KEYS]
+        [
+            ScenarioSpec(key=key, family=SCENARIO_FAMILY_FORECAST, public_dataset_key=key)
+            for key in FORECAST_SCENARIO_KEYS
+        ]
         + [
             ScenarioSpec(key=key, family=SCENARIO_FAMILY_CONDITIONAL_GENERATION, public_dataset_key=key)
             for key in CONDITIONAL_GENERATION_SCENARIO_KEYS
         ]
-        + [ScenarioSpec(key=key, family=SCENARIO_FAMILY_MOLECULE, public_dataset_key=key) for key in MOLECULE_SCENARIO_KEYS]
+        + [
+            ScenarioSpec(key=key, family=SCENARIO_FAMILY_MOLECULE, public_dataset_key=key)
+            for key in MOLECULE_SCENARIO_KEYS
+        ]
     )
 
 

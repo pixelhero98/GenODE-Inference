@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from decimal import Decimal
-import math
 from numbers import Integral
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Sequence, Tuple
@@ -54,33 +54,33 @@ LOCKED_SAMPLE_COUNT = 50_000
 LOCKED_INCEPTION_SPLITS = 10
 LOCKED_PRECISION_RECALL_NEIGHBORHOOD = 3
 LOCKED_PRECISION_RECALL_BATCH_SIZE = 10_000
-LOCKED_METRIC_EXECUTION_PROTOCOL = (
-    "image_locked_metric_execution_v1"
-)
+LOCKED_METRIC_EXECUTION_PROTOCOL = "image_locked_metric_execution_v1"
 FID_COVARIANCE_EPSILON = 1e-6
 FID_COMPLEX_IMAGINARY_TOLERANCE = 1e-3
 FID_NEGATIVE_RELATIVE_TOLERANCE = 1e-8
-LOCKED_TORCH_FIDELITY_FIXED_OPTIONS: Mapping[str, object] = MappingProxyType({
-    "isc": True,
-    "fid": False,
-    "kid": False,
-    "prc": True,
-    "isc_splits": LOCKED_INCEPTION_SPLITS,
-    "prc_neighborhood": LOCKED_PRECISION_RECALL_NEIGHBORHOOD,
-    "prc_batch_size": LOCKED_PRECISION_RECALL_BATCH_SIZE,
-    "samples_shuffle": False,
-    "feature_extractor": TORCH_FIDELITY_FEATURE_EXTRACTOR,
-    "feature_layer_isc": "logits_unbiased",
-    "feature_layer_fid": TORCH_FIDELITY_FEATURE_LAYER,
-    "feature_layer_kid": TORCH_FIDELITY_FEATURE_LAYER,
-    "feature_layer_prc": TORCH_FIDELITY_FEATURE_LAYER,
-    "feature_extractor_internal_dtype": "float32",
-    "feature_extractor_compile": False,
-    "save_cpu_ram": True,
-    "cache": False,
-    "datasets_download": False,
-    "verbose": False,
-})
+LOCKED_TORCH_FIDELITY_FIXED_OPTIONS: Mapping[str, object] = MappingProxyType(
+    {
+        "isc": True,
+        "fid": False,
+        "kid": False,
+        "prc": True,
+        "isc_splits": LOCKED_INCEPTION_SPLITS,
+        "prc_neighborhood": LOCKED_PRECISION_RECALL_NEIGHBORHOOD,
+        "prc_batch_size": LOCKED_PRECISION_RECALL_BATCH_SIZE,
+        "samples_shuffle": False,
+        "feature_extractor": TORCH_FIDELITY_FEATURE_EXTRACTOR,
+        "feature_layer_isc": "logits_unbiased",
+        "feature_layer_fid": TORCH_FIDELITY_FEATURE_LAYER,
+        "feature_layer_kid": TORCH_FIDELITY_FEATURE_LAYER,
+        "feature_layer_prc": TORCH_FIDELITY_FEATURE_LAYER,
+        "feature_extractor_internal_dtype": "float32",
+        "feature_extractor_compile": False,
+        "save_cpu_ram": True,
+        "cache": False,
+        "datasets_download": False,
+        "verbose": False,
+    }
+)
 
 PANEL_PHASE_REWARD_TRAIN = "reward_train"
 PANEL_PHASE_SELECTION_SCREENING = "selection_screening"
@@ -88,9 +88,7 @@ PANEL_PHASE_SURVIVOR_CONFIRMATION = "survivor_confirmation"
 PANEL_PHASE_LOCKED_MAIN = "locked_main"
 PANEL_PHASE_CONDITIONAL_REWARD_TRAIN = "conditional_reward_train"
 PANEL_PHASE_CONDITIONAL_SELECTION_SCREENING = "conditional_selection_screening"
-PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION = (
-    "conditional_survivor_confirmation"
-)
+PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION = "conditional_survivor_confirmation"
 PANEL_PHASES: Tuple[str, ...] = (
     PANEL_PHASE_REWARD_TRAIN,
     PANEL_PHASE_SELECTION_SCREENING,
@@ -254,7 +252,7 @@ def survivor_confirmation_workload(
         pair_count=pair_count,
         extra_late_p_values=extra_late_p_values,
     )
-    normalized: Dict[int, int] = {nfe: 0 for nfe in IMAGE_TARGET_NFES}
+    normalized: Dict[int, int] = dict.fromkeys(IMAGE_TARGET_NFES, 0)
     for raw_nfe, raw_count in survivors_by_nfe.items():
         nfe = normalize_image_nfe(raw_nfe)
         if isinstance(raw_count, bool) or not isinstance(raw_count, Integral):
@@ -291,14 +289,8 @@ def image_protocol_metadata(
         "unseen_nfe_evaluation": False,
         "schedule_keys": list(schedule_keys),
         "schedule_count": len(schedule_keys),
-        "schedule_specifications": [
-            ScheduleSpecification(key).as_payload()
-            for key in schedule_keys
-        ],
-        "reference_clock_provenance": [
-            reference_clock_provenance(key)
-            for key in schedule_keys
-        ],
+        "schedule_specifications": [ScheduleSpecification(key).as_payload() for key in schedule_keys],
+        "reference_clock_provenance": [reference_clock_provenance(key) for key in schedule_keys],
         "kid": {
             "reward_metric": "kernel_inception_distance",
             "estimator": "unbiased_mmd2",
@@ -315,9 +307,7 @@ def image_protocol_metadata(
             "fid": "fid50k",
             "inception_score_splits": LOCKED_INCEPTION_SPLITS,
             "precision_recall_neighborhood": (LOCKED_PRECISION_RECALL_NEIGHBORHOOD),
-            "precision_recall_batch_size": (
-                LOCKED_PRECISION_RECALL_BATCH_SIZE
-            ),
+            "precision_recall_batch_size": (LOCKED_PRECISION_RECALL_BATCH_SIZE),
             "same_generated_panel": True,
             "execution": locked_metric_execution_spec(),
         },
@@ -338,9 +328,7 @@ def image_protocol_metadata(
             "teacher_evidence_phase": "reward_train",
             "teacher_score_weight": IMAGE_GICO_TEACHER_SCORE_WEIGHT,
             "teacher_score_schedule": "zero_then_linear_late_ramp",
-            "teacher_score_warmup_fraction": (
-                IMAGE_GICO_TEACHER_SCORE_WARMUP_FRACTION
-            ),
+            "teacher_score_warmup_fraction": (IMAGE_GICO_TEACHER_SCORE_WARMUP_FRACTION),
             "teacher_score_clip": IMAGE_GICO_TEACHER_SCORE_CLIP,
             "unseen_nfe_distillation": False,
         },
@@ -367,35 +355,19 @@ def locked_metric_execution_spec() -> Dict[str, Any]:
             "input1": "locked_generated_metric_dataset",
             "input2": "bound_real_metric_dataset",
             "cuda": "execution_environment.device_type",
-            "batch_size": (
-                "fid_reference.feature_extraction_batch_size"
-            ),
+            "batch_size": ("fid_reference.feature_extraction_batch_size"),
             "rng_seed": "locked_sample_panel.seed_start",
-            "feature_extractor_weights_path": (
-                "verified_feature_weights.path"
-            ),
+            "feature_extractor_weights_path": ("verified_feature_weights.path"),
         },
-        "torch_fidelity_fixed_options": dict(
-            LOCKED_TORCH_FIDELITY_FIXED_OPTIONS
-        ),
+        "torch_fidelity_fixed_options": dict(LOCKED_TORCH_FIDELITY_FIXED_OPTIONS),
         "fid50k": {
-            "generated_moments": (
-                "ordered_fixed_1024_row_float64_chunks"
-            ),
+            "generated_moments": ("ordered_fixed_1024_row_float64_chunks"),
             "real_moments": "bound_full_training_fid_reference",
-            "distance": (
-                "scipy_sqrtm_of_covariance_product_trace"
-            ),
+            "distance": ("scipy_sqrtm_of_covariance_product_trace"),
             "covariance_epsilon": FID_COVARIANCE_EPSILON,
-            "fallback": (
-                "add_epsilon_identity_to_both_covariances"
-            ),
-            "complex_imaginary_tolerance": (
-                FID_COMPLEX_IMAGINARY_TOLERANCE
-            ),
-            "negative_relative_tolerance": (
-                FID_NEGATIVE_RELATIVE_TOLERANCE
-            ),
+            "fallback": ("add_epsilon_identity_to_both_covariances"),
+            "complex_imaginary_tolerance": (FID_COMPLEX_IMAGINARY_TOLERANCE),
+            "negative_relative_tolerance": (FID_NEGATIVE_RELATIVE_TOLERANCE),
             "negative_within_tolerance": "clamp_to_zero",
         },
     }

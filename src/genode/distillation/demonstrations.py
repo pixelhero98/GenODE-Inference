@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
-from dataclasses import dataclass
 import errno
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import stat
 import tempfile
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
@@ -19,8 +19,11 @@ import torch
 
 from genode.checkpoint_validation import (
     normalize_strict_solver_nfe_fields as normalize_solver_nfe_fields,
+)
+from genode.checkpoint_validation import (
     validate_strict_integer,
 )
+from genode.data.otflow_paths import resolve_project_path
 from genode.distillation.artifacts import (
     DEMONSTRATION_ARTIFACT_VERSION,
     DEMONSTRATION_MANIFEST_NAME,
@@ -31,7 +34,6 @@ from genode.distillation.artifacts import (
     write_demonstration_manifest,
     write_npz_shard,
 )
-from genode.data.otflow_paths import resolve_project_path
 from genode.distillation.gico_policy import GICOSchedulePolicy, load_gico_schedule_policy
 from genode.evaluation.otflow_evaluation_support import load_checkpoint_model
 from genode.gico.density_representation import (
@@ -39,11 +41,10 @@ from genode.gico.density_representation import (
 )
 from genode.models.conditioning import ConditioningCache
 from genode.models.otflow_model import OTFlow
-from genode.provenance import file_sha256
 from genode.path_safety import is_link_or_reparse_point
+from genode.provenance import file_sha256
 from genode.runtime import resolve_torch_device
 from genode.solver_protocol import CANONICAL_SOLVER_KEYS
-
 
 SUPPORTED_SOLVER_KEYS = CANONICAL_SOLVER_KEYS
 
@@ -87,9 +88,7 @@ def _solve_snapshot_trajectory(
         dtype=initial_state.dtype,
     )
     if grid.ndim != 1 or int(grid.numel()) != nfe.macro_steps + 1:
-        raise ValueError(
-            "time_grid must be one-dimensional with macro_steps + 1 entries."
-        )
+        raise ValueError("time_grid must be one-dimensional with macro_steps + 1 entries.")
     if (
         not bool(torch.isfinite(grid).all())
         or not bool((torch.diff(grid) > 0.0).all())
@@ -162,10 +161,7 @@ def _solve_snapshot_trajectory(
                 state = state + dt * velocity
             else:
                 step_ratio = dt / previous_dt
-                state = state + dt * (
-                    (1.0 + 0.5 * step_ratio) * velocity
-                    - 0.5 * step_ratio * previous_velocity
-                )
+                state = state + dt * ((1.0 + 0.5 * step_ratio) * velocity - 0.5 * step_ratio * previous_velocity)
             previous_velocity = velocity
             previous_dt = dt
         else:  # pragma: no cover - the solver protocol is authoritative.
@@ -265,8 +261,7 @@ class DistillationContexts:
             raise ValueError("context_ids may not be empty.")
         if self.histories.ndim != 3:
             raise ValueError(
-                "histories must have shape [contexts, history_steps, features], "
-                f"got {tuple(self.histories.shape)}."
+                f"histories must have shape [contexts, history_steps, features], got {tuple(self.histories.shape)}."
             )
         if int(self.histories.shape[0]) != len(self.context_ids):
             raise ValueError("context_ids and histories must have the same first dimension.")
@@ -286,16 +281,12 @@ class DistillationContexts:
         fingerprints = tuple(
             context_fingerprint(
                 self.histories[index].detach().cpu().numpy(),
-                None
-                if self.conditions is None
-                else self.conditions[index].detach().cpu().numpy(),
+                None if self.conditions is None else self.conditions[index].detach().cpu().numpy(),
             )
             for index in range(len(self.context_ids))
         )
         if len(set(fingerprints)) != len(fingerprints):
-            raise ValueError(
-                "Physical demonstration contexts must be unique even when context_ids differ."
-            )
+            raise ValueError("Physical demonstration contexts must be unique even when context_ids differ.")
         return fingerprints
 
 
@@ -324,9 +315,7 @@ def parse_distillation_settings(value: str) -> tuple[DistillationSetting, ...]:
     for item in text.split(","):
         parts = item.strip().split(":")
         if len(parts) != 2:
-            raise ValueError(
-                f"Invalid setting {item!r}; expected comma-separated solver_key:target_nfe values."
-            )
+            raise ValueError(f"Invalid setting {item!r}; expected comma-separated solver_key:target_nfe values.")
         settings.append(DistillationSetting(parts[0].strip(), int(parts[1])))
     if len(set(settings)) != len(settings):
         raise ValueError("Distillation settings may not contain duplicates.")
@@ -423,9 +412,7 @@ def _noise_seed(
 ) -> int:
     # Common random numbers make teacher endpoints directly comparable across
     # solver/NFE settings for the same context and rollout.
-    encoded = (
-        f"{int(base_seed)}\0{context_fingerprint}\0{int(rollout_index)}"
-    ).encode("utf-8")
+    encoded = (f"{int(base_seed)}\0{context_fingerprint}\0{int(rollout_index)}").encode("utf-8")
     digest = hashlib.sha256(encoded).digest()
     return int.from_bytes(digest[:8], "big") % (2**63 - 1)
 
@@ -531,9 +518,7 @@ def _install_path_no_replace(source: Path, destination: Path) -> None:
         os.rename(source, destination)
     except OSError as exc:
         if os.path.lexists(destination):
-            raise FileExistsError(
-                f"Refusing to overwrite concurrently created path {destination.name!r}."
-            ) from exc
+            raise FileExistsError(f"Refusing to overwrite concurrently created path {destination.name!r}.") from exc
         raise
     _fsync_parent_directory(destination)
     if source.parent != destination.parent:
@@ -573,13 +558,9 @@ def _exclusive_collection_lock(target: Path) -> Iterator[None]:
     """
 
     if os.name not in {"nt", "posix"}:
-        raise RuntimeError(
-            f"Demonstration collection locking is unsupported on platform {os.name!r}."
-        )
+        raise RuntimeError(f"Demonstration collection locking is unsupported on platform {os.name!r}.")
     lock_path = _collection_lock_path(target)
-    if lock_path.exists() and (
-        is_link_or_reparse_point(lock_path) or not lock_path.is_file()
-    ):
+    if lock_path.exists() and (is_link_or_reparse_point(lock_path) or not lock_path.is_file()):
         raise ValueError("Demonstration collection lock must be a regular file.")
 
     flags = os.O_RDWR
@@ -594,7 +575,7 @@ def _exclusive_collection_lock(target: Path) -> Iterator[None]:
         descriptor = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         if is_link_or_reparse_point(lock_path) or not lock_path.is_file():
-            raise ValueError("Demonstration collection lock must be a regular file.")
+            raise ValueError("Demonstration collection lock must be a regular file.") from None
         descriptor = os.open(lock_path, flags)
 
     try:
@@ -615,12 +596,8 @@ def _exclusive_collection_lock(target: Path) -> Iterator[None]:
             _acquire_platform_lock(descriptor)
         except OSError as exc:
             if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
-                raise RuntimeError(
-                    f"Another demonstration collector is already using target {target.name!r}."
-                ) from exc
-            raise RuntimeError(
-                f"Could not safely acquire the demonstration lock for target {target.name!r}."
-            ) from exc
+                raise RuntimeError(f"Another demonstration collector is already using target {target.name!r}.") from exc
+            raise RuntimeError(f"Could not safely acquire the demonstration lock for target {target.name!r}.") from exc
         os.lseek(descriptor, 0, os.SEEK_SET)
         marker = os.read(descriptor, len(_COLLECTION_LOCK_MARKER) + 1)
         if not marker:
@@ -631,9 +608,7 @@ def _exclusive_collection_lock(target: Path) -> Iterator[None]:
             os.fsync(descriptor)
             _fsync_parent_directory(lock_path)
         elif marker != _COLLECTION_LOCK_MARKER:
-            raise ValueError(
-                "Refusing to use an unrecognized demonstration collection lock file."
-            )
+            raise ValueError("Refusing to use an unrecognized demonstration collection lock file.")
         yield
     finally:
         # Closing the descriptor releases both POSIX flock and Windows byte-range
@@ -649,9 +624,7 @@ def _validated_artifact_manifest_sha256(root: Path) -> str:
         raise ValueError("Managed demonstration artifact must be a regular directory.")
     manifest_path = root / DEMONSTRATION_MANIFEST_NAME
     if is_link_or_reparse_point(manifest_path) or not manifest_path.is_file():
-        raise ValueError(
-            "Safe replacement requires an intact demonstration manifest; refusing partial output."
-        )
+        raise ValueError("Safe replacement requires an intact demonstration manifest; refusing partial output.")
     manifest = load_demonstration_manifest(manifest_path)
     managed_files = {
         manifest_path.resolve(),
@@ -680,13 +653,9 @@ def _validated_artifact_manifest_sha256(root: Path) -> str:
         elif path.is_dir():
             discovered_directories.add(path.resolve())
         else:
-            raise ValueError(
-                "Refusing to replace a demonstration directory containing special files."
-            )
+            raise ValueError("Refusing to replace a demonstration directory containing special files.")
     if discovered_files != managed_files or discovered_directories != managed_directories:
-        raise ValueError(
-            "Refusing to replace a demonstration directory containing unmanaged paths."
-        )
+        raise ValueError("Refusing to replace a demonstration directory containing unmanaged paths.")
     return file_sha256(manifest_path)
 
 
@@ -720,10 +689,7 @@ def _fsync_managed_artifact(root: Path) -> str:
 
 def _validate_output_root(root: Path, *, overwrite: bool) -> None:
     if is_link_or_reparse_point(root):
-        raise ValueError(
-            "Refusing a demonstration output that is a symlink, junction, or "
-            f"reparse point: {root}."
-        )
+        raise ValueError(f"Refusing a demonstration output that is a symlink, junction, or reparse point: {root}.")
     manifest_path = root / DEMONSTRATION_MANIFEST_NAME
     shards_path = root / "shards"
     if root.exists() and not root.is_dir():
@@ -733,9 +699,7 @@ def _validate_output_root(root: Path, *, overwrite: bool) -> None:
             raise ValueError("Refusing to write demonstrations into a non-empty unmanaged directory.")
         return
     if not overwrite:
-        raise FileExistsError(
-            f"Refusing to overwrite an existing demonstration artifact in {root.name!r}."
-        )
+        raise FileExistsError(f"Refusing to overwrite an existing demonstration artifact in {root.name!r}.")
     _validated_artifact_manifest_sha256(root)
 
 
@@ -754,9 +718,7 @@ def _promotion_sibling(target: Path, name: object, *, kind: str) -> Path:
 
 def _write_promotion_journal(path: Path, record: Mapping[str, object]) -> None:
     if path.exists():
-        raise ValueError(
-            "Refusing to replace an existing promotion journal without recovering it first."
-        )
+        raise ValueError("Refusing to replace an existing promotion journal without recovering it first.")
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -893,9 +855,7 @@ def _prepare_promotion_journal(
         if is_link_or_reparse_point(target) or not target.is_dir():
             raise ValueError("Demonstration target must be a regular directory.")
         if not bool(overwrite) and any(target.iterdir()):
-            raise FileExistsError(
-                f"Refusing to overwrite concurrently created demonstration artifact {target.name!r}."
-            )
+            raise FileExistsError(f"Refusing to overwrite concurrently created demonstration artifact {target.name!r}.")
         backup = target.with_name(f".{target.name}.backup-{time.time_ns()}")
         while backup.exists():
             backup = target.with_name(f".{target.name}.backup-{time.time_ns()}")
@@ -930,11 +890,7 @@ def _recover_interrupted_promotion(target: Path) -> None:
     staging = _promotion_sibling(target, record["staging_name"], kind="staging")
     staged_hash = str(record["staging_manifest_sha256"])
     previous_kind = str(record["previous_kind"])
-    backup = (
-        None
-        if previous_kind == "absent"
-        else _promotion_sibling(target, record["backup_name"], kind="backup")
-    )
+    backup = None if previous_kind == "absent" else _promotion_sibling(target, record["backup_name"], kind="backup")
     backup_hash = str(record["backup_manifest_sha256"])
 
     target_hash: str | None = None
@@ -959,10 +915,7 @@ def _recover_interrupted_promotion(target: Path) -> None:
         return
 
     target_matches_previous = (
-        previous_kind == "artifact"
-        and target_hash == backup_hash
-        or previous_kind == "empty"
-        and target_is_empty
+        previous_kind == "artifact" and target_hash == backup_hash or previous_kind == "empty" and target_is_empty
     )
     if target_matches_previous:
         _cleanup_obsolete_promotion_paths(
@@ -1004,9 +957,7 @@ def _recover_interrupted_promotion(target: Path) -> None:
         _unlink_path(journal)
         return
 
-    raise ValueError(
-        "Cannot recover demonstration promotion because journaled paths do not match a safe state."
-    )
+    raise ValueError("Cannot recover demonstration promotion because journaled paths do not match a safe state.")
 
 
 def _promote_staged_artifact(
@@ -1019,11 +970,7 @@ def _promote_staged_artifact(
 
     record = _prepare_promotion_journal(staging, target, overwrite=overwrite)
     previous_kind = str(record["previous_kind"])
-    backup = (
-        None
-        if previous_kind == "absent"
-        else _promotion_sibling(target, record["backup_name"], kind="backup")
-    )
+    backup = None if previous_kind == "absent" else _promotion_sibling(target, record["backup_name"], kind="backup")
     try:
         if backup is not None:
             _replace_path(target, backup)
@@ -1075,9 +1022,7 @@ def _collect_flow_map_demonstrations_into(
         raise ValueError("Distillation settings may not contain duplicates.")
     phase = str(split_phase).strip()
     if phase not in DEMONSTRATION_TRAINING_SPLITS:
-        raise ValueError(
-            f"split_phase must be a non-test training or validation split, got {split_phase!r}."
-        )
+        raise ValueError(f"split_phase must be a non-test training or validation split, got {split_phase!r}.")
     rollout_count = int(rollouts_per_context)
     if rollout_count <= 0:
         raise ValueError("rollouts_per_context must be positive.")
@@ -1086,9 +1031,7 @@ def _collect_flow_map_demonstrations_into(
     if cache_batch <= 0 or shard_size <= 0:
         raise ValueError("context_batch_size and shard_contexts must be positive.")
     if gico_policy.density_dim != DENSITY_BIN_COUNT:
-        raise ValueError(
-            f"Flow-map distillation requires the {DENSITY_BIN_COUNT}-bin GICO density representation."
-        )
+        raise ValueError(f"Flow-map distillation requires the {DENSITY_BIN_COUNT}-bin GICO density representation.")
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
 
@@ -1111,9 +1054,7 @@ def _collect_flow_map_demonstrations_into(
                     device=device,
                     dtype=dtype,
                 )
-            cache_parts.append(
-                _cache_to_cpu(backbone_model.backbone.precompute(histories, cond=conditions))
-            )
+            cache_parts.append(_cache_to_cpu(backbone_model.backbone.precompute(histories, cond=conditions)))
         shard_cache = _concatenate_caches(cache_parts)
         context_embedding = gico_policy.context_embedding_from_cache(shard_cache)
 
@@ -1200,18 +1141,12 @@ def _collect_flow_map_demonstrations_into(
                 trajectory_states = getattr(trajectory, "states", None)
                 if not torch.is_tensor(trajectory_states):
                     raise RuntimeError("OTFlow.solve did not return a trajectory.")
-                context_index_rows.append(
-                    np.full((rollout_count,), common.context_index, dtype=np.int64)
-                )
+                context_index_rows.append(np.full((rollout_count,), common.context_index, dtype=np.int64))
                 seed_rows.append(np.asarray(common.seeds, dtype=np.int64))
                 initial_rows.append(initial_state.detach().cpu().numpy())
-                grid_rows.append(
-                    schedule.time_grid.expand(rollout_count, -1).detach().cpu().numpy()
-                )
+                grid_rows.append(schedule.time_grid.expand(rollout_count, -1).detach().cpu().numpy())
                 state_rows.append(trajectory_states.detach().cpu().numpy())
-                density_rows.append(
-                    schedule.density_mass.expand(rollout_count, -1).detach().cpu().numpy()
-                )
+                density_rows.append(schedule.density_mass.expand(rollout_count, -1).detach().cpu().numpy())
             arrays = {
                 "context_index": np.concatenate(context_index_rows, axis=0),
                 "noise_seed": np.concatenate(seed_rows, axis=0),
@@ -1222,10 +1157,7 @@ def _collect_flow_map_demonstrations_into(
             }
             record = write_npz_shard(
                 root,
-                (
-                    f"shards/trajectories_{setting.solver_key}_nfe{setting.target_nfe}_"
-                    f"{shard_index:05d}.npz"
-                ),
+                (f"shards/trajectories_{setting.solver_key}_nfe{setting.target_nfe}_{shard_index:05d}.npz"),
                 arrays,
             )
             record.update(
@@ -1251,8 +1183,7 @@ def _collect_flow_map_demonstrations_into(
         "context_embedding_protocol": gico_policy.context_embedding_protocol,
         "setting_encoder_config": gico_policy.setting_encoder_config.to_payload(),
         "settings": [
-            {"solver_key": item.solver_key, "target_nfe": int(item.target_nfe)}
-            for item in requested_settings
+            {"solver_key": item.solver_key, "target_nfe": int(item.target_nfe)} for item in requested_settings
         ],
         "backbone_checkpoint_sha256": str(backbone_checkpoint_sha256),
         "gico_checkpoint_sha256": str(gico_checkpoint_sha256),
@@ -1308,44 +1239,30 @@ def collect_flow_map_demonstrations(
             physical_fingerprints,
         )
         if source_sha256 and source_sha256 != expected_source_sha256:
-            raise ValueError(
-                "contexts_source_sha256 does not match the in-memory contexts."
-            )
+            raise ValueError("contexts_source_sha256 does not match the in-memory contexts.")
         source_sha256 = expected_source_sha256
-    if len(source_sha256) != 64 or any(
-        character not in "0123456789abcdef" for character in source_sha256
-    ):
+    if len(source_sha256) != 64 or any(character not in "0123456789abcdef" for character in source_sha256):
         raise ValueError("contexts_source_sha256 must be a lowercase SHA-256 digest.")
     policy_metadata = getattr(gico_policy, "checkpoint_payload", None)
     if isinstance(policy_metadata, Mapping):
         policy_scenario = str(policy_metadata.get("scenario_key", "") or "").strip()
-        policy_family = str(
-            policy_metadata.get("benchmark_family", "") or ""
-        ).strip()
+        policy_family = str(policy_metadata.get("benchmark_family", "") or "").strip()
         if not policy_scenario or not policy_family:
-            raise ValueError(
-                "GICO checkpoint requires scenario provenance for demonstration collection."
-            )
+            raise ValueError("GICO checkpoint requires scenario provenance for demonstration collection.")
         if (policy_scenario, policy_family) != (
             str(scenario_key).strip(),
             str(benchmark_family).strip(),
         ):
-            raise ValueError(
-                "Requested demonstration scenario does not match the GICO checkpoint."
-            )
+            raise ValueError("Requested demonstration scenario does not match the GICO checkpoint.")
     requested_target = Path(os.path.abspath(Path(output_dir).expanduser()))
     if is_link_or_reparse_point(requested_target):
         raise ValueError(
-            "Refusing a demonstration output that is a symlink, junction, or "
-            f"reparse point: {requested_target}."
+            f"Refusing a demonstration output that is a symlink, junction, or reparse point: {requested_target}."
         )
     requested_target.parent.mkdir(parents=True, exist_ok=True)
     target = requested_target.parent.resolve(strict=True) / requested_target.name
     if is_link_or_reparse_point(target):
-        raise ValueError(
-            "Refusing a demonstration output that is a symlink, junction, or "
-            f"reparse point: {target}."
-        )
+        raise ValueError(f"Refusing a demonstration output that is a symlink, junction, or reparse point: {target}.")
     with _exclusive_collection_lock(target):
         _recover_interrupted_promotion(target)
         _validate_output_root(target, overwrite=bool(overwrite))
@@ -1395,23 +1312,18 @@ def load_distillation_contexts(path: str | Path) -> DistillationContexts:
             if ids_array.ndim != 1 or ids_array.dtype.kind not in {"U", "S"}:
                 raise ValueError("context_ids must be a one-dimensional Unicode or byte-string array.")
             context_ids = tuple(
-                value.decode("utf-8") if isinstance(value, bytes) else str(value)
-                for value in ids_array.tolist()
+                value.decode("utf-8") if isinstance(value, bytes) else str(value) for value in ids_array.tolist()
             )
             histories_array = np.asarray(payload["histories"])
             if histories_array.dtype.kind != "f":
                 raise ValueError("histories must contain floating-point values.")
-            histories = torch.from_numpy(
-                np.asarray(histories_array, dtype=np.float32)
-            )
+            histories = torch.from_numpy(np.asarray(histories_array, dtype=np.float32))
             conditions = None
             if "conditions" in payload.files:
                 conditions_array = np.asarray(payload["conditions"])
                 if conditions_array.dtype.kind != "f":
                     raise ValueError("conditions must contain floating-point values.")
-                conditions = torch.from_numpy(
-                    np.asarray(conditions_array, dtype=np.float32)
-                )
+                conditions = torch.from_numpy(np.asarray(conditions_array, dtype=np.float32))
     except OSError as exc:
         raise ValueError(f"Could not read context NPZ {input_path.name!r}: {exc}") from exc
     return DistillationContexts(context_ids, histories, conditions).validate()
@@ -1449,9 +1361,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     gico_path = resolve_project_path(args.gico_checkpoint)
     contexts_path = resolve_project_path(args.contexts_npz)
     output_dir = resolve_project_path(args.output_dir)
-    output_manifest = (
-        output_dir / DEMONSTRATION_MANIFEST_NAME
-    )
+    output_manifest = output_dir / DEMONSTRATION_MANIFEST_NAME
     if output_manifest in {backbone_path, gico_path, contexts_path}:
         raise ValueError("Demonstration output must differ from every input artifact path.")
     backbone_model, _ = load_checkpoint_model(backbone_path, device)

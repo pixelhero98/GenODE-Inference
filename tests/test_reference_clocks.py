@@ -4,16 +4,16 @@ import math
 import unittest
 from decimal import Decimal
 
-from genode.canonical_experiment_layout import CANONICAL_SUPERVISION_SCHEDULE_KEYS
 from genode.benchmarks.image.protocol import (
     IMAGE_SCHEDULE_KEYS,
     euler_image_workload,
     image_protocol_metadata,
 )
+from genode.canonical_experiment_layout import CANONICAL_SUPERVISION_SCHEDULE_KEYS
+from genode.evaluation import diffusion_flow_time_reparameterization as schedule_runner
 from genode.gico.policy import grid_for_schedule, validate_gico_support_schedule_keys
 from genode.gico.train_gico import build_argparser as build_gico_argparser
 from genode.pipeline import full_pipeline
-from genode.evaluation import diffusion_flow_time_reparameterization as schedule_runner
 from genode.schedule_transfer.diffusion_flow_schedules import load_external_schedule_catalog
 from genode.schedule_transfer.reference_clocks import (
     AYS_SD15_SIGMAS,
@@ -46,7 +46,6 @@ from genode.schedules.fixed import (
     validate_fixed_schedule_keys,
 )
 from genode.schedules.specification import ScheduleSpecification
-
 
 EXPECTED_DEFAULT_KEYS = (
     "uniform",
@@ -83,11 +82,7 @@ class ReferenceClockTests(unittest.TestCase):
         self.assertEqual(IMAGE_SCHEDULE_KEYS, EXPECTED_DEFAULT_KEYS)
         self.assertEqual(len(DEFAULT_REFERENCE_CLOCK_KEYS), 23)
         self.assertEqual(len(set(DEFAULT_REFERENCE_CLOCK_KEYS)), 23)
-        runner_defaults = tuple(
-            schedule_runner.build_argparser()
-            .parse_args([])
-            .baseline_scheduler_names.split(",")
-        )
+        runner_defaults = tuple(schedule_runner.build_argparser().parse_args([]).baseline_scheduler_names.split(","))
         self.assertEqual(runner_defaults, EXPECTED_DEFAULT_KEYS)
         for removed in ("late_power_3", "ser_ptg_local_defect_eta005", "ays_avg_reversed"):
             self.assertNotIn(removed, DEFAULT_REFERENCE_CLOCK_KEYS)
@@ -123,9 +118,9 @@ class ReferenceClockTests(unittest.TestCase):
         ots_times, ots_lambdas = ots_vp_linear_source_nodes(4)
         expected_times = (1.0, 0.62910004, 0.41664592, 0.12023062, 0.001)
         expected_lambdas = (-5.02497841, -1.99115979, -0.79098555, 0.88994725, 4.55771493)
-        for observed, expected in zip(ots_times, expected_times):
+        for observed, expected in zip(ots_times, expected_times, strict=False):
             self.assertAlmostEqual(observed, expected, places=5)
-        for observed, expected in zip(ots_lambdas, expected_lambdas):
+        for observed, expected in zip(ots_lambdas, expected_lambdas, strict=False):
             self.assertAlmostEqual(observed, expected, places=5)
 
         self.assertEqual(
@@ -147,12 +142,11 @@ class ReferenceClockTests(unittest.TestCase):
                 self.assertIs(lambdas, OTS_VP_LINEAR_OFFICIAL_LAMBDAS[step_count])
                 self.assertEqual(len(times), step_count + 1)
                 self.assertEqual(len(lambdas), step_count + 1)
-                self.assertTrue(all(left > right for left, right in zip(times, times[1:])))
-                self.assertTrue(all(left < right for left, right in zip(lambdas, lambdas[1:])))
+                self.assertTrue(all(left > right for left, right in zip(times, times[1:], strict=False)))
+                self.assertTrue(all(left < right for left, right in zip(lambdas, lambdas[1:], strict=False)))
         self.assertEqual(
             OTS_VP_LINEAR_TABLE_SHA256,
-            "ots-vp-linear-official-tables-v2:"
-            "7686201dc408a0c9d56b3f9abed9849967426dc352c5f9870488ceee57ad9271",
+            "ots-vp-linear-official-tables-v2:7686201dc408a0c9d56b3f9abed9849967426dc352c5f9870488ceee57ad9271",
         )
         step7_times, step7_lambdas = ots_vp_linear_source_nodes(7)
         self.assertEqual(
@@ -209,18 +203,19 @@ class ReferenceClockTests(unittest.TestCase):
     def test_late_p_augmentation_is_validated_canonical_deduped_and_sorted(self) -> None:
         self.assertEqual(canonical_late_p_key("1.500"), "late_p_1p5")
         self.assertEqual(canonical_late_p_key(Decimal("3.2500")), "late_p_3p25")
-        self.assertEqual(parse_extra_late_p_values("4,2.25,3,2.250,1.5"), (
-            Decimal("1.5"), Decimal("2.25"), Decimal("3"), Decimal("4")
-        ))
+        self.assertEqual(
+            parse_extra_late_p_values("4,2.25,3,2.250,1.5"),
+            (Decimal("1.5"), Decimal("2.25"), Decimal("3"), Decimal("4")),
+        )
         keys = reference_clock_keys("3,2.25,3.0")
-        self.assertEqual(keys[7:14], (
-            "late_p_1p5", "late_p_2", "late_p_2p25", "late_p_3", "late_p_4", "late_p_8", "flowts_power_0p03"
-        ))
+        self.assertEqual(
+            keys[7:14],
+            ("late_p_1p5", "late_p_2", "late_p_2p25", "late_p_3", "late_p_4", "late_p_8", "flowts_power_0p03"),
+        )
         self.assertEqual(len(keys), len(set(keys)))
         for invalid in ("nan", "inf", "-inf", "1.4999", "8.0001"):
-            with self.subTest(invalid=invalid):
-                with self.assertRaisesRegex(ValueError, r"finite and within \[1.5, 8\]"):
-                    validate_late_p_value(invalid)
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, r"finite and within \[1.5, 8\]"):
+                validate_late_p_value(invalid)
 
     def test_reverse_is_an_involution_and_all_default_grids_are_valid(self) -> None:
         for key in DEFAULT_REFERENCE_CLOCK_KEYS:
@@ -229,9 +224,9 @@ class ReferenceClockTests(unittest.TestCase):
                 self.assertEqual(len(grid), 5)
                 self.assertEqual((grid[0], grid[-1]), (0.0, 1.0))
                 self.assertTrue(all(math.isfinite(value) for value in grid))
-                self.assertTrue(all(right > left for left, right in zip(grid, grid[1:])))
+                self.assertTrue(all(right > left for left, right in zip(grid, grid[1:], strict=False)))
                 restored = reverse_reference_clock_grid(reverse_reference_clock_grid(grid))
-                for observed, expected in zip(restored, grid):
+                for observed, expected in zip(restored, grid, strict=False):
                     self.assertAlmostEqual(observed, expected, places=14)
 
     def test_image_fixed_schedules_delegate_to_canonical_reference_clocks(self) -> None:
@@ -267,9 +262,11 @@ class ReferenceClockTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "complete canonical pool"):
             validate_fixed_schedule_keys(keys[:-1])
         for removed_key in ("late_power", "flowts", "ays", "uniform_reversed"):
-            with self.subTest(removed_key=removed_key):
-                with self.assertRaisesRegex(ValueError, "Unsupported image reference clock"):
-                    build_fixed_schedule(ScheduleSpecification(removed_key), 4)
+            with (
+                self.subTest(removed_key=removed_key),
+                self.assertRaisesRegex(ValueError, "Unsupported image reference clock"),
+            ):
+                build_fixed_schedule(ScheduleSpecification(removed_key), 4)
         with self.assertRaisesRegex(ValueError, "encoded in the canonical schedule key"):
             build_fixed_schedule(
                 ScheduleSpecification("late_p_3", {"p": 3.0}),
@@ -312,19 +309,22 @@ class ReferenceClockTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "n_steps must be positive"):
             build_reference_clock_grid("uniform", 0)
         for invalid_steps in (True, False, 4.9):
-            with self.subTest(invalid_steps=invalid_steps):
-                with self.assertRaisesRegex(ValueError, "positive integer"):
-                    build_reference_clock_grid("uniform", invalid_steps)
+            with self.subTest(invalid_steps=invalid_steps), self.assertRaisesRegex(ValueError, "positive integer"):
+                build_reference_clock_grid("uniform", invalid_steps)
         with self.assertRaisesRegex(KeyError, "Unknown reference clock"):
             build_reference_clock_grid("uniform_reversed", 4)
 
     def test_trainer_cli_and_density_grid_accept_explicit_late_p_augmentation(self) -> None:
         args = build_gico_argparser().parse_args(
             [
-                "--rows_csv", "rows.csv",
-                "--context_embeddings_npz", "contexts.npz",
-                "--out_dir", "out",
-                "--extra_late_p_values", "3,2.25,3.0",
+                "--rows_csv",
+                "rows.csv",
+                "--context_embeddings_npz",
+                "contexts.npz",
+                "--out_dir",
+                "out",
+                "--extra_late_p_values",
+                "3,2.25,3.0",
             ]
         )
         self.assertEqual(args.extra_late_p_values, "3,2.25,3.0")
@@ -332,7 +332,7 @@ class ReferenceClockTests(unittest.TestCase):
         self.assertEqual(validate_gico_support_schedule_keys(keys), keys)
         grid = grid_for_schedule("late_p_3_reversed", "euler", 4)
         self.assertEqual(len(grid), 5)
-        self.assertTrue(all(right > left for left, right in zip(grid, grid[1:])))
+        self.assertTrue(all(right > left for left, right in zip(grid, grid[1:], strict=False)))
 
         pipeline_args = full_pipeline.build_argparser().parse_args(
             ["--schedule_keys", "uniform,late_p_4", "--extra_late_p_values", "3,2.25,3.0"]

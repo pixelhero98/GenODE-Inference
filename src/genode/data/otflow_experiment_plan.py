@@ -91,9 +91,7 @@ PAPER_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
 
 EXPERIMENTAL_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = ()
 
-SUPPORTED_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
-    PAPER_EXPERIMENT_SPECS + EXPERIMENTAL_EXPERIMENT_SPECS
-)
+SUPPORTED_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = PAPER_EXPERIMENT_SPECS + EXPERIMENTAL_EXPERIMENT_SPECS
 
 CANONICAL_FORECAST_PAPER_DATASETS: tuple[str, ...] = tuple(
     spec.dataset_key for spec in PAPER_EXPERIMENT_SPECS if spec.benchmark_family == FORECAST_FAMILY

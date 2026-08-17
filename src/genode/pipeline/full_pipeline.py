@@ -9,14 +9,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
+from genode.backbone_packages import (
+    apply_backbone_package_to_args,
+    backbone_package_protocol_payload,
+    validate_provided_backbone_manifest,
+)
 from genode.canonical_experiment_layout import (
     CANONICAL_CHECKPOINT_STEPS,
     CANONICAL_CONTEXT_SAMPLE_COUNT,
-    CANONICAL_UNSEEN_TARGET_WEIGHT,
     CANONICAL_SEEN_NFES,
     CANONICAL_SOLVER_KEYS,
     CANONICAL_SUPERVISION_SCHEDULE_KEYS,
     CANONICAL_UNSEEN_NFES,
+    CANONICAL_UNSEEN_TARGET_WEIGHT,
     SCENARIO_FAMILY_CONDITIONAL_GENERATION,
     SCENARIO_FAMILY_FORECAST,
     SCENARIO_FAMILY_MOLECULE,
@@ -24,7 +29,11 @@ from genode.canonical_experiment_layout import (
     STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS,
     scenario_family_for_key,
 )
-from genode.data.molecule_xyz import default_molecule_group_root, load_molecule_group_manifest, trainable_molecule_group_members
+from genode.data.molecule_xyz import (
+    default_molecule_group_root,
+    load_molecule_group_manifest,
+    trainable_molecule_group_members,
+)
 from genode.data.otflow_experiment_plan import experiment_plan_by_key
 from genode.data.otflow_paths import (
     default_backbone_manifest_path,
@@ -37,21 +46,15 @@ from genode.data.otflow_paths import (
     project_root,
     resolve_project_path,
 )
-from genode.backbone_packages import (
-    apply_backbone_package_to_args,
-    backbone_package_protocol_payload,
-    validate_provided_backbone_manifest,
-)
 from genode.evaluation import diffusion_flow_time_reparameterization as schedule_runner
 from genode.evaluation.diffusion_flow_time_reparameterization import SCHEDULE_CONTEXT_SELECTION_PROTOCOL
-from genode.gico.objectives import teacher_metric_profile_for_scenario, teacher_objective_specs_for_scenario
-from genode.gico.ser_ptg_reference import SER_PTG_EXAMPLE_SELECTION_PROTOCOL, SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL
 from genode.gico.ablation_plan import (
     DEFAULT_GICO_ABLATION_PRESET,
     GicoAblationArm,
     gico_ablation_arms,
     gico_ablation_preset_choices,
 )
+from genode.gico.objectives import teacher_metric_profile_for_scenario, teacher_objective_specs_for_scenario
 from genode.gico.policy import (
     DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
     DEFAULT_STUDENT_TARGET_ELITE_FRACTION,
@@ -59,10 +62,11 @@ from genode.gico.policy import (
     DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT,
     DEFAULT_STUDENT_TARGET_MIXTURE_MODE,
     DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
-    DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT,
     DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION,
+    DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT,
     STUDENT_TARGET_MIXTURE_MODES,
 )
+from genode.gico.ser_ptg_reference import SER_PTG_EXAMPLE_SELECTION_PROTOCOL, SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL
 from genode.schedule_transfer.reference_clocks import (
     canonical_late_p_key,
     parse_extra_late_p_values,
@@ -259,7 +263,10 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
     effective_stages = set(_effective_stage_names(args))
     includes_backbone_training = "backbone_training" in effective_stages
     provided_validation: Dict[str, Any] | None = None
-    if bool(getattr(args, "use_provided_backbones", False)) or str(getattr(args, "backbone_package_root", "") or "").strip():
+    if (
+        bool(getattr(args, "use_provided_backbones", False))
+        or str(getattr(args, "backbone_package_root", "") or "").strip()
+    ):
         if includes_backbone_training:
             raise ValueError("Provided-backbone mode cannot include backbone_training; run downstream stages only.")
         manifest_path = resolve_project_path(str(args.backbone_manifest))
@@ -281,7 +288,10 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
                 benchmark_family=family,
             )
             if provided_validation["status"] != "complete" and not bool(getattr(args, "dry_run", False)):
-                raise ValueError("Ablation-first mode requires ready provided backbones:\n- " + "\n- ".join(provided_validation["errors"]))
+                raise ValueError(
+                    "Ablation-first mode requires ready provided backbones:\n- "
+                    + "\n- ".join(provided_validation["errors"])
+                )
         elif not bool(getattr(args, "dry_run", False)):
             raise FileNotFoundError(f"Ablation-first mode requires an existing backbone manifest: {manifest_path}")
         else:
@@ -314,7 +324,9 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
     dataset = _resolved_scenario_key(args)
     plan = experiment_plan_by_key().get(dataset)
     effective_stages = _effective_stage_names(args)
-    includes_ablations = any(stage in {GICO_ABLATION_STUDENT_STAGE, GICO_ABLATION_LOCKED_TEST_STAGE} for stage in effective_stages)
+    includes_ablations = any(
+        stage in {GICO_ABLATION_STUDENT_STAGE, GICO_ABLATION_LOCKED_TEST_STAGE} for stage in effective_stages
+    )
     ablation_preset = str(getattr(args, "gico_ablation_preset", DEFAULT_GICO_ABLATION_PRESET))
     return {
         "version": PIPELINE_VERSION,
@@ -323,7 +335,9 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "stages": effective_stages,
         "ablation_first": bool(getattr(args, "ablation_first", False)),
         "gico_ablation_preset": ablation_preset if includes_ablations else "",
-        "gico_ablation_arms": [arm.manifest_record() for arm in gico_ablation_arms(ablation_preset)] if includes_ablations else [],
+        "gico_ablation_arms": [arm.manifest_record() for arm in gico_ablation_arms(ablation_preset)]
+        if includes_ablations
+        else [],
         "backbone_steps": int(args.backbone_steps),
         "checkpoint_steps": _parse_int_csv(str(args.checkpoint_steps), CANONICAL_CHECKPOINT_STEPS),
         "seen_nfes": _parse_int_csv(str(args.seen_nfes), CANONICAL_SEEN_NFES),
@@ -354,19 +368,19 @@ def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "student_target_elite_blend_all_weight": float(args.student_target_elite_blend_all_weight),
         "teacher_metric_profile": teacher_metric_profile_for_scenario(dataset),
         "synthetic_length": int(args.synthetic_length),
-        "locked_test_rows": (
-            _display_path(str(args.locked_test_rows))
-            if str(args.locked_test_rows).strip()
-            else ""
-        ),
+        "locked_test_rows": (_display_path(str(args.locked_test_rows)) if str(args.locked_test_rows).strip() else ""),
         "dataset_root": _display_path(str(args.dataset_root)),
         "shared_backbone_root": _display_path(str(args.shared_backbone_root)),
         "backbone_manifest": _display_path(str(args.backbone_manifest)),
         "cryptos_path": _display_path(str(args.cryptos_path)),
         "lobster_synthetic_profile_path": _display_path(str(args.lobster_synthetic_profile_path)),
         "long_term_st_path": _display_path(str(args.long_term_st_path)),
-        "molecule_group_root": _display_path(str(getattr(args, "molecule_group_root", "") or default_molecule_group_root())),
-        "molecule_backbone_root": _display_path(str(getattr(args, "molecule_backbone_root", "") or (project_outputs_root() / "molecule_3d_backbones"))),
+        "molecule_group_root": _display_path(
+            str(getattr(args, "molecule_group_root", "") or default_molecule_group_root())
+        ),
+        "molecule_backbone_root": _display_path(
+            str(getattr(args, "molecule_backbone_root", "") or (project_outputs_root() / "molecule_3d_backbones"))
+        ),
         "backbone_package": backbone_package_protocol_payload(args),
     }
 
@@ -527,7 +541,9 @@ def _schedule_row_command_status(command: Sequence[str]) -> Dict[str, Any] | Non
     return schedule_runner.schedule_row_output_status(resolve_project_path(str(parsed.out_root)), parsed)
 
 
-def _command_json_output_exists(command: Sequence[str], *, module: str, out_arg: str, relative_path: str) -> Tuple[bool, str]:
+def _command_json_output_exists(
+    command: Sequence[str], *, module: str, out_arg: str, relative_path: str
+) -> Tuple[bool, str]:
     if _command_module_args(command, module) is None:
         return True, ""
     out_dir = _command_arg_value(command, out_arg)
@@ -642,7 +658,9 @@ def _stage_manifest_complete(run_root: Path, entry: StageCommand, *, protocol_ha
     return True, ""
 
 
-def _resume_completed_prefix(run_root: Path, commands: Sequence[StageCommand], *, protocol_hash: str) -> List[StageCommand]:
+def _resume_completed_prefix(
+    run_root: Path, commands: Sequence[StageCommand], *, protocol_hash: str
+) -> List[StageCommand]:
     completed: List[StageCommand] = []
     for entry in commands:
         is_complete, _reason = _stage_manifest_complete(run_root, entry, protocol_hash=protocol_hash)
@@ -733,7 +751,14 @@ def _backbone_training_commands(args: argparse.Namespace, dataset: str, checkpoi
     group_root = resolve_project_path(str(getattr(args, "molecule_group_root", "") or default_molecule_group_root()))
     manifest_path = group_root / str(dataset) / "group_manifest.json"
     if not manifest_path.exists() and bool(getattr(args, "dry_run", False)):
-        return [["internal", "expand_molecule_member_backbones", f"--scenario_key={dataset}", f"--molecule_group_root={_display_path(group_root)}"]]
+        return [
+            [
+                "internal",
+                "expand_molecule_member_backbones",
+                f"--scenario_key={dataset}",
+                f"--molecule_group_root={_display_path(group_root)}",
+            ]
+        ]
     manifest = load_molecule_group_manifest(str(dataset), group_root)
     commands: List[List[str]] = []
     for member in trainable_molecule_group_members(manifest):
@@ -835,7 +860,9 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             *_student_objective_args(args, arm),
         ]
         if mode == STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS:
-            unseen_target_weight = CANONICAL_UNSEEN_TARGET_WEIGHT if arm is None else float(arm.student_unseen_target_weight)
+            unseen_target_weight = (
+                CANONICAL_UNSEEN_TARGET_WEIGHT if arm is None else float(arm.student_unseen_target_weight)
+            )
             command_args.extend(
                 [
                     "--student_unseen_target_rows_csv",
@@ -1041,7 +1068,9 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                     f"--scenario_key={dataset}",
                     f"--synthetic_length={int(args.synthetic_length)}",
                 ]
-            ] if bool(args.dry_run) else [],
+            ]
+            if bool(args.dry_run)
+            else [],
             "data_prep_manifest.json",
         ),
         StageCommand(
@@ -1066,12 +1095,21 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
         ),
         StageCommand(
             "gico_student_seen_only_zero_shot",
-            [_gico_train_command(STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, gico_root / STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT)],
+            [
+                _gico_train_command(
+                    STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, gico_root / STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT
+                )
+            ],
             "gico_seen_only_manifest.json",
         ),
         StageCommand(
             "gico_student_seen_plus_unseen_targets",
-            [_gico_train_command(STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS, gico_root / STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS)],
+            [
+                _gico_train_command(
+                    STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS,
+                    gico_root / STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS,
+                )
+            ],
             "gico_seen_plus_unseen_manifest.json",
         ),
         StageCommand(
@@ -1104,7 +1142,11 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     _validate_run_root(run_root, protocol_hash, resume=bool(args.resume), overwrite=bool(args.overwrite))
     commands = _build_stage_commands(args, run_root)
     has_ablation_stage = _has_ablation_stage(commands)
-    skipped_entries = _resume_completed_prefix(run_root, commands, protocol_hash=protocol_hash) if bool(args.resume) and not bool(args.overwrite) else []
+    skipped_entries = (
+        _resume_completed_prefix(run_root, commands, protocol_hash=protocol_hash)
+        if bool(args.resume) and not bool(args.overwrite)
+        else []
+    )
     skipped_stage_names = [entry.stage for entry in skipped_entries]
     commands_to_run = list(commands[len(skipped_entries) :])
     should_write_ablation_manifest = has_ablation_stage and (
@@ -1119,7 +1161,9 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             protocol_hash=protocol_hash,
             status="dry_run" if bool(args.dry_run) else "running",
         )
-        _write_json(_ablation_root(run_root, str(args.gico_ablation_preset)) / "ablation_manifest.json", ablation_manifest)
+        _write_json(
+            _ablation_root(run_root, str(args.gico_ablation_preset)) / "ablation_manifest.json", ablation_manifest
+        )
     _write_json(run_root / "protocol.json", {**protocol, "protocol_hash": protocol_hash})
     _write_json(
         _status_path(run_root),
@@ -1165,7 +1209,11 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                     }
                     manifest["command_results"].append(command_result)
                     continue
-                if schedule_status is not None and bool(schedule_status.get("protocol_mismatch", False)) and bool(args.resume):
+                if (
+                    schedule_status is not None
+                    and bool(schedule_status.get("protocol_mismatch", False))
+                    and bool(args.resume)
+                ):
                     manifest["command_results"].append(
                         {
                             "command_index": int(command_idx),
@@ -1268,12 +1316,16 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             protocol_hash=protocol_hash,
             status="dry_run" if bool(args.dry_run) else "complete",
         )
-        _write_json(_ablation_root(run_root, str(args.gico_ablation_preset)) / "ablation_manifest.json", final_ablation_manifest)
+        _write_json(
+            _ablation_root(run_root, str(args.gico_ablation_preset)) / "ablation_manifest.json", final_ablation_manifest
+        )
     return summary
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the canonical multi-family GICO pipeline with restartable status.")
+    parser = argparse.ArgumentParser(
+        description="Run the canonical multi-family GICO pipeline with restartable status."
+    )
     parser.add_argument("--scenario_key", default="")
     parser.add_argument("--dataset", default="")
     parser.add_argument("--run_root", default="")
@@ -1304,13 +1356,21 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--gico_teacher_steps", type=int, default=DEFAULT_GICO_TEACHER_STEPS)
     parser.add_argument("--gico_student_steps", type=int, default=DEFAULT_GICO_STUDENT_STEPS)
     parser.add_argument("--student_teacher_score_weight", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT)
-    parser.add_argument("--student_teacher_score_warmup_fraction", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION)
+    parser.add_argument(
+        "--student_teacher_score_warmup_fraction", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WARMUP_FRACTION
+    )
     parser.add_argument("--student_teacher_score_include_unseen_targets", action="store_true", default=False)
-    parser.add_argument("--student_target_mixture_mode", choices=STUDENT_TARGET_MIXTURE_MODES, default=DEFAULT_STUDENT_TARGET_MIXTURE_MODE)
+    parser.add_argument(
+        "--student_target_mixture_mode",
+        choices=STUDENT_TARGET_MIXTURE_MODES,
+        default=DEFAULT_STUDENT_TARGET_MIXTURE_MODE,
+    )
     parser.add_argument("--student_target_elite_fraction", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_FRACTION)
     parser.add_argument("--student_target_elite_k", type=int, default=DEFAULT_STUDENT_TARGET_ELITE_K)
     parser.add_argument("--student_target_elite_min_count", type=int, default=DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT)
-    parser.add_argument("--student_target_elite_blend_all_weight", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT)
+    parser.add_argument(
+        "--student_target_elite_blend_all_weight", type=float, default=DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT
+    )
     parser.add_argument("--synthetic_length", type=int, default=2_000_000)
     parser.add_argument("--locked_test_rows", default="")
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
@@ -1321,10 +1381,26 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--long_term_st_path", default=str(default_long_term_st_data_path()))
     parser.add_argument("--molecule_group_root", default=str(default_molecule_group_root()))
     parser.add_argument("--molecule_backbone_root", default=str(project_outputs_root() / "molecule_3d_backbones"))
-    parser.add_argument("--backbone_package_root", default="", help="Portable backbone package root to use for downstream-only GICO stages.")
-    parser.add_argument("--use_provided_backbones", action="store_true", default=False, help="Require existing packaged/provided backbones and refuse backbone_training stages.")
-    parser.add_argument("--ablation_first", action="store_true", default=False, help="Run prerequisite artifacts plus GICO ablations before stock GICO stages.")
-    parser.add_argument("--gico_ablation_preset", choices=gico_ablation_preset_choices(), default=DEFAULT_GICO_ABLATION_PRESET)
+    parser.add_argument(
+        "--backbone_package_root",
+        default="",
+        help="Portable backbone package root to use for downstream-only GICO stages.",
+    )
+    parser.add_argument(
+        "--use_provided_backbones",
+        action="store_true",
+        default=False,
+        help="Require existing packaged/provided backbones and refuse backbone_training stages.",
+    )
+    parser.add_argument(
+        "--ablation_first",
+        action="store_true",
+        default=False,
+        help="Run prerequisite artifacts plus GICO ablations before stock GICO stages.",
+    )
+    parser.add_argument(
+        "--gico_ablation_preset", choices=gico_ablation_preset_choices(), default=DEFAULT_GICO_ABLATION_PRESET
+    )
     parser.add_argument("--dry_run", action="store_true", default=False)
     parser.add_argument("--resume", action="store_true", default=False)
     parser.add_argument("--overwrite", action="store_true", default=False)

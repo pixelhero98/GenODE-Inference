@@ -18,10 +18,10 @@ flowchart LR
   D --> E["Frozen ODE / flow solver"]
 ```
 
-**Verified public artifact.** This repository provides reference clocks,
-teacher/student training, strict checkpoint validation, locked-test reporting,
-and deterministic release archives. It does not make a public performance
-claim before the manuscript and final evaluation tables are released.
+**Code-only publication.** Version 0.5.0 provides reference clocks,
+teacher/student training, strict artifact validation, locked-test reporting,
+and deterministic release archives. Trained weights, experiment results,
+checkpoints, and cluster configuration are intentionally not distributed.
 
 ```bash
 python -m pip install -e ".[test]"
@@ -41,10 +41,12 @@ secondary, opt-in workflow.
 
 ## Guarantees
 
-- GICO is the only active policy name, import path, CLI namespace, and
-  checkpoint protocol. There are no aliases for the former name.
-- The default supervision pool contains exactly 23 clocks: 12 base clocks and
-  the reversals of the 11 nonuniform clocks. Uniform is self-reversing.
+- The image API exposes exactly two student kinds:
+  `deterministic_barycenter` and `stochastic_causal_ar`. No legacy stochastic
+  policy is exposed as an alias or compatibility mode.
+- The default conditional supervision pool contains exactly 23 schedules: 12
+  base schedules and the reversals of the 11 nonuniform schedules. Uniform is
+  self-reversing.
 - Conditional policies use the exact context space of the frozen field.
   CIFAR-10 image backbones are explicitly unconditional and reject labels.
 - Checkpoint loaders are strict about schema version, tensor names, shapes,
@@ -52,8 +54,8 @@ secondary, opt-in workflow.
 - Release ZIPs are byte-deterministic and contain canonical manifests and
   SHA-256 sidecars. Source paths, symlinks, reparse points, traversal, and
   case/Unicode member collisions are rejected.
-- Datasets, generated outputs, private paths, and third-party image weights are
-  not stored in this repository.
+- Datasets, generated outputs, measured results, trained weights, private
+  paths, and third-party image weights are not stored in this repository.
 
 ## Installation
 
@@ -139,31 +141,93 @@ For ImageNet-64, GICO uses the frozen RF++/1-RF model's native
 backbone/checkpoint/context identities. Both registered CIFAR-10 backbones are
 unconditional; supplying a label is an error.
 
-### Complete-clock stochastic decoding
+### Image GICO supervision and students
 
-ImageNet-64 policies can add a source-bound complete-clock sidecar. For each
-class context and NFE, the decoder predicts probabilities `q` over whole clocks
-from the supervised pool. Its deterministic schedule is the density barycenter
-`mu = sum(q_i * d_i)`. A caller may also supply one replayable uniform draw and
-`alpha` in `[0, 1]` to execute
-`D_alpha = (1 - alpha) * mu + alpha * d_I`. Thus `alpha=0` is exactly the
-barycenter, `alpha=1` is exactly one supervised complete clock, and intermediate
-values preserve the mean while scaling covariance by `alpha^2`.
+Both image students consume one validated `ImageGICOSupervision` object. It
+binds NFEs 2, 4, and 8 to the fixed schedule support, alias-aggregated mixture
+weights, the corresponding density barycenter, an exact context table, reward
+diagnostics, and semantic source identities. Consequently, the students cannot
+quietly train against different teacher laws:
 
-The default 23-clock pool is represented on the exact union of all NFE 2, 4,
-and 8 clock nodes (171 nodes, 170 density bins), so complete clocks reconstruct
-without finite-bin drift. Duplicate supervision aliases are trained as grouped
-categorical targets and split uniformly inside each group. Randomness is never
-created inside the policy: SHA-256 counter draws are explicitly bound to the
-sampling plan, policy artifact, clock library, frozen context binding, seed,
-class label, and NFE; `alpha` is deliberately excluded so comparisons use the
-same selected clock.
+| Student kind | Training target | Published default |
+| --- | --- | --- |
+| `deterministic_barycenter` | Mixture-weighted density barycenter | Conditional model with 256 hidden dimensions |
+| `stochastic_causal_ar` | Terminal-weighted complete-path NLL on strict prefix-trie support | 128 model dimensions, 256-token vocabulary, four heads, 192-dimensional FFN, one Transformer block, 16-dimensional NFE embedding (339,184 parameters) |
 
-The six-file sidecar contains only its manifest, model state, clock-library
-identity, and exact NFE 2/4/8 clock grids. It carries neither raw/normalized
-contexts nor copied conditional targets. Loading requires the original GICO
-source artifact, and execution requires rebinding that source to its verified
-frozen backbone so contexts can only be derived from class labels.
+Conditional ImageNet supervision minimizes KID. Its advantage is
+`uniform KID - schedule KID`; jackknife standard errors feed
+class-to-feature-group-to-global shrinkage, followed by reward-scale
+normalization and clipping to `[-5, 5]`. Density aliases are aggregated before
+softmax and their mass is split consistently over duplicate schedules. The
+same weights form the deterministic density barycenter.
+
+Authenticated unconditional mixture evidence uses one explicit all-zero
+context, which covers CIFAR without inventing class labels. Contexts are never
+manufactured, truncated, or remapped: conditional artifacts require their
+bound table, while unconditional artifacts require the singleton zero table.
+
+The stochastic student retains 63 actions, 64 density bins, endpoint-aware
+cube-companded tokens, and a maximum clock-node quantization drift below
+`0.005`. At inference it samples only complete supported prefix-trie paths,
+using either caller-supplied uniforms or replayable SHA-256 counter uniforms.
+The deterministic student directly materializes its predicted barycenter.
+Neither inference path reads reward evidence or invokes the teacher. Both
+freeze the complete time grid before Euler integration and account for exactly
+the requested number of field evaluations. Student artifacts embed only the
+reward-free deployment binding they need (contexts plus support or direct
+barycenter), so materialization does not load the supervision evidence.
+
+Strict loaders preserve the active deterministic artifact protocols and the
+causal Transformer's state layout. Unsupported legacy stochastic layouts are
+rejected instead of converted implicitly.
+
+## Image GICO workflow
+
+`genode-image-gico` is the single image-policy executable:
+
+```bash
+genode-image-gico build-targets --manifest inputs/targets.json --output artifacts/supervision
+genode-image-gico train-deterministic --supervision artifacts/supervision --output artifacts/deterministic
+genode-image-gico train-stochastic --supervision artifacts/supervision --output artifacts/stochastic
+genode-image-gico validate --supervision artifacts/supervision \
+  --deterministic artifacts/deterministic --stochastic artifacts/stochastic
+genode-image-gico materialize --student deterministic_barycenter \
+  --artifact artifacts/deterministic \
+  --target-nfe 4 --context-indices 0 --output artifacts/schedule
+```
+
+`build-targets` accepts a portable JSON manifest. Array paths must be relative
+to the manifest, remain inside its directory, and name numeric `.npy` files
+loadable with `allow_pickle=False`. A conditional manifest has this shape:
+
+```json
+{
+  "kind": "conditional_kid",
+  "conditional_targets": "conditional-targets.json",
+  "fixed_density_mass": "fixed-density-mass.npy",
+  "normalized_contexts": "normalized-contexts.npy"
+}
+```
+
+For authenticated unconditional evidence, use `kind` equal to
+`unconditional_mixture` and provide `target_nfes`, `schedule_keys`,
+`fixed_density_mass`, `mixture_weights`, and a nonempty `source_identities`
+object. The builder creates the required singleton zero context; it does not
+accept a synthetic label table.
+
+Training configuration JSON can be supplied with `--config`. Stochastic
+materialization requires either an explicit `--uniforms` NumPy array or a
+`--request-sha256` plus optional comma-separated `--sample-keys`. Published
+directories are additive (existing destinations are rejected), contain
+semantic identities and file hashes, and never record absolute input paths.
+Use `genode-image-gico <command> --help` for complete arguments.
+
+The same contracts are available from `genode.gico`. The public surface
+includes the conditional and unconditional supervision builders, both student
+trainers, strict supervision and student artifact loaders, schedule
+materialization, counter-uniform derivation, and exact-NFE Euler execution.
+`ImageGICOStudentKind` is the type-level source of truth for selecting a
+student; downstream code should not use free-form legacy policy names.
 
 ## Primary workflow
 
@@ -228,7 +292,6 @@ Build checkpoint-only, named-checkpoint, or frozen policy archives with:
 genode-build-release-archive backbone-manifest --help
 genode-build-release-archive named-checkpoints --help
 genode-build-release-archive gico-policy --help
-genode-build-release-archive gico-clock-policy --help
 genode-build-release-archive validate --archive release.zip
 ```
 
@@ -236,16 +299,7 @@ The policy archive validates the complete source bundle, then includes the
 teacher state, student state, density table, context normalizers, and a fresh
 portable GICO manifest. The wrapper records the original manifest digest and
 actual training clock pool without carrying obsolete protocol-labelled JSON;
-packaging does not imply retraining on the current 23-clock default.
-
-`gico-clock-policy` accepts only the native current-v4 source policy (historical
-frozen policies remain supported by `gico-policy`). It performs the strict
-source validation, then uses the native source and complete-clock artifact
-loaders before packaging either artifact. The distinct combined schema is
-self-contained after extraction: it includes all eight source-policy files and
-all six sidecar files. Its portable archive metadata binds the source and
-decoder artifact identities, the decoder execution-state identity, and the
-independently load-verifiable serialized-state identity.
+packaging does not imply retraining on the current 23-schedule default.
 
 Each build writes:
 
@@ -257,13 +311,16 @@ Each build writes:
 
 ```bash
 python -m ruff check .
+python -m ruff format --check .
+python -m compileall -q src tests
 python -m pytest -q
 python -m pip check
 git diff --check
 ```
 
-The CI matrix runs Python 3.11 and 3.13, includes Windows portability coverage,
-builds the wheel, and smoke-tests every public CLI.
+The release matrix covers Python 3.11 and 3.13 with NumPy 1.26 and 2.x, builds
+and inspects both the wheel and source distribution, installs the wheel in a
+clean environment, and smoke-tests every public CLI.
 
 ## License
 

@@ -23,7 +23,6 @@ from genode.path_safety import resolve_portable_relative_path
 from ._strict_json import loads_strict_json
 from .registry import RFPP_CONFIG_IDENTITY_NAMESPACE, ImageBackboneSpec
 
-
 _MAX_CONFIG_BYTES = 64 * 1024
 _IMPORT_LOCK = threading.RLock()
 _IMPORT_COUNTER = itertools.count()

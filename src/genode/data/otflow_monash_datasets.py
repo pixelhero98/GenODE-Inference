@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import json
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
-
 import hashlib
-import stat
+import json
 import shutil
+import stat
 import tempfile
 import urllib.request
 import zipfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from genode.data.otflow_experiment_plan import FORECAST_FAMILY
 from genode.path_safety import (
@@ -19,7 +18,6 @@ from genode.path_safety import (
     portable_relative_path,
     resolve_portable_relative_path,
 )
-
 
 MONASH_ARCHIVE_URL = "https://forecastingdata.org/"
 
@@ -104,6 +102,7 @@ MONASH_REFERENCE_DATASETS: Tuple[MonashDatasetSpec, ...] = (
         horizon_source="TSForecasting experiments/fixed_horizon.R weather benchmark horizon.",
     ),
 )
+
 
 def monash_reference_dataset_keys() -> Tuple[str, ...]:
     return tuple(spec.key for spec in MONASH_REFERENCE_DATASETS)
@@ -210,9 +209,7 @@ def _download_file(
                         break
                     total += len(chunk)
                     if total > expected_size:
-                        raise ValueError(
-                            f"Download from {url} exceeded the expected size of {expected_size} bytes."
-                        )
+                        raise ValueError(f"Download from {url} exceeded the expected size of {expected_size} bytes.")
                     digest.update(chunk)
                     out_fh.write(chunk)
         if total != expected_size:
@@ -231,18 +228,12 @@ def _download_file(
 def _safe_extraction_root(destination_dir: Path) -> Path:
     absolute = destination_dir.expanduser().absolute()
     if is_link_or_reparse_point(absolute):
-        raise ValueError(
-            "Archive destination may not be a symlink, junction, or reparse point: "
-            f"{absolute}."
-        )
+        raise ValueError(f"Archive destination may not be a symlink, junction, or reparse point: {absolute}.")
     if absolute.exists() and not absolute.is_dir():
         raise ValueError(f"Archive destination must be a directory: {absolute}.")
     absolute.mkdir(parents=True, exist_ok=True)
     if is_link_or_reparse_point(absolute):
-        raise ValueError(
-            "Archive destination may not be a symlink, junction, or reparse point: "
-            f"{absolute}."
-        )
+        raise ValueError(f"Archive destination may not be a symlink, junction, or reparse point: {absolute}.")
     # Resolve only after accepting the caller-selected destination.  This
     # permits trusted platform mount aliases (for example /mount -> /storage)
     # above the destination while giving member extraction a canonical root.
@@ -383,10 +374,7 @@ def iter_tsf_series(tsf_path: str | Path) -> Iterator[Tuple[int, Dict[str, str],
                     series_values.append(None)
                 else:
                     series_values.append(float(item))
-            metadata = {
-                str(name): str(value)
-                for name, value in zip(header.attribute_names, attr_values)
-            }
+            metadata = {str(name): str(value) for name, value in zip(header.attribute_names, attr_values, strict=False)}
             yield int(line_number), metadata, series_values
 
 
@@ -462,7 +450,9 @@ def download_monash_dataset(dataset_root: str | Path, dataset_key: str) -> Dict[
     return manifest_payload
 
 
-def download_monash_paper_datasets(dataset_root: str | Path, dataset_keys: Optional[Tuple[str, ...]] = None) -> List[Dict[str, Any]]:
+def download_monash_paper_datasets(
+    dataset_root: str | Path, dataset_keys: Optional[Tuple[str, ...]] = None
+) -> List[Dict[str, Any]]:
     keys = monash_reference_dataset_keys() if dataset_keys is None else tuple(str(key) for key in dataset_keys)
     return [download_monash_dataset(dataset_root, key) for key in keys]
 

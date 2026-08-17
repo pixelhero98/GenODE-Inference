@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import tempfile
+from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
 import numpy as np
@@ -23,14 +23,11 @@ from genode.path_safety import (
 )
 from genode.provenance import file_sha256
 
-
 DEMONSTRATION_PROTOCOL = "flow_map_demonstrations"
 CHECKPOINT_PROTOCOL = "endpoint_flow_map"
 DEMONSTRATION_MANIFEST_NAME = "flow_map_demonstrations.json"
 DEMONSTRATION_ARTIFACT_VERSION = 1
-DEMONSTRATION_NON_TEST_SPLITS = frozenset(
-    {"train", "training", "train_tuning", "validation", "validation_tuning"}
-)
+DEMONSTRATION_NON_TEST_SPLITS = frozenset({"train", "training", "train_tuning", "validation", "validation_tuning"})
 DEMONSTRATION_TRAINING_SPLITS = frozenset({"train", "training", "train_tuning"})
 CONTEXT_BINDING_DOMAIN = "genode.flow_map.context_content"
 IN_MEMORY_CONTEXT_SOURCE_DOMAIN = "genode.flow_map.context_source.in_memory"
@@ -57,9 +54,7 @@ def context_fingerprint(history: Any, condition: Any | None = None) -> str:
             continue
         array = np.asarray(value)
         if array.dtype.kind != "f" or not bool(np.isfinite(array).all()):
-            raise ValueError(
-                f"Context fingerprint {name} must contain finite real floating-point values."
-            )
+            raise ValueError(f"Context fingerprint {name} must contain finite real floating-point values.")
         with np.errstate(over="ignore", invalid="ignore"):
             normalized = np.array(
                 array,
@@ -68,9 +63,7 @@ def context_fingerprint(history: Any, condition: Any | None = None) -> str:
                 copy=True,
             )
         if not bool(np.isfinite(normalized).all()):
-            raise ValueError(
-                f"Context fingerprint {name} cannot be represented at float32 model precision."
-            )
+            raise ValueError(f"Context fingerprint {name} cannot be represented at float32 model precision.")
         normalized[normalized == 0.0] = np.float32(0.0)
         shape = json.dumps(
             [int(size) for size in normalized.shape],
@@ -85,12 +78,8 @@ def context_fingerprint(history: Any, condition: Any | None = None) -> str:
 
 def context_binding(context_fingerprints: Sequence[Any]) -> Dict[str, Any]:
     fingerprints = sorted(str(value).strip() for value in context_fingerprints)
-    if not fingerprints or any(
-        _SHA256_PATTERN.fullmatch(value) is None for value in fingerprints
-    ):
-        raise ValueError(
-            "Context fingerprints must be non-empty lowercase SHA-256 digests."
-        )
+    if not fingerprints or any(_SHA256_PATTERN.fullmatch(value) is None for value in fingerprints):
+        raise ValueError("Context fingerprints must be non-empty lowercase SHA-256 digests.")
     if len(set(fingerprints)) != len(fingerprints):
         raise ValueError("Context fingerprints must be unique before context binding.")
     encoded = json.dumps(fingerprints, sort_keys=True, separators=(",", ":"))
@@ -141,21 +130,14 @@ def validate_context_binding(payload: Mapping[str, Any]) -> Dict[str, Any]:
     if set(binding) != required:
         missing = sorted(required - set(binding))
         extra = sorted(set(binding) - required)
-        raise ValueError(
-            "Context binding fields are invalid; "
-            f"missing={missing}, extra={extra}."
-        )
+        raise ValueError(f"Context binding fields are invalid; missing={missing}, extra={extra}.")
     if binding.get("algorithm") != "sha256" or binding.get("domain") != CONTEXT_BINDING_DOMAIN:
         raise ValueError("Context binding has an unsupported algorithm or domain.")
     raw_fingerprints = binding.get("context_fingerprints")
-    if not isinstance(raw_fingerprints, Sequence) or isinstance(
-        raw_fingerprints, (str, bytes)
-    ):
+    if not isinstance(raw_fingerprints, Sequence) or isinstance(raw_fingerprints, (str, bytes)):
         raise ValueError("Context binding context_fingerprints must be a list.")
     fingerprints = [str(value) for value in raw_fingerprints]
-    if not fingerprints or any(
-        _SHA256_PATTERN.fullmatch(value) is None for value in fingerprints
-    ):
+    if not fingerprints or any(_SHA256_PATTERN.fullmatch(value) is None for value in fingerprints):
         raise ValueError("Context binding contains invalid context fingerprints.")
     if fingerprints != sorted(set(fingerprints)):
         raise ValueError("Context binding fingerprints must be unique and sorted.")
@@ -205,16 +187,12 @@ def _context_identities_from_records(
                 or values.dtype.kind not in {"U", "S"}
                 or raw_ids.shape != values.shape
             ):
-                raise ValueError(
-                    "Context shard IDs and fingerprints must be aligned string vectors."
-                )
+                raise ValueError("Context shard IDs and fingerprints must be aligned string vectors.")
             context_ids.extend(
-                value.decode("utf-8") if isinstance(value, bytes) else str(value)
-                for value in raw_ids.tolist()
+                value.decode("utf-8") if isinstance(value, bytes) else str(value) for value in raw_ids.tolist()
             )
             fingerprints.extend(
-                value.decode("utf-8") if isinstance(value, bytes) else str(value)
-                for value in values.tolist()
+                value.decode("utf-8") if isinstance(value, bytes) else str(value) for value in values.tolist()
             )
     if any(not value.strip() or value != value.strip() for value in context_ids):
         raise ValueError("Context shard context_id values must be non-empty and trimmed.")
@@ -232,21 +210,15 @@ def _resolve_context_source_metadata(
     resolved = dict(metadata)
     kind = str(resolved.get("contexts_source_kind", "in_memory")).strip()
     if kind not in CONTEXT_SOURCE_KINDS:
-        raise ValueError(
-            "Demonstration metadata contexts_source_kind must be 'in_memory' or 'npz'."
-        )
+        raise ValueError("Demonstration metadata contexts_source_kind must be 'in_memory' or 'npz'.")
     source_sha256 = str(resolved.get("contexts_source_sha256", "")).strip()
     if kind == "in_memory":
         expected = in_memory_context_source_sha256(context_ids, context_fingerprints)
         if source_sha256 and source_sha256 != expected:
-            raise ValueError(
-                "Demonstration in-memory context source hash does not match its context shards."
-            )
+            raise ValueError("Demonstration in-memory context source hash does not match its context shards.")
         source_sha256 = expected
     if _SHA256_PATTERN.fullmatch(source_sha256) is None:
-        raise ValueError(
-            "Demonstration metadata contexts_source_sha256 must be a lowercase SHA-256 digest."
-        )
+        raise ValueError("Demonstration metadata contexts_source_sha256 must be a lowercase SHA-256 digest.")
     resolved["contexts_source_kind"] = kind
     resolved["contexts_source_sha256"] = source_sha256
     return resolved
@@ -320,8 +292,7 @@ def write_npz_shard(
         "size_bytes": int(target.stat().st_size),
         "sha256": file_sha256(target),
         "arrays": {
-            name: {"shape": list(array.shape), "dtype": str(array.dtype)}
-            for name, array in sorted(normalized.items())
+            name: {"shape": list(array.shape), "dtype": str(array.dtype)} for name, array in sorted(normalized.items())
         },
     }
 
@@ -339,17 +310,11 @@ def write_demonstration_manifest(
         raise ValueError("At least one context shard is required.")
     if not trajectory_shards:
         raise ValueError("At least one trajectory shard is required.")
-    portable_context_shards = [
-        _portable_shard_record(root, record, label="context shard")
-        for record in context_shards
-    ]
+    portable_context_shards = [_portable_shard_record(root, record, label="context shard") for record in context_shards]
     portable_trajectory_shards = [
-        _portable_shard_record(root, record, label="trajectory shard")
-        for record in trajectory_shards
+        _portable_shard_record(root, record, label="trajectory shard") for record in trajectory_shards
     ]
-    context_ids, context_fingerprints = _context_identities_from_records(
-        root, portable_context_shards
-    )
+    context_ids, context_fingerprints = _context_identities_from_records(root, portable_context_shards)
     resolved_metadata = _resolve_context_source_metadata(
         metadata,
         context_ids=context_ids,
@@ -390,11 +355,7 @@ def _portable_shard_record(
     unknown = sorted(set(record) - allowed_fields - {"resolved_path"})
     if unknown:
         raise ValueError(f"{label} contains unknown fields: {unknown}.")
-    portable = {
-        field: record.get(field)
-        for field in allowed_fields
-        if field in record or field in core_fields
-    }
+    portable = {field: record.get(field) for field in allowed_fields if field in record or field in core_fields}
     _validate_shard_record(root, portable, label=label)
     return portable
 
@@ -411,8 +372,7 @@ def _validate_shard_record(root: Path, record: Mapping[str, Any], *, label: str)
     )
     if expected_size != int(resolved.stat().st_size):
         raise ValueError(
-            f"{label} size mismatch for {path_value!r}: expected {expected_size}, "
-            f"found {int(resolved.stat().st_size)}."
+            f"{label} size mismatch for {path_value!r}: expected {expected_size}, found {int(resolved.stat().st_size)}."
         )
     expected_hash = str(record.get("sha256", ""))
     actual_hash = file_sha256(resolved)
@@ -438,9 +398,7 @@ def _validate_shard_record(root: Path, record: Mapping[str, Any], *, label: str)
         if not name or name != name.strip() or not isinstance(raw_schema, Mapping):
             raise ValueError(f"{label} contains an invalid array schema for {raw_name!r}.")
         if set(raw_schema) != {"shape", "dtype"}:
-            raise ValueError(
-                f"{label} array {name!r} requires exactly shape and dtype metadata."
-            )
+            raise ValueError(f"{label} array {name!r} requires exactly shape and dtype metadata.")
         raw_shape = raw_schema.get("shape")
         if not isinstance(raw_shape, Sequence) or isinstance(raw_shape, (str, bytes)):
             raise ValueError(f"{label} array {name!r} shape must be an integer sequence.")
@@ -462,11 +420,14 @@ def _validate_shard_record(root: Path, record: Mapping[str, Any], *, label: str)
 
 
 def _validate_demonstration_metadata(metadata: Mapping[str, Any]) -> None:
-    if validate_strict_integer(
-        metadata.get("artifact_version"),
-        label="Demonstration artifact_version",
-        minimum=1,
-    ) != DEMONSTRATION_ARTIFACT_VERSION:
+    if (
+        validate_strict_integer(
+            metadata.get("artifact_version"),
+            label="Demonstration artifact_version",
+            minimum=1,
+        )
+        != DEMONSTRATION_ARTIFACT_VERSION
+    ):
         raise ValueError(
             "Unsupported demonstration artifact version "
             f"{metadata.get('artifact_version')!r}; expected {DEMONSTRATION_ARTIFACT_VERSION}."
@@ -481,16 +442,10 @@ def _validate_demonstration_metadata(metadata: Mapping[str, Any]) -> None:
         if not str(metadata.get(name, "")).strip():
             raise ValueError(f"Demonstration metadata {name!r} may not be empty.")
     if "context_embedding_kind" in metadata:
+        raise ValueError("Demonstration metadata may not contain the retired context_embedding_kind field.")
+    if str(metadata.get("context_embedding_protocol", "")) != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL:
         raise ValueError(
-            "Demonstration metadata may not contain the retired context_embedding_kind field."
-        )
-    if (
-        str(metadata.get("context_embedding_protocol", ""))
-        != FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
-    ):
-        raise ValueError(
-            "Demonstration metadata context_embedding_protocol must be "
-            f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
+            f"Demonstration metadata context_embedding_protocol must be {FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}."
         )
     integer_metadata = {
         name: validate_strict_integer(
@@ -534,15 +489,9 @@ def _validate_demonstration_metadata(metadata: Mapping[str, Any]) -> None:
             raise ValueError(f"Demonstration metadata {name!r} must be a lowercase SHA-256 digest.")
     source_kind = str(metadata.get("contexts_source_kind", "")).strip()
     if source_kind not in CONTEXT_SOURCE_KINDS:
-        raise ValueError(
-            "Demonstration metadata contexts_source_kind must be 'in_memory' or 'npz'."
-        )
-    if _SHA256_PATTERN.fullmatch(
-        str(metadata.get("contexts_source_sha256", ""))
-    ) is None:
-        raise ValueError(
-            "Demonstration metadata contexts_source_sha256 must be a lowercase SHA-256 digest."
-        )
+        raise ValueError("Demonstration metadata contexts_source_kind must be 'in_memory' or 'npz'.")
+    if _SHA256_PATTERN.fullmatch(str(metadata.get("contexts_source_sha256", ""))) is None:
+        raise ValueError("Demonstration metadata contexts_source_sha256 must be a lowercase SHA-256 digest.")
     validate_locked_test_exclusion(
         metadata,
         label="Demonstration metadata",
@@ -554,9 +503,7 @@ def _validate_demonstration_metadata(metadata: Mapping[str, Any]) -> None:
             raise ValueError("Demonstration metadata context_binding must be an object.")
         validated_binding = validate_context_binding(binding)
         if validated_binding["context_count"] != integer_metadata["context_count"]:
-            raise ValueError(
-                "Demonstration context binding count does not match metadata context_count."
-            )
+            raise ValueError("Demonstration context binding count does not match metadata context_count.")
 
 
 def load_demonstration_manifest(path: str | Path) -> Dict[str, Any]:
@@ -569,8 +516,7 @@ def load_demonstration_manifest(path: str | Path) -> Dict[str, Any]:
         raise ValueError("Demonstration manifest must contain a JSON object.")
     if str(payload.get("protocol", "")) != DEMONSTRATION_PROTOCOL:
         raise ValueError(
-            f"Unsupported demonstration protocol {payload.get('protocol')!r}; "
-            f"expected {DEMONSTRATION_PROTOCOL!r}."
+            f"Unsupported demonstration protocol {payload.get('protocol')!r}; expected {DEMONSTRATION_PROTOCOL!r}."
         )
     root = resolve_manifest_path_base(manifest_path, payload.get("path_base"))
     metadata = dict(payload.get("metadata", {}))
@@ -593,10 +539,7 @@ def load_demonstration_manifest(path: str | Path) -> Dict[str, Any]:
     paths = [str(record.get("path", "")) for record in raw_records]
     if len(set(paths)) != len(paths):
         raise ValueError("Demonstration shard paths must be unique.")
-    contexts = [
-        _validate_shard_record(root, record, label="context shard")
-        for record in raw_contexts
-    ]
+    contexts = [_validate_shard_record(root, record, label="context shard") for record in raw_contexts]
     context_ids, context_fingerprints = _context_identities_from_records(root, contexts)
     metadata = _resolve_context_source_metadata(
         metadata,
@@ -609,10 +552,7 @@ def load_demonstration_manifest(path: str | Path) -> Dict[str, Any]:
         raise ValueError("Demonstration context binding does not match context shards.")
     metadata["context_binding"] = derived_binding
     _validate_demonstration_metadata(metadata)
-    trajectories = [
-        _validate_shard_record(root, record, label="trajectory shard")
-        for record in raw_trajectories
-    ]
+    trajectories = [_validate_shard_record(root, record, label="trajectory shard") for record in raw_trajectories]
     if not contexts or not trajectories:
         raise ValueError("Demonstration manifest requires context and trajectory shards.")
     return {

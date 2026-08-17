@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import io
-from pathlib import Path
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from genode.distillation import evaluation as evaluation_module
 from genode.distillation.evaluation import (
     read_candidate_catalog,
     read_quality_contexts,
     read_quality_protocol,
     read_quality_rows,
 )
-from genode.distillation import evaluation as evaluation_module
 
 
 def test_candidate_catalog_rejects_duplicate_json_keys(tmp_path: Path) -> None:
@@ -30,9 +30,7 @@ def test_candidate_catalog_rejects_duplicate_json_keys(tmp_path: Path) -> None:
 def test_pipeline_protocol_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     path = tmp_path / "protocol.json"
     path.write_text(
-        '{"protocol_hash":"' + "0" * 64 + '",'
-        '"scenario_key":"cryptos","scenario_key":"electricity",'
-        '"flow_map":{}}',
+        '{"protocol_hash":"' + "0" * 64 + '","scenario_key":"cryptos","scenario_key":"electricity","flow_map":{}}',
         encoding="utf-8",
     )
 

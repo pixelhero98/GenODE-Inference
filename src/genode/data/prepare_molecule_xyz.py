@@ -8,11 +8,11 @@ from genode.data.molecule_xyz import (
     DEFAULT_MOLECULE_SPLIT_SEED,
     MOLECULE_GROUP_DATASET_KEYS,
     build_balanced_molecule_stratum_groups,
-    discover_molecule_xyz_strata,
     default_molecule_processed_dir,
     default_molecule_raw_zip,
-    prepare_molecule_xyz_group_datasets,
+    discover_molecule_xyz_strata,
     prepare_molecule_xyz_all_strata,
+    prepare_molecule_xyz_group_datasets,
     prepare_molecule_xyz_zip,
     write_molecule_group_manifests,
 )
@@ -42,7 +42,9 @@ def main() -> None:
     if bool(args.balanced_groups):
         zip_paths = [part.strip() for part in str(args.zip_paths or "").split(",") if part.strip()]
         if not zip_paths:
-            zip_paths = [default_molecule_raw_zip(args.dataset_key, args.stratum) if args.zip_path is None else args.zip_path]
+            zip_paths = [
+                default_molecule_raw_zip(args.dataset_key, args.stratum) if args.zip_path is None else args.zip_path
+            ]
         dataset_keys = tuple(part.strip() for part in str(args.group_dataset_keys).split(",") if part.strip())
         if bool(args.discover_only):
             print(json.dumps(build_balanced_molecule_stratum_groups(zip_paths, dataset_keys=dataset_keys), indent=2))
@@ -63,7 +65,9 @@ def main() -> None:
         print(json.dumps(discover_molecule_xyz_strata(zip_path), indent=2))
         return
     if bool(args.all_strata):
-        processed_root = default_molecule_processed_dir(args.dataset_key, None) if args.processed_dir is None else args.processed_dir
+        processed_root = (
+            default_molecule_processed_dir(args.dataset_key, None) if args.processed_dir is None else args.processed_dir
+        )
         metadata = prepare_molecule_xyz_all_strata(
             zip_path,
             processed_root,
@@ -73,7 +77,11 @@ def main() -> None:
             split_seed=int(args.split_seed),
         )
     else:
-        processed_dir = default_molecule_processed_dir(args.dataset_key, args.stratum) if args.processed_dir is None else args.processed_dir
+        processed_dir = (
+            default_molecule_processed_dir(args.dataset_key, args.stratum)
+            if args.processed_dir is None
+            else args.processed_dir
+        )
         metadata = prepare_molecule_xyz_zip(
             zip_path,
             processed_dir,

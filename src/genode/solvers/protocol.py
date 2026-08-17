@@ -9,7 +9,6 @@ from torch import Tensor
 
 from genode.schedules.progress import validate_time_grid
 
-
 EULER_SOLVER_KEY = "euler"
 
 

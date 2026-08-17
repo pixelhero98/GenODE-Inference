@@ -8,7 +8,6 @@ from torch import Tensor
 from genode.artifacts.identity import semantic_sha256
 from genode.schedules.progress import PROGRESS_PROTOCOL, uniform_time_grid, validate_time_grid
 
-
 DENSITY_MASS_PROTOCOL = "progress_density_mass_v1"
 DEFAULT_DENSITY_BIN_COUNT = 64
 _SUM_TOLERANCE = 1e-6

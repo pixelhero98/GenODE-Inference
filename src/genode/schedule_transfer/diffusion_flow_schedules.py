@@ -19,7 +19,6 @@ from genode.schedule_transfer.reference_clocks import (
 )
 from genode.solver_protocol import solver_eval_multiplier
 
-
 BASELINE_SCHEDULE_KEYS: Tuple[str, ...] = REFERENCE_CLOCK_BASE_KEYS
 TRANSFER_SCHEDULE_KEYS: Tuple[str, ...] = (
     "ays_sd15_native",

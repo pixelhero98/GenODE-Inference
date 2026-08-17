@@ -45,7 +45,6 @@ from genode.schedules.specification import (
     schedule_parameters_json,
 )
 
-
 __all__ = [
     "DATA_ENDPOINT",
     "DEFAULT_DENSITY_BIN_COUNT",

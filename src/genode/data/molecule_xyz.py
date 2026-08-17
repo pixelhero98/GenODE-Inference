@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import copy
 import fnmatch
 import json
 import re
-import copy
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -16,7 +16,6 @@ import torch
 from genode.data.otflow_paths import project_root, resolve_project_path
 from genode.models.config import OTFlowConfig
 from genode.path_safety import portable_relative_path, resolve_portable_relative_path
-
 
 MOLECULE_BENCHMARK_FAMILY = "molecule_3d_coordinate_generation"
 MOLECULE_GROUP_ROOT_NAME = "molecule_3d"
@@ -173,7 +172,11 @@ def molecule_processed_npz_path(
     dataset_key: str | None = None,
     stratum: str | None = None,
 ) -> Path:
-    root = default_molecule_processed_dir(dataset_key, stratum) if processed_dir is None else resolve_project_path(processed_dir)
+    root = (
+        default_molecule_processed_dir(dataset_key, stratum)
+        if processed_dir is None
+        else resolve_project_path(processed_dir)
+    )
     return root / "molecule_3d_dataset.npz"
 
 
@@ -183,7 +186,11 @@ def molecule_processed_metadata_path(
     dataset_key: str | None = None,
     stratum: str | None = None,
 ) -> Path:
-    root = default_molecule_processed_dir(dataset_key, stratum) if processed_dir is None else resolve_project_path(processed_dir)
+    root = (
+        default_molecule_processed_dir(dataset_key, stratum)
+        if processed_dir is None
+        else resolve_project_path(processed_dir)
+    )
     return root / "molecule_3d_metadata.json"
 
 
@@ -427,12 +434,16 @@ def build_balanced_molecule_stratum_groups(
         }
         for key in keys
     ]
-    for row in sorted(strata, key=lambda item: (-int(item["trajectory_count"]), str(item["source_zip_name"]), str(item["stratum"]))):
+    for row in sorted(
+        strata, key=lambda item: (-int(item["trajectory_count"]), str(item["source_zip_name"]), str(item["stratum"]))
+    ):
         target_idx = min(range(len(groups)), key=lambda idx: (int(groups[idx]["trajectory_count"]), idx))
         member = dict(row)
         member["processed_dir"] = f"processed/{member['member_key']}"
         groups[target_idx]["strata"].append(member)
-        groups[target_idx]["trajectory_count"] = int(groups[target_idx]["trajectory_count"]) + int(row["trajectory_count"])
+        groups[target_idx]["trajectory_count"] = int(groups[target_idx]["trajectory_count"]) + int(
+            row["trajectory_count"]
+        )
     group_counts = [int(group["trajectory_count"]) for group in groups]
     total = int(sum(group_counts))
     balance = {
@@ -493,7 +504,9 @@ def load_molecule_group_manifest(dataset_key: str, group_root: str | Path | None
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     expected_key = _clean_path_token(dataset_key, label="dataset_key")
     if str(payload.get("dataset_key")) != expected_key:
-        raise ValueError(f"Molecule group manifest {manifest_path} is for {payload.get('dataset_key')}, not {expected_key}.")
+        raise ValueError(
+            f"Molecule group manifest {manifest_path} is for {payload.get('dataset_key')}, not {expected_key}."
+        )
     rows = payload.get("strata", [])
     if not isinstance(rows, list):
         raise ValueError("Molecule group manifest strata must be a list.")
@@ -610,7 +623,9 @@ def kabsch_rotation(moving: np.ndarray, reference: np.ndarray) -> np.ndarray:
     return (u @ correction @ vh).astype(np.float32)
 
 
-def align_window_to_reference(window: np.ndarray, reference_coords: np.ndarray, anchor_offset: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def align_window_to_reference(
+    window: np.ndarray, reference_coords: np.ndarray, anchor_offset: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     window_f = np.asarray(window, dtype=np.float32)
     anchor = window_f[int(anchor_offset)]
     center = anchor.mean(axis=0, keepdims=True)
@@ -623,7 +638,9 @@ def align_window_to_reference(window: np.ndarray, reference_coords: np.ndarray, 
 
 
 def invert_aligned_coords(local: np.ndarray, center: np.ndarray, rotation: np.ndarray) -> np.ndarray:
-    return (np.asarray(local, dtype=np.float32) @ np.asarray(rotation, dtype=np.float32).T) + np.asarray(center, dtype=np.float32)
+    return (np.asarray(local, dtype=np.float32) @ np.asarray(rotation, dtype=np.float32).T) + np.asarray(
+        center, dtype=np.float32
+    )
 
 
 def kabsch_aligned_rmsd(a: np.ndarray, b: np.ndarray) -> float:
@@ -634,14 +651,16 @@ def kabsch_aligned_rmsd(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.sum(diff * diff, axis=1))))
 
 
-def _frame_quality_masks(coords: np.ndarray, segment_ends: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _frame_quality_masks(
+    coords: np.ndarray, segment_ends: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     total = int(coords.shape[0])
     duplicates = np.zeros(total, dtype=bool)
     transitions = np.zeros(total, dtype=bool)
     discontinuities = np.zeros(total, dtype=bool)
     rmsd = np.zeros(total, dtype=np.float32)
     starts = np.concatenate(([0], np.asarray(segment_ends[:-1], dtype=np.int64)))
-    for start, end in zip(starts, segment_ends):
+    for start, end in zip(starts, segment_ends, strict=False):
         for frame_idx in range(int(start) + 1, int(end)):
             prev_frame = coords[frame_idx - 1]
             cur_frame = coords[frame_idx]
@@ -727,8 +746,7 @@ def _trajectory_split_stats(
     total = int(sum(int(frame_counts[int(value)]) for values in split_trajectory_ids.values() for value in values))
     out: Dict[str, Any] = {
         "split_trajectory_ids": {
-            split: [int(value) for value in values]
-            for split, values in split_trajectory_ids.items()
+            split: [int(value) for value in values] for split, values in split_trajectory_ids.items()
         },
     }
     for split, ids_raw in split_trajectory_ids.items():
@@ -741,9 +759,7 @@ def _trajectory_split_stats(
             "trajectory_ids": ids,
             "trajectory_keys": [str(trajectory_keys[int(value)]) for value in ids],
             "iso_ids": [
-                int(iso_by_trajectory[int(value)])
-                for value in ids
-                if iso_by_trajectory.get(int(value)) is not None
+                int(iso_by_trajectory[int(value)]) for value in ids if iso_by_trajectory.get(int(value)) is not None
             ],
             "length_strata": _length_strata_counts(ids, frame_counts),
         }
@@ -774,7 +790,11 @@ def prepare_molecule_xyz_zip(
     zip_path = Path(zip_path).expanduser().resolve()
     if not zip_path.exists():
         raise FileNotFoundError(f"Missing molecule trajectory zip: {zip_path}")
-    out_dir = default_molecule_processed_dir(key, stratum_name) if processed_dir is None else resolve_project_path(processed_dir)
+    out_dir = (
+        default_molecule_processed_dir(key, stratum_name)
+        if processed_dir is None
+        else resolve_project_path(processed_dir)
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_coords: List[np.ndarray] = []
@@ -820,7 +840,9 @@ def prepare_molecule_xyz_zip(
 
     coords_full = np.concatenate(all_coords, axis=0).astype(np.float32)
     segment_ends_arr = np.asarray(segment_ends, dtype=np.int64)
-    duplicate_mask, transition_mask, discontinuity_mask, frame_rmsd = _frame_quality_masks(coords_full, segment_ends_arr)
+    duplicate_mask, transition_mask, discontinuity_mask, frame_rmsd = _frame_quality_masks(
+        coords_full, segment_ends_arr
+    )
     atom_symbols = tuple(expected_symbols or ())
     split_trajectory_ids = _deterministic_trajectory_split(trajectory_frame_counts, seed=int(split_seed))
     split_stats = _trajectory_split_stats(
@@ -830,11 +852,7 @@ def prepare_molecule_xyz_zip(
         iso_by_trajectory=iso_by_trajectory,
     )
     split_iso_ids = {
-        split: [
-            int(iso_by_trajectory[int(value)])
-            for value in values
-            if iso_by_trajectory.get(int(value)) is not None
-        ]
+        split: [int(iso_by_trajectory[int(value)]) for value in values if iso_by_trajectory.get(int(value)) is not None]
         for split, values in split_trajectory_ids.items()
     }
     category = stratum_name or (categories[0] if len(categories) == 1 else "")
@@ -877,16 +895,12 @@ def prepare_molecule_xyz_zip(
         "trajectory_keys": trajectory_keys,
         "trajectory_ids": [int(value) for value in sorted(trajectory_frame_counts)],
         "trajectory_iso_ids": {
-            str(key): (None if value is None else int(value))
-            for key, value in sorted(iso_by_trajectory.items())
+            str(key): (None if value is None else int(value)) for key, value in sorted(iso_by_trajectory.items())
         },
         "trajectory_frame_counts": {str(key): int(value) for key, value in sorted(trajectory_frame_counts.items())},
         "split_seed": int(split_seed),
         "split_iso_ids": split_iso_ids,
-        "split_trajectory_ids": {
-            key: [int(value) for value in values]
-            for key, values in split_trajectory_ids.items()
-        },
+        "split_trajectory_ids": {key: [int(value) for value in values] for key, values in split_trajectory_ids.items()},
         "split_stats": split_stats,
         "quality": {
             "duplicate_steps": int(duplicate_mask.sum()),
@@ -915,7 +929,7 @@ def prepare_molecule_xyz_all_strata(
     root = default_molecule_processed_dir(key, None) if processed_root is None else resolve_project_path(processed_root)
     strata = discover_molecule_xyz_strata(zip_path)
     summaries: Dict[str, Any] = {}
-    for stratum_key, summary in strata.items():
+    for _stratum_key, summary in strata.items():
         stratum_name = str(summary.get("stratum") or "")
         if not stratum_name:
             continue
@@ -946,13 +960,14 @@ def _metadata_matches_request(
     dataset_key: str | None,
     stratum: str | None,
 ) -> bool:
-    if dataset_key not in (None, ""):
-        if str(metadata.get("dataset_key", "")) != _clean_path_token(dataset_key, label="dataset_key"):
-            return False
-    if stratum not in (None, ""):
-        if str(metadata.get("stratum", "")).lower() != _clean_optional_stratum(stratum).lower():
-            return False
-    return True
+    if dataset_key not in (None, "") and str(metadata.get("dataset_key", "")) != _clean_path_token(
+        dataset_key, label="dataset_key"
+    ):
+        return False
+    return not (
+        stratum not in (None, "")
+        and str(metadata.get("stratum", "")).lower() != _clean_optional_stratum(stratum).lower()
+    )
 
 
 def load_molecule_processed(
@@ -974,7 +989,11 @@ def load_molecule_processed(
     with np.load(npz_path, allow_pickle=False) as payload:
         coords = payload["coords"].astype(np.float32)
         trajectory_ids = payload["trajectory_ids"].astype(np.int64)
-        trajectory_keys = tuple(str(value) for value in payload["trajectory_keys"].tolist()) if "trajectory_keys" in payload.files else tuple()
+        trajectory_keys = (
+            tuple(str(value) for value in payload["trajectory_keys"].tolist())
+            if "trajectory_keys" in payload.files
+            else ()
+        )
         atom_symbols = tuple(str(value) for value in payload["atom_symbols"].tolist())
         iso_ids = payload["iso_ids"].astype(np.int64)
         segment_ends = payload["segment_ends"].astype(np.int64)
@@ -988,7 +1007,7 @@ def load_molecule_processed(
         raise ValueError("Processed molecule coordinates contain non-finite values.")
     frame_counts = {
         int(trajectory_id): int(np.sum(trajectory_ids == int(trajectory_id)))
-        for trajectory_id in sorted(set(int(value) for value in trajectory_ids.tolist()))
+        for trajectory_id in sorted({int(value) for value in trajectory_ids.tolist()})
     }
     return MoleculeProcessedData(
         coords=coords,
@@ -1047,7 +1066,7 @@ def _split_segment_indices(data: MoleculeProcessedData, split: str) -> List[Tupl
     selected_trajectory_ids = {int(value) for value in split_trajectory_ids[str(split)]}
     starts = _segment_starts(data.segment_ends)
     out: List[Tuple[int, int, int]] = []
-    for start, end in zip(starts, data.segment_ends):
+    for start, end in zip(starts, data.segment_ends, strict=False):
         trajectory_id = int(data.trajectory_ids[int(start)])
         if trajectory_id in selected_trajectory_ids:
             out.append((int(start), int(end), trajectory_id))
@@ -1354,7 +1373,9 @@ class MoleculeWindowDataset(torch.utils.data.Dataset):
         self.sampler_weights = None
         if self.sampler_replacement and len(self.start_indices) > 0:
             group_for_start = data.trajectory_ids[self.start_indices]
-            counts = {int(group_id): int(np.sum(group_for_start == group_id)) for group_id in np.unique(group_for_start)}
+            counts = {
+                int(group_id): int(np.sum(group_for_start == group_id)) for group_id in np.unique(group_for_start)
+            }
             self.sampler_weights = np.asarray(
                 [1.0 / float(max(1, counts[int(group_id)])) for group_id in group_for_start],
                 dtype=np.float64,
@@ -1406,10 +1427,7 @@ class MoleculeWindowDataset(torch.utils.data.Dataset):
     def context_features_from_history_coords(self, history_coords: np.ndarray) -> np.ndarray:
         history = np.asarray(history_coords, dtype=np.float32)
         if history.ndim != 3 or history.shape[1:] != (self.data.atom_count, 3):
-            raise ValueError(
-                "history_coords must have shape [history_len, atom_count, 3], "
-                f"got {history.shape}."
-            )
+            raise ValueError(f"history_coords must have shape [history_len, atom_count, 3], got {history.shape}.")
         if history.shape[0] < self.H:
             raise ValueError(f"Need at least {self.H} molecule history frames, got {history.shape[0]}.")
         return _context_features_from_local(history[-self.H :], self.atom_static)
@@ -1441,7 +1459,9 @@ class MoleculeWindowDataset(torch.utils.data.Dataset):
             "target_idx": target_idx,
             "iso_id": int(self.data.iso_ids[target_idx]),
             "trajectory_id": trajectory_id,
-            "trajectory_key": self.data.trajectory_keys[trajectory_id] if trajectory_id < len(self.data.trajectory_keys) else str(trajectory_id),
+            "trajectory_key": self.data.trajectory_keys[trajectory_id]
+            if trajectory_id < len(self.data.trajectory_keys)
+            else str(trajectory_id),
             "transition": bool(self.data.transition_step_mask[target_idx]),
             "transition_window": bool(transition_window),
             "discontinuity": bool(self.data.discontinuity_step_mask[target_idx]),
@@ -1470,7 +1490,9 @@ class MoleculeWindowDataset(torch.utils.data.Dataset):
             "segment_end": seg_end,
             "iso_id": int(self.data.iso_ids[target_idx]),
             "trajectory_id": trajectory_id,
-            "trajectory_key": self.data.trajectory_keys[trajectory_id] if trajectory_id < len(self.data.trajectory_keys) else str(trajectory_id),
+            "trajectory_key": self.data.trajectory_keys[trajectory_id]
+            if trajectory_id < len(self.data.trajectory_keys)
+            else str(trajectory_id),
             "transition": bool(self.data.transition_step_mask[target_idx]),
             "discontinuity": bool(self.data.discontinuity_step_mask[target_idx]),
             "transition_window": bool(
@@ -1590,16 +1612,57 @@ def build_molecule_dataset_splits(
         fitted_stats = molecule_stats_from_mapping(stats)
         stats_source = "checkpoint"
     datasets = {
-        "train": MoleculeWindowDataset(data, split="train", start_indices=train_starts, history_len=history_len, future_horizon=future_horizon, stats=fitted_stats),
-        "val": MoleculeWindowDataset(data, split="val", start_indices=val_starts, history_len=history_len, future_horizon=future_horizon, stats=fitted_stats),
-        "val_clean": MoleculeWindowDataset(data, split="val_clean", start_indices=val_clean_starts, history_len=history_len, future_horizon=future_horizon, stats=fitted_stats),
-        "test": MoleculeWindowDataset(data, split="test", start_indices=test_starts, history_len=history_len, future_horizon=future_horizon, stats=fitted_stats),
-        "test_clean": MoleculeWindowDataset(data, split="test_clean", start_indices=test_clean_starts, history_len=history_len, future_horizon=future_horizon, stats=fitted_stats),
+        "train": MoleculeWindowDataset(
+            data,
+            split="train",
+            start_indices=train_starts,
+            history_len=history_len,
+            future_horizon=future_horizon,
+            stats=fitted_stats,
+        ),
+        "val": MoleculeWindowDataset(
+            data,
+            split="val",
+            start_indices=val_starts,
+            history_len=history_len,
+            future_horizon=future_horizon,
+            stats=fitted_stats,
+        ),
+        "val_clean": MoleculeWindowDataset(
+            data,
+            split="val_clean",
+            start_indices=val_clean_starts,
+            history_len=history_len,
+            future_horizon=future_horizon,
+            stats=fitted_stats,
+        ),
+        "test": MoleculeWindowDataset(
+            data,
+            split="test",
+            start_indices=test_starts,
+            history_len=history_len,
+            future_horizon=future_horizon,
+            stats=fitted_stats,
+        ),
+        "test_clean": MoleculeWindowDataset(
+            data,
+            split="test_clean",
+            start_indices=test_clean_starts,
+            history_len=history_len,
+            future_horizon=future_horizon,
+            stats=fitted_stats,
+        ),
     }
     split_stats = dict(data.metadata.get("split_stats", {}))
-    train_filter_counts = _target_exclusion_counts(data, train_segments, history_len=history_len, future_horizon=future_horizon)
-    val_filter_counts = _target_exclusion_counts(data, val_segments, history_len=history_len, future_horizon=future_horizon)
-    test_filter_counts = _target_exclusion_counts(data, test_segments, history_len=history_len, future_horizon=future_horizon)
+    train_filter_counts = _target_exclusion_counts(
+        data, train_segments, history_len=history_len, future_horizon=future_horizon
+    )
+    val_filter_counts = _target_exclusion_counts(
+        data, val_segments, history_len=history_len, future_horizon=future_horizon
+    )
+    test_filter_counts = _target_exclusion_counts(
+        data, test_segments, history_len=history_len, future_horizon=future_horizon
+    )
     split_stats.update(
         {
             "history_len": int(history_len),
@@ -1643,9 +1706,7 @@ def configure_molecule_otflow(
     if levels <= 0:
         raise ValueError(f"atom_count must be positive, got {atom_count!r}.")
     context_dim = (
-        levels * MOLECULE_CONTEXT_ATOM_FEATURE_DIM
-        if context_feature_dim is None
-        else int(context_feature_dim)
+        levels * MOLECULE_CONTEXT_ATOM_FEATURE_DIM if context_feature_dim is None else int(context_feature_dim)
     )
     cfg.apply_overrides(
         levels=levels,
@@ -1721,7 +1782,9 @@ def build_molecule_group_dataset_splits(
             "splits": splits,
         }
         aggregate["stratum_count"] = int(aggregate["stratum_count"]) + 1
-        aggregate["trajectory_count"] = int(aggregate["trajectory_count"]) + int(member.get("trajectory_count", member.get("xyz_count", 0)))
+        aggregate["trajectory_count"] = int(aggregate["trajectory_count"]) + int(
+            member.get("trajectory_count", member.get("xyz_count", 0))
+        )
         aggregate["atom_counts"][member_key] = atom_count
         aggregate["formulas"][member_key] = str(member.get("formula", ""))
     return {

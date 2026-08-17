@@ -11,6 +11,7 @@ from genode.data.otflow_experiment_plan import (
     canonical_forecast_paper_dataset_keys,
     experiment_plan_by_key,
 )
+from genode.data.otflow_paths import display_project_path
 from genode.evaluation.fm_backbone_registry import (
     ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS,
     ACTIVE_FORECAST_BACKBONE_BUDGETS,
@@ -24,9 +25,7 @@ from genode.evaluation.fm_backbone_registry import (
     load_backbone_manifest,
     materialize_backbone_manifest,
 )
-from genode.data.otflow_paths import display_project_path
 from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
-
 
 FORECAST_KEYS = ("solar_energy_10m", "traffic_hourly", "weather_daily")
 CONDITIONAL_KEYS = ("cryptos", "lobster_synthetic", "long_term_st")
@@ -34,7 +33,11 @@ CONDITIONAL_KEYS = ("cryptos", "lobster_synthetic", "long_term_st")
 
 def _checkpoint_metadata(benchmark_family: str, dataset_key: str, train_steps: int) -> dict:
     spec = experiment_plan_by_key()[str(dataset_key)]
-    family_token = "temporal_extrapolation" if benchmark_family == FORECAST_FAMILY else "temporal_conditional_generation_transformer"
+    family_token = (
+        "temporal_extrapolation"
+        if benchmark_family == FORECAST_FAMILY
+        else "temporal_conditional_generation_transformer"
+    )
     metadata = {
         "checkpoint_id": f"{dataset_key}_otflow_{family_token}_{train_steps // 1000}k_seed0",
         "dataset_key": str(dataset_key),
@@ -96,7 +99,11 @@ class BackboneMatrixTests(unittest.TestCase):
         self.assertEqual(payload["missing_count"], 30)
         self.assertTrue(all(artifact["backbone_name"] == BACKBONE_NAME_OTFLOW for artifact in payload["artifacts"]))
         active = {(row["benchmark_family"], row["dataset_key"]) for row in payload["artifacts"]}
-        self.assertEqual(active, {(FORECAST_FAMILY, key) for key in FORECAST_KEYS} | {(CONDITIONAL_GENERATION_FAMILY, key) for key in CONDITIONAL_KEYS})
+        self.assertEqual(
+            active,
+            {(FORECAST_FAMILY, key) for key in FORECAST_KEYS}
+            | {(CONDITIONAL_GENERATION_FAMILY, key) for key in CONDITIONAL_KEYS},
+        )
 
     def test_manifest_loader_resolves_declared_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -121,8 +128,12 @@ class BackboneMatrixTests(unittest.TestCase):
             loaded = load_backbone_manifest(manifest_path)
 
         artifact = loaded["artifacts"][0]
-        self.assertEqual(Path(artifact["checkpoint_path"]), root / "outputs" / "backbone_matrix" / "example" / "model.pt")
-        self.assertEqual(Path(artifact["summary_path"]), root / "outputs" / "backbone_matrix" / "example" / "artifact_summary.json")
+        self.assertEqual(
+            Path(artifact["checkpoint_path"]), root / "outputs" / "backbone_matrix" / "example" / "model.pt"
+        )
+        self.assertEqual(
+            Path(artifact["summary_path"]), root / "outputs" / "backbone_matrix" / "example" / "artifact_summary.json"
+        )
 
     def test_manifest_loader_preserves_logical_symlinked_mount_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -468,7 +479,9 @@ class BackboneMatrixTests(unittest.TestCase):
         enriched = augment_rows_with_relative_metrics(rows)
         by_schedule = {(row["train_steps"], row["schedule_name"]): row for row in enriched}
         self.assertIsNone(by_schedule[(4000, "flowts_power_sampling")]["relative_score_gain_vs_uniform"])
-        self.assertAlmostEqual(by_schedule[(4000, "flowts_power_sampling")]["forecast_relative_crps_gain_vs_uniform"], 0.25)
+        self.assertAlmostEqual(
+            by_schedule[(4000, "flowts_power_sampling")]["forecast_relative_crps_gain_vs_uniform"], 0.25
+        )
 
     def test_conditional_generation_relative_metrics_preserve_seed_paired_gain(self) -> None:
         rows = [

@@ -7,7 +7,6 @@ from torch import Tensor
 
 from genode.artifacts.identity import semantic_sha256
 
-
 IMAGE_METRIC_POSTPROCESS_PROTOCOL = "image_edm_uint8_postprocess_v1"
 IMAGE_METRIC_POSTPROCESS_SHA256 = semantic_sha256(
     {

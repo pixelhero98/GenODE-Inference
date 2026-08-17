@@ -55,10 +55,16 @@ CONDITIONAL_PRIMARY_ECG_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
 CONDITIONAL_DIAGNOSTIC_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec("u_l1", "u_temporal_u_l1_uniform", METRIC_DIRECTION_LOWER, 0.0),
     MetricObjectiveSpec("c_l1", "u_temporal_c_l1_uniform", METRIC_DIRECTION_LOWER, 0.0),
-    MetricObjectiveSpec("spread_specific_error", "u_temporal_spread_specific_error_uniform", METRIC_DIRECTION_LOWER, 0.0),
-    MetricObjectiveSpec("imbalance_specific_error", "u_temporal_imbalance_specific_error_uniform", METRIC_DIRECTION_LOWER, 0.0),
+    MetricObjectiveSpec(
+        "spread_specific_error", "u_temporal_spread_specific_error_uniform", METRIC_DIRECTION_LOWER, 0.0
+    ),
+    MetricObjectiveSpec(
+        "imbalance_specific_error", "u_temporal_imbalance_specific_error_uniform", METRIC_DIRECTION_LOWER, 0.0
+    ),
     MetricObjectiveSpec("ret_vol_acf_error", "u_temporal_ret_vol_acf_error_uniform", METRIC_DIRECTION_LOWER, 0.0),
-    MetricObjectiveSpec("impact_response_error", "u_temporal_impact_response_error_uniform", METRIC_DIRECTION_LOWER, 0.0),
+    MetricObjectiveSpec(
+        "impact_response_error", "u_temporal_impact_response_error_uniform", METRIC_DIRECTION_LOWER, 0.0
+    ),
 )
 CONDITIONAL_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
     *CONDITIONAL_PRIMARY_LOB_METRIC_SPECS,
@@ -66,10 +72,27 @@ CONDITIONAL_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
 )
 MOLECULE_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec("molecule_kabsch_rmsd_3d", "u_molecule_kabsch_rmsd_3d_uniform", METRIC_DIRECTION_LOWER, 0.40),
-    MetricObjectiveSpec("molecule_ensemble_velocity_norm_w1", "u_molecule_ensemble_velocity_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15),
-    MetricObjectiveSpec("molecule_ensemble_acceleration_norm_w1", "u_molecule_ensemble_acceleration_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15),
-    MetricObjectiveSpec("molecule_rollout_velocity_norm_w1", "u_molecule_rollout_velocity_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15),
-    MetricObjectiveSpec("molecule_rollout_acceleration_norm_w1", "u_molecule_rollout_acceleration_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15),
+    MetricObjectiveSpec(
+        "molecule_ensemble_velocity_norm_w1",
+        "u_molecule_ensemble_velocity_norm_w1_uniform",
+        METRIC_DIRECTION_LOWER,
+        0.15,
+    ),
+    MetricObjectiveSpec(
+        "molecule_ensemble_acceleration_norm_w1",
+        "u_molecule_ensemble_acceleration_norm_w1_uniform",
+        METRIC_DIRECTION_LOWER,
+        0.15,
+    ),
+    MetricObjectiveSpec(
+        "molecule_rollout_velocity_norm_w1", "u_molecule_rollout_velocity_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15
+    ),
+    MetricObjectiveSpec(
+        "molecule_rollout_acceleration_norm_w1",
+        "u_molecule_rollout_acceleration_norm_w1_uniform",
+        METRIC_DIRECTION_LOWER,
+        0.15,
+    ),
 )
 OBJECTIVE_SPECS_BY_FAMILY: Dict[str, Tuple[MetricObjectiveSpec, ...]] = {
     SCENARIO_FAMILY_FORECAST: FORECAST_METRIC_SPECS,
@@ -133,11 +156,7 @@ def teacher_metric_profile_for_scenario(scenario_key: str) -> Dict[str, object]:
 
 
 def objective_weight_map_for_keys(target_keys: Sequence[str]) -> Dict[str, float]:
-    spec_by_utility = {
-        spec.utility_key: spec
-        for specs in OBJECTIVE_SPECS_BY_FAMILY.values()
-        for spec in specs
-    }
+    spec_by_utility = {spec.utility_key: spec for specs in OBJECTIVE_SPECS_BY_FAMILY.values() for spec in specs}
     return {str(key): float(spec_by_utility[str(key)].weight) for key in target_keys if str(key) in spec_by_utility}
 
 
@@ -239,11 +258,15 @@ def uniform_anchored_objective_columns(
         if candidate is None or reference is None:
             out[spec.utility_key] = None
             continue
-        utility = 0.0 if is_uniform else directional_uniform_utility(
-            candidate,
-            reference,
-            direction=spec.direction,
-            eps=float(eps),
+        utility = (
+            0.0
+            if is_uniform
+            else directional_uniform_utility(
+                candidate,
+                reference,
+                direction=spec.direction,
+                eps=float(eps),
+            )
         )
         utilities[spec.utility_key] = float(utility)
         weights[spec.utility_key] = float(spec.weight)
@@ -441,7 +464,11 @@ def reward_columns_for_row(
         uniform_mase_f = _finite_positive(uniform_mase)
         generic = uniform_anchored_objective_columns(
             row,
-            {"scheduler_key": str(reference.get("uniform_schedule_key", UNIFORM_SCHEDULE_KEY)), "crps": uniform_crps_f, "mase": uniform_mase_f},
+            {
+                "scheduler_key": str(reference.get("uniform_schedule_key", UNIFORM_SCHEDULE_KEY)),
+                "crps": uniform_crps_f,
+                "mase": uniform_mase_f,
+            },
             FORECAST_METRIC_SPECS,
             uniform_schedule_key=str(reference.get("uniform_schedule_key", UNIFORM_SCHEDULE_KEY)),
             eps=e,
@@ -477,8 +504,7 @@ def attach_reward_columns(
         setting = (str(row["solver_key"]), int(row["target_nfe"]))
         if setting not in references:
             raise ValueError(
-                "Reward columns require fixed baseline references "
-                f"for setting {setting}; none were available."
+                f"Reward columns require fixed baseline references for setting {setting}; none were available."
             )
         copied = dict(row)
         copied.update(reward_columns_for_row(copied, references[setting], eps=float(eps)))
@@ -520,6 +546,7 @@ def rewards_by_setting(
             for row in setting_rows
         }
     return rewards
+
 
 def best_schedule_by_setting(rows: Iterable[MetricRow]) -> Dict[SettingKey, str]:
     rewards = rewards_by_setting(rows)

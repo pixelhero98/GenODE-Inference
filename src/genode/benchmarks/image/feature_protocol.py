@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import hashlib
-from pathlib import Path
 import re
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Mapping
 
 import numpy as np
@@ -12,7 +12,6 @@ import torch
 from genode.artifacts.identity import canonical_json_bytes, semantic_sha256
 from genode.path_safety import is_link_or_reparse_point
 from genode.provenance import file_sha256
-
 
 TORCH_FIDELITY_DISTRIBUTION = "torch-fidelity"
 TORCH_FIDELITY_VERSION = "0.4.0"

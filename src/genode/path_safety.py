@@ -4,7 +4,6 @@ import os
 import stat
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-
 MANIFEST_PARENT_PATH_BASE = "manifest_parent"
 
 
@@ -108,9 +107,7 @@ def resolve_manifest_path_base(manifest_path: str | os.PathLike[str], value: obj
 
     token = str(value or "").strip()
     if token != MANIFEST_PARENT_PATH_BASE:
-        raise ValueError(
-            f"Manifest path_base must be {MANIFEST_PARENT_PATH_BASE!r}, got {token!r}."
-        )
+        raise ValueError(f"Manifest path_base must be {MANIFEST_PARENT_PATH_BASE!r}, got {token!r}.")
     return Path(manifest_path).expanduser().resolve().parent
 
 

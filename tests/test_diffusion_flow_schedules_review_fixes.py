@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -18,8 +18,8 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
     schedule_display_name,
     schedule_time_alignment,
 )
-from genode.schedule_transfer.otflow_schedule_diagnostics import _collect_rollout_diagnostics
 from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
+from genode.schedule_transfer.otflow_schedule_diagnostics import _collect_rollout_diagnostics
 
 
 class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
@@ -40,14 +40,16 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
                     self.assertEqual(len(grid), runtime_steps + 1)
                     self.assertAlmostEqual(grid[0], 0.0)
                     self.assertAlmostEqual(grid[-1], 1.0)
-                    self.assertTrue(all(b > a for a, b in zip(grid, grid[1:])))
+                    self.assertTrue(all(b > a for a, b in zip(grid, grid[1:], strict=False)))
 
     def test_schedule_grid_rejects_nonpositive_steps(self) -> None:
         for schedule_key in BASELINE_SCHEDULE_KEYS:
             for runtime_steps in (0, -1):
-                with self.subTest(schedule_key=schedule_key, runtime_steps=runtime_steps):
-                    with self.assertRaisesRegex(ValueError, "n_steps must be positive"):
-                        build_schedule_grid(schedule_key, runtime_steps)
+                with (
+                    self.subTest(schedule_key=schedule_key, runtime_steps=runtime_steps),
+                    self.assertRaisesRegex(ValueError, "n_steps must be positive"),
+                ):
+                    build_schedule_grid(schedule_key, runtime_steps)
 
     def test_flowts_power_sampling_grid_is_supported(self) -> None:
         grid = build_schedule_grid("flowts_power_0p03", 4)
@@ -57,7 +59,7 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
         self.assertEqual(len(grid), 5)
         self.assertAlmostEqual(grid[0], 0.0)
         self.assertAlmostEqual(grid[-1], 1.0)
-        self.assertTrue(all(b > a for a, b in zip(grid, grid[1:])))
+        self.assertTrue(all(b > a for a, b in zip(grid, grid[1:], strict=False)))
 
     def test_experimental_reversed_schedule_grids_are_reversed_counterparts(self) -> None:
         self.assertNotIn("uniform_reversed", EXPERIMENTAL_REVERSED_SCHEDULE_KEYS)
@@ -74,9 +76,11 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
                 self.assertEqual(len(reversed_grid), len(base_grid))
                 self.assertAlmostEqual(reversed_grid[0], 0.0)
                 self.assertAlmostEqual(reversed_grid[-1], 1.0)
-                self.assertTrue(all(right > left for left, right in zip(reversed_grid, reversed_grid[1:])))
+                self.assertTrue(
+                    all(right > left for left, right in zip(reversed_grid, reversed_grid[1:], strict=False))
+                )
                 expected = tuple(1.0 - value for value in reversed(base_grid))
-                for observed, target in zip(reversed_grid, expected):
+                for observed, target in zip(reversed_grid, expected, strict=False):
                     self.assertAlmostEqual(observed, target)
                 self.assertIn("reversed", schedule_display_name(schedule_key).lower())
                 self.assertIn("reversed", schedule_time_alignment(schedule_key))
@@ -155,14 +159,20 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
             "mean_field_evals_per_step": 2.0,
             "mean_total_field_evals_per_rollout": 4.0,
         }
-        with patch.object(schedule_module, "_apply_sample_overrides", return_value={}), patch.object(
-            schedule_module,
-            "_restore_sample_overrides",
-        ), patch.object(schedule_module, "eval_many_windows", return_value=result), patch.object(
-            schedule_module,
-            "_collect_rollout_diagnostics",
-            return_value=diagnostics,
-        ), patch.object(schedule_module, "_metric_bundle", return_value={}):
+        with (
+            patch.object(schedule_module, "_apply_sample_overrides", return_value={}),
+            patch.object(
+                schedule_module,
+                "_restore_sample_overrides",
+            ),
+            patch.object(schedule_module, "eval_many_windows", return_value=result),
+            patch.object(
+                schedule_module,
+                "_collect_rollout_diagnostics",
+                return_value=diagnostics,
+            ),
+            patch.object(schedule_module, "_metric_bundle", return_value={}),
+        ):
             row = schedule_module.run_fixed_schedule_variant(
                 model=object(),
                 ds=object(),
@@ -212,18 +222,25 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
             "disagreement": torch.tensor([[0.0, 0.25]]),
             "mean_total_field_evals_per_rollout": 4.0,
         }
-        with patch.object(diagnostics_module, "_get_dataset_item_by_t", return_value=object()), patch.object(
-            diagnostics_module,
-            "_parse_batch",
-            return_value=(hist, None, None, None, None),
-        ), patch.object(diagnostics_module, "resolve_context_length", return_value=2), patch.object(
-            diagnostics_module,
-            "crop_history_window",
-            side_effect=lambda value, _: value,
-        ), patch.object(diagnostics_module, "_future_time_context_seq", return_value=None), patch.object(
-            diagnostics_module,
-            "_sample_eval_trace",
-            return_value=(torch.zeros(1, 1, 3), trace, 1),
+        with (
+            patch.object(diagnostics_module, "_get_dataset_item_by_t", return_value=object()),
+            patch.object(
+                diagnostics_module,
+                "_parse_batch",
+                return_value=(hist, None, None, None, None),
+            ),
+            patch.object(diagnostics_module, "resolve_context_length", return_value=2),
+            patch.object(
+                diagnostics_module,
+                "crop_history_window",
+                side_effect=lambda value, _: value,
+            ),
+            patch.object(diagnostics_module, "_future_time_context_seq", return_value=None),
+            patch.object(
+                diagnostics_module,
+                "_sample_eval_trace",
+                return_value=(torch.zeros(1, 1, 3), trace, 1),
+            ),
         ):
             result = _collect_rollout_diagnostics(
                 object(),

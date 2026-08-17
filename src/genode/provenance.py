@@ -74,12 +74,9 @@ def path_fingerprint(
     if not manifests:
         expected = ", ".join(str(name) for name in manifest_names)
         raise ValueError(
-            f"Directory provenance requires an authoritative manifest ({expected}): "
-            f"{display_project_path(resolved)}"
+            f"Directory provenance requires an authoritative manifest ({expected}): {display_project_path(resolved)}"
         )
-    encoded = "\n".join(
-        f"{row['name']}\0{row['size_bytes']}\0{row['sha256']}" for row in manifests
-    ).encode("utf-8")
+    encoded = "\n".join(f"{row['name']}\0{row['size_bytes']}\0{row['sha256']}" for row in manifests).encode("utf-8")
     record.update(
         {
             "kind": "directory",

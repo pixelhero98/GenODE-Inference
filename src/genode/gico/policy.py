@@ -11,15 +11,16 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
-from genode.checkpoint_validation import validate_strict_integer, validate_tensor_state_dict
 from genode.canonical_experiment_layout import (
     AVERAGED_SCHEDULE_COMPONENTS,
     CANONICAL_CONTEXT_SAMPLE_COUNT,
     CANONICAL_SUPERVISION_SCHEDULE_KEYS,
 )
+from genode.checkpoint_validation import validate_strict_integer, validate_tensor_state_dict
+from genode.gico.checkpoint_scope import checkpoint_scope_from_row
 from genode.gico.density_representation import (
     DEFAULT_DENSITY_BIN_COUNT,
     DEFAULT_LOG_DENSITY_EPS,
@@ -33,7 +34,6 @@ from genode.gico.density_representation import (
     uniform_reference_grid,
     validate_reference_grid,
 )
-from genode.gico.checkpoint_scope import checkpoint_scope_from_row
 from genode.gico.models import (
     SETTING_ENCODER_MODE_CONTINUOUS_V3,
     SettingEncoderConfig,
@@ -48,18 +48,18 @@ from genode.gico.objectives import (
     DEFAULT_REWARD_EPS,
     FORECAST_METRIC_SPECS,
     MOLECULE_METRIC_SPECS,
-    MetricObjectiveSpec,
     UNIFORM_SCHEDULE_KEY,
+    MetricObjectiveSpec,
     objective_weight_map_for_keys,
     uniform_anchored_objective_columns,
 )
 from genode.gico.schedule_hash import json_hash as _canonical_json_hash
 from genode.gico.schedule_hash import schedule_grid_hash
-from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
-from genode.solver_protocol import normalize_solver_key, normalize_solver_nfe_fields
 from genode.gico.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
+from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
 from genode.schedule_transfer.diffusion_flow_schedules import build_schedule_grid
 from genode.schedule_transfer.reference_clocks import late_p_value_from_key
+from genode.solver_protocol import normalize_solver_key, normalize_solver_nfe_fields
 
 MetricRow = Mapping[str, Any]
 ContextPairKey = Tuple[str, str, int, str, int | None, str]
@@ -178,20 +178,14 @@ def require_current_gico_checkpoint_payload(
         )
     retired_payload_keys = sorted(set(payload) & _RETIRED_GICO_PAYLOAD_KEYS)
     if retired_payload_keys:
-        raise ValueError(
-            f"{label} uses retired metadata keys: {retired_payload_keys}."
-        )
+        raise ValueError(f"{label} uses retired metadata keys: {retired_payload_keys}.")
     for config_key in ("teacher_model_config", "student_model_config"):
         raw_config = payload.get(config_key)
         if not isinstance(raw_config, Mapping):
             continue
-        retired_config_keys = sorted(
-            set(raw_config) & _RETIRED_GICO_MODEL_CONFIG_KEYS
-        )
+        retired_config_keys = sorted(set(raw_config) & _RETIRED_GICO_MODEL_CONFIG_KEYS)
         if retired_config_keys:
-            raise ValueError(
-                f"{label} {config_key} uses retired keys: {retired_config_keys}."
-            )
+            raise ValueError(f"{label} {config_key} uses retired keys: {retired_config_keys}.")
     return dict(payload)
 
 
@@ -227,8 +221,7 @@ def validate_canonical_conditioning_style(
     if style == CONDITIONING_STYLE_ADDITIVE_MLP:
         return style
     raise ValueError(
-        f"GICO density transformers require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP!r}; "
-        f"got {style!r}."
+        f"GICO density transformers require conditioning_style={CONDITIONING_STYLE_ADDITIVE_MLP!r}; got {style!r}."
     )
 
 
@@ -239,9 +232,7 @@ def validate_gico_teacher_training_metadata(metadata: Mapping[str, Any] | None) 
         raise ValueError("GICO checkpoint must come from a metric-vector teacher.")
     teacher_metric_targets = validate_teacher_metric_target_keys(teacher_training.get("teacher_metric_targets", ()))
     if str(teacher_training.get("teacher_scalarization", "")) != TEACHER_SCALARIZATION_WEIGHTED_AVERAGE:
-        raise ValueError(
-            f"GICO checkpoint teacher_scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE!r}."
-        )
+        raise ValueError(f"GICO checkpoint teacher_scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE!r}.")
     selection = dict(teacher_training.get("teacher_checkpoint_selection", {}) or {})
     if str(selection.get("selection_protocol", "")) != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET:
         raise ValueError(
@@ -264,10 +255,14 @@ def validate_gico_teacher_training_metadata(metadata: Mapping[str, Any] | None) 
     }
 
 
-def validate_gico_density_token_attention(model_config: Mapping[str, Any] | None, *, require_present: bool = False) -> str:
+def validate_gico_density_token_attention(
+    model_config: Mapping[str, Any] | None, *, require_present: bool = False
+) -> str:
     if not model_config or "density_token_attention" not in model_config:
         if require_present:
-            raise ValueError(f"GICO density transformer checkpoints require density_token_attention={DENSITY_TOKEN_ATTENTION_ROPE!r}.")
+            raise ValueError(
+                f"GICO density transformer checkpoints require density_token_attention={DENSITY_TOKEN_ATTENTION_ROPE!r}."
+            )
         return DENSITY_TOKEN_ATTENTION_ROPE
     attention = str(model_config["density_token_attention"]).strip()
     if attention != DENSITY_TOKEN_ATTENTION_ROPE:
@@ -337,10 +332,7 @@ def _metric_weight_alias(target_key: str) -> str:
 def validate_teacher_metric_target_keys(keys: Sequence[str] | str | None) -> Tuple[str, ...]:
     if keys is None:
         return TEACHER_METRIC_TARGET_KEYS
-    if isinstance(keys, str):
-        raw = [part.strip() for part in keys.split(",")]
-    else:
-        raw = [str(part).strip() for part in keys]
+    raw = [part.strip() for part in keys.split(",")] if isinstance(keys, str) else [str(part).strip() for part in keys]
     out = tuple(part for part in raw if part)
     if not out:
         raise ValueError("teacher_metric_target_keys must contain at least one utility column.")
@@ -376,10 +368,12 @@ def normalize_teacher_utility_weights(
     total = float(sum(values))
     if total <= 0.0:
         raise ValueError("At least one teacher utility metric weight must be positive.")
-    return {key: float(value / total) for key, value in zip(keys, values)}
+    return {key: float(value / total) for key, value in zip(keys, values, strict=False)}
 
 
-def teacher_utility_weights_for_summary(target_keys: Sequence[str], weights: Mapping[str, float] | None) -> Dict[str, float]:
+def teacher_utility_weights_for_summary(
+    target_keys: Sequence[str], weights: Mapping[str, float] | None
+) -> Dict[str, float]:
     normalized = normalize_teacher_utility_weights(target_keys, weights)
     if tuple(target_keys) == DEFAULT_TEACHER_METRIC_TARGET_KEYS:
         return {_metric_weight_alias(key): float(value) for key, value in normalized.items()}
@@ -565,7 +559,7 @@ def _group_indices_by_pair_key(pair_keys: Sequence[ContextPairKey]) -> List[List
     grouped: Dict[ContextPairKey, List[int]] = defaultdict(list)
     for idx, key in enumerate(pair_keys):
         grouped[key].append(int(idx))
-    return [indices for indices in grouped.values()]
+    return list(grouped.values())
 
 
 def _rank_pair_count_for_groups(
@@ -942,10 +936,14 @@ def series_key_from_row(row: MetricRow) -> str:
         return f"axis_series:{axis_series}"
     axis_member = str(row.get("axis_member", row.get("member_key", "")) or "").strip()
     axis_stratum = str(row.get("axis_stratum", row.get("stratum", "")) or "").strip()
-    axis_trajectory = str(row.get("axis_trajectory", row.get("trajectory_key", row.get("trajectory_id", ""))) or "").strip()
+    axis_trajectory = str(
+        row.get("axis_trajectory", row.get("trajectory_key", row.get("trajectory_id", ""))) or ""
+    ).strip()
     if axis_member or axis_stratum or axis_trajectory:
         return "axis:" + "|".join(part for part in (axis_member, axis_stratum, axis_trajectory) if part)
-    raise ValueError("Rows require series_id, series_idx, or generalized axis series fields for series-disjoint diagnostics.")
+    raise ValueError(
+        "Rows require series_id, series_idx, or generalized axis series fields for series-disjoint diagnostics."
+    )
 
 
 def context_pair_key(row: MetricRow, *, pair_on_seed: bool = True) -> ContextPairKey:
@@ -974,6 +972,7 @@ def teacher_selection_candidate_group_key(row: MetricRow) -> TeacherSelectionCan
         evaluation_seed_from_row(row),
         checkpoint_scope_from_row(row),
     )
+
 
 def complete_candidate_group_payload(key: TeacherSelectionCandidateGroupKey) -> Dict[str, Any]:
     return {
@@ -1016,7 +1015,7 @@ def student_nfe_sequence_pairs(rows: Sequence[MetricRow]) -> List[Tuple[int, int
     pairs: List[Tuple[int, int, float]] = []
     for items in sequence_items.values():
         ordered = sorted(items, key=lambda item: (int(item[0]), int(item[1])))
-        for left, right in zip(ordered, ordered[1:]):
+        for left, right in zip(ordered, ordered[1:], strict=False):
             delta = max(1.0, float(int(right[0]) - int(left[0])))
             pairs.append((int(left[1]), int(right[1]), delta))
     return pairs
@@ -1057,7 +1056,9 @@ def nfe_sequence_diagnostic_summary(rows: Sequence[MetricRow]) -> Dict[str, Any]
     return {
         "row_count": int(len(rows)),
         "observed_target_nfes": sorted({int(row["target_nfe"]) for row in rows}),
-        "split_phases": sorted({str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) for row in rows}),
+        "split_phases": sorted(
+            {str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) for row in rows}
+        ),
         "nfe_sequence_pair_count": int(len(student_nfe_sequence_pairs(rows))),
         "sequence_group_count": int(len(sequence_groups)),
         "sequence_multi_nfe_group_count": int(sum(1 for nfes in sequence_groups.values() if len(nfes) > 1)),
@@ -1072,7 +1073,6 @@ def nfe_sequence_diagnostic_summary(rows: Sequence[MetricRow]) -> Dict[str, Any]
             for nfes, count in sorted(physical_nfe_sets.items(), key=lambda item: (-item[1], item[0]))[:8]
         ],
     }
-
 
 
 def validate_gico_support_schedule_keys(
@@ -1151,8 +1151,7 @@ def split_rows_by_density_family_holdout(
         unrewarded_count = sum(
             1
             for row in rows
-            if str(row.get("gico_reward_protocol", "")).strip() != GICO_PROTOCOL
-            or "u_comp_uniform" not in row
+            if str(row.get("gico_reward_protocol", "")).strip() != GICO_PROTOCOL or "u_comp_uniform" not in row
         )
         if unrewarded_count:
             raise ValueError(
@@ -1217,10 +1216,12 @@ def attach_uniform_gico_rewards(
 
     out: List[Dict[str, Any]] = []
     for key, group in sorted(grouped.items(), key=lambda item: item[0]):
-        counts = {schedule: 0 for schedule in support}
+        counts = dict.fromkeys(support, 0)
         for row in group:
             counts[str(row["scheduler_key"])] = counts.get(str(row["scheduler_key"]), 0) + 1
-        bad_counts = {schedule: int(counts.get(schedule, 0)) for schedule in sorted(support) if int(counts.get(schedule, 0)) != 1}
+        bad_counts = {
+            schedule: int(counts.get(schedule, 0)) for schedule in sorted(support) if int(counts.get(schedule, 0)) != 1
+        }
         if bad_counts:
             raise ValueError(
                 "Uniform-anchored context rewards require exactly one row for every support schedule "
@@ -1228,7 +1229,9 @@ def attach_uniform_gico_rewards(
             )
         uniform_rows = [row for row in group if str(row["scheduler_key"]) == uniform_key]
         if len(uniform_rows) != 1:
-            raise ValueError(f"Uniform-anchored context rewards require exactly one uniform row in paired context {key}.")
+            raise ValueError(
+                f"Uniform-anchored context rewards require exactly one uniform row in paired context {key}."
+            )
         for row in group:
             reward_columns = uniform_anchored_objective_columns(
                 row,
@@ -1306,7 +1309,11 @@ def recommended_context_calibration_count(
     if available <= 0:
         raise ValueError("available_contexts must be positive.")
     cap = int(max_total)
-    requested = int(default_total) if normalized_combined_reference is None else int(round(0.20 * float(normalized_combined_reference)))
+    requested = (
+        int(default_total)
+        if normalized_combined_reference is None
+        else int(round(0.20 * float(normalized_combined_reference)))
+    )
     target = min(cap, max(int(min_total), requested))
     return int(min(available, target))
 
@@ -1378,7 +1385,7 @@ def sample_context_ids_stratified(
         if counts[idx] < len(stratum_items[idx][1]):
             counts[idx] += 1
             remaining -= 1
-    for (_, ids), keep in zip(stratum_items, counts):
+    for (_, ids), keep in zip(stratum_items, counts, strict=False):
         if keep <= 0:
             continue
         local = list(ids)
@@ -1433,7 +1440,9 @@ class DensityFeatureNormalizer:
     std: np.ndarray
 
     @classmethod
-    def fit(cls, density_masses: Iterable[Sequence[float]], *, reference_time_grid: Sequence[float]) -> "DensityFeatureNormalizer":
+    def fit(
+        cls, density_masses: Iterable[Sequence[float]], *, reference_time_grid: Sequence[float]
+    ) -> "DensityFeatureNormalizer":
         features = [density_log_features(mass, reference_time_grid=reference_time_grid) for mass in density_masses]
         if not features:
             raise ValueError("Density feature normalization requires at least one density mass.")
@@ -1446,7 +1455,9 @@ class DensityFeatureNormalizer:
     def transform_one(self, density_mass: Sequence[float], *, reference_time_grid: Sequence[float]) -> np.ndarray:
         features = density_log_features(density_mass, reference_time_grid=reference_time_grid)
         if features.shape != self.mean.shape:
-            raise ValueError(f"Density feature shape {features.shape} does not match normalizer shape {self.mean.shape}.")
+            raise ValueError(
+                f"Density feature shape {features.shape} does not match normalizer shape {self.mean.shape}."
+            )
         return ((features - self.mean) / self.std).astype(np.float32)
 
     def to_payload(self) -> Dict[str, Any]:
@@ -1468,7 +1479,9 @@ def _density_mass_to_normalized_log_features_torch(
     reference = np.asarray(validate_reference_grid(reference_time_grid), dtype=np.float32)
     if int(reference.size) != int(density_mass.shape[-1]) + 1:
         raise ValueError("reference_time_grid must have density_mass.shape[-1] + 1 edges.")
-    if density_normalizer.mean.shape != (int(density_mass.shape[-1]),) or density_normalizer.std.shape != (int(density_mass.shape[-1]),):
+    if density_normalizer.mean.shape != (int(density_mass.shape[-1]),) or density_normalizer.std.shape != (
+        int(density_mass.shape[-1]),
+    ):
         raise ValueError("density_normalizer shape must match density_mass bins.")
     widths = torch.tensor(
         np.diff(reference).astype(np.float32),
@@ -1494,9 +1507,7 @@ def _sanitize_public_manifest_value(value: Any) -> Any:
         return [_sanitize_public_manifest_value(item) for item in value]
     if isinstance(value, str):
         text = str(value)
-        looks_absolute = Path(text).is_absolute() or text.startswith("/") or (
-            len(text) >= 3 and text[1:3] == ":\\"
-        )
+        looks_absolute = Path(text).is_absolute() or text.startswith("/") or (len(text) >= 3 and text[1:3] == ":\\")
         if looks_absolute:
             return Path(text).name
     return value
@@ -1612,7 +1623,9 @@ def density_mass_for_row(
         schedule_grids=schedule_grids,
         checkpoint_step=checkpoint_step,
     )
-    return grid_to_density_mass(grid, reference_time_grid=reference_time_grid, macro_steps=solver_macro_steps(solver, target_nfe))
+    return grid_to_density_mass(
+        grid, reference_time_grid=reference_time_grid, macro_steps=solver_macro_steps(solver, target_nfe)
+    )
 
 
 def _density_bin_geometry(density_dim: int, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -1819,8 +1832,16 @@ class GICODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
             {"conditioning_style": conditioning_style},
         )
         self.teacher_metric_targets = validate_teacher_metric_target_keys(teacher_metric_targets)
-        mean = np.zeros(int(density_dim), dtype=np.float32) if density_feature_mean is None else np.asarray(density_feature_mean, dtype=np.float32)
-        std = np.ones(int(density_dim), dtype=np.float32) if density_feature_std is None else np.asarray(density_feature_std, dtype=np.float32)
+        mean = (
+            np.zeros(int(density_dim), dtype=np.float32)
+            if density_feature_mean is None
+            else np.asarray(density_feature_mean, dtype=np.float32)
+        )
+        std = (
+            np.ones(int(density_dim), dtype=np.float32)
+            if density_feature_std is None
+            else np.asarray(density_feature_std, dtype=np.float32)
+        )
         if mean.shape != (int(density_dim),) or std.shape != (int(density_dim),):
             raise ValueError("density_feature_mean/std must match density_dim.")
         std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
@@ -1832,7 +1853,9 @@ class GICODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
             nn.SiLU(),
             nn.Linear(int(hidden_dim), int(hidden_dim)),
         )
-        self.density_token_proj = nn.Sequential(nn.Linear(4, int(hidden_dim)), nn.SiLU(), nn.Linear(int(hidden_dim), int(hidden_dim)))
+        self.density_token_proj = nn.Sequential(
+            nn.Linear(4, int(hidden_dim)), nn.SiLU(), nn.Linear(int(hidden_dim), int(hidden_dim))
+        )
         self.bin_geometry_proj = nn.Linear(2, int(hidden_dim))
         self.blocks = nn.ModuleList(
             [
@@ -1845,7 +1868,9 @@ class GICODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
             ]
         )
         self.final_norm = nn.LayerNorm(int(hidden_dim))
-        self.head = nn.Sequential(nn.LayerNorm(int(hidden_dim)), nn.Linear(int(hidden_dim), len(self.teacher_metric_targets)))
+        self.head = nn.Sequential(
+            nn.LayerNorm(int(hidden_dim)), nn.Linear(int(hidden_dim), len(self.teacher_metric_targets))
+        )
 
     def forward(
         self,
@@ -1862,7 +1887,9 @@ class GICODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
             setting_feature_batch,
             context_embedding_batch,
         )
-        normalized_log_density = density_feature_batch.to(device=setting_feature_batch.device, dtype=setting_feature_batch.dtype)
+        normalized_log_density = density_feature_batch.to(
+            device=setting_feature_batch.device, dtype=setting_feature_batch.dtype
+        )
         log_density = normalized_log_density * self.density_feature_std.to(
             device=normalized_log_density.device,
             dtype=normalized_log_density.dtype,
@@ -1873,7 +1900,9 @@ class GICODensityFormTeacherTransformer(_DensityConditioningMixin, nn.Module):
             device=setting_feature_batch.device,
         )
         token_geometry = geometry.unsqueeze(0).expand(batch, -1, -1)
-        token_features = torch.cat([log_density.unsqueeze(-1), normalized_log_density.unsqueeze(-1), token_geometry], dim=-1)
+        token_features = torch.cat(
+            [log_density.unsqueeze(-1), normalized_log_density.unsqueeze(-1), token_geometry], dim=-1
+        )
         tokens = self.density_token_proj(token_features) + self.bin_geometry_proj(token_geometry)
         encoded = self._encode_density_tokens(tokens, z)
         pooled = encoded.mean(dim=1)
@@ -1914,7 +1943,9 @@ class GICODensityQueryStudentTransformer(_DensityConditioningMixin, nn.Module):
             nn.SiLU(),
             nn.Linear(int(hidden_dim), int(hidden_dim)),
         )
-        self.query_proj = nn.Sequential(nn.Linear(2, int(hidden_dim)), nn.SiLU(), nn.Linear(int(hidden_dim), int(hidden_dim)))
+        self.query_proj = nn.Sequential(
+            nn.Linear(2, int(hidden_dim)), nn.SiLU(), nn.Linear(int(hidden_dim), int(hidden_dim))
+        )
         self.blocks = nn.ModuleList(
             [
                 _DensityTokenTransformerBlock(
@@ -2002,7 +2033,9 @@ def build_gico_teacher_model(
         conditioning_style=conditioning_style,
         density_feature_mean=cfg.get("density_feature_mean"),
         density_feature_std=cfg.get("density_feature_std"),
-        teacher_metric_targets=validate_teacher_metric_target_keys(cfg.get("teacher_metric_targets", TEACHER_METRIC_TARGET_KEYS)),
+        teacher_metric_targets=validate_teacher_metric_target_keys(
+            cfg.get("teacher_metric_targets", TEACHER_METRIC_TARGET_KEYS)
+        ),
     )
 
 
@@ -2147,7 +2180,11 @@ def _teacher_metric_weights(
             raise ValueError("Teacher scalarization rows must match the score batch length.")
         values: List[List[float]] = []
         default_weights = objective_weight_map_for_keys(keys)
-        explicit_weights = normalize_teacher_utility_weights(keys, teacher_utility_weights) if teacher_utility_weights is not None else {}
+        explicit_weights = (
+            normalize_teacher_utility_weights(keys, teacher_utility_weights)
+            if teacher_utility_weights is not None
+            else {}
+        )
         for row in rows:
             reward_weights = _row_reward_metric_weights(row, keys)
             if reward_weights:
@@ -2218,9 +2255,7 @@ def _scalarize_teacher_metric_values(
 ) -> torch.Tensor:
     expected = len(validate_teacher_metric_target_keys(target_keys))
     if values.ndim != 2 or values.shape[-1] != expected:
-        raise ValueError(
-            f"Teacher metric scores must have shape [batch, {expected}], got {tuple(values.shape)}."
-        )
+        raise ValueError(f"Teacher metric scores must have shape [batch, {expected}], got {tuple(values.shape)}.")
     if weights.shape != values.shape:
         raise ValueError("Teacher metric scalarization weights must match metric score shape.")
     normalized = _masked_normalize_teacher_weights(weights.to(device=values.device, dtype=values.dtype), target_mask)
@@ -2237,14 +2272,16 @@ def _masked_smooth_l1_loss(pred: torch.Tensor, target: torch.Tensor, target_mask
     return torch.sum(loss) / denom
 
 
-def _masked_metric_huber_values(pred: torch.Tensor, target: torch.Tensor, target_mask: torch.Tensor) -> List[float | None]:
+def _masked_metric_huber_values(
+    pred: torch.Tensor, target: torch.Tensor, target_mask: torch.Tensor
+) -> List[float | None]:
     if pred.shape != target.shape or target_mask.shape != target.shape:
         raise ValueError("Masked teacher regression tensors must have matching shapes.")
     loss = F.smooth_l1_loss(pred, target, reduction="none") * target_mask.to(device=pred.device, dtype=pred.dtype)
     counts = torch.sum(target_mask.to(device=pred.device, dtype=pred.dtype), dim=0)
     totals = torch.sum(loss, dim=0)
     out: List[float | None] = []
-    for total, count in zip(totals.detach().cpu().tolist(), counts.detach().cpu().tolist()):
+    for total, count in zip(totals.detach().cpu().tolist(), counts.detach().cpu().tolist(), strict=False):
         out.append(None if float(count) <= 0.0 else float(total) / float(count))
     return out
 
@@ -2415,7 +2452,9 @@ def _student_teacher_score_objective(
         rows=rows,
         teacher_utility_weights=teacher_utility_weights,
     )
-    z_score = (score - score_mean.to(device=score.device, dtype=score.dtype)) / score_std.to(device=score.device, dtype=score.dtype)
+    z_score = (score - score_mean.to(device=score.device, dtype=score.dtype)) / score_std.to(
+        device=score.device, dtype=score.dtype
+    )
     z_score = torch.clamp(z_score, min=-float(clip), max=float(clip))
     return z_score.mean(), score.mean()
 
@@ -2504,7 +2543,16 @@ def _teacher_training_tensors(
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     teacher_metric_target_keys: Sequence[str] = TEACHER_METRIC_TARGET_KEYS,
     seed: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[ContextPairKey], List[str], List[Tuple[float, ...]]]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    List[ContextPairKey],
+    List[str],
+    List[Tuple[float, ...]],
+]:
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     setting_rows: List[torch.Tensor] = []
@@ -2526,7 +2574,9 @@ def _teacher_training_tensors(
         pair_keys.append(context_pair_key(row, pair_on_seed=True))
         schedule_keys.append(str(row["scheduler_key"]))
         density_masses.append(mass)
-    metric_targets, metric_target_mask = _teacher_metric_targets(rows, target_keys=teacher_metric_target_keys, device=device)
+    metric_targets, metric_target_mask = _teacher_metric_targets(
+        rows, target_keys=teacher_metric_target_keys, device=device
+    )
     return (
         torch.stack(setting_rows, dim=0).to(device=device),
         torch.tensor(np.stack(density_rows, axis=0), dtype=torch.float32, device=device),
@@ -2655,7 +2705,9 @@ def gico_teacher_diagnostics(
         )
         if not pair_on_seed:
             pair_keys = [_context_pair_key_without_seed(key) for key in pair_keys]
-        rank_left, rank_right, rank_sign = _pair_indices(targets, pair_keys, margin=float(pair_margin), device=sx.device)
+        rank_left, rank_right, rank_sign = _pair_indices(
+            targets, pair_keys, margin=float(pair_margin), device=sx.device
+        )
         metric_pred = _teacher_metric_scores_batched(
             teacher,
             sx,
@@ -2708,9 +2760,7 @@ def gico_teacher_diagnostics(
     complete_group_examples: List[Dict[str, Any]] = []
     for group_key, schedule_to_indices in candidate_groups.items():
         missing_schedules = [
-            schedule
-            for schedule in expected_candidate_schedules
-            if len(schedule_to_indices.get(schedule, [])) != 1
+            schedule for schedule in expected_candidate_schedules if len(schedule_to_indices.get(schedule, [])) != 1
         ]
         if missing_schedules:
             incomplete_candidate_groups += 1
@@ -2769,10 +2819,10 @@ def gico_teacher_diagnostics(
     for items in by_candidate_sequence.values():
         ordered = sorted(items, key=lambda item: (int(item[0]), int(item[1])))
         values = [float(pred_values[idx]) for _, idx in ordered]
-        for left_value, right_value in zip(values, values[1:]):
+        for left_value, right_value in zip(values, values[1:], strict=False):
             sequence_delta_values.append(abs(float(right_value) - float(left_value)))
         if len(values) >= 3:
-            for a, b, c in zip(values, values[1:], values[2:]):
+            for a, b, c in zip(values, values[1:], values[2:], strict=False):
                 sequence_second_diff_values.append(abs(float(c) - 2.0 * float(b) + float(a)))
     delta_stats = _summary_percentiles(sequence_delta_values)
     second_stats = _summary_percentiles(sequence_second_diff_values)
@@ -2784,13 +2834,17 @@ def gico_teacher_diagnostics(
             "huber_loss": float(huber.detach().cpu().item()),
             **{
                 f"metric_huber_loss_{_metric_weight_alias(key)}": (None if value is None else float(value))
-                for key, value in zip(teacher_metric_target_keys, metric_huber_values)
+                for key, value in zip(teacher_metric_target_keys, metric_huber_values, strict=False)
             },
             "total_loss": float(total.detach().cpu().item()),
             "pairwise_accuracy": pairwise_accuracy,
             "pair_count": int(rank_left.numel()),
-            "spearman_rank_correlation": float(np.mean(np.asarray(spearman_values, dtype=np.float64))) if spearman_values else None,
-            "best_candidate_agreement": None if best_candidate_total == 0 else float(best_candidate_hits / best_candidate_total),
+            "spearman_rank_correlation": float(np.mean(np.asarray(spearman_values, dtype=np.float64)))
+            if spearman_values
+            else None,
+            "best_candidate_agreement": None
+            if best_candidate_total == 0
+            else float(best_candidate_hits / best_candidate_total),
             "candidate_group_count": int(best_candidate_total),
             "complete_candidate_group_count": int(len(soft_regret_values)),
             "complete_candidate_group_raw_count": int(len(candidate_groups)),
@@ -2885,13 +2939,41 @@ def _selected_gico_teacher_checkpoint(
             for name in active_names
             if diagnostics[name].get("total_loss") is not None
         ]
-        rank_values = [float(diagnostics[name]["rank_loss"]) for name in active_names if diagnostics[name].get("rank_loss") is not None]
-        huber_values = [float(diagnostics[name]["huber_loss"]) for name in active_names if diagnostics[name].get("huber_loss") is not None]
-        pairwise_values = [float(diagnostics[name]["pairwise_accuracy"]) for name in active_names if diagnostics[name].get("pairwise_accuracy") is not None]
-        spearman_values = [float(diagnostics[name]["spearman_rank_correlation"]) for name in active_names if diagnostics[name].get("spearman_rank_correlation") is not None]
-        agreement_values = [float(diagnostics[name]["best_candidate_agreement"]) for name in active_names if diagnostics[name].get("best_candidate_agreement") is not None]
-        soft_regret_values = [float(diagnostics[name]["validation_soft_regret"]) for name in active_names if diagnostics[name].get("validation_soft_regret") is not None]
-        top1_regret_values = [float(diagnostics[name]["validation_top1_regret"]) for name in active_names if diagnostics[name].get("validation_top1_regret") is not None]
+        rank_values = [
+            float(diagnostics[name]["rank_loss"])
+            for name in active_names
+            if diagnostics[name].get("rank_loss") is not None
+        ]
+        huber_values = [
+            float(diagnostics[name]["huber_loss"])
+            for name in active_names
+            if diagnostics[name].get("huber_loss") is not None
+        ]
+        pairwise_values = [
+            float(diagnostics[name]["pairwise_accuracy"])
+            for name in active_names
+            if diagnostics[name].get("pairwise_accuracy") is not None
+        ]
+        spearman_values = [
+            float(diagnostics[name]["spearman_rank_correlation"])
+            for name in active_names
+            if diagnostics[name].get("spearman_rank_correlation") is not None
+        ]
+        agreement_values = [
+            float(diagnostics[name]["best_candidate_agreement"])
+            for name in active_names
+            if diagnostics[name].get("best_candidate_agreement") is not None
+        ]
+        soft_regret_values = [
+            float(diagnostics[name]["validation_soft_regret"])
+            for name in active_names
+            if diagnostics[name].get("validation_soft_regret") is not None
+        ]
+        top1_regret_values = [
+            float(diagnostics[name]["validation_top1_regret"])
+            for name in active_names
+            if diagnostics[name].get("validation_top1_regret") is not None
+        ]
         copied = dict(entry)
         copied["diagnostics"] = diagnostics
         copied["selection_constraints_passed"] = True
@@ -2899,11 +2981,21 @@ def _selected_gico_teacher_checkpoint(
         copied["mean_diagnostic_total_loss"] = float(np.mean(np.asarray(losses, dtype=np.float64))) if losses else 0.0
         copied["mean_rank_loss"] = float(np.mean(np.asarray(rank_values, dtype=np.float64))) if rank_values else 0.0
         copied["mean_huber_loss"] = float(np.mean(np.asarray(huber_values, dtype=np.float64))) if huber_values else 0.0
-        copied["mean_pairwise_accuracy"] = float(np.mean(np.asarray(pairwise_values, dtype=np.float64))) if pairwise_values else 0.0
-        copied["mean_spearman_rank_correlation"] = float(np.mean(np.asarray(spearman_values, dtype=np.float64))) if spearman_values else 0.0
-        copied["mean_best_candidate_agreement"] = float(np.mean(np.asarray(agreement_values, dtype=np.float64))) if agreement_values else 0.0
-        copied["mean_validation_soft_regret"] = float(np.mean(np.asarray(soft_regret_values, dtype=np.float64))) if soft_regret_values else None
-        copied["mean_validation_top1_regret"] = float(np.mean(np.asarray(top1_regret_values, dtype=np.float64))) if top1_regret_values else None
+        copied["mean_pairwise_accuracy"] = (
+            float(np.mean(np.asarray(pairwise_values, dtype=np.float64))) if pairwise_values else 0.0
+        )
+        copied["mean_spearman_rank_correlation"] = (
+            float(np.mean(np.asarray(spearman_values, dtype=np.float64))) if spearman_values else 0.0
+        )
+        copied["mean_best_candidate_agreement"] = (
+            float(np.mean(np.asarray(agreement_values, dtype=np.float64))) if agreement_values else 0.0
+        )
+        copied["mean_validation_soft_regret"] = (
+            float(np.mean(np.asarray(soft_regret_values, dtype=np.float64))) if soft_regret_values else None
+        )
+        copied["mean_validation_top1_regret"] = (
+            float(np.mean(np.asarray(top1_regret_values, dtype=np.float64))) if top1_regret_values else None
+        )
         copied["selection_active_splits"] = list(active_names)
         scored.append(copied)
 
@@ -2920,7 +3012,9 @@ def _selected_gico_teacher_checkpoint(
         for entry in valid_entries:
             diag = dict(dict(entry.get("diagnostics", {}) or {}).get(name, {}) or {})
             if diag.get("validation_soft_regret") is None:
-                raise ValueError(f"Weighted normalized regret selection missing validation_soft_regret for split {name!r}.")
+                raise ValueError(
+                    f"Weighted normalized regret selection missing validation_soft_regret for split {name!r}."
+                )
             split_values[int(entry["step"])] = float(diag["validation_soft_regret"])
         raw_by_split[name] = split_values
 
@@ -2933,10 +3027,7 @@ def _selected_gico_teacher_checkpoint(
         if hi - lo <= 1e-12:
             normalized_by_split[name] = {int(step): 0.0 for step in values}
         else:
-            normalized_by_split[name] = {
-                int(step): (float(value) - lo) / (hi - lo)
-                for step, value in values.items()
-            }
+            normalized_by_split[name] = {int(step): (float(value) - lo) / (hi - lo) for step, value in values.items()}
 
     if component_weights:
         raw_weights = {name: max(0.0, _component_weight(name, dict(component_weights or {}))) for name in active_splits}
@@ -2953,7 +3044,7 @@ def _selected_gico_teacher_checkpoint(
         }
     weight_sum = sum(float(value) for value in raw_weights.values())
     if weight_sum <= 0.0:
-        raw_weights = {name: 1.0 for name in active_splits}
+        raw_weights = dict.fromkeys(active_splits, 1.0)
         weight_sum = float(len(active_splits))
     normalized_weights = {name: float(value) / weight_sum for name, value in raw_weights.items()}
 
@@ -2961,7 +3052,9 @@ def _selected_gico_teacher_checkpoint(
         step = int(entry["step"])
         raw_values = {name: float(raw_by_split[name][step]) for name in active_splits}
         normalized_values = {name: float(normalized_by_split[name][step]) for name in active_splits}
-        weighted_score = float(sum(float(normalized_weights[name]) * float(normalized_values[name]) for name in active_splits))
+        weighted_score = float(
+            sum(float(normalized_weights[name]) * float(normalized_values[name]) for name in active_splits)
+        )
         minimax_score = float(max(normalized_values.values())) if normalized_values else 0.0
         raw_mean = float(np.mean(np.asarray(list(raw_values.values()), dtype=np.float64))) if raw_values else 0.0
         entry["selection_raw_regret_values"] = dict(raw_values)
@@ -3096,7 +3189,9 @@ def train_gico_teacher(
     checkpoint_every = int(teacher_checkpoint_every)
     if checkpoint_every <= 0:
         raise ValueError("teacher_checkpoint_every must be positive.")
-    validate_gico_support_schedule_keys(sorted({str(row["scheduler_key"]) for row in rows}), allowed_schedule_keys=allowed_schedule_keys)
+    validate_gico_support_schedule_keys(
+        sorted({str(row["scheduler_key"]) for row in rows}), allowed_schedule_keys=allowed_schedule_keys
+    )
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     rank_temperature, regression_weight, pair_margin = validate_teacher_objective_hyperparameters(
@@ -3176,7 +3271,9 @@ def train_gico_teacher(
         batch_metric_target_mask = metric_target_mask.index_select(0, batch_cpu_idx).to(device=device)
         batch_target_weights = target_weights.index_select(0, batch_cpu_idx).to(device=device)
         batch_targets = targets.index_select(0, batch_cpu_idx).to(device=device)
-        left, right, sign = _pair_indices(batch_targets, batch_pair_keys, margin=float(pair_margin), device=batch_targets.device)
+        left, right, sign = _pair_indices(
+            batch_targets, batch_pair_keys, margin=float(pair_margin), device=batch_targets.device
+        )
         metric_pred = _teacher_metric_scores(teacher, batch_sx, batch_dx, batch_cx)
         pred = _scalarize_teacher_metric_values(
             metric_pred,
@@ -3259,7 +3356,9 @@ def train_gico_teacher(
     final_teacher_retrain = {
         "protocol": "gico_teacher_finalization",
         "performed": False,
-        "reason": "selected_checkpoint_state_restored" if selected_state is not None else "final_checkpoint_state_retained",
+        "reason": "selected_checkpoint_state_restored"
+        if selected_state is not None
+        else "final_checkpoint_state_retained",
         "selected_checkpoint_step": checkpoint_selection.get("selected_step"),
         "selection_protocol": checkpoint_selection.get("selection_protocol"),
         "selection_metric": checkpoint_selection.get("selection_metric"),
@@ -3280,7 +3379,12 @@ def train_gico_teacher(
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_utility_weights": teacher_utility_weights_for_summary(
             teacher_metric_target_keys,
-            {key: float(value) for key, value in zip(teacher_metric_target_keys, target_weights[0].detach().cpu().tolist())},
+            {
+                key: float(value)
+                for key, value in zip(
+                    teacher_metric_target_keys, target_weights[0].detach().cpu().tolist(), strict=False
+                )
+            },
         ),
         "teacher_density_feature": "train_normalized_log_density",
         "setting_feature_mode": feature_mode,
@@ -3414,25 +3518,26 @@ def build_teacher_weighted_density_targets(
             target_mask=metric_score_mask,
         )
     utility_by_row_id = {
-        id(row): float(value)
-        for row, value in zip(rows, score_values.detach().cpu().tolist())
+        id(row): float(value) for row, value in zip(rows, score_values.detach().cpu().tolist(), strict=False)
     }
     score_weights_by_row_id = {
         id(row): tuple(float(part) for part in value)
-        for row, value in zip(rows, score_weights.detach().cpu().tolist())
+        for row, value in zip(rows, score_weights.detach().cpu().tolist(), strict=False)
     }
     score_mask_by_row_id = {
         id(row): tuple(float(part) for part in value)
-        for row, value in zip(rows, metric_score_mask.detach().cpu().tolist())
+        for row, value in zip(rows, metric_score_mask.detach().cpu().tolist(), strict=False)
     }
     for _, group in target_groups:
-        counts: Dict[str, int] = {key: 0 for key in supervision_keys}
+        counts: Dict[str, int] = dict.fromkeys(supervision_keys, 0)
         for row in group:
             key = str(row["scheduler_key"])
             counts[key] = counts.get(key, 0) + 1
         bad_counts = {key: count for key, count in counts.items() if count != 1}
         if bad_counts:
-            raise ValueError(f"Teacher-weighted density targets require exactly one row per supervision schedule; counts={bad_counts}.")
+            raise ValueError(
+                f"Teacher-weighted density targets require exactly one row per supervision schedule; counts={bad_counts}."
+            )
         first = group[0]
         context_embedding_id = context_embedding_id_from_row(first)
         if context_embedding_id not in context_embeddings:
@@ -3469,7 +3574,7 @@ def build_teacher_weighted_density_targets(
         )
         full_mixture = np.zeros(len(reference_time_grid) - 1, dtype=np.float64)
         mixture = np.zeros(len(reference_time_grid) - 1, dtype=np.float64)
-        for full_weight, active_weight, mass in zip(full_weights, active_weights, masses):
+        for full_weight, active_weight, mass in zip(full_weights, active_weights, masses, strict=False):
             mass_arr = np.asarray(mass, dtype=np.float64)
             full_mixture += float(full_weight) * mass_arr
             mixture += float(active_weight) * mass_arr
@@ -3522,7 +3627,12 @@ def build_teacher_weighted_density_targets(
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_utility_weights": teacher_utility_weights_for_summary(
             teacher_metric_target_keys,
-            {key: float(value) for key, value in zip(teacher_metric_target_keys, score_weights[0].detach().cpu().tolist())},
+            {
+                key: float(value)
+                for key, value in zip(
+                    teacher_metric_target_keys, score_weights[0].detach().cpu().tolist(), strict=False
+                )
+            },
         ),
         "teacher_temperature": float(fixed_temperature),
         "setting_feature_mode": feature_mode,
@@ -3574,7 +3684,9 @@ def build_teacher_weighted_density_targets(
         "teacher_score_normalization_protocol": "per_context_solver_nfe_candidate_score_mean_std",
         "teacher_score_normalization_mean_values": [float(value) for value in score_mean_values],
         "teacher_score_normalization_std_values": [float(value) for value in score_std_values],
-        "mean_candidate_count": float(np.mean(np.asarray(candidate_counts, dtype=np.float64))) if candidate_counts else 0.0,
+        "mean_candidate_count": float(np.mean(np.asarray(candidate_counts, dtype=np.float64)))
+        if candidate_counts
+        else 0.0,
         "nfe_sequence_pair_count": int(len(sequence_pairs)),
         "supervision_schedule_keys": list(supervision_keys),
         "density_protocol": DENSITY_PROTOCOL,
@@ -3643,7 +3755,11 @@ def train_gico_student(
     if not math.isfinite(teacher_score_weight) or teacher_score_weight < 0.0:
         raise ValueError("student_teacher_score_weight must be finite and nonnegative.")
     teacher_score_warmup_fraction = float(student_teacher_score_warmup_fraction)
-    if not math.isfinite(teacher_score_warmup_fraction) or teacher_score_warmup_fraction < 0.0 or teacher_score_warmup_fraction >= 1.0:
+    if (
+        not math.isfinite(teacher_score_warmup_fraction)
+        or teacher_score_warmup_fraction < 0.0
+        or teacher_score_warmup_fraction >= 1.0
+    ):
         raise ValueError("student_teacher_score_warmup_fraction must be finite and in [0, 1).")
     teacher_score_schedule_steps = int(student_teacher_score_schedule_steps or int(steps))
     if teacher_score_schedule_steps <= 0:
@@ -3713,9 +3829,7 @@ def train_gico_student(
     }
     if unseen_targets_enabled:
         unseen_embeddings = (
-            unseen_target_context_embeddings
-            if unseen_target_context_embeddings is not None
-            else context_embeddings
+            unseen_target_context_embeddings if unseen_target_context_embeddings is not None else context_embeddings
         )
         unseen_sx, unseen_cx, unseen_target_mass, built_unseen_summary = build_teacher_weighted_density_targets(
             teacher,
@@ -3749,7 +3863,12 @@ def train_gico_student(
             "unseen_target_weight": float(unseen_weight),
             "unseen_context_setting_count": int(unseen_target_mass.shape[0]),
             "unseen_target_nfes": sorted({int(row["target_nfe"]) for row in unseen_representative_rows}),
-            "unseen_split_phases": sorted({str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) for row in (unseen_target_rows or [])}),
+            "unseen_split_phases": sorted(
+                {
+                    str(row.get("source_split_phase") or row.get("split_phase", row.get("split", "")))
+                    for row in (unseen_target_rows or [])
+                }
+            ),
         }
     validation_sx: torch.Tensor | None = None
     validation_cx: torch.Tensor | None = None
@@ -3759,25 +3878,29 @@ def train_gico_student(
         "student_validation_context_count": 0,
     }
     if validation_fit_rows:
-        validation_embeddings = validation_context_embeddings if validation_context_embeddings is not None else context_embeddings
-        validation_sx, validation_cx, validation_target_mass, built_validation_summary = build_teacher_weighted_density_targets(
-            teacher,
-            validation_fit_rows,
-            context_embeddings=validation_embeddings,
-            schedule_grids=schedule_grids,
-            reference_time_grid=reference_time_grid,
-            density_normalizer=density_normalizer,
-            supervision_schedule_keys=sorted({str(row["scheduler_key"]) for row in validation_fit_rows}),
-            temperature=float(teacher_temperature),
-            teacher_utility_weights=teacher_utility_weights,
-            setting_feature_mode=feature_mode,
-            setting_encoder_config=encoder_config,
-            student_target_mixture_mode=target_mode,
-            student_target_elite_fraction=elite_fraction,
-            student_target_elite_k=elite_k,
-            student_target_elite_min_count=elite_min_count,
-            student_target_elite_blend_all_weight=elite_blend_all_weight,
-            device=device,
+        validation_embeddings = (
+            validation_context_embeddings if validation_context_embeddings is not None else context_embeddings
+        )
+        validation_sx, validation_cx, validation_target_mass, built_validation_summary = (
+            build_teacher_weighted_density_targets(
+                teacher,
+                validation_fit_rows,
+                context_embeddings=validation_embeddings,
+                schedule_grids=schedule_grids,
+                reference_time_grid=reference_time_grid,
+                density_normalizer=density_normalizer,
+                supervision_schedule_keys=sorted({str(row["scheduler_key"]) for row in validation_fit_rows}),
+                temperature=float(teacher_temperature),
+                teacher_utility_weights=teacher_utility_weights,
+                setting_feature_mode=feature_mode,
+                setting_encoder_config=encoder_config,
+                student_target_mixture_mode=target_mode,
+                student_target_elite_fraction=elite_fraction,
+                student_target_elite_k=elite_k,
+                student_target_elite_min_count=elite_min_count,
+                student_target_elite_blend_all_weight=elite_blend_all_weight,
+                device=device,
+            )
         )
         validation_target_summary = {
             **built_validation_summary,
@@ -3785,7 +3908,10 @@ def train_gico_student(
             "student_validation_context_count": int(len({context_id_from_row(row) for row in validation_fit_rows})),
             "student_validation_row_count": int(len(validation_fit_rows)),
             "student_validation_split_phases": sorted(
-                {str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))) for row in validation_fit_rows}
+                {
+                    str(row.get("source_split_phase") or row.get("split_phase", row.get("split", "")))
+                    for row in validation_fit_rows
+                }
             ),
         }
     opt = torch.optim.AdamW(student.parameters(), lr=float(lr), weight_decay=weight_decay)
@@ -3882,12 +4008,7 @@ def train_gico_student(
                 clip=DEFAULT_STUDENT_TEACHER_SCORE_CLIP,
             )
         if unseen_targets_enabled:
-            if (
-                unseen_sx is None
-                or unseen_cx is None
-                or unseen_target_mass is None
-                or next_unseen_batch is None
-            ):
+            if unseen_sx is None or unseen_cx is None or unseen_target_mass is None or next_unseen_batch is None:
                 raise RuntimeError("Unseen-target training inputs are incomplete.")
             unseen_batch_indices = next_unseen_batch()
             unseen_batch_idx = _index_tensor(unseen_batch_indices, device=unseen_target_mass.device)
@@ -3946,7 +4067,9 @@ def train_gico_student(
                     "student_kl_ce_loss": float(ce_loss.detach().cpu().item()),
                     "student_eval_kl_ce_loss": float(train_ce_for_checkpoint),
                     "student_unseen_target_kl_ce_loss": float(unseen_ce_loss.detach().cpu().item()),
-                    "student_unseen_target_weighted_loss": float((float(unseen_weight) * unseen_ce_loss).detach().cpu().item()),
+                    "student_unseen_target_weighted_loss": float(
+                        (float(unseen_weight) * unseen_ce_loss).detach().cpu().item()
+                    ),
                     "student_teacher_score_eta": float(eta),
                     "student_teacher_score_z_mean": float(teacher_score_z.detach().cpu().item()),
                     "student_teacher_score_mean": float(teacher_score_mean.detach().cpu().item()),
@@ -4088,7 +4211,9 @@ def train_gico_student(
         "student_validation_split": {
             "protocol": "context_disjoint_student_validation",
             "validation_row_count": int(len(validation_fit_rows)),
-            "validation_context_count": int(len({context_id_from_row(row) for row in validation_fit_rows})) if validation_fit_rows else 0,
+            "validation_context_count": int(len({context_id_from_row(row) for row in validation_fit_rows}))
+            if validation_fit_rows
+            else 0,
             "locked_test_used_for_selection": False,
         },
         "student_validation_used_for_selection": bool(use_validation_selection),
@@ -4144,7 +4269,9 @@ def predict_gico_density_many(
         context_embedding_id = context_embedding_id_from_row(row)
         if context_embedding_id not in context_embeddings:
             raise KeyError(f"Missing context embedding for {context_embedding_id}.")
-        setting_rows.append(setting_features(str(row["solver_key"]), int(row["target_nfe"]), mode=feature_mode, config=encoder_config))
+        setting_rows.append(
+            setting_features(str(row["solver_key"]), int(row["target_nfe"]), mode=feature_mode, config=encoder_config)
+        )
         context_rows.append(np.asarray(context_embeddings[context_embedding_id], dtype=np.float32))
     student.to(device)
     student.eval()
@@ -4155,7 +4282,7 @@ def predict_gico_density_many(
             torch.tensor(np.stack(context_rows, axis=0), dtype=torch.float32, device=device),
         )
     outputs: List[Dict[str, Any]] = []
-    for row, mass_t in zip(rows, masses_t):
+    for row, mass_t in zip(rows, masses_t, strict=False):
         solver = str(row["solver_key"])
         target_nfe = int(row["target_nfe"])
         nfe = normalize_solver_nfe_fields(solver, target_nfe, source="GICO prediction row")

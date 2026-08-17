@@ -20,7 +20,6 @@ from genode.schedules.density import (
 from genode.schedules.progress import validate_time_grid
 from genode.schedules.specification import ScheduleSpecification
 
-
 ContextT = TypeVar("ContextT", contravariant=True)
 _EXECUTABLE_BINDING_ATOL = 1e-12
 

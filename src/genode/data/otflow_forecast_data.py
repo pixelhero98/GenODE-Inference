@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from genode.models.config import OTFlowConfig
 from genode.data.otflow_monash_datasets import (
     default_manifest_path,
     default_source_dir,
@@ -15,7 +14,7 @@ from genode.data.otflow_monash_datasets import (
     iter_tsf_series,
     load_monash_manifest,
 )
-
+from genode.models.config import OTFlowConfig
 
 _FREQUENCY_SECONDS: Mapping[str, int] = {
     "yearly": 365 * 24 * 60 * 60,
@@ -342,7 +341,9 @@ def _train_example_refs(
     return refs
 
 
-def _holdout_example_refs(series_records: Sequence[ForecastSeriesRecord], *, split_name: str) -> List[ForecastExampleRef]:
+def _holdout_example_refs(
+    series_records: Sequence[ForecastSeriesRecord], *, split_name: str
+) -> List[ForecastExampleRef]:
     refs: List[ForecastExampleRef] = []
     for series_idx, record in enumerate(series_records):
         if str(split_name) == "val":
@@ -383,7 +384,9 @@ def build_monash_forecast_splits(
         history_len=int(history_len),
         horizon=int(horizon),
         series_records=records,
-        example_refs=_train_example_refs(records, history_len=int(history_len), horizon=int(horizon), stride=int(stride_train)),
+        example_refs=_train_example_refs(
+            records, history_len=int(history_len), horizon=int(horizon), stride=int(stride_train)
+        ),
         time_feature_mode=str(time_feature_mode),
         frequency_label=str(manifest.frequency),
         mase_seasonal_period=int(mase_seasonal_period),

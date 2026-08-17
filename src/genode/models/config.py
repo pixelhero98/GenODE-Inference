@@ -5,7 +5,6 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-
 _CONFIG_SECTIONS = ("data", "model", "fm", "train", "sample")
 
 

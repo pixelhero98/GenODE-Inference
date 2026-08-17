@@ -44,9 +44,7 @@ def _assert_archive_bundle_complete(output: Path) -> None:
         "sha256": digest,
         "size_bytes": archive_path.stat().st_size,
     }
-    assert sha256_path.read_bytes() == f"{digest}  {archive_path.name}\n".encode(
-        "ascii"
-    )
+    assert sha256_path.read_bytes() == f"{digest}  {archive_path.name}\n".encode("ascii")
     assert validate_deterministic_zip(archive_path)["status"] == "complete"
 
 
@@ -512,11 +510,7 @@ def test_archive_bundle_failed_overwrite_restores_partial_predecessor(
         archive_path.write_bytes(b"legacy archive")
     else:
         manifest_path.write_bytes(b"legacy manifest")
-    previous = {
-        path: path.read_bytes()
-        for path in _archive_bundle_paths(output)
-        if path.exists()
-    }
+    previous = {path: path.read_bytes() for path in _archive_bundle_paths(output) if path.exists()}
     real_install = artifact_bundle._link_without_overwrite
 
     def fail_manifest_promotion(source_path: Path, destination: Path) -> None:
@@ -537,11 +531,7 @@ def test_archive_bundle_failed_overwrite_restores_partial_predecessor(
             overwrite=True,
         )
 
-    assert {
-        path: path.read_bytes()
-        for path in _archive_bundle_paths(output)
-        if path.exists()
-    } == previous
+    assert {path: path.read_bytes() for path in _archive_bundle_paths(output) if path.exists()} == previous
     assert not bundle_journal_path(output).exists()
     assert not list(tmp_path.glob(".*.bundle-stage-*.tmp"))
     assert not list(tmp_path.glob(".*.bundle-backup-*"))
@@ -562,20 +552,13 @@ def test_archive_bundle_promotion_failure_rolls_back_and_retries(
             output,
             bundle_kind="test",
         )
-    previous = {
-        path: path.read_bytes()
-        for path in _archive_bundle_paths(output)
-        if path.exists()
-    }
+    previous = {path: path.read_bytes() for path in _archive_bundle_paths(output) if path.exists()}
     source.write_bytes(b"new payload")
     manifest_path = output.with_suffix(output.suffix + ".manifest.json")
     real_install = artifact_bundle._link_without_overwrite
 
     def fail_manifest_promotion(source_path: Path, destination: Path) -> None:
-        if (
-            destination == manifest_path
-            and ".bundle-stage-" in source_path.name
-        ):
+        if destination == manifest_path and ".bundle-stage-" in source_path.name:
             raise OSError("simulated manifest promotion failure")
         real_install(source_path, destination)
 
@@ -592,11 +575,7 @@ def test_archive_bundle_promotion_failure_rolls_back_and_retries(
             overwrite=preexisting,
         )
 
-    assert {
-        path: path.read_bytes()
-        for path in _archive_bundle_paths(output)
-        if path.exists()
-    } == previous
+    assert {path: path.read_bytes() for path in _archive_bundle_paths(output) if path.exists()} == previous
     assert not bundle_journal_path(output).exists()
     assert not list(tmp_path.glob(".*.bundle-stage-*.tmp"))
     assert not list(tmp_path.glob(".*.bundle-backup-*"))
@@ -625,10 +604,7 @@ def test_archive_bundle_retry_recovers_prepared_partial_publication(
     real_recover = artifact_bundle._recover_locked
 
     def interrupt_manifest_promotion(source_path: Path, destination: Path) -> None:
-        if (
-            destination == manifest_path
-            and ".bundle-stage-" in source_path.name
-        ):
+        if destination == manifest_path and ".bundle-stage-" in source_path.name:
             raise OSError("simulated process interruption")
         real_install(source_path, destination)
 

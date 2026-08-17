@@ -11,28 +11,6 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from genode.canonical_experiment_layout import CANONICAL_CONTEXT_SAMPLE_COUNT, CANONICAL_SEEN_NFES
-from genode.solver_protocol import (
-    CANONICAL_SOLVER_KEYS,
-    normalize_solver_key,
-    normalize_solver_keys,
-    normalize_solver_nfe_fields,
-)
-from genode.gico.density_representation import (
-    average_density_masses,
-    density_mass_to_time_grid,
-    grid_to_density_mass,
-    uniform_reference_grid,
-)
-from genode.gico.models import validate_time_grid
-from genode.gico.policy import load_context_embedding_table, save_context_embedding_table
-from genode.gico.schedule_hash import schedule_grid_hash
-from genode.gico.objectives import attach_reward_columns, crps_mase_reward, rewards_by_setting, seed_mean_metric_rows
-from genode.gico.ser_ptg_reference import (
-    SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
-    SER_PTG_REVERSED_SCHEDULE_KEY,
-    SER_PTG_SCHEDULE_KEY,
-    grid_geometry,
-)
 from genode.data.otflow_paths import (
     default_backbone_manifest_path,
     project_outputs_root,
@@ -58,13 +36,35 @@ from genode.evaluation.otflow_evaluation_support import (
     train_tuning_sampler_key,
     train_tuning_target_example_count,
 )
-from genode.models.otflow_train_val import save_json
+from genode.gico.density_representation import (
+    average_density_masses,
+    density_mass_to_time_grid,
+    grid_to_density_mass,
+    uniform_reference_grid,
+)
+from genode.gico.models import validate_time_grid
+from genode.gico.objectives import attach_reward_columns, crps_mase_reward, rewards_by_setting, seed_mean_metric_rows
+from genode.gico.policy import load_context_embedding_table, save_context_embedding_table
+from genode.gico.schedule_hash import schedule_grid_hash
+from genode.gico.ser_ptg_reference import (
+    SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
+    SER_PTG_REVERSED_SCHEDULE_KEY,
+    SER_PTG_SCHEDULE_KEY,
+    grid_geometry,
+)
 from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
+from genode.models.otflow_train_val import save_json
 from genode.runtime import ProgressBar, resolve_torch_device
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
     fixed_schedule_shape_statistics,
     schedule_display_name,
+)
+from genode.solver_protocol import (
+    CANONICAL_SOLVER_KEYS,
+    normalize_solver_key,
+    normalize_solver_keys,
+    normalize_solver_nfe_fields,
 )
 
 DEFAULT_SOLVERS: Tuple[str, ...] = CANONICAL_SOLVER_KEYS
@@ -339,7 +339,9 @@ def _cap_context_indices(
         token = f"{SCHEDULE_CONTEXT_SELECTION_PROTOCOL}|{salt}|{int(seed)}|{len(candidate)}|{selected_cap}"
         local_seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
         rng = np.random.default_rng(local_seed)
-        keep_positions = sorted(int(pos) for pos in rng.choice(np.arange(len(candidate)), size=selected_cap, replace=False).tolist())
+        keep_positions = sorted(
+            int(pos) for pos in rng.choice(np.arange(len(candidate)), size=selected_cap, replace=False).tolist()
+        )
         selected = [candidate[pos] for pos in keep_positions]
         was_capped = True
     return np.asarray(selected, dtype=np.int64), {
@@ -369,16 +371,26 @@ def _protocol_hash(args: argparse.Namespace) -> str:
         "eval_train_fraction": float(getattr(args, "eval_train_fraction", 0.20)),
         "train_tuning_seed": int(getattr(args, "train_tuning_seed", 0)),
         "train_tuning_strata": int(getattr(args, "train_tuning_strata", 20)),
-        "train_tuning_sampling_mode": str(getattr(args, "train_tuning_sampling_mode", TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION)),
-        "train_tuning_sampler": train_tuning_sampler_key(str(getattr(args, "train_tuning_sampling_mode", TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION))),
-        "train_tuning_train_split_fraction": float(getattr(args, "train_tuning_train_split_fraction", DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION)),
-        "train_tuning_val_split_fraction": float(getattr(args, "train_tuning_val_split_fraction", DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION)),
+        "train_tuning_sampling_mode": str(
+            getattr(args, "train_tuning_sampling_mode", TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION)
+        ),
+        "train_tuning_sampler": train_tuning_sampler_key(
+            str(getattr(args, "train_tuning_sampling_mode", TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION))
+        ),
+        "train_tuning_train_split_fraction": float(
+            getattr(args, "train_tuning_train_split_fraction", DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION)
+        ),
+        "train_tuning_val_split_fraction": float(
+            getattr(args, "train_tuning_val_split_fraction", DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION)
+        ),
         "eval_windows_val": int(args.eval_windows_val),
         "eval_windows_test": int(args.eval_windows_test),
         "otflow_train_steps": int(args.otflow_train_steps),
         "dataset_root": _path_fingerprint(str(args.dataset_root)),
         "shared_backbone_root": _path_fingerprint(str(args.shared_backbone_root)),
-        "backbone_manifest": _path_fingerprint(str(args.backbone_manifest)) if str(args.backbone_manifest).strip() else None,
+        "backbone_manifest": _path_fingerprint(str(args.backbone_manifest))
+        if str(args.backbone_manifest).strip()
+        else None,
         "schedule_summary": _path_fingerprint(str(args.schedule_summary)),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -404,7 +416,9 @@ def _derived_ser_time_grid(schedule_key: str, base_grid: Sequence[float], *, mac
         return validate_time_grid([1.0 - float(value) for value in reversed(base)], macro_steps=int(macro_steps))
     if str(schedule_key) == SER_PTG_AVG_REVERSED_SCHEDULE_KEY:
         reference = uniform_reference_grid()
-        reversed_grid = validate_time_grid([1.0 - float(value) for value in reversed(base)], macro_steps=int(macro_steps))
+        reversed_grid = validate_time_grid(
+            [1.0 - float(value) for value in reversed(base)], macro_steps=int(macro_steps)
+        )
         base_mass = grid_to_density_mass(base, reference_time_grid=reference, macro_steps=int(macro_steps))
         reversed_mass = grid_to_density_mass(reversed_grid, reference_time_grid=reference, macro_steps=int(macro_steps))
         averaged_mass = average_density_masses(base_mass, reversed_mass)
@@ -459,7 +473,9 @@ def load_schedule_predictions(
     path = resolve_project_path(str(schedule_summary_path))
     payload = json.loads(path.read_text(encoding="utf-8"))
     if str(payload.get("dataset", dataset)) != str(dataset):
-        raise ValueError(f"Schedule summary dataset={payload.get('dataset')!r} does not match requested dataset={dataset!r}.")
+        raise ValueError(
+            f"Schedule summary dataset={payload.get('dataset')!r} does not match requested dataset={dataset!r}."
+        )
     allowed_solvers = {str(name) for name in solver_names}
     allowed_nfes = {int(value) for value in target_nfe_values}
     predictions: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
@@ -470,7 +486,9 @@ def load_schedule_predictions(
     else:
         schedule_items = [
             {
-                "scheduler_key": str(payload.get("schedule_key", payload.get("scheduler_key", SELECTED_STUDENT_SCHEDULE_KEY))),
+                "scheduler_key": str(
+                    payload.get("schedule_key", payload.get("scheduler_key", SELECTED_STUDENT_SCHEDULE_KEY))
+                ),
                 "schedule_name": str(payload.get("schedule_name", SELECTED_STUDENT_SCHEDULE_NAME)),
                 "gico_step_budget": payload.get("selected_gico_step_budget"),
                 "predictions": list(payload.get("predictions", []) or []),
@@ -482,7 +500,9 @@ def load_schedule_predictions(
             raise ValueError("Schedule summary contains a schedule without scheduler_key.")
         expected_schedule_keys.append(scheduler_key)
         schedule_name = str(schedule.get("schedule_name") or schedule_display_name_for_key(scheduler_key))
-        budget = schedule.get("gico_step_budget", schedule.get("student_gico_steps", schedule.get("selected_gico_step_budget")))
+        budget = schedule.get(
+            "gico_step_budget", schedule.get("student_gico_steps", schedule.get("selected_gico_step_budget"))
+        )
         for item in list(schedule.get("predictions", []) or []):
             solver_key = normalize_solver_key(str(item.get("solver_key")))
             target_nfe = int(item.get("target_nfe"))
@@ -557,8 +577,27 @@ def load_schedule_predictions(
     return predictions
 
 
-def _row_signature(*, dataset: str, split_phase: str, seed: int, target_nfe: int, solver_key: str, scheduler_key: str, checkpoint_id: str) -> str:
-    return "|".join([str(dataset), str(split_phase), str(seed), str(target_nfe), str(solver_key), str(scheduler_key), str(checkpoint_id)])
+def _row_signature(
+    *,
+    dataset: str,
+    split_phase: str,
+    seed: int,
+    target_nfe: int,
+    solver_key: str,
+    scheduler_key: str,
+    checkpoint_id: str,
+) -> str:
+    return "|".join(
+        [
+            str(dataset),
+            str(split_phase),
+            str(seed),
+            str(target_nfe),
+            str(solver_key),
+            str(scheduler_key),
+            str(checkpoint_id),
+        ]
+    )
 
 
 def _row_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
@@ -731,14 +770,24 @@ def _schedule_row(
         "perturbation_params_json": prediction.get("perturbation_params_json", ""),
         "intervals_json": prediction.get(
             "intervals_json",
-            json.dumps([float(x) for x in np.diff(np.asarray(time_grid, dtype=np.float64)).tolist()], separators=(",", ":")),
+            json.dumps(
+                [float(x) for x in np.diff(np.asarray(time_grid, dtype=np.float64)).tolist()], separators=(",", ":")
+            ),
         ),
         "utility": prediction.get("utility", ""),
         "validity_flags_json": prediction.get("validity_flags_json", ""),
     }
 
 
-def _load_forecast_rows_csv(path: str | Path, *, dataset: str, split_phase: Optional[str], seeds: Sequence[int], solver_names: Sequence[str], target_nfe_values: Sequence[int]) -> List[Dict[str, Any]]:
+def _load_forecast_rows_csv(
+    path: str | Path,
+    *,
+    dataset: str,
+    split_phase: Optional[str],
+    seeds: Sequence[int],
+    solver_names: Sequence[str],
+    target_nfe_values: Sequence[int],
+) -> List[Dict[str, Any]]:
     resolved = resolve_project_path(str(path))
     seed_set = {int(seed) for seed in seeds}
     solver_set = {str(solver) for solver in solver_names}
@@ -795,7 +844,12 @@ def _missing_cells(
     schedule_keys: Sequence[str],
 ) -> List[Dict[str, Any]]:
     observed = {
-        (int(row.get("seed", -1)), str(row.get("solver_key")), int(row.get("target_nfe", -1)), str(row.get("scheduler_key")))
+        (
+            int(row.get("seed", -1)),
+            str(row.get("solver_key")),
+            int(row.get("target_nfe", -1)),
+            str(row.get("scheduler_key")),
+        )
         for row in rows
     }
     missing: List[Dict[str, Any]] = []
@@ -805,7 +859,14 @@ def _missing_cells(
                 for schedule in schedule_keys:
                     key = (int(seed), str(solver), int(target_nfe), str(schedule))
                     if key not in observed:
-                        missing.append({"seed": int(seed), "solver_key": str(solver), "target_nfe": int(target_nfe), "scheduler_key": str(schedule)})
+                        missing.append(
+                            {
+                                "seed": int(seed),
+                                "solver_key": str(solver),
+                                "target_nfe": int(target_nfe),
+                                "scheduler_key": str(schedule),
+                            }
+                        )
     return missing
 
 
@@ -815,7 +876,9 @@ def _aggregate_schedule_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str
         key = (str(row.get("solver_key")), int(row.get("target_nfe", -1)), str(row.get("scheduler_key")))
         groups.setdefault(key, []).append(row)
     summaries: List[Dict[str, Any]] = []
-    for (solver_key, target_nfe, scheduler_key), group in sorted(groups.items(), key=lambda item: (item[0][0], item[0][1], item[0][2])):
+    for (solver_key, target_nfe, scheduler_key), group in sorted(
+        groups.items(), key=lambda item: (item[0][0], item[0][1], item[0][2])
+    ):
         summary: Dict[str, Any] = {
             "solver_key": solver_key,
             "target_nfe": int(target_nfe),
@@ -847,7 +910,13 @@ def _aggregate_schedule_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str
             values = [row.get(metric) for row in group]
             summary[f"{metric}_mean"] = _mean(values)
             summary[f"{metric}_std"] = _std(values)
-        for metric in ("internal_fraction_after_098", "internal_count_after_098", "internal_count", "min_interval", "max_interval"):
+        for metric in (
+            "internal_fraction_after_098",
+            "internal_count_after_098",
+            "internal_count",
+            "min_interval",
+            "max_interval",
+        ):
             values = [row.get(metric) for row in group]
             summary[f"{metric}_mean"] = _mean(values)
         summaries.append(summary)
@@ -868,7 +937,9 @@ def _metric_higher_is_better(metric: str) -> bool:
     return str(metric) in {"u_comp_uniform", "temporal_tstr_f1"}
 
 
-def _candidate_centered_rewards_by_setting(rows: Sequence[Mapping[str, Any]]) -> Dict[Tuple[str, int], Dict[str, float]]:
+def _candidate_centered_rewards_by_setting(
+    rows: Sequence[Mapping[str, Any]],
+) -> Dict[Tuple[str, int], Dict[str, float]]:
     by_setting: Dict[Tuple[str, int], List[Mapping[str, Any]]] = {}
     for row in rows:
         by_setting.setdefault((str(row["solver_key"]), int(row["target_nfe"])), []).append(row)
@@ -896,15 +967,23 @@ def _selection_rewards(
     aggregated_candidates = seed_mean_metric_rows(candidate_rows)
     aggregated_references = seed_mean_metric_rows(reference_rows)
     if not aggregated_references:
-        raise ValueError("Validation selection requires fixed baseline reference rows for paired best-fixed CRPS/MASE utility.")
-    annotated = attach_reward_columns([*aggregated_references, *aggregated_candidates], fixed_schedule_keys=BASELINE_SCHEDULE_KEYS)
-    candidate_keys = {(str(row["solver_key"]), int(row["target_nfe"]), str(row["scheduler_key"])) for row in aggregated_candidates}
+        raise ValueError(
+            "Validation selection requires fixed baseline reference rows for paired best-fixed CRPS/MASE utility."
+        )
+    annotated = attach_reward_columns(
+        [*aggregated_references, *aggregated_candidates], fixed_schedule_keys=BASELINE_SCHEDULE_KEYS
+    )
+    candidate_keys = {
+        (str(row["solver_key"]), int(row["target_nfe"]), str(row["scheduler_key"])) for row in aggregated_candidates
+    }
     annotated_candidates = [
         row
         for row in annotated
         if (str(row["solver_key"]), int(row["target_nfe"]), str(row["scheduler_key"])) in candidate_keys
     ]
-    rewards = rewards_by_setting([*aggregated_references, *aggregated_candidates], fixed_schedule_keys=BASELINE_SCHEDULE_KEYS)
+    rewards = rewards_by_setting(
+        [*aggregated_references, *aggregated_candidates], fixed_schedule_keys=BASELINE_SCHEDULE_KEYS
+    )
     return annotated_candidates, rewards, "best_fixed_baseline_crps_mase", list(BASELINE_SCHEDULE_KEYS)
 
 
@@ -929,7 +1008,9 @@ def select_best_validation_schedule(
     ]
     if not candidate_rows:
         raise ValueError("No generated candidate rows were available for validation selection.")
-    aggregated, rewards, utility_reference, fixed_reference_schedule_keys = _selection_rewards(candidate_rows=candidate_rows, reference_rows=reference_rows)
+    aggregated, rewards, utility_reference, fixed_reference_schedule_keys = _selection_rewards(
+        candidate_rows=candidate_rows, reference_rows=reference_rows
+    )
     by_setting: Dict[Tuple[str, int], List[Mapping[str, Any]]] = {}
     for row in aggregated:
         by_setting.setdefault((str(row["solver_key"]), int(row["target_nfe"])), []).append(row)
@@ -988,7 +1069,9 @@ def select_best_validation_schedule(
                 "mean_validation_utility": float(np.mean(np.asarray(values, dtype=np.float64))),
                 "mean_u_crps_best": float(np.mean(np.asarray(crps_scores[schedule_key], dtype=np.float64))),
                 "mean_u_mase_best": float(np.mean(np.asarray(mase_scores[schedule_key], dtype=np.float64))),
-                "mean_min_metric_utility": float(np.mean(np.asarray(worst_metric_scores[schedule_key], dtype=np.float64))),
+                "mean_min_metric_utility": float(
+                    np.mean(np.asarray(worst_metric_scores[schedule_key], dtype=np.float64))
+                ),
                 "cells": int(len(values)),
             }
         )
@@ -1014,7 +1097,9 @@ def select_best_validation_schedule(
     }
 
 
-def write_selected_schedule_summary(source_summary_path: str | Path, selection: Mapping[str, Any], out_path: str | Path) -> Dict[str, Any]:
+def write_selected_schedule_summary(
+    source_summary_path: str | Path, selection: Mapping[str, Any], out_path: str | Path
+) -> Dict[str, Any]:
     source_path = resolve_project_path(str(source_summary_path))
     payload = json.loads(source_path.read_text(encoding="utf-8"))
     selected_key = str(selection["selected_schedule_key"])
@@ -1084,7 +1169,11 @@ def build_comparison_summary(
             )
         else:
             raise ValueError(f"Unsupported benchmark_family={family!r} for comparison summary.")
-        all_rows = [dict(row) for row in baseline_rows] + [dict(row) for row in comparator_rows] + [dict(row) for row in student_rows]
+        all_rows = (
+            [dict(row) for row in baseline_rows]
+            + [dict(row) for row in comparator_rows]
+            + [dict(row) for row in student_rows]
+        )
         aggregate_rows = _aggregate_schedule_rows(all_rows)
         by_cell: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
         for row in aggregate_rows:
@@ -1107,23 +1196,38 @@ def build_comparison_summary(
                 for metric in metric_keys:
                     mean_key = f"{metric}_mean"
                     if _metric_higher_is_better(metric):
-                        ordered = sorted(cell_rows, key=lambda row: (-_finite_metric_high(row, metric), str(row["scheduler_key"])))
+                        ordered = sorted(
+                            cell_rows, key=lambda row: (-_finite_metric_high(row, metric), str(row["scheduler_key"]))
+                        )
                         best_baseline = max(baselines, key=lambda row: _finite_metric_high(row, metric), default=None)
                     else:
-                        ordered = sorted(cell_rows, key=lambda row: (_finite_metric(row, metric), str(row["scheduler_key"])))
+                        ordered = sorted(
+                            cell_rows, key=lambda row: (_finite_metric(row, metric), str(row["scheduler_key"]))
+                        )
                         best_baseline = min(baselines, key=lambda row: _finite_metric(row, metric), default=None)
-                    ranking["metric_rankings"][metric] = [row["scheduler_key"] for row in ordered if row.get(mean_key) not in (None, "")]
-                    ranking[f"best_baseline_by_{metric}"] = None if best_baseline is None else best_baseline["scheduler_key"]
-                for student_row in sorted([row for row in cell_rows if str(row["scheduler_key"]) in student_schedule_keys], key=lambda row: str(row["scheduler_key"])):
+                    ranking["metric_rankings"][metric] = [
+                        row["scheduler_key"] for row in ordered if row.get(mean_key) not in (None, "")
+                    ]
+                    ranking[f"best_baseline_by_{metric}"] = (
+                        None if best_baseline is None else best_baseline["scheduler_key"]
+                    )
+                for student_row in sorted(
+                    [row for row in cell_rows if str(row["scheduler_key"]) in student_schedule_keys],
+                    key=lambda row: str(row["scheduler_key"]),
+                ):
                     comparison: Dict[str, Any] = {"scheduler_key": student_row["scheduler_key"]}
                     for metric in metric_keys:
                         mean_key = f"{metric}_mean"
                         comparison[f"student_{metric}_mean"] = student_row.get(mean_key)
                         if _metric_higher_is_better(metric):
-                            comparison[f"student_{metric}_delta_vs_uniform"] = None if uniform is None else (
-                                _finite_metric_high(student_row, metric) - _finite_metric_high(uniform, metric)
+                            comparison[f"student_{metric}_delta_vs_uniform"] = (
+                                None
+                                if uniform is None
+                                else (_finite_metric_high(student_row, metric) - _finite_metric_high(uniform, metric))
                             )
-                            best_baseline = max(baselines, key=lambda row: _finite_metric_high(row, metric), default=None)
+                            best_baseline = max(
+                                baselines, key=lambda row: _finite_metric_high(row, metric), default=None
+                            )
                             comparison[f"student_{metric}_gain_vs_uniform"] = _safe_high_gain(
                                 student_row.get(mean_key),
                                 None if uniform is None else uniform.get(mean_key),
@@ -1171,14 +1275,20 @@ def build_comparison_summary(
             "seeds": [int(seed) for seed in seeds],
             "solver_names": [str(solver) for solver in solver_names],
             "target_nfe_values": [int(nfe) for nfe in target_nfe_values],
-            "expected_student_rows": int(len(seeds) * len(solver_names) * len(target_nfe_values) * len(student_schedule_keys)),
+            "expected_student_rows": int(
+                len(seeds) * len(solver_names) * len(target_nfe_values) * len(student_schedule_keys)
+            ),
             "observed_student_rows": int(len(student_rows)),
             "missing_student_cells": student_missing,
             "metric_keys": list(metric_keys),
             "schedule_summaries": aggregate_rows,
             "cell_rankings": rankings,
         }
-    all_rows = [dict(row) for row in baseline_rows] + [dict(row) for row in comparator_rows] + [dict(row) for row in student_rows]
+    all_rows = (
+        [dict(row) for row in baseline_rows]
+        + [dict(row) for row in comparator_rows]
+        + [dict(row) for row in student_rows]
+    )
     aggregate_rows = _aggregate_schedule_rows(all_rows)
     by_cell: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
     for row in aggregate_rows:
@@ -1189,7 +1299,9 @@ def build_comparison_summary(
         for target_nfe in target_nfe_values:
             cell_rows = by_cell.get((str(solver), int(target_nfe)), [])
             student_rows_for_cell = [row for row in cell_rows if str(row["scheduler_key"]) in student_schedule_keys]
-            student = next((row for row in student_rows_for_cell if row["scheduler_key"] == SELECTED_STUDENT_SCHEDULE_KEY), None)
+            student = next(
+                (row for row in student_rows_for_cell if row["scheduler_key"] == SELECTED_STUDENT_SCHEDULE_KEY), None
+            )
             if student is None and len(student_schedule_keys) == 1:
                 student = next(iter(student_rows_for_cell), None)
             uniform = next((row for row in cell_rows if row["scheduler_key"] == "uniform"), None)
@@ -1248,12 +1360,24 @@ def build_comparison_summary(
                     {
                         "student_crps_mean": student.get("crps_mean"),
                         "student_mase_mean": student.get("mase_mean"),
-                        "student_relative_crps_gain_vs_uniform": _safe_gain(student.get("crps_mean"), None if uniform is None else uniform.get("crps_mean")),
-                        "student_relative_mase_gain_vs_uniform": _safe_gain(student.get("mase_mean"), None if uniform is None else uniform.get("mase_mean")),
-                        "student_relative_crps_gain_vs_best_baseline": _safe_gain(student.get("crps_mean"), None if best_crps is None else best_crps.get("crps_mean")),
-                        "student_relative_mase_gain_vs_best_baseline": _safe_gain(student.get("mase_mean"), None if best_mase is None else best_mase.get("mase_mean")),
-                        "student_relative_crps_gain_vs_ser_ptg": _safe_gain(student.get("crps_mean"), None if ser_ptg is None else ser_ptg.get("crps_mean")),
-                        "student_relative_mase_gain_vs_ser_ptg": _safe_gain(student.get("mase_mean"), None if ser_ptg is None else ser_ptg.get("mase_mean")),
+                        "student_relative_crps_gain_vs_uniform": _safe_gain(
+                            student.get("crps_mean"), None if uniform is None else uniform.get("crps_mean")
+                        ),
+                        "student_relative_mase_gain_vs_uniform": _safe_gain(
+                            student.get("mase_mean"), None if uniform is None else uniform.get("mase_mean")
+                        ),
+                        "student_relative_crps_gain_vs_best_baseline": _safe_gain(
+                            student.get("crps_mean"), None if best_crps is None else best_crps.get("crps_mean")
+                        ),
+                        "student_relative_mase_gain_vs_best_baseline": _safe_gain(
+                            student.get("mase_mean"), None if best_mase is None else best_mase.get("mase_mean")
+                        ),
+                        "student_relative_crps_gain_vs_ser_ptg": _safe_gain(
+                            student.get("crps_mean"), None if ser_ptg is None else ser_ptg.get("crps_mean")
+                        ),
+                        "student_relative_mase_gain_vs_ser_ptg": _safe_gain(
+                            student.get("mase_mean"), None if ser_ptg is None else ser_ptg.get("mase_mean")
+                        ),
                         "student_internal_fraction_after_098_mean": student.get("internal_fraction_after_098_mean"),
                     }
                 )
@@ -1272,13 +1396,17 @@ def build_comparison_summary(
         target_nfe_values=target_nfe_values,
         schedule_keys=student_schedule_keys,
     )
-    ser_missing = _missing_cells(
-        comparator_rows,
-        seeds=seeds,
-        solver_names=solver_names,
-        target_nfe_values=target_nfe_values,
-        schedule_keys=SER_REFERENCE_SCHEDULE_KEYS,
-    ) if comparator_rows else []
+    ser_missing = (
+        _missing_cells(
+            comparator_rows,
+            seeds=seeds,
+            solver_names=solver_names,
+            target_nfe_values=target_nfe_values,
+            schedule_keys=SER_REFERENCE_SCHEDULE_KEYS,
+        )
+        if comparator_rows
+        else []
+    )
     return {
         "evaluator_signature": EVALUATOR_SIGNATURE_VERSION,
         "dataset": str(dataset),
@@ -1289,18 +1417,28 @@ def build_comparison_summary(
         "ser_ptg_is_baseline": SER_PTG_SCHEDULE_KEY in BASELINE_SCHEDULE_KEYS,
         "student_schedule_key": student_schedule_keys[0] if len(student_schedule_keys) == 1 else None,
         "student_schedule_keys": student_schedule_keys,
-        "student_is_baseline": False if len(student_schedule_keys) != 1 else student_schedule_keys[0] in BASELINE_SCHEDULE_KEYS,
+        "student_is_baseline": False
+        if len(student_schedule_keys) != 1
+        else student_schedule_keys[0] in BASELINE_SCHEDULE_KEYS,
         "student_schedule_key_is_baseline": {key: key in BASELINE_SCHEDULE_KEYS for key in student_schedule_keys},
         "seeds": [int(seed) for seed in seeds],
         "solver_names": [str(solver) for solver in solver_names],
         "target_nfe_values": [int(nfe) for nfe in target_nfe_values],
-        "expected_baseline_rows": int(len(seeds) * len(solver_names) * len(target_nfe_values) * len(BASELINE_SCHEDULE_KEYS)),
+        "expected_baseline_rows": int(
+            len(seeds) * len(solver_names) * len(target_nfe_values) * len(BASELINE_SCHEDULE_KEYS)
+        ),
         "observed_baseline_rows": int(len(baseline_rows)),
         "missing_baseline_cells": baseline_missing,
-        "expected_ser_ptg_rows": int(len(seeds) * len(solver_names) * len(target_nfe_values) * len(SER_REFERENCE_SCHEDULE_KEYS)) if comparator_rows else 0,
+        "expected_ser_ptg_rows": int(
+            len(seeds) * len(solver_names) * len(target_nfe_values) * len(SER_REFERENCE_SCHEDULE_KEYS)
+        )
+        if comparator_rows
+        else 0,
         "observed_ser_ptg_rows": int(len(comparator_rows)),
         "missing_ser_ptg_cells": ser_missing,
-        "expected_student_rows": int(len(seeds) * len(solver_names) * len(target_nfe_values) * len(student_schedule_keys)),
+        "expected_student_rows": int(
+            len(seeds) * len(solver_names) * len(target_nfe_values) * len(student_schedule_keys)
+        ),
         "observed_student_rows": int(len(student_rows)),
         "missing_student_cells": student_missing,
         "schedule_summaries": aggregate_rows,
@@ -1369,7 +1507,10 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
     selected_examples_cap, selected_examples_cap_source = _split_example_cap(args, split_phase)
     mode = "a" if rows_by_key else "w"
     total_cells = len(seeds) * len(schedule_keys) * len(target_nfes) * len(solver_names)
-    with jsonl_path.open(mode, encoding="utf-8") as fh, ProgressBar(total_cells, f"{split_phase} inference cells") as progress:
+    with (
+        jsonl_path.open(mode, encoding="utf-8") as fh,
+        ProgressBar(total_cells, f"{split_phase} inference cells") as progress,
+    ):
         for seed in seeds:
             if split_phase == TRAIN_TUNING_PHASE:
                 tuning_seed = int(args.train_tuning_seed) + int(seed)
@@ -1467,7 +1608,9 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                                 "selected_examples_cap": int(selection_meta["selected_examples_cap"]),
                                 "selected_examples_cap_source": str(selected_examples_cap_source),
                                 "uncapped_candidate_examples": int(selection_meta["uncapped_candidate_examples"]),
-                                "candidate_examples_after_initial_selection": int(selection_meta["candidate_examples_after_initial_selection"]),
+                                "candidate_examples_after_initial_selection": int(
+                                    selection_meta["candidate_examples_after_initial_selection"]
+                                ),
                                 "selection_was_capped": bool(selection_meta["selection_was_capped"]),
                             }
                         )
@@ -1477,11 +1620,15 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                                     "train_tuning_fraction": float(args.eval_train_fraction),
                                     "train_tuning_seed": int(args.train_tuning_seed) + int(seed),
                                     "train_tuning_strata": int(args.train_tuning_strata),
-                                    "train_tuning_sampler": train_tuning_sampler_key(str(args.train_tuning_sampling_mode)),
+                                    "train_tuning_sampler": train_tuning_sampler_key(
+                                        str(args.train_tuning_sampling_mode)
+                                    ),
                                     "train_tuning_sampling_mode": str(args.train_tuning_sampling_mode),
                                     "train_tuning_reference_examples": int(train_tuning_reference_examples),
                                     "train_tuning_target_examples": int(len(chosen_examples)),
-                                    "train_tuning_uncapped_candidate_examples": int(selection_meta["uncapped_candidate_examples"]),
+                                    "train_tuning_uncapped_candidate_examples": int(
+                                        selection_meta["uncapped_candidate_examples"]
+                                    ),
                                     "train_tuning_train_split_fraction": float(args.train_tuning_train_split_fraction),
                                     "train_tuning_val_split_fraction": float(args.train_tuning_val_split_fraction),
                                 }
@@ -1508,12 +1655,16 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                                             "train_tuning_fraction": float(args.eval_train_fraction),
                                             "train_tuning_seed": int(args.train_tuning_seed) + int(seed),
                                             "train_tuning_strata": int(args.train_tuning_strata),
-                                            "train_tuning_sampler": train_tuning_sampler_key(str(args.train_tuning_sampling_mode)),
+                                            "train_tuning_sampler": train_tuning_sampler_key(
+                                                str(args.train_tuning_sampling_mode)
+                                            ),
                                         }
                                     )
                                 signature = str(copied_detail["row_signature"])
                                 if signature in context_rows_by_signature:
-                                    raise ValueError(f"Duplicate context row signature while appending context artifacts: {signature}")
+                                    raise ValueError(
+                                        f"Duplicate context row signature while appending context artifacts: {signature}"
+                                    )
                                 context_rows_by_signature[signature] = copied_detail
                             _merge_context_embeddings_checked(
                                 context_embeddings,
@@ -1580,14 +1731,18 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
     if bool(args.select_schedule_from_validation):
         if split_phase != VALIDATION_PHASE:
             raise ValueError("Validation selection requires --split_phase validation_tuning.")
-        reference_rows = _load_rows_csv(
-            args.selection_reference_rows,
-            dataset=str(args.dataset),
-            split_phase=split_phase,
-            seeds=seeds,
-            solver_names=solver_names,
-            target_nfe_values=target_nfes,
-        ) if str(args.selection_reference_rows).strip() else []
+        reference_rows = (
+            _load_rows_csv(
+                args.selection_reference_rows,
+                dataset=str(args.dataset),
+                split_phase=split_phase,
+                seeds=seeds,
+                solver_names=solver_names,
+                target_nfe_values=target_nfes,
+            )
+            if str(args.selection_reference_rows).strip()
+            else []
+        )
         selection = select_best_validation_schedule(rows, reference_rows=reference_rows)
         selection_name = "validation_schedule_selection.json"
         save_json(selection, str(out_dir / selection_name))
@@ -1631,16 +1786,22 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
             solver_names=solver_names,
             target_nfe_values=target_nfes,
         )
-        save_json(comparison, str(out_dir / str(args.comparison_output_name or "student_vs_baselines_ser_ptg_summary.json")))
+        save_json(
+            comparison, str(out_dir / str(args.comparison_output_name or "student_vs_baselines_ser_ptg_summary.json"))
+        )
         summary["comparison_summary"] = comparison
     return summary
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate forecast schedule-summary grids on train-tuning, validation, or locked test splits.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate forecast schedule-summary grids on train-tuning, validation, or locked test splits."
+    )
     parser.add_argument("--dataset", default="traffic_hourly")
     parser.add_argument("--schedule_summary", required=True)
-    parser.add_argument("--split_phase", choices=(TRAIN_TUNING_PHASE, VALIDATION_PHASE, LOCKED_TEST_PHASE), required=True)
+    parser.add_argument(
+        "--split_phase", choices=(TRAIN_TUNING_PHASE, VALIDATION_PHASE, LOCKED_TEST_PHASE), required=True
+    )
     parser.add_argument("--out_dir", default=str(project_outputs_root() / "schedule_summary_evaluation"))
     parser.add_argument("--row_csv_name", default="")
     parser.add_argument("--row_jsonl_name", default="")
@@ -1661,9 +1822,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_train_fraction", type=float, default=0.20)
     parser.add_argument("--train_tuning_seed", type=int, default=0)
     parser.add_argument("--train_tuning_strata", type=int, default=20)
-    parser.add_argument("--train_tuning_sampling_mode", choices=TRAIN_TUNING_SAMPLING_MODES, default=TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION)
-    parser.add_argument("--train_tuning_train_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION)
-    parser.add_argument("--train_tuning_val_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION)
+    parser.add_argument(
+        "--train_tuning_sampling_mode",
+        choices=TRAIN_TUNING_SAMPLING_MODES,
+        default=TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
+    )
+    parser.add_argument(
+        "--train_tuning_train_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION
+    )
+    parser.add_argument(
+        "--train_tuning_val_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION
+    )
     parser.add_argument("--eval_windows_val", type=int, default=0)
     parser.add_argument("--eval_windows_test", type=int, default=0)
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))

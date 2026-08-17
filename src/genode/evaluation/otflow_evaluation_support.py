@@ -15,36 +15,19 @@ import numpy as np
 import torch
 
 from genode.canonical_experiment_layout import CANONICAL_CHECKPOINT_STEPS, SCENARIO_FAMILY_MOLECULE
-from genode.solver_protocol import (
-    CANONICAL_SOLVER_KEYS,
-    CANONICAL_SOLVER_RUNTIME_NAMES,
-    solver_eval_multiplier,
-    solver_macro_steps,
-    solver_order_p,
-)
 from genode.data.experiment_common import DATASET_PLANS, build_dataset_splits, get_otflow_paper_backbone_preset
-from genode.evaluation.fm_backbone_registry import (
-    BACKBONE_NAME_OTFLOW,
-    build_backbone_checkpoint_id,
-    find_backbone_artifact,
-    load_backbone_manifest,
-    train_budget_label,
-)
 from genode.data.otflow_experiment_plan import (
     CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS,
     CANONICAL_FORECAST_PAPER_DATASETS,
     CONDITIONAL_GENERATION_FAMILY,
     FORECAST_FAMILY,
-    SUPPORTED_CONDITIONAL_GENERATION_DATASETS as ALL_SUPPORTED_CONDITIONAL_GENERATION_DATASETS,
     experiment_plan_by_key,
+)
+from genode.data.otflow_experiment_plan import (
+    SUPPORTED_CONDITIONAL_GENERATION_DATASETS as ALL_SUPPORTED_CONDITIONAL_GENERATION_DATASETS,
 )
 from genode.data.otflow_forecast_data import build_monash_forecast_splits
 from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
-from genode.models.conditioning import (
-    FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
-    frozen_backbone_policy_context,
-)
-from genode.models.otflow_model import OTFlow
 from genode.data.otflow_paths import (
     default_cryptos_data_path,
     default_lobster_synthetic_profile_path,
@@ -52,14 +35,33 @@ from genode.data.otflow_paths import (
     project_results_root,
     resolve_project_path,
 )
+from genode.evaluation.fm_backbone_registry import (
+    BACKBONE_NAME_OTFLOW,
+    build_backbone_checkpoint_id,
+    find_backbone_artifact,
+    load_backbone_manifest,
+    train_budget_label,
+)
 from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _restore_sample_overrides
+from genode.models.conditioning import (
+    FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+    frozen_backbone_policy_context,
+)
+from genode.models.otflow_model import OTFlow
+from genode.models.otflow_train_val import save_json, seed_all
 from genode.runtime import ProgressBar
 from genode.schedule_transfer.otflow_signal_traces import (
     NATIVE_INFO_GROWTH_TRACE_KEY,
     compute_info_growth_hardness_numpy,
     resolved_info_growth_scale,
 )
-from genode.models.otflow_train_val import save_json, seed_all
+from genode.solver_protocol import (
+    CANONICAL_SOLVER_KEYS,
+    CANONICAL_SOLVER_RUNTIME_NAMES,
+    solver_eval_multiplier,
+    solver_macro_steps,
+    solver_order_p,
+)
 
 VALIDATION_PHASE = "validation_tuning"
 LOCKED_TEST_PHASE = "locked_test"
@@ -77,9 +79,7 @@ DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION = 0.70
 DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION = 0.10
 
 UNIFORM_SCHEDULER_KEY = "uniform"
-DEFAULT_SHARED_BACKBONE_ROOT = (
-    project_results_root() / "shared_backbones" / "otflow_fullhorizon_seed0"
-)
+DEFAULT_SHARED_BACKBONE_ROOT = project_results_root() / "shared_backbones" / "otflow_fullhorizon_seed0"
 DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE = "transformer"
 DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS = 20_000
 CANONICAL_TEMPORAL_ROLLOUT_MODE = "non_ar"
@@ -105,6 +105,7 @@ DEFAULT_CONDITIONAL_GENERATION_DATASETS = tuple(CANONICAL_CONDITIONAL_GENERATION
 SUPPORTED_CONDITIONAL_GENERATION_DATASETS = tuple(ALL_SUPPORTED_CONDITIONAL_GENERATION_DATASETS)
 ALL_SOLVER_ORDER: Tuple[str, ...] = CANONICAL_SOLVER_KEYS
 SOLVER_RUNTIME_NAMES: Dict[str, str] = dict(CANONICAL_SOLVER_RUNTIME_NAMES)
+
 
 def _empirical_crps(samples: np.ndarray, target: np.ndarray) -> float:
     samples = np.asarray(samples, dtype=np.float64)
@@ -294,7 +295,7 @@ def choose_forecast_train_tuning_indices(
             ranges = _strata_ranges(total, int(strata))
             counts = _allocate_stratified_target_counts(total, int(strata), int(cap))
             selected: List[int] = []
-            for stratum, ((start, end), keep) in enumerate(zip(ranges, counts)):
+            for stratum, ((start, end), keep) in enumerate(zip(ranges, counts, strict=False)):
                 if int(keep) <= 0:
                     continue
                 size = int(end - start)
@@ -340,7 +341,7 @@ def choose_forecast_train_tuning_indices(
     ranges = _strata_ranges(total, int(strata))
     counts = _allocate_stratified_target_counts(total, int(strata), int(target))
     selected = []
-    for stratum, ((start, end), keep) in enumerate(zip(ranges, counts)):
+    for stratum, ((start, end), keep) in enumerate(zip(ranges, counts, strict=False)):
         if int(keep) <= 0:
             continue
         size = int(end - start)
@@ -385,17 +386,9 @@ def _forecast_example_detail_metadata(
     if isinstance(meta, Mapping):
         metadata.update(dict(meta))
     dataset = str(
-        dataset_key
-        or metadata.get("dataset")
-        or metadata.get("dataset_key")
-        or getattr(ds, "dataset_key", "")
+        dataset_key or metadata.get("dataset") or metadata.get("dataset_key") or getattr(ds, "dataset_key", "")
     )
-    split = str(
-        split_phase
-        or metadata.get("split_phase")
-        or metadata.get("split")
-        or getattr(ds, "split_name", "")
-    )
+    split = str(split_phase or metadata.get("split_phase") or metadata.get("split") or getattr(ds, "split_name", ""))
     series_idx = int(metadata.get("series_idx", example_idx))
     return {
         "dataset": dataset,
@@ -576,8 +569,7 @@ def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
         if missing_manifest_checkpoints:
             missing_lines = ", ".join(str(path) for path in missing_manifest_checkpoints)
             errors.append(
-                "Backbone manifest contains ready OTFlow artifacts whose checkpoint files are missing: "
-                f"{missing_lines}"
+                f"Backbone manifest contains ready OTFlow artifacts whose checkpoint files are missing: {missing_lines}"
             )
     else:
         missing_checkpoints = _missing_shared_checkpoint_paths(
@@ -666,8 +658,7 @@ def resolved_eval_horizon(cli_args: argparse.Namespace, dataset: str) -> int:
         return int(expected)
     if override != expected:
         raise ValueError(
-            f"Non-canonical --eval_horizon={override} for {dataset}; use 0 or the locked "
-            f"experiment horizon {expected}."
+            f"Non-canonical --eval_horizon={override} for {dataset}; use 0 or the locked experiment horizon {expected}."
         )
     return int(expected)
 
@@ -829,15 +820,13 @@ def load_otflow_checkpoint_payload(
     size_bytes = int(path.stat().st_size)
     if size_bytes < 1024:
         raise RuntimeError(
-            f"Invalid OTFlow checkpoint at {path}: file is only {size_bytes} bytes; "
-            f"expected {expected_identity}."
+            f"Invalid OTFlow checkpoint at {path}: file is only {size_bytes} bytes; expected {expected_identity}."
         )
     with path.open("rb") as fh:
         header = fh.read(256)
     if _checkpoint_header_is_known_text_placeholder(header):
         raise RuntimeError(
-            f"Invalid OTFlow checkpoint at {path}: file looks like text or a pointer, "
-            f"not {expected_identity}."
+            f"Invalid OTFlow checkpoint at {path}: file looks like text or a pointer, not {expected_identity}."
         )
     try:
         payload = torch.load(str(path), map_location="cpu", weights_only=True)
@@ -854,8 +843,7 @@ def load_otflow_checkpoint_payload(
     missing_keys = sorted({"cfg", "model_state"} - set(payload.keys()))
     if missing_keys:
         raise RuntimeError(
-            f"Invalid OTFlow checkpoint at {path}: missing required keys {missing_keys} "
-            f"for {expected_identity}."
+            f"Invalid OTFlow checkpoint at {path}: missing required keys {missing_keys} for {expected_identity}."
         )
     return payload
 
@@ -974,8 +962,7 @@ def _validate_metadata_identity(
         observed = caster(_required_metadata_value(metadata, key))
         if observed != expected:
             raise RuntimeError(
-                f"Checkpoint {ckpt_path} metadata mismatch for {dataset}: "
-                f"{key}={observed!r}, expected {expected!r}."
+                f"Checkpoint {ckpt_path} metadata mismatch for {dataset}: {key}={observed!r}, expected {expected!r}."
             )
     if expected_field_network_type is not None:
         observed_field = str(_required_metadata_value(metadata, "field_network_type"))
@@ -1116,7 +1103,9 @@ def load_forecast_checkpoint_splits(
     resolved_eval_horizon(cli_args, str(dataset))
     resolved_future_block_len(cli_args, str(dataset))
     resolved_rollout_mode(cli_args, str(dataset))
-    manifest_artifact = _resolved_manifest_artifact(cli_args, benchmark_family=FORECAST_FAMILY, dataset_key=str(dataset))
+    manifest_artifact = _resolved_manifest_artifact(
+        cli_args, benchmark_family=FORECAST_FAMILY, dataset_key=str(dataset)
+    )
     if manifest_artifact is not None:
         ckpt_path = _resolve_checkpoint_path(str(manifest_artifact["checkpoint_path"]))
         checkpoint_id = str(manifest_artifact["checkpoint_id"])
@@ -1126,7 +1115,9 @@ def load_forecast_checkpoint_splits(
     else:
         ckpt_path = shared_backbone_root / FORECAST_FAMILY / str(dataset) / "model.pt"
         metadata = _safe_json(shared_backbone_root / FORECAST_FAMILY / str(dataset) / "checkpoint_metadata.json") or {}
-        resolved_checkpoint_steps = int(metadata.get("train_steps", int(getattr(cli_args, "otflow_train_steps", 20000))))
+        resolved_checkpoint_steps = int(
+            metadata.get("train_steps", int(getattr(cli_args, "otflow_train_steps", 20000)))
+        )
         resolved_budget_label = str(metadata.get("train_budget_label", train_budget_label(resolved_checkpoint_steps)))
         checkpoint_id = str(
             metadata.get("checkpoint_id")
@@ -1327,7 +1318,6 @@ def load_conditional_generation_checkpoint_splits(
     }
 
 
-
 def collect_forecast_calibration(
     model: OTFlow,
     ds_val,
@@ -1380,7 +1370,7 @@ def collect_forecast_calibration(
         residual_rows.append(residual)
         oracle_rows.append(oracle)
         for step_idx, (disagreement_value, residual_value, oracle_value) in enumerate(
-            zip(disagreement.tolist(), residual.tolist(), oracle.tolist())
+            zip(disagreement.tolist(), residual.tolist(), oracle.tolist(), strict=False)
         ):
             trace_rows.append(
                 {
@@ -1400,10 +1390,7 @@ def collect_forecast_calibration(
     base_scale = resolved_info_growth_scale(residual_arr.reshape(-1))
     effective_scale = float(base_scale) * float(info_growth_scale_multiplier)
     if effective_scale <= 0.0:
-        raise ValueError(
-            "info_growth_scale_multiplier must keep scale positive, "
-            f"got {info_growth_scale_multiplier}"
-        )
+        raise ValueError(f"info_growth_scale_multiplier must keep scale positive, got {info_growth_scale_multiplier}")
     info_growth_arr = compute_info_growth_hardness_numpy(
         residual_arr,
         disagreement_arr,
@@ -1502,7 +1489,9 @@ def evaluate_forecast_schedule(
             separators=(",", ":"),
         )
         evaluation_protocol_hash = hashlib.sha256(encoded_protocol.encode("utf-8")).hexdigest()
-        chosen_examples_hash = hashlib.sha256(json.dumps(example_payload, separators=(",", ":")).encode("utf-8")).hexdigest()
+        chosen_examples_hash = hashlib.sha256(
+            json.dumps(example_payload, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         realized_nfe = int(runtime_nfe) * int(solver_eval_multiplier(str(solver_name)))
         resolved_target_nfe = int(realized_nfe if target_nfe is None else target_nfe)
         chunk_starts = list(range(0, len(example_list), effective_batch_size))
@@ -1573,7 +1562,8 @@ def evaluate_forecast_schedule(
                         for context_idx, context_id in enumerate(chunk_context_ids):
                             context_embedding_id = f"{checkpoint_id}:{context_id}"
                             context_embeddings[context_embedding_id] = [
-                                float(value) for value in chunk_context_embeddings[context_idx].astype(np.float32).tolist()
+                                float(value)
+                                for value in chunk_context_embeddings[context_idx].astype(np.float32).tolist()
                             ]
                 chunk_draws: List[np.ndarray] = []
                 for sample_idx in range(int(num_eval_samples)):
@@ -1670,11 +1660,15 @@ def evaluate_forecast_schedule(
                                 "forecast_mase_scale_kind": "seasonal"
                                 if int(getattr(ds, "mase_seasonal_period", 1) or 1) > 1
                                 else "nonseasonal",
-                                "forecast_mase_scale_period": int(max(1, int(getattr(ds, "mase_seasonal_period", 1) or 1))),
+                                "forecast_mase_scale_period": int(
+                                    max(1, int(getattr(ds, "mase_seasonal_period", 1) or 1))
+                                ),
                                 "num_eval_samples": int(num_eval_samples),
                                 "eval_horizon": int(getattr(ds, "horizon", 1)),
                                 "batch_size": int(effective_batch_size),
-                                "sample_seed_start": int(sample_seed_values[0]) if sample_seed_values else int(evaluation_seed),
+                                "sample_seed_start": int(sample_seed_values[0])
+                                if sample_seed_values
+                                else int(evaluation_seed),
                                 "sample_seed_values_json": json.dumps(sample_seed_values, separators=(",", ":")),
                                 "chosen_examples_hash": str(chosen_examples_hash),
                                 "evaluation_protocol_hash": str(evaluation_protocol_hash),

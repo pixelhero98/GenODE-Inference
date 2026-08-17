@@ -5,7 +5,6 @@ from typing import Sequence, Tuple
 import numpy as np
 import torch
 
-
 NATIVE_INFO_GROWTH_ROW_KEY = "info_growth_hardness"
 NATIVE_INFO_GROWTH_TRACE_KEY = "info_growth_hardness_by_step"
 BASE_MODEL_SIGNAL_SPECS: Tuple[Tuple[str, str], ...] = (

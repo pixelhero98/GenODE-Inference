@@ -20,6 +20,8 @@ from genode.distillation.demonstrations import _noise_seed
 from genode.distillation.training import DemonstrationStore
 from genode.gico.density_representation import (
     DEFAULT_DENSITY_BIN_COUNT as DENSITY_BIN_COUNT,
+)
+from genode.gico.density_representation import (
     uniform_reference_grid,
 )
 from genode.gico.models import build_setting_encoder_config
@@ -114,9 +116,7 @@ def test_context_fingerprint_uses_float32_and_normalized_zero_without_mutation()
     condition64 = np.asarray([0.0, 0.3], dtype=np.float64)
     original_bytes = (history32.tobytes(), history64.tobytes(), condition32.tobytes())
 
-    assert context_fingerprint(history32, condition32) == context_fingerprint(
-        history64, condition64
-    )
+    assert context_fingerprint(history32, condition32) == context_fingerprint(history64, condition64)
     assert (history32.tobytes(), history64.tobytes(), condition32.tobytes()) == original_bytes
     assert bool(np.signbit(history32[0, 1]))
     assert bool(np.signbit(condition32[0]))
@@ -148,18 +148,13 @@ def test_store_split_and_rollout_seed_depend_on_physical_identity(tmp_path: Path
     assert first.context_fingerprints == renamed.context_fingerprints
     first_metadata = load_demonstration_manifest(first_manifest)["metadata"]
     assert first_metadata["contexts_source_kind"] == "in_memory"
-    assert first_metadata["contexts_source_sha256"] == in_memory_context_source_sha256(
-        ("alpha", "beta"), fingerprints
-    )
+    assert first_metadata["contexts_source_sha256"] == in_memory_context_source_sha256(("alpha", "beta"), fingerprints)
 
     expected_seed = int.from_bytes(
         hashlib.sha256(f"23\0{fingerprints[0]}\0{0}".encode("utf-8")).digest()[:8],
         "big",
     ) % (2**63 - 1)
-    assert (
-        _noise_seed(23, context_fingerprint=fingerprints[0], rollout_index=0)
-        == expected_seed
-    )
+    assert _noise_seed(23, context_fingerprint=fingerprints[0], rollout_index=0) == expected_seed
 
 
 @pytest.mark.parametrize("field", ["contexts_source_kind", "contexts_source_sha256"])

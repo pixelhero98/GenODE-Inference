@@ -16,8 +16,14 @@ from genode.canonical_experiment_layout import (
     canonical_nfes_for_role,
 )
 from genode.evaluation import diffusion_flow_time_reparameterization as runner
-from genode.solver_protocol import expected_realized_nfe, normalize_solver_key, normalize_solver_keys, normalize_solver_nfe_fields, solver_macro_steps
 from genode.gico.train_gico import build_argparser as build_gico_argparser
+from genode.solver_protocol import (
+    expected_realized_nfe,
+    normalize_solver_key,
+    normalize_solver_keys,
+    normalize_solver_nfe_fields,
+    solver_macro_steps,
+)
 
 
 class CanonicalSeenUnseenLayoutTests(unittest.TestCase):

@@ -71,9 +71,7 @@ SOLVER_LABELS: Dict[str, str] = {
 TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
 TRANSFER_SCHEDULES: Tuple[str, ...] = TRANSFER_SCHEDULE_KEYS
 INTEGRATION_SCHEDULES: Tuple[str, ...] = ("uniform", *TRANSFER_SCHEDULES)
-SCHEDULE_LABELS: Dict[str, str] = {
-    key: schedule_display_name(key) for key in INTEGRATION_SCHEDULES
-}
+SCHEDULE_LABELS: Dict[str, str] = {key: schedule_display_name(key) for key in INTEGRATION_SCHEDULES}
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2, 3, 4)
 DEFAULT_REFERENCE_MACRO_FACTOR = 4.0
 DEFAULT_DENSE_REFERENCE_MACRO_FACTOR = 16.0
@@ -162,10 +160,7 @@ def normalize_hardness_for_ptg(
     h = np.clip(_finite_1d(hardness, name="hardness"), 0.0, None)
     grid = validate_time_grid(reference_time_grid, name="reference_time_grid")
     if grid.size != h.size + 1:
-        raise ValueError(
-            "reference_time_grid must have length len(hardness) + 1 "
-            f"({h.size + 1}), got {grid.size}."
-        )
+        raise ValueError(f"reference_time_grid must have length len(hardness) + 1 ({h.size + 1}), got {grid.size}.")
     widths = np.diff(grid)
     eps_h = float(eps_multiplier) * max(float(np.mean(h)), 1e-12)
     weighted = h + eps_h
@@ -191,7 +186,7 @@ def schedule_density_on_reference_grid(
     local_density = 1.0 / (float(n_steps) * step_widths)
     rho = np.zeros(int(ref_widths.size), dtype=np.float64)
     step_idx = 0
-    for ref_idx, (left, right) in enumerate(zip(reference[:-1], reference[1:])):
+    for ref_idx, (left, right) in enumerate(zip(reference[:-1], reference[1:], strict=False)):
         left_f = float(left)
         right_f = float(right)
         while step_idx < n_steps - 1 and float(schedule[step_idx + 1]) <= left_f + 1e-14:
@@ -250,8 +245,7 @@ def local_defect_trace_from_oracle(
     grid = validate_time_grid(reference_time_grid, name="reference_time_grid")
     if grid.size != oracle.size + 1:
         raise ValueError(
-            "reference_time_grid must have length len(oracle_local_error) + 1 "
-            f"({oracle.size + 1}), got {grid.size}."
+            f"reference_time_grid must have length len(oracle_local_error) + 1 ({oracle.size + 1}), got {grid.size}."
         )
     p = float(solver_order_p)
     if p <= 0.0:
@@ -385,13 +379,14 @@ def solver_order_for_ptg(solver_key: str) -> float:
 
 def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
     import torch
+
+    from genode.data.otflow_paths import project_paper_dataset_root
     from genode.evaluation.otflow_evaluation_support import (
         collect_forecast_calibration,
         load_forecast_checkpoint_splits,
         resolve_reference_macro_steps,
         solver_macro_steps,
     )
-    from genode.data.otflow_paths import project_paper_dataset_root
     from genode.runtime import resolve_torch_device
 
     datasets = parse_csv(str(args.datasets))
@@ -471,9 +466,7 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
                         if reference_time_grid is None:
                             reference_time_grid = grid
                         elif not np.allclose(reference_time_grid, grid, atol=1e-8, rtol=1e-8):
-                            raise ValueError(
-                                f"Reference grids differ for {dataset}/{solver_key}/NFE={target_nfe}."
-                            )
+                            raise ValueError(f"Reference grids differ for {dataset}/{solver_key}/NFE={target_nfe}.")
                         local_defect_trace = local_defect_trace_from_oracle(
                             oracle_trace,
                             grid,
@@ -500,7 +493,9 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
                         )
                     if reference_time_grid is None:
                         raise ValueError(f"No reference grid collected for {dataset}/{solver_key}/NFE={target_nfe}.")
-                    mean_info_growth = mean_trace(info_growth_traces, name=f"{dataset}_{solver_key}_{target_nfe}_info_growth")
+                    mean_info_growth = mean_trace(
+                        info_growth_traces, name=f"{dataset}_{solver_key}_{target_nfe}_info_growth"
+                    )
                     mean_oracle = mean_trace(oracle_traces, name=f"{dataset}_{solver_key}_{target_nfe}_oracle")
                     mean_local_defect = mean_trace(
                         local_defect_traces,
@@ -581,6 +576,7 @@ def _sample_forecast_endpoints_norm(
     batch_size: int = 64,
 ) -> Tuple[List[np.ndarray], float]:
     import torch
+
     from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _restore_sample_overrides
     from genode.models.otflow_train_val import seed_all
 
@@ -620,11 +616,13 @@ def _mean_endpoint_l2(endpoints: Sequence[np.ndarray], references: Sequence[np.n
     if not endpoints:
         raise ValueError("Cannot compute integration error from an empty endpoint list.")
     errors: List[float] = []
-    for idx, (endpoint, reference) in enumerate(zip(endpoints, references)):
+    for idx, (endpoint, reference) in enumerate(zip(endpoints, references, strict=False)):
         endpoint_arr = np.asarray(endpoint, dtype=np.float64).reshape(-1)
         reference_arr = np.asarray(reference, dtype=np.float64).reshape(-1)
         if endpoint_arr.shape != reference_arr.shape:
-            raise ValueError(f"Endpoint/reference shape mismatch at example {idx}: {endpoint_arr.shape} vs {reference_arr.shape}.")
+            raise ValueError(
+                f"Endpoint/reference shape mismatch at example {idx}: {endpoint_arr.shape} vs {reference_arr.shape}."
+            )
         errors.append(float(np.linalg.norm(endpoint_arr - reference_arr, ord=2)))
     return float(np.mean(np.asarray(errors, dtype=np.float64)))
 
@@ -638,12 +636,13 @@ def _dense_uniform_grid(n_steps: int) -> List[float]:
 
 def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
     import torch
+
+    from genode.data.otflow_paths import project_paper_dataset_root
     from genode.evaluation.otflow_evaluation_support import (
         load_forecast_checkpoint_splits,
         resolve_reference_macro_steps,
         solver_macro_steps,
     )
-    from genode.data.otflow_paths import project_paper_dataset_root
     from genode.runtime import resolve_torch_device
 
     datasets = parse_csv(str(args.datasets))
@@ -885,7 +884,7 @@ def write_csv_rows(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames: List[str] = []
     for row in rows:
-        for key in row.keys():
+        for key in row:
             if key not in fieldnames:
                 fieldnames.append(str(key))
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -936,9 +935,8 @@ def load_integration_gain_rows(path: Path) -> Dict[Tuple[str, int, str, str], Di
 
 
 def _load_zip_csv(zip_path: Path, member_name: str) -> List[Dict[str, str]]:
-    with zipfile.ZipFile(zip_path) as archive:
-        with archive.open(member_name) as handle:
-            return list(csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8")))
+    with zipfile.ZipFile(zip_path) as archive, archive.open(member_name) as handle:
+        return list(csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8")))
 
 
 def observed_gain_from_relative_row(row: Mapping[str, str]) -> Dict[str, float]:
@@ -1159,7 +1157,9 @@ def _axis_limits(values: np.ndarray, *, pad_fraction: float = 0.08) -> Tuple[flo
     return low - pad_fraction * span, high + pad_fraction * span
 
 
-def summarize_ptg_points(points: Sequence[Mapping[str, Any]], *, main_ptg_key: str = DEFAULT_MAIN_PTG_KEY) -> Dict[str, Any]:
+def summarize_ptg_points(
+    points: Sequence[Mapping[str, Any]], *, main_ptg_key: str = DEFAULT_MAIN_PTG_KEY
+) -> Dict[str, Any]:
     if not points:
         raise ValueError("Cannot summarize an empty point set.")
     y = [float(point["observed_integration_gain_percent"]) for point in points]
@@ -1477,7 +1477,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build the forecast PTG vs observed gain scatter figure.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    collect = subparsers.add_parser("collect", help="Collect validation hardness traces using the diffusion-flow evaluation harness.")
+    collect = subparsers.add_parser(
+        "collect", help="Collect validation hardness traces using the diffusion-flow evaluation harness."
+    )
     collect.add_argument("--out-json", type=Path, default=DEFAULT_INPUT_JSON)
     collect.add_argument("--datasets", type=str, default=",".join(DATASET_ORDER))
     collect.add_argument("--solvers", type=str, default=",".join(SOLVER_ORDER))
@@ -1488,7 +1490,9 @@ def build_argparser() -> argparse.ArgumentParser:
     collect.add_argument("--calibration-trace-samples", type=int, default=DEFAULT_CALIBRATION_TRACE_SAMPLES)
     collect.add_argument("--backbone-manifest", type=str, default="outputs/backbone_matrix/backbone_manifest.json")
     collect.add_argument("--device", type=str, default="auto")
-    collect.add_argument("--smoke", action="store_true", help="Collect the first dataset/solver/NFE/seed with a tiny window cap.")
+    collect.add_argument(
+        "--smoke", action="store_true", help="Collect the first dataset/solver/NFE/seed with a tiny window cap."
+    )
 
     integration = subparsers.add_parser(
         "collect-integration-error",
@@ -1509,7 +1513,9 @@ def build_argparser() -> argparse.ArgumentParser:
     integration.add_argument("--resume", action="store_true", help="Skip seed cells already present in --rows-csv.")
     integration.add_argument("--smoke", action="store_true", help="Collect one tiny integration-error cell.")
 
-    plot = subparsers.add_parser("plot", help="Join collected PTG inputs with integration-error gains and render the figure.")
+    plot = subparsers.add_parser(
+        "plot", help="Join collected PTG inputs with integration-error gains and render the figure."
+    )
     plot.add_argument("--input-json", type=Path, default=DEFAULT_INPUT_JSON)
     plot.add_argument("--integration-error-csv", type=Path, default=DEFAULT_INTEGRATION_SEED_STATS_CSV)
     plot.add_argument("--points-csv", type=Path, default=DEFAULT_POINTS_CSV)
@@ -1541,7 +1547,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         stats_rows = aggregate_integration_error_rows(rows)
         write_csv_rows(rows, Path(args.rows_csv))
         write_csv_rows(stats_rows, Path(args.seed_stats_csv))
-        print(json.dumps({"rows_csv": str(Path(args.rows_csv)), "seed_stats_csv": str(Path(args.seed_stats_csv)), "rows": len(rows), "seed_stats_rows": len(stats_rows)}, indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "rows_csv": str(Path(args.rows_csv)),
+                    "seed_stats_csv": str(Path(args.seed_stats_csv)),
+                    "rows": len(rows),
+                    "seed_stats_rows": len(stats_rows),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return
     if args.command == "plot":
         payload = load_json(Path(args.input_json))

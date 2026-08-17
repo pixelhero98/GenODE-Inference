@@ -104,21 +104,15 @@ def test_measurement_protocol_round_trip_binds_external_runner(tmp_path: Path) -
         (lambda payload: payload.update({"candidate_catalog_sha256": "e" * 64}), "does not match"),
         (lambda payload: payload["runner"].update({"implementation_sha256": "bad"}), "SHA-256"),
         (
-            lambda payload: payload["artifact_binding"].update(
-                {"gico_checkpoint_sha256": "e" * 64}
-            ),
+            lambda payload: payload["artifact_binding"].update({"gico_checkpoint_sha256": "e" * 64}),
             "does not match",
         ),
         (
-            lambda payload: payload["quality_gate"].update(
-                {"bootstrap_seed": 7}
-            ),
+            lambda payload: payload["quality_gate"].update({"bootstrap_seed": 7}),
             "does not match",
         ),
         (
-            lambda payload: payload["quality_evaluator"].update(
-                {"implementation_sha256": "e" * 64}
-            ),
+            lambda payload: payload["quality_evaluator"].update({"implementation_sha256": "e" * 64}),
             "does not match",
         ),
         (lambda payload: payload.update({"locked_test_used_for_selection": True}), "locked_test"),

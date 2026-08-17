@@ -9,9 +9,9 @@ from unittest import mock
 import torch
 
 from genode.canonical_experiment_layout import CANONICAL_CONTEXT_SAMPLE_COUNT
+from genode.evaluation.otflow_evaluation_support import build_conditional_generation_dataset_args_from_cfg
 from genode.gico import ser_ptg_reference as ser
 from genode.gico.ser_ptg_reference import build_argparser, build_ser_ptg_reference, collect_batched_local_defect_trace
-from genode.evaluation.otflow_evaluation_support import build_conditional_generation_dataset_args_from_cfg
 from genode.models.config import OTFlowConfig
 
 
@@ -133,10 +133,14 @@ class SerPtgReferenceTests(unittest.TestCase):
             "splits": {"train": FakeDataset(5000), "val": FakeDataset(50)},
             "checkpoint_id": "forecast_ckpt",
         }
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(ser, "load_forecast_checkpoint_splits", return_value=checkpoint), mock.patch.object(
-            ser,
-            "collect_batched_local_defect_trace",
-            side_effect=fake_collector,
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(ser, "load_forecast_checkpoint_splits", return_value=checkpoint),
+            mock.patch.object(
+                ser,
+                "collect_batched_local_defect_trace",
+                side_effect=fake_collector,
+            ),
         ):
             args = build_argparser().parse_args(
                 [
@@ -200,10 +204,14 @@ class SerPtgReferenceTests(unittest.TestCase):
             "splits": {"train": FakeDataset(10), "val": FakeDataset(2000)},
             "checkpoint_id": "forecast_ckpt",
         }
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(ser, "load_forecast_checkpoint_splits", return_value=checkpoint), mock.patch.object(
-            ser,
-            "collect_batched_local_defect_trace",
-            side_effect=fake_collector,
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(ser, "load_forecast_checkpoint_splits", return_value=checkpoint),
+            mock.patch.object(
+                ser,
+                "collect_batched_local_defect_trace",
+                side_effect=fake_collector,
+            ),
         ):
             args = build_argparser().parse_args(
                 [
@@ -271,14 +279,20 @@ class SerPtgReferenceTests(unittest.TestCase):
             "splits": {"train": FakeDataset(), "val": FakeDataset()},
             "checkpoint_id": "conditional_ckpt",
         }
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(ser, "load_conditional_generation_checkpoint_splits", return_value=checkpoint), mock.patch.object(
-            ser,
-            "resolved_eval_horizon",
-            return_value=1,
-        ), mock.patch.object(ser, "_choose_valid_windows", side_effect=fake_choose_valid_windows), mock.patch.object(
-            ser,
-            "collect_batched_local_defect_trace",
-            side_effect=fake_collector,
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(ser, "load_conditional_generation_checkpoint_splits", return_value=checkpoint),
+            mock.patch.object(
+                ser,
+                "resolved_eval_horizon",
+                return_value=1,
+            ),
+            mock.patch.object(ser, "_choose_valid_windows", side_effect=fake_choose_valid_windows),
+            mock.patch.object(
+                ser,
+                "collect_batched_local_defect_trace",
+                side_effect=fake_collector,
+            ),
         ):
             args = build_argparser().parse_args(
                 [
@@ -338,26 +352,35 @@ class SerPtgReferenceTests(unittest.TestCase):
             "cfg": SimpleNamespace(),
             "splits": {"train": FakeDataset(), "val": FakeDataset()},
         }
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(ser, "load_molecule_group_manifest", return_value={}), mock.patch.object(
-            ser,
-            "trainable_molecule_group_members",
-            return_value=[{"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"}],
-        ), mock.patch.object(ser, "load_backbone_manifest", return_value={}), mock.patch.object(
-            ser,
-            "find_backbone_artifact",
-            return_value={"checkpoint_path": str(Path(tmpdir) / "model.pt"), "checkpoint_id": "molecule_ckpt"},
-        ), mock.patch.object(
-            ser,
-            "load_molecule_checkpoint_splits",
-            return_value=loaded,
-        ), mock.patch.object(
-            ser,
-            "_choose_molecule_indices",
-            return_value=list(range(400)),
-        ), mock.patch.object(
-            ser,
-            "collect_molecule_local_defect_trace",
-            side_effect=fake_collector,
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(ser, "load_molecule_group_manifest", return_value={}),
+            mock.patch.object(
+                ser,
+                "trainable_molecule_group_members",
+                return_value=[{"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"}],
+            ),
+            mock.patch.object(ser, "load_backbone_manifest", return_value={}),
+            mock.patch.object(
+                ser,
+                "find_backbone_artifact",
+                return_value={"checkpoint_path": str(Path(tmpdir) / "model.pt"), "checkpoint_id": "molecule_ckpt"},
+            ),
+            mock.patch.object(
+                ser,
+                "load_molecule_checkpoint_splits",
+                return_value=loaded,
+            ),
+            mock.patch.object(
+                ser,
+                "_choose_molecule_indices",
+                return_value=list(range(400)),
+            ),
+            mock.patch.object(
+                ser,
+                "collect_molecule_local_defect_trace",
+                side_effect=fake_collector,
+            ),
         ):
             args = build_argparser().parse_args(
                 [
@@ -423,31 +446,43 @@ class SerPtgReferenceTests(unittest.TestCase):
         def fake_artifact(*args, **kwargs):
             del args
             member_key = str(kwargs["member_key"])
-            return {"checkpoint_path": str(Path(tempdir) / f"{member_key}.pt"), "checkpoint_id": f"molecule_{member_key}"}
+            return {
+                "checkpoint_path": str(Path(tempdir) / f"{member_key}.pt"),
+                "checkpoint_id": f"molecule_{member_key}",
+            }
 
-        with tempfile.TemporaryDirectory() as tempdir, mock.patch.object(ser, "load_molecule_group_manifest", return_value={}), mock.patch.object(
-            ser,
-            "trainable_molecule_group_members",
-            return_value=[
-                {"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"},
-                {"member_key": "member_b", "stratum": "set1", "processed_dir": "member_b"},
-            ],
-        ), mock.patch.object(ser, "load_backbone_manifest", return_value={}), mock.patch.object(
-            ser,
-            "find_backbone_artifact",
-            side_effect=fake_artifact,
-        ), mock.patch.object(
-            ser,
-            "load_molecule_checkpoint_splits",
-            return_value=loaded,
-        ), mock.patch.object(
-            ser,
-            "_choose_molecule_indices",
-            return_value=list(range(100)),
-        ), mock.patch.object(
-            ser,
-            "collect_molecule_local_defect_trace",
-            side_effect=fake_collector,
+        with (
+            tempfile.TemporaryDirectory() as tempdir,
+            mock.patch.object(ser, "load_molecule_group_manifest", return_value={}),
+            mock.patch.object(
+                ser,
+                "trainable_molecule_group_members",
+                return_value=[
+                    {"member_key": "member_a", "stratum": "set1", "processed_dir": "member_a"},
+                    {"member_key": "member_b", "stratum": "set1", "processed_dir": "member_b"},
+                ],
+            ),
+            mock.patch.object(ser, "load_backbone_manifest", return_value={}),
+            mock.patch.object(
+                ser,
+                "find_backbone_artifact",
+                side_effect=fake_artifact,
+            ),
+            mock.patch.object(
+                ser,
+                "load_molecule_checkpoint_splits",
+                return_value=loaded,
+            ),
+            mock.patch.object(
+                ser,
+                "_choose_molecule_indices",
+                return_value=list(range(100)),
+            ),
+            mock.patch.object(
+                ser,
+                "collect_molecule_local_defect_trace",
+                side_effect=fake_collector,
+            ),
         ):
             args = build_argparser().parse_args(
                 [

@@ -11,27 +11,26 @@ Adds evaluation helpers:
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
-from contextlib import contextmanager
 import copy
 import hashlib
 import json
 import random
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, RandomSampler, WeightedRandomSampler
 from torch.optim.swa_utils import AveragedModel
+from torch.utils.data import DataLoader, RandomSampler, WeightedRandomSampler
 
+from genode.data.otflow_datasets import L2FeatureMap, WindowedParamSequenceDataset, compute_basic_l2_metrics
+from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 from genode.models.config import OTFlowConfig
 from genode.models.modules import EMAModel
 from genode.models.otflow_model import OTFlow
-from genode.data.otflow_datasets import L2FeatureMap, WindowedParamSequenceDataset, compute_basic_l2_metrics
-from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
-from genode.models.otflow_utils import flatten_dict, unflatten_to_nested, microstructure_series
-
+from genode.models.otflow_utils import flatten_dict, microstructure_series, unflatten_to_nested
 
 SUPPORTED_MODEL_NAMES = ("otflow",)
 CORE_L2_STATS = ("spread", "depth", "imb", "ret")
@@ -132,7 +131,7 @@ def make_loader(
     sampler = None
     effective_shuffle = bool(shuffle)
     if bool(shuffle) and getattr(ds, "sampler_weights", None) is not None:
-        weights = torch.as_tensor(getattr(ds, "sampler_weights"), dtype=torch.double)
+        weights = torch.as_tensor(ds.sampler_weights, dtype=torch.double)
         num_samples = getattr(ds, "sampler_num_samples", None)
         sampler = WeightedRandomSampler(
             weights=weights,
@@ -478,10 +477,7 @@ def train_loop(
     device = cfg.device
     model_name = _normalize_model_name(model_name)
     _validate_model_dataset_support(model_name, cfg)
-    if model is None:
-        model = _build_model(model_name, cfg, device)
-    else:
-        model = model.to(device)
+    model = _build_model(model_name, cfg, device) if model is None else model.to(device)
     if initial_model_state is not None:
         model.load_state_dict(dict(initial_model_state))
 
@@ -525,8 +521,7 @@ def train_loop(
         loader = make_loader(ds, cfg.batch_size, shuffle=shuffle, drop_last=False, generator=generator)
         if len(loader) == 0:
             raise ValueError(
-                "Training loader is empty. Check dataset construction, history_len, "
-                "split boundaries, and batch_size."
+                "Training loader is empty. Check dataset construction, history_len, split boundaries, and batch_size."
             )
         return loader
 
@@ -663,21 +658,27 @@ def generate_continuation(
     extra_dim = max(0, int(D) - int(snapshot_dim))
     if extra_dim > 0 and future_context_seq is None:
         uses_time_context = bool(
-            getattr(model_cfg, "use_time_features", False)
-            or getattr(model_cfg, "use_time_gaps", False)
+            getattr(model_cfg, "use_time_features", False) or getattr(model_cfg, "use_time_gaps", False)
         )
         if not uses_time_context:
             raise ValueError(
                 "Continuation with context_dim > snapshot_dim requires explicit future_context_seq. "
                 "Use a domain-specific rollout path for non-temporal augmented contexts."
             )
-    if extra_dim > 0 and future_context_seq is not None:
-        if future_context_seq.shape[0] != B or future_context_seq.shape[1] < int(steps) or future_context_seq.shape[2] != extra_dim:
-            raise ValueError(
-                "future_context_seq must have shape [B, steps, context_extra_dim] "
-                f"with B={B}, steps>={int(steps)}, context_extra_dim={extra_dim}; "
-                f"got {tuple(future_context_seq.shape)}."
-            )
+    if (
+        extra_dim > 0
+        and future_context_seq is not None
+        and (
+            future_context_seq.shape[0] != B
+            or future_context_seq.shape[1] < int(steps)
+            or future_context_seq.shape[2] != extra_dim
+        )
+    ):
+        raise ValueError(
+            "future_context_seq must have shape [B, steps, context_extra_dim] "
+            f"with B={B}, steps>={int(steps)}, context_extra_dim={extra_dim}; "
+            f"got {tuple(future_context_seq.shape)}."
+        )
 
     def _append_context_features(block: torch.Tensor, cursor: int, take: int) -> torch.Tensor:
         if extra_dim <= 0:
@@ -927,11 +928,7 @@ def _train_small_multiclass_mlp(
         raise ValueError("Cannot train stage classifier on an empty feature matrix.")
     if np.unique(train_y).size < 2:
         raise ValueError("Stage classifier requires at least two training classes.")
-    class_count = int(
-        num_classes
-        if num_classes is not None
-        else int(np.max(train_y)) + 1
-    )
+    class_count = int(num_classes if num_classes is not None else int(np.max(train_y)) + 1)
     if class_count <= 1:
         raise ValueError(f"Stage classifier requires at least two classes, got {class_count}.")
 
@@ -1052,7 +1049,7 @@ def _future_moves_from_params(params_raw: np.ndarray, label_horizon: int) -> Tup
     params_raw = np.asarray(params_raw, dtype=np.float32)
     T = int(len(params_raw))
     hh = int(label_horizon)
-    if hh <= 0 or T <= hh:
+    if hh <= 0 or hh >= T:
         return np.zeros((0, params_raw.shape[1]), dtype=np.float32), np.zeros(0, dtype=np.float32)
 
     delta_mid = params_raw[:, 0].astype(np.float64)
@@ -1160,9 +1157,7 @@ def _aggregate_core_l2_distribution_metrics(rows: Sequence[Dict[str, Any]]) -> D
 
     for row in rows:
         seq = row["seq"]
-        sg = microstructure_series(
-            seq["gen"]["ask_p"], seq["gen"]["ask_v"], seq["gen"]["bid_p"], seq["gen"]["bid_v"]
-        )
+        sg = microstructure_series(seq["gen"]["ask_p"], seq["gen"]["ask_v"], seq["gen"]["bid_p"], seq["gen"]["bid_v"])
         st = microstructure_series(
             seq["true"]["ask_p"], seq["true"]["ask_v"], seq["true"]["bid_p"], seq["true"]["bid_v"]
         )
@@ -1186,10 +1181,13 @@ def _aggregate_core_l2_distribution_metrics(rows: Sequence[Dict[str, Any]]) -> D
         stat_scales[key] = scale
         x_norm = (pooled_gen_arr - float(np.mean(pooled_true_arr))) / scale
         y_norm = (pooled_true_arr - float(np.mean(pooled_true_arr))) / scale
-        unconditional_by_stat[key] = _wasserstein_1d(
-            pooled_gen_arr,
-            pooled_true_arr,
-        ) / scale
+        unconditional_by_stat[key] = (
+            _wasserstein_1d(
+                pooled_gen_arr,
+                pooled_true_arr,
+            )
+            / scale
+        )
         unconditional_l1_by_stat[key] = _hist_l1(x_norm, y_norm)
         conditional_by_stat[key] = float(np.mean(per_window[key]) / scale)
         conditional_l1_by_stat[key] = float(np.mean(per_window_l1[key]))
@@ -1248,9 +1246,7 @@ def _signal_feature_vector(
         centered = channel - float(np.mean(channel))
         line_length = float(np.mean(np.abs(np.diff(channel)))) if channel.size > 1 else 0.0
         zero_crossings = (
-            float(np.mean(np.signbit(centered[1:]) != np.signbit(centered[:-1])))
-            if channel.size > 1
-            else 0.0
+            float(np.mean(np.signbit(centered[1:]) != np.signbit(centered[:-1]))) if channel.size > 1 else 0.0
         )
         base_stats = {
             "mean": float(np.mean(channel)),
@@ -1316,7 +1312,12 @@ def _collect_signal_feature_examples(
             history_scores.append(float(np.nanmean(np.abs(history_vec))))
     if not real_features:
         empty = np.zeros((0, 1), dtype=np.float32)
-        return {"real_x": empty, "gen_x": empty, "feature_names": ["empty"], "condition_labels": np.zeros(0, dtype=np.int64)}
+        return {
+            "real_x": empty,
+            "gen_x": empty,
+            "feature_names": ["empty"],
+            "condition_labels": np.zeros(0, dtype=np.int64),
+        }
     score_arr = np.asarray(history_scores, dtype=np.float64)
     if score_arr.size >= 3 and np.isfinite(score_arr).any():
         q1, q2 = np.nanquantile(score_arr, [1.0 / 3.0, 2.0 / 3.0])
@@ -1366,7 +1367,7 @@ def _aggregate_signal_feature_distances(
         per_condition = []
         per_condition_l1 = []
         if labels is not None:
-            for label in sorted(set(int(value) for value in labels.tolist())):
+            for label in sorted({int(value) for value in labels.tolist()}):
                 mask = labels == int(label)
                 if int(np.count_nonzero(mask)) < 2:
                     continue
@@ -1379,7 +1380,9 @@ def _aggregate_signal_feature_distances(
                     )
                 )
         conditional_by_stat[str(feature_name)] = float(np.mean(per_condition)) if per_condition else float("nan")
-        conditional_l1_by_stat[str(feature_name)] = float(np.mean(per_condition_l1)) if per_condition_l1 else float("nan")
+        conditional_l1_by_stat[str(feature_name)] = (
+            float(np.mean(per_condition_l1)) if per_condition_l1 else float("nan")
+        )
     unconditional = float(np.nanmean(np.asarray(list(unconditional_by_stat.values()), dtype=np.float64)))
     conditional = float(np.nanmean(np.asarray(list(conditional_by_stat.values()), dtype=np.float64)))
     u_l1 = float(np.nanmean(np.asarray(list(unconditional_l1_by_stat.values()), dtype=np.float64)))
@@ -1428,7 +1431,9 @@ def _compare_signal_sequences(
         signal_errors.append(mae)
         acf_by_channel[str(channel_name)] = {
             "acf_l1": float(np.mean(np.abs(_acf(gen_col, max_lag=max_acf_lag) - _acf(true_col, max_lag=max_acf_lag)))),
-            "acf_l2": float(np.sqrt(np.mean((_acf(gen_col, max_lag=max_acf_lag) - _acf(true_col, max_lag=max_acf_lag)) ** 2))),
+            "acf_l2": float(
+                np.sqrt(np.mean((_acf(gen_col, max_lag=max_acf_lag) - _acf(true_col, max_lag=max_acf_lag)) ** 2))
+            ),
         }
         gen_feat, feat_names = _signal_feature_vector(
             gen_arr[:, [int(channel_index)]],
@@ -1604,7 +1609,9 @@ def _evaluate_generation_main_metrics(
     }
 
 
-def _param_horizon_metrics(gen_params: np.ndarray, true_params: np.ndarray, horizons: Sequence[int]) -> Dict[str, Dict[str, float]]:
+def _param_horizon_metrics(
+    gen_params: np.ndarray, true_params: np.ndarray, horizons: Sequence[int]
+) -> Dict[str, Dict[str, float]]:
     T = min(len(gen_params), len(true_params))
     g = gen_params[:T]
     r = true_params[:T]
@@ -1701,7 +1708,7 @@ def compare_l2_sequences(
     response_g = _impact_response_curve(sg["imb"], sg["ret"])
     response_t = _impact_response_curve(st["imb"], st["ret"])
     response_err = []
-    for lag_key in response_t.keys():
+    for lag_key in response_t:
         if np.isfinite(response_g[lag_key]) and np.isfinite(response_t[lag_key]):
             denom = max(abs(response_t[lag_key]), 1e-6)
             response_err.append(abs(response_g[lag_key] - response_t[lag_key]) / denom)
@@ -1828,8 +1835,12 @@ def eval_one_window(
     gen_raw_params = _denorm_params_seq(ds, gen_norm)
     true_raw_params = _denorm_params_seq(ds, true_norm)
     history_start = max(0, int(t0) - int(context_len))
-    history_norm = ds.params[history_start:int(t0)].astype(np.float32)
-    history_raw_params = _denorm_params_seq(ds, history_norm) if history_norm.size > 0 else np.zeros((0, gen_raw_params.shape[1]), dtype=np.float32)
+    history_norm = ds.params[history_start : int(t0)].astype(np.float32)
+    history_raw_params = (
+        _denorm_params_seq(ds, history_norm)
+        if history_norm.size > 0
+        else np.zeros((0, gen_raw_params.shape[1]), dtype=np.float32)
+    )
 
     if dataset_kind == LONG_TERM_ST_DATASET_KEY:
         channel_names = list(dataset_metadata.get("channel_names", []))
@@ -1908,21 +1919,21 @@ def eval_one_window(
         else compare_l2_sequences(
             gen_params=gen_raw_params,
             true_params=true_raw_params,
-            ask_p_gen=ask_p_g, ask_v_gen=ask_v_g, bid_p_gen=bid_p_g, bid_v_gen=bid_v_g,
-            ask_p_true=ask_p_r, ask_v_true=ask_v_r, bid_p_true=bid_p_r, bid_v_true=bid_v_r,
+            ask_p_gen=ask_p_g,
+            ask_v_gen=ask_v_g,
+            bid_p_gen=bid_p_g,
+            bid_v_gen=bid_v_g,
+            ask_p_true=ask_p_r,
+            ask_v_true=ask_v_r,
+            bid_p_true=bid_p_r,
+            bid_v_true=bid_v_r,
         )
     )
-    horizon_metrics = {} if main_metrics_only else _param_horizon_metrics(gen_raw_params, true_raw_params, horizons=horizons_eval)
-    basic_gen = (
-        {}
-        if main_metrics_only
-        else compute_basic_l2_metrics(ask_p_g, ask_v_g, bid_p_g, bid_v_g)
+    horizon_metrics = (
+        {} if main_metrics_only else _param_horizon_metrics(gen_raw_params, true_raw_params, horizons=horizons_eval)
     )
-    basic_true = (
-        {}
-        if main_metrics_only
-        else compute_basic_l2_metrics(ask_p_r, ask_v_r, bid_p_r, bid_v_r)
-    )
+    basic_gen = {} if main_metrics_only else compute_basic_l2_metrics(ask_p_g, ask_v_g, bid_p_g, bid_v_g)
+    basic_true = {} if main_metrics_only else compute_basic_l2_metrics(ask_p_r, ask_v_r, bid_p_r, bid_v_r)
 
     out: Dict[str, Any] = {
         "gen": basic_gen,
@@ -2068,7 +2079,7 @@ def eval_many_windows(
         chosen = np.asarray([int(t0) for t0 in chosen_t0s], dtype=np.int64)
         if chosen.ndim != 1 or chosen.size == 0:
             raise ValueError("chosen_t0s must be a non-empty 1D sequence of valid window starts.")
-        valid_set = set(int(t0) for t0 in valid_ts.tolist())
+        valid_set = {int(t0) for t0 in valid_ts.tolist()}
         invalid = [int(t0) for t0 in chosen.tolist() if int(t0) not in valid_set]
         if invalid:
             raise ValueError(f"chosen_t0s contains invalid window starts: {invalid}")
@@ -2086,8 +2097,11 @@ def eval_many_windows(
         )
         rows.append(
             eval_one_window(
-                ds, model, cfg,
-                horizon=horizon, nfe=nfe,
+                ds,
+                model,
+                cfg,
+                horizon=horizon,
+                nfe=nfe,
                 t0=int(t0),
                 seed=window_seed,
                 horizons_eval=horizons_eval,
@@ -2119,17 +2133,12 @@ def eval_many_windows(
         "n_examples_gen": int(main_metrics["n_examples_gen"]),
         "threshold_abs_move": _wrap_scalar_as_mean_std(main_metrics["threshold_abs_move"]),
         "temporal_uw1_by_stat": {
-            key: _wrap_scalar_as_mean_std(val)
-            for key, val in main_metrics["temporal_uw1_by_stat"].items()
+            key: _wrap_scalar_as_mean_std(val) for key, val in main_metrics["temporal_uw1_by_stat"].items()
         },
         "temporal_cw1_by_stat": {
-            key: _wrap_scalar_as_mean_std(val)
-            for key, val in main_metrics["temporal_cw1_by_stat"].items()
+            key: _wrap_scalar_as_mean_std(val) for key, val in main_metrics["temporal_cw1_by_stat"].items()
         },
-        "stat_scales": {
-            key: _wrap_scalar_as_mean_std(val)
-            for key, val in main_metrics["stat_scales"].items()
-        },
+        "stat_scales": {key: _wrap_scalar_as_mean_std(val) for key, val in main_metrics["stat_scales"].items()},
     }
     ret_acf = cmp.get("temporal", {}).get("ret", {}).get("acf_l1", {}).get("mean")
     vol_acf = cmp.get("temporal", {}).get("volatility", {}).get("acf_l1", {}).get("mean")
@@ -2145,7 +2154,9 @@ def eval_many_windows(
             "u_l1": _wrap_scalar_as_mean_std(main_metrics["u_l1"]),
             "c_l1": _wrap_scalar_as_mean_std(main_metrics["c_l1"]),
             "spread_specific_error": cmp.get("error", {}).get("signal_mae", _wrap_scalar_as_mean_std(float("nan"))),
-            "imbalance_specific_error": cmp.get("error", {}).get("spectral_mae", _wrap_scalar_as_mean_std(float("nan"))),
+            "imbalance_specific_error": cmp.get("error", {}).get(
+                "spectral_mae", _wrap_scalar_as_mean_std(float("nan"))
+            ),
             "ret_vol_acf_error": _wrap_scalar_as_mean_std(
                 float(np.mean(temporal_entries)) if temporal_entries else float("nan")
             ),
@@ -2157,9 +2168,15 @@ def eval_many_windows(
             "u_l1": _wrap_scalar_as_mean_std(main_metrics["u_l1"]),
             "c_l1": _wrap_scalar_as_mean_std(main_metrics["c_l1"]),
             "spread_specific_error": cmp.get("error", {}).get("spread_mae", _wrap_scalar_as_mean_std(float("nan"))),
-            "imbalance_specific_error": cmp.get("error", {}).get("imbalance_mae", _wrap_scalar_as_mean_std(float("nan"))),
-            "ret_vol_acf_error": _wrap_scalar_as_mean_std(float(np.mean(ret_vol_terms)) if ret_vol_terms else float("nan")),
-            "impact_response_error": cmp.get("microstructure", {}).get("impact_response_l1", _wrap_scalar_as_mean_std(float("nan"))),
+            "imbalance_specific_error": cmp.get("error", {}).get(
+                "imbalance_mae", _wrap_scalar_as_mean_std(float("nan"))
+            ),
+            "ret_vol_acf_error": _wrap_scalar_as_mean_std(
+                float(np.mean(ret_vol_terms)) if ret_vol_terms else float("nan")
+            ),
+            "impact_response_error": cmp.get("microstructure", {}).get(
+                "impact_response_l1", _wrap_scalar_as_mean_std(float("nan"))
+            ),
             "efficiency_ms_per_sample": timing.get("latency_ms_per_sample", _wrap_scalar_as_mean_std(float("nan"))),
         }
     cmp["score_main"] = _wrap_scalar_as_mean_std(main_metrics["score_main"])
@@ -2199,7 +2216,9 @@ def eval_rollout_horizons(
 ) -> Dict[int, Dict[str, Any]]:
     out = {}
     for h in horizons:
-        out[int(h)] = eval_many_windows(ds, model, cfg, horizon=int(h), nfe=nfe, n_windows=n_windows, seed=seed, horizons_eval=horizons)
+        out[int(h)] = eval_many_windows(
+            ds, model, cfg, horizon=int(h), nfe=nfe, n_windows=n_windows, seed=seed, horizons_eval=horizons
+        )
     return out
 
 
@@ -2276,7 +2295,9 @@ def eval_speed_quality_nfe(
     results = {}
     for nfe in nfe_list:
         q = eval_many_windows(ds, model, cfg, horizon=horizon, nfe=int(nfe), n_windows=n_windows, seed=seed)
-        t = benchmark_sampling_latency(ds, model, cfg, horizon=horizon, nfe=int(nfe), n_trials=n_trials_latency, seed=seed)
+        t = benchmark_sampling_latency(
+            ds, model, cfg, horizon=horizon, nfe=int(nfe), n_trials=n_trials_latency, seed=seed
+        )
         results[int(nfe)] = {"quality": q, "latency": t}
     return results
 
@@ -2314,9 +2335,13 @@ def run_ablation_grid(
         model = train_loop(ds_train, cfg_i, model_name=model_name, steps=train_steps, log_every=log_every)
 
         res = eval_many_windows(
-            ds_eval, model, cfg_i,
-            horizon=eval_horizon, nfe=eval_nfe,
-            n_windows=n_windows, seed=int(rng.integers(0, 1_000_000)),
+            ds_eval,
+            model,
+            cfg_i,
+            horizon=eval_horizon,
+            nfe=eval_nfe,
+            n_windows=n_windows,
+            seed=int(rng.integers(0, 1_000_000)),
         )
 
         suite[name] = {
@@ -2378,10 +2403,14 @@ def save_qualitative_window_npz(
         save_path,
         gen_params_raw=seq["gen_params_raw"],
         true_params_raw=seq["true_params_raw"],
-        gen_ask_p=seq["gen"]["ask_p"], gen_ask_v=seq["gen"]["ask_v"],
-        gen_bid_p=seq["gen"]["bid_p"], gen_bid_v=seq["gen"]["bid_v"],
-        true_ask_p=seq["true"]["ask_p"], true_ask_v=seq["true"]["ask_v"],
-        true_bid_p=seq["true"]["bid_p"], true_bid_v=seq["true"]["bid_v"],
+        gen_ask_p=seq["gen"]["ask_p"],
+        gen_ask_v=seq["gen"]["ask_v"],
+        gen_bid_p=seq["gen"]["bid_p"],
+        gen_bid_v=seq["gen"]["bid_v"],
+        true_ask_p=seq["true"]["ask_p"],
+        true_ask_v=seq["true"]["ask_v"],
+        true_bid_p=seq["true"]["bid_p"],
+        true_bid_v=seq["true"]["bid_v"],
         meta_t=np.int64(meta["t"]),
         meta_init_mid_prev=np.float32(meta["init_mid_prev"]),
         horizon=np.int64(horizon),
@@ -2399,6 +2428,7 @@ def save_json(obj: Dict[str, Any], path: str):
         if isinstance(x, np.ndarray):
             return x.tolist()
         return x
+
     path_obj = Path(path)
     path_obj.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path_obj.with_name(f".{path_obj.name}.{time.time_ns()}.tmp")

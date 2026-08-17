@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import hashlib
 import re
+from dataclasses import dataclass, field
 from typing import Mapping
 
 import numpy as np
@@ -15,7 +15,6 @@ from genode.backbones.adapter import (
     CanonicalNoiseToDataAdapter,
 )
 from genode.backbones.registry import get_image_backbone_spec
-
 
 IMAGE_GICO_BACKBONE_CONTEXT_PROTOCOL = "image_gico_backbone_context_binding_v3"
 IMAGE_GICO_BACKBONE_CONTEXT_CLASS_COUNT = 1_000

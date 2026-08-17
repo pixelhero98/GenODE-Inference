@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from numbers import Integral
-import re
 from typing import Dict, Iterable, Sequence, Tuple
 
 CANONICAL_SOLVER_KEYS: Tuple[str, ...] = ("euler", "dpmpp2m", "heun", "midpoint_rk2")
@@ -156,9 +156,7 @@ def normalize_solver_nfe_fields(
     parsed_runtime = _optional_positive_int(runtime_nfe, field="runtime_nfe", source=source)
     parsed_realized = _optional_positive_int(realized_nfe, field="realized_nfe", source=source)
     if parsed_macro is not None and parsed_macro != expected_macro:
-        raise ValueError(
-            f"{source} has macro_steps={parsed_macro} for {key}/{target}; expected {expected_macro}."
-        )
+        raise ValueError(f"{source} has macro_steps={parsed_macro} for {key}/{target}; expected {expected_macro}.")
     if parsed_runtime is not None and parsed_runtime != expected_macro:
         raise ValueError(
             f"{source} has runtime_nfe={parsed_runtime} for {key}/{target}; "

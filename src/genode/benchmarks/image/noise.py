@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-import hashlib
 from numbers import Integral
 
 import numpy as np
@@ -11,7 +11,6 @@ from torch import Tensor
 
 from genode.artifacts.identity import semantic_sha256
 from genode.backbones.registry import get_image_dataset_spec
-
 
 IMAGE_NOISE_PROTOCOL = "image_seeded_pcg64_normal_f32_v1"
 IMAGE_NOISE_PROTOCOL_SHA256 = semantic_sha256(

@@ -82,7 +82,9 @@ class RectifiedFlow(nn.Module):
         return F.mse_loss(v_hat, v_target)
 
     @torch.no_grad()
-    def sample(self, hist: torch.Tensor, cond: Optional[torch.Tensor] = None, steps: Optional[int] = None) -> torch.Tensor:
+    def sample(
+        self, hist: torch.Tensor, cond: Optional[torch.Tensor] = None, steps: Optional[int] = None
+    ) -> torch.Tensor:
         state_dim = self.cfg.sample_state_dim
         batch_size = hist.shape[0]
         x = torch.randn(batch_size, state_dim, device=hist.device)

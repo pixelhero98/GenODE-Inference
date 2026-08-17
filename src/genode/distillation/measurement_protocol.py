@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import hashlib
-from importlib import metadata
 import json
 import math
-from pathlib import Path
 import platform
 import re
+from importlib import metadata
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from genode.checkpoint_validation import validate_strict_integer
 from genode.data.otflow_paths import resolve_project_path
-
 
 MEASUREMENT_PROTOCOL = "flow_map_quality_measurement"
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -49,30 +48,20 @@ def _primary_metrics(values: Any) -> list[dict[str, Any]]:
     for index, raw in enumerate(values):
         required = {"name", "direction", "weight", "applicable_key"}
         if not isinstance(raw, Mapping) or set(raw) != required:
-            raise ValueError(
-                f"Measurement protocol primary metric {index} has invalid fields."
-            )
+            raise ValueError(f"Measurement protocol primary metric {index} has invalid fields.")
         name = str(raw["name"]).strip()
         direction = str(raw["direction"]).strip()
         applicable_key = str(raw["applicable_key"]).strip()
         if isinstance(raw["weight"], bool):
-            raise ValueError(
-                f"Measurement protocol primary metric {index} weight must be numeric."
-            )
+            raise ValueError(f"Measurement protocol primary metric {index} weight must be numeric.")
         try:
             weight = float(raw["weight"])
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Measurement protocol primary metric {index} weight must be numeric."
-            ) from exc
+            raise ValueError(f"Measurement protocol primary metric {index} weight must be numeric.") from exc
         if not name or direction not in {"higher", "lower"}:
-            raise ValueError(
-                f"Measurement protocol primary metric {index} has an invalid name or direction."
-            )
+            raise ValueError(f"Measurement protocol primary metric {index} has an invalid name or direction.")
         if not math.isfinite(weight) or weight <= 0.0:
-            raise ValueError(
-                f"Measurement protocol primary metric {index} weight must be finite and positive."
-            )
+            raise ValueError(f"Measurement protocol primary metric {index} weight must be finite and positive.")
         metrics.append(
             {
                 "name": name,
@@ -148,19 +137,13 @@ def _quality_gate(
         minimum=0,
     )
     if isinstance(familywise_alpha, bool):
-        raise ValueError(
-            "Measurement protocol familywise_alpha must lie strictly between zero and one."
-        )
+        raise ValueError("Measurement protocol familywise_alpha must lie strictly between zero and one.")
     try:
         alpha = float(familywise_alpha)
     except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "Measurement protocol familywise_alpha must lie strictly between zero and one."
-        ) from exc
+        raise ValueError("Measurement protocol familywise_alpha must lie strictly between zero and one.") from exc
     if not math.isfinite(alpha) or not 0.0 < alpha < 1.0:
-        raise ValueError(
-            "Measurement protocol familywise_alpha must lie strictly between zero and one."
-        )
+        raise ValueError("Measurement protocol familywise_alpha must lie strictly between zero and one.")
     return {
         "bootstrap_samples": samples,
         "bootstrap_seed": seed,
@@ -173,9 +156,7 @@ def _quality_gate(
         "all_primary_metrics_required": True,
         "selection_protocol": "weighted_normalized_primary_metric_utility",
         "comparison_protocol": "centered_paired_bootstrap_mean_difference",
-        "bootstrap_seed_protocol": (
-            "base_plus_comparison_index_times_104729_plus_metric_index"
-        ),
+        "bootstrap_seed_protocol": ("base_plus_comparison_index_times_104729_plus_metric_index"),
     }
 
 
@@ -219,9 +200,7 @@ def _quality_evaluator(values: Any) -> dict[str, str]:
         raise ValueError("Measurement protocol quality_evaluator name is invalid.")
     for name in ("genode_release", "python_release", "numpy_release"):
         if not normalized[name]:
-            raise ValueError(
-                f"Measurement protocol quality_evaluator {name} must be non-empty."
-            )
+            raise ValueError(f"Measurement protocol quality_evaluator {name} must be non-empty.")
     normalized["implementation_sha256"] = _sha256(
         values["implementation_sha256"],
         label="Measurement protocol quality_evaluator implementation_sha256",
@@ -277,9 +256,7 @@ def quality_measurement_protocol_payload(
             familywise_alpha=familywise_alpha,
         ),
         "quality_evaluator": _quality_evaluator(
-            quality_evaluator_binding()
-            if quality_evaluator is None
-            else quality_evaluator
+            quality_evaluator_binding() if quality_evaluator is None else quality_evaluator
         ),
         "candidate_execution_required": True,
         "common_sample_panel_required": True,
@@ -323,10 +300,7 @@ def validate_quality_measurement_protocol(
     if set(payload) != required:
         missing = sorted(required - set(payload))
         extra = sorted(set(payload) - required)
-        raise ValueError(
-            "Measurement protocol fields are invalid; "
-            f"missing={missing}, extra={extra}."
-        )
+        raise ValueError(f"Measurement protocol fields are invalid; missing={missing}, extra={extra}.")
     normalized = quality_measurement_protocol_payload(
         scenario_key=str(payload["scenario_key"]),
         candidate_catalog_sha256=payload["candidate_catalog_sha256"],
@@ -337,19 +311,13 @@ def validate_quality_measurement_protocol(
         primary_metrics=payload["primary_metrics"],
         runner=payload["runner"],
         bootstrap_samples=(
-            payload["quality_gate"].get("bootstrap_samples")
-            if isinstance(payload["quality_gate"], Mapping)
-            else None
+            payload["quality_gate"].get("bootstrap_samples") if isinstance(payload["quality_gate"], Mapping) else None
         ),
         bootstrap_seed=(
-            payload["quality_gate"].get("bootstrap_seed")
-            if isinstance(payload["quality_gate"], Mapping)
-            else None
+            payload["quality_gate"].get("bootstrap_seed") if isinstance(payload["quality_gate"], Mapping) else None
         ),
         familywise_alpha=(
-            payload["quality_gate"].get("familywise_alpha")
-            if isinstance(payload["quality_gate"], Mapping)
-            else None
+            payload["quality_gate"].get("familywise_alpha") if isinstance(payload["quality_gate"], Mapping) else None
         ),
         quality_evaluator=payload["quality_evaluator"],
     )
@@ -362,18 +330,12 @@ def validate_quality_measurement_protocol(
         if payload.get(field) is not True:
             raise ValueError(f"Measurement protocol requires {field}=true.")
     if payload.get("locked_test_used_for_selection") is not False:
-        raise ValueError(
-            "Measurement protocol requires locked_test_used_for_selection=false."
-        )
+        raise ValueError("Measurement protocol requires locked_test_used_for_selection=false.")
     if payload.get("flow_map_model_evaluations") != 1:
         raise ValueError("Measurement protocol requires one flow-map model evaluation.")
     if payload.get("comparator_model_evaluations") != "target_nfe":
-        raise ValueError(
-            "Measurement protocol comparator evaluations must equal target_nfe."
-        )
-    if not isinstance(payload["quality_gate"], Mapping) or dict(
-        payload["quality_gate"]
-    ) != normalized["quality_gate"]:
+        raise ValueError("Measurement protocol comparator evaluations must equal target_nfe.")
+    if not isinstance(payload["quality_gate"], Mapping) or dict(payload["quality_gate"]) != normalized["quality_gate"]:
         raise ValueError("Measurement protocol quality_gate fields are invalid.")
     expected = quality_measurement_protocol_payload(
         scenario_key=scenario_key,
@@ -399,9 +361,7 @@ def validate_quality_measurement_protocol(
 def measurement_protocol_sha256(payload: Mapping[str, Any]) -> str:
     """Hash a normalized measurement protocol independently of JSON formatting."""
 
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -420,13 +380,12 @@ def read_quality_measurement_protocol(
 ) -> tuple[dict[str, Any], str]:
     input_path = resolve_project_path(path)
     try:
+
         def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             result: dict[str, Any] = {}
             for key, value in pairs:
                 if key in result:
-                    raise ValueError(
-                        f"Quality measurement protocol contains duplicate key {key!r}."
-                    )
+                    raise ValueError(f"Quality measurement protocol contains duplicate key {key!r}.")
                 result[key] = value
             return result
 
@@ -435,13 +394,9 @@ def read_quality_measurement_protocol(
             object_pairs_hook=reject_duplicate_keys,
         )
     except OSError as exc:
-        raise ValueError(
-            f"Could not read quality measurement protocol {input_path.name!r}: {exc}"
-        ) from exc
+        raise ValueError(f"Could not read quality measurement protocol {input_path.name!r}: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Quality measurement protocol {input_path.name!r} is invalid JSON: {exc}"
-        ) from exc
+        raise ValueError(f"Quality measurement protocol {input_path.name!r} is invalid JSON: {exc}") from exc
     if not isinstance(payload, Mapping):
         raise ValueError("Quality measurement protocol JSON must contain an object.")
     normalized = validate_quality_measurement_protocol(

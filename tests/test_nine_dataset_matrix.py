@@ -32,8 +32,8 @@ from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 from genode.data.otflow_monash_datasets import get_monash_dataset_spec, monash_reference_dataset_keys
 from genode.evaluation import otflow_evaluation_support as eval_support
 from genode.evaluation.fm_backbone_registry import CONDITIONAL_GENERATION_FAMILY
-from genode.evaluation.otflow_evaluation_support import parse_conditional_generation_datasets, parse_forecast_datasets
 from genode.evaluation.molecule_metrics import aggregate_molecule_group_evaluation
+from genode.evaluation.otflow_evaluation_support import parse_conditional_generation_datasets, parse_forecast_datasets
 from genode.models.config import OTFlowConfig
 from genode.training import train_molecule_backbone as train_molecule_module
 
@@ -71,7 +71,9 @@ def _symbols(atom_count: int) -> list[str]:
     return ["C"] * max(1, atom_count - 2) + ["H"] * min(2, atom_count)
 
 
-def _write_xyz_zip(path: Path, entries: dict[str, tuple[int, int]], *, frames: int = 7, root_level: bool = False) -> None:
+def _write_xyz_zip(
+    path: Path, entries: dict[str, tuple[int, int]], *, frames: int = 7, root_level: bool = False
+) -> None:
     with ZipFile(path, "w") as zf:
         for category, (trajectory_count, atom_count) in entries.items():
             symbols = _symbols(atom_count)
@@ -110,12 +112,21 @@ class NineDatasetMatrixTests(unittest.TestCase):
                 experiment_common.build_dataset_splits(SimpleNamespace(dataset=retired_dataset), cfg)
 
     def test_exact_canonical_dataset_lists_and_retired_parser_rejection(self) -> None:
-        self.assertEqual(canonical_forecast_paper_dataset_keys(), ("solar_energy_10m", "traffic_hourly", "weather_daily"))
-        self.assertEqual(canonical_conditional_generation_paper_dataset_keys(), ("cryptos", "lobster_synthetic", "long_term_st"))
+        self.assertEqual(
+            canonical_forecast_paper_dataset_keys(), ("solar_energy_10m", "traffic_hourly", "weather_daily")
+        )
+        self.assertEqual(
+            canonical_conditional_generation_paper_dataset_keys(), ("cryptos", "lobster_synthetic", "long_term_st")
+        )
         self.assertEqual(OTFLOW_PAPER_DATASET_CHOICES, ("cryptos", "lobster_synthetic", "long_term_st"))
         self.assertEqual(monash_reference_dataset_keys(), ("solar_energy_10m", "traffic_hourly", "weather_daily"))
 
-        for retired in ("san_francisco_traffic", "wind_farms_wo_missing", "london_smart_meters_wo_missing", "electricity"):
+        for retired in (
+            "san_francisco_traffic",
+            "wind_farms_wo_missing",
+            "london_smart_meters_wo_missing",
+            "electricity",
+        ):
             with self.assertRaisesRegex(ValueError, "Unknown forecast datasets"):
                 parse_forecast_datasets(retired)
         for retired in ("es_mbp_10", "sleep_edf"):

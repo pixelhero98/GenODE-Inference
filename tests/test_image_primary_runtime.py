@@ -178,9 +178,7 @@ def test_unconditional_cifar_executes_a_content_identified_policy() -> None:
     policy = _IdentifiedUniformPolicy()
     context = torch.zeros((2, 1), dtype=torch.float32)
     schedule = policy.predict(context, target_nfe=2)
-    output_hash, grid_hash, execution_hash, mass_hash = (
-        policy_schedule_request_hashes(schedule)
-    )
+    output_hash, grid_hash, execution_hash, mass_hash = policy_schedule_request_hashes(schedule)
     request = ImageGenerationRequest(
         source_request_sha256=semantic_sha256(
             {"request": "unconditional-policy"},
@@ -235,15 +233,9 @@ def test_imagenet_teacher_student_artifact_round_trip_and_euler_evaluation(
         reward_scales=np.asarray((0.25, 0.5, 1.0), dtype=np.float32),
         fixed_density_mass=masses,
         schedule_keys=IMAGE_SCHEDULE_KEYS,
-        schedule_sha256s=tuple(
-            f"schedule-{index}" for index in range(schedule_count)
-        ),
+        schedule_sha256s=tuple(f"schedule-{index}" for index in range(schedule_count)),
         density_mass_sha256s=tuple(
-            tuple(
-                f"density-{nfe}-{schedule}"
-                for schedule in range(schedule_count)
-            )
-            for nfe in (2, 4, 8)
+            tuple(f"density-{nfe}-{schedule}" for schedule in range(schedule_count)) for nfe in (2, 4, 8)
         ),
         feature_groups=groups,
         reward_evidence_sha256="evidence:" + "4" * 64,
@@ -291,8 +283,7 @@ def test_imagenet_teacher_student_artifact_round_trip_and_euler_evaluation(
     raw_contexts = backbone.encode_conditioning(labels).cpu().numpy()
     expected_contexts = torch.from_numpy(
         np.ascontiguousarray(
-            (raw_contexts - prepared.normalizer.mean[None, :])
-            / prepared.normalizer.scale[None, :],
+            (raw_contexts - prepared.normalizer.mean[None, :]) / prepared.normalizer.scale[None, :],
             dtype=np.float32,
         )
     )

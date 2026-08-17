@@ -11,10 +11,48 @@ import numpy as np
 import torch
 
 from genode.canonical_experiment_layout import SCENARIO_FAMILY_MOLECULE
-from genode.data.molecule_xyz import default_molecule_group_root, load_molecule_group_manifest, trainable_molecule_group_members
-from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW_MOLECULE, MOLECULE_FAMILY, find_backbone_artifact, load_backbone_manifest
+from genode.data.molecule_xyz import (
+    default_molecule_group_root,
+    load_molecule_group_manifest,
+    trainable_molecule_group_members,
+)
+from genode.data.otflow_paths import (
+    default_backbone_manifest_path,
+    project_outputs_root,
+    project_paper_dataset_root,
+    resolve_project_path,
+)
+from genode.evaluation.fm_backbone_registry import (
+    BACKBONE_NAME_OTFLOW_MOLECULE,
+    MOLECULE_FAMILY,
+    find_backbone_artifact,
+    load_backbone_manifest,
+)
 from genode.evaluation.molecule_metrics import evaluate_molecule_rollout_schedule, load_molecule_checkpoint_splits
-from genode.solver_protocol import normalize_solver_key, normalize_solver_keys
+from genode.evaluation.otflow_evaluation_support import (
+    CONDITIONAL_GENERATION_FAMILY,
+    DEFAULT_SHARED_BACKBONE_ROOT,
+    FORECAST_FAMILY,
+    LOCKED_TEST_PHASE,
+    SOLVER_RUNTIME_NAMES,
+    TRAIN_TUNING_PHASE,
+    VALIDATION_PHASE,
+    evaluate_forecast_schedule,
+    load_conditional_generation_checkpoint_splits,
+    load_forecast_checkpoint_splits,
+)
+from genode.gico.evaluate_schedule_summary import (
+    SER_REFERENCE_SCHEDULE_KEYS,
+    _filter_rows_to_schedule_keys,
+    build_comparison_summary,
+)
+from genode.gico.models import (
+    SETTING_ENCODER_MODE_CONTINUOUS_V3,
+    setting_encoder_config_from_payload,
+    setting_feature_dim,
+    solver_macro_steps,
+    validate_setting_feature_mode,
+)
 from genode.gico.objectives import (
     CONDITIONAL_METRIC_SPECS,
     FORECAST_METRIC_SPECS,
@@ -36,39 +74,15 @@ from genode.gico.policy import (
     predict_gico_density_many,
     read_metric_rows_csv,
     require_current_gico_checkpoint_payload,
-    validate_gico_attention_heads,
     validate_canonical_conditioning_style,
+    validate_gico_attention_heads,
     validate_gico_density_token_attention,
     validate_gico_teacher_training_metadata,
 )
 from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
-from genode.gico.evaluate_schedule_summary import (
-    SER_REFERENCE_SCHEDULE_KEYS,
-    _filter_rows_to_schedule_keys,
-    build_comparison_summary,
-)
-from genode.gico.models import solver_macro_steps
-from genode.gico.models import SETTING_ENCODER_MODE_CONTINUOUS_V3, setting_encoder_config_from_payload, setting_feature_dim, validate_setting_feature_mode
-from genode.data.otflow_paths import (
-    default_backbone_manifest_path,
-    project_paper_dataset_root,
-    project_outputs_root,
-    resolve_project_path,
-)
-from genode.evaluation.otflow_evaluation_support import (
-    CONDITIONAL_GENERATION_FAMILY,
-    DEFAULT_SHARED_BACKBONE_ROOT,
-    FORECAST_FAMILY,
-    LOCKED_TEST_PHASE,
-    SOLVER_RUNTIME_NAMES,
-    TRAIN_TUNING_PHASE,
-    VALIDATION_PHASE,
-    evaluate_forecast_schedule,
-    load_conditional_generation_checkpoint_splits,
-    load_forecast_checkpoint_splits,
-)
-from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, run_fixed_schedule_variant
 from genode.runtime import ProgressBar, resolve_torch_device
+from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, run_fixed_schedule_variant
+from genode.solver_protocol import normalize_solver_key, normalize_solver_keys
 
 GICO_SCHEDULE_KEY = "gico"
 REQUIRED_GICO_DENSITY_BIN_COUNT = 64
@@ -131,7 +145,9 @@ def _source_split_phase(row: Mapping[str, Any]) -> str:
 
 
 def _selection_split(row: Mapping[str, Any]) -> str:
-    return str(row.get("selection_split") or row.get("report_split") or row.get("split_phase", row.get("split", ""))).strip()
+    return str(
+        row.get("selection_split") or row.get("report_split") or row.get("split_phase", row.get("split", ""))
+    ).strip()
 
 
 def _validate_context_rows(
@@ -148,17 +164,28 @@ def _validate_context_rows(
         locked = [
             row
             for row in rows
-            if _source_split_phase(row) == LOCKED_TEST_PHASE or str(row.get("split_phase", row.get("split", ""))) == LOCKED_TEST_PHASE
+            if _source_split_phase(row) == LOCKED_TEST_PHASE
+            or str(row.get("split_phase", row.get("split", ""))) == LOCKED_TEST_PHASE
         ]
         if locked:
             raise ValueError("Calibration GICO selection refuses locked_test rows.")
     if requested in CALIBRATION_HOLDOUT_PHASES:
         bad_selection = sorted({_selection_split(row) for row in rows if _selection_split(row) != requested})
         if bad_selection:
-            raise ValueError(f"GICO calibration reporter expected selection_split={requested!r}; found {bad_selection}.")
-        bad_source = sorted({_source_split_phase(row) for row in rows if _source_split_phase(row) not in (TRAIN_TUNING_PHASE, VALIDATION_PHASE)})
+            raise ValueError(
+                f"GICO calibration reporter expected selection_split={requested!r}; found {bad_selection}."
+            )
+        bad_source = sorted(
+            {
+                _source_split_phase(row)
+                for row in rows
+                if _source_split_phase(row) not in (TRAIN_TUNING_PHASE, VALIDATION_PHASE)
+            }
+        )
         if bad_source:
-            raise ValueError(f"Calibration holdout rows require train/validation source split phases; found {bad_source}.")
+            raise ValueError(
+                f"Calibration holdout rows require train/validation source split phases; found {bad_source}."
+            )
         return
     bad = sorted({_source_split_phase(row) for row in rows if _source_split_phase(row) != requested})
     if bad:
@@ -285,12 +312,16 @@ def _load_student_checkpoint(
     teacher_training = dict(payload.get("teacher_training", {}) or {})
     teacher_training_meta = validate_gico_teacher_training_metadata(teacher_training)
     teacher_metric_targets = teacher_training_meta["teacher_metric_targets"]
-    teacher_utility_weights = dict(payload.get("teacher_utility_weights") or teacher_training.get("teacher_utility_weights") or {})
+    teacher_utility_weights = dict(
+        payload.get("teacher_utility_weights") or teacher_training.get("teacher_utility_weights") or {}
+    )
     if not teacher_utility_weights:
         raise ValueError("GICO student checkpoint is missing teacher_utility_weights.")
     normalize_teacher_utility_weights(teacher_metric_targets, teacher_utility_weights)
     reference_time_grid = tuple(float(x) for x in density_meta["reference_time_grid"])
-    setting_feature_mode = validate_setting_feature_mode(str(payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3)))
+    setting_feature_mode = validate_setting_feature_mode(
+        str(payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3))
+    )
     setting_encoder_config = setting_encoder_config_from_payload(
         payload.get("setting_encoder_config", {"mode": setting_feature_mode})
     )
@@ -515,10 +546,14 @@ def _forecast_dataset_for_source_phase(splits: Mapping[str, Any], source_phase: 
 
 def _benchmark_family_from_rows(rows: Sequence[Mapping[str, Any]], requested: str = "") -> str:
     requested = str(requested or "").strip()
-    families = {str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()}
+    families = {
+        str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()
+    }
     if requested:
         if families and families != {requested}:
-            raise ValueError(f"context rows benchmark_family mismatch: requested {requested!r}, found {sorted(families)}.")
+            raise ValueError(
+                f"context rows benchmark_family mismatch: requested {requested!r}, found {sorted(families)}."
+            )
         return requested
     if not families:
         has_generic_context_schema = any(
@@ -592,7 +627,9 @@ def _single_value_from_rows(
     values = sorted({_row_text_value(row, field, aliases) for row in rows if _row_text_value(row, field, aliases)})
     if requested_text:
         if requested_text not in values:
-            raise ValueError(f"Requested {arg_name or field}={requested_text!r} is not present in context_rows values {values}.")
+            raise ValueError(
+                f"Requested {arg_name or field}={requested_text!r} is not present in context_rows values {values}."
+            )
         return requested_text
     if len(values) != 1:
         raise ValueError(f"Could not infer a single {arg_name or field} from context_rows; found {values}.")
@@ -617,7 +654,9 @@ def _infer_int_values_from_rows(
 def _infer_solver_values_from_rows(rows: Sequence[Mapping[str, Any]], *, requested: str = "") -> Tuple[str, ...]:
     if str(requested or "").strip():
         return tuple(normalize_solver_keys(str(requested)))
-    values = sorted({normalize_solver_key(str(row["solver_key"])) for row in rows if str(row.get("solver_key", "")).strip()})
+    values = sorted(
+        {normalize_solver_key(str(row["solver_key"])) for row in rows if str(row.get("solver_key", "")).strip()}
+    )
     if not values:
         raise ValueError("Could not infer solver_names from context_rows; pass --solver_names.")
     return tuple(values)
@@ -689,12 +728,13 @@ def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("training_summary does not use the frozen-backbone policy context protocol.")
     if bool(training_summary.get("locked_test_used_for_selection", False)):
         raise ValueError("training_summary indicates locked_test was used for selection.")
-    required_checkpoint_selection_mode = str(getattr(args, "require_teacher_checkpoint_selection_mode", "") or "").strip()
+    required_checkpoint_selection_mode = str(
+        getattr(args, "require_teacher_checkpoint_selection_mode", "") or ""
+    ).strip()
     if required_checkpoint_selection_mode:
         if required_checkpoint_selection_mode != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET:
             raise ValueError(
-                "GICO reporter only supports "
-                f"{TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET!r} checkpoints."
+                f"GICO reporter only supports {TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET!r} checkpoints."
             )
         actual_selection_mode = str(
             checkpoint_payload.get("teacher_checkpoint_selection_mode")
@@ -709,7 +749,9 @@ def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         if required_checkpoint_selection_mode == TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET:
             final_retrain = _teacher_final_retrain_metadata(checkpoint_payload, training_summary)
             if final_retrain.get("enabled") is not True:
-                raise ValueError("GICO reporter requires final teacher retrain metadata for weighted-normalized-regret checkpoints.")
+                raise ValueError(
+                    "GICO reporter requires final teacher retrain metadata for weighted-normalized-regret checkpoints."
+                )
 
     selection_mode = str(getattr(args, "selection_mode", SELECTION_MODE_REPORTING))
     split_phase = str(getattr(args, "split_phase", LOCKED_TEST_PHASE))
@@ -751,7 +793,9 @@ def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         solvers=solvers,
         target_nfes=target_nfes,
     )
-    molecule_group_root = resolve_project_path(str(getattr(args, "molecule_group_root", "") or default_molecule_group_root()))
+    molecule_group_root = resolve_project_path(
+        str(getattr(args, "molecule_group_root", "") or default_molecule_group_root())
+    )
     molecule_members_for_coverage: Dict[Tuple[str, str], Dict[str, Any]] = {}
     if benchmark_family == SCENARIO_FAMILY_MOLECULE:
         molecule_members_for_coverage = _molecule_group_member_lookup(dataset, molecule_group_root)
@@ -774,9 +818,16 @@ def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
             for row in representatives
         }
     else:
-        expected_cells = {(dataset, seed, solver, target_nfe) for seed in seeds for solver in solvers for target_nfe in target_nfes}
+        expected_cells = {
+            (dataset, seed, solver, target_nfe) for seed in seeds for solver in solvers for target_nfe in target_nfes
+        }
         observed_cells = {
-            (str(row.get("dataset", row.get("dataset_key", ""))), _logical_seed_from_row(row), str(row["solver_key"]), int(row["target_nfe"]))
+            (
+                str(row.get("dataset", row.get("dataset_key", ""))),
+                _logical_seed_from_row(row),
+                str(row["solver_key"]),
+                int(row["target_nfe"]),
+            )
             for row in representatives
         }
     missing_cells = sorted(expected_cells - observed_cells)
@@ -803,7 +854,9 @@ def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
     raw_embeddings = load_context_embedding_table(resolve_project_path(embeddings_arg))
-    missing_context_embeddings = sorted({context_embedding_id_from_row(row) for row in representatives} - set(raw_embeddings))
+    missing_context_embeddings = sorted(
+        {context_embedding_id_from_row(row) for row in representatives} - set(raw_embeddings)
+    )
     if missing_context_embeddings:
         raise KeyError(f"context embeddings NPZ is missing contexts: {missing_context_embeddings[:8]}")
     embeddings = normalizer.transform_table(raw_embeddings)
@@ -917,8 +970,12 @@ def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
                 member_key, stratum = _molecule_member_from_row(row)
                 member = molecule_members.get((member_key, stratum))
                 if member is None:
-                    raise ValueError(f"Molecule member {member_key}/{stratum} is not present in group manifest for {dataset}.")
-                checkpoint_step = int(row.get("checkpoint_step", getattr(args, "steps", 0) or getattr(args, "otflow_train_steps", 0) or 0))
+                    raise ValueError(
+                        f"Molecule member {member_key}/{stratum} is not present in group manifest for {dataset}."
+                    )
+                checkpoint_step = int(
+                    row.get("checkpoint_step", getattr(args, "steps", 0) or getattr(args, "otflow_train_steps", 0) or 0)
+                )
                 cache_key = (member_key, stratum, int(checkpoint_step))
                 if cache_key not in molecule_cache:
                     artifact = find_backbone_artifact(
@@ -1125,27 +1182,43 @@ def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         "mean_crps": float(np.mean(np.asarray(crps_values, dtype=np.float64))) if crps_values else None,
         "mean_mase": float(np.mean(np.asarray(mase_values, dtype=np.float64))) if mase_values else None,
         "mean_score_main": float(np.mean(np.asarray(score_values, dtype=np.float64))) if score_values else None,
-        "mean_molecule_kabsch_rmsd_3d": float(np.mean(np.asarray(molecule_kabsch_values, dtype=np.float64))) if molecule_kabsch_values else None,
-        "mean_molecule_rollout_velocity_norm_w1": float(np.mean(np.asarray(molecule_rollout_velocity_values, dtype=np.float64))) if molecule_rollout_velocity_values else None,
+        "mean_molecule_kabsch_rmsd_3d": float(np.mean(np.asarray(molecule_kabsch_values, dtype=np.float64)))
+        if molecule_kabsch_values
+        else None,
+        "mean_molecule_rollout_velocity_norm_w1": float(
+            np.mean(np.asarray(molecule_rollout_velocity_values, dtype=np.float64))
+        )
+        if molecule_rollout_velocity_values
+        else None,
         "metric_means": _numeric_metric_means(aggregate_rows),
         "density_representation": checkpoint_payload.get("density_representation", {}),
         **conditioning_metadata,
         "setting_feature_mode": checkpoint_payload.get("setting_feature_mode", SETTING_ENCODER_MODE_CONTINUOUS_V3),
         "setting_encoder_mode": checkpoint_payload.get("setting_encoder_mode", ""),
         "setting_encoder_config": checkpoint_payload.get("setting_encoder_config", {}),
-        "student_training_mode": training_summary.get("student_training_mode", checkpoint_payload.get("student_training_mode", "")),
-        "student_objective_settings": training_summary.get("student_objective_settings", checkpoint_payload.get("student_objective_settings", {})),
-        "student_target_summary": training_summary.get("student_target_summary", checkpoint_payload.get("student_target_summary", {})),
+        "student_training_mode": training_summary.get(
+            "student_training_mode", checkpoint_payload.get("student_training_mode", "")
+        ),
+        "student_objective_settings": training_summary.get(
+            "student_objective_settings", checkpoint_payload.get("student_objective_settings", {})
+        ),
+        "student_target_summary": training_summary.get(
+            "student_target_summary", checkpoint_payload.get("student_target_summary", {})
+        ),
         "student_unseen_target_distillation": training_summary.get(
             "student_unseen_target_distillation",
             checkpoint_payload.get("student_unseen_target_distillation", {}),
         ),
-        "teacher_checkpoint_selection_mode": checkpoint_payload.get("teacher_checkpoint_selection_mode", training_summary.get("teacher_checkpoint_selection_mode", "")),
+        "teacher_checkpoint_selection_mode": checkpoint_payload.get(
+            "teacher_checkpoint_selection_mode", training_summary.get("teacher_checkpoint_selection_mode", "")
+        ),
         "teacher_final_retrain": _teacher_final_retrain_metadata(checkpoint_payload, training_summary),
         "locked_test_used_for_selection": False,
         "comparison_summary_path": "" if comparison is None else comparison_file,
     }
-    (out_dir / f"{output_prefix}_policy_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    (out_dir / f"{output_prefix}_policy_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+    )
     return summary
 
 
@@ -1153,17 +1226,31 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Report locked-test performance for a frozen GICO student.")
     parser.add_argument("--gico_student_checkpoint", required=True)
     parser.add_argument("--training_summary", required=True)
-    parser.add_argument("--context_rows", default="", help="Comma-separated context-row CSVs used to enumerate report contexts.")
+    parser.add_argument(
+        "--context_rows", default="", help="Comma-separated context-row CSVs used to enumerate report contexts."
+    )
     parser.add_argument("--context_embeddings_npz", default="", help="Context embedding table for --context_rows.")
-    parser.add_argument("--split_phase", default=LOCKED_TEST_PHASE, help="Report split label: locked_test, validation_tuning, train_tuning, or context_disjoint.")
-    parser.add_argument("--selection_mode", choices=(SELECTION_MODE_REPORTING, SELECTION_MODE_CALIBRATION), default=SELECTION_MODE_REPORTING)
+    parser.add_argument(
+        "--split_phase",
+        default=LOCKED_TEST_PHASE,
+        help="Report split label: locked_test, validation_tuning, train_tuning, or context_disjoint.",
+    )
+    parser.add_argument(
+        "--selection_mode",
+        choices=(SELECTION_MODE_REPORTING, SELECTION_MODE_CALIBRATION),
+        default=SELECTION_MODE_REPORTING,
+    )
     parser.add_argument("--require_teacher_checkpoint_selection_mode", default="")
     parser.add_argument("--report_label", default="")
     parser.add_argument("--out_dir", required=True)
-    parser.add_argument("--baseline_rows", default="", help="Required uniform baseline context-row CSVs used as reward anchors.")
+    parser.add_argument(
+        "--baseline_rows", default="", help="Required uniform baseline context-row CSVs used as reward anchors."
+    )
     parser.add_argument("--comparator_rows", default="")
     parser.add_argument("--benchmark_family", default="")
-    parser.add_argument("--dataset", default="", help="Dataset key. Defaults to the single dataset inferred from --context_rows.")
+    parser.add_argument(
+        "--dataset", default="", help="Dataset key. Defaults to the single dataset inferred from --context_rows."
+    )
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
     parser.add_argument("--shared_backbone_root", default=str(DEFAULT_SHARED_BACKBONE_ROOT))
     parser.add_argument("--backbone_manifest", default=str(default_backbone_manifest_path()))
@@ -1188,9 +1275,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--fu_net_layers", type=int, default=3)
     parser.add_argument("--fu_net_heads", type=int, default=4)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--seeds", default="", help="Comma-separated logical seeds. Defaults to seeds inferred from --context_rows.")
-    parser.add_argument("--solver_names", default="", help="Comma-separated solver keys. Defaults to solvers inferred from --context_rows.")
-    parser.add_argument("--target_nfe_values", default="", help="Comma-separated target NFEs. Defaults to NFEs inferred from --context_rows.")
+    parser.add_argument(
+        "--seeds", default="", help="Comma-separated logical seeds. Defaults to seeds inferred from --context_rows."
+    )
+    parser.add_argument(
+        "--solver_names",
+        default="",
+        help="Comma-separated solver keys. Defaults to solvers inferred from --context_rows.",
+    )
+    parser.add_argument(
+        "--target_nfe_values",
+        default="",
+        help="Comma-separated target NFEs. Defaults to NFEs inferred from --context_rows.",
+    )
     parser.add_argument("--num_eval_samples", type=int, default=5)
     parser.add_argument("--forecast_eval_batch_size", type=int, default=1)
     return parser

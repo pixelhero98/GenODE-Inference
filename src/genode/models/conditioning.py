@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -10,7 +10,6 @@ import torch.nn.functional as F
 
 from genode.models.config import OTFlowConfig
 from genode.models.modules import MLP
-
 
 FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL = "frozen_backbone_policy_context_v1"
 
@@ -107,7 +106,9 @@ class TransformerContextEncoder(nn.Module):
     def forward(self, ctx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.in_proj(ctx)
         if x.shape[1] != self.pos.shape[1]:
-            pos = F.interpolate(self.pos.transpose(1, 2), size=x.shape[1], mode="linear", align_corners=False).transpose(1, 2)
+            pos = F.interpolate(
+                self.pos.transpose(1, 2), size=x.shape[1], mode="linear", align_corners=False
+            ).transpose(1, 2)
         else:
             pos = self.pos
         x = x + pos[:, -x.shape[1] :, :]
@@ -174,7 +175,7 @@ class HybridContextEncoder(nn.Module):
             return tokens
         bsz, total_steps, hidden_dim = tokens.shape
         pieces = [tokens]
-        for proj, scale in zip(self.scale_projs, self.scales):
+        for proj, scale in zip(self.scale_projs, self.scales, strict=False):
             if total_steps < scale:
                 continue
             remainder = total_steps % scale
@@ -199,15 +200,13 @@ class MultiScaleContextEncoder(nn.Module):
         super().__init__()
         self.base_encoder = TransformerContextEncoder(cfg)
         self.scales = (1, 5, 10)
-        self.pool_projs = nn.ModuleList(
-            [nn.Linear(cfg.context_dim, cfg.model.hidden_dim) for _ in self.scales[1:]]
-        )
+        self.pool_projs = nn.ModuleList([nn.Linear(cfg.context_dim, cfg.model.hidden_dim) for _ in self.scales[1:]])
 
     def forward(self, ctx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         h_base, pooled_base = self.base_encoder(ctx)
         bsz, total_steps, state_dim = ctx.shape
         multi_scale_tokens = [h_base]
-        for proj, scale in zip(self.pool_projs, self.scales[1:]):
+        for proj, scale in zip(self.pool_projs, self.scales[1:], strict=False):
             if total_steps < scale:
                 continue
             remainder = total_steps % scale
@@ -215,6 +214,7 @@ class MultiScaleContextEncoder(nn.Module):
             pooled_ctx = ctx_crop.view(bsz, -1, scale, state_dim).mean(dim=2)
             multi_scale_tokens.append(proj(pooled_ctx))
         return torch.cat(multi_scale_tokens, dim=1), pooled_base
+
 
 def build_context_encoder(cfg: OTFlowConfig) -> nn.Module:
     name = cfg.model.ctx_encoder.lower()
@@ -234,7 +234,9 @@ class CrossAttentionConditioner(nn.Module):
         super().__init__()
         hidden_dim = cfg.model.hidden_dim
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.attn = nn.MultiheadAttention(hidden_dim, num_heads=cfg.model.ctx_heads, batch_first=True, dropout=cfg.model.dropout)
+        self.attn = nn.MultiheadAttention(
+            hidden_dim, num_heads=cfg.model.ctx_heads, batch_first=True, dropout=cfg.model.dropout
+        )
         self.out = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.LayerNorm(hidden_dim))
 
     def forward(self, q: torch.Tensor, ctx_tokens: torch.Tensor) -> torch.Tensor:
@@ -275,8 +277,7 @@ def _validate_policy_context_tensor(
         )
     if int(tensor.shape[1]) != int(width):
         raise ValueError(
-            f"Frozen-backbone policy {name} feature width mismatch: "
-            f"expected {int(width)}, got {int(tensor.shape[1])}."
+            f"Frozen-backbone policy {name} feature width mismatch: expected {int(width)}, got {int(tensor.shape[1])}."
         )
     if not tensor.is_floating_point() or not bool(torch.isfinite(tensor).all()):
         raise ValueError(f"Frozen-backbone policy {name} must contain finite floating-point values.")

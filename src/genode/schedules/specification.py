@@ -12,7 +12,6 @@ from typing import Any
 from genode.artifacts.identity import canonical_json_text, semantic_sha256
 from genode.schedules.progress import PROGRESS_PROTOCOL
 
-
 SCHEDULE_SPECIFICATION_PROTOCOL = "schedule_specification_v2"
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*")
 

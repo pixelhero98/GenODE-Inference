@@ -5,8 +5,8 @@ import copy
 import csv
 import hashlib
 import json
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -19,10 +19,10 @@ from genode.canonical_experiment_layout import (
     CANONICAL_SEEN_NFES,
     NFE_ROLE_SEEN,
     NFE_ROLES,
+    SCENARIO_FAMILY_MOLECULE,
     canonical_nfes_for_role,
     density_source_key_for_schedule,
     schedule_family_for_key,
-    SCENARIO_FAMILY_MOLECULE,
 )
 from genode.data.molecule_xyz import (
     MOLECULE_GROUP_DATASET_KEYS,
@@ -32,15 +32,15 @@ from genode.data.molecule_xyz import (
     trainable_molecule_group_members,
 )
 from genode.data.otflow_monash_datasets import default_manifest_path
-from genode.schedule_transfer.diffusion_flow_schedules import (
-    BASELINE_SCHEDULE_KEYS,
-    EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
-    TRANSFER_SCHEDULE_KEYS,
-    build_schedule_grid,
-    fixed_schedule_shape_statistics,
-    run_fixed_schedule_variant,
-    schedule_display_name,
-    schedule_time_alignment,
+from genode.data.otflow_paths import (
+    default_backbone_manifest_path,
+    default_cryptos_data_path,
+    default_lobster_synthetic_profile_path,
+    default_long_term_st_data_path,
+    project_outputs_root,
+    project_paper_dataset_root,
+    project_root,
+    resolve_project_path,
 )
 from genode.evaluation.fm_backbone_registry import (
     BACKBONE_NAME_OTFLOW_MOLECULE,
@@ -55,7 +55,6 @@ from genode.evaluation.molecule_metrics import (
     load_molecule_checkpoint_splits,
     molecule_context_embeddings_for_indices,
 )
-from genode.evaluation.otflow_sampling_support import _choose_valid_windows
 from genode.evaluation.otflow_evaluation_support import (
     ALL_SOLVER_ORDER,
     CONDITIONAL_GENERATION_FAMILY,
@@ -91,37 +90,38 @@ from genode.evaluation.otflow_evaluation_support import (
     train_tuning_target_example_count,
     validate_execution_preflight,
 )
+from genode.evaluation.otflow_sampling_support import _choose_valid_windows
+from genode.gico.models import validate_time_grid
 from genode.gico.objectives import (
     MOLECULE_METRIC_SPECS,
     teacher_metric_profile_for_scenario,
     teacher_objective_specs_for_scenario,
     uniform_anchored_objective_columns,
 )
-from genode.gico.models import validate_time_grid
-from genode.solver_protocol import normalize_solver_keys, normalize_solver_nfe_fields
-from genode.schedule_transfer.otflow_paper_registry import METHOD_KEY
-from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
-from genode.data.otflow_paths import (
-    default_backbone_manifest_path,
-    default_cryptos_data_path,
-    default_lobster_synthetic_profile_path,
-    default_long_term_st_data_path,
-    project_outputs_root,
-    project_paper_dataset_root,
-    project_root,
-    resolve_project_path,
-)
-from genode.path_safety import portable_relative_path, resolve_portable_relative_path
-from genode.provenance import fingerprint_identity, path_fingerprint
-from genode.models.otflow_train_val import _get_dataset_item_by_t, _parse_batch, save_json
+from genode.gico.policy import GICO_PROTOCOL, load_context_embedding_table, save_context_embedding_table
+from genode.gico.schedule_hash import schedule_grid_hash
 from genode.models.conditioning import (
     FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
     frozen_backbone_policy_context,
 )
+from genode.models.otflow_train_val import _get_dataset_item_by_t, _parse_batch, save_json
+from genode.path_safety import portable_relative_path, resolve_portable_relative_path
+from genode.provenance import fingerprint_identity, path_fingerprint
 from genode.runtime import resolve_torch_device
-from genode.gico.policy import GICO_PROTOCOL, load_context_embedding_table, save_context_embedding_table
-from genode.gico.schedule_hash import schedule_grid_hash
+from genode.schedule_transfer.diffusion_flow_schedules import (
+    BASELINE_SCHEDULE_KEYS,
+    EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
+    TRANSFER_SCHEDULE_KEYS,
+    build_schedule_grid,
+    fixed_schedule_shape_statistics,
+    run_fixed_schedule_variant,
+    schedule_display_name,
+    schedule_time_alignment,
+)
+from genode.schedule_transfer.otflow_paper_registry import METHOD_KEY
+from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
 from genode.schedule_transfer.reference_clocks import reference_clock_provenance
+from genode.solver_protocol import normalize_solver_keys, normalize_solver_nfe_fields
 
 RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen_phase_context_v4"
 CONTEXT_REWARD_PROTOCOL_VERSION = "conditional_primary_metric_context_rewards_v2"
@@ -494,9 +494,7 @@ def _validate_recorder_artifact_paths(
     names_by_path: Dict[Path, List[str]] = {}
     for name, path in artifacts.items():
         names_by_path.setdefault(path.resolve(strict=False), []).append(name)
-    output_collisions = {
-        str(path): names for path, names in names_by_path.items() if len(names) > 1
-    }
+    output_collisions = {str(path): names for path, names in names_by_path.items() if len(names) > 1}
     input_output_collisions = {
         str(path.resolve(strict=False)): {
             "outputs": names_by_path[path.resolve(strict=False)],
@@ -527,8 +525,7 @@ def _runner_input_artifact_paths(cli_args: argparse.Namespace) -> Dict[str, Path
         "cryptos": str(getattr(cli_args, "cryptos_path", "")).strip() or default_cryptos_data_path(),
         "lobster_synthetic": str(getattr(cli_args, "lobster_synthetic_profile_path", "")).strip()
         or default_lobster_synthetic_profile_path(),
-        "long_term_st": str(getattr(cli_args, "long_term_st_path", "")).strip()
-        or default_long_term_st_data_path(),
+        "long_term_st": str(getattr(cli_args, "long_term_st_path", "")).strip() or default_long_term_st_data_path(),
     }
     for scenario_key in parse_conditional_generation_datasets(str(cli_args.conditional_generation_datasets)):
         inputs[f"conditional input {scenario_key}"] = resolve_project_path(conditional_paths[scenario_key])
@@ -537,9 +534,7 @@ def _runner_input_artifact_paths(cli_args: argparse.Namespace) -> Dict[str, Path
     for scenario_key in parse_forecast_datasets(str(cli_args.forecast_datasets)):
         inputs[f"forecast manifest {scenario_key}"] = default_manifest_path(dataset_root, scenario_key)
 
-    molecule_root = resolve_project_path(
-        str(getattr(cli_args, "molecule_group_root", default_molecule_group_root()))
-    )
+    molecule_root = resolve_project_path(str(getattr(cli_args, "molecule_group_root", default_molecule_group_root())))
     for scenario_key in parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", ""))):
         inputs[f"molecule manifest {scenario_key}"] = default_molecule_group_manifest_path(
             scenario_key,
@@ -650,7 +645,9 @@ def _load_schedule_summary_cases(path_text: str) -> List[Dict[str, Any]]:
         for item in list(schedule.get("predictions", []) or []):
             solver_key = str(item.get("solver_key", "")).strip()
             target_nfe = int(item.get("target_nfe", 0) or 0)
-            checkpoint_step = item.get("checkpoint_step", schedule.get("checkpoint_step", payload.get("checkpoint_step", "")))
+            checkpoint_step = item.get(
+                "checkpoint_step", schedule.get("checkpoint_step", payload.get("checkpoint_step", ""))
+            )
             if not solver_key or target_nfe <= 0:
                 continue
             nfe = normalize_solver_nfe_fields(
@@ -674,7 +671,10 @@ def _load_schedule_summary_cases(path_text: str) -> List[Dict[str, Any]]:
                     "time_grid": [float(x) for x in grid],
                     "schedule_grid_hash": schedule_grid_hash(grid),
                     "reference_time_alignment": str(
-                        item.get("reference_time_alignment", schedule.get("reference_time_alignment", "summary_density_time_grid"))
+                        item.get(
+                            "reference_time_alignment",
+                            schedule.get("reference_time_alignment", "summary_density_time_grid"),
+                        )
                     ),
                     "paper_duplicate_count": int(item.get("paper_duplicate_count", 0) or 0),
                     "reference_macro_steps": int(item.get("reference_macro_steps", nfe.macro_steps) or nfe.macro_steps),
@@ -718,7 +718,7 @@ def _checkpoint_steps_for_args(cli_args: argparse.Namespace) -> List[int]:
     else:
         fallback = int(getattr(cli_args, "otflow_train_steps", 0) or 0)
         values = [fallback] if fallback > 0 else list(CANONICAL_CHECKPOINT_STEPS)
-    allowed = set(int(value) for value in CANONICAL_CHECKPOINT_STEPS)
+    allowed = {int(value) for value in CANONICAL_CHECKPOINT_STEPS}
     unknown = [int(value) for value in values if int(value) not in allowed]
     if unknown:
         raise ValueError(
@@ -768,31 +768,22 @@ def _data_path_fingerprints(cli_args: argparse.Namespace) -> Dict[str, Any]:
         "cryptos": str(cli_args.cryptos_path).strip() or default_cryptos_data_path(),
         "lobster_synthetic": str(getattr(cli_args, "lobster_synthetic_profile_path", "")).strip()
         or default_lobster_synthetic_profile_path(),
-        "long_term_st": str(getattr(cli_args, "long_term_st_path", "")).strip()
-        or default_long_term_st_data_path(),
+        "long_term_st": str(getattr(cli_args, "long_term_st_path", "")).strip() or default_long_term_st_data_path(),
     }
     dataset_root = resolve_project_path(str(cli_args.dataset_root))
-    molecule_root = resolve_project_path(
-        str(getattr(cli_args, "molecule_group_root", default_molecule_group_root()))
-    )
+    molecule_root = resolve_project_path(str(getattr(cli_args, "molecule_group_root", default_molecule_group_root())))
     return {
         "conditional_generation_inputs": {
             scenario_key: _path_fingerprint(conditional_paths[scenario_key])
-            for scenario_key in parse_conditional_generation_datasets(
-                str(cli_args.conditional_generation_datasets)
-            )
+            for scenario_key in parse_conditional_generation_datasets(str(cli_args.conditional_generation_datasets))
         },
         "forecast_manifests": {
             scenario_key: _path_fingerprint(default_manifest_path(dataset_root, scenario_key))
             for scenario_key in parse_forecast_datasets(str(cli_args.forecast_datasets))
         },
         "molecule_manifests": {
-            scenario_key: _path_fingerprint(
-                default_molecule_group_manifest_path(scenario_key, molecule_root)
-            )
-            for scenario_key in parse_molecule_datasets(
-                str(getattr(cli_args, "molecule_datasets", ""))
-            )
+            scenario_key: _path_fingerprint(default_molecule_group_manifest_path(scenario_key, molecule_root))
+            for scenario_key in parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", "")))
         },
     }
 
@@ -835,8 +826,7 @@ def _context_reward_protocol_payload(cli_args: argparse.Namespace) -> Dict[str, 
         "version": CONTEXT_REWARD_PROTOCOL_VERSION,
         "conditional_generation_reward_granularity": "aggregate_primary_metric_components",
         "conditional_generation_profiles": {
-            str(dataset): teacher_metric_profile_for_scenario(str(dataset))
-            for dataset in conditional_datasets
+            str(dataset): teacher_metric_profile_for_scenario(str(dataset)) for dataset in conditional_datasets
         },
         "conditional_diagnostic_metrics_are_teacher_targets": False,
         "conditional_diagnostic_columns": [
@@ -973,7 +963,9 @@ def _cap_context_indices(
         token = f"{SCHEDULE_CONTEXT_SELECTION_PROTOCOL}|{salt}|{int(seed)}|{len(candidate)}|{selected_cap}"
         local_seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
         rng = np.random.default_rng(local_seed)
-        keep_positions = sorted(int(pos) for pos in rng.choice(np.arange(len(candidate)), size=selected_cap, replace=False).tolist())
+        keep_positions = sorted(
+            int(pos) for pos in rng.choice(np.arange(len(candidate)), size=selected_cap, replace=False).tolist()
+        )
         selected = [candidate[pos] for pos in keep_positions]
         was_capped = True
     return np.asarray(selected, dtype=np.int64), {
@@ -1007,7 +999,9 @@ def _cap_context_index_groups(
                 "uncapped_candidate_examples cannot be smaller than the selected candidate list "
                 f"({uncapped_count} < {len(candidate)})."
             )
-        normalized.append({**dict(group), "candidate_indices": candidate, "uncapped_candidate_examples": uncapped_count})
+        normalized.append(
+            {**dict(group), "candidate_indices": candidate, "uncapped_candidate_examples": uncapped_count}
+        )
         uncapped_total += int(uncapped_count)
         flat_candidates.extend((int(group_idx), int(pos)) for pos in range(len(candidate)))
     if not flat_candidates:
@@ -1048,7 +1042,7 @@ def _cap_context_index_groups(
         selected_by_group[group_idx].append(int(normalized[group_idx]["candidate_indices"][candidate_pos]))
     selected_total = int(sum(len(indices) for indices in selected_by_group))
     records: List[Dict[str, Any]] = []
-    for group, selected in zip(normalized, selected_by_group):
+    for group, selected in zip(normalized, selected_by_group, strict=False):
         record = dict(group.get("selection_record", {}))
         record.update(
             {
@@ -1065,16 +1059,22 @@ def _cap_context_index_groups(
             }
         )
         records.append(record)
-    return [np.asarray(indices, dtype=np.int64) for indices in selected_by_group], records, {
-        "selected_examples": int(selected_total),
-        "selected_examples_cap": int(selected_cap),
-        "uncapped_candidate_examples": int(uncapped_total),
-        "candidate_examples_after_initial_selection": int(len(flat_candidates)),
-        "selection_was_capped": bool(was_capped),
-    }
+    return (
+        [np.asarray(indices, dtype=np.int64) for indices in selected_by_group],
+        records,
+        {
+            "selected_examples": int(selected_total),
+            "selected_examples_cap": int(selected_cap),
+            "uncapped_candidate_examples": int(uncapped_total),
+            "candidate_examples_after_initial_selection": int(len(flat_candidates)),
+            "selection_was_capped": bool(was_capped),
+        },
+    )
 
 
-def _selection_metadata_row_fields(selection_meta: Mapping[str, Any], *, cap_source: str, context_sample_count: int) -> Dict[str, Any]:
+def _selection_metadata_row_fields(
+    selection_meta: Mapping[str, Any], *, cap_source: str, context_sample_count: int
+) -> Dict[str, Any]:
     fields = {
         "example_selection_protocol": str(selection_meta["example_selection_protocol"]),
         "context_sample_count": int(context_sample_count),
@@ -1153,9 +1153,26 @@ def _realized_nfe_for_solver(solver_key: str, runtime_nfe: int) -> int:
     return int(runtime_nfe) * int(solver_eval_multiplier(str(solver_key)))
 
 
-def _row_signature(*, dataset: str, split_phase: str, seed: int, target_nfe: int, solver_key: str, scheduler_key: str, checkpoint_id: str) -> str:
+def _row_signature(
+    *,
+    dataset: str,
+    split_phase: str,
+    seed: int,
+    target_nfe: int,
+    solver_key: str,
+    scheduler_key: str,
+    checkpoint_id: str,
+) -> str:
     return "|".join(
-        [str(dataset), str(split_phase), str(seed), str(target_nfe), str(solver_key), str(scheduler_key), str(checkpoint_id)]
+        [
+            str(dataset),
+            str(split_phase),
+            str(seed),
+            str(target_nfe),
+            str(solver_key),
+            str(scheduler_key),
+            str(checkpoint_id),
+        ]
     )
 
 
@@ -1270,7 +1287,9 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
     context_embeddings_path = artifact_paths["context_embeddings"]
     protocol_hash = _protocol_config_fingerprint(cli_args)
     previous_config = json.loads(run_config_path.read_text(encoding="utf-8")) if run_config_path.exists() else {}
-    can_resume = bool(getattr(cli_args, "resume", True)) and str(previous_config.get("protocol_hash", "")) == protocol_hash
+    can_resume = (
+        bool(getattr(cli_args, "resume", True)) and str(previous_config.get("protocol_hash", "")) == protocol_hash
+    )
     rows_by_key = _load_rows(jsonl_path, protocol_hash=str(protocol_hash)) if can_resume else {}
     save_json(
         {
@@ -1284,7 +1303,9 @@ def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str
         str(run_config_path),
     )
     context_rows_by_signature = _load_context_rows(context_csv_path) if can_resume else {}
-    existing_context_embeddings = load_context_embedding_table(context_embeddings_path) if can_resume and context_embeddings_path.exists() else {}
+    existing_context_embeddings = (
+        load_context_embedding_table(context_embeddings_path) if can_resume and context_embeddings_path.exists() else {}
+    )
     if can_resume and _write_context_rows_enabled(cli_args):
         rows_by_key = {
             key: row
@@ -1446,7 +1467,13 @@ def _append_context_records(
     coverage["row_count"] = int(coverage.get("row_count", 0)) + int(added_row_count)
     coverage["embedding_count"] = int(coverage.get("embedding_count", 0)) + int(added_embedding_count)
     row_recorder["context_embedding_metadata"] = {
-        "coverage": sorted(row_recorder["context_embedding_coverage"].values(), key=lambda item: tuple(str(item.get(field, "")) for field in ("benchmark_family", "dataset", "checkpoint_id", "split_phase", "context_schema"))),
+        "coverage": sorted(
+            row_recorder["context_embedding_coverage"].values(),
+            key=lambda item: tuple(
+                str(item.get(field, ""))
+                for field in ("benchmark_family", "dataset", "checkpoint_id", "split_phase", "context_schema")
+            ),
+        ),
     }
     _write_context_row_csv(Path(row_recorder["context_csv_path"]), list(rows_by_signature.values()))
     if row_recorder["context_embeddings"]:
@@ -1482,8 +1509,7 @@ def _context_embedding_export_batch_size(cfg: Any | None = None) -> int:
     fallback_batch_size = _positive_int_or_none(CONTEXT_EMBEDDING_EXPORT_FALLBACK_BATCH_SIZE)
     if max_batch_size is None or fallback_batch_size is None:
         raise ValueError(
-            "CONTEXT_EMBEDDING_EXPORT_MAX_BATCH_SIZE and "
-            "CONTEXT_EMBEDDING_EXPORT_FALLBACK_BATCH_SIZE must be positive."
+            "CONTEXT_EMBEDDING_EXPORT_MAX_BATCH_SIZE and CONTEXT_EMBEDDING_EXPORT_FALLBACK_BATCH_SIZE must be positive."
         )
     configured_batch_size: Optional[int] = None
     if cfg is not None:
@@ -1599,9 +1625,7 @@ def _conditional_context_records(
     for window_idx, t0 in enumerate([int(x) for x in chosen_t0s]):
         metrics_for_row = dict(per_window.get(int(t0), {}) or aggregate_metrics)
         if not metrics_for_row:
-            raise ValueError(
-                "Conditional context rows require per-window diagnostics or aggregate schedule metrics."
-            )
+            raise ValueError("Conditional context rows require per-window diagnostics or aggregate schedule metrics.")
         if scheduler_key == UNIFORM_SCHEDULER_KEY:
             uniform_metrics_for_row = dict(metrics_for_row)
         else:
@@ -1616,9 +1640,7 @@ def _conditional_context_records(
         score_value = metrics_for_row.get("score_main", score_main)
         uniform_score_value = uniform_metrics_for_row.get("score_main", uniform_score_main)
         score_gain = (
-            0.0
-            if scheduler_key == UNIFORM_SCHEDULER_KEY
-            else _safe_log_utility_gain(score_value, uniform_score_value)
+            0.0 if scheduler_key == UNIFORM_SCHEDULER_KEY else _safe_log_utility_gain(score_value, uniform_score_value)
         )
         reward_columns = uniform_anchored_objective_columns(
             {**reward_metric_row, "scheduler_key": scheduler_key},
@@ -1771,8 +1793,26 @@ def _pending_scheduler_cases(
         case_checkpoint_step = case.get("checkpoint_step", "")
         if case_checkpoint_step not in ("", None) and int(case_checkpoint_step) != int(checkpoint_step):
             continue
-        signature = _row_signature(dataset=dataset, split_phase=split_phase, seed=seed, target_nfe=target_nfe, solver_key=solver_key, scheduler_key=scheduler_key, checkpoint_id=checkpoint_id)
-        key = (row_recorder["protocol_hash"], benchmark_family, split_phase, int(seed), dataset, int(target_nfe), solver_key, scheduler_key, signature)
+        signature = _row_signature(
+            dataset=dataset,
+            split_phase=split_phase,
+            seed=seed,
+            target_nfe=target_nfe,
+            solver_key=solver_key,
+            scheduler_key=scheduler_key,
+            checkpoint_id=checkpoint_id,
+        )
+        key = (
+            row_recorder["protocol_hash"],
+            benchmark_family,
+            split_phase,
+            int(seed),
+            dataset,
+            int(target_nfe),
+            solver_key,
+            scheduler_key,
+            signature,
+        )
         row = _existing_complete_row(row_recorder, key)
         if row is None:
             pending.append(dict(case, row_signature=signature))
@@ -1795,9 +1835,7 @@ def _scheduler_case_matches_command(
     if case_target_nfe not in ("", None) and int(case_target_nfe) != int(target_nfe):
         return False
     case_checkpoint_step = case.get("checkpoint_step", "")
-    if case_checkpoint_step not in ("", None) and int(case_checkpoint_step) != int(checkpoint_step):
-        return False
-    return True
+    return not (case_checkpoint_step not in ("", None) and int(case_checkpoint_step) != int(checkpoint_step))
 
 
 def _schedule_row_resume_identity(
@@ -1848,7 +1886,10 @@ def _expected_schedule_row_identities(cli_args: argparse.Namespace) -> Tuple[Tup
     target_nfes = _target_nfe_values_for_args(cli_args)
     checkpoint_steps = _checkpoint_steps_for_args(cli_args)
     solver_keys = list(normalize_solver_keys(str(cli_args.solver_names)))
-    summary_requested = bool(str(getattr(cli_args, "schedule_summary_json", "")).strip() or str(getattr(cli_args, "summary_scheduler_names", "")).strip())
+    summary_requested = bool(
+        str(getattr(cli_args, "schedule_summary_json", "")).strip()
+        or str(getattr(cli_args, "summary_scheduler_names", "")).strip()
+    )
     identities: set[Tuple[Any, ...]] = set()
 
     def add_identities_for_dataset(
@@ -1896,7 +1937,9 @@ def _expected_schedule_row_identities(cli_args: argparse.Namespace) -> Tuple[Tup
                 scheduler_cases=cases_by_dataset[str(dataset)],
             )
 
-    conditional_generation_datasets = parse_conditional_generation_datasets(str(cli_args.conditional_generation_datasets))
+    conditional_generation_datasets = parse_conditional_generation_datasets(
+        str(cli_args.conditional_generation_datasets)
+    )
     if conditional_generation_datasets:
         cases_by_dataset = _scheduler_cases_for_datasets(
             cli_args,
@@ -2165,16 +2208,25 @@ def _molecule_context_records(
         context_id = raw_context_id
         context_embedding_id = str(metric_row.get("context_embedding_id", "") or "").strip()
         if not context_embedding_id:
-            raise ValueError(
-                "Molecule metric rows must contain a checkpoint-scoped context_embedding_id."
+            raise ValueError("Molecule metric rows must contain a checkpoint-scoped context_embedding_id.")
+        uniform_metric_row = (
+            metric_row if str(scheduler_key) == UNIFORM_SCHEDULER_KEY else uniform_by_context.get(context_id)
+        )
+        reward_columns = (
+            uniform_anchored_objective_columns(
+                dict(metric_row, scheduler_key=str(scheduler_key)),
+                dict(uniform_metric_row or {}),
+                MOLECULE_METRIC_SPECS,
+                uniform_schedule_key=UNIFORM_SCHEDULER_KEY,
             )
-        uniform_metric_row = metric_row if str(scheduler_key) == UNIFORM_SCHEDULER_KEY else uniform_by_context.get(context_id)
-        reward_columns = uniform_anchored_objective_columns(
-            dict(metric_row, scheduler_key=str(scheduler_key)),
-            dict(uniform_metric_row or {}),
-            MOLECULE_METRIC_SPECS,
-            uniform_schedule_key=UNIFORM_SCHEDULER_KEY,
-        ) if uniform_metric_row is not None else {"u_comp_uniform": None, "reward_metric_count": 0, "reward_metric_weights_json": "{}", "reward_metric_directions_json": "{}"}
+            if uniform_metric_row is not None
+            else {
+                "u_comp_uniform": None,
+                "reward_metric_count": 0,
+                "reward_metric_weights_json": "{}",
+                "reward_metric_directions_json": "{}",
+            }
+        )
         row_signature_payload = {
             "checkpoint_id": str(checkpoint["checkpoint_id"]),
             "context_id": context_id,
@@ -2217,7 +2269,9 @@ def _molecule_context_records(
                 "context_schema": MOLECULE_CONTEXT_SCHEMA,
                 "axis_dataset": str(dataset),
                 "axis_series": str(metric_row.get("axis_member", "")),
-                "axis_time_bin": _time_bin_for_target(int(metric_row.get("target_t", 0)), [int(row.get("target_t", 0)) for row in per_context_metrics]),
+                "axis_time_bin": _time_bin_for_target(
+                    int(metric_row.get("target_t", 0)), [int(row.get("target_t", 0)) for row in per_context_metrics]
+                ),
                 "axis_record": str(metric_row.get("axis_trajectory", "")),
                 "axis_window": str(metric_row.get("axis_window", "")),
                 "axis_stratum": str(metric_row.get("axis_stratum", "")),
@@ -2317,7 +2371,9 @@ def _schedule_details_from_case(case: Mapping[str, Any], runtime_nfe: int) -> Di
         "paper_duplicate_count": int(case.get("paper_duplicate_count", 0) or 0),
         "macro_steps": int(case.get("macro_steps", runtime_nfe) or runtime_nfe),
         "runtime_nfe": int(case.get("runtime_nfe", runtime_nfe) or runtime_nfe),
-        "realized_nfe": int(case.get("realized_nfe", _realized_nfe_for_solver(str(case.get("solver_key", "euler")), int(runtime_nfe)))),
+        "realized_nfe": int(
+            case.get("realized_nfe", _realized_nfe_for_solver(str(case.get("solver_key", "euler")), int(runtime_nfe)))
+        ),
         "reference_macro_steps": int(case.get("reference_macro_steps", runtime_nfe) or runtime_nfe),
     }
     details.update(fixed_schedule_shape_statistics(grid))
@@ -2336,7 +2392,24 @@ def _evaluation_protocol_fields(result_row: Mapping[str, Any], *, eval_horizon: 
     }
 
 
-def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: str, checkpoint: Mapping[str, Any], checkpoint_step: int, nfe_role: str, target_nfe: int, runtime_nfe: int, solver_key: str, scheduler_key: str, details: Mapping[str, Any], metrics: Mapping[str, Any], row_signature: str, protocol_hash: str) -> Dict[str, Any]:
+def _build_row(
+    *,
+    benchmark_family: str,
+    split_phase: str,
+    seed: int,
+    dataset: str,
+    checkpoint: Mapping[str, Any],
+    checkpoint_step: int,
+    nfe_role: str,
+    target_nfe: int,
+    runtime_nfe: int,
+    solver_key: str,
+    scheduler_key: str,
+    details: Mapping[str, Any],
+    metrics: Mapping[str, Any],
+    row_signature: str,
+    protocol_hash: str,
+) -> Dict[str, Any]:
     selection_metric = selection_metric_for_family(str(benchmark_family))
     nfe = normalize_solver_nfe_fields(
         str(solver_key),
@@ -2391,7 +2464,9 @@ def _build_row(*, benchmark_family: str, split_phase: str, seed: int, dataset: s
         "selection_metric": str(selection_metric),
         "selection_metric_value": metrics.get(selection_metric),
         "reference_macro_steps": int(details.get("reference_macro_steps", nfe.macro_steps)),
-        "reference_time_alignment": str(details.get("reference_time_alignment", schedule_time_alignment(str(scheduler_key)))),
+        "reference_time_alignment": str(
+            details.get("reference_time_alignment", schedule_time_alignment(str(scheduler_key)))
+        ),
         "runtime_grid_q25": details.get("runtime_grid_q25"),
         "runtime_grid_q50": details.get("runtime_grid_q50"),
         "runtime_grid_q75": details.get("runtime_grid_q75"),
@@ -2452,11 +2527,17 @@ def _scheduler_cases_for_datasets(
     _raise_if_duplicate_values(schedule_names, label="fixed diffusion-flow schedules")
     if UNIFORM_SCHEDULER_KEY in schedule_names:
         schedule_names = [UNIFORM_SCHEDULER_KEY] + [key for key in schedule_names if key != UNIFORM_SCHEDULER_KEY]
-    summary_cases = _load_schedule_summary_cases(str(getattr(cli_args, "schedule_summary_json", ""))) if include_summary_cases else []
+    summary_cases = (
+        _load_schedule_summary_cases(str(getattr(cli_args, "schedule_summary_json", "")))
+        if include_summary_cases
+        else []
+    )
     requested_summary_names = _parse_summary_schedule_names(str(getattr(cli_args, "summary_scheduler_names", "")))
     _raise_if_duplicate_values(requested_summary_names, label="summary diffusion-flow schedules")
     if requested_summary_names and include_summary_cases:
-        summary_cases = [case for case in summary_cases if str(case.get("scheduler_key")) in set(requested_summary_names)]
+        summary_cases = [
+            case for case in summary_cases if str(case.get("scheduler_key")) in set(requested_summary_names)
+        ]
         observed_summary_names = {str(case.get("scheduler_key")) for case in summary_cases}
         missing = sorted(set(requested_summary_names) - observed_summary_names)
         if missing:
@@ -2485,7 +2566,14 @@ def _scheduler_cases_for_datasets(
     return {str(dataset): [dict(case) for case in cases] for dataset in datasets}
 
 
-def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[str, Any], split_phase: str, seeds: Sequence[int], scheduler_cases_by_dataset: Mapping[str, Sequence[Mapping[str, Any]]]) -> List[Dict[str, Any]]:
+def _run_forecast_phase(
+    cli_args: argparse.Namespace,
+    *,
+    row_recorder: Mapping[str, Any],
+    split_phase: str,
+    seeds: Sequence[int],
+    scheduler_cases_by_dataset: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> List[Dict[str, Any]]:
     dataset_root = resolve_project_path(str(cli_args.dataset_root))
     shared_backbone_root = resolve_project_path(str(cli_args.shared_backbone_root))
     device = resolve_torch_device(str(cli_args.device))
@@ -2547,7 +2635,9 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                     )
                 else:
                     tuning_seed = int(seed) + 1_000 * dataset_idx
-                    eval_examples = int(selected_examples_cap) if selected_examples_cap is not None else int(len(eval_ds))
+                    eval_examples = (
+                        int(selected_examples_cap) if selected_examples_cap is not None else int(len(eval_ds))
+                    )
                     candidate_examples = choose_forecast_example_indices(
                         eval_ds,
                         n_examples=int(eval_examples),
@@ -2571,7 +2661,7 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                 salt=f"forecast|{dataset}|{split_phase}|{checkpoint_step}",
             )
             selections_by_seed: Dict[int, Tuple[np.ndarray, Dict[str, Any], int]] = {}
-            for selected, record in zip(selected_groups, selection_records):
+            for selected, record in zip(selected_groups, selection_records, strict=False):
                 selections_by_seed[int(record["seed"])] = (selected, record, int(record["tuning_seed"]))
             for seed in seeds:
                 chosen_examples, selection_meta, tuning_seed = selections_by_seed[int(seed)]
@@ -2663,13 +2753,23 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                         "train_tuning_fraction": float(cli_args.eval_train_fraction),
                                         "train_tuning_seed": int(tuning_seed),
                                         "train_tuning_strata": int(cli_args.train_tuning_strata),
-                                        "train_tuning_sampler": train_tuning_sampler_key(str(cli_args.train_tuning_sampling_mode)),
+                                        "train_tuning_sampler": train_tuning_sampler_key(
+                                            str(cli_args.train_tuning_sampling_mode)
+                                        ),
                                         "train_tuning_sampling_mode": str(cli_args.train_tuning_sampling_mode),
                                         "train_tuning_reference_examples": int(train_tuning_reference_examples),
-                                        "train_tuning_target_examples": int(selection_meta["uncapped_candidate_examples"]),
-                                        "train_tuning_uncapped_candidate_examples": int(selection_meta["uncapped_candidate_examples"]),
-                                        "train_tuning_train_split_fraction": float(cli_args.train_tuning_train_split_fraction),
-                                        "train_tuning_val_split_fraction": float(cli_args.train_tuning_val_split_fraction),
+                                        "train_tuning_target_examples": int(
+                                            selection_meta["uncapped_candidate_examples"]
+                                        ),
+                                        "train_tuning_uncapped_candidate_examples": int(
+                                            selection_meta["uncapped_candidate_examples"]
+                                        ),
+                                        "train_tuning_train_split_fraction": float(
+                                            cli_args.train_tuning_train_split_fraction
+                                        ),
+                                        "train_tuning_val_split_fraction": float(
+                                            cli_args.train_tuning_val_split_fraction
+                                        ),
                                     }
                                 )
                             _append_row_record(row_recorder, row)
@@ -2685,10 +2785,18 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                             "scenario_family": FORECAST_FAMILY,
                                             "nfe_role": nfe_role,
                                             "checkpoint_step": int(checkpoint_step),
-                                            "checkpoint_maturity_label": _checkpoint_maturity_label(int(checkpoint_step)),
-                                            "checkpoint_maturity_index": _checkpoint_maturity_index(int(checkpoint_step)),
-                                            "effective_train_steps": int(checkpoint.get("effective_train_steps", checkpoint_step)),
-                                            "checkpoint_export_protocol": str(checkpoint.get("checkpoint_export_protocol", "")),
+                                            "checkpoint_maturity_label": _checkpoint_maturity_label(
+                                                int(checkpoint_step)
+                                            ),
+                                            "checkpoint_maturity_index": _checkpoint_maturity_index(
+                                                int(checkpoint_step)
+                                            ),
+                                            "effective_train_steps": int(
+                                                checkpoint.get("effective_train_steps", checkpoint_step)
+                                            ),
+                                            "checkpoint_export_protocol": str(
+                                                checkpoint.get("checkpoint_export_protocol", "")
+                                            ),
                                             "parent_row_signature": str(case["row_signature"]),
                                             "protocol_hash": str(row_recorder["protocol_hash"]),
                                             "schedule_family": schedule_family_for_key(str(scheduler_key)),
@@ -2701,7 +2809,9 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
                                                 "train_tuning_fraction": float(cli_args.eval_train_fraction),
                                                 "train_tuning_seed": int(tuning_seed),
                                                 "train_tuning_strata": int(cli_args.train_tuning_strata),
-                                                "train_tuning_sampler": train_tuning_sampler_key(str(cli_args.train_tuning_sampling_mode)),
+                                                "train_tuning_sampler": train_tuning_sampler_key(
+                                                    str(cli_args.train_tuning_sampling_mode)
+                                                ),
                                             }
                                         )
                                     context_rows.append(copied_detail)
@@ -2729,7 +2839,14 @@ def _run_forecast_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[s
     return rows
 
 
-def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recorder: Mapping[str, Any], split_phase: str, seeds: Sequence[int], scheduler_cases_by_dataset: Mapping[str, Sequence[Mapping[str, Any]]]) -> List[Dict[str, Any]]:
+def _run_conditional_generation_phase(
+    cli_args: argparse.Namespace,
+    *,
+    row_recorder: Mapping[str, Any],
+    split_phase: str,
+    seeds: Sequence[int],
+    scheduler_cases_by_dataset: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> List[Dict[str, Any]]:
     shared_backbone_root = resolve_project_path(str(cli_args.shared_backbone_root))
     device = resolve_torch_device(str(cli_args.device))
     dataset_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
@@ -2833,7 +2950,7 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                 salt=f"conditional|{dataset}|{split_phase}|{checkpoint_step}",
             )
             selections_by_seed: Dict[int, Tuple[np.ndarray, Dict[str, Any], int]] = {}
-            for selected, record in zip(selected_groups, selection_records):
+            for selected, record in zip(selected_groups, selection_records, strict=False):
                 selections_by_seed[int(record["seed"])] = (selected, record, int(record["selection_seed"]))
             for seed in seeds:
                 chosen_eval_t0s, selection_meta, selection_seed = selections_by_seed[int(seed)]
@@ -2890,7 +3007,9 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 "grid_name": scheduler_key,
                                 "grid_kind": "fixed_diffusion_flow_time_grid",
                                 "selection_group": scheduler_key,
-                                "comparison_role": "transferred" if scheduler_key in TRANSFER_SCHEDULE_KEYS else "baseline",
+                                "comparison_role": "transferred"
+                                if scheduler_key in TRANSFER_SCHEDULE_KEYS
+                                else "baseline",
                                 "solver_name": str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
                                 "nfe": int(runtime_nfe),
                                 "time_grid": details["time_grid"],
@@ -2933,7 +3052,9 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 **_evaluation_protocol_fields(result_row, eval_horizon=int(eval_horizon)),
                             }
                             if scheduler_key != UNIFORM_SCHEDULER_KEY and cell_uniform_metrics is not None:
-                                metrics["relative_score_gain_vs_uniform"] = _safe_relative_gain(metrics.get("score_main"), cell_uniform_metrics.get("score_main"))
+                                metrics["relative_score_gain_vs_uniform"] = _safe_relative_gain(
+                                    metrics.get("score_main"), cell_uniform_metrics.get("score_main")
+                                )
                             row = _build_row(
                                 benchmark_family=CONDITIONAL_GENERATION_FAMILY,
                                 split_phase=str(split_phase),
@@ -2969,8 +3090,14 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 )
                             _append_row_record(row_recorder, row)
                             if _write_context_rows_enabled(cli_args):
-                                uniform_score = row.get("score_main") if scheduler_key == UNIFORM_SCHEDULER_KEY else (
-                                    cell_uniform_metrics.get("score_main") if cell_uniform_metrics is not None else None
+                                uniform_score = (
+                                    row.get("score_main")
+                                    if scheduler_key == UNIFORM_SCHEDULER_KEY
+                                    else (
+                                        cell_uniform_metrics.get("score_main")
+                                        if cell_uniform_metrics is not None
+                                        else None
+                                    )
                                 )
                                 context_rows = _conditional_context_records(
                                     benchmark_family=CONDITIONAL_GENERATION_FAMILY,
@@ -3000,7 +3127,9 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                         else cell_uniform_per_window_metrics_by_t0
                                     ),
                                     metric_row=row,
-                                    uniform_metric_row=row if scheduler_key == UNIFORM_SCHEDULER_KEY else cell_uniform_metrics,
+                                    uniform_metric_row=row
+                                    if scheduler_key == UNIFORM_SCHEDULER_KEY
+                                    else cell_uniform_metrics,
                                     evaluation_protocol_hash=str(row.get("evaluation_protocol_hash", "")),
                                     chosen_t0s_hash=str(row.get("chosen_t0s_hash", "")),
                                     train_tuning_context_metadata=(
@@ -3008,7 +3137,9 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                             "train_tuning_fraction": float(cli_args.eval_train_fraction),
                                             "train_tuning_seed": int(selection_seed),
                                             "train_tuning_strata": int(cli_args.train_tuning_strata),
-                                            "train_tuning_sampler": train_tuning_sampler_key(TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION),
+                                            "train_tuning_sampler": train_tuning_sampler_key(
+                                                TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION
+                                            ),
                                         }
                                         if str(split_phase) == TRAIN_TUNING_PHASE
                                         else None
@@ -3018,7 +3149,9 @@ def _run_conditional_generation_phase(cli_args: argparse.Namespace, *, row_recor
                                 for context_row in context_rows:
                                     t0 = int(context_row["target_t"])
                                     if t0 in conditional_embeddings_by_t0:
-                                        context_embeddings[str(context_row["context_embedding_id"])] = list(conditional_embeddings_by_t0[t0])
+                                        context_embeddings[str(context_row["context_embedding_id"])] = list(
+                                            conditional_embeddings_by_t0[t0]
+                                        )
                                 _append_context_records(
                                     row_recorder,
                                     context_rows,
@@ -3100,7 +3233,9 @@ def _run_molecule_phase(
                     **artifact,
                     "checkpoint_id": str(artifact["checkpoint_id"]),
                     "checkpoint_path": str(artifact["checkpoint_path"]),
-                    "train_budget_label": str(artifact.get("train_budget_label", _checkpoint_maturity_label(int(checkpoint_step)))),
+                    "train_budget_label": str(
+                        artifact.get("train_budget_label", _checkpoint_maturity_label(int(checkpoint_step)))
+                    ),
                 }
                 loaded = cache[cache_key]
                 model = loaded["model"]
@@ -3110,7 +3245,9 @@ def _run_molecule_phase(
                     if str(split_phase) == TRAIN_TUNING_PHASE:
                         if selected_examples_cap is None:
                             raise RuntimeError("Train-tuning example selection is missing its required cap.")
-                        selection_seed = int(cli_args.train_tuning_seed) + int(seed) + 10_000 * dataset_idx + 1_000 * member_idx
+                        selection_seed = (
+                            int(cli_args.train_tuning_seed) + int(seed) + 10_000 * dataset_idx + 1_000 * member_idx
+                        )
                         candidate_indices, target_examples = _choose_stratified_train_tuning_positions(
                             len(ds),
                             fraction=float(cli_args.eval_train_fraction),
@@ -3161,7 +3298,9 @@ def _run_molecule_phase(
                 seed=10_000 * int(dataset_idx) + int(checkpoint_step),
                 salt=f"molecule|{dataset}|{split_phase}|{checkpoint_step}",
             )
-            for selected_indices, selection_meta, work_item in zip(selected_groups, selection_records, work_items):
+            for selected_indices, selection_meta, work_item in zip(
+                selected_groups, selection_records, work_items, strict=False
+            ):
                 indices = [int(idx) for idx in selected_indices.tolist()]
                 if not indices:
                     continue
@@ -3216,7 +3355,13 @@ def _run_molecule_phase(
                         for case in pending_cases:
                             scheduler_key = str(case["scheduler_key"])
                             details = _schedule_details_from_case(case, int(runtime_nfe))
-                            eval_seed = int(seed) + 1_000_000 * dataset_idx + 100_000 * member_idx + 10_000 * target_idx + solver_idx
+                            eval_seed = (
+                                int(seed)
+                                + 1_000_000 * dataset_idx
+                                + 100_000 * member_idx
+                                + 10_000 * target_idx
+                                + solver_idx
+                            )
                             metrics = evaluate_molecule_rollout_schedule(
                                 model=model,
                                 ds=ds,
@@ -3257,7 +3402,11 @@ def _run_molecule_phase(
                                     "eval_windows": int(metrics.get("eval_windows", len(indices))),
                                     "eval_examples": int(metrics.get("eval_windows", len(indices))),
                                     "eval_horizon": int(getattr(cli_args, "molecule_rollout_steps", 16)),
-                                    "realized_nfe": int(metrics.get("realized_nfe", _realized_nfe_for_solver(str(solver_key), int(runtime_nfe)))),
+                                    "realized_nfe": int(
+                                        metrics.get(
+                                            "realized_nfe", _realized_nfe_for_solver(str(solver_key), int(runtime_nfe))
+                                        )
+                                    ),
                                 }
                             )
                             row = _build_row(
@@ -3324,7 +3473,9 @@ def _run_molecule_phase(
                                     parent_row_signature=str(case["row_signature"]),
                                     protocol_hash=str(row_recorder["protocol_hash"]),
                                     per_context_metrics=list(metrics.get("per_context_rows", []) or []),
-                                    uniform_by_context_id=uniform_context_by_id if scheduler_key != UNIFORM_SCHEDULER_KEY else {
+                                    uniform_by_context_id=uniform_context_by_id
+                                    if scheduler_key != UNIFORM_SCHEDULER_KEY
+                                    else {
                                         str(ctx["context_id"]): dict(ctx, scheduler_key=UNIFORM_SCHEDULER_KEY)
                                         for ctx in list(metrics.get("per_context_rows", []) or [])
                                     },
@@ -3334,7 +3485,9 @@ def _run_molecule_phase(
                                             "train_tuning_fraction": float(cli_args.eval_train_fraction),
                                             "train_tuning_seed": int(selection_meta["selection_seed"]),
                                             "train_tuning_strata": int(cli_args.train_tuning_strata),
-                                            "train_tuning_sampler": train_tuning_sampler_key(TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION),
+                                            "train_tuning_sampler": train_tuning_sampler_key(
+                                                TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION
+                                            ),
                                         }
                                         if str(split_phase) == TRAIN_TUNING_PHASE
                                         else None
@@ -3360,7 +3513,9 @@ def _run_molecule_phase(
     return rows
 
 
-def _candidate_rows_by_phase(rows: Sequence[Mapping[str, Any]], split_phase: str, solver_names: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
+def _candidate_rows_by_phase(
+    rows: Sequence[Mapping[str, Any]], split_phase: str, solver_names: Optional[Sequence[str]] = None
+) -> List[Dict[str, Any]]:
     solver_filter = None if solver_names is None else {str(x) for x in solver_names}
     out = []
     for row in rows:
@@ -3446,15 +3601,25 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
             vals = [float(v) for v in vals if v is not None]
             summary[f"{metric}_mean"] = _mean(vals)
             summary[f"{metric}_std"] = _std(vals)
-        scale_kinds = sorted({str(row.get("forecast_mase_scale_kind")) for row in group if row.get("forecast_mase_scale_kind") not in (None, "")})
-        summary["forecast_mase_scale_kind"] = scale_kinds[0] if len(scale_kinds) == 1 else (",".join(scale_kinds) if scale_kinds else "")
+        scale_kinds = sorted(
+            {
+                str(row.get("forecast_mase_scale_kind"))
+                for row in group
+                if row.get("forecast_mase_scale_kind") not in (None, "")
+            }
+        )
+        summary["forecast_mase_scale_kind"] = (
+            scale_kinds[0] if len(scale_kinds) == 1 else (",".join(scale_kinds) if scale_kinds else "")
+        )
         applicability_values = {
             bool(row.get("temporal_tstr_f1_applicable"))
             for row in group
             if row.get("temporal_tstr_f1_applicable") is not None
         }
         summary["temporal_tstr_f1_applicable"] = (
-            next(iter(applicability_values)) if len(applicability_values) == 1 else (None if not applicability_values else True)
+            next(iter(applicability_values))
+            if len(applicability_values) == 1
+            else (None if not applicability_values else True)
         )
         summaries.append(summary)
     return summaries
@@ -3481,7 +3646,9 @@ def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
     solvers = list(normalize_solver_keys(str(cli_args.solver_names)))
     nfes = _target_nfe_values_for_args(cli_args)
     checkpoint_steps = _checkpoint_steps_for_args(cli_args)
-    manifest_path = resolve_project_path(str(cli_args.backbone_manifest)) if str(cli_args.backbone_manifest).strip() else None
+    manifest_path = (
+        resolve_project_path(str(cli_args.backbone_manifest)) if str(cli_args.backbone_manifest).strip() else None
+    )
     manifest_summary: Dict[str, Any] = {"path": None, "ready_count": None, "missing_count": None}
     if manifest_path is not None:
         resolved = manifest_path
@@ -3569,8 +3736,14 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--eval_train_fraction", type=float, default=0.20)
     ap.add_argument("--train_tuning_seed", type=int, default=0)
     ap.add_argument("--train_tuning_strata", type=int, default=20)
-    ap.add_argument("--train_tuning_sampling_mode", choices=TRAIN_TUNING_SAMPLING_MODES, default=TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION)
-    ap.add_argument("--train_tuning_train_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION)
+    ap.add_argument(
+        "--train_tuning_sampling_mode",
+        choices=TRAIN_TUNING_SAMPLING_MODES,
+        default=TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
+    )
+    ap.add_argument(
+        "--train_tuning_train_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION
+    )
     ap.add_argument("--train_tuning_val_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION)
     ap.add_argument("--eval_windows_val", type=int, default=0)
     ap.add_argument("--eval_windows_test", type=int, default=0)
@@ -3610,7 +3783,12 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
             for row in _candidate_rows_by_phase(rows, LOCKED_TEST_PHASE)
             if int(row.get("seed", -1)) in selected_seeds
         ]
-        payload = {"runner_mode": "diagnose_locked_forecast_only", "row_count": int(len(rows)), "locked_row_count": int(len(locked)), "main_table_summary": _aggregate_main_table(locked)}
+        payload = {
+            "runner_mode": "diagnose_locked_forecast_only",
+            "row_count": int(len(rows)),
+            "locked_row_count": int(len(locked)),
+            "main_table_summary": _aggregate_main_table(locked),
+        }
         save_json(dict(payload), str(out_root / "combined_summary.json"))
         return payload
     if not bool(cli_args.allow_execute):
@@ -3626,7 +3804,10 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
         str(cli_args.conditional_generation_datasets)
     )
     molecule_datasets = parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", "")))
-    summary_requested = bool(str(getattr(cli_args, "schedule_summary_json", "")).strip() or str(getattr(cli_args, "summary_scheduler_names", "")).strip())
+    summary_requested = bool(
+        str(getattr(cli_args, "schedule_summary_json", "")).strip()
+        or str(getattr(cli_args, "summary_scheduler_names", "")).strip()
+    )
     scheduler_cases: Dict[str, List[Dict[str, Any]]] = {}
     if forecast_datasets:
         scheduler_cases.update(
@@ -3667,7 +3848,9 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
                 row_recorder=row_recorder,
                 split_phase=active_split_phase,
                 seeds=selected_seeds,
-                scheduler_cases_by_dataset={dataset: scheduler_cases[dataset] for dataset in conditional_generation_datasets},
+                scheduler_cases_by_dataset={
+                    dataset: scheduler_cases[dataset] for dataset in conditional_generation_datasets
+                },
             )
         if molecule_datasets:
             _run_molecule_phase(
@@ -3680,7 +3863,7 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
     finally:
         row_recorder["fh"].close()
 
-    selected_seed_set = set(int(seed) for seed in selected_seeds)
+    selected_seed_set = {int(seed) for seed in selected_seeds}
     phase_rows = [
         row
         for row in _candidate_rows_by_phase(list(row_recorder["rows_by_key"].values()), active_split_phase)
@@ -3707,7 +3890,12 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
         "summary_schedule_keys": _parse_summary_schedule_names(str(getattr(cli_args, "summary_scheduler_names", ""))),
     }
     save_json(dict(schedule_selection), str(out_root / "schedule_selection_summary.json"))
-    combined = {"prep": dict(prep_payload), "schedule_selection_summary": dict(schedule_selection), seed_summary_key: dict(seed_summary_payload), "main_table_summary": dict(main_table_summary)}
+    combined = {
+        "prep": dict(prep_payload),
+        "schedule_selection_summary": dict(schedule_selection),
+        seed_summary_key: dict(seed_summary_payload),
+        "main_table_summary": dict(main_table_summary),
+    }
     save_json(dict(combined), str(out_root / "combined_summary.json"))
     return combined
 

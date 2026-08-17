@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 import errno
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import stat
 import tempfile
-from typing import Callable, Iterator, Mapping
 import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Callable, Iterator, Mapping
 
 from genode.path_safety import is_link_or_reparse_point
 from genode.provenance import file_sha256
-
 
 BUNDLE_TRANSACTION_PROTOCOL = "genode_artifact_bundle_transaction"
 BUNDLE_TRANSACTION_VERSION = 1
@@ -62,9 +61,7 @@ def _normalize_bundle(
     def normalized_final_path(value: str | Path, *, label: str) -> Path:
         lexical = _lexical_leaf(value)
         if is_link_or_reparse_point(lexical):
-            raise ValueError(
-                f"Artifact bundle {label} may not be a symlink, junction, or reparse point."
-            )
+            raise ValueError(f"Artifact bundle {label} may not be a symlink, junction, or reparse point.")
         return lexical
 
     normalized_anchor = normalized_final_path(anchor, label="anchor")
@@ -84,24 +81,16 @@ def _normalize_bundle(
     for index, path in enumerate(normalized_paths):
         for other in normalized_paths[index + 1 :]:
             if path in other.parents or other in path.parents:
-                raise ValueError(
-                    "Artifact bundle targets may not contain one another."
-                )
+                raise ValueError("Artifact bundle targets may not contain one another.")
     deterministic_anchor = normalized[next(iter(normalized))]
     if normalized_anchor != deterministic_anchor:
-        raise ValueError(
-            "Artifact bundle anchor must be the target with the lexicographically first role."
-        )
+        raise ValueError("Artifact bundle anchor must be the target with the lexicographically first role.")
     for candidate in normalized_paths:
         for owner in normalized_paths:
             lock_path = owner.with_name(f".{owner.name}.bundle.lock")
-            journal_path = owner.with_name(
-                f".{owner.name}.bundle.transaction.json"
-            )
+            journal_path = owner.with_name(f".{owner.name}.bundle.transaction.json")
             if candidate in {lock_path, journal_path}:
-                raise ValueError(
-                    "Artifact bundle target collides with a reserved lock or journal sidecar."
-                )
+                raise ValueError("Artifact bundle target collides with a reserved lock or journal sidecar.")
             if candidate.parent != owner.parent:
                 continue
             staging_prefix = f".{owner.name}.bundle-stage-"
@@ -110,14 +99,9 @@ def _normalize_bundle(
             if (
                 candidate.name.startswith(staging_prefix)
                 or candidate.name.startswith(backup_prefix)
-                or (
-                    candidate.name.startswith(journal_temporary_prefix)
-                    and candidate.name.endswith(".tmp")
-                )
+                or (candidate.name.startswith(journal_temporary_prefix) and candidate.name.endswith(".tmp"))
             ):
-                raise ValueError(
-                    "Artifact bundle target collides with a reserved managed sidecar namespace."
-                )
+                raise ValueError("Artifact bundle target collides with a reserved managed sidecar namespace.")
     return normalized_anchor, normalized
 
 
@@ -131,13 +115,8 @@ def validate_artifact_bundle_layout(
 
 
 def _bundle_key(targets: Mapping[str, Path]) -> str:
-    payload = [
-        [role, os.path.normcase(str(path))]
-        for role, path in sorted(targets.items())
-    ]
-    encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode(
-        "utf-8"
-    )
+    payload = [[role, os.path.normcase(str(path))] for role, path in sorted(targets.items())]
+    encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -154,9 +133,7 @@ def bundle_journal_path(anchor: str | Path) -> Path:
 def temporary_bundle_path(target: str | Path) -> Path:
     path = _lexical_leaf(target)
     if is_link_or_reparse_point(path):
-        raise ValueError(
-            "Artifact bundle target may not be a symlink, junction, or reparse point."
-        )
+        raise ValueError("Artifact bundle target may not be a symlink, junction, or reparse point.")
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(
         prefix=f".{path.name}.bundle-stage-",
@@ -187,9 +164,7 @@ def discard_temporary_bundle_path(
         if not _path_exists(staged_path):
             return True
         _require_regular_file(staged_path, label="Managed bundle staging file")
-        if expected_sha256 is not None and not _exact_hash(
-            staged_path, expected_sha256
-        ):
+        if expected_sha256 is not None and not _exact_hash(staged_path, expected_sha256):
             return False
         _unlink(staged_path)
     except (OSError, ValueError):
@@ -303,14 +278,10 @@ def exclusive_bundle_lock(anchor: str | Path) -> Iterator[None]:
     """Hold a persistent, target-scoped interprocess advisory lock."""
 
     if os.name not in {"nt", "posix"}:
-        raise RuntimeError(
-            f"Artifact bundle locking is unsupported on platform {os.name!r}."
-        )
+        raise RuntimeError(f"Artifact bundle locking is unsupported on platform {os.name!r}.")
     lock_path = bundle_lock_path(anchor)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if _path_exists(lock_path) and (
-        is_link_or_reparse_point(lock_path) or not lock_path.is_file()
-    ):
+    if _path_exists(lock_path) and (is_link_or_reparse_point(lock_path) or not lock_path.is_file()):
         raise ValueError("Artifact bundle lock must be a regular file.")
     flags = os.O_RDWR
     if hasattr(os, "O_BINARY"):
@@ -323,7 +294,7 @@ def exclusive_bundle_lock(anchor: str | Path) -> Iterator[None]:
         descriptor = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         if is_link_or_reparse_point(lock_path) or not lock_path.is_file():
-            raise ValueError("Artifact bundle lock must be a regular file.")
+            raise ValueError("Artifact bundle lock must be a regular file.") from None
         descriptor = os.open(lock_path, flags)
     try:
         os.set_inheritable(descriptor, False)
@@ -343,9 +314,7 @@ def exclusive_bundle_lock(anchor: str | Path) -> Iterator[None]:
                 raise RuntimeError(
                     f"Another process is already writing artifact bundle {Path(anchor).name!r}."
                 ) from exc
-            raise RuntimeError(
-                f"Could not safely acquire the artifact bundle lock for {Path(anchor).name!r}."
-            ) from exc
+            raise RuntimeError(f"Could not safely acquire the artifact bundle lock for {Path(anchor).name!r}.") from exc
         os.lseek(descriptor, 0, os.SEEK_SET)
         marker = os.read(descriptor, len(_LOCK_MARKER) + 1)
         if not marker:
@@ -364,11 +333,7 @@ def exclusive_bundle_lock(anchor: str | Path) -> Iterator[None]:
 def _staging_path(target: Path, name: object) -> Path:
     text = str(name)
     prefix = f".{target.name}.bundle-stage-"
-    if (
-        Path(text).name != text
-        or not text.startswith(prefix)
-        or not text.endswith(".tmp")
-    ):
+    if Path(text).name != text or not text.startswith(prefix) or not text.endswith(".tmp"):
         raise ValueError("Bundle journal contains an invalid staging sidecar name.")
     path = target.parent / text
     if _path_exists(path) and is_link_or_reparse_point(path):
@@ -380,9 +345,7 @@ def _backup_path(target: Path, name: object) -> Path:
     text = str(name)
     prefix = f".{target.name}.bundle-backup-"
     suffix = text[len(prefix) :] if text.startswith(prefix) else ""
-    if Path(text).name != text or not text.startswith(prefix) or re.fullmatch(
-        r"[0-9a-f]{32}", suffix
-    ) is None:
+    if Path(text).name != text or not text.startswith(prefix) or re.fullmatch(r"[0-9a-f]{32}", suffix) is None:
         raise ValueError("Bundle journal contains an invalid backup sidecar name.")
     path = target.parent / text
     if _path_exists(path) and is_link_or_reparse_point(path):
@@ -402,11 +365,7 @@ def _journal_payload(
     records: list[dict[str, object]] = []
     for role, target in targets.items():
         previous_kind = previous_kinds[role]
-        backup_name = (
-            f".{target.name}.bundle-backup-{uuid.uuid4().hex}"
-            if previous_kind == "file"
-            else ""
-        )
+        backup_name = f".{target.name}.bundle-backup-{uuid.uuid4().hex}" if previous_kind == "file" else ""
         records.append(
             {
                 "role": role,
@@ -431,9 +390,7 @@ def _journal_payload(
 def _write_journal(path: Path, payload: Mapping[str, object], *, replace: bool) -> None:
     if not replace and _path_exists(path):
         raise ValueError("Recover the existing artifact bundle journal before promotion.")
-    descriptor, name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
@@ -576,10 +533,7 @@ def _paths_from_records(
     if kind == "target":
         return dict(targets)
     if kind == "staging":
-        return {
-            role: _staging_path(targets[role], record["staging_name"])
-            for role, record in records.items()
-        }
+        return {role: _staging_path(targets[role], record["staging_name"]) for role, record in records.items()}
     if kind == "backup":
         return {
             role: _backup_path(targets[role], record["backup_name"])
@@ -595,10 +549,7 @@ def _verify_hashes(
     *,
     hash_field: str,
 ) -> bool:
-    return all(
-        _exact_hash(paths[role], str(record[hash_field]))
-        for role, record in records.items()
-    )
+    return all(_exact_hash(paths[role], str(record[hash_field])) for role, record in records.items())
 
 
 def _finalize_journal(
@@ -644,15 +595,11 @@ def _validate_previous_bundle(
         previous_kind = str(record["previous_kind"])
         if previous_kind == "file":
             if not _exact_hash(target, str(record["previous_sha256"])):
-                raise ValueError(
-                    f"Recovered artifact bundle target {target.name!r} does not match its previous hash."
-                )
+                raise ValueError(f"Recovered artifact bundle target {target.name!r} does not match its previous hash.")
         else:
             complete = False
             if _path_exists(target):
-                raise ValueError(
-                    f"Recovered artifact bundle target {target.name!r} should be absent."
-                )
+                raise ValueError(f"Recovered artifact bundle target {target.name!r} should be absent.")
     if complete:
         _validate_complete_bundle(targets, targets, validator)
 
@@ -676,9 +623,7 @@ def _restore_previous_bundle(
             if _exact_hash(target, staged_hash):
                 _unlink(target)
             else:
-                raise ValueError(
-                    f"Cannot recover artifact bundle because target {target.name!r} is unknown."
-                )
+                raise ValueError(f"Cannot recover artifact bundle because target {target.name!r} is unknown.")
         if previous_kind == "file":
             backup = backups[role]
             if not _exact_hash(backup, previous_hash):
@@ -783,9 +728,7 @@ def preflight_artifact_bundle(
         if state == "absent":
             return
         if not overwrite:
-            raise FileExistsError(
-                f"Refusing to overwrite existing artifact bundle {normalized_anchor.name!r}."
-            )
+            raise FileExistsError(f"Refusing to overwrite existing artifact bundle {normalized_anchor.name!r}.")
         if state == "file" and validate_previous:
             _validate_complete_bundle(normalized_targets, normalized_targets, validator)
 
@@ -808,9 +751,7 @@ def validate_artifact_bundle(
             previous_validator=validator if validate_previous else None,
         )
         if _existing_bundle_state(normalized_targets) != "file":
-            raise FileNotFoundError(
-                f"Artifact bundle {normalized_anchor.name!r} is not complete."
-            )
+            raise FileNotFoundError(f"Artifact bundle {normalized_anchor.name!r} is not complete.")
         _validate_complete_bundle(normalized_targets, normalized_targets, validator)
 
 
@@ -826,9 +767,7 @@ def promote_artifact_bundle(
     validate_previous: bool = True,
 ) -> None:
     normalized_anchor, normalized_targets = _normalize_bundle(anchor, targets)
-    normalized_staged = {
-        str(role): _lexical_leaf(path) for role, path in staged.items()
-    }
+    normalized_staged = {str(role): _lexical_leaf(path) for role, path in staged.items()}
     if set(normalized_staged) != set(normalized_targets):
         raise ValueError("Staged artifact roles must exactly match bundle target roles.")
     for role, path in normalized_staged.items():
@@ -837,9 +776,7 @@ def promote_artifact_bundle(
         if _staging_path(normalized_targets[role], path.name) != path:
             raise ValueError("Staged bundle path does not use the managed sidecar format.")
     _validate_complete_bundle(normalized_staged, normalized_targets, validator)
-    staged_hashes = {
-        role: _fsync_regular_file(path) for role, path in normalized_staged.items()
-    }
+    staged_hashes = {role: _fsync_regular_file(path) for role, path in normalized_staged.items()}
     for parent in {path.parent for path in normalized_staged.values()}:
         _fsync_directory(parent)
 
@@ -856,15 +793,11 @@ def promote_artifact_bundle(
         )
         previous_kinds = _existing_bundle_kinds(normalized_targets)
         if previous_state != "absent" and not overwrite:
-            raise FileExistsError(
-                f"Refusing to overwrite existing artifact bundle {normalized_anchor.name!r}."
-            )
+            raise FileExistsError(f"Refusing to overwrite existing artifact bundle {normalized_anchor.name!r}.")
         if previous_state == "file" and validate_previous:
             _validate_complete_bundle(normalized_targets, normalized_targets, validator)
         previous_hashes = {
-            role: file_sha256(path)
-            for role, path in normalized_targets.items()
-            if previous_kinds[role] == "file"
+            role: file_sha256(path) for role, path in normalized_targets.items() if previous_kinds[role] == "file"
         }
         if precommit_validator is not None:
             precommit_validator()
@@ -883,37 +816,25 @@ def promote_artifact_bundle(
             raise RuntimeError("Artifact bundle journal disappeared before promotion.")
         records = _records_for_targets(normalized_payload)
         try:
-            backups = _paths_from_records(
-                normalized_targets, records, kind="backup"
-            )
+            backups = _paths_from_records(normalized_targets, records, kind="backup")
             for role, target in normalized_targets.items():
                 if previous_kinds[role] == "file":
                     if file_sha256(target) != previous_hashes[role]:
-                        raise ValueError(
-                            f"Artifact bundle target {target.name!r} changed before promotion."
-                        )
+                        raise ValueError(f"Artifact bundle target {target.name!r} changed before promotion.")
                     _link_without_overwrite(target, backups[role])
                 elif _path_exists(target):
-                    raise FileExistsError(
-                        "An artifact bundle target appeared concurrently before promotion."
-                    )
+                    raise FileExistsError("An artifact bundle target appeared concurrently before promotion.")
             for role, target in normalized_targets.items():
                 try:
                     _link_without_overwrite(normalized_staged[role], target)
                 except FileExistsError as exc:
-                    raise FileExistsError(
-                        f"Artifact bundle target {target.name!r} appeared concurrently."
-                    ) from exc
+                    raise FileExistsError(f"Artifact bundle target {target.name!r} appeared concurrently.") from exc
                 if file_sha256(target) != staged_hashes[role]:
-                    raise ValueError(
-                        f"Promoted artifact bundle target {target.name!r} changed unexpectedly."
-                    )
+                    raise ValueError(f"Promoted artifact bundle target {target.name!r} changed unexpectedly.")
             if precommit_validator is not None:
                 precommit_validator()
             _validate_complete_bundle(normalized_targets, normalized_targets, validator)
-            normalized_payload = _finalize_journal(
-                journal, normalized_payload, state="committed"
-            )
+            normalized_payload = _finalize_journal(journal, normalized_payload, state="committed")
         except BaseException as exc:
             try:
                 _recover_locked(
@@ -925,9 +846,7 @@ def promote_artifact_bundle(
                 )
             except BaseException as recovery_error:
                 if hasattr(exc, "add_note"):
-                    exc.add_note(
-                        f"Automatic artifact bundle recovery also failed: {recovery_error}"
-                    )
+                    exc.add_note(f"Automatic artifact bundle recovery also failed: {recovery_error}")
             raise
         _cleanup_finalized_transaction(
             journal=journal,

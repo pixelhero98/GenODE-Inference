@@ -58,7 +58,6 @@ class ResMLP(nn.Module):
         return self.out_norm(self.out_proj(h))
 
 
-
 def build_mlp(in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.0, use_res: bool = True) -> nn.Module:
     if use_res:
         return ResMLP(in_dim, hidden_dim, out_dim, n_blocks=2, dropout=dropout)
@@ -83,12 +82,12 @@ class AdaLN(nn.Module):
         return scale * self.norm(x) + shift
 
 
-
-def compute_rope_freqs(seq_len: int, dim: int, base: float = 10000.0, device: Optional[torch.device] = None) -> torch.Tensor:
+def compute_rope_freqs(
+    seq_len: int, dim: int, base: float = 10000.0, device: Optional[torch.device] = None
+) -> torch.Tensor:
     inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
     t = torch.arange(seq_len, device=device).float()
     return torch.outer(t, inv_freq)
-
 
 
 def apply_rotary_pos_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -173,9 +172,7 @@ class TransformerFUNet(nn.Module):
             raise ValueError(f"token_dim must be positive, got {self.token_dim}")
         sample_state_dim = int(cfg.sample_state_dim)
         if sample_state_dim % self.token_dim != 0:
-            raise ValueError(
-                f"sample_state_dim={sample_state_dim} must be divisible by token_dim={self.token_dim}"
-            )
+            raise ValueError(f"sample_state_dim={sample_state_dim} must be divisible by token_dim={self.token_dim}")
         self.seq_len = sample_state_dim // self.token_dim
         self.n_heads = cfg.model.fu_net_heads
         self.in_proj = nn.Linear(self.token_dim, hidden_dim)

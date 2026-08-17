@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, Mapping
 
-
 ConditioningMode = Literal["unconditional", "class_conditional"]
 
 RFPP_REPOSITORY_URL = "https://github.com/sangyun884/rfpp"

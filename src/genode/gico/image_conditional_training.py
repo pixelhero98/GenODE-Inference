@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from numbers import Integral, Real
 from typing import Any
 
@@ -22,13 +22,8 @@ from genode.gico.image_conditional import (
     validate_image_gico_backbone_context_tensor,
 )
 
-
-IMAGE_GICO_BACKBONE_CONTEXT_TEACHER_PROTOCOL = (
-    "image_gico_backbone_context_nfe_density_teacher_v4"
-)
-IMAGE_GICO_BACKBONE_CONTEXT_TRAINING_PROTOCOL = (
-    "image_gico_backbone_context_training_v4"
-)
+IMAGE_GICO_BACKBONE_CONTEXT_TEACHER_PROTOCOL = "image_gico_backbone_context_nfe_density_teacher_v4"
+IMAGE_GICO_BACKBONE_CONTEXT_TRAINING_PROTOCOL = "image_gico_backbone_context_training_v4"
 IMAGE_GICO_DENSITY_SUMMARY_PROTOCOL = "image_gico_density_summaries_v1"
 
 
@@ -147,16 +142,9 @@ class ImageGICOBackboneContextTrainingConfig:
             "weight_decay": self.weight_decay,
             "residual_penalty_weight": self.residual_penalty_weight,
             "seed": self.seed,
-            "student_objective": (
-                "full_3000_target_kl_plus_centered_residual_penalty"
-                "_minus_late_teacher_score"
-            ),
-            "teacher_objective": (
-                "pairwise_rank_plus_standardized_reward_regression"
-            ),
-            "teacher_cross_validation": (
-                "leave_one_complete_schedule_form_out"
-            ),
+            "student_objective": ("full_3000_target_kl_plus_centered_residual_penalty_minus_late_teacher_score"),
+            "teacher_objective": ("pairwise_rank_plus_standardized_reward_regression"),
+            "teacher_cross_validation": ("leave_one_complete_schedule_form_out"),
             "teacher_score_weight": self.teacher_score_weight,
             "teacher_score_warmup_fraction": self.teacher_score_warmup_fraction,
             "teacher_score_clip": self.teacher_score_clip,
@@ -190,18 +178,12 @@ def _density_summaries(density_mass: Tensor) -> Tensor:
     centered = centers - mean
     variance = torch.sum(density_mass * centered.square(), dim=-1, keepdim=True)
     standard_deviation = torch.sqrt(variance.clamp_min(1e-12))
-    skewness = torch.sum(density_mass * centered.pow(3), dim=-1, keepdim=True) / (
-        standard_deviation.pow(3) + 1e-12
-    )
+    skewness = torch.sum(density_mass * centered.pow(3), dim=-1, keepdim=True) / (standard_deviation.pow(3) + 1e-12)
     excess_kurtosis = (
-        torch.sum(density_mass * centered.pow(4), dim=-1, keepdim=True)
-        / (variance.square() + 1e-12)
-        - 3.0
+        torch.sum(density_mass * centered.pow(4), dim=-1, keepdim=True) / (variance.square() + 1e-12) - 3.0
     )
     safe = density_mass.clamp_min(1e-12)
-    entropy = -torch.sum(safe * torch.log(safe), dim=-1, keepdim=True) / math.log(
-        float(bins)
-    )
+    entropy = -torch.sum(safe * torch.log(safe), dim=-1, keepdim=True) / math.log(float(bins))
     total_variation = torch.sum(
         torch.abs(density_mass[..., 1:] - density_mass[..., :-1]),
         dim=-1,
@@ -253,12 +235,7 @@ class ImageGICOBackboneContextTeacher(nn.Module):
         self.nfe_embedding = nn.Embedding(3, nfe_embedding_dim)
         summary_dim = 13
         input_dim = (
-            self.context_dim
-            + nfe_embedding_dim
-            + self.density_bin_count
-            + self.density_bin_count
-            - 1
-            + summary_dim
+            self.context_dim + nfe_embedding_dim + self.density_bin_count + self.density_bin_count - 1 + summary_dim
         )
         self.network = nn.Sequential(
             nn.LayerNorm(input_dim),
@@ -280,9 +257,7 @@ class ImageGICOBackboneContextTeacher(nn.Module):
         if contexts.dtype != torch.float32:
             raise TypeError("Teacher contexts must use torch.float32.")
         if contexts.ndim != 2 or contexts.shape[1] != self.context_dim:
-            raise ValueError(
-                f"Teacher contexts must have shape [batch, {self.context_dim}]."
-            )
+            raise ValueError(f"Teacher contexts must have shape [batch, {self.context_dim}].")
         if contexts.shape[0] <= 0 or not bool(torch.isfinite(contexts).all()):
             raise ValueError("Teacher contexts must be nonempty and finite.")
         if nfe_indices.shape != (contexts.shape[0],):
@@ -296,9 +271,7 @@ class ImageGICOBackboneContextTeacher(nn.Module):
             raise ValueError("Teacher density_mass has an incompatible shape.")
         if contexts.device != density_mass.device or indices.device != density_mass.device:
             raise ValueError("Teacher inputs must share a device.")
-        if not bool(torch.isfinite(density_mass).all()) or bool(
-            torch.any(density_mass < 0.0)
-        ):
+        if not bool(torch.isfinite(density_mass).all()) or bool(torch.any(density_mass < 0.0)):
             raise ValueError("Teacher density_mass must be finite and nonnegative.")
         if not bool(
             torch.allclose(
@@ -361,14 +334,9 @@ class ImageGICOBackboneContextTrainingResult:
             raise ValueError("Teacher OOF pairwise accuracy must be in [0, 1].")
         if not self.teacher_schedule_fold_diagnostics:
             raise ValueError("Teacher diagnostics must contain schedule folds.")
-        fold_indices = tuple(
-            int(item.get("fold", -1))
-            for item in self.teacher_schedule_fold_diagnostics
-        )
+        fold_indices = tuple(int(item.get("fold", -1)) for item in self.teacher_schedule_fold_diagnostics)
         if fold_indices != tuple(range(len(fold_indices))):
-            raise ValueError(
-                "Teacher diagnostics must contain one ordered fold per schedule."
-            )
+            raise ValueError("Teacher diagnostics must contain one ordered fold per schedule.")
 
     @property
     def model_state_sha256(self) -> str:
@@ -386,9 +354,7 @@ class ImageGICOBackboneContextTrainingResult:
 
     def manifest_payload(self) -> dict[str, Any]:
         schedule_count = len(self.teacher_schedule_fold_diagnostics)
-        teacher_evidence_row_count = (
-            len(IMAGE_TARGET_NFES) * IMAGE_GICO_CLASS_COUNT * schedule_count
-        )
+        teacher_evidence_row_count = len(IMAGE_TARGET_NFES) * IMAGE_GICO_CLASS_COUNT * schedule_count
         payload = {
             "protocol": IMAGE_GICO_BACKBONE_CONTEXT_TRAINING_PROTOCOL,
             "conditioning": "normalized_frozen_backbone_map_label_plus_target_nfe",
@@ -421,9 +387,7 @@ class ImageGICOBackboneContextTrainingResult:
             "final_teacher_score": self.final_teacher_score,
             "final_objective": self.final_objective,
             "conditional_density_range": self.conditional_density_range,
-            "teacher_schedule_fold_diagnostics": [
-                dict(item) for item in self.teacher_schedule_fold_diagnostics
-            ],
+            "teacher_schedule_fold_diagnostics": [dict(item) for item in self.teacher_schedule_fold_diagnostics],
             "teacher_oof_rmse": self.teacher_oof_rmse,
             "teacher_oof_pairwise_accuracy": self.teacher_oof_pairwise_accuracy,
         }
@@ -435,9 +399,7 @@ class ImageGICOBackboneContextTrainingResult:
 
 
 def _score_weight(step: int, config: ImageGICOBackboneContextTrainingConfig) -> float:
-    warmup_steps = int(
-        math.floor(config.student_steps * config.teacher_score_warmup_fraction)
-    )
+    warmup_steps = int(math.floor(config.student_steps * config.teacher_score_warmup_fraction))
     if step < warmup_steps:
         return 0.0
     denominator = max(config.student_steps - warmup_steps - 1, 1)
@@ -496,20 +458,13 @@ def _teacher_training_step(
     contexts = context_table[labels]
     left_score = teacher(contexts, nfe_indices, left_density)
     right_score = teacher(contexts, nfe_indices, right_density)
-    regression = 0.5 * (
-        F.mse_loss(left_score, left_target)
-        + F.mse_loss(right_score, right_target)
-    )
+    regression = 0.5 * (F.mse_loss(left_score, left_target) + F.mse_loss(right_score, right_target))
     target_difference = left_target - right_target
     non_ties = target_difference != 0.0
     if bool(non_ties.any()):
         direction = torch.sign(target_difference[non_ties])
         predicted_difference = left_score[non_ties] - right_score[non_ties]
-        rank = F.softplus(
-            -direction
-            * predicted_difference
-            / config.teacher_rank_temperature
-        ).mean()
+        rank = F.softplus(-direction * predicted_difference / config.teacher_rank_temperature).mean()
     else:
         rank = regression.new_zeros(())
     loss = rank + config.teacher_regression_weight * regression
@@ -530,20 +485,16 @@ def _train_teacher(
     schedule_count = int(density_sources.shape[1])
     if schedule_count <= 1:
         raise ValueError("Teacher training requires at least two schedules.")
-    teacher = ImageGICOBackboneContextTeacher(
-        density_bin_count=int(density_sources.shape[-1])
-    ).to(device=rewards.device)
+    teacher = ImageGICOBackboneContextTeacher(density_bin_count=int(density_sources.shape[-1])).to(
+        device=rewards.device
+    )
     optimizer = torch.optim.AdamW(
         teacher.parameters(),
         lr=config.teacher_learning_rate,
         weight_decay=config.weight_decay,
     )
     allowed = torch.tensor(
-        [
-            index
-            for index in range(schedule_count)
-            if index != heldout_schedule
-        ],
+        [index for index in range(schedule_count) if index != heldout_schedule],
         dtype=torch.int64,
         device=rewards.device,
     )
@@ -577,9 +528,7 @@ def _teacher_oof_diagnostics(
     if schedule_count <= 1:
         raise ValueError("Teacher diagnostics require at least two schedules.")
     if rewards.shape[-1] != schedule_count or density_sources.shape[1] != schedule_count:
-        raise ValueError(
-            "Teacher diagnostics schedule tensors must match schedule_keys."
-        )
+        raise ValueError("Teacher diagnostics schedule tensors must match schedule_keys.")
     predictions = torch.empty_like(rewards)
     rows: list[dict[str, float | int | str]] = []
     class_count = context_table.shape[0]
@@ -609,9 +558,7 @@ def _teacher_oof_diagnostics(
                         class_count,
                         -1,
                     )
-                    fold_rows.append(
-                        fold_teacher(context_table, nfe_indices, density)
-                    )
+                    fold_rows.append(fold_teacher(context_table, nfe_indices, density))
             prediction = torch.stack(fold_rows)
             predictions[..., heldout] = prediction
             target = rewards[..., heldout]
@@ -620,12 +567,8 @@ def _teacher_oof_diagnostics(
                     "fold": heldout,
                     "heldout_schedule_key": schedule_keys[heldout],
                     "heldout_row_count": 3 * IMAGE_GICO_CLASS_COUNT,
-                    "root_mean_squared_error": float(
-                        torch.sqrt(F.mse_loss(prediction, target)).cpu()
-                    ),
-                    "mean_absolute_error": float(
-                        F.l1_loss(prediction, target).cpu()
-                    ),
+                    "root_mean_squared_error": float(torch.sqrt(F.mse_loss(prediction, target)).cpu()),
+                    "mean_absolute_error": float(F.l1_loss(prediction, target).cpu()),
                 }
             )
             del fold_teacher
@@ -642,9 +585,10 @@ def _teacher_oof_diagnostics(
     )
     non_ties = (difference_target != 0.0) & upper
     accuracy = (
-        torch.sign(difference_target[non_ties])
-        == torch.sign(difference_prediction[non_ties])
-    ).to(dtype=torch.float64).mean()
+        (torch.sign(difference_target[non_ties]) == torch.sign(difference_prediction[non_ties]))
+        .to(dtype=torch.float64)
+        .mean()
+    )
     rmse = torch.sqrt(F.mse_loss(predictions, rewards))
     return tuple(rows), float(rmse.cpu()), float(accuracy.cpu())
 
@@ -689,9 +633,7 @@ def train_image_gico_backbone_context(
         targets.density_bin_count,
     )
     if density_sources.shape != expected_density_shape:
-        raise ValueError(
-            f"fixed_density_mass must have shape {expected_density_shape}."
-        )
+        raise ValueError(f"fixed_density_mass must have shape {expected_density_shape}.")
     if bool(torch.any(density_sources < 0.0)) or not bool(
         torch.allclose(
             density_sources.sum(dim=-1),
@@ -752,8 +694,7 @@ def train_image_gico_backbone_context(
     for step in range(training.student_steps):
         predicted = model.canonical_density_table()
         kl = torch.sum(
-            target_density
-            * (torch.log(target_density) - torch.log(predicted)),
+            target_density * (torch.log(target_density) - torch.log(predicted)),
             dim=-1,
         ).mean()
         residual_penalty = model.centered_residual_table().square().mean()
@@ -763,20 +704,20 @@ def train_image_gico_backbone_context(
             dtype=torch.int64,
             device=execution_device,
         ).repeat_interleave(IMAGE_GICO_CLASS_COUNT)
-        teacher_score = teacher(
-            flat_contexts,
-            flat_nfes,
-            predicted.reshape(-1, targets.density_bin_count),
-        ).clamp(
-            min=-training.teacher_score_clip,
-            max=training.teacher_score_clip,
-        ).mean()
-        weight = _score_weight(step, training)
-        objective = (
-            kl
-            + training.residual_penalty_weight * residual_penalty
-            - weight * teacher_score
+        teacher_score = (
+            teacher(
+                flat_contexts,
+                flat_nfes,
+                predicted.reshape(-1, targets.density_bin_count),
+            )
+            .clamp(
+                min=-training.teacher_score_clip,
+                max=training.teacher_score_clip,
+            )
+            .mean()
         )
+        weight = _score_weight(step, training)
+        objective = kl + training.residual_penalty_weight * residual_penalty - weight * teacher_score
         optimizer.zero_grad(set_to_none=True)
         objective.backward()
         optimizer.step()
@@ -787,9 +728,7 @@ def train_image_gico_backbone_context(
     model.eval()
     with torch.no_grad():
         table = model.canonical_density_table()
-    conditional_range = float(
-        (table.amax(dim=1) - table.amin(dim=1)).amax().detach().cpu()
-    )
+    conditional_range = float((table.amax(dim=1) - table.amin(dim=1)).amax().detach().cpu())
     return ImageGICOBackboneContextTrainingResult(
         model=model,
         teacher=teacher,

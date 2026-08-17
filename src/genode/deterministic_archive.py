@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -10,6 +9,7 @@ import struct
 import tempfile
 import unicodedata
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterable, Iterator, Mapping, Sequence
@@ -21,7 +21,6 @@ from genode.artifact_bundle import (
     promote_artifact_bundle,
     validate_artifact_bundle_layout,
 )
-
 
 ARCHIVE_SCHEMA_VERSION = "genode_deterministic_archive_v1"
 ARCHIVE_MANIFEST_NAME = "MANIFEST.json"
@@ -41,9 +40,7 @@ _POSIX_LOCAL_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9/])/(?!/)[^\s,;]+")
 _UNC_LOCAL_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9:])//[^/]", re.IGNORECASE)
 _TILDE_LOCAL_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9])~[/\\]")
 _WINDOWS_RESERVED_COMPONENTS = frozenset(
-    {"aux", "con", "nul", "prn"}
-    | {f"com{index}" for index in range(1, 10)}
-    | {f"lpt{index}" for index in range(1, 10)}
+    {"aux", "con", "nul", "prn"} | {f"com{index}" for index in range(1, 10)} | {f"lpt{index}" for index in range(1, 10)}
 )
 _WINDOWS_INVALID_COMPONENT = re.compile(r'[<>"|?*]')
 
@@ -202,10 +199,7 @@ def _checked_source(path: str | Path) -> Path:
         raise RuntimeError(f"Archive source changed while it was resolved: {requested}")
     if not stat.S_ISREG(requested_after.st_mode) or not stat.S_ISREG(source_after.st_mode):
         raise ValueError(f"Archive source is not a regular file: {source}")
-    if (
-        _file_identity(requested_after) != expected_identity
-        or _file_identity(source_after) != expected_identity
-    ):
+    if _file_identity(requested_after) != expected_identity or _file_identity(source_after) != expected_identity:
         raise RuntimeError(f"Archive source changed while it was resolved: {requested}")
 
     _reject_linked_components(source)
@@ -352,18 +346,12 @@ def _canonical_zip_framing_errors(
         errors.append("ZIP64 central directory is not contiguous with its canonical frame.")
     if zip64_directory_offset != central_directory_start:
         errors.append("ZIP64 central-directory offset is inconsistent.")
-    expected_classic_disk_entries = (
-        0xFFFF if zip64_disk_entries > zipfile.ZIP_FILECOUNT_LIMIT else zip64_disk_entries
-    )
+    expected_classic_disk_entries = 0xFFFF if zip64_disk_entries > zipfile.ZIP_FILECOUNT_LIMIT else zip64_disk_entries
     expected_classic_total_entries = (
         0xFFFF if zip64_total_entries > zipfile.ZIP_FILECOUNT_LIMIT else zip64_total_entries
     )
-    expected_classic_directory_size = (
-        0xFFFFFFFF if zip64_directory_size > 0xFFFFFFFF else zip64_directory_size
-    )
-    expected_classic_directory_offset = (
-        0xFFFFFFFF if zip64_directory_offset > 0xFFFFFFFF else zip64_directory_offset
-    )
+    expected_classic_directory_size = 0xFFFFFFFF if zip64_directory_size > 0xFFFFFFFF else zip64_directory_size
+    expected_classic_directory_offset = 0xFFFFFFFF if zip64_directory_offset > 0xFFFFFFFF else zip64_directory_offset
     if (
         disk_entry_count != expected_classic_disk_entries
         or total_entry_count != expected_classic_total_entries
@@ -435,17 +423,15 @@ def _canonical_local_header_errors(
                 errors.append(f"ZIP local header flags or compression disagree: {info.filename}")
             if dos_time != expected_dos_time or dos_date != expected_dos_date:
                 errors.append(f"ZIP local header has a non-canonical timestamp: {info.filename}")
-            if (
-                crc32 != info.CRC
-                or compressed_size != expected_compressed_size
-                or file_size != expected_file_size
-            ):
+            if crc32 != info.CRC or compressed_size != expected_compressed_size or file_size != expected_file_size:
                 errors.append(f"ZIP local header sizes or CRC disagree: {info.filename}")
             if filename != expected_filename:
                 errors.append(f"ZIP local header filename disagrees: {info.filename}")
             if extra != expected_extra:
                 errors.append(f"ZIP local header has non-canonical extra metadata: {info.filename}")
-            expected_offset = info.header_offset + _LOCAL_FILE_HEADER_SIZE + filename_size + extra_size + info.compress_size
+            expected_offset = (
+                info.header_offset + _LOCAL_FILE_HEADER_SIZE + filename_size + extra_size + info.compress_size
+            )
     if expected_offset != central_directory_start:
         errors.append("ZIP local payload region is not contiguous with the central directory.")
     return errors
@@ -478,11 +464,7 @@ def _snapshot_source(source: Path) -> _SourceSnapshot:
         opened_after = os.fstat(handle.fileno())
     _reject_linked_components(source)
     after = source.lstat()
-    if (
-        _file_identity(opened_after) != expected
-        or _file_identity(after) != expected
-        or size != expected[2]
-    ):
+    if _file_identity(opened_after) != expected or _file_identity(after) != expected or size != expected[2]:
         raise RuntimeError(f"Archive source changed while it was being hashed: {source}")
     return _SourceSnapshot(
         identity=expected,
@@ -548,7 +530,7 @@ def _archive_bundle_targets(output: Path) -> dict[str, Path]:
 
 @contextmanager
 def _exclusive_bundle_stage(target: Path) -> Iterator[tuple[Path, BinaryIO]]:
-    handle = tempfile.NamedTemporaryFile(
+    handle = tempfile.NamedTemporaryFile(  # noqa: SIM115 - closed by this context manager
         mode="w+b",
         prefix=f".{target.name}.bundle-stage-",
         suffix=".tmp",
@@ -601,13 +583,9 @@ def _write_archive_stage(
             _reject_linked_components(source_path)
             if _file_identity(source_path.lstat()) != value.identity:
                 raise RuntimeError(f"Archive source changed before it was written: {source_path}")
-            with source_path.open("rb") as source, archive.open(
-                info, "w", force_zip64=True
-            ) as target:
+            with source_path.open("rb") as source, archive.open(info, "w", force_zip64=True) as target:
                 if _file_identity(os.fstat(source.fileno())) != value.identity:
-                    raise RuntimeError(
-                        f"Archive source changed before it was written: {source_path}"
-                    )
+                    raise RuntimeError(f"Archive source changed before it was written: {source_path}")
                 size, digest = _copy_and_hash(source, target)
                 opened_after = os.fstat(source.fileno())
             _reject_linked_components(source_path)
@@ -617,9 +595,7 @@ def _write_archive_stage(
                 or size != expected["size_bytes"]
                 or digest != expected["sha256"]
             ):
-                raise RuntimeError(
-                    f"Archive source changed while it was being written: {source_path}"
-                )
+                raise RuntimeError(f"Archive source changed while it was being written: {source_path}")
 
 
 def _validate_archive_bundle_identity(
@@ -650,18 +626,12 @@ def _validate_archive_bundle_identity(
         sidecar_bytes = paths["manifest"].read_bytes()
         sidecar = json.loads(
             sidecar_bytes,
-            parse_constant=lambda value: (_ for _ in ()).throw(
-                ValueError(f"non-finite JSON constant {value!r}")
-            ),
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"non-finite JSON constant {value!r}")),
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"Could not read deterministic archive manifest sidecar: {exc}") from exc
-    if not isinstance(sidecar, Mapping) or sidecar_bytes != canonical_json_bytes(
-        expected_sidecar
-    ):
-        raise ValueError(
-            "Deterministic archive manifest sidecar does not match the ZIP artifact."
-        )
+    if not isinstance(sidecar, Mapping) or sidecar_bytes != canonical_json_bytes(expected_sidecar):
+        raise ValueError("Deterministic archive manifest sidecar does not match the ZIP artifact.")
 
     expected_sha256 = f"{archive_digest}  {targets['archive'].name}\n".encode("ascii")
     try:
@@ -669,9 +639,7 @@ def _validate_archive_bundle_identity(
     except OSError as exc:
         raise ValueError(f"Could not read deterministic archive SHA-256 sidecar: {exc}") from exc
     if sha256_bytes != expected_sha256:
-        raise ValueError(
-            "Deterministic archive SHA-256 sidecar does not match the ZIP artifact."
-        )
+        raise ValueError("Deterministic archive SHA-256 sidecar does not match the ZIP artifact.")
 
 
 def write_deterministic_zip(
@@ -862,9 +830,10 @@ def validate_deterministic_zip(path: str | Path) -> dict[str, Any]:
                             errors.append("Archive manifest has unexpected or missing fields.")
                         if manifest.get("schema_version") != ARCHIVE_SCHEMA_VERSION:
                             errors.append("Archive manifest uses an unsupported schema version.")
-                        if not isinstance(manifest.get("bundle_kind"), str) or not str(
-                            manifest.get("bundle_kind", "")
-                        ).strip():
+                        if (
+                            not isinstance(manifest.get("bundle_kind"), str)
+                            or not str(manifest.get("bundle_kind", "")).strip()
+                        ):
                             errors.append("Archive manifest bundle_kind must be a non-empty string.")
                         if not isinstance(manifest.get("metadata"), Mapping):
                             errors.append("Archive manifest metadata field must be an object.")

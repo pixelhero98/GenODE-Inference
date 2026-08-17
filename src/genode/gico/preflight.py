@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
 import math
@@ -17,6 +18,8 @@ from genode.canonical_experiment_layout import (
     scenario_family_for_key,
 )
 from genode.data.otflow_paths import display_project_path, resolve_project_path
+from genode.gico.checkpoint_scope import checkpoint_scope_from_row as _checkpoint_scope_from_row
+from genode.gico.density_representation import uniform_reference_grid
 from genode.gico.objectives import (
     CONDITIONAL_METRIC_SPECS,
     FORECAST_METRIC_SPECS,
@@ -25,13 +28,10 @@ from genode.gico.objectives import (
     teacher_objective_utility_keys_for_family,
     teacher_objective_utility_keys_for_scenario,
 )
-from genode.gico.checkpoint_scope import checkpoint_scope_from_row as _checkpoint_scope_from_row
-from genode.gico.density_representation import uniform_reference_grid
 from genode.gico.policy import teacher_rank_pair_diagnostics, validate_gico_support_schedule_keys
 from genode.gico.schedule_grids import load_schedule_summary_grids, schedule_grid_coverage_report
 from genode.gico.schedule_hash import json_hash as _canonical_json_hash
 from genode.solver_protocol import normalize_solver_key
-
 
 DEFAULT_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = CANONICAL_SUPERVISION_SCHEDULE_KEYS
 _MEMORY_SOURCE_PATH = Path("__memory__")
@@ -174,7 +174,9 @@ def _logical_seed_from_row(row: Mapping[str, Any]) -> int | None:
     return _optional_int(row.get("seed"))
 
 
-def _context_pair_key(row: Mapping[str, Any], *, pair_on_seed: bool = True) -> Tuple[str, str, int, str, int | None, str]:
+def _context_pair_key(
+    row: Mapping[str, Any], *, pair_on_seed: bool = True
+) -> Tuple[str, str, int, str, int | None, str]:
     seed = _logical_seed_from_row(row) if pair_on_seed else None
     return (
         str(row.get("dataset", row.get("dataset_key", ""))),
@@ -195,10 +197,7 @@ def _validate_gico_support_schedule_keys(
 def _validate_teacher_metric_target_keys(keys: Sequence[str] | str | None) -> Tuple[str, ...]:
     if keys is None:
         return ("u_comp_uniform",)
-    if isinstance(keys, str):
-        raw = [part.strip() for part in keys.split(",")]
-    else:
-        raw = [str(part).strip() for part in keys]
+    raw = [part.strip() for part in keys.split(",")] if isinstance(keys, str) else [str(part).strip() for part in keys]
     out = tuple(part for part in raw if part)
     if not out:
         raise ValueError("teacher_metric_target_keys must contain at least one utility column.")
@@ -253,24 +252,32 @@ def _rows_have_forecast_metrics(rows: Sequence[Mapping[str, Any]]) -> bool:
 
 
 def _infer_single_benchmark_family(rows: Sequence[Mapping[str, Any]]) -> str:
-    families = {str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()}
+    families = {
+        str(row.get("benchmark_family", "")).strip() for row in rows if str(row.get("benchmark_family", "")).strip()
+    }
     if not families:
         dataset_families = set()
         for row in rows:
             dataset = str(row.get("dataset", row.get("dataset_key", ""))).strip()
             if not dataset:
                 continue
-            try:
+            with contextlib.suppress(KeyError, ValueError):
                 dataset_families.add(scenario_family_for_key(dataset))
-            except (KeyError, ValueError):
-                pass
         families = dataset_families
     if not families:
         if _rows_have_forecast_metrics(rows):
             return SCENARIO_FAMILY_FORECAST
-        if any(_has_nonempty_value(row, key) for row in rows for key in objective_utility_keys_for_family(SCENARIO_FAMILY_CONDITIONAL_GENERATION)):
+        if any(
+            _has_nonempty_value(row, key)
+            for row in rows
+            for key in objective_utility_keys_for_family(SCENARIO_FAMILY_CONDITIONAL_GENERATION)
+        ):
             return SCENARIO_FAMILY_CONDITIONAL_GENERATION
-        if any(_has_nonempty_value(row, key) for row in rows for key in objective_utility_keys_for_family(SCENARIO_FAMILY_MOLECULE)):
+        if any(
+            _has_nonempty_value(row, key)
+            for row in rows
+            for key in objective_utility_keys_for_family(SCENARIO_FAMILY_MOLECULE)
+        ):
             return SCENARIO_FAMILY_MOLECULE
         raise ValueError("Cannot infer benchmark_family for automatic GICO teacher target selection.")
     if len(families) != 1:
@@ -607,7 +614,11 @@ def _support_report(
         "support_schedule_count": int(len(support_keys)),
         "uniform_anchor_present": "uniform" in support_set,
         "observed_schedule_keys": sorted(
-            {str(record.row.get("scheduler_key", "") or "").strip() for record in records if str(record.row.get("scheduler_key", "") or "").strip()}
+            {
+                str(record.row.get("scheduler_key", "") or "").strip()
+                for record in records
+                if str(record.row.get("scheduler_key", "") or "").strip()
+            }
         ),
         "support_cell_count": int(len(grouped)),
         "complete_support_cell_count": int(len(complete_cell_keys)),
@@ -622,7 +633,9 @@ def _support_report(
         "row_errors": row_errors,
     }
     if "uniform" not in support_set:
-        report["support_semantic_errors"] = ["GICO supervision support must include the uniform reward anchor schedule."]
+        report["support_semantic_errors"] = [
+            "GICO supervision support must include the uniform reward anchor schedule."
+        ]
     else:
         report["support_semantic_errors"] = []
     return report, complete_clean_cell_keys, complete_rows
@@ -828,7 +841,11 @@ def build_gico_support_preflight_report(
     if teacher_metric_target_keys:
         target_keys = _validate_teacher_metric_target_keys(teacher_metric_target_keys)
         complete_rows = [record.row for record in complete_records]
-        support_rows = [record.row for record in records if str(record.row.get("scheduler_key", "") or "").strip() in set(support_keys)]
+        support_rows = [
+            record.row
+            for record in records
+            if str(record.row.get("scheduler_key", "") or "").strip() in set(support_keys)
+        ]
         metric_validation = _teacher_metric_target_validation_report(
             support_rows,
             target_keys,
@@ -938,8 +955,17 @@ def validate_gico_support_preflight_report(report: Mapping[str, Any], *, label: 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Preflight GICO support rows without training.")
     parser.add_argument("--rows_csv", required=True, help="Comma-separated per-example fixed/SER metric rows CSVs.")
-    parser.add_argument("--schedule_summary_json", default="", help="Comma-separated schedule summaries used to validate non-fixed schedule grids.")
-    parser.add_argument("--min_context_count", type=int, default=3, help="Minimum complete clean contexts required for holdout-based GICO training.")
+    parser.add_argument(
+        "--schedule_summary_json",
+        default="",
+        help="Comma-separated schedule summaries used to validate non-fixed schedule grids.",
+    )
+    parser.add_argument(
+        "--min_context_count",
+        type=int,
+        default=3,
+        help="Minimum complete clean contexts required for holdout-based GICO training.",
+    )
     parser.add_argument(
         "--support_schedule_keys",
         default="",
@@ -988,7 +1014,9 @@ def preflight_gico_rows(args: argparse.Namespace) -> Dict[str, Any]:
 
     identity_conflicts, dirty_rows, _, identity_row_errors = _identity_conflict_report(records)
     support, complete_cell_keys, complete_records = _support_report(records, support_keys, dirty_rows)
-    support_rows = [record.row for record in records if str(record.row.get("scheduler_key", "") or "").strip() in support_set]
+    support_rows = [
+        record.row for record in records if str(record.row.get("scheduler_key", "") or "").strip() in support_set
+    ]
     complete_clean_rows = [record.row for record in complete_records]
     complete_clean_contexts = sorted({_context_id_from_row(row) for row in complete_clean_rows})
     observed_context_ids: set[str] = set()

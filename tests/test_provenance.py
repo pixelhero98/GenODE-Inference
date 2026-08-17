@@ -5,8 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from genode.provenance import fingerprint_identity, path_fingerprint
 from genode.gico.train_gico import _artifact_input_summary
+from genode.provenance import fingerprint_identity, path_fingerprint
 
 
 class ProvenanceTests(unittest.TestCase):

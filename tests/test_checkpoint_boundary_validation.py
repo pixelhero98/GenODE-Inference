@@ -8,13 +8,15 @@ import torch
 
 from genode.checkpoint_validation import (
     normalize_strict_solver_nfe_fields as normalize_solver_nfe_fields,
+)
+from genode.checkpoint_validation import (
     validate_tensor_state_dict,
 )
-from genode.distillation.model import EndpointFlowMap, FlowMapSampler
 from genode.distillation.gico_policy import (
     build_gico_student_model,
     validate_gico_teacher_training_metadata,
 )
+from genode.distillation.model import EndpointFlowMap, FlowMapSampler
 from genode.distillation.training import _validate_continuous_array
 from genode.gico.models import (
     build_setting_encoder_config,
@@ -146,9 +148,7 @@ def test_flow_map_and_gico_boundaries_reject_dtype_coercion() -> None:
         setting_dim=setting_feature_dim(config=config),
         density_dim=8,
     )
-    flow_state = OrderedDict(
-        (name, tensor.detach().clone()) for name, tensor in flow_map.state_dict().items()
-    )
+    flow_state = OrderedDict((name, tensor.detach().clone()) for name, tensor in flow_map.state_dict().items())
     flow_key = next(iter(flow_state))
     flow_state[flow_key] = flow_state[flow_key].to(torch.float64)
     with pytest.raises(ValueError, match="has dtype"):
@@ -165,9 +165,7 @@ def test_flow_map_and_gico_boundaries_reject_dtype_coercion() -> None:
             "dropout": 0.0,
         },
     )
-    student_state = OrderedDict(
-        (name, tensor.detach().clone()) for name, tensor in student.state_dict().items()
-    )
+    student_state = OrderedDict((name, tensor.detach().clone()) for name, tensor in student.state_dict().items())
     student_key = next(iter(student_state))
     student_state[student_key] = student_state[student_key].to(torch.float64)
     with pytest.raises(ValueError, match="has dtype"):

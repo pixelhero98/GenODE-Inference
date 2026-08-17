@@ -22,7 +22,9 @@ def default_long_term_st_data_path() -> str:
 
 
 def default_long_term_st_manifest_path(data_path: str | Path | None = None) -> Path:
-    return Path(data_path or default_long_term_st_data_path()).expanduser().resolve() / DEFAULT_LONG_TERM_ECG_MANIFEST_NAME
+    return (
+        Path(data_path or default_long_term_st_data_path()).expanduser().resolve() / DEFAULT_LONG_TERM_ECG_MANIFEST_NAME
+    )
 
 
 __all__ = [

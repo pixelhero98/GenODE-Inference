@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -45,10 +45,7 @@ from genode.gico.image_conditional_training import (
 )
 from genode.provenance import file_sha256
 
-
-IMAGE_GICO_CONDITIONAL_BUNDLE_PROTOCOL = (
-    "image_gico_backbone_context_policy_bundle_v4"
-)
+IMAGE_GICO_CONDITIONAL_BUNDLE_PROTOCOL = "image_gico_backbone_context_policy_bundle_v4"
 _BOUND_ARTIFACT_CONSTRUCTION_TOKEN = object()
 _MANIFEST = "manifest.json"
 _FEATURE_GROUPS = "reward-feature-groups.json"
@@ -104,9 +101,7 @@ def _canonical_payload(path: Path) -> Mapping[str, Any]:
     text = path.read_text(encoding="utf-8")
     payload = json.loads(
         text,
-        parse_constant=lambda value: (_ for _ in ()).throw(
-            ValueError(f"Non-finite JSON constant {value!r}.")
-        ),
+        parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"Non-finite JSON constant {value!r}.")),
     )
     if not isinstance(payload, Mapping) or canonical_json_text(payload) != text:
         raise ValueError(f"{path.name} is not canonical JSON.")
@@ -117,17 +112,9 @@ def _state_dict(path: Path) -> Mapping[str, torch.Tensor]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(payload, Mapping) or not payload:
         raise ValueError(f"{path.name} does not contain a state dictionary.")
-    if not all(
-        isinstance(key, str) and isinstance(value, torch.Tensor)
-        for key, value in payload.items()
-    ):
+    if not all(isinstance(key, str) and isinstance(value, torch.Tensor) for key, value in payload.items()):
         raise ValueError(f"{path.name} contains an unsafe state dictionary.")
-    return MappingProxyType(
-        {
-            key: value.detach().to(device="cpu").contiguous()
-            for key, value in payload.items()
-        }
-    )
+    return MappingProxyType({key: value.detach().to(device="cpu").contiguous() for key, value in payload.items()})
 
 
 def _npy_array(path: Path, *, shape: tuple[int, ...]) -> np.ndarray:
@@ -192,10 +179,7 @@ def _manifest_fields() -> set[str]:
 
 def _verified_manifest_artifact_sha256(manifest: Mapping[str, Any]) -> str:
     if set(manifest) != _manifest_fields():
-        raise ValueError(
-            "Backbone-context bundle manifest fields must be exactly "
-            f"{sorted(_manifest_fields())}."
-        )
+        raise ValueError(f"Backbone-context bundle manifest fields must be exactly {sorted(_manifest_fields())}.")
     if (
         manifest.get("artifact") != "image_gico_backbone_context_policy"
         or manifest.get("protocol") != IMAGE_GICO_CONDITIONAL_BUNDLE_PROTOCOL
@@ -219,15 +203,9 @@ def _validate_bundle(
     manifest = _canonical_payload(paths["manifest"])
     _verified_manifest_artifact_sha256(manifest)
 
-    feature_groups = ImageGICOFeatureGroups.from_payload(
-        _canonical_payload(paths["feature_groups"])
-    )
-    targets = ImageGICOConditionalTargets.from_payload(
-        _canonical_payload(paths["targets"])
-    )
-    context_binding = ImageGICOBackboneContextBinding.from_payload(
-        manifest["context_binding"]
-    )
+    feature_groups = ImageGICOFeatureGroups.from_payload(_canonical_payload(paths["feature_groups"]))
+    targets = ImageGICOConditionalTargets.from_payload(_canonical_payload(paths["targets"]))
+    context_binding = ImageGICOBackboneContextBinding.from_payload(manifest["context_binding"])
     training = manifest["training"]
     _training_result_identity(training)
     if not isinstance(training, Mapping):
@@ -241,8 +219,7 @@ def _validate_bundle(
         manifest["feature_group_sha256"] != feature_groups.sha256
         or manifest["target_sha256"] != targets.sha256
         or targets.feature_group_sha256 != feature_groups.sha256
-        or targets.feature_protocol_sha256
-        != feature_groups.feature_protocol_sha256
+        or targets.feature_protocol_sha256 != feature_groups.feature_protocol_sha256
         or training.get("feature_group_sha256") != feature_groups.sha256
         or training.get("target_sha256") != targets.sha256
     ):
@@ -284,9 +261,7 @@ def _validate_bundle(
     expected_support = {
         "schedule_keys": list(targets.schedule_keys),
         "schedule_sha256s": list(targets.schedule_sha256s),
-        "density_mass_sha256s": [
-            list(row) for row in targets.density_mass_sha256s
-        ],
+        "density_mass_sha256s": [list(row) for row in targets.density_mass_sha256s],
         "fixed_support_sha256": targets.fixed_support_sha256,
         "reward_evidence_sha256": targets.reward_evidence_sha256,
     }
@@ -334,9 +309,7 @@ def _validate_bundle(
     ):
         raise ValueError("Portable context normalizer does not match its binding.")
 
-    config = ImageGICOBackboneContextModelConfig(
-        density_bin_count=targets.density_bin_count
-    )
+    config = ImageGICOBackboneContextModelConfig(density_bin_count=targets.density_bin_count)
     if training.get("model_config") != config.as_payload():
         raise ValueError("Bundle model config is inconsistent.")
     dummy_contexts = np.zeros((1_000, 768), dtype=np.float32)
@@ -351,9 +324,7 @@ def _validate_bundle(
         or training.get("model_state_sha256") != observed_student_hash
     ):
         raise ValueError("Backbone-context student state hash is inconsistent.")
-    teacher = ImageGICOBackboneContextTeacher(
-        density_bin_count=targets.density_bin_count
-    )
+    teacher = ImageGICOBackboneContextTeacher(density_bin_count=targets.density_bin_count)
     teacher.load_state_dict(_state_dict(paths["teacher_state"]), strict=True)
     observed_teacher_hash = conditional_module_state_sha256(
         teacher,
@@ -398,9 +369,7 @@ class BoundImageGICOConditionalArtifact:
 
     def __post_init__(self) -> None:
         if self._construction_token is not _BOUND_ARTIFACT_CONSTRUCTION_TOKEN:
-            raise TypeError(
-                "Bound GICO artifacts must be created by LoadedImageGICOConditionalArtifact.bind()."
-            )
+            raise TypeError("Bound GICO artifacts must be created by LoadedImageGICOConditionalArtifact.bind().")
         if type(self.policy) is not ImageGICOBackboneContextSchedulePolicy:
             raise TypeError("Bound GICO policy must use the canonical policy class.")
         if type(self.policy.model) is not ImageGICOBackboneContextDensityModel:
@@ -453,9 +422,7 @@ class BoundImageGICOConditionalArtifact:
     def verify_execution_identity(self) -> None:
         """Revalidate every mutable value that controls policy execution."""
 
-        observed_artifact_sha256 = _verified_manifest_artifact_sha256(
-            self.manifest
-        )
+        observed_artifact_sha256 = _verified_manifest_artifact_sha256(self.manifest)
         if (
             observed_artifact_sha256 != self._bound_artifact_sha256
             or self.artifact_sha256 != self._bound_artifact_sha256
@@ -466,15 +433,11 @@ class BoundImageGICOConditionalArtifact:
         if type(self.policy.model) is not ImageGICOBackboneContextDensityModel:
             raise TypeError("Bound GICO policy must use the canonical density model.")
 
-        manifest_binding = ImageGICOBackboneContextBinding.from_payload(
-            self.manifest["context_binding"]
-        )
+        manifest_binding = ImageGICOBackboneContextBinding.from_payload(self.manifest["context_binding"])
         prepared_binding = self.prepared_context.binding
         if (
-            manifest_binding.binding_sha256
-            != self.manifest["context_binding_sha256"]
-            or prepared_binding.binding_sha256
-            != manifest_binding.binding_sha256
+            manifest_binding.binding_sha256 != self.manifest["context_binding_sha256"]
+            or prepared_binding.binding_sha256 != manifest_binding.binding_sha256
         ):
             raise ValueError("Bound GICO context identity is inconsistent.")
         observed_backbone = (
@@ -496,9 +459,7 @@ class BoundImageGICOConditionalArtifact:
         ):
             raise ValueError("Bound GICO reward or target identity is inconsistent.")
 
-        expected_config = ImageGICOBackboneContextModelConfig(
-            density_bin_count=self.targets.density_bin_count
-        )
+        expected_config = ImageGICOBackboneContextModelConfig(density_bin_count=self.targets.density_bin_count)
         training = self.manifest["training"]
         if (
             not isinstance(training, Mapping)
@@ -519,9 +480,8 @@ class BoundImageGICOConditionalArtifact:
             .contiguous()
             .numpy()
         )
-        if (
-            not np.array_equal(prepared_contexts, self._expected_context_table)
-            or not np.array_equal(observed_contexts, self._expected_context_table)
+        if not np.array_equal(prepared_contexts, self._expected_context_table) or not np.array_equal(
+            observed_contexts, self._expected_context_table
         ):
             raise ValueError("Bound GICO canonical context table was modified.")
 
@@ -565,18 +525,14 @@ class LoadedImageGICOConditionalArtifact:
             self.context_normalizer,
             backbone,
         )
-        config = ImageGICOBackboneContextModelConfig(
-            density_bin_count=self.targets.density_bin_count
-        )
+        config = ImageGICOBackboneContextModelConfig(density_bin_count=self.targets.density_bin_count)
         model, expected_table = _canonical_cpu_density_table(
             self._student_state,
             config=config,
             normalized_context_table=prepared.normalized_context_table,
         )
         if not np.array_equal(expected_table, self._density_table):
-            raise ValueError(
-                "Portable density table does not match the verified backbone context."
-            )
+            raise ValueError("Portable density table does not match the verified backbone context.")
         return BoundImageGICOConditionalArtifact(
             policy=ImageGICOBackboneContextSchedulePolicy(model, self.targets),
             prepared_context=prepared,
@@ -604,8 +560,7 @@ def save_image_gico_conditional_artifact(
         result.feature_group_sha256 != feature_groups.sha256
         or result.target_sha256 != targets.sha256
         or targets.feature_group_sha256 != feature_groups.sha256
-        or targets.feature_protocol_sha256
-        != feature_groups.feature_protocol_sha256
+        or targets.feature_protocol_sha256 != feature_groups.feature_protocol_sha256
         or result.context_binding_sha256 != prepared_context.binding.binding_sha256
     ):
         raise ValueError("Training result does not match rewards, targets, and context.")
@@ -633,23 +588,17 @@ def save_image_gico_conditional_artifact(
     staged = {role: temporary_bundle_path(path) for role, path in paths.items()}
     staged_hashes: dict[str, str] = {}
     try:
-        staged["feature_groups"].write_bytes(
-            canonical_json_bytes(feature_groups.as_payload())
-        )
+        staged["feature_groups"].write_bytes(canonical_json_bytes(feature_groups.as_payload()))
         staged["targets"].write_bytes(canonical_json_bytes(targets.as_payload()))
         student_state = {
-            name: value.detach().to(device="cpu").contiguous()
-            for name, value in result.model.state_dict().items()
+            name: value.detach().to(device="cpu").contiguous() for name, value in result.model.state_dict().items()
         }
         teacher_state = {
-            name: value.detach().to(device="cpu").contiguous()
-            for name, value in result.teacher.state_dict().items()
+            name: value.detach().to(device="cpu").contiguous() for name, value in result.teacher.state_dict().items()
         }
         torch.save(student_state, staged["student_state"])
         torch.save(teacher_state, staged["teacher_state"])
-        config = ImageGICOBackboneContextModelConfig(
-            density_bin_count=targets.density_bin_count
-        )
+        config = ImageGICOBackboneContextModelConfig(density_bin_count=targets.density_bin_count)
         _, density_table = _canonical_cpu_density_table(
             student_state,
             config=config,
@@ -698,9 +647,7 @@ def save_image_gico_conditional_artifact(
             "schedule_support": {
                 "schedule_keys": list(targets.schedule_keys),
                 "schedule_sha256s": list(targets.schedule_sha256s),
-                "density_mass_sha256s": [
-                    list(row) for row in targets.density_mass_sha256s
-                ],
+                "density_mass_sha256s": [list(row) for row in targets.density_mass_sha256s],
                 "fixed_support_sha256": targets.fixed_support_sha256,
                 "reward_evidence_sha256": targets.reward_evidence_sha256,
             },
@@ -758,15 +705,9 @@ def load_image_gico_conditional_artifact(
         validator=_validate_bundle,
     )
     manifest = _canonical_payload(paths["manifest"])
-    feature_groups = ImageGICOFeatureGroups.from_payload(
-        _canonical_payload(paths["feature_groups"])
-    )
-    targets = ImageGICOConditionalTargets.from_payload(
-        _canonical_payload(paths["targets"])
-    )
-    context_binding = ImageGICOBackboneContextBinding.from_payload(
-        manifest["context_binding"]
-    )
+    feature_groups = ImageGICOFeatureGroups.from_payload(_canonical_payload(paths["feature_groups"]))
+    targets = ImageGICOConditionalTargets.from_payload(_canonical_payload(paths["targets"]))
+    context_binding = ImageGICOBackboneContextBinding.from_payload(manifest["context_binding"])
     normalizer = ImageGICOContextNormalizer(
         mean=_npy_array(paths["context_mean"], shape=(768,)),
         scale=_npy_array(paths["context_scale"], shape=(768,)),

@@ -12,7 +12,11 @@ import torch
 
 from genode.evaluation import diffusion_flow_time_reparameterization as runner
 from genode.evaluation.otflow_evaluation_support import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
-from genode.gico import evaluate_schedule_summary
+from genode.gico import evaluate_schedule_summary, report_locked_test
+from genode.gico.ablation_plan import (
+    GICO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX,
+    gico_ablation_arms,
+)
 from genode.gico.evaluate_schedule_summary import build_comparison_summary
 from genode.gico.objectives import (
     CONDITIONAL_METRIC_SPECS,
@@ -37,13 +41,7 @@ from genode.gico.policy import (
     split_rows_by_context_holdout,
     stable_context_id,
 )
-from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
-from genode.gico import report_locked_test
-from genode.gico.ablation_plan import (
-    GICO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX,
-    gico_ablation_arms,
-)
-from genode.pipeline import full_pipeline
+from genode.gico.preflight import _context_identity_fingerprint
 from genode.gico.train_gico import (
     _context_sampling_summary,
     _merge_embedding_tables_guarded,
@@ -56,7 +54,8 @@ from genode.gico.train_gico import (
     _validate_unique_schedule_rows,
     train_gico,
 )
-from genode.gico.preflight import _context_identity_fingerprint
+from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
+from genode.pipeline import full_pipeline
 
 
 class GenericContextGicoTests(unittest.TestCase):
@@ -307,7 +306,9 @@ class GenericContextGicoTests(unittest.TestCase):
         self.assertTrue(all(row["context_schema"] == "conditional_generation_window" for row in rows))
         self.assertAlmostEqual(float(rows[0]["u_score_uniform"]), math.log(1.0 / 0.75))
         self.assertAlmostEqual(float(rows[1]["u_score_uniform"]), math.log(0.9 / 0.7))
-        self.assertTrue(all(math.isclose(float(row["u_temporal_tstr_f1_uniform"]), math.log(0.8 / 0.4)) for row in rows))
+        self.assertTrue(
+            all(math.isclose(float(row["u_temporal_tstr_f1_uniform"]), math.log(0.8 / 0.4)) for row in rows)
+        )
         self.assertTrue(all(float(row["u_comp_uniform"]) > 0.0 for row in rows))
         expected_raw_id = stable_context_id(
             dataset="lobster_synthetic",
@@ -375,8 +376,20 @@ class GenericContextGicoTests(unittest.TestCase):
         self.assertNotAlmostEqual(float(rows[0]["u_comp_uniform"]), float(rows[0]["u_score_uniform"]))
 
     def test_directional_objective_columns_mix_lower_and_higher_metrics(self) -> None:
-        row = {"scheduler_key": "late_p_2", "temporal_cw1": 0.5, "temporal_uw1": 1.0, "temporal_tstr_f1": 0.8, "temporal_tstr_f1_applicable": True}
-        uniform = {"scheduler_key": "uniform", "temporal_cw1": 1.0, "temporal_uw1": 2.0, "temporal_tstr_f1": 0.4, "temporal_tstr_f1_applicable": True}
+        row = {
+            "scheduler_key": "late_p_2",
+            "temporal_cw1": 0.5,
+            "temporal_uw1": 1.0,
+            "temporal_tstr_f1": 0.8,
+            "temporal_tstr_f1_applicable": True,
+        }
+        uniform = {
+            "scheduler_key": "uniform",
+            "temporal_cw1": 1.0,
+            "temporal_uw1": 2.0,
+            "temporal_tstr_f1": 0.4,
+            "temporal_tstr_f1_applicable": True,
+        }
         cols = uniform_anchored_objective_columns(row, uniform, CONDITIONAL_METRIC_SPECS)
         self.assertAlmostEqual(float(cols["u_temporal_cw1_uniform"]), math.log(1.0 / 0.5))
         self.assertAlmostEqual(float(cols["u_temporal_uw1_uniform"]), math.log(2.0 / 1.0))
@@ -442,7 +455,9 @@ class GenericContextGicoTests(unittest.TestCase):
         self.assertEqual(rows[0]["axis_member"], "member_a")
         self.assertAlmostEqual(float(rows[0]["u_molecule_kabsch_rmsd_3d_uniform"]), math.log(1.0 / 0.5))
         self.assertAlmostEqual(float(rows[0]["u_comp_uniform"]), math.log(1.0 / 0.5))
-        uniform_cols = uniform_anchored_objective_columns(dict(uniform, scheduler_key="uniform"), dict(uniform, scheduler_key="uniform"), MOLECULE_METRIC_SPECS)
+        uniform_cols = uniform_anchored_objective_columns(
+            dict(uniform, scheduler_key="uniform"), dict(uniform, scheduler_key="uniform"), MOLECULE_METRIC_SPECS
+        )
         self.assertEqual(float(uniform_cols["u_comp_uniform"]), 0.0)
 
     def test_context_embedding_id_is_canonical_lookup_key(self) -> None:
@@ -569,7 +584,9 @@ class GenericContextGicoTests(unittest.TestCase):
         holdout_contexts = {row["context_id"] for row in holdout_rows}
         self.assertFalse(fit_contexts & holdout_contexts)
         for context_id in holdout_contexts:
-            self.assertEqual({row["checkpoint_id"] for row in holdout_rows if row["context_id"] == context_id}, {"ckpt_a", "ckpt_b"})
+            self.assertEqual(
+                {row["checkpoint_id"] for row in holdout_rows if row["context_id"] == context_id}, {"ckpt_a", "ckpt_b"}
+            )
 
     def test_preflight_identity_fingerprint_ignores_checkpoint_scoped_embedding_id(self) -> None:
         row = {
@@ -622,14 +639,23 @@ class GenericContextGicoTests(unittest.TestCase):
 
         self.assertNotEqual(context_pair_key(early, pair_on_seed=True), context_pair_key(late, pair_on_seed=True))
         _validate_unique_schedule_rows([early, late], label="test")
-        self.assertEqual(checkpoint_scope_from_row(dict(row, checkpoint_step="", train_steps=4000)), "checkpoint_step:4000")
-        self.assertEqual(checkpoint_scope_from_row(dict(row, checkpoint_step="", train_steps="", otflow_train_steps=8000)), "checkpoint_step:8000")
+        self.assertEqual(
+            checkpoint_scope_from_row(dict(row, checkpoint_step="", train_steps=4000)), "checkpoint_step:4000"
+        )
+        self.assertEqual(
+            checkpoint_scope_from_row(dict(row, checkpoint_step="", train_steps="", otflow_train_steps=8000)),
+            "checkpoint_step:8000",
+        )
 
         train_early = dict(row, train_steps=4000)
         train_late = dict(row, train_steps=8000)
         otflow_late = dict(row, otflow_train_steps=12000)
-        self.assertNotEqual(context_pair_key(train_early, pair_on_seed=True), context_pair_key(train_late, pair_on_seed=True))
-        self.assertNotEqual(context_pair_key(train_late, pair_on_seed=True), context_pair_key(otflow_late, pair_on_seed=True))
+        self.assertNotEqual(
+            context_pair_key(train_early, pair_on_seed=True), context_pair_key(train_late, pair_on_seed=True)
+        )
+        self.assertNotEqual(
+            context_pair_key(train_late, pair_on_seed=True), context_pair_key(otflow_late, pair_on_seed=True)
+        )
         _validate_unique_schedule_rows([train_early, train_late, otflow_late], label="test")
         split_summary = _split_membership_summary([train_early, train_late, otflow_late])
         self.assertEqual(split_summary["checkpoint_scope_count"], 3)
@@ -646,7 +672,7 @@ class GenericContextGicoTests(unittest.TestCase):
             _validate_context_embedding_checkpoint_scope([bad], label="test")
 
     def test_duplicate_context_row_signatures_are_rejected_on_load(self) -> None:
-        row = {field: "" for field in runner.CONTEXT_ROW_FIELDS}
+        row = dict.fromkeys(runner.CONTEXT_ROW_FIELDS, "")
         row.update({"row_signature": "sig", "context_id": "ctx", "context_embedding_id": "ckpt:ctx"})
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "context_rows.csv"
@@ -670,7 +696,9 @@ class GenericContextGicoTests(unittest.TestCase):
         target_keys = tuple(spec.utility_key for spec in CONDITIONAL_METRIC_SPECS[:3])
         values, mask = _teacher_metric_targets([row], target_keys=target_keys, device="cpu")
         self.assertEqual(mask.tolist(), [[1.0, 1.0, 0.0]])
-        weights = _teacher_metric_weights([row], target_keys=target_keys, batch=1, device=torch.device("cpu"), dtype=torch.float32, target_mask=mask)
+        weights = _teacher_metric_weights(
+            [row], target_keys=target_keys, batch=1, device=torch.device("cpu"), dtype=torch.float32, target_mask=mask
+        )
         scalar = _scalarize_teacher_metric_values(values, weights, target_keys=target_keys, target_mask=mask)
         self.assertAlmostEqual(float(scalar.item()), float(row["u_comp_uniform"]))
 
@@ -725,7 +753,7 @@ class GenericContextGicoTests(unittest.TestCase):
 
     def test_auto_teacher_target_keys_are_scenario_primary_vectors_after_csv_roundtrip(self) -> None:
         args = argparse.Namespace(teacher_metric_target_keys="auto")
-        row = {field: "" for field in runner.CONTEXT_ROW_FIELDS}
+        row = dict.fromkeys(runner.CONTEXT_ROW_FIELDS, "")
         row.update(
             {
                 "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
@@ -751,19 +779,27 @@ class GenericContextGicoTests(unittest.TestCase):
     def test_auto_teacher_target_keys_cover_all_families(self) -> None:
         args = argparse.Namespace(teacher_metric_target_keys="auto")
         self.assertEqual(
-            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": FORECAST_FAMILY, "dataset": "solar_energy_10m"}]),
+            _resolve_teacher_metric_target_keys(
+                args, [{"benchmark_family": FORECAST_FAMILY, "dataset": "solar_energy_10m"}]
+            ),
             tuple(spec.utility_key for spec in FORECAST_METRIC_SPECS),
         )
         self.assertEqual(
-            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": CONDITIONAL_GENERATION_FAMILY, "dataset": "lobster_synthetic"}]),
+            _resolve_teacher_metric_target_keys(
+                args, [{"benchmark_family": CONDITIONAL_GENERATION_FAMILY, "dataset": "lobster_synthetic"}]
+            ),
             tuple(spec.utility_key for spec in CONDITIONAL_PRIMARY_LOB_METRIC_SPECS),
         )
         self.assertEqual(
-            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": CONDITIONAL_GENERATION_FAMILY, "dataset": "long_term_st"}]),
+            _resolve_teacher_metric_target_keys(
+                args, [{"benchmark_family": CONDITIONAL_GENERATION_FAMILY, "dataset": "long_term_st"}]
+            ),
             tuple(spec.utility_key for spec in CONDITIONAL_PRIMARY_ECG_METRIC_SPECS),
         )
         self.assertEqual(
-            _resolve_teacher_metric_target_keys(args, [{"benchmark_family": "molecule_3d_coordinate_generation", "dataset": "molecule_3d_set1"}]),
+            _resolve_teacher_metric_target_keys(
+                args, [{"benchmark_family": "molecule_3d_coordinate_generation", "dataset": "molecule_3d_set1"}]
+            ),
             tuple(spec.utility_key for spec in MOLECULE_METRIC_SPECS),
         )
 
@@ -845,7 +881,9 @@ class GenericContextGicoTests(unittest.TestCase):
             (4, 6),
         )
         with self.assertRaisesRegex(ValueError, "not present"):
-            report_locked_test._single_value_from_rows(rows, field="dataset", requested="traffic_hourly", arg_name="dataset")
+            report_locked_test._single_value_from_rows(
+                rows, field="dataset", requested="traffic_hourly", arg_name="dataset"
+            )
 
     def test_locked_reporter_representatives_filter_matrix_by_logical_seed(self) -> None:
         rows = [
@@ -983,12 +1021,14 @@ class GenericContextGicoTests(unittest.TestCase):
                 molecule_group_root="",
                 baseline_rows="",
             )
-            with mock.patch(
-                "genode.gico.report_locked_test._load_student_checkpoint",
-                return_value=(mock.Mock(), mock.Mock(), [], {}),
+            with (
+                mock.patch(
+                    "genode.gico.report_locked_test._load_student_checkpoint",
+                    return_value=(mock.Mock(), mock.Mock(), [], {}),
+                ),
+                self.assertRaisesRegex(ValueError, "requires --baseline_rows") as cm,
             ):
-                with self.assertRaisesRegex(ValueError, "requires --baseline_rows") as cm:
-                    report_locked_test.report_gico_locked_test(args)
+                report_locked_test.report_gico_locked_test(args)
             self.assertNotIn("missing seed/solver/NFE", str(cm.exception))
 
     def test_locked_reporter_output_uses_logical_seed_with_offset_uniform_context_match(self) -> None:
@@ -1127,7 +1167,9 @@ class GenericContextGicoTests(unittest.TestCase):
             self.assertEqual(summary["context_row_count"], 1)
             self.assertEqual(summary["aggregate_row_count"], 1)
             rows = list(csv.DictReader((out_dir / "locked_test_gico_rows.csv").open(newline="", encoding="utf-8")))
-            aggregate_rows = list(csv.DictReader((out_dir / "locked_test_gico_aggregate_rows.csv").open(newline="", encoding="utf-8")))
+            aggregate_rows = list(
+                csv.DictReader((out_dir / "locked_test_gico_aggregate_rows.csv").open(newline="", encoding="utf-8"))
+            )
             comparison = json.loads((out_dir / "locked_test_gico_comparison_summary.json").read_text(encoding="utf-8"))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["seed"], "0")
@@ -1316,7 +1358,9 @@ class GenericContextGicoTests(unittest.TestCase):
             with (
                 mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
                 mock.patch.object(full_pipeline, "_build_stage_commands", return_value=[first_stage, second_stage]),
-                mock.patch.object(full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run_mock,
+                mock.patch.object(
+                    full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)
+                ) as run_mock,
             ):
                 summary = full_pipeline.run_full_pipeline(args)
         self.assertEqual(run_mock.call_count, 1)
@@ -1329,7 +1373,9 @@ class GenericContextGicoTests(unittest.TestCase):
             run_root = Path(tmpdir) / "run"
             partial_out = run_root / "schedule_rows" / "seen" / "train_tuning" / "4000_steps"
             partial_out.mkdir(parents=True)
-            (partial_out / "combined_summary.json").write_text(json.dumps({"main_table_summary": {"row_count": 1}}), encoding="utf-8")
+            (partial_out / "combined_summary.json").write_text(
+                json.dumps({"main_table_summary": {"row_count": 1}}), encoding="utf-8"
+            )
             args = full_pipeline.build_argparser().parse_args(
                 [
                     "--scenario_key",
@@ -1343,8 +1389,12 @@ class GenericContextGicoTests(unittest.TestCase):
             complete_command = [full_pipeline.sys.executable, "-c", "print('complete')"]
             schedule_command = [full_pipeline.sys.executable, "-c", "print('schedule')"]
             complete_stage = full_pipeline.StageCommand("data_prep", [complete_command], "data_prep_manifest.json")
-            schedule_stage = full_pipeline.StageCommand("schedule_rows_seen", [schedule_command], "schedule_rows_seen_manifest.json")
-            (run_root / "status.json").write_text(json.dumps({"protocol_hash": protocol_hash, "status": "failed"}), encoding="utf-8")
+            schedule_stage = full_pipeline.StageCommand(
+                "schedule_rows_seen", [schedule_command], "schedule_rows_seen_manifest.json"
+            )
+            (run_root / "status.json").write_text(
+                json.dumps({"protocol_hash": protocol_hash, "status": "failed"}), encoding="utf-8"
+            )
             (run_root / complete_stage.manifest_name).write_text(
                 json.dumps(
                     {
@@ -1358,6 +1408,7 @@ class GenericContextGicoTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+
             def schedule_status(command):
                 if list(command) == schedule_command:
                     return {"complete": False, "reason": "missing rows"}
@@ -1365,9 +1416,13 @@ class GenericContextGicoTests(unittest.TestCase):
 
             with (
                 mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
-                mock.patch.object(full_pipeline, "_build_stage_commands", return_value=[complete_stage, schedule_stage]),
+                mock.patch.object(
+                    full_pipeline, "_build_stage_commands", return_value=[complete_stage, schedule_stage]
+                ),
                 mock.patch.object(full_pipeline, "_schedule_row_command_status", side_effect=schedule_status),
-                mock.patch.object(full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run_mock,
+                mock.patch.object(
+                    full_pipeline.subprocess, "run", return_value=SimpleNamespace(returncode=0)
+                ) as run_mock,
             ):
                 summary = full_pipeline.run_full_pipeline(args)
         self.assertEqual(run_mock.call_count, 1)
@@ -1445,7 +1500,10 @@ class GenericContextGicoTests(unittest.TestCase):
         self.assertNotIn("--teacher_unseen_selection_rows_csv", zero_shot)
         self.assertNotIn("--teacher_unseen_selection_context_embeddings_npz", zero_shot)
         for command in (zero_shot, unseen):
-            self.assertIn("--teacher_metric_target_keys u_temporal_uw1_uniform,u_temporal_cw1_uniform,u_temporal_tstr_f1_uniform", command)
+            self.assertIn(
+                "--teacher_metric_target_keys u_temporal_uw1_uniform,u_temporal_cw1_uniform,u_temporal_tstr_f1_uniform",
+                command,
+            )
             self.assertIn("--teacher_steps 500", command)
             self.assertIn("--student_steps 500", command)
             self.assertIn("--seen_target_nfe_values 4,8,12,16", command)
@@ -1562,9 +1620,13 @@ class GenericContextGicoTests(unittest.TestCase):
         blend_weights_by_mode = {}
         for arm in arms:
             if arm.student_target_mixture_mode == "full":
-                full_scores_by_mode.setdefault(arm.student_training_mode, set()).add(float(arm.student_teacher_score_weight))
+                full_scores_by_mode.setdefault(arm.student_training_mode, set()).add(
+                    float(arm.student_teacher_score_weight)
+                )
             if arm.student_target_mixture_mode == "elite_blend":
-                blend_weights_by_mode.setdefault(arm.student_training_mode, set()).add(float(arm.student_target_elite_blend_all_weight))
+                blend_weights_by_mode.setdefault(arm.student_training_mode, set()).add(
+                    float(arm.student_target_elite_blend_all_weight)
+                )
         self.assertEqual(set(full_scores_by_mode), {"seen_only_zero_shot", "seen_plus_unseen_targets"})
         for weights in full_scores_by_mode.values():
             self.assertEqual(weights, {0.0, 0.01, 0.05, 0.10})
@@ -1586,9 +1648,12 @@ class GenericContextGicoTests(unittest.TestCase):
             )
             summary = full_pipeline.run_full_pipeline(args)
             manifest = json.loads(
-                (run_root / "gico_ablations" / GICO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX / "ablation_manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (
+                    run_root
+                    / "gico_ablations"
+                    / GICO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX
+                    / "ablation_manifest.json"
+                ).read_text(encoding="utf-8")
             )
 
         self.assertEqual(
@@ -1621,7 +1686,9 @@ class GenericContextGicoTests(unittest.TestCase):
         self.assertEqual(manifest["gico_teacher_steps"], 500)
         self.assertEqual(manifest["gico_student_steps"], 500)
         self.assertEqual(manifest["ablation_root"], f"gico_ablations/{GICO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX}")
-        self.assertTrue(all(not str(value).startswith(("/", "C:")) for arm in manifest["arms"] for value in arm["outputs"].values()))
+        self.assertTrue(
+            all(not str(value).startswith(("/", "C:")) for arm in manifest["arms"] for value in arm["outputs"].values())
+        )
 
     def test_full_pipeline_dataset_alias_routes_requested_scenario(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1691,10 +1758,7 @@ class GenericContextGicoTests(unittest.TestCase):
         by_stage = {stage["stage"]: [" ".join(command) for command in stage["commands"]] for stage in summary["stages"]}
         ser_commands = by_stage["ser_summaries"]
         non_ser_commands = [
-            command
-            for stage, commands in by_stage.items()
-            if stage != "ser_summaries"
-            for command in commands
+            command for stage, commands in by_stage.items() if stage != "ser_summaries" for command in commands
         ]
         self.assertEqual(ser_commands, [])
         self.assertTrue(all("--calibration_batch_size" not in command for command in non_ser_commands))
@@ -1726,7 +1790,12 @@ class GenericContextGicoTests(unittest.TestCase):
             summary = full_pipeline.run_full_pipeline(args)
         by_stage = {stage["stage"]: [" ".join(command) for command in stage["commands"]] for stage in summary["stages"]}
         self.assertTrue(all("--train_tuning_max_examples 123" in command for command in by_stage["ser_summaries"]))
-        self.assertTrue(all("--train_tuning_max_examples_source context_sample_count" in command for command in by_stage["ser_summaries"]))
+        self.assertTrue(
+            all(
+                "--train_tuning_max_examples_source context_sample_count" in command
+                for command in by_stage["ser_summaries"]
+            )
+        )
         protocol = full_pipeline._protocol_payload(args)
         self.assertEqual(protocol["ser_train_tuning_max_examples"], 0)
         self.assertEqual(protocol["ser_train_tuning_effective_max_examples"], 123)
@@ -1749,8 +1818,12 @@ class GenericContextGicoTests(unittest.TestCase):
             summary = full_pipeline.run_full_pipeline(args)
         by_stage = {stage["stage"]: stage["commands"] for stage in summary["stages"]}
         schedule_commands = by_stage["schedule_rows_seen"] + by_stage["schedule_rows_unseen"]
-        train_commands = [command for command in schedule_commands if command[command.index("--split_phase") + 1] == "train_tuning"]
-        locked_commands = [command for command in schedule_commands if command[command.index("--split_phase") + 1] == "locked_test"]
+        train_commands = [
+            command for command in schedule_commands if command[command.index("--split_phase") + 1] == "train_tuning"
+        ]
+        locked_commands = [
+            command for command in schedule_commands if command[command.index("--split_phase") + 1] == "locked_test"
+        ]
         self.assertTrue(train_commands)
         self.assertTrue(locked_commands)
         for command in train_commands:
@@ -1761,7 +1834,9 @@ class GenericContextGicoTests(unittest.TestCase):
             self.assertNotIn("--train_tuning_context_sample_count", command)
             self.assertNotIn("--eval_windows_test", command)
             self.assertNotIn("--eval_windows_val", command)
-        self.assertFalse(any(command[command.index("--split_phase") + 1] == "validation_tuning" for command in schedule_commands))
+        self.assertFalse(
+            any(command[command.index("--split_phase") + 1] == "validation_tuning" for command in schedule_commands)
+        )
         protocol = full_pipeline._protocol_payload(args)
         self.assertEqual(protocol["schedule_row_split_phases"], ["train_tuning", "locked_test"])
         gico_commands = [" ".join(command) for command in by_stage["gico_ablation_students"]]
@@ -1788,8 +1863,14 @@ class GenericContextGicoTests(unittest.TestCase):
             summary = full_pipeline.run_full_pipeline(args)
         by_stage = {stage["stage"]: stage["commands"] for stage in summary["stages"]}
         schedule_commands = by_stage["schedule_rows_seen"] + by_stage["schedule_rows_unseen"]
-        locked_commands = [command for command in schedule_commands if command[command.index("--split_phase") + 1] == "locked_test"]
-        validation_commands = [command for command in schedule_commands if command[command.index("--split_phase") + 1] == "validation_tuning"]
+        locked_commands = [
+            command for command in schedule_commands if command[command.index("--split_phase") + 1] == "locked_test"
+        ]
+        validation_commands = [
+            command
+            for command in schedule_commands
+            if command[command.index("--split_phase") + 1] == "validation_tuning"
+        ]
         self.assertEqual(validation_commands, [])
         self.assertFalse(any("--eval_windows_val" in command for command in schedule_commands))
         self.assertTrue(all(command[command.index("--eval_windows_test") + 1] == "19" for command in locked_commands))
@@ -1843,8 +1924,12 @@ class GenericContextGicoTests(unittest.TestCase):
             )
         )
         self.assertTrue(all("--support_schedule_keys uniform,late_p_2" in command for command in gico_commands))
-        report_commands = [" ".join(command).replace("\\", "/") for command in by_stage["gico_ablation_locked_test_reports"]]
-        self.assertTrue(all("/locked_test/" in command and "context_rows.csv" in command for command in report_commands))
+        report_commands = [
+            " ".join(command).replace("\\", "/") for command in by_stage["gico_ablation_locked_test_reports"]
+        ]
+        self.assertTrue(
+            all("/locked_test/" in command and "context_rows.csv" in command for command in report_commands)
+        )
 
     def test_full_pipeline_ablation_first_routes_arm_knobs_and_locked_reports(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1882,7 +1967,10 @@ class GenericContextGicoTests(unittest.TestCase):
             self.assertIn("--schedule_summary_json", command)
             self.assertNotIn("--student_teacher_score_include_unseen_targets", command)
             if arm.student_target_mixture_mode == "elite_blend":
-                self.assertIn(f"--student_target_elite_blend_all_weight {float(arm.student_target_elite_blend_all_weight)}", command)
+                self.assertIn(
+                    f"--student_target_elite_blend_all_weight {float(arm.student_target_elite_blend_all_weight)}",
+                    command,
+                )
             if arm.uses_unseen_targets:
                 self.assertIn("--student_unseen_target_rows_csv", command)
                 self.assertIn("--student_unseen_target_schedule_summary_json", command)
@@ -1892,12 +1980,23 @@ class GenericContextGicoTests(unittest.TestCase):
                 self.assertNotIn("--student_unseen_target_schedule_summary_json", command)
         self.assertTrue(all("gico_ablations" in command for command in report_commands))
         self.assertTrue(all("locked_test" in command for command in report_commands))
-        self.assertTrue(all("--training_summary" in command and "--gico_student_checkpoint" in command for command in report_commands))
+        self.assertTrue(
+            all(
+                "--training_summary" in command and "--gico_student_checkpoint" in command
+                for command in report_commands
+            )
+        )
 
     def test_full_pipeline_default_ablation_first_run_root_is_namespaced(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs_root = Path(tmpdir) / "outputs"
-            expected_root = outputs_root / "full_pipeline" / "lobster_synthetic" / "gico_ablations" / GICO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX
+            expected_root = (
+                outputs_root
+                / "full_pipeline"
+                / "lobster_synthetic"
+                / "gico_ablations"
+                / GICO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX
+            )
             args = full_pipeline.build_argparser().parse_args(
                 [
                     "--scenario_key",
@@ -1934,13 +2033,16 @@ class GenericContextGicoTests(unittest.TestCase):
             with (
                 mock.patch.object(full_pipeline, "_validate_inputs_preflight", return_value={"status": "complete"}),
                 mock.patch.object(full_pipeline, "_build_stage_commands", return_value=[failing_stage]),
+                self.assertRaises(RuntimeError),
             ):
-                with self.assertRaises(RuntimeError):
-                    full_pipeline.run_full_pipeline(args)
+                full_pipeline.run_full_pipeline(args)
             manifest = json.loads(
-                (run_root / "gico_ablations" / GICO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX / "ablation_manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (
+                    run_root
+                    / "gico_ablations"
+                    / GICO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX
+                    / "ablation_manifest.json"
+                ).read_text(encoding="utf-8")
             )
         self.assertEqual(manifest["status"], "failed")
         self.assertEqual(manifest["failed_stage"], full_pipeline.GICO_ABLATION_STUDENT_STAGE)

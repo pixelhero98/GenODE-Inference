@@ -11,7 +11,6 @@ from ._strict_json import loads_strict_json
 from .checkpoint import CheckpointBinding, bind_checkpoint
 from .registry import get_image_backbone_spec, get_image_dataset_spec
 
-
 IMAGE_BACKBONE_PROTOCOL_SCHEMA = "genode_image_backbone_protocol_v1"
 IMAGE_EVALUATION_NFES = (2, 4, 8)
 IMAGE_EVALUATION_SOLVER = "euler"

@@ -11,19 +11,19 @@ import numpy as np
 import torch
 
 import genode.evaluation.otflow_evaluation_support as eval_support
-from genode.models.config import OTFlowConfig
+from genode.data.otflow_datasets import build_dataset_splits_from_arrays
 from genode.evaluation.fm_backbone_registry import (
     BACKBONE_NAME_OTFLOW,
     CONDITIONAL_GENERATION_FAMILY,
     FORECAST_FAMILY,
     materialize_backbone_manifest,
 )
-from genode.data.otflow_datasets import build_dataset_splits_from_arrays
 from genode.evaluation.otflow_evaluation_support import load_conditional_generation_checkpoint_splits
 from genode.models.conditioning import (
     FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
     frozen_backbone_policy_context,
 )
+from genode.models.config import OTFlowConfig
 from genode.models.otflow_model import OTFlow
 from genode.models.otflow_train_val import _parse_batch, train_loop
 
@@ -156,7 +156,9 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
         self.assertEqual(result["context_embedding_width"], 3)
 
     def test_manifest_metadata_path_uses_project_relative_resolution(self) -> None:
-        with mock.patch.object(eval_support, "resolve_project_path", side_effect=lambda value: Path("/repo") / str(value)):
+        with mock.patch.object(
+            eval_support, "resolve_project_path", side_effect=lambda value: Path("/repo") / str(value)
+        ):
             path = eval_support._metadata_path_for_checkpoint(
                 {"metadata_path": "outputs/backbone_matrix/example/checkpoint_metadata.json"},
                 Path("/other/model.pt"),
@@ -300,7 +302,9 @@ class ConditionalGenerationFixesTest(unittest.TestCase):
         model = OTFlow(cfg)
         with tempfile.TemporaryDirectory() as tmpdir:
             matrix_root = Path(tmpdir) / "matrix"
-            artifact_dir = matrix_root / "otflow" / CONDITIONAL_GENERATION_FAMILY / "20k" / "long_term_st" / "transformer"
+            artifact_dir = (
+                matrix_root / "otflow" / CONDITIONAL_GENERATION_FAMILY / "20k" / "long_term_st" / "transformer"
+            )
             artifact_dir.mkdir(parents=True, exist_ok=True)
             torch.save({"cfg": cfg.to_dict(), "model_state": model.state_dict()}, artifact_dir / "model.pt")
             (artifact_dir / "checkpoint_metadata.json").write_text(

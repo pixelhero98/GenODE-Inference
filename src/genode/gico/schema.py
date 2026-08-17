@@ -105,7 +105,7 @@ def consistent_metadata_value(
     """Return one metadata value and reject conflicting declarations."""
 
     declared: list[tuple[str, Any]] = []
-    for index, mapping in enumerate(sources):
+    for _index, mapping in enumerate(sources):
         if key not in mapping:
             continue
         value = mapping.get(key)

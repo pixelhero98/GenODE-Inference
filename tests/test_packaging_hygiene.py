@@ -17,7 +17,6 @@ import numpy as np
 from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 from genode.gico.density_representation import density_metadata
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -181,9 +180,11 @@ class PackagingHygieneTests(unittest.TestCase):
     def test_raw_long_term_st_preparation_reports_missing_wfdb_extra(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             prepare_long_term_st_dataset = self._prepare_long_term_st_dataset()
-            with patch("importlib.util.find_spec", return_value=None):
-                with self.assertRaisesRegex(ImportError, r"pip install -e \.\[medical\]"):
-                    prepare_long_term_st_dataset(Path(tmpdir) / "prepared", archive_paths=[])
+            with (
+                patch("importlib.util.find_spec", return_value=None),
+                self.assertRaisesRegex(ImportError, r"pip install -e \.\[medical\]"),
+            ):
+                prepare_long_term_st_dataset(Path(tmpdir) / "prepared", archive_paths=[])
 
 
 if __name__ == "__main__":

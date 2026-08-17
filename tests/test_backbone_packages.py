@@ -6,8 +6,8 @@ import json
 import shutil
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 from genode.backbone_packages import (
     PACKAGE_MANIFEST_NAME,
@@ -19,9 +19,8 @@ from genode.backbone_packages import (
     validate_backbone_package,
     validate_provided_backbone_manifest,
 )
-from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY
 from genode.canonical_experiment_layout import CANONICAL_CHECKPOINT_STEPS, SCENARIO_FAMILY_MOLECULE
-from genode.data.otflow_experiment_plan import FORECAST_FAMILY
+from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
 from genode.deterministic_archive import ARCHIVE_SCHEMA_VERSION, validate_deterministic_zip
 
 MOLECULE_FAMILY = SCENARIO_FAMILY_MOLECULE
@@ -49,21 +48,27 @@ class BackbonePackageTests(unittest.TestCase):
                 summary_rel = f"{base}/artifact_summary.json"
                 _write(root / f"outputs/backbone_matrix/otflow/temporal_extrapolation/{label}/{scenario}/model.pt")
                 _write(
-                    root / f"outputs/backbone_matrix/otflow/temporal_extrapolation/{label}/{scenario}/checkpoint_metadata.json",
+                    root
+                    / f"outputs/backbone_matrix/otflow/temporal_extrapolation/{label}/{scenario}/checkpoint_metadata.json",
                     json.dumps(
                         {
                             "checkpoint_path": (
-                                "/" + "scratch" + f"/example/genode/outputs/backbone_matrix/otflow/temporal_extrapolation/{label}/{scenario}/model.pt"
+                                "/"
+                                + "scratch"
+                                + f"/example/genode/outputs/backbone_matrix/otflow/temporal_extrapolation/{label}/{scenario}/model.pt"
                             )
                         }
                     ),
                 )
                 _write(
-                    root / f"outputs/backbone_matrix/otflow/temporal_extrapolation/{label}/{scenario}/artifact_summary.json",
+                    root
+                    / f"outputs/backbone_matrix/otflow/temporal_extrapolation/{label}/{scenario}/artifact_summary.json",
                     json.dumps(
                         {
                             "summary_path": (
-                                "/" + "projects" + f"/example/genode/outputs/backbone_matrix/otflow/temporal_extrapolation/{label}/{scenario}/artifact_summary.json"
+                                "/"
+                                + "projects"
+                                + f"/example/genode/outputs/backbone_matrix/otflow/temporal_extrapolation/{label}/{scenario}/artifact_summary.json"
                             )
                         }
                     ),
@@ -165,7 +170,10 @@ class BackbonePackageTests(unittest.TestCase):
             self.assertNotIn(str(Path(tmpdir).resolve()), json.dumps(validation, sort_keys=True))
             raw_manifest = json.loads((package_root / PACKAGED_BACKBONE_MANIFEST).read_text(encoding="utf-8"))
             artifact = raw_manifest["artifacts"][0]
-            self.assertEqual(artifact["checkpoint_path"], "outputs/backbone_matrix/otflow/temporal_extrapolation/4k/solar_energy_10m/model.pt")
+            self.assertEqual(
+                artifact["checkpoint_path"],
+                "outputs/backbone_matrix/otflow/temporal_extrapolation/4k/solar_energy_10m/model.pt",
+            )
             self.assertEqual(raw_manifest["path_base"], "../..")
             loaded = load_portable_backbone_manifest(package_root / PACKAGED_BACKBONE_MANIFEST)
             self.assertTrue(Path(loaded["artifacts"][0]["checkpoint_path"]).exists())
@@ -342,7 +350,10 @@ class BackbonePackageTests(unittest.TestCase):
             artifacts = []
             for train_steps in TRAIN_BUDGET_STEPS:
                 label = f"{int(train_steps) // 1000}k"
-                base = root / f"outputs/backbone_matrix/otflow/temporal_conditional_generation/{label}/lobster_synthetic/transformer"
+                base = (
+                    root
+                    / f"outputs/backbone_matrix/otflow/temporal_conditional_generation/{label}/lobster_synthetic/transformer"
+                )
                 _write(base / "model.pt", b"checkpoint" * 256)
                 _write(base / "checkpoint_metadata.json", "{}")
                 _write(base / "artifact_summary.json", "{}")
@@ -490,7 +501,9 @@ class BackbonePackageTests(unittest.TestCase):
                 )
 
         self.assertEqual(validation["status"], "failed")
-        self.assertTrue(any("duplicate runtime lookup key" in error for error in validation["errors"]), validation["errors"])
+        self.assertTrue(
+            any("duplicate runtime lookup key" in error for error in validation["errors"]), validation["errors"]
+        )
         self.assertTrue(any("expected 1" in error and "train_steps=4000" in error for error in validation["errors"]))
 
     def test_load_checkpoint_model_wraps_unreadable_torch_payload(self) -> None:

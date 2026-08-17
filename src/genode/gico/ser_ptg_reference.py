@@ -16,18 +16,11 @@ from genode.canonical_experiment_layout import (
     SCENARIO_FAMILY_MOLECULE,
     scenario_family_for_key,
 )
-from genode.data.molecule_xyz import default_molecule_group_root, load_molecule_group_manifest, trainable_molecule_group_members
-from genode.solver_protocol import CANONICAL_SOLVER_KEYS, normalize_solver_keys, solver_order_p
-from genode.gico.density_representation import (
-    average_density_masses,
-    density_mass_hash,
-    density_mass_to_time_grid,
-    grid_to_density_mass,
-    reference_grid_hash,
-    uniform_reference_grid,
+from genode.data.molecule_xyz import (
+    default_molecule_group_root,
+    load_molecule_group_manifest,
+    trainable_molecule_group_members,
 )
-from genode.gico.models import validate_time_grid
-from genode.gico.schedule_hash import schedule_grid_hash
 from genode.data.otflow_paths import (
     default_backbone_manifest_path,
     default_cryptos_data_path,
@@ -37,9 +30,13 @@ from genode.data.otflow_paths import (
     project_paper_dataset_root,
     resolve_project_path,
 )
-from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW_MOLECULE, MOLECULE_FAMILY, find_backbone_artifact, load_backbone_manifest
+from genode.evaluation.fm_backbone_registry import (
+    BACKBONE_NAME_OTFLOW_MOLECULE,
+    MOLECULE_FAMILY,
+    find_backbone_artifact,
+    load_backbone_manifest,
+)
 from genode.evaluation.molecule_metrics import load_molecule_checkpoint_splits
-from genode.evaluation.otflow_sampling_support import _choose_valid_windows
 from genode.evaluation.otflow_evaluation_support import (
     DEFAULT_SHARED_BACKBONE_ROOT,
     DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION,
@@ -53,15 +50,27 @@ from genode.evaluation.otflow_evaluation_support import (
     choose_forecast_train_tuning_indices,
     load_conditional_generation_checkpoint_splits,
     load_forecast_checkpoint_splits,
-    resolved_eval_horizon,
     resolve_reference_macro_steps,
+    resolved_eval_horizon,
     solver_eval_multiplier,
     solver_macro_steps,
     train_tuning_sampler_key,
     train_tuning_target_example_count,
 )
+from genode.evaluation.otflow_sampling_support import _choose_valid_windows
+from genode.gico.density_representation import (
+    average_density_masses,
+    density_mass_hash,
+    density_mass_to_time_grid,
+    grid_to_density_mass,
+    reference_grid_hash,
+    uniform_reference_grid,
+)
+from genode.gico.models import validate_time_grid
+from genode.gico.schedule_hash import schedule_grid_hash
 from genode.models.otflow_train_val import _get_dataset_item_by_t, _parse_batch, save_json, seed_all
 from genode.runtime import resolve_torch_device
+from genode.solver_protocol import CANONICAL_SOLVER_KEYS, normalize_solver_keys, solver_order_p
 
 SER_PTG_SCHEDULE_KEY = "ser_ptg_local_defect_eta005"
 SER_PTG_SCHEDULE_NAME = "SER-PTG local defect eta=0.05"
@@ -98,9 +107,13 @@ def _optional_positive_int(value: Any, *, name: str) -> Optional[int]:
 
 
 def _reference_example_cap_and_source(args: argparse.Namespace, *, reference_split: str) -> Tuple[int, str]:
-    context_cap = _positive_int(getattr(args, "context_sample_count", CANONICAL_CONTEXT_SAMPLE_COUNT), name="--context_sample_count")
+    context_cap = _positive_int(
+        getattr(args, "context_sample_count", CANONICAL_CONTEXT_SAMPLE_COUNT), name="--context_sample_count"
+    )
     if str(reference_split) == TRAIN_TUNING_PHASE:
-        explicit = _optional_positive_int(getattr(args, "train_tuning_max_examples", None), name="--train_tuning_max_examples")
+        explicit = _optional_positive_int(
+            getattr(args, "train_tuning_max_examples", None), name="--train_tuning_max_examples"
+        )
         if explicit is not None:
             source = str(getattr(args, "train_tuning_max_examples_source", "") or "train_tuning_max_examples")
             return int(explicit), source
@@ -141,7 +154,9 @@ def _deterministically_cap_indices(
         token = f"{SER_PTG_EXAMPLE_SELECTION_PROTOCOL}|{salt}|{int(seed)}|{len(candidate)}|{selected_cap}"
         local_seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
         rng = np.random.default_rng(local_seed)
-        keep_positions = sorted(int(pos) for pos in rng.choice(np.arange(len(candidate)), size=selected_cap, replace=False).tolist())
+        keep_positions = sorted(
+            int(pos) for pos in rng.choice(np.arange(len(candidate)), size=selected_cap, replace=False).tolist()
+        )
         selected = [candidate[pos] for pos in keep_positions]
         was_capped = True
     return selected, {
@@ -173,7 +188,9 @@ def _deterministically_cap_index_groups(
                 "uncapped_candidate_examples cannot be smaller than the selected candidate list "
                 f"({uncapped_count} < {len(candidate)})."
             )
-        normalized.append({**dict(group), "candidate_indices": candidate, "uncapped_candidate_examples": uncapped_count})
+        normalized.append(
+            {**dict(group), "candidate_indices": candidate, "uncapped_candidate_examples": uncapped_count}
+        )
         uncapped_total += int(uncapped_count)
         flat_candidates.extend((int(group_idx), int(pos)) for pos in range(len(candidate)))
     if not flat_candidates:
@@ -214,7 +231,7 @@ def _deterministically_cap_index_groups(
         selected_by_group[group_idx].append(int(normalized[group_idx]["candidate_indices"][candidate_pos]))
     selected_total = int(sum(len(indices) for indices in selected_by_group))
     records: List[Dict[str, Any]] = []
-    for group, selected in zip(normalized, selected_by_group):
+    for group, selected in zip(normalized, selected_by_group, strict=False):
         record = dict(group.get("selection_record", {}))
         record.update(
             {
@@ -226,20 +243,26 @@ def _deterministically_cap_index_groups(
                 "selected_examples": int(len(selected)),
                 "selected_examples_cap": int(selected_cap),
                 "global_selected_examples": int(selected_total),
-                "selection_was_capped": bool(selection_was_capped or int(group["uncapped_candidate_examples"]) > len(selected)),
+                "selection_was_capped": bool(
+                    selection_was_capped or int(group["uncapped_candidate_examples"]) > len(selected)
+                ),
                 "global_selection_was_capped": bool(selection_was_capped),
                 "eval_examples": 0,
                 "trace_count": 0,
             }
         )
         records.append(record)
-    return selected_by_group, records, {
-        "selected_examples": int(selected_total),
-        "selected_examples_cap": int(selected_cap),
-        "uncapped_candidate_examples": int(uncapped_total),
-        "candidate_examples_after_initial_selection": int(len(flat_candidates)),
-        "selection_was_capped": bool(selection_was_capped),
-    }
+    return (
+        selected_by_group,
+        records,
+        {
+            "selected_examples": int(selected_total),
+            "selected_examples_cap": int(selected_cap),
+            "uncapped_candidate_examples": int(uncapped_total),
+            "candidate_examples_after_initial_selection": int(len(flat_candidates)),
+            "selection_was_capped": bool(selection_was_capped),
+        },
+    )
 
 
 def _sum_int_records_by(records: Sequence[Mapping[str, Any]], key: str, value_key: str) -> Dict[str, int]:
@@ -273,7 +296,9 @@ def grid_geometry(time_grid: Sequence[float]) -> Dict[str, float]:
     }
 
 
-def _prediction_with_density_metadata(prediction: Mapping[str, Any], *, scheduler_key: str, schedule_name: str, time_grid: Sequence[float]) -> Dict[str, Any]:
+def _prediction_with_density_metadata(
+    prediction: Mapping[str, Any], *, scheduler_key: str, schedule_name: str, time_grid: Sequence[float]
+) -> Dict[str, Any]:
     macro_steps = int(prediction["macro_steps"])
     grid = validate_time_grid(time_grid, macro_steps=macro_steps)
     density_reference = uniform_reference_grid()
@@ -309,7 +334,9 @@ def _derive_ser_reference_predictions(predictions: Sequence[Mapping[str, Any]]) 
             schedule_name=SER_PTG_SCHEDULE_NAME,
             time_grid=base_grid,
         )
-        reversed_grid = validate_time_grid([1.0 - float(value) for value in reversed(base_grid)], macro_steps=macro_steps)
+        reversed_grid = validate_time_grid(
+            [1.0 - float(value) for value in reversed(base_grid)], macro_steps=macro_steps
+        )
         reversed_prediction = _prediction_with_density_metadata(
             {**prediction, "schedule_derivation": "reverse_physical_clock"},
             scheduler_key=SER_PTG_REVERSED_SCHEDULE_KEY,
@@ -317,7 +344,9 @@ def _derive_ser_reference_predictions(predictions: Sequence[Mapping[str, Any]]) 
             time_grid=reversed_grid,
         )
         base_mass = grid_to_density_mass(base_grid, reference_time_grid=density_reference, macro_steps=macro_steps)
-        reversed_mass = grid_to_density_mass(reversed_grid, reference_time_grid=density_reference, macro_steps=macro_steps)
+        reversed_mass = grid_to_density_mass(
+            reversed_grid, reference_time_grid=density_reference, macro_steps=macro_steps
+        )
         averaged_mass = average_density_masses(base_mass, reversed_mass)
         averaged_grid = density_mass_to_time_grid(
             averaged_mass,
@@ -408,7 +437,9 @@ def ser_ptg_grid_from_trace(
     return validate_time_grid(grid.tolist(), macro_steps=int(macro_steps))
 
 
-def _local_defect_trace_from_oracle(oracle: np.ndarray, reference_time_grid: Sequence[float], *, solver_order_p: float) -> np.ndarray:
+def _local_defect_trace_from_oracle(
+    oracle: np.ndarray, reference_time_grid: Sequence[float], *, solver_order_p: float
+) -> np.ndarray:
     grid = np.asarray(reference_time_grid, dtype=np.float64)
     widths = np.diff(grid)
     return np.asarray(oracle, dtype=np.float64) / (np.power(widths, float(solver_order_p) + 1.0) + 1e-12)
@@ -566,7 +597,9 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
         solvers = solvers[:1]
         target_nfes = target_nfes[:1]
         args.val_windows = min(max(1, int(args.val_windows) if int(args.val_windows) > 0 else 2), 2)
-    reference_example_cap, reference_example_cap_source = _reference_example_cap_and_source(args, reference_split=reference_split)
+    reference_example_cap, reference_example_cap_source = _reference_example_cap_and_source(
+        args, reference_split=reference_split
+    )
     dataset_root = resolve_project_path(str(args.dataset_root))
     shared_backbone_root = resolve_project_path(str(args.shared_backbone_root))
     device = resolve_torch_device(str(args.device))
@@ -580,7 +613,9 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             dataset=dataset,
             device=device,
         )
-        member_refs.append({"checkpoint": checkpoint, "reference_ds": checkpoint["splits"][split_key], "member_key": "", "stratum": ""})
+        member_refs.append(
+            {"checkpoint": checkpoint, "reference_ds": checkpoint["splits"][split_key], "member_key": "", "stratum": ""}
+        )
     elif family == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
         if not hasattr(args, "steps") or int(getattr(args, "steps", 0) or 0) <= 0:
             args.steps = int(getattr(args, "otflow_train_steps", 0) or 0)
@@ -590,9 +625,13 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             dataset=dataset,
             device=device,
         )
-        member_refs.append({"checkpoint": checkpoint, "reference_ds": checkpoint["splits"][split_key], "member_key": "", "stratum": ""})
+        member_refs.append(
+            {"checkpoint": checkpoint, "reference_ds": checkpoint["splits"][split_key], "member_key": "", "stratum": ""}
+        )
     elif family == SCENARIO_FAMILY_MOLECULE:
-        group_root = resolve_project_path(str(getattr(args, "molecule_group_root", "") or default_molecule_group_root()))
+        group_root = resolve_project_path(
+            str(getattr(args, "molecule_group_root", "") or default_molecule_group_root())
+        )
         manifest = load_molecule_group_manifest(dataset, group_root)
         backbone_manifest = load_backbone_manifest(resolve_project_path(str(args.backbone_manifest)))
         for member in trainable_molecule_group_members(manifest):
@@ -616,7 +655,12 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             )
             member_refs.append(
                 {
-                    "checkpoint": {"model": loaded["model"], "cfg": loaded["cfg"], "splits": loaded["splits"], "checkpoint_id": artifact["checkpoint_id"]},
+                    "checkpoint": {
+                        "model": loaded["model"],
+                        "cfg": loaded["cfg"],
+                        "splits": loaded["splits"],
+                        "checkpoint_id": artifact["checkpoint_id"],
+                    },
                     "reference_ds": loaded["splits"][split_key],
                     "member_key": str(member["member_key"]),
                     "stratum": str(member["stratum"]),
@@ -695,13 +739,16 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                     elif family == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
                         horizon = resolved_eval_horizon(args, dataset)
                         available = len(getattr(reference_ds, "start_indices", []))
-                        window_count = int(args.val_windows) if int(args.val_windows) > 0 else int(reference_example_cap)
+                        window_count = (
+                            int(args.val_windows) if int(args.val_windows) > 0 else int(reference_example_cap)
+                        )
                         candidate_indices = _choose_valid_windows(
                             reference_ds,
                             horizon=int(horizon),
                             n_windows=min(max(1, int(window_count)), max(1, int(available))),
                             seed=selection_seed,
                         )
+
                         def item_getter(ds, t0):
                             return _get_dataset_item_by_t(ds, int(t0))
 
@@ -709,8 +756,12 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                         available_examples = int(available)
                         uncapped_candidate_examples = int(available_examples)
                     else:
-                        window_count = int(args.val_windows) if int(args.val_windows) > 0 else int(reference_example_cap)
-                        candidate_indices = _choose_molecule_indices(reference_ds, count=int(window_count), seed=selection_seed)
+                        window_count = (
+                            int(args.val_windows) if int(args.val_windows) > 0 else int(reference_example_cap)
+                        )
+                        candidate_indices = _choose_molecule_indices(
+                            reference_ds, count=int(window_count), seed=selection_seed
+                        )
                         item_getter = None
                         collector = collect_molecule_local_defect_trace
                         available_examples = int(len(reference_ds))
@@ -724,7 +775,10 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                             "cfg": cfg,
                             "collector": collector,
                             "item_getter": item_getter,
-                            "collector_seed": int(seed) + 100_000 * int(member_idx) + 10_000 * int(solver_idx) + 1_000 * int(target_idx),
+                            "collector_seed": int(seed)
+                            + 100_000 * int(member_idx)
+                            + 10_000 * int(solver_idx)
+                            + 1_000 * int(target_idx),
                             "selection_record": {
                                 "benchmark_family": str(family),
                                 "reference_split": str(reference_split),
@@ -738,7 +792,9 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                             },
                         }
                     )
-            effective_reference_cap = min(2, int(reference_example_cap)) if bool(args.smoke) else int(reference_example_cap)
+            effective_reference_cap = (
+                min(2, int(reference_example_cap)) if bool(args.smoke) else int(reference_example_cap)
+            )
             selected_groups, selection_records, _global_selection_meta = _deterministically_cap_index_groups(
                 work_items,
                 cap=int(effective_reference_cap),
@@ -748,7 +804,7 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             if bool(args.smoke):
                 for record in selection_records:
                     record["smoke_selected_examples_cap"] = 2
-            for group_idx, (work_item, chosen) in enumerate(zip(work_items, selected_groups)):
+            for group_idx, (work_item, chosen) in enumerate(zip(work_items, selected_groups, strict=False)):
                 if not chosen:
                     continue
                 collector = work_item["collector"]
@@ -779,7 +835,9 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             if reference_grid is None:
                 raise ValueError(f"No reference grid collected for {solver_key}/{target_nfe}.")
             selected_examples = int(sum(int(record["selected_examples"]) for record in selection_records))
-            uncapped_candidate_examples = int(sum(int(record["uncapped_candidate_examples"]) for record in selection_records))
+            uncapped_candidate_examples = int(
+                sum(int(record["uncapped_candidate_examples"]) for record in selection_records)
+            )
             selected_example_caps = sorted({int(record["selected_examples_cap"]) for record in selection_records})
             selection_was_capped = any(bool(record.get("selection_was_capped", False)) for record in selection_records)
             examples_by_seed = _sum_int_records_by(selection_records, "seed", "selected_examples")
@@ -788,7 +846,9 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             trace_count_by_member = _sum_int_records_by(selection_records, "member_key", "trace_count")
             per_seed_counts = list(examples_by_seed.values())
             reference_examples_per_seed = int(max(per_seed_counts)) if per_seed_counts else int(selected_examples)
-            mean_trace = np.average(np.stack(seed_traces, axis=0), axis=0, weights=np.asarray(trace_weights, dtype=np.float64))
+            mean_trace = np.average(
+                np.stack(seed_traces, axis=0), axis=0, weights=np.asarray(trace_weights, dtype=np.float64)
+            )
             time_grid = ser_ptg_grid_from_trace(
                 mean_trace.tolist(),
                 reference_grid,
@@ -817,7 +877,9 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                     "example_selection_protocol": SER_PTG_EXAMPLE_SELECTION_PROTOCOL,
                     "context_sample_count": int(args.context_sample_count),
                     "selected_examples": int(selected_examples),
-                    "selected_examples_cap": int(selected_example_caps[0]) if len(selected_example_caps) == 1 else selected_example_caps,
+                    "selected_examples_cap": int(selected_example_caps[0])
+                    if len(selected_example_caps) == 1
+                    else selected_example_caps,
                     "selected_examples_cap_source": str(reference_example_cap_source),
                     "uncapped_candidate_examples": int(uncapped_candidate_examples),
                     "selection_was_capped": bool(selection_was_capped),
@@ -826,23 +888,51 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                     "reference_examples_by_seed": examples_by_seed,
                     "reference_examples_by_member": examples_by_member,
                     "reference_examples_per_seed": int(reference_examples_per_seed),
-                    "reference_examples_per_seed_min": int(min(per_seed_counts)) if per_seed_counts else int(selected_examples),
-                    "reference_examples_per_seed_mean": float(np.mean(per_seed_counts)) if per_seed_counts else float(selected_examples),
+                    "reference_examples_per_seed_min": int(min(per_seed_counts))
+                    if per_seed_counts
+                    else int(selected_examples),
+                    "reference_examples_per_seed_mean": float(np.mean(per_seed_counts))
+                    if per_seed_counts
+                    else float(selected_examples),
                     "reference_seed_count": int(len(examples_by_seed)),
-                    "reference_member_count": int(len(examples_by_member)) if examples_by_member else int(len(member_refs)),
+                    "reference_member_count": int(len(examples_by_member))
+                    if examples_by_member
+                    else int(len(member_refs)),
                     "reference_selection_group_count": int(len(selection_records)),
-                    "train_tuning_fraction": float(args.train_tuning_fraction) if reference_split == TRAIN_TUNING_PHASE else "",
+                    "train_tuning_fraction": float(args.train_tuning_fraction)
+                    if reference_split == TRAIN_TUNING_PHASE
+                    else "",
                     "train_tuning_seed": int(args.train_tuning_seed) if reference_split == TRAIN_TUNING_PHASE else "",
-                    "train_tuning_strata": int(args.train_tuning_strata) if reference_split == TRAIN_TUNING_PHASE else "",
-                    "train_tuning_sampler": train_tuning_sampler_key(str(args.train_tuning_sampling_mode)) if reference_split == TRAIN_TUNING_PHASE else "",
-                    "train_tuning_sampling_mode": str(args.train_tuning_sampling_mode) if reference_split == TRAIN_TUNING_PHASE else "",
-                    "train_tuning_reference_examples": int(train_tuning_reference_examples) if reference_split == TRAIN_TUNING_PHASE else "",
-                    "train_tuning_target_examples": int(selected_examples) if reference_split == TRAIN_TUNING_PHASE else "",
-                    "train_tuning_max_examples": int(reference_example_cap) if reference_split == TRAIN_TUNING_PHASE else "",
-                    "train_tuning_max_examples_source": str(reference_example_cap_source) if reference_split == TRAIN_TUNING_PHASE else "",
-                    "train_tuning_uncapped_candidate_examples": int(uncapped_candidate_examples) if reference_split == TRAIN_TUNING_PHASE else "",
-                    "train_tuning_train_split_fraction": float(args.train_tuning_train_split_fraction) if reference_split == TRAIN_TUNING_PHASE else "",
-                    "train_tuning_val_split_fraction": float(args.train_tuning_val_split_fraction) if reference_split == TRAIN_TUNING_PHASE else "",
+                    "train_tuning_strata": int(args.train_tuning_strata)
+                    if reference_split == TRAIN_TUNING_PHASE
+                    else "",
+                    "train_tuning_sampler": train_tuning_sampler_key(str(args.train_tuning_sampling_mode))
+                    if reference_split == TRAIN_TUNING_PHASE
+                    else "",
+                    "train_tuning_sampling_mode": str(args.train_tuning_sampling_mode)
+                    if reference_split == TRAIN_TUNING_PHASE
+                    else "",
+                    "train_tuning_reference_examples": int(train_tuning_reference_examples)
+                    if reference_split == TRAIN_TUNING_PHASE
+                    else "",
+                    "train_tuning_target_examples": int(selected_examples)
+                    if reference_split == TRAIN_TUNING_PHASE
+                    else "",
+                    "train_tuning_max_examples": int(reference_example_cap)
+                    if reference_split == TRAIN_TUNING_PHASE
+                    else "",
+                    "train_tuning_max_examples_source": str(reference_example_cap_source)
+                    if reference_split == TRAIN_TUNING_PHASE
+                    else "",
+                    "train_tuning_uncapped_candidate_examples": int(uncapped_candidate_examples)
+                    if reference_split == TRAIN_TUNING_PHASE
+                    else "",
+                    "train_tuning_train_split_fraction": float(args.train_tuning_train_split_fraction)
+                    if reference_split == TRAIN_TUNING_PHASE
+                    else "",
+                    "train_tuning_val_split_fraction": float(args.train_tuning_val_split_fraction)
+                    if reference_split == TRAIN_TUNING_PHASE
+                    else "",
                     "trace_count": int(trace_count),
                     "trace_count_by_seed": trace_count_by_seed,
                     "trace_count_by_member": trace_count_by_member,
@@ -883,7 +973,9 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
     ]
     selected_examples_by_prediction = [int(prediction.get("selected_examples", 0)) for prediction in predictions]
     trace_counts_by_prediction = [int(prediction.get("trace_count", 0)) for prediction in predictions]
-    uncapped_examples_by_prediction = [int(prediction.get("uncapped_candidate_examples", 0)) for prediction in predictions]
+    uncapped_examples_by_prediction = [
+        int(prediction.get("uncapped_candidate_examples", 0)) for prediction in predictions
+    ]
     summary = {
         "status": "ready",
         "artifact": "ser_ptg_schedule_summary",
@@ -907,11 +999,15 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
         "selected_examples_cap": int(reference_example_cap),
         "selected_examples_cap_source": str(reference_example_cap_source),
         "selected_examples": int(max(selected_examples_by_prediction) if selected_examples_by_prediction else 0),
-        "selected_examples_per_prediction_max": int(max(selected_examples_by_prediction) if selected_examples_by_prediction else 0),
+        "selected_examples_per_prediction_max": int(
+            max(selected_examples_by_prediction) if selected_examples_by_prediction else 0
+        ),
         "selected_examples_total_across_predictions": int(sum(selected_examples_by_prediction)),
         "trace_count_total_across_predictions": int(sum(trace_counts_by_prediction)),
         "prediction_count": int(len(predictions)),
-        "uncapped_candidate_examples": int(max(uncapped_examples_by_prediction) if uncapped_examples_by_prediction else 0),
+        "uncapped_candidate_examples": int(
+            max(uncapped_examples_by_prediction) if uncapped_examples_by_prediction else 0
+        ),
         "uncapped_candidate_examples_total_across_predictions": int(sum(uncapped_examples_by_prediction)),
         "selection_was_capped": any(bool(prediction.get("selection_was_capped", False)) for prediction in predictions),
         "local_defect_trace_protocol": SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL,
@@ -928,7 +1024,9 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
             "max_examples_source": str(reference_example_cap_source),
             "train_split_fraction": float(args.train_tuning_train_split_fraction),
             "val_split_fraction": float(args.train_tuning_val_split_fraction),
-        } if reference_split == TRAIN_TUNING_PHASE else None,
+        }
+        if reference_split == TRAIN_TUNING_PHASE
+        else None,
         "checkpoint_step": int(args.otflow_train_steps),
         "checkpoint_ids": sorted(str(ref["checkpoint"].get("checkpoint_id", "")) for ref in member_refs),
         "member_keys": sorted(str(ref.get("member_key", "")) for ref in member_refs if str(ref.get("member_key", ""))),
@@ -954,9 +1052,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--train_tuning_fraction", type=float, default=0.20)
     parser.add_argument("--train_tuning_seed", type=int, default=0)
     parser.add_argument("--train_tuning_strata", type=int, default=20)
-    parser.add_argument("--train_tuning_sampling_mode", choices=TRAIN_TUNING_SAMPLING_MODES, default=TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION)
-    parser.add_argument("--train_tuning_train_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION)
-    parser.add_argument("--train_tuning_val_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION)
+    parser.add_argument(
+        "--train_tuning_sampling_mode",
+        choices=TRAIN_TUNING_SAMPLING_MODES,
+        default=TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
+    )
+    parser.add_argument(
+        "--train_tuning_train_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION
+    )
+    parser.add_argument(
+        "--train_tuning_val_split_fraction", type=float, default=DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION
+    )
     parser.add_argument("--calibration_trace_samples", type=int, default=1)
     parser.add_argument("--calibration_batch_size", type=int, default=64)
     parser.add_argument("--reference_macro_factor", type=float, default=4.0)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import csv
 import contextlib
+import csv
 import io
 import json
 import tempfile
@@ -9,6 +9,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from genode.evaluation.otflow_evaluation_support import (
+    TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED,
+    choose_forecast_train_tuning_indices,
+    train_tuning_target_example_count,
+)
 from genode.gico.evaluate_schedule_summary import (
     SELECTED_STUDENT_SCHEDULE_KEY,
     _protocol_hash,
@@ -23,11 +28,6 @@ from genode.gico.ser_ptg_reference import (
     SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
     SER_PTG_REVERSED_SCHEDULE_KEY,
     SER_PTG_SCHEDULE_KEY,
-)
-from genode.evaluation.otflow_evaluation_support import (
-    TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED,
-    choose_forecast_train_tuning_indices,
-    train_tuning_target_example_count,
 )
 from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS
 
@@ -128,7 +128,13 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         legacy = build_argparser().parse_args([*base, "--train_tuning_sampling_mode", "train_window_fraction"])
         valnorm = build_argparser().parse_args([*base, "--train_tuning_sampling_mode", "validation_normalized"])
         valnorm_alt_fraction = build_argparser().parse_args(
-            [*base, "--train_tuning_sampling_mode", "validation_normalized", "--train_tuning_train_split_fraction", "0.60"]
+            [
+                *base,
+                "--train_tuning_sampling_mode",
+                "validation_normalized",
+                "--train_tuning_train_split_fraction",
+                "0.60",
+            ]
         )
         self.assertNotEqual(_protocol_hash(legacy), _protocol_hash(valnorm))
         self.assertNotEqual(_protocol_hash(valnorm), _protocol_hash(valnorm_alt_fraction))
@@ -318,9 +324,25 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             }
             for schedule_key in BASELINE_SCHEDULE_KEYS
         ]
-        ser_rows = [{"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": SER_PTG_SCHEDULE_KEY, "crps": 1.5, "mase": 2.5}]
+        ser_rows = [
+            {
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": SER_PTG_SCHEDULE_KEY,
+                "crps": 1.5,
+                "mase": 2.5,
+            }
+        ]
         student_rows = [
-            {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY, "crps": 1.25, "mase": 2.0}
+            {
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                "crps": 1.25,
+                "mase": 2.0,
+            }
         ]
         summary = build_comparison_summary(
             baseline_rows=baseline_rows,
@@ -354,7 +376,14 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         ]
         student_rows = [
             {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": "density_a", "crps": 1.5, "mase": 2.5},
-            {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": "density_b", "crps": 1.25, "mase": 2.25},
+            {
+                "seed": 0,
+                "solver_key": "euler",
+                "target_nfe": 4,
+                "scheduler_key": "density_b",
+                "crps": 1.25,
+                "mase": 2.25,
+            },
         ]
         summary = build_comparison_summary(
             baseline_rows=baseline_rows,
@@ -401,9 +430,30 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 encoding="utf-8",
             )
             mixed_rows = [
-                {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": BASELINE_SCHEDULE_KEYS[0], "crps": 2.0, "mase": 3.0},
-                {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": SER_PTG_SCHEDULE_KEY, "crps": 1.5, "mase": 2.5},
-                {"seed": 0, "solver_key": "euler", "target_nfe": 4, "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY, "crps": 1.0, "mase": 2.0},
+                {
+                    "seed": 0,
+                    "solver_key": "euler",
+                    "target_nfe": 4,
+                    "scheduler_key": BASELINE_SCHEDULE_KEYS[0],
+                    "crps": 2.0,
+                    "mase": 3.0,
+                },
+                {
+                    "seed": 0,
+                    "solver_key": "euler",
+                    "target_nfe": 4,
+                    "scheduler_key": SER_PTG_SCHEDULE_KEY,
+                    "crps": 1.5,
+                    "mase": 2.5,
+                },
+                {
+                    "seed": 0,
+                    "solver_key": "euler",
+                    "target_nfe": 4,
+                    "scheduler_key": SELECTED_STUDENT_SCHEDULE_KEY,
+                    "crps": 1.0,
+                    "mase": 2.0,
+                },
             ]
 
             class FakeDataset:
@@ -448,30 +498,35 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "cpu",
                 ]
             )
-            with mock.patch(
-                "genode.gico.evaluate_schedule_summary.load_forecast_checkpoint_splits",
-                return_value=fake_checkpoint,
-            ), mock.patch(
-                "genode.gico.evaluate_schedule_summary.evaluate_forecast_schedule",
-                return_value={
-                    "crps": 1.0,
-                    "mse": 1.5,
-                    "mase": 2.0,
-                    "latency_ms_per_sample": 0.25,
-                    "num_eval_samples": 1,
-                    "eval_examples": 1,
-                    "eval_horizon": 168,
-                    "evaluation_protocol_hash": "protocol",
-                    "chosen_examples_hash": "examples",
-                    "realized_nfe": 4,
-                },
-            ), mock.patch(
-                "genode.gico.evaluate_schedule_summary._load_rows_csv",
-                return_value=mixed_rows,
-            ), mock.patch(
-                "genode.gico.evaluate_schedule_summary.build_comparison_summary",
-                return_value={"status": "captured"},
-            ) as build_mock:
+            with (
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary.load_forecast_checkpoint_splits",
+                    return_value=fake_checkpoint,
+                ),
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary.evaluate_forecast_schedule",
+                    return_value={
+                        "crps": 1.0,
+                        "mse": 1.5,
+                        "mase": 2.0,
+                        "latency_ms_per_sample": 0.25,
+                        "num_eval_samples": 1,
+                        "eval_examples": 1,
+                        "eval_horizon": 168,
+                        "evaluation_protocol_hash": "protocol",
+                        "chosen_examples_hash": "examples",
+                        "realized_nfe": 4,
+                    },
+                ),
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary._load_rows_csv",
+                    return_value=mixed_rows,
+                ),
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary.build_comparison_summary",
+                    return_value={"status": "captured"},
+                ) as build_mock,
+            ):
                 evaluate_schedule_summary(args)
 
         call_kwargs = build_mock.call_args.kwargs
@@ -515,7 +570,9 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         self.assertEqual(selection["selected_schedule_key"], "gico_candidate_steps35")
         self.assertEqual(selection["selected_gico_step_budget"], 35)
         self.assertEqual(selection["utility_reference"], "best_fixed_baseline_crps_mase")
-        self.assertTrue(any(row["scheduler_key"] == "ser_ptg_residual_tail_s200_eps030" for row in selection["schedule_table"]))
+        self.assertTrue(
+            any(row["scheduler_key"] == "ser_ptg_residual_tail_s200_eps030" for row in selection["schedule_table"])
+        )
         self.assertNotIn("eps_rho", selection["schedule_table"][0])
         self.assertNotIn("kl_weight", selection["schedule_table"][0])
 
@@ -587,7 +644,10 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 )
         selection = select_best_validation_schedule(rows, reference_rows=fixed_rows)
         self.assertEqual(selection["selected_schedule_key"], "gico_candidate_steps25")
-        self.assertGreater(selection["schedule_table"][0]["mean_min_metric_utility"], selection["schedule_table"][1]["mean_min_metric_utility"])
+        self.assertGreater(
+            selection["schedule_table"][0]["mean_min_metric_utility"],
+            selection["schedule_table"][1]["mean_min_metric_utility"],
+        )
 
     def test_validation_schedule_selection_requires_fixed_reference_rows(self) -> None:
         rows = []
@@ -690,23 +750,26 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "cpu",
                 ]
             )
-            with mock.patch(
-                "genode.gico.evaluate_schedule_summary.load_forecast_checkpoint_splits",
-                return_value=fake_checkpoint,
-            ), mock.patch(
-                "genode.gico.evaluate_schedule_summary.evaluate_forecast_schedule",
-                return_value={
-                    "crps": 1.0,
-                    "mse": 1.5,
-                    "mase": 2.0,
-                    "latency_ms_per_sample": 0.25,
-                    "num_eval_samples": 1,
-                    "eval_examples": 1,
-                    "eval_horizon": 168,
-                    "evaluation_protocol_hash": "protocol",
-                    "chosen_examples_hash": "examples",
-                    "realized_nfe": 4,
-                },
+            with (
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary.load_forecast_checkpoint_splits",
+                    return_value=fake_checkpoint,
+                ),
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary.evaluate_forecast_schedule",
+                    return_value={
+                        "crps": 1.0,
+                        "mse": 1.5,
+                        "mase": 2.0,
+                        "latency_ms_per_sample": 0.25,
+                        "num_eval_samples": 1,
+                        "eval_examples": 1,
+                        "eval_horizon": 168,
+                        "evaluation_protocol_hash": "protocol",
+                        "chosen_examples_hash": "examples",
+                        "realized_nfe": 4,
+                    },
+                ),
             ):
                 summary = evaluate_schedule_summary(args)
             self.assertEqual(summary["observed_rows"], 1)
@@ -798,12 +861,15 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "cpu",
                 ]
             )
-            with mock.patch(
-                "genode.gico.evaluate_schedule_summary.load_forecast_checkpoint_splits",
-                return_value=fake_checkpoint,
-            ), mock.patch(
-                "genode.gico.evaluate_schedule_summary.evaluate_forecast_schedule",
-                side_effect=fake_eval,
+            with (
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary.load_forecast_checkpoint_splits",
+                    return_value=fake_checkpoint,
+                ),
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary.evaluate_forecast_schedule",
+                    side_effect=fake_eval,
+                ),
             ):
                 evaluate_schedule_summary(args)
 
@@ -895,12 +961,15 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "cpu",
                 ]
             )
-            with mock.patch(
-                "genode.gico.evaluate_schedule_summary.load_forecast_checkpoint_splits",
-                return_value=fake_checkpoint,
-            ), mock.patch(
-                "genode.gico.evaluate_schedule_summary.evaluate_forecast_schedule",
-                side_effect=fake_eval,
+            with (
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary.load_forecast_checkpoint_splits",
+                    return_value=fake_checkpoint,
+                ),
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary.evaluate_forecast_schedule",
+                    side_effect=fake_eval,
+                ),
             ):
                 evaluate_schedule_summary(args)
 
@@ -999,12 +1068,15 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "cpu",
                 ]
             )
-            with mock.patch(
-                "genode.gico.evaluate_schedule_summary.load_forecast_checkpoint_splits",
-                return_value=fake_checkpoint,
-            ), mock.patch(
-                "genode.gico.evaluate_schedule_summary.evaluate_forecast_schedule",
-                side_effect=fake_eval,
+            with (
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary.load_forecast_checkpoint_splits",
+                    return_value=fake_checkpoint,
+                ),
+                mock.patch(
+                    "genode.gico.evaluate_schedule_summary.evaluate_forecast_schedule",
+                    side_effect=fake_eval,
+                ),
             ):
                 summary = evaluate_schedule_summary(args)
             self.assertEqual(summary["split_phase"], "train_tuning")

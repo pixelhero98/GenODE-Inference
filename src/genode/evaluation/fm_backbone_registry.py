@@ -8,6 +8,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from genode.data.molecule_xyz import (
+    MOLECULE_GROUP_DATASET_KEYS,
+    default_molecule_group_root,
+    load_molecule_group_manifest,
+)
 from genode.data.otflow_experiment_plan import (
     CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS,
     CANONICAL_FORECAST_PAPER_DATASETS,
@@ -19,19 +24,16 @@ from genode.data.otflow_medical_constants import (
     LONG_TERM_ST_DATASET_KEY,
     default_long_term_st_manifest_path,
 )
-from genode.data.molecule_xyz import (
-    MOLECULE_GROUP_DATASET_KEYS,
-    default_molecule_group_root,
-    load_molecule_group_manifest,
-)
 from genode.data.otflow_paths import (
     default_lobster_synthetic_profile_path,
     display_project_path,
     normalize_project_relative_path,
-    project_backbone_matrix_root as default_project_backbone_matrix_root,
     project_data_root,
     project_outputs_root,
     project_paper_dataset_root,
+)
+from genode.data.otflow_paths import (
+    project_backbone_matrix_root as default_project_backbone_matrix_root,
 )
 
 MOLECULE_FAMILY = "molecule_3d_coordinate_generation"
@@ -179,7 +181,9 @@ def _forecast_artifact_root(matrix_root: Path, backbone_name: str, dataset_key: 
     return matrix_root / str(backbone_name) / FORECAST_FAMILY / train_budget_label(int(train_steps)) / str(dataset_key)
 
 
-def _conditional_generation_artifact_root(matrix_root: Path, backbone_name: str, dataset_key: str, train_steps: int) -> Path:
+def _conditional_generation_artifact_root(
+    matrix_root: Path, backbone_name: str, dataset_key: str, train_steps: int
+) -> Path:
     return (
         matrix_root
         / str(backbone_name)
@@ -318,7 +322,7 @@ def _checkpoint_signature(checkpoint_path: Path) -> Tuple[Optional[Dict[str, int
         return None, f"Unable to load OTFlow checkpoint: {type(exc).__name__}: {exc}"
     signature = {
         "model_cond_dim": int(getattr(cfg.model, "cond_dim", 0) or 0),
-        "history_len": int(getattr(cfg, "history_len")),
+        "history_len": int(cfg.history_len),
         "future_block_len": int(getattr(cfg.model, "future_block_len", 1)),
         "prediction_horizon": int(getattr(cfg, "prediction_horizon", 1)),
         "rollout_mode": str(getattr(cfg.model, "rollout_mode", "")),
@@ -426,7 +430,15 @@ def _molecule_manifest_members(
 ) -> List[Dict[str, Any]]:
     members: List[Dict[str, Any]] = []
     for dataset_key in tuple(str(key) for key in dataset_keys):
-        manifest_path = (default_molecule_group_root() if molecule_group_root is None else Path(molecule_group_root).expanduser().resolve()) / dataset_key / "group_manifest.json"
+        manifest_path = (
+            (
+                default_molecule_group_root()
+                if molecule_group_root is None
+                else Path(molecule_group_root).expanduser().resolve()
+            )
+            / dataset_key
+            / "group_manifest.json"
+        )
         if not manifest_path.exists():
             continue
         manifest = load_molecule_group_manifest(dataset_key, manifest_path.parent.parent)
@@ -493,16 +505,18 @@ def _molecule_artifact_compatibility(
     model_cfg = dict(cfg.get("model", {}) or {})
     observed_rollout = str(metadata.get("rollout_mode", model_cfg.get("rollout_mode", "")))
     if observed_rollout.strip().lower() != CANONICAL_MOLECULE_ROLLOUT_MODE:
-        errors.append(
-            f"metadata.rollout_mode={observed_rollout!r} != expected {CANONICAL_MOLECULE_ROLLOUT_MODE!r}"
-        )
+        errors.append(f"metadata.rollout_mode={observed_rollout!r} != expected {CANONICAL_MOLECULE_ROLLOUT_MODE!r}")
     split_stats = dict(metadata.get("split_stats", {}) or {})
     if int(split_stats.get("atom_count", atom_count)) != int(atom_count):
-        errors.append(f"metadata.split_stats.atom_count={split_stats.get('atom_count')!r} != expected {int(atom_count)!r}")
+        errors.append(
+            f"metadata.split_stats.atom_count={split_stats.get('atom_count')!r} != expected {int(atom_count)!r}"
+        )
     if str(split_stats.get("formula", formula)) != str(formula):
         errors.append(f"metadata.split_stats.formula={split_stats.get('formula')!r} != expected {str(formula)!r}")
     if str(metadata.get("source_zip_name", "")) != str(source_zip_name):
-        errors.append(f"metadata.source_zip_name={metadata.get('source_zip_name')!r} != expected {str(source_zip_name)!r}")
+        errors.append(
+            f"metadata.source_zip_name={metadata.get('source_zip_name')!r} != expected {str(source_zip_name)!r}"
+        )
     if errors:
         return "invalid", "; ".join(errors)
     return "ready", None
@@ -539,7 +553,9 @@ def _existing_matrix_artifact(
         benchmark_family=str(benchmark_family),
         dataset_key=str(dataset_key),
         train_steps=int(train_steps),
-        field_network_type=str(field_network_type or expected_field_network_type) if (field_network_type or expected_field_network_type) else None,
+        field_network_type=str(field_network_type or expected_field_network_type)
+        if (field_network_type or expected_field_network_type)
+        else None,
     )
     checkpoint_id = None if metadata is None else metadata.get("checkpoint_id")
     summary_path = _existing_summary_path(
@@ -742,12 +758,7 @@ def _imported_source_dir(
     dataset_key: str,
     train_steps: int,
 ) -> Path:
-    return (
-        imported_root
-        / str(benchmark_family)
-        / str(dataset_key)
-        / train_budget_label(int(train_steps))
-    )
+    return imported_root / str(benchmark_family) / str(dataset_key) / train_budget_label(int(train_steps))
 
 
 def _rewrite_normalized_json_payload(
@@ -828,11 +839,7 @@ def _normalize_imported_artifact(
         if not source_file.exists():
             continue
         if source_file.suffix.lower() == ".json":
-            summary_target = (
-                paths["summary_path"]
-                if name == STANDARD_ARTIFACT_SUMMARY_NAME
-                else artifact_root / name
-            )
+            summary_target = paths["summary_path"] if name == STANDARD_ARTIFACT_SUMMARY_NAME else artifact_root / name
             _copy_json_with_rewritten_paths(
                 source_file,
                 summary_target,
@@ -1053,6 +1060,8 @@ def _iter_target_specs(
                 train_steps=int(train_steps),
                 seed=int(seed),
             )
+
+
 def materialize_backbone_manifest(
     *,
     matrix_root: str | Path | None = None,
@@ -1083,9 +1092,7 @@ def materialize_backbone_manifest(
         budget_steps=budget_steps,
     ):
         if str(planned.benchmark_family) == MOLECULE_FAMILY:
-            member = molecule_member_by_key[
-                (str(planned.dataset_key), str(planned.member_key), str(planned.stratum))
-            ]
+            member = molecule_member_by_key[(str(planned.dataset_key), str(planned.member_key), str(planned.stratum))]
             resolved = _existing_molecule_artifact(
                 resolved_matrix_root,
                 molecule_backbone_root=resolved_molecule_backbone_root,
@@ -1124,7 +1131,11 @@ def materialize_backbone_manifest(
         "molecule_group_root": _project_display_path(resolved_molecule_group_root),
         "molecule_backbone_root": _project_display_path(resolved_molecule_backbone_root),
         "temporal_artifact_count": int(
-            sum(1 for row in artifacts if str(row.get("benchmark_family")) in {FORECAST_FAMILY, CONDITIONAL_GENERATION_FAMILY})
+            sum(
+                1
+                for row in artifacts
+                if str(row.get("benchmark_family")) in {FORECAST_FAMILY, CONDITIONAL_GENERATION_FAMILY}
+            )
         ),
         "molecule_stratum_count": int(len(molecule_member_by_key)),
         "molecule_artifact_count": int(
@@ -1166,7 +1177,13 @@ def load_backbone_manifest(path: str | Path) -> Dict[str, Any]:
                         artifact[field],
                         path_base=path_base,
                     )
-        for field in ("matrix_root", "otflow_reuse_root", "imported_backbone_root", "molecule_group_root", "molecule_backbone_root"):
+        for field in (
+            "matrix_root",
+            "otflow_reuse_root",
+            "imported_backbone_root",
+            "molecule_group_root",
+            "molecule_backbone_root",
+        ):
             if field in payload:
                 payload[field] = _resolve_manifest_relative_path(
                     manifest_path,
@@ -1188,7 +1205,9 @@ def find_backbone_artifact(
     stratum: str | None = None,
 ) -> Dict[str, Any]:
     if str(benchmark_family) == MOLECULE_FAMILY and member_key is None and stratum is None:
-        raise ValueError("Molecule backbone artifact lookup requires member_key or stratum to avoid ambiguous group matches.")
+        raise ValueError(
+            "Molecule backbone artifact lookup requires member_key or stratum to avoid ambiguous group matches."
+        )
     matches: List[Dict[str, Any]] = []
     for artifact in manifest_payload.get("artifacts", []):
         if (
@@ -1204,9 +1223,7 @@ def find_backbone_artifact(
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        raise ValueError(
-            "Backbone artifact lookup is ambiguous; add a narrower molecule member_key or stratum filter."
-        )
+        raise ValueError("Backbone artifact lookup is ambiguous; add a narrower molecule member_key or stratum filter.")
     raise KeyError(
         "No matching backbone artifact found for "
         f"{backbone_name}/{benchmark_family}/{dataset_key}/{int(train_steps)} with status={status}"
@@ -1221,15 +1238,14 @@ def build_runtime_probe(
     molecule_group_root: str | Path | None = None,
 ) -> Dict[str, Any]:
     resolved_dataset_root = Path(dataset_root or project_paper_dataset_root()).resolve()
-    resolved_lobster_profile_path = Path(lobster_synthetic_profile_path or default_lobster_synthetic_profile_path()).resolve()
+    resolved_lobster_profile_path = Path(
+        lobster_synthetic_profile_path or default_lobster_synthetic_profile_path()
+    ).resolve()
     resolved_long_term_st_path = Path(long_term_st_path or default_long_term_st_manifest_path().parent).resolve()
     resolved_molecule_group_root = Path(molecule_group_root or default_molecule_group_root()).resolve()
     monash_root = resolved_dataset_root / "monash"
     import_names = ("numpy", "torch", "wfdb")
-    imports = {
-        name: bool(importlib.util.find_spec(name) is not None)
-        for name in import_names
-    }
+    imports = {name: bool(importlib.util.find_spec(name) is not None) for name in import_names}
     forecast_dataset_presence = {
         str(dataset_key): bool((monash_root / str(dataset_key) / "manifest.json").exists())
         for dataset_key in CANONICAL_FORECAST_PAPER_DATASETS

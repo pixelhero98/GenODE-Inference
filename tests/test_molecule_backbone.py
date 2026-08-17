@@ -235,7 +235,9 @@ class MoleculeBackboneTests(unittest.TestCase):
             for split_name in ("train", "val", "test"):
                 ds = splits[split_name]
                 for target_idx in ds.start_indices[:20]:
-                    seg_end = int(ds.data.segment_ends[np.searchsorted(ds.data.segment_ends, int(target_idx), side="right")])
+                    seg_end = int(
+                        ds.data.segment_ends[np.searchsorted(ds.data.segment_ends, int(target_idx), side="right")]
+                    )
                     self.assertLess(int(target_idx) + int(ds.future_horizon), seg_end + 1)
 
     def test_clean_window_filter_excludes_context_discontinuities(self) -> None:
@@ -255,7 +257,9 @@ class MoleculeBackboneTests(unittest.TestCase):
             with np.load(npz_path, allow_pickle=False) as payload:
                 arrays = {key: payload[key] for key in payload.files}
             arrays["discontinuity_step_mask"] = arrays["discontinuity_step_mask"].copy()
-            train_trajectory = json.loads(molecule_xyz.molecule_processed_metadata_path(processed).read_text())["split_trajectory_ids"]["train"][0]
+            train_trajectory = json.loads(molecule_xyz.molecule_processed_metadata_path(processed).read_text())[
+                "split_trajectory_ids"
+            ]["train"][0]
             train_start = int(np.where(arrays["trajectory_ids"] == int(train_trajectory))[0][0])
             arrays["discontinuity_step_mask"][train_start + 4] = True
             np.savez_compressed(npz_path, **arrays)
@@ -386,37 +390,50 @@ class MoleculeBackboneTests(unittest.TestCase):
                     "reference_coords": [[0.0, 0.0, 0.0]] * 6,
                 },
             }
-            with patch.object(
-                train_molecule_module,
-                "ensure_molecule_processed",
-                return_value={"dataset_key": "demo", "stratum": "Dynamic_Test", "atom_count": 6, "context_feature_dim": 66, "trainable": True},
-            ), patch.object(
-                train_molecule_module,
-                "build_molecule_dataset_splits",
-                return_value={
-                    "train": [0],
-                    "val": [0],
-                    "val_clean": [0],
-                    "test": [0],
-                    "test_clean": [0],
-                    "stats": split_stats,
-                },
-            ), patch.object(
-                train_molecule_module,
-                "train_loop",
-                side_effect=fake_train_loop,
-            ), patch.object(
-                train_molecule_module,
-                "evaluate_average_loss",
-                side_effect=fake_eval,
-            ), patch.object(
-                train_molecule_module,
-                "_evaluate_iso_balanced_loss",
-                return_value={"loss": 1.0, "examples": 2, "iso_count": 1},
-            ), patch.object(
-                train_molecule_module,
-                "project_outputs_root",
-                return_value=project_outputs,
+            with (
+                patch.object(
+                    train_molecule_module,
+                    "ensure_molecule_processed",
+                    return_value={
+                        "dataset_key": "demo",
+                        "stratum": "Dynamic_Test",
+                        "atom_count": 6,
+                        "context_feature_dim": 66,
+                        "trainable": True,
+                    },
+                ),
+                patch.object(
+                    train_molecule_module,
+                    "build_molecule_dataset_splits",
+                    return_value={
+                        "train": [0],
+                        "val": [0],
+                        "val_clean": [0],
+                        "test": [0],
+                        "test_clean": [0],
+                        "stats": split_stats,
+                    },
+                ),
+                patch.object(
+                    train_molecule_module,
+                    "train_loop",
+                    side_effect=fake_train_loop,
+                ),
+                patch.object(
+                    train_molecule_module,
+                    "evaluate_average_loss",
+                    side_effect=fake_eval,
+                ),
+                patch.object(
+                    train_molecule_module,
+                    "_evaluate_iso_balanced_loss",
+                    return_value={"loss": 1.0, "examples": 2, "iso_count": 1},
+                ),
+                patch.object(
+                    train_molecule_module,
+                    "project_outputs_root",
+                    return_value=project_outputs,
+                ),
             ):
                 summary = train_molecule_module.train_molecule_backbone(args)
 
@@ -424,7 +441,9 @@ class MoleculeBackboneTests(unittest.TestCase):
             self.assertEqual(summary["budget_artifacts"]["1"]["selected_step"], 1)
             self.assertEqual(summary["budget_artifacts"]["2"]["selected_step"], 2)
             self.assertEqual(summary["budget_artifacts"]["3"]["selected_step"], 2)
-            metadata_path = root / "outputs" / "demo" / "Dynamic_Test" / "ar_h1" / "3_steps" / "checkpoint_metadata.json"
+            metadata_path = (
+                root / "outputs" / "demo" / "Dynamic_Test" / "ar_h1" / "3_steps" / "checkpoint_metadata.json"
+            )
             metadata = json.loads(metadata_path.read_text())
             self.assertEqual(metadata["selection"]["selection_metric"], "clean_validation_loss")
             self.assertEqual(metadata["selection"]["selected_step"], 2)
@@ -479,26 +498,31 @@ class MoleculeBackboneTests(unittest.TestCase):
             out_json="",
         )
 
-        with patch.object(
-            molecule_metrics,
-            "load_otflow_checkpoint_payload",
-            return_value={
-                "molecule_stats": checkpoint_stats.to_dict(),
-                "dataset_key": "demo",
-                "stratum": "Dynamic_Test",
-            },
-        ), patch.object(
-            molecule_metrics,
-            "load_checkpoint_model",
-            return_value=(SimpleNamespace(), cfg),
-        ), patch.object(
-            molecule_metrics,
-            "build_molecule_dataset_splits",
-            side_effect=fake_build,
-        ), patch.object(
-            molecule_metrics,
-            "evaluate_average_loss",
-            return_value={"loss": 1.0, "examples": 1, "batches": 1},
+        with (
+            patch.object(
+                molecule_metrics,
+                "load_otflow_checkpoint_payload",
+                return_value={
+                    "molecule_stats": checkpoint_stats.to_dict(),
+                    "dataset_key": "demo",
+                    "stratum": "Dynamic_Test",
+                },
+            ),
+            patch.object(
+                molecule_metrics,
+                "load_checkpoint_model",
+                return_value=(SimpleNamespace(), cfg),
+            ),
+            patch.object(
+                molecule_metrics,
+                "build_molecule_dataset_splits",
+                side_effect=fake_build,
+            ),
+            patch.object(
+                molecule_metrics,
+                "evaluate_average_loss",
+                return_value={"loss": 1.0, "examples": 1, "batches": 1},
+            ),
         ):
             summary = molecule_metrics.evaluate_molecule_checkpoint(args)
 
@@ -544,7 +568,13 @@ class MoleculeBackboneTests(unittest.TestCase):
 
         self.assertAlmostEqual(metrics["molecule_pair_distance_w1"], 1.0, places=6)
         self.assertAlmostEqual(metrics["molecule_coordinate_w1_max"], 1.0, places=6)
-        self.assertTrue(np.isnan(molecule_metrics.molecule_distributional_metrics(pred, true, current, None)["molecule_ensemble_acceleration_norm_w1"]))
+        self.assertTrue(
+            np.isnan(
+                molecule_metrics.molecule_distributional_metrics(pred, true, current, None)[
+                    "molecule_ensemble_acceleration_norm_w1"
+                ]
+            )
+        )
         with self.assertRaisesRegex(ValueError, "pred/true"):
             molecule_metrics.molecule_distributional_metrics(pred[:, :1], true, current, previous)
         with self.assertRaisesRegex(ValueError, "current coordinate"):
@@ -570,8 +600,12 @@ class MoleculeBackboneTests(unittest.TestCase):
 
         def context_from_positions(first: np.ndarray, second: np.ndarray) -> np.ndarray:
             context = np.zeros((2, 22), dtype=np.float32)
-            context[0] = np.concatenate([np.concatenate([first[0], np.zeros(8)]), np.concatenate([first[1], np.zeros(8)])])
-            context[1] = np.concatenate([np.concatenate([second[0], np.zeros(8)]), np.concatenate([second[1], np.zeros(8)])])
+            context[0] = np.concatenate(
+                [np.concatenate([first[0], np.zeros(8)]), np.concatenate([first[1], np.zeros(8)])]
+            )
+            context[1] = np.concatenate(
+                [np.concatenate([second[0], np.zeros(8)]), np.concatenate([second[1], np.zeros(8)])]
+            )
             return context
 
         class FakeDataset:
@@ -639,26 +673,32 @@ class MoleculeBackboneTests(unittest.TestCase):
             out_json="",
         )
 
-        with patch.object(
-            molecule_metrics,
-            "load_otflow_checkpoint_payload",
-            return_value={"molecule_stats": checkpoint_stats.to_dict()},
-        ), patch.object(
-            molecule_metrics,
-            "load_checkpoint_model",
-            return_value=(FakeModel(), cfg),
-        ), patch.object(
-            molecule_metrics,
-            "build_molecule_dataset_splits",
-            return_value={"test_clean": FakeDataset()},
-        ), patch.object(
-            molecule_metrics,
-            "evaluate_average_loss",
-            return_value={"loss": 1.0, "examples": 2, "batches": 1},
-        ), patch.object(
-            molecule_metrics,
-            "molecule_distributional_metrics",
-            side_effect=fake_distributional,
+        with (
+            patch.object(
+                molecule_metrics,
+                "load_otflow_checkpoint_payload",
+                return_value={"molecule_stats": checkpoint_stats.to_dict()},
+            ),
+            patch.object(
+                molecule_metrics,
+                "load_checkpoint_model",
+                return_value=(FakeModel(), cfg),
+            ),
+            patch.object(
+                molecule_metrics,
+                "build_molecule_dataset_splits",
+                return_value={"test_clean": FakeDataset()},
+            ),
+            patch.object(
+                molecule_metrics,
+                "evaluate_average_loss",
+                return_value={"loss": 1.0, "examples": 2, "batches": 1},
+            ),
+            patch.object(
+                molecule_metrics,
+                "molecule_distributional_metrics",
+                side_effect=fake_distributional,
+            ),
         ):
             summary = molecule_metrics.evaluate_molecule_checkpoint(args)
 

@@ -4,7 +4,12 @@ import json
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 from genode.data.otflow_paths import resolve_project_path
-from genode.gico.density_representation import average_density_masses, density_mass_to_time_grid, grid_to_density_mass, uniform_reference_grid
+from genode.gico.density_representation import (
+    average_density_masses,
+    density_mass_to_time_grid,
+    grid_to_density_mass,
+    uniform_reference_grid,
+)
 from genode.gico.models import validate_time_grid
 from genode.gico.policy import density_mass_for_row
 from genode.solver_protocol import normalize_solver_key, normalize_solver_nfe_fields
@@ -13,7 +18,9 @@ CANONICAL_DENSITY_BIN_COUNT = 64
 ScheduleGridKey = Tuple[Any, ...]
 
 
-def checkpoint_step_from_payload(payload: Mapping[str, Any], schedule: Mapping[str, Any], item: Mapping[str, Any]) -> int | None:
+def checkpoint_step_from_payload(
+    payload: Mapping[str, Any], schedule: Mapping[str, Any], item: Mapping[str, Any]
+) -> int | None:
     for source in (item, schedule, payload):
         for key in ("checkpoint_step", "train_steps", "otflow_train_steps"):
             value = source.get(key)
@@ -69,8 +76,12 @@ def load_schedule_summary_grids(paths: Sequence[str]) -> Dict[ScheduleGridKey, T
                     if checkpoint_step is not None:
                         grids[(*reversed_key, int(checkpoint_step))] = reversed_grid
                     reference = uniform_reference_grid(CANONICAL_DENSITY_BIN_COUNT)
-                    base_mass = grid_to_density_mass(base_grid, reference_time_grid=reference, macro_steps=nfe.macro_steps)
-                    reversed_mass = grid_to_density_mass(reversed_grid, reference_time_grid=reference, macro_steps=nfe.macro_steps)
+                    base_mass = grid_to_density_mass(
+                        base_grid, reference_time_grid=reference, macro_steps=nfe.macro_steps
+                    )
+                    reversed_mass = grid_to_density_mass(
+                        reversed_grid, reference_time_grid=reference, macro_steps=nfe.macro_steps
+                    )
                     averaged_mass = average_density_masses(base_mass, reversed_mass)
                     avg_key = ("ser_ptg_local_defect_eta005_avg_reversed", solver, target_nfe)
                     avg_grid = density_mass_to_time_grid(
@@ -127,8 +138,7 @@ def validate_schedule_grid_coverage(
     )
     if report["missing_grid_row_count"]:
         raise ValueError(
-            f"{label} rows are missing schedule grids for non-fixed schedules: "
-            f"{report['missing_grid_rows'][:8]}"
+            f"{label} rows are missing schedule grids for non-fixed schedules: {report['missing_grid_rows'][:8]}"
         )
     return report
 

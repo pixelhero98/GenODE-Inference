@@ -6,15 +6,20 @@ import unittest
 import numpy as np
 import torch
 
-from genode.models.config import OTFlowConfig
 from genode.data.otflow_datasets import WindowedParamSequenceDataset
+from genode.data.otflow_forecast_data import (
+    ForecastExampleRef,
+    ForecastSeriesRecord,
+    MonashForecastWindowDataset,
+    _regular_time_features,
+)
 from genode.evaluation.otflow_evaluation_support import (
     choose_forecast_example_indices,
     collect_forecast_calibration,
     evaluate_forecast_schedule,
     parse_forecast_datasets,
 )
-from genode.data.otflow_forecast_data import ForecastExampleRef, ForecastSeriesRecord, MonashForecastWindowDataset, _regular_time_features
+from genode.models.config import OTFlowConfig
 
 
 class ExtrapolationFixesTest(unittest.TestCase):

@@ -72,7 +72,11 @@ def sanitize_density_mass(
 
 def density_mass_hash(density_mass: Sequence[float], *, reference_time_grid: Sequence[float] | None = None) -> str:
     mass = [round(float(x), 12) for x in sanitize_density_mass(density_mass, eps=0.0)]
-    grid = uniform_reference_grid(len(mass)) if reference_time_grid is None else validate_reference_grid(reference_time_grid)
+    grid = (
+        uniform_reference_grid(len(mass))
+        if reference_time_grid is None
+        else validate_reference_grid(reference_time_grid)
+    )
     return _json_hash(
         {
             "density_protocol": DENSITY_PROTOCOL,
@@ -121,9 +125,7 @@ def grid_to_density_mass(
     grid = np.asarray(validate_time_grid(time_grid, macro_steps=steps), dtype=np.float64)
     reference = np.asarray(
         validate_reference_grid(
-            uniform_reference_grid(DEFAULT_DENSITY_BIN_COUNT)
-            if reference_time_grid is None
-            else reference_time_grid
+            uniform_reference_grid(DEFAULT_DENSITY_BIN_COUNT) if reference_time_grid is None else reference_time_grid
         ),
         dtype=np.float64,
     )
@@ -161,9 +163,7 @@ def density_mass_to_time_grid(
     mass = np.asarray(sanitize_density_mass(density_mass, eps=float(eps)), dtype=np.float64)
     reference = np.asarray(
         validate_reference_grid(
-            uniform_reference_grid(int(mass.size))
-            if reference_time_grid is None
-            else reference_time_grid
+            uniform_reference_grid(int(mass.size)) if reference_time_grid is None else reference_time_grid
         ),
         dtype=np.float64,
     )
@@ -191,9 +191,7 @@ def density_log_features(
     mass = np.asarray(sanitize_density_mass(density_mass, eps=0.0), dtype=np.float64)
     reference = np.asarray(
         validate_reference_grid(
-            uniform_reference_grid(int(mass.size))
-            if reference_time_grid is None
-            else reference_time_grid
+            uniform_reference_grid(int(mass.size)) if reference_time_grid is None else reference_time_grid
         ),
         dtype=np.float64,
     )
@@ -206,9 +204,7 @@ def density_log_features(
 
 def density_metadata(reference_time_grid: Sequence[float] | None = None) -> dict[str, Any]:
     grid = validate_reference_grid(
-        uniform_reference_grid(DEFAULT_DENSITY_BIN_COUNT)
-        if reference_time_grid is None
-        else reference_time_grid
+        uniform_reference_grid(DEFAULT_DENSITY_BIN_COUNT) if reference_time_grid is None else reference_time_grid
     )
     return {
         "density_protocol": DENSITY_PROTOCOL,

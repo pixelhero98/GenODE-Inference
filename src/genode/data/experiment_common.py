@@ -7,7 +7,6 @@ from typing import Dict, List, Mapping
 
 import torch
 
-from genode.models.config import OTFlowConfig
 from genode.data.otflow_datasets import (
     DEFAULT_SYNTHETIC_LENGTH,
     LOBSTER_SYNTHETIC_DATASET_KEY,
@@ -23,6 +22,7 @@ from genode.data.otflow_medical_constants import (
     LONG_TERM_ST_HORIZON_LEN,
     default_long_term_st_data_path,
 )
+from genode.models.config import OTFlowConfig
 
 OTFLOW_PAPER_DATASET_CHOICES = ("cryptos", LOBSTER_SYNTHETIC_DATASET_KEY, LONG_TERM_ST_DATASET_KEY)
 OTFLOW_PAPER_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
@@ -259,19 +259,15 @@ def apply_otflow_dataset_preset(args, variant: str | None = None):
     dataset = getattr(args, "dataset", None)
     if dataset not in OTFLOW_QUALITY_PRESETS:
         return args
-    variant_name = str(
-        variant
-        or getattr(args, "otflow_variant", None)
-        or "quality"
-    ).strip().lower()
+    variant_name = str(variant or getattr(args, "otflow_variant", None) or "quality").strip().lower()
     preset = get_otflow_dataset_preset(str(dataset), variant=variant_name)
     for key, value in preset.items():
         if not hasattr(args, key):
             continue
         if getattr(args, key) is None:
             setattr(args, key, value)
-    if hasattr(args, "otflow_variant") and getattr(args, "otflow_variant") is None:
-        setattr(args, "otflow_variant", variant_name)
+    if hasattr(args, "otflow_variant") and args.otflow_variant is None:
+        args.otflow_variant = variant_name
     return args
 
 

@@ -24,7 +24,6 @@ from genode.gico.train_gico import (
     train_gico,
 )
 
-
 SUPPORT_SCHEDULES = ("uniform", "late_p_2")
 VALID_REWARD_METADATA = {
     "gico_reward_protocol": GICO_PROTOCOL,
@@ -263,9 +262,7 @@ class GicoTrainOptionsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r"seen calibration NFEs \[4, 8, 12, 16\].*found \[5, 7\]"):
                 train_gico(_trainer_args(root, rows_csv, embeddings_npz))
 
-            summary = train_gico(
-                _trainer_args(root, rows_csv, embeddings_npz, "--seen_target_nfe_values", "5,7")
-            )
+            summary = train_gico(_trainer_args(root, rows_csv, embeddings_npz, "--seen_target_nfe_values", "5,7"))
 
         self.assertEqual(summary["status"], "dry_run")
         self.assertEqual(summary["seen_target_nfe_values"], [5, 7])
@@ -392,7 +389,9 @@ class GicoTrainOptionsTests(unittest.TestCase):
             root = Path(tmpdir)
             rows_csv = root / "seen.csv"
             embeddings_npz = root / "ctx.npz"
-            _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES, schedules=("uniform", "late_p_2", "flowts_power_0p03"))
+            _write_rows(
+                rows_csv, target_nfes=CANONICAL_SEEN_NFES, schedules=("uniform", "late_p_2", "flowts_power_0p03")
+            )
             _write_embeddings(embeddings_npz)
 
             summary = train_gico(
@@ -407,8 +406,14 @@ class GicoTrainOptionsTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(summary["teacher_selection_nominal_axis_weights"], {"context": 0.25, "density_family": 0.25, "unseen_nfe": 0.5})
-        self.assertEqual(summary["teacher_selection_effective_axis_weights"], {"context": 0.5, "density_family": 0.5, "unseen_nfe": 0.0})
+        self.assertEqual(
+            summary["teacher_selection_nominal_axis_weights"],
+            {"context": 0.25, "density_family": 0.25, "unseen_nfe": 0.5},
+        )
+        self.assertEqual(
+            summary["teacher_selection_effective_axis_weights"],
+            {"context": 0.5, "density_family": 0.5, "unseen_nfe": 0.0},
+        )
         self.assertEqual(summary["teacher_selection_inactive_axes"], ["unseen_nfe"])
         scopes = summary["normalizer_fit_scopes"]
         self.assertEqual(scopes["protocol"], "selector_final_normalizer_scopes_v1")
@@ -470,21 +475,24 @@ class GicoTrainOptionsTests(unittest.TestCase):
             ({"reward_metric_weights_json": ""}, "missing reward_metric_weights_json"),
             ({"reward_metric_weights_json": "{bad-json"}, "invalid reward_metric_weights_json"),
             (
-                {"reward_metric_weights_json": json.dumps({"u_alt_uniform": 1.0}, separators=(",", ":"), sort_keys=True)},
+                {
+                    "reward_metric_weights_json": json.dumps(
+                        {"u_alt_uniform": 1.0}, separators=(",", ":"), sort_keys=True
+                    )
+                },
                 r"missing=\['u_comp_uniform'\].*unexpected=\['u_alt_uniform'\]",
             ),
         ]
         for overrides, pattern in cases:
-            with self.subTest(overrides=overrides):
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    root = Path(tmpdir)
-                    rows_csv = root / "seen.csv"
-                    embeddings_npz = root / "ctx.npz"
-                    _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES, row_overrides=overrides)
-                    _write_embeddings(embeddings_npz)
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                rows_csv = root / "seen.csv"
+                embeddings_npz = root / "ctx.npz"
+                _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES, row_overrides=overrides)
+                _write_embeddings(embeddings_npz)
 
-                    with self.assertRaisesRegex(ValueError, pattern):
-                        train_gico(_trainer_args(root, rows_csv, embeddings_npz))
+                with self.assertRaisesRegex(ValueError, pattern):
+                    train_gico(_trainer_args(root, rows_csv, embeddings_npz))
 
     def test_train_gico_rejects_invalid_generated_train_tuning_provenance(self) -> None:
         cases = [
@@ -496,16 +504,15 @@ class GicoTrainOptionsTests(unittest.TestCase):
             ),
         ]
         for overrides, pattern in cases:
-            with self.subTest(overrides=overrides):
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    root = Path(tmpdir)
-                    rows_csv = root / "seen.csv"
-                    embeddings_npz = root / "ctx.npz"
-                    _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES, row_overrides=overrides)
-                    _write_embeddings(embeddings_npz)
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                rows_csv = root / "seen.csv"
+                embeddings_npz = root / "ctx.npz"
+                _write_rows(rows_csv, target_nfes=CANONICAL_SEEN_NFES, row_overrides=overrides)
+                _write_embeddings(embeddings_npz)
 
-                    with self.assertRaisesRegex(ValueError, pattern):
-                        train_gico(_trainer_args(root, rows_csv, embeddings_npz))
+                with self.assertRaisesRegex(ValueError, pattern):
+                    train_gico(_trainer_args(root, rows_csv, embeddings_npz))
 
     def test_train_gico_rejects_context_sample_count_above_canonical_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -558,19 +565,21 @@ class GicoTrainOptionsTests(unittest.TestCase):
                             )
             _write_embeddings(embeddings_npz)
 
-            with mock.patch("genode.gico.train_gico.train_gico_teacher") as teacher_train:
-                with self.assertRaisesRegex(ValueError, "rank_pair_preflight.*rankable_pair_count=0"):
-                    train_gico(
-                        _trainer_args(
-                            root,
-                            rows_csv,
-                            embeddings_npz,
-                            "--seen_target_nfe_values",
-                            "5,7",
-                            "--context_holdout_fraction",
-                            "0",
-                        )
+            with (
+                mock.patch("genode.gico.train_gico.train_gico_teacher") as teacher_train,
+                self.assertRaisesRegex(ValueError, "rank_pair_preflight.*rankable_pair_count=0"),
+            ):
+                train_gico(
+                    _trainer_args(
+                        root,
+                        rows_csv,
+                        embeddings_npz,
+                        "--seen_target_nfe_values",
+                        "5,7",
+                        "--context_holdout_fraction",
+                        "0",
                     )
+                )
 
         teacher_train.assert_not_called()
 

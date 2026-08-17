@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import hashlib
 import json
-import shutil
 import zipfile
 from pathlib import Path
 
@@ -20,42 +18,19 @@ from genode.deterministic_archive import (
     sha256_file,
     validate_deterministic_zip,
 )
-from genode.release_bundles import (
-    FROZEN_GICO_CLOCK_MIXTURE_POLICY_SCHEMA,
-    NamedCheckpoint,
-    package_backbone_manifest_checkpoints,
-    package_frozen_gico_clock_mixture_policy,
-    package_frozen_gico_policy,
-    package_named_checkpoints,
-)
-from genode.gico.image_clock_mixture import build_image_gico_clock_library
-from genode.gico.image_clock_mixture_artifacts import (
-    load_image_gico_clock_mixture_artifact,
-    save_image_gico_clock_mixture_artifact,
-)
-from genode.gico.image_clock_mixture_training import (
-    ImageGICOClockMixtureTrainingConfig,
-    train_image_gico_clock_mixture,
-)
 from genode.gico.image_conditional import (
     ImageGICOBackboneContextDensityModel,
     ImageGICOBackboneContextModelConfig,
-    build_image_gico_feature_groups,
-)
-from genode.gico.image_conditional_artifacts import (
-    load_image_gico_conditional_artifact,
-    save_image_gico_conditional_artifact,
-)
-from genode.gico.image_conditional_context import (
-    prepare_image_gico_backbone_context,
 )
 from genode.gico.image_conditional_training import (
     ImageGICOBackboneContextTeacher,
-    ImageGICOBackboneContextTrainingConfig,
-    ImageGICOBackboneContextTrainingResult,
 )
-from tests.test_image_clock_mixture import _targets
-from tests.test_image_primary_runtime import _frozen_imagenet_backbone
+from genode.release_bundles import (
+    NamedCheckpoint,
+    package_backbone_manifest_checkpoints,
+    package_frozen_gico_policy,
+    package_named_checkpoints,
+)
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -391,99 +366,6 @@ def _rewrite_policy_state(policy: Path, *, label: str, state: dict[str, torch.Te
     _resign_policy_manifest(policy, manifest)
 
 
-@pytest.fixture(scope="module")
-def _clock_policy_template(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> tuple[Path, Path]:
-    root = tmp_path_factory.mktemp("release-clock-policy")
-    backbone = _frozen_imagenet_backbone(digest="5" * 64, offset=0.125)
-    prepared = prepare_image_gico_backbone_context(backbone)
-    feature_protocol_sha256 = "image-feature-protocol:" + "6" * 64
-    feature_groups = build_image_gico_feature_groups(
-        np.random.default_rng(4).normal(size=(1_000, 64)),
-        source_panel_fingerprint="panel:" + "1" * 64,
-        feature_protocol_sha256=feature_protocol_sha256,
-        real_feature_panel_sha256="real:" + "3" * 64,
-    )
-    targets = replace(
-        _targets(),
-        feature_group_sha256=feature_groups.sha256,
-        feature_protocol_sha256=feature_protocol_sha256,
-        backbone_model_key=backbone.manifest.model_key,
-        backbone_protocol_sha256=backbone.manifest.protocol_sha256,
-        backbone_checkpoint_sha256=backbone.manifest.checkpoint.sha256,
-    )
-    library = build_image_gico_clock_library(targets)
-    torch.manual_seed(11)
-    source_model = ImageGICOBackboneContextDensityModel(
-        ImageGICOBackboneContextModelConfig(density_bin_count=64),
-        prepared.normalized_context_table,
-    )
-    source_model.eval()
-    source_model.requires_grad_(False)
-    source_teacher = ImageGICOBackboneContextTeacher(density_bin_count=64)
-    source_teacher.eval()
-    source_teacher.requires_grad_(False)
-    source_result = ImageGICOBackboneContextTrainingResult(
-        model=source_model,
-        teacher=source_teacher,
-        config=ImageGICOBackboneContextTrainingConfig(
-            teacher_steps=1,
-            student_steps=1,
-            teacher_batch_size=8,
-        ),
-        context_binding_sha256=prepared.binding.binding_sha256,
-        target_sha256=targets.sha256,
-        feature_group_sha256=feature_groups.sha256,
-        final_kl=0.1,
-        final_residual_penalty=0.0,
-        final_teacher_score=0.0,
-        final_objective=0.1,
-        conditional_density_range=0.1,
-        teacher_schedule_fold_diagnostics=tuple(
-            {"fold": index} for index in range(len(targets.schedule_keys))
-        ),
-        teacher_oof_rmse=0.0,
-        teacher_oof_pairwise_accuracy=1.0,
-    )
-    policy = root / "policy"
-    save_image_gico_conditional_artifact(
-        policy,
-        source_result,
-        feature_groups,
-        targets,
-        prepared,
-    )
-    loaded_source = load_image_gico_conditional_artifact(policy)
-    bound_source = loaded_source.bind(backbone)
-    decoder_result = train_image_gico_clock_mixture(
-        targets,
-        library=library,
-        normalized_context_table=prepared.normalized_context_table,
-        context_binding_sha256=prepared.binding.binding_sha256,
-        config=ImageGICOClockMixtureTrainingConfig(steps=1, seed=19),
-    )
-    decoder = root / "decoder"
-    save_image_gico_clock_mixture_artifact(
-        decoder,
-        decoder_result,
-        source_artifact=bound_source,
-    )
-    return policy, decoder
-
-
-def _copy_clock_policy_template(
-    template: tuple[Path, Path],
-    destination: Path,
-) -> tuple[Path, Path]:
-    source_policy, source_decoder = template
-    policy = destination / "policy"
-    decoder = destination / "decoder"
-    shutil.copytree(source_policy, policy)
-    shutil.copytree(source_decoder, decoder)
-    return policy, decoder
-
-
 def test_checkpoint_collection_contains_only_checkpoints_and_support_files(tmp_path: Path) -> None:
     model = tmp_path / "outputs" / "matrix" / "model.pt"
     metadata = model.with_name("checkpoint_metadata.json")
@@ -530,7 +412,9 @@ def test_checkpoint_collection_contains_only_checkpoints_and_support_files(tmp_p
         assert str(tmp_path) not in archive_manifest
 
 
-def test_release_validation_cli_exits_nonzero_for_invalid_archive(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_release_validation_cli_exits_nonzero_for_invalid_archive(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     archive = tmp_path / "invalid.zip"
     archive.write_bytes(b"not-a-zip")
 
@@ -774,252 +658,3 @@ def test_frozen_gico_policy_recomputes_density_table_digest(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="density-table digest differs"):
         package_frozen_gico_policy(policy_dir=policy, output_path=tmp_path / "forged.zip")
-
-
-def test_frozen_gico_clock_mixture_policy_is_reproducible_bound_and_complete(
-    tmp_path: Path,
-    _clock_policy_template: tuple[Path, Path],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    policy, decoder = _copy_clock_policy_template(_clock_policy_template, tmp_path)
-    first = tmp_path / "clock-policy-first.zip"
-    second = tmp_path / "clock-policy-second.zip"
-    validation_cache: list[object] = []
-    source_cache: list[object] = []
-    decoder_cache: list[object] = []
-    original_validation = release_bundle_module._validated_frozen_policy_source
-    original_source_loader = release_bundle_module.load_image_gico_conditional_artifact
-    original_decoder_loader = release_bundle_module.load_image_gico_clock_mixture_artifact
-
-    def recording_validation(root: Path) -> object:
-        result = original_validation(root)
-        validation_cache.append(result)
-        return result
-
-    def recording_source_loader(root: Path) -> object:
-        result = original_source_loader(root)
-        source_cache.append(result)
-        return result
-
-    def recording_decoder_loader(
-        root: Path,
-        *,
-        source_artifact: object,
-    ) -> object:
-        result = original_decoder_loader(root, source_artifact=source_artifact)
-        decoder_cache.append(result)
-        return result
-
-    monkeypatch.setattr(
-        release_bundle_module,
-        "_validated_frozen_policy_source",
-        recording_validation,
-    )
-    monkeypatch.setattr(
-        release_bundle_module,
-        "load_image_gico_conditional_artifact",
-        recording_source_loader,
-    )
-    monkeypatch.setattr(
-        release_bundle_module,
-        "load_image_gico_clock_mixture_artifact",
-        recording_decoder_loader,
-    )
-    package_frozen_gico_clock_mixture_policy(
-        policy_dir=policy,
-        decoder_dir=decoder,
-        output_path=first,
-    )
-    assert len(validation_cache) == len(source_cache) == len(decoder_cache) == 1
-    monkeypatch.setattr(
-        release_bundle_module,
-        "_validated_frozen_policy_source",
-        lambda _root: validation_cache[0],
-    )
-    monkeypatch.setattr(
-        release_bundle_module,
-        "load_image_gico_conditional_artifact",
-        lambda _root: source_cache[0],
-    )
-    monkeypatch.setattr(
-        release_bundle_module,
-        "load_image_gico_clock_mixture_artifact",
-        lambda _root, *, source_artifact: decoder_cache[0],
-    )
-    package_frozen_gico_clock_mixture_policy(
-        policy_dir=policy,
-        decoder_dir=decoder,
-        output_path=second,
-    )
-
-    assert first.read_bytes() == second.read_bytes()
-    assert validate_deterministic_zip(first)["status"] == "complete"
-    source_manifest = json.loads((policy / "manifest.json").read_text(encoding="utf-8"))
-    decoder_manifest = json.loads((decoder / "manifest.json").read_text(encoding="utf-8"))
-    expected_names = {
-        ARCHIVE_MANIFEST_NAME,
-        "policy/class-density-table.npy",
-        "policy/context-normalizer-mean.npy",
-        "policy/context-normalizer-scale.npy",
-        "policy/student-state.pt",
-        "policy/teacher-state.pt",
-        "policy/manifest.json",
-        "policy/conditional-targets.json",
-        "policy/reward-feature-groups.json",
-        "decoder/manifest.json",
-        "decoder/clock-mixture-state.pt",
-        "decoder/clock-library.json",
-        "decoder/complete-clocks-nfe-2.npy",
-        "decoder/complete-clocks-nfe-4.npy",
-        "decoder/complete-clocks-nfe-8.npy",
-    }
-    with zipfile.ZipFile(first) as bundle:
-        assert set(bundle.namelist()) == expected_names
-        manifest = json.loads(bundle.read(ARCHIVE_MANIFEST_NAME))
-        assert manifest["bundle_kind"] == "frozen_gico_clock_mixture_policy"
-        metadata = manifest["metadata"]
-        assert metadata["policy_schema_version"] == FROZEN_GICO_CLOCK_MIXTURE_POLICY_SCHEMA
-        assert metadata["source_policy"]["artifact_sha256"] == source_manifest["artifact_sha256"]
-        assert metadata["clock_mixture"]["artifact_sha256"] == decoder_manifest["artifact_sha256"]
-        assert metadata["clock_mixture"]["clock_library_sha256"] == decoder_manifest[
-            "clock_library_sha256"
-        ]
-        assert metadata["clock_mixture"]["execution_model_state_sha256"] == decoder_manifest[
-            "model_state_sha256"
-        ]
-        assert metadata["clock_mixture"]["serialized_model_state_sha256"] == decoder_manifest[
-            "serialized_model_state_sha256"
-        ]
-        assert metadata["inference_contract"]["internal_rng"] is False
-        assert metadata["inference_contract"]["target_nfes"] == [2, 4, 8]
-        assert {record["role"] for record in manifest["files"]} == {
-            "context_mean",
-            "context_scale",
-            "density_table",
-            "student_state",
-            "teacher_state",
-            "clock_mixture_manifest",
-            "clock_mixture_state",
-            "clock_library",
-            "clock_grid_nfe_2",
-            "clock_grid_nfe_4",
-            "clock_grid_nfe_8",
-            "source_policy_manifest",
-            "conditional_targets",
-            "reward_feature_groups",
-        }
-        extracted = tmp_path / "extracted"
-        bundle.extractall(extracted)
-    extracted_source = load_image_gico_conditional_artifact(extracted / "policy")
-    extracted_decoder = load_image_gico_clock_mixture_artifact(
-        extracted / "decoder",
-        source_artifact=extracted_source,
-    )
-    assert extracted_source.artifact_sha256 == source_manifest["artifact_sha256"]
-    assert extracted_decoder.artifact_sha256 == decoder_manifest["artifact_sha256"]
-
-
-@pytest.mark.parametrize("mutation", ["missing_decoder_grid", "tampered_decoder_state"])
-def test_frozen_gico_clock_mixture_policy_rejects_missing_or_tampered_inputs(
-    tmp_path: Path,
-    _clock_policy_template: tuple[Path, Path],
-    mutation: str,
-) -> None:
-    policy, decoder = _copy_clock_policy_template(_clock_policy_template, tmp_path)
-    if mutation == "missing_decoder_grid":
-        (decoder / "complete-clocks-nfe-8.npy").unlink()
-    elif mutation == "tampered_decoder_state":
-        state_path = decoder / "clock-mixture-state.pt"
-        state = torch.load(state_path, map_location="cpu", weights_only=True)
-        name = next(key for key, value in state.items() if value.is_floating_point() and value.numel())
-        state[name] = state[name].clone()
-        state[name].reshape(-1)[0] += 0.125
-        torch.save(state, state_path)
-        manifest_path = decoder / "manifest.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["files"]["model_state"] = {
-            "filename": state_path.name,
-            "sha256": sha256_file(state_path),
-            "size_bytes": state_path.stat().st_size,
-        }
-        manifest_body = dict(manifest)
-        manifest_body.pop("artifact_sha256")
-        manifest["artifact_sha256"] = semantic_sha256(
-            manifest_body,
-            namespace="image-gico-complete-clock-mixture-artifact-v1",
-        )
-        _write_canonical_json(manifest_path, manifest)
-    with pytest.raises(ValueError, match="incomplete|inconsistent|does not match|missing|partial"):
-        package_frozen_gico_clock_mixture_policy(
-            policy_dir=policy,
-            decoder_dir=decoder,
-            output_path=tmp_path / "invalid.zip",
-        )
-
-
-def test_gico_clock_policy_cli_uses_the_strict_packager(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    policy = tmp_path / "policy"
-    decoder = tmp_path / "decoder"
-    archive = tmp_path / "cli-clock-policy.zip"
-    observed: dict[str, object] = {}
-
-    def fake_packager(**kwargs: object) -> dict[str, object]:
-        observed.update(kwargs)
-        return {"bundle_kind": "frozen_gico_clock_mixture_policy"}
-
-    monkeypatch.setattr(
-        release_bundle_module,
-        "package_frozen_gico_clock_mixture_policy",
-        fake_packager,
-    )
-    release_bundle_module.main(
-        [
-            "gico-clock-policy",
-            "--policy-dir",
-            str(policy),
-            "--decoder-dir",
-            str(decoder),
-            "--output",
-            str(archive),
-        ]
-    )
-    result = json.loads(capsys.readouterr().out)
-    assert result == {"bundle_kind": "frozen_gico_clock_mixture_policy"}
-    assert observed == {
-        "policy_dir": str(policy),
-        "decoder_dir": str(decoder),
-        "output_path": str(archive),
-        "overwrite": False,
-    }
-
-
-def test_clock_mixture_packager_explicitly_requires_current_v4_source_policy(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    policy = tmp_path / "historical-policy"
-    decoder = tmp_path / "decoder"
-    policy.mkdir()
-    decoder.mkdir()
-    for filename in release_bundle_module._ARCHIVED_CLOCK_MIXTURE_FILES:
-        (decoder / filename).write_bytes(b"placeholder")
-    monkeypatch.setattr(
-        release_bundle_module,
-        "_validated_frozen_policy_source",
-        lambda _root: (
-            [],
-            {},
-            {"protocol": "image_gico_backbone_context_policy_bundle_v3"},
-        ),
-    )
-
-    with pytest.raises(ValueError, match="current v4.*gico-policy"):
-        package_frozen_gico_clock_mixture_policy(
-            policy_dir=policy,
-            decoder_dir=decoder,
-            output_path=tmp_path / "unsupported.zip",
-        )
