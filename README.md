@@ -6,20 +6,6 @@ and the solver budget to predict a continuous density over integration time.
 Integrating and inverting that density produces a strictly increasing time grid
 while the generative backbone remains frozen.
 
-```mermaid
-flowchart LR
-  A["Frozen backbone context + NFE budget"] --> B["GICO density policy"]
-  B --> C["Monotone cumulative clock"]
-  C --> D["Strictly increasing time grid"]
-  D --> E["Frozen ODE / flow solver"]
-```
-
-Version 0.5.0 is a code-only publication. It includes reference clocks,
-teacher/student training, strict artifact validation, locked-test reporting,
-and deterministic release archives. Trained weights, measured results,
-checkpoints, datasets, generated outputs, and cluster configuration are not
-distributed.
-
 ## Installation
 
 GenODE requires Python 3.11 or newer. Install the package and its command-line
