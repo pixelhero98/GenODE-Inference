@@ -380,7 +380,7 @@ class BackboneMatrixTests(unittest.TestCase):
             def _write_imported_artifact(benchmark_family: str, dataset_key: str, train_steps: int) -> None:
                 artifact_dir = imported_root / benchmark_family / dataset_key / f"{train_steps // 1000}k"
                 artifact_dir.mkdir(parents=True, exist_ok=True)
-                (artifact_dir / "model.pt").write_bytes(f"{dataset_key}-{train_steps}".encode("utf-8"))
+                (artifact_dir / "model.pt").write_bytes(f"{dataset_key}-{train_steps}".encode())
                 metadata = _checkpoint_metadata(benchmark_family, dataset_key, train_steps)
                 (artifact_dir / "checkpoint_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
                 (artifact_dir / "artifact_summary.json").write_text(json.dumps(metadata), encoding="utf-8")

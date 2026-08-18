@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -83,7 +82,7 @@ class AdaLN(nn.Module):
 
 
 def compute_rope_freqs(
-    seq_len: int, dim: int, base: float = 10000.0, device: Optional[torch.device] = None
+    seq_len: int, dim: int, base: float = 10000.0, device: torch.device | None = None
 ) -> torch.Tensor:
     inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
     t = torch.arange(seq_len, device=device).float()
@@ -148,7 +147,7 @@ class TransformerFUBlock(nn.Module):
         x: torch.Tensor,
         ctx_tokens: torch.Tensor,
         adaln_cond: torch.Tensor,
-        freqs: Optional[torch.Tensor] = None,
+        freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         h = self.adaln_sa(x, adaln_cond)
         if freqs is None:
@@ -204,8 +203,8 @@ class TransformerFUNet(nn.Module):
 class EMAModel:
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.decay = decay
-        self.shadow: Dict[str, torch.Tensor] = {}
-        self.backup: Dict[str, torch.Tensor] = {}
+        self.shadow: dict[str, torch.Tensor] = {}
+        self.backup: dict[str, torch.Tensor] = {}
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()

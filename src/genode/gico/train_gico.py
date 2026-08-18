@@ -5,7 +5,8 @@ import contextlib
 import hashlib
 import json
 import math
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -109,12 +110,12 @@ from genode.schedule_transfer.reference_clocks import (
 from genode.solver_protocol import normalize_solver_key
 
 CANONICAL_DENSITY_BIN_COUNT = 64
-CANONICAL_TEACHER_SELECTION_COMPONENT_WEIGHTS: Dict[str, float] = {
+CANONICAL_TEACHER_SELECTION_COMPONENT_WEIGHTS: dict[str, float] = {
     "context": 0.25,
     "density_family": 0.25,
     "unseen_nfe": 0.50,
 }
-TEACHER_SELECTION_AXIS_ORDER: Tuple[str, ...] = ("context", "density_family", "unseen_nfe")
+TEACHER_SELECTION_AXIS_ORDER: tuple[str, ...] = ("context", "density_family", "unseen_nfe")
 GICO_PREPROCESSING_PROTOCOL = "selector_final_normalizer_scopes_v1"
 GICO_TEACHER_TARGET_COVERAGE_PROTOCOL = "strict_per_metric_finite_coverage_v1"
 GICO_TEACHER_SELECTION_WEIGHT_PROTOCOL = "nominal_effective_axis_weights_v1"
@@ -125,30 +126,30 @@ CANONICAL_TRAIN_TUNING_FRACTION = 0.20
 CANONICAL_REWARD_UTILITY_TRANSFORM = "directional_log_uniform_anchor"
 
 
-def _parse_csv(text: str) -> List[str]:
+def _parse_csv(text: str) -> list[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
-def _read_metric_rows_csvs(paths_text: str) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+def _read_metric_rows_csvs(paths_text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     for path_text in _parse_csv(str(paths_text)):
         rows.extend(read_metric_rows_csv(resolve_project_path(path_text)))
     return rows
 
 
-def _load_context_embedding_tables(paths_text: str) -> Dict[str, np.ndarray]:
-    merged: Dict[str, np.ndarray] = {}
+def _load_context_embedding_tables(paths_text: str) -> dict[str, np.ndarray]:
+    merged: dict[str, np.ndarray] = {}
     for path_text in _parse_csv(str(paths_text)):
         table = load_context_embedding_table(resolve_project_path(path_text))
         _merge_embedding_tables_guarded(merged, table, label="context_embeddings")
     return merged
 
 
-def _artifact_input_summary(paths_text: str) -> List[Dict[str, Any]]:
-    summary: List[Dict[str, Any]] = []
+def _artifact_input_summary(paths_text: str) -> list[dict[str, Any]]:
+    summary: list[dict[str, Any]] = []
     for path_text in _parse_csv(str(paths_text)):
         path = resolve_project_path(path_text)
-        item: Dict[str, Any] = {
+        item: dict[str, Any] = {
             "name": path.name,
             "logical_path": path.name,
             "exists": bool(path.exists()),
@@ -165,17 +166,17 @@ def _artifact_input_summary(paths_text: str) -> List[Dict[str, Any]]:
     return summary
 
 
-def _parse_int_csv(text: str) -> List[int]:
+def _parse_int_csv(text: str) -> list[int]:
     return [int(part) for part in _parse_csv(text)]
 
 
-def _parse_int_csv_or_default(text: Any, default: Sequence[int]) -> List[int]:
+def _parse_int_csv_or_default(text: Any, default: Sequence[int]) -> list[int]:
     parsed = _parse_int_csv(str(text))
     return parsed if parsed else [int(value) for value in default]
 
 
-def _parse_float_mapping(text: str) -> Dict[str, float]:
-    out: Dict[str, float] = {}
+def _parse_float_mapping(text: str) -> dict[str, float]:
+    out: dict[str, float] = {}
     for part in _parse_csv(text):
         if "=" not in part:
             raise ValueError("teacher_utility_weights entries must be name=value pairs.")
@@ -187,7 +188,7 @@ def _parse_float_mapping(text: str) -> Dict[str, float]:
     return out
 
 
-def _rows_for_target_nfes(rows: Sequence[Mapping[str, Any]], target_nfes: Sequence[int]) -> List[Dict[str, Any]]:
+def _rows_for_target_nfes(rows: Sequence[Mapping[str, Any]], target_nfes: Sequence[int]) -> list[dict[str, Any]]:
     allowed = {int(value) for value in target_nfes}
     return [dict(row) for row in rows if int(row["target_nfe"]) in allowed]
 
@@ -247,7 +248,7 @@ def _infer_single_dataset_key(rows: Sequence[Mapping[str, Any]]) -> str:
     return next(iter(datasets)) if datasets else ""
 
 
-def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
+def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
     raw = str(args.teacher_metric_target_keys).strip()
     if not raw or raw.lower() == "auto":
         dataset_key = _infer_single_dataset_key(rows)
@@ -277,7 +278,7 @@ def _rows_have_forecast_metrics(rows: Sequence[Mapping[str, Any]]) -> bool:
     )
 
 
-def _missing_target_value_keys(rows: Sequence[Mapping[str, Any]], target_keys: Sequence[str]) -> List[str]:
+def _missing_target_value_keys(rows: Sequence[Mapping[str, Any]], target_keys: Sequence[str]) -> list[str]:
     return sorted({key for key in target_keys if all(not _has_nonempty_value(row, key) for row in rows)})
 
 
@@ -294,14 +295,14 @@ def _needs_forecast_uniform_rewards(rows: Sequence[Mapping[str, Any]], target_ke
 
 def _rows_without_schedule_keys(
     rows: Sequence[Mapping[str, Any]], schedule_keys: Sequence[str]
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     excluded = {str(value) for value in schedule_keys}
     return [dict(row) for row in rows if str(row["scheduler_key"]) not in excluded]
 
 
-def _history_by_step(training_summary: Mapping[str, Any]) -> Dict[int, Dict[str, Any]]:
+def _history_by_step(training_summary: Mapping[str, Any]) -> dict[int, dict[str, Any]]:
     selection = dict(training_summary.get("teacher_checkpoint_selection", {}))
-    out: Dict[int, Dict[str, Any]] = {}
+    out: dict[int, dict[str, Any]] = {}
     for entry in list(selection.get("history", []) or []):
         if not bool(entry.get("selection_constraints_passed", True)):
             continue
@@ -314,7 +315,7 @@ def _select_weighted_normalized_regret_step(
     context_density_training: Mapping[str, Any],
     unseen_nfe_training: Mapping[str, Any],
     component_weights: Mapping[str, float],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     context_history = _history_by_step(context_density_training)
     unseen_history = _history_by_step(unseen_nfe_training)
     common_steps = sorted(set(context_history) & set(unseen_history))
@@ -325,7 +326,7 @@ def _select_weighted_normalized_regret_step(
         "density_family_holdout",
         "unseen_nfe_holdout",
     )
-    combined_history: List[Dict[str, Any]] = []
+    combined_history: list[dict[str, Any]] = []
     for step in common_steps:
         context_diagnostics = dict(context_history[step].get("diagnostics", {}) or {})
         unseen_diagnostics = dict(unseen_history[step].get("diagnostics", {}) or {})
@@ -368,7 +369,7 @@ def _select_context_density_regret_step(
     *,
     context_density_training: Mapping[str, Any],
     component_weights: Mapping[str, float],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     context_history = _history_by_step(context_density_training)
     if not context_history:
         raise ValueError("Context/density checkpoint selection found no eligible checkpoint steps.")
@@ -408,7 +409,7 @@ def _observed_support(
     rows: Sequence[Mapping[str, Any]],
     *,
     extra_late_p_values: str | Sequence[float | int | str] = (),
-) -> Tuple[str, ...]:
+) -> tuple[str, ...]:
     observed = tuple(sorted({str(row["scheduler_key"]) for row in rows}))
     canonical_order = tuple(key for key in reference_clock_keys(extra_late_p_values) if key in observed)
     extras = tuple(key for key in observed if key not in canonical_order)
@@ -424,7 +425,7 @@ def _checkpoint_scope_from_row(row: Mapping[str, Any]) -> str:
     return checkpoint_scope_from_row(row, empty_label="unscoped")
 
 
-def _checkpoint_context_key(row: Mapping[str, Any]) -> Tuple[str, str]:
+def _checkpoint_context_key(row: Mapping[str, Any]) -> tuple[str, str]:
     return (_checkpoint_scope_from_row(row), context_id_from_row(row))
 
 
@@ -448,7 +449,7 @@ def _row_membership_key(row: Mapping[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
-def _split_membership_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+def _split_membership_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     context_ids = sorted({context_id_from_row(row) for row in rows})
     checkpoint_scopes = sorted({_checkpoint_scope_from_row(row) for row in rows})
     series_keys = sorted({series_key_from_row(row) for row in rows})
@@ -468,7 +469,7 @@ def _split_membership_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, An
     }
 
 
-def _normalizer_fit_scope_summary(scope: str, rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+def _normalizer_fit_scope_summary(scope: str, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     context_ids = sorted({context_id_from_row(row) for row in rows})
     embedding_ids = sorted(_embedding_ids(rows))
     series_keys = sorted({series_key_from_row(row) for row in rows})
@@ -490,7 +491,7 @@ def _normalizer_fit_scope_summary(scope: str, rows: Sequence[Mapping[str, Any]])
     }
 
 
-def _split_counts(rows: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+def _split_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     from genode.gico.policy import series_key_from_row
 
     return {
@@ -519,10 +520,10 @@ def _teacher_metric_coverage_summary(
     target_keys: Sequence[str],
     *,
     scope: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     row_count = int(len(rows))
     raw_coverage = teacher_metric_target_coverage(rows, target_keys)
-    metrics: Dict[str, Dict[str, Any]] = {}
+    metrics: dict[str, dict[str, Any]] = {}
     for key, item in raw_coverage.items():
         valid_count = int(item["valid_count"])
         metrics[str(key)] = {
@@ -556,7 +557,7 @@ def _validate_teacher_metric_coverage(
     min_coverage_fraction: float,
     min_valid_rows: int,
 ) -> None:
-    failures: List[str] = []
+    failures: list[str] = []
     for key, item in dict(coverage.get("metrics", {}) or {}).items():
         valid_count = int(dict(item).get("valid_row_count", 0))
         fraction = float(dict(item).get("coverage_fraction", 0.0))
@@ -572,7 +573,7 @@ def _validate_teacher_metric_coverage(
         )
 
 
-def _normalized_teacher_selection_axis_weights(component_weights: Mapping[str, float]) -> Dict[str, float]:
+def _normalized_teacher_selection_axis_weights(component_weights: Mapping[str, float]) -> dict[str, float]:
     raw = {axis: max(0.0, float(component_weights.get(axis, 0.0))) for axis in TEACHER_SELECTION_AXIS_ORDER}
     total = float(sum(raw.values()))
     if total <= 0.0:
@@ -584,7 +585,7 @@ def _teacher_selection_weight_summary(
     component_weights: Mapping[str, float],
     *,
     active_axes: Sequence[str],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     nominal = _normalized_teacher_selection_axis_weights(component_weights)
     active_set = {str(axis) for axis in active_axes if str(axis) in set(TEACHER_SELECTION_AXIS_ORDER)}
     inactive_axes = [axis for axis in TEACHER_SELECTION_AXIS_ORDER if axis not in active_set]
@@ -609,7 +610,7 @@ def _validate_support_group_counts(rows: Sequence[Mapping[str, Any]], support_sc
     if "uniform" not in set(support_keys):
         raise ValueError("GICO supervision support must include the uniform reward anchor schedule.")
     support_set = set(support_keys)
-    grouped: Dict[Tuple[Any, ...], Dict[str, int]] = {}
+    grouped: dict[tuple[Any, ...], dict[str, int]] = {}
     for row in rows:
         schedule_key = str(row["scheduler_key"])
         if schedule_key not in support_set:
@@ -630,7 +631,7 @@ def _validate_support_group_counts(rows: Sequence[Mapping[str, Any]], support_sc
 
 
 def _validate_rank_pair_preflight(rank_pair_preflight: Mapping[str, Mapping[str, Any]]) -> None:
-    failures: List[str] = []
+    failures: list[str] = []
     for split_name, diagnostics in rank_pair_preflight.items():
         row_count = int(diagnostics.get("row_count", 0) or 0)
         rankable_pair_count = int(diagnostics.get("rankable_pair_count", 0) or 0)
@@ -652,7 +653,7 @@ def _validate_rank_pair_preflight(rank_pair_preflight: Mapping[str, Mapping[str,
 
 
 def _validate_unique_schedule_rows(rows: Sequence[Mapping[str, Any]], *, label: str) -> None:
-    counts: Dict[Tuple[Any, ...], int] = {}
+    counts: dict[tuple[Any, ...], int] = {}
     for row in rows:
         key = (*context_pair_key(row, pair_on_seed=True), str(row["scheduler_key"]))
         counts[key] = int(counts.get(key, 0)) + 1
@@ -667,8 +668,8 @@ def _validate_unique_schedule_rows(rows: Sequence[Mapping[str, Any]], *, label: 
 
 
 def _validate_context_embedding_checkpoint_scope(rows: Sequence[Mapping[str, Any]], *, label: str) -> None:
-    mismatches: List[str] = []
-    prefixed_context_ids: List[str] = []
+    mismatches: list[str] = []
+    prefixed_context_ids: list[str] = []
     for row in rows:
         checkpoint_id = str(row.get("checkpoint_id", "") or "").strip()
         if not checkpoint_id:
@@ -699,7 +700,7 @@ def _required_embedding_table(
     required_ids: set[str],
     *,
     label: str,
-) -> Dict[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     missing = sorted(required_ids - set(embeddings))
     if missing:
         raise KeyError(f"{label} context embeddings are missing contexts: {missing[:8]}")
@@ -715,11 +716,11 @@ def _sample_context_keys_by_checkpoint(
     *,
     sample_count: int,
     seed: int,
-) -> set[Tuple[str, str]]:
-    by_checkpoint: Dict[str, List[Mapping[str, Any]]] = {}
+) -> set[tuple[str, str]]:
+    by_checkpoint: dict[str, list[Mapping[str, Any]]] = {}
     for row in rows:
         by_checkpoint.setdefault(_checkpoint_id_from_row(row), []).append(row)
-    selected: set[Tuple[str, str]] = set()
+    selected: set[tuple[str, str]] = set()
     for checkpoint_idx, checkpoint_id in enumerate(sorted(by_checkpoint)):
         checkpoint_rows = by_checkpoint[checkpoint_id]
         per_checkpoint_count = min(
@@ -737,20 +738,20 @@ def _sample_context_keys_by_checkpoint(
 
 def _rows_for_context_keys(
     rows: Sequence[Mapping[str, Any]],
-    selected: set[Tuple[str, str]],
-) -> List[Dict[str, Any]]:
+    selected: set[tuple[str, str]],
+) -> list[dict[str, Any]]:
     return [dict(row) for row in rows if _checkpoint_context_key(row) in selected]
 
 
 def _context_sampling_summary(
     rows: Sequence[Mapping[str, Any]],
-    selected: set[Tuple[str, str]],
+    selected: set[tuple[str, str]],
     *,
     sample_count: int,
-) -> Dict[str, Any]:
-    per_checkpoint: Dict[str, Dict[str, int]] = {}
-    available_by_checkpoint: Dict[str, set[str]] = {}
-    selected_by_checkpoint: Dict[str, set[str]] = {}
+) -> dict[str, Any]:
+    per_checkpoint: dict[str, dict[str, int]] = {}
+    available_by_checkpoint: dict[str, set[str]] = {}
+    selected_by_checkpoint: dict[str, set[str]] = {}
     for row in rows:
         checkpoint_id = _checkpoint_id_from_row(row)
         available_by_checkpoint.setdefault(checkpoint_id, set()).add(context_id_from_row(row))
@@ -781,7 +782,7 @@ def _assert_embedding_overlap_compatible(
     atol: float = 1e-5,
 ) -> None:
     overlap = sorted(set(base) & set(extra))
-    bad: List[Tuple[str, float | None]] = []
+    bad: list[tuple[str, float | None]] = []
     for key in overlap:
         left = np.asarray(base[key], dtype=np.float32)
         right = np.asarray(extra[key], dtype=np.float32)
@@ -801,7 +802,7 @@ def _assert_embedding_overlap_compatible(
 
 
 def _merge_embedding_tables_guarded(
-    base: Dict[str, np.ndarray],
+    base: dict[str, np.ndarray],
     extra: Mapping[str, Sequence[float]],
     *,
     label: str,
@@ -952,7 +953,7 @@ def _validate_context_split_capacity(
     holdout_fraction: float,
     label: str,
     minimum_contexts: int = 3,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     context_ids = sorted({context_id_from_row(row) for row in rows})
     report = {
         "label": str(label),
@@ -1107,7 +1108,7 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
-def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
+def train_gico(args: argparse.Namespace) -> dict[str, Any]:
     _validate_positive_training_args(args)
     seed_all(int(args.seed))
     density_bin_count = CANONICAL_DENSITY_BIN_COUNT
@@ -1214,7 +1215,7 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
     teacher_metric_min_valid_rows = int(getattr(args, "teacher_metric_min_valid_rows", 1))
     if teacher_metric_min_valid_rows < 0:
         raise ValueError("teacher_metric_min_valid_rows must be nonnegative.")
-    teacher_metric_coverage_scopes: Dict[str, Any] = {}
+    teacher_metric_coverage_scopes: dict[str, Any] = {}
     if _needs_forecast_uniform_rewards(rows, teacher_metric_target_keys):
         rewarded_rows = attach_uniform_gico_rewards(
             rows,
@@ -1281,8 +1282,8 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             f"{seen_target_nfes}; "
             f"found {sampled_target_nfes}."
         )
-    unseen_selection_rows: List[Dict[str, Any]] = []
-    unseen_context_sampling: Dict[str, Any] = {}
+    unseen_selection_rows: list[dict[str, Any]] = []
+    unseen_context_sampling: dict[str, Any] = {}
     unseen_selection_target_nfes = _parse_int_csv(str(args.teacher_unseen_selection_target_nfe_values))
     if str(args.teacher_unseen_selection_rows_csv).strip():
         unseen_raw_rows = _read_metric_rows_csvs(str(args.teacher_unseen_selection_rows_csv))
@@ -1376,7 +1377,7 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
                 f"{list(support_keys)} is missing {missing_density_holdout_keys}. "
                 "Pass --teacher_density_holdout_schedule_keys with supported non-uniform keys or include the default rows."
             )
-        density_holdout_keys: List[str] = present_default_keys
+        density_holdout_keys: list[str] = present_default_keys
     elif missing_density_holdout_keys:
         raise ValueError(
             f"density-family holdout keys must be in support_schedule_keys; unsupported={missing_density_holdout_keys}."
@@ -1542,15 +1543,15 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
     student_target_elite_blend_all_weight = float(
         getattr(args, "student_target_elite_blend_all_weight", DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT)
     )
-    unseen_target_rows: List[Dict[str, Any]] = []
-    unseen_target_embeddings: Dict[str, Any] | None = None
-    unseen_target_schedule_grids: Dict[Tuple[str, str, int], Tuple[float, ...]] | None = None
+    unseen_target_rows: list[dict[str, Any]] = []
+    unseen_target_embeddings: dict[str, Any] | None = None
+    unseen_target_schedule_grids: dict[tuple[str, str, int], tuple[float, ...]] | None = None
     unseen_target_weight = float(args.student_unseen_target_weight)
     if not torch.isfinite(torch.tensor(unseen_target_weight, dtype=torch.float64)) or unseen_target_weight < 0.0:
         raise ValueError("student_unseen_target_weight must be finite and nonnegative.")
-    unseen_target_source_rows: List[Dict[str, Any]] = []
-    unseen_target_support_keys: Tuple[str, ...] = ()
-    unseen_target_context_sampling: Dict[str, Any] = {}
+    unseen_target_source_rows: list[dict[str, Any]] = []
+    unseen_target_support_keys: tuple[str, ...] = ()
+    unseen_target_context_sampling: dict[str, Any] = {}
     if str(args.student_unseen_target_rows_csv).strip():
         raw_unseen_target_rows = _read_metric_rows_csvs(str(args.student_unseen_target_rows_csv))
         if not raw_unseen_target_rows:
@@ -1648,7 +1649,7 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         else STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT
     )
     student_selector_fit_rows = [dict(row) for row in fit_rows]
-    student_selector_validation_rows: List[Dict[str, Any]] = []
+    student_selector_validation_rows: list[dict[str, Any]] = []
     if student_selection_mode == STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE:
         context_split_preflight["student_validation_holdout"] = _validate_context_split_capacity(
             fit_rows,
@@ -1673,7 +1674,7 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         "dropout": float(args.transformer_dropout),
     }
 
-    def _transformer_model_config_for(normalizer: DensityFeatureNormalizer) -> Dict[str, Any]:
+    def _transformer_model_config_for(normalizer: DensityFeatureNormalizer) -> dict[str, Any]:
         return {
             **base_transformer_model_config,
             "density_feature_mean": normalizer.mean.astype(float).tolist(),
@@ -1781,7 +1782,7 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
     teacher_model_config = teacher.model_config()
     student_model_config = student.model_config()
 
-    summary_base: Dict[str, Any] = {
+    summary_base: dict[str, Any] = {
         "artifact": "gico_training_summary",
         "protocol": GICO_PROTOCOL,
         "student_policy_type": "continuous_density",
@@ -1959,7 +1960,7 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         diagnostic_splits: Mapping[str, Sequence[Mapping[str, Any]]],
         diagnostic_candidate_schedule_keys: Mapping[str, Sequence[str]] | None = None,
         steps: int,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         if not pass_fit_rows:
             raise ValueError(f"{pass_name} teacher pass requires non-empty fit rows.")
         active_diagnostics = {name: [dict(row) for row in split] for name, split in diagnostic_splits.items() if split}
@@ -2010,7 +2011,7 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         },
         steps=int(args.teacher_steps),
     )
-    unseen_nfe_training: Dict[str, Any] = {}
+    unseen_nfe_training: dict[str, Any] = {}
     if unseen_nfe_diagnostic_rows:
         unseen_nfe_training = _train_teacher_pass(
             seed_offset=102,
@@ -2070,7 +2071,6 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         "teacher_checkpoint_selection": checkpoint_selection,
         "teacher_checkpoint_selection_mode": selection_mode,
         "teacher_final_retrain": final_retrain_metadata,
-        "final_teacher_retrain": final_retrain_metadata,
         "teacher_selection_passes": {
             "context_density": context_density_training,
             "unseen_nfe": unseen_nfe_training,
@@ -2084,7 +2084,7 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         steps: int,
         validation_rows: Sequence[Mapping[str, Any]] | None = None,
         final_retrain_mode: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         return train_gico_student(
             student_model,
             teacher,
@@ -2244,9 +2244,6 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             "student_unseen_target_distillation": summary_base["student_unseen_target_distillation"],
             "student_final_retrain": student_training.get("student_final_retrain", {}),
             "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
-            "final_teacher_retrain": teacher_training.get(
-                "final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})
-            ),
             "nfe_sequence_diagnostics": summary_base["nfe_sequence_diagnostics"],
             "locked_test_used_for_selection": False,
         },
@@ -2297,9 +2294,6 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
             "student_unseen_target_distillation": summary_base["student_unseen_target_distillation"],
             "student_final_retrain": student_training.get("student_final_retrain", {}),
             "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
-            "final_teacher_retrain": teacher_training.get(
-                "final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})
-            ),
             "nfe_sequence_diagnostics": summary_base["nfe_sequence_diagnostics"],
             "locked_test_used_for_selection": False,
         },
@@ -2339,9 +2333,6 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         "student_unseen_target_distillation": summary_base["student_unseen_target_distillation"],
         "student_final_retrain": student_training.get("student_final_retrain", {}),
         "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
-        "final_teacher_retrain": teacher_training.get(
-            "final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})
-        ),
     }
     policy_id = (
         "gico_"
@@ -2360,9 +2351,6 @@ def train_gico(args: argparse.Namespace) -> Dict[str, Any]:
         "student_checkpoint_selection": student_training.get("student_checkpoint_selection", {}),
         "student_final_retrain": student_training.get("student_final_retrain", {}),
         "teacher_final_retrain": teacher_training.get("teacher_final_retrain", {}),
-        "final_teacher_retrain": teacher_training.get(
-            "final_teacher_retrain", teacher_training.get("teacher_final_retrain", {})
-        ),
         "student_objective_settings": student_objective_settings,
         "student_target_summary": student_training.get("student_target_summary", {}),
         "student_training": student_training,

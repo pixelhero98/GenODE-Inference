@@ -5,9 +5,10 @@ import hashlib
 import json
 import subprocess
 import sys
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any
 
 from genode.backbone_packages import (
     apply_backbone_package_to_args,
@@ -103,15 +104,15 @@ SCHEDULE_ROW_SPLIT_PHASES = ("train_tuning", "locked_test")
 @dataclass(frozen=True)
 class StageCommand:
     stage: str
-    commands: List[List[str]]
+    commands: list[list[str]]
     manifest_name: str
 
 
-def _parse_csv(text: str) -> List[str]:
+def _parse_csv(text: str) -> list[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
-def _requested_schedule_keys(args: argparse.Namespace) -> List[str]:
+def _requested_schedule_keys(args: argparse.Namespace) -> list[str]:
     requested = _parse_csv(str(args.schedule_keys)) or list(CANONICAL_SUPERVISION_SCHEDULE_KEYS)
     extra_powers = parse_extra_late_p_values(str(getattr(args, "extra_late_p_values", "")))
     requested_set = set(requested)
@@ -128,12 +129,12 @@ def _resolved_scenario_key(args: argparse.Namespace) -> str:
     return str(getattr(args, "scenario_key", "") or getattr(args, "dataset", "") or "lobster_synthetic")
 
 
-def _parse_int_csv(text: str, default: Sequence[int]) -> List[int]:
+def _parse_int_csv(text: str, default: Sequence[int]) -> list[int]:
     raw = _parse_csv(text)
     return [int(part) for part in raw] if raw else [int(value) for value in default]
 
 
-def _effective_stage_names(args: argparse.Namespace) -> List[str]:
+def _effective_stage_names(args: argparse.Namespace) -> list[str]:
     requested = _parse_csv(str(args.stages))
     if requested:
         requested_set = set(requested)
@@ -171,8 +172,8 @@ def _display_run_root(run_root: Path) -> str:
     return display
 
 
-def _display_command(command: Sequence[str], *, run_root: Path | None = None) -> List[str]:
-    out: List[str] = []
+def _display_command(command: Sequence[str], *, run_root: Path | None = None) -> list[str]:
+    out: list[str] = []
     for token in command:
         text = str(token)
         path = Path(text).expanduser()
@@ -186,7 +187,7 @@ def _display_command(command: Sequence[str], *, run_root: Path | None = None) ->
     return out
 
 
-def _display_stage(entry: StageCommand, *, run_root: Path | None = None) -> Dict[str, Any]:
+def _display_stage(entry: StageCommand, *, run_root: Path | None = None) -> dict[str, Any]:
     return {
         "stage": entry.stage,
         "manifest_name": entry.manifest_name,
@@ -207,7 +208,7 @@ def _git_head_commit() -> str:
     return result.stdout.strip()
 
 
-def _teacher_target_args_for_scenario(dataset: str) -> List[str]:
+def _teacher_target_args_for_scenario(dataset: str) -> list[str]:
     specs = teacher_objective_specs_for_scenario(str(dataset))
     target_keys = [str(spec.utility_key) for spec in specs]
     weights = [f"{spec.utility_key}={float(spec.weight):g}" for spec in specs]
@@ -219,9 +220,9 @@ def _teacher_target_args_for_scenario(dataset: str) -> List[str]:
     ]
 
 
-def _student_objective_args(args: argparse.Namespace, override: GicoAblationArm | None = None) -> List[Any]:
+def _student_objective_args(args: argparse.Namespace, override: GicoAblationArm | None = None) -> list[Any]:
     source: Any = override if override is not None else args
-    values: List[Any] = [
+    values: list[Any] = [
         "--student_teacher_score_weight",
         float(source.student_teacher_score_weight),
         "--student_teacher_score_warmup_fraction",
@@ -242,7 +243,7 @@ def _student_objective_args(args: argparse.Namespace, override: GicoAblationArm 
     return values
 
 
-def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
+def _validate_inputs_preflight(args: argparse.Namespace) -> dict[str, Any]:
     dataset = _resolved_scenario_key(args)
     family = scenario_family_for_key(dataset)
     if int(args.synthetic_length) <= 0:
@@ -262,7 +263,7 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("--locked_test_eval_windows must be nonnegative.")
     effective_stages = set(_effective_stage_names(args))
     includes_backbone_training = "backbone_training" in effective_stages
-    provided_validation: Dict[str, Any] | None = None
+    provided_validation: dict[str, Any] | None = None
     if (
         bool(getattr(args, "use_provided_backbones", False))
         or str(getattr(args, "backbone_package_root", "") or "").strip()
@@ -320,7 +321,7 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> Dict[str, Any]:
     return report
 
 
-def _protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
+def _protocol_payload(args: argparse.Namespace) -> dict[str, Any]:
     dataset = _resolved_scenario_key(args)
     plan = experiment_plan_by_key().get(dataset)
     effective_stages = _effective_stage_names(args)
@@ -432,7 +433,7 @@ def _build_ablation_manifest(
     protocol_hash: str,
     status: str,
     extra: Mapping[str, Any] | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     dataset = _resolved_scenario_key(args)
     family = scenario_family_for_key(dataset)
     preset = str(getattr(args, "gico_ablation_preset", DEFAULT_GICO_ABLATION_PRESET))
@@ -479,7 +480,7 @@ def _status_path(run_root: Path) -> Path:
     return run_root / "status.json"
 
 
-def _load_existing_status(run_root: Path) -> Dict[str, Any]:
+def _load_existing_status(run_root: Path) -> dict[str, Any]:
     path = _status_path(run_root)
     if not path.exists():
         return {}
@@ -504,7 +505,7 @@ def _validate_run_root(run_root: Path, protocol_hash: str, *, resume: bool, over
     raise ValueError(f"Run root {run_root} already has status.json; pass --resume or --overwrite explicitly.")
 
 
-def _python_module_command(module: str, args: Iterable[str]) -> List[str]:
+def _python_module_command(module: str, args: Iterable[str]) -> list[str]:
     return [sys.executable, "-m", module, *[str(value) for value in args]]
 
 
@@ -513,7 +514,7 @@ def _command_hash(command: Sequence[str]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _command_module_args(command: Sequence[str], module: str) -> List[str] | None:
+def _command_module_args(command: Sequence[str], module: str) -> list[str] | None:
     parts = [str(part) for part in command]
     if module not in parts:
         return None
@@ -533,7 +534,7 @@ def _command_arg_value(command: Sequence[str], name: str) -> str:
     return parts[idx + 1]
 
 
-def _schedule_row_command_status(command: Sequence[str]) -> Dict[str, Any] | None:
+def _schedule_row_command_status(command: Sequence[str]) -> dict[str, Any] | None:
     runner_args = _command_module_args(command, "genode.evaluation.diffusion_flow_time_reparameterization")
     if runner_args is None:
         return None
@@ -543,7 +544,7 @@ def _schedule_row_command_status(command: Sequence[str]) -> Dict[str, Any] | Non
 
 def _command_json_output_exists(
     command: Sequence[str], *, module: str, out_arg: str, relative_path: str
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     if _command_module_args(command, module) is None:
         return True, ""
     out_dir = _command_arg_value(command, out_arg)
@@ -559,7 +560,7 @@ def _command_json_output_exists(
     return True, ""
 
 
-def _command_path_exists(command: Sequence[str], *, module: str, out_arg: str, relative_path: str) -> Tuple[bool, str]:
+def _command_path_exists(command: Sequence[str], *, module: str, out_arg: str, relative_path: str) -> tuple[bool, str]:
     if _command_module_args(command, module) is None:
         return True, ""
     out_dir = _command_arg_value(command, out_arg)
@@ -571,7 +572,7 @@ def _command_path_exists(command: Sequence[str], *, module: str, out_arg: str, r
     return True, ""
 
 
-def _stage_outputs_complete(entry: StageCommand) -> Tuple[bool, str]:
+def _stage_outputs_complete(entry: StageCommand) -> tuple[bool, str]:
     for command in entry.commands:
         schedule_status = _schedule_row_command_status(command)
         if schedule_status is not None and not bool(schedule_status.get("complete", False)):
@@ -624,7 +625,7 @@ def _stage_outputs_complete(entry: StageCommand) -> Tuple[bool, str]:
     return True, ""
 
 
-def _stage_manifest_complete(run_root: Path, entry: StageCommand, *, protocol_hash: str) -> Tuple[bool, str]:
+def _stage_manifest_complete(run_root: Path, entry: StageCommand, *, protocol_hash: str) -> tuple[bool, str]:
     path = run_root / entry.manifest_name
     if not path.exists():
         return False, f"missing stage manifest: {path}"
@@ -660,8 +661,8 @@ def _stage_manifest_complete(run_root: Path, entry: StageCommand, *, protocol_ha
 
 def _resume_completed_prefix(
     run_root: Path, commands: Sequence[StageCommand], *, protocol_hash: str
-) -> List[StageCommand]:
-    completed: List[StageCommand] = []
+) -> list[StageCommand]:
+    completed: list[StageCommand] = []
     for entry in commands:
         is_complete, _reason = _stage_manifest_complete(run_root, entry, protocol_hash=protocol_hash)
         if not is_complete:
@@ -670,11 +671,11 @@ def _resume_completed_prefix(
     return completed
 
 
-def _fixed_schedule_keys_for_runner(schedule_keys: Sequence[str]) -> List[str]:
+def _fixed_schedule_keys_for_runner(schedule_keys: Sequence[str]) -> list[str]:
     return [str(key) for key in schedule_keys if "ser_ptg_local_defect" not in str(key)]
 
 
-def _ser_schedule_keys_for_runner(schedule_keys: Sequence[str]) -> List[str]:
+def _ser_schedule_keys_for_runner(schedule_keys: Sequence[str]) -> list[str]:
     return [str(key) for key in schedule_keys if "ser_ptg_local_defect" in str(key)]
 
 
@@ -682,7 +683,7 @@ def _schedule_keys_for_gico(schedule_keys: Sequence[str]) -> str:
     return ",".join(str(key) for key in schedule_keys)
 
 
-def _schedule_dataset_args(dataset: str) -> List[str]:
+def _schedule_dataset_args(dataset: str) -> list[str]:
     family = scenario_family_for_key(str(dataset))
     if family == SCENARIO_FAMILY_FORECAST:
         return ["--forecast_datasets", str(dataset), "--conditional_generation_datasets", "", "--molecule_datasets", ""]
@@ -693,7 +694,7 @@ def _schedule_dataset_args(dataset: str) -> List[str]:
     raise ValueError(f"Unsupported scenario family {family!r} for {dataset!r}.")
 
 
-def _data_path_args(args: argparse.Namespace) -> List[str]:
+def _data_path_args(args: argparse.Namespace) -> list[str]:
     return [
         "--dataset_root",
         str(args.dataset_root),
@@ -708,7 +709,7 @@ def _data_path_args(args: argparse.Namespace) -> List[str]:
     ]
 
 
-def _temporal_training_data_path_args(args: argparse.Namespace) -> List[str]:
+def _temporal_training_data_path_args(args: argparse.Namespace) -> list[str]:
     return [
         "--dataset_root",
         str(args.dataset_root),
@@ -725,7 +726,7 @@ def _molecule_processed_dir_arg(group_root: Path, dataset: str, member: Mapping[
     return group_root / str(dataset) / str(member["processed_dir"])
 
 
-def _backbone_training_commands(args: argparse.Namespace, dataset: str, checkpoints: str) -> List[List[str]]:
+def _backbone_training_commands(args: argparse.Namespace, dataset: str, checkpoints: str) -> list[list[str]]:
     family = scenario_family_for_key(str(dataset))
     if family != SCENARIO_FAMILY_MOLECULE:
         return [
@@ -760,7 +761,7 @@ def _backbone_training_commands(args: argparse.Namespace, dataset: str, checkpoi
             ]
         ]
     manifest = load_molecule_group_manifest(str(dataset), group_root)
-    commands: List[List[str]] = []
+    commands: list[list[str]] = []
     for member in trainable_molecule_group_members(manifest):
         commands.append(
             _python_module_command(
@@ -793,7 +794,7 @@ def _backbone_training_commands(args: argparse.Namespace, dataset: str, checkpoi
     return commands
 
 
-def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[StageCommand]:
+def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[StageCommand]:
     dataset = _resolved_scenario_key(args)
     checkpoint_values = _parse_int_csv(str(args.checkpoint_steps), CANONICAL_CHECKPOINT_STEPS)
     checkpoints = ",".join(str(value) for value in checkpoint_values)
@@ -826,7 +827,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             return ""
         return ",".join(str(_ser_summary_path(role, int(step))) for step in checkpoint_values)
 
-    def _schedule_row_phase_budget_args(phase: str) -> List[Any]:
+    def _schedule_row_phase_budget_args(phase: str) -> list[Any]:
         if str(phase) == "train_tuning":
             return ["--train_tuning_context_sample_count", int(args.context_sample_count)]
         if str(phase) == "locked_test":
@@ -836,8 +837,8 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             return ["--eval_windows_test", windows] if windows > 0 else []
         raise ValueError(f"Unsupported split phase {phase!r}.")
 
-    def _gico_train_command(mode: str, out_dir: Path, arm: GicoAblationArm | None = None) -> List[str]:
-        command_args: List[Any] = [
+    def _gico_train_command(mode: str, out_dir: Path, arm: GicoAblationArm | None = None) -> list[str]:
+        command_args: list[Any] = [
             "--rows_csv",
             _csv_list("seen", "train_tuning", "context_rows.csv"),
             "--context_embeddings_npz",
@@ -885,11 +886,11 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
         )
         return _python_module_command("genode.gico.train_gico", command_args)
 
-    def _schedule_row_commands(role: str, nfe_values: str) -> List[List[str]]:
-        commands: List[List[str]] = []
+    def _schedule_row_commands(role: str, nfe_values: str) -> list[list[str]]:
+        commands: list[list[str]] = []
         for phase in split_phases:
             for checkpoint_step in checkpoint_values:
-                summary_args: List[Any] = []
+                summary_args: list[Any] = []
                 if ser_schedules:
                     summary_args = [
                         "--schedule_summary_json",
@@ -934,8 +935,8 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
         *,
         student_root: Path,
         report_root: Path,
-    ) -> List[List[str]]:
-        commands: List[List[str]] = []
+    ) -> list[list[str]]:
+        commands: list[list[str]] = []
         family = scenario_family_for_key(dataset)
         for role, nfe_values in role_nfes.items():
             for checkpoint_step in checkpoint_values:
@@ -985,8 +986,8 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
                 )
         return commands
 
-    def _locked_test_report_commands() -> List[List[str]]:
-        commands: List[List[str]] = []
+    def _locked_test_report_commands() -> list[list[str]]:
+        commands: list[list[str]] = []
         for mode in (STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS):
             commands.extend(
                 _locked_test_report_commands_for_student(
@@ -996,7 +997,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             )
         return commands
 
-    def _gico_ablation_student_commands() -> List[List[str]]:
+    def _gico_ablation_student_commands() -> list[list[str]]:
         return [
             _gico_train_command(
                 arm.student_training_mode,
@@ -1006,8 +1007,8 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
             for arm in ablation_arms
         ]
 
-    def _gico_ablation_locked_test_commands() -> List[List[str]]:
-        commands: List[List[str]] = []
+    def _gico_ablation_locked_test_commands() -> list[list[str]]:
+        commands: list[list[str]] = []
         for arm in ablation_arms:
             commands.extend(
                 _locked_test_report_commands_for_student(
@@ -1132,7 +1133,7 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> List[Stag
     return [entry for entry in commands if entry.stage in stage_filter]
 
 
-def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
+def run_full_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     args = apply_backbone_package_to_args(args)
     run_root = _resolve_run_root(args)
     run_root.mkdir(parents=True, exist_ok=True)
@@ -1179,7 +1180,7 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             "preflight": preflight,
         },
     )
-    completed: List[str] = list(skipped_stage_names)
+    completed: list[str] = list(skipped_stage_names)
     for entry in commands_to_run:
         manifest = {
             "stage": entry.stage,

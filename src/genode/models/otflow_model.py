@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -9,7 +9,7 @@ from genode.models.config import OTFlowConfig
 from genode.models.rectified_flow import RectifiedFlow
 from genode.solver_protocol import normalize_solver_key
 
-OTFLOW_TRACE_FIELDS: Tuple[str, ...] = (
+OTFLOW_TRACE_FIELDS: tuple[str, ...] = (
     "solver",
     "steps",
     "step_index",
@@ -100,9 +100,9 @@ class OTFlow(RectifiedFlow):
         self,
         x: torch.Tensor,
         hist: torch.Tensor,
-        cond: Optional[torch.Tensor],
+        cond: torch.Tensor | None,
         z: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
         if x.shape[0] <= 1 or not bool(self.cfg.fm.use_minibatch_ot):
             identity = torch.arange(x.shape[0], device=x.device)
             zero_cost = x.new_tensor(0.0)
@@ -122,7 +122,7 @@ class OTFlow(RectifiedFlow):
         t: torch.Tensor,
         hist: torch.Tensor,
         *,
-        cond: Optional[torch.Tensor],
+        cond: torch.Tensor | None,
         guidance: float,
     ) -> torch.Tensor:
         if guidance == 1.0 or cond is None:
@@ -146,7 +146,7 @@ class OTFlow(RectifiedFlow):
     def _future_training_target(
         self,
         tgt: torch.Tensor,
-        fut: Optional[torch.Tensor],
+        fut: torch.Tensor | None,
     ) -> torch.Tensor:
         horizon = self._prediction_horizon()
         if horizon <= 1:
@@ -172,10 +172,10 @@ class OTFlow(RectifiedFlow):
         self,
         x: torch.Tensor,
         hist: torch.Tensor,
-        fut: Optional[torch.Tensor] = None,
-        cond: Optional[torch.Tensor] = None,
-        meta: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        fut: torch.Tensor | None = None,
+        cond: torch.Tensor | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         del meta
         if self._is_non_autoregressive():
             x = self._future_training_target(x, fut)
@@ -202,11 +202,11 @@ class OTFlow(RectifiedFlow):
         }
         return loss, logs
 
-    def _resolve_solver_name(self, solver: Optional[str]) -> str:
+    def _resolve_solver_name(self, solver: str | None) -> str:
         configured = getattr(self.cfg.sample, "solver", "euler") if solver is None else solver
         return normalize_solver_key(str(configured))
 
-    def _resolved_time_grid(self, n_steps: int) -> Tuple[float, ...]:
+    def _resolved_time_grid(self, n_steps: int) -> tuple[float, ...]:
         raw_grid = tuple(float(x) for x in getattr(self.cfg.sample, "time_grid", ()) or ())
         if len(raw_grid) == 0:
             return tuple(float(i) / float(n_steps) for i in range(int(n_steps) + 1))
@@ -266,7 +266,7 @@ class OTFlow(RectifiedFlow):
         v: torch.Tensor,
         *,
         hist: torch.Tensor,
-        cond: Optional[torch.Tensor],
+        cond: torch.Tensor | None,
         guidance: float,
         dt: float,
         t_cur: float,
@@ -283,13 +283,13 @@ class OTFlow(RectifiedFlow):
         self,
         hist: torch.Tensor,
         *,
-        cond: Optional[torch.Tensor],
-        steps: Optional[int],
-        cfg_scale: Optional[float],
-        solver: Optional[str],
+        cond: torch.Tensor | None,
+        steps: int | None,
+        cfg_scale: float | None,
+        solver: str | None,
         record_trace: bool,
         oracle_local_error: bool,
-    ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
+    ) -> tuple[torch.Tensor, dict[str, Any] | None]:
         batch_size = hist.shape[0]
         state_dim = self._sample_state_dim()
         x = torch.randn(batch_size, state_dim, device=hist.device)
@@ -301,11 +301,11 @@ class OTFlow(RectifiedFlow):
         guidance = float(default_cfg_scale if cfg_scale is None else cfg_scale)
         solver_name = self._resolve_solver_name(solver)
         time_grid = self._resolved_time_grid(n_steps)
-        prev_dpm_v: Optional[torch.Tensor] = None
-        prev_dpm_dt: Optional[float] = None
-        ema_v: Optional[torch.Tensor] = None
-        ema_v_sq: Optional[torch.Tensor] = None
-        ema_u: Optional[torch.Tensor] = None
+        prev_dpm_v: torch.Tensor | None = None
+        prev_dpm_dt: float | None = None
+        ema_v: torch.Tensor | None = None
+        ema_v_sq: torch.Tensor | None = None
+        ema_u: torch.Tensor | None = None
         top_book_weights = self._top_of_book_feature_weights(device=hist.device, dtype=x.dtype)[None, :]
 
         if record_trace:
@@ -439,7 +439,7 @@ class OTFlow(RectifiedFlow):
                 trace_field_evals.append(field_evals.detach().cpu())
                 trace_time.append(float(t_cur))
 
-        trace: Optional[Dict[str, Any]] = None
+        trace: dict[str, Any] | None = None
         if record_trace:
             disagreement_t = torch.stack(trace_disagreement, dim=1)
             velocity_norm_t = torch.stack(trace_velocity_norm, dim=1)
@@ -484,12 +484,12 @@ class OTFlow(RectifiedFlow):
     def sample_trace(
         self,
         hist: torch.Tensor,
-        cond: Optional[torch.Tensor] = None,
-        steps: Optional[int] = None,
-        cfg_scale: Optional[float] = None,
-        solver: Optional[str] = None,
+        cond: torch.Tensor | None = None,
+        steps: int | None = None,
+        cfg_scale: float | None = None,
+        solver: str | None = None,
         oracle_local_error: bool = False,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Sample a single next state and return per-solver-step trace statistics."""
         if self._is_non_autoregressive():
             raise RuntimeError("Non-autoregressive OTFlow uses sample_future_trace(...), not sample_trace(...).")
@@ -510,10 +510,10 @@ class OTFlow(RectifiedFlow):
     def sample(
         self,
         hist: torch.Tensor,
-        cond: Optional[torch.Tensor] = None,
-        steps: Optional[int] = None,
-        cfg_scale: Optional[float] = None,
-        solver: Optional[str] = None,
+        cond: torch.Tensor | None = None,
+        steps: int | None = None,
+        cfg_scale: float | None = None,
+        solver: str | None = None,
     ) -> torch.Tensor:
         """Sampler with optional classifier-free guidance."""
         if self._is_non_autoregressive():
@@ -533,12 +533,12 @@ class OTFlow(RectifiedFlow):
     def sample_future_trace(
         self,
         hist: torch.Tensor,
-        cond: Optional[torch.Tensor] = None,
-        steps: Optional[int] = None,
-        cfg_scale: Optional[float] = None,
-        solver: Optional[str] = None,
+        cond: torch.Tensor | None = None,
+        steps: int | None = None,
+        cfg_scale: float | None = None,
+        solver: str | None = None,
         oracle_local_error: bool = False,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         x, trace = self._sample_impl(
             hist,
             cond=cond,
@@ -556,10 +556,10 @@ class OTFlow(RectifiedFlow):
     def sample_future(
         self,
         hist: torch.Tensor,
-        cond: Optional[torch.Tensor] = None,
-        steps: Optional[int] = None,
-        cfg_scale: Optional[float] = None,
-        solver: Optional[str] = None,
+        cond: torch.Tensor | None = None,
+        steps: int | None = None,
+        cfg_scale: float | None = None,
+        solver: str | None = None,
     ) -> torch.Tensor:
         x, _ = self._sample_impl(
             hist,

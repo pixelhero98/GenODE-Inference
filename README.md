@@ -327,3 +327,7 @@ clean environment, and smoke-tests every public CLI.
 GenODE is released under the [MIT License](LICENSE). Third-party code,
 reference data, external model implementations, datasets, and checkpoint
 weights remain subject to their respective terms.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution
+guidance. Report vulnerabilities privately according to
+[SECURITY.md](SECURITY.md).

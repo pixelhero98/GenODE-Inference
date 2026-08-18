@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 from genode.artifacts.identity import canonical_json_bytes, canonical_json_text, semantic_sha256
 

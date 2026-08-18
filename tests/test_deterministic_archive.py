@@ -662,13 +662,28 @@ def test_archive_bundle_stage_link_swap_cannot_modify_external_file(
     real_named_temporary = deterministic_archive.tempfile.NamedTemporaryFile
     swapped_stage: Path | None = None
 
+    class SwapOnClose:
+        def __init__(self, handle: object, path: Path) -> None:
+            self._handle = handle
+            self._path = path
+            self._swapped = False
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._handle, name)
+
+        def close(self) -> None:
+            self._handle.close()  # type: ignore[attr-defined]
+            if not self._swapped:
+                self._path.unlink()
+                self._path.symlink_to(external)
+                self._swapped = True
+
     def swap_archive_stage(*args: object, **kwargs: object):
         nonlocal swapped_stage
         handle = real_named_temporary(*args, **kwargs)  # type: ignore[arg-type]
         if kwargs.get("prefix") == ".out.zip.bundle-stage-":
             swapped_stage = Path(handle.name)
-            swapped_stage.unlink()
-            swapped_stage.symlink_to(external)
+            return SwapOnClose(handle, swapped_stage)
         return handle
 
     monkeypatch.setattr(

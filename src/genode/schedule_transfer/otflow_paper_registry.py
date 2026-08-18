@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from genode.canonical_experiment_layout import (
     CANONICAL_SEEN_NFES,
@@ -19,8 +19,8 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
 )
 from genode.schedule_transfer.reference_clocks import reference_clock_provenance
 
-MAIN_NFE_VALUES: Tuple[int, ...] = CANONICAL_SEEN_NFES
-APPENDIX_NFE_VALUES: Tuple[int, ...] = CANONICAL_UNSEEN_NFES
+MAIN_NFE_VALUES: tuple[int, ...] = CANONICAL_SEEN_NFES
+APPENDIX_NFE_VALUES: tuple[int, ...] = CANONICAL_UNSEEN_NFES
 METHOD_KEY = "diffusion_flow_time_reparameterization"
 PAPER_MAIN_SIGNAL_FAMILY = "native_info_growth"
 
@@ -33,10 +33,10 @@ class ScheduleSpec:
     comparison_role: str
     solver_scope: str
     implementation_status: str
-    source_url: Optional[str] = None
-    paper_url: Optional[str] = None
+    source_url: str | None = None
+    paper_url: str | None = None
     requires_signal: bool = False
-    external_mapping_status: Optional[str] = None
+    external_mapping_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -47,11 +47,11 @@ class SolverSpec:
     family: str
     implementation_status: str
     main_matrix_scope: str
-    otflow_runtime_name: Optional[str] = None
+    otflow_runtime_name: str | None = None
 
 
-def paper_schedule_specs() -> List[ScheduleSpec]:
-    specs: List[ScheduleSpec] = []
+def paper_schedule_specs() -> list[ScheduleSpec]:
+    specs: list[ScheduleSpec] = []
     for key in BASELINE_SCHEDULE_KEYS:
         provenance = reference_clock_provenance(key)
         transferred = provenance["application_behavior"] == "transferred_reference"
@@ -70,7 +70,7 @@ def paper_schedule_specs() -> List[ScheduleSpec]:
     return specs
 
 
-def paper_solver_specs() -> List[SolverSpec]:
+def paper_solver_specs() -> list[SolverSpec]:
     return [
         SolverSpec("euler", "Euler", 1, "deterministic_ode", "available", "all_schedules", "euler"),
         SolverSpec("heun", "Heun / RK2", 2, "deterministic_ode", "available", "all_schedules", "heun"),
@@ -81,7 +81,7 @@ def paper_solver_specs() -> List[SolverSpec]:
     ]
 
 
-def paper_registry_snapshot() -> Dict[str, Any]:
+def paper_registry_snapshot() -> dict[str, Any]:
     return {
         "method_key": METHOD_KEY,
         "paper_method": METHOD_KEY,

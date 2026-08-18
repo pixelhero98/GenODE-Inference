@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral, Real
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -17,7 +19,6 @@ from genode.benchmarks.image.protocol import (
     IMAGE_TARGET_NFES,
     normalize_image_nfe,
 )
-from genode.gico.image_model import DEFAULT_DENSITY_FLOOR
 from genode.schedules import (
     ScheduleBatch,
     ScheduleSpecification,
@@ -39,7 +40,9 @@ IMAGE_GICO_DEFAULT_SCHEDULE_COUNT = len(IMAGE_SCHEDULE_KEYS)
 IMAGE_GICO_NFE_EMBEDDING_DIM = 16
 IMAGE_GICO_CONDITIONAL_HIDDEN_DIM = 256
 IMAGE_GICO_CONDITIONAL_REWARD_CLIP = 5.0
+DEFAULT_DENSITY_FLOOR = 1e-8
 _RAW_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_SHA256_IDENTITY_PATTERN = re.compile(r"(?:[a-z][a-z0-9_.-]*:)?[0-9a-f]{64}\Z")
 _FEATURE_PROTOCOL_NAMESPACE = "image-feature-protocol"
 
 
@@ -70,6 +73,12 @@ def _identity(value: object, *, field: str) -> str:
 def _raw_sha256_identity(value: object, *, field: str) -> str:
     if not isinstance(value, str) or _RAW_SHA256_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{field} must be one lowercase SHA-256 digest.")
+    return value
+
+
+def _sha256_identity(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or _SHA256_IDENTITY_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{field} must be a raw or namespaced lowercase SHA-256 identity.")
     return value
 
 
@@ -264,12 +273,9 @@ class ImageGICOFeatureGroups:
             atol=1e-7,
         ):
             raise ValueError("pca_components must have orthonormal rows.")
-        for field in (
-            "source_panel_fingerprint",
-            "feature_protocol_sha256",
-            "real_feature_panel_sha256",
-        ):
-            _identity(getattr(self, field), field=field)
+        _identity(self.source_panel_fingerprint, field="source_panel_fingerprint")
+        _feature_protocol_identity(self.feature_protocol_sha256, field="feature_protocol_sha256")
+        _sha256_identity(self.real_feature_panel_sha256, field="real_feature_panel_sha256")
         object.__setattr__(self, "samples_per_class", samples)
         object.__setattr__(self, "group_count", groups)
         object.__setattr__(
@@ -519,11 +525,12 @@ class ImageGICOConditionalTargets:
         temperatures = tuple(_finite_positive(value, field="temperature_by_nfe") for value in self.temperature_by_nfe)
         if len(temperatures) != 3:
             raise ValueError("temperature_by_nfe must contain exactly three values.")
-        schedule_hashes = tuple(_identity(value, field="schedule_sha256s") for value in self.schedule_sha256s)
+        schedule_hashes = tuple(_sha256_identity(value, field="schedule_sha256s") for value in self.schedule_sha256s)
         if len(schedule_hashes) != schedule_count:
             raise ValueError(f"schedule_sha256s must contain {schedule_count} entries.")
         density_hashes = tuple(
-            tuple(_identity(value, field="density_mass_sha256s") for value in row) for row in self.density_mass_sha256s
+            tuple(_sha256_identity(value, field="density_mass_sha256s") for value in row)
+            for row in self.density_mass_sha256s
         )
         if len(density_hashes) != 3 or any(len(row) != schedule_count for row in density_hashes):
             raise ValueError(f"density_mass_sha256s must have shape [3, {schedule_count}].")
@@ -532,7 +539,7 @@ class ImageGICOConditionalTargets:
             "reward_evidence_sha256",
             "fixed_support_sha256",
         ):
-            _identity(getattr(self, field), field=field)
+            _sha256_identity(getattr(self, field), field=field)
         _validate_imagenet_target_binding(
             backbone_model_key=self.backbone_model_key,
             backbone_protocol_sha256=self.backbone_protocol_sha256,
@@ -686,6 +693,29 @@ def _jackknife_standard_error(jackknife_advantage: np.ndarray) -> np.ndarray:
     return np.sqrt(np.maximum(variance, 0.0))
 
 
+def validate_image_gico_density_alias_bindings(
+    density_sha256s: Sequence[Sequence[str]],
+    fixed_density_mass: np.ndarray,
+) -> None:
+    """Require supplied identities to describe the exact fixed-support aliases."""
+
+    masses = np.ascontiguousarray(fixed_density_mass, dtype="<f8")
+    for nfe_index, identity_row in enumerate(density_sha256s):
+        content_sha256s = tuple(
+            hashlib.sha256(np.ascontiguousarray(row, dtype="<f8").tobytes(order="C")).hexdigest()
+            for row in masses[nfe_index]
+        )
+        for left in range(len(identity_row)):
+            for right in range(left + 1, len(identity_row)):
+                same_identity = identity_row[left] == identity_row[right]
+                same_content = content_sha256s[left] == content_sha256s[right]
+                if same_identity != same_content:
+                    raise ValueError(
+                        "Conditional density aliases disagree with fixed_density_mass; density_mass_sha256s must "
+                        "identify exactly the aliases present in fixed_density_mass."
+                    )
+
+
 def _hierarchical_shrinkage(
     advantages: np.ndarray,
     standard_errors: np.ndarray,
@@ -823,6 +853,10 @@ def build_image_gico_conditional_targets(
     density_hashes = tuple(tuple(str(value) for value in row) for row in density_mass_sha256s)
     if len(density_hashes) != 3 or any(len(row) != schedule_count for row in density_hashes):
         raise ValueError(f"density_mass_sha256s must have shape [3, {schedule_count}].")
+    density_hashes = tuple(
+        tuple(_sha256_identity(value, field="density_mass_sha256s") for value in row) for row in density_hashes
+    )
+    validate_image_gico_density_alias_bindings(density_hashes, masses)
     schedule_weights = np.empty(
         (3, IMAGE_GICO_CLASS_COUNT, schedule_count),
         dtype=np.float64,
@@ -1187,4 +1221,5 @@ __all__ = [
     "build_image_gico_conditional_targets",
     "build_image_gico_feature_groups",
     "validate_image_gico_backbone_context_tensor",
+    "validate_image_gico_density_alias_bindings",
 ]

@@ -23,8 +23,7 @@ import math
 import os
 import tempfile
 import urllib.request
-from functools import lru_cache
-from typing import Dict, Optional, Tuple, Union
+from functools import cache
 
 import numpy as np
 import torch
@@ -33,7 +32,7 @@ from genode.data.otflow_paths import default_lobster_synthetic_profile_path, pro
 from genode.models.config import OTFlowConfig
 from genode.path_safety import is_link_or_reparse_point
 
-ArrayLike = Union[np.ndarray, torch.Tensor]
+ArrayLike = np.ndarray | torch.Tensor
 DEFAULT_SYNTHETIC_LENGTH = 2_000_000
 DEFAULT_CRYPTOS_NPZ = str(project_data_root() / "cryptos_binance_spot_monthly_1s_l10.npz")
 LOBIFLOW_REVISION = "2d33cfd6b5e27d2483e2095b22d340813389cd0c"
@@ -101,7 +100,7 @@ class L2FeatureMap:
         ask_v: np.ndarray,
         bid_p: np.ndarray,
         bid_v: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         matrices = {
             "ask_p": self._finite_numeric_matrix(ask_p, label="ask_p"),
             "ask_v": self._finite_numeric_matrix(ask_v, label="ask_v"),
@@ -160,7 +159,7 @@ class L2FeatureMap:
 
     def decode_sequence(
         self, params: np.ndarray, init_mid: float
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Decode params to raw L2 arrays using the mid immediately before the window.
 
         Notes
@@ -227,7 +226,7 @@ class L2FeatureMap:
 # -----------------------------
 # Standardization helpers
 # -----------------------------
-def fit_standardizer(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def fit_standardizer(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Fit mean/std on x [T,D] only."""
     mu = x.mean(axis=0).astype(np.float32)
     sig = (x.std(axis=0) + 1e-6).astype(np.float32)
@@ -238,12 +237,12 @@ def apply_standardizer(x: np.ndarray, mu: np.ndarray, sig: np.ndarray) -> np.nda
     return ((x - mu[None, :]) / sig[None, :]).astype(np.float32)
 
 
-def standardize_params(params: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def standardize_params(params: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     mu, sig = fit_standardizer(params)
     return apply_standardizer(params, mu, sig), mu, sig
 
 
-def standardize_cond(cond: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def standardize_cond(cond: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     mu, sig = fit_standardizer(cond)
     return apply_standardizer(cond, mu, sig), mu, sig
 
@@ -268,10 +267,6 @@ def _time_feature_mode(cfg: OTFlowConfig) -> str:
     return "none"
 
 
-def _use_time_features_enabled(cfg: OTFlowConfig) -> bool:
-    return _time_feature_mode(cfg) != "none"
-
-
 def _time_feature_dim(mode: str) -> int:
     mode_key = str(mode)
     if mode_key == "gap_elapsed":
@@ -291,7 +286,7 @@ def _set_model_cond_dim(cfg: OTFlowConfig, cond_dim: int) -> None:
     cfg.model.cond_dim = resolved
 
 
-def _timestamps_from_loaded_npz(data: Dict[str, np.ndarray]) -> Optional[np.ndarray]:
+def _timestamps_from_loaded_npz(data: dict[str, np.ndarray]) -> np.ndarray | None:
     for key in ("local_timestamps", "timestamps", "ts_event", "ts_recv", "ts"):
         if key in data:
             return np.asarray(data[key], dtype=np.int64)
@@ -299,10 +294,10 @@ def _timestamps_from_loaded_npz(data: Dict[str, np.ndarray]) -> Optional[np.ndar
 
 
 def _fit_time_gap_scale(
-    timestamps: Optional[np.ndarray],
+    timestamps: np.ndarray | None,
     *,
     train_end: int,
-    segment_ends: Optional[np.ndarray],
+    segment_ends: np.ndarray | None,
 ) -> float:
     if timestamps is None or int(train_end) <= 1:
         return 1.0
@@ -337,11 +332,11 @@ def _fit_time_gap_scale(
 
 
 def _build_time_gap_features(
-    timestamps: Optional[np.ndarray],
+    timestamps: np.ndarray | None,
     *,
     gap_scale: float,
-    segment_ends: Optional[np.ndarray],
-) -> Optional[np.ndarray]:
+    segment_ends: np.ndarray | None,
+) -> np.ndarray | None:
     if timestamps is None:
         return None
 
@@ -367,11 +362,11 @@ def _build_time_gap_features(
 
 
 def _build_elapsed_time_features(
-    timestamps: Optional[np.ndarray],
+    timestamps: np.ndarray | None,
     *,
     gap_scale: float,
-    segment_ends: Optional[np.ndarray],
-) -> Optional[np.ndarray]:
+    segment_ends: np.ndarray | None,
+) -> np.ndarray | None:
     if timestamps is None:
         return None
 
@@ -403,12 +398,12 @@ def _build_elapsed_time_features(
 
 
 def _build_time_features(
-    timestamps: Optional[np.ndarray],
+    timestamps: np.ndarray | None,
     *,
     gap_scale: float,
-    segment_ends: Optional[np.ndarray],
+    segment_ends: np.ndarray | None,
     include_elapsed: bool = True,
-) -> Optional[np.ndarray]:
+) -> np.ndarray | None:
     gap_feature = _build_time_gap_features(
         timestamps,
         gap_scale=float(gap_scale),
@@ -504,21 +499,21 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
         mids: np.ndarray,
         history_len: int,
         stride: int = 1,
-        params_mean: Optional[np.ndarray] = None,
-        params_std: Optional[np.ndarray] = None,
+        params_mean: np.ndarray | None = None,
+        params_std: np.ndarray | None = None,
         future_horizon: int = 0,
-        cond: Optional[np.ndarray] = None,
-        cond_mean: Optional[np.ndarray] = None,
-        cond_std: Optional[np.ndarray] = None,
-        time_features: Optional[np.ndarray] = None,
-        time_gap_features: Optional[np.ndarray] = None,
-        elapsed_time_features: Optional[np.ndarray] = None,
-        time_gap_scale: Optional[float] = None,
+        cond: np.ndarray | None = None,
+        cond_mean: np.ndarray | None = None,
+        cond_std: np.ndarray | None = None,
+        time_features: np.ndarray | None = None,
+        time_gap_features: np.ndarray | None = None,
+        elapsed_time_features: np.ndarray | None = None,
+        time_gap_scale: float | None = None,
         time_feature_source: str = "none",
-        segment_ends: Optional[np.ndarray] = None,
-        valid_start_mask: Optional[np.ndarray] = None,
-        dataset_kind: Optional[str] = None,
-        dataset_metadata: Optional[Dict[str, object]] = None,
+        segment_ends: np.ndarray | None = None,
+        valid_start_mask: np.ndarray | None = None,
+        dataset_kind: str | None = None,
+        dataset_metadata: dict[str, object] | None = None,
         global_offset: int = 0,  # Maps a split-local timestep to the source timeline.
     ):
         super().__init__()
@@ -575,7 +570,7 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
             starts = starts[self.valid_start_mask[starts]]
         return starts
 
-    def segment_end_for_t(self, t: Union[int, np.ndarray]) -> np.ndarray:
+    def segment_end_for_t(self, t: int | np.ndarray) -> np.ndarray:
         t_arr = np.asarray(t, dtype=np.int64)
         if self.segment_ends is None:
             return np.full_like(t_arr, len(self.params), dtype=np.int64)
@@ -591,7 +586,7 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
     def has_time_features(self) -> bool:
         return self.time_features is not None
 
-    def _slice_time_features(self, start: int, stop: int) -> Optional[np.ndarray]:
+    def _slice_time_features(self, start: int, stop: int) -> np.ndarray | None:
         if self.time_features is None:
             return None
         features = self.time_features[int(start) : int(stop)].astype(np.float32, copy=True)
@@ -599,13 +594,13 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
             features[:, 1] = features[:, 1] - float(features[0, 1])
         return features
 
-    def future_time_features(self, t0: int, horizon: int) -> Optional[torch.Tensor]:
+    def future_time_features(self, t0: int, horizon: int) -> torch.Tensor | None:
         features = self._slice_time_features(int(t0), int(t0) + int(horizon))
         if features is None:
             return None
         return torch.from_numpy(features)
 
-    def future_time_gap_features(self, t0: int, horizon: int) -> Optional[torch.Tensor]:
+    def future_time_gap_features(self, t0: int, horizon: int) -> torch.Tensor | None:
         if self.time_gap_features is None:
             return None
         return torch.from_numpy(self.time_gap_features[int(t0) : int(t0) + int(horizon)].astype(np.float32, copy=True))
@@ -652,7 +647,7 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
 # -----------------------------
 # Loaders / builders
 # -----------------------------
-def load_l2_npz(path: str) -> Dict[str, np.ndarray]:
+def load_l2_npz(path: str) -> dict[str, np.ndarray]:
     """Load a standardized L2 snapshot NPZ prepared by `lob_prepare_dataset.py`.
 
     Required keys:
@@ -671,78 +666,11 @@ def load_l2_npz(path: str) -> Dict[str, np.ndarray]:
     return out
 
 
-def _build_windowed_dataset(
-    params_raw: np.ndarray,
-    mids: np.ndarray,
-    cfg: OTFlowConfig,
-    stride: int,
-    *,
-    timestamps: Optional[np.ndarray] = None,
-) -> WindowedParamSequenceDataset:
-    """Build a windowed LOB dataset from one parameterized array bundle."""
-    # params
-    if cfg.standardize:
-        params, mu, sig = standardize_params(params_raw)
-    else:
-        params, mu, sig = params_raw.astype(np.float32), None, None
-
-    # cond features
-    cond = None
-    c_mu = c_sig = None
-    if cfg.use_cond_features:
-        cond_raw = build_cond_features(params_raw, mids, cfg)
-        if cfg.cond_standardize:
-            cond, c_mu, c_sig = standardize_cond(cond_raw)
-        else:
-            cond = cond_raw
-
-        _set_model_cond_dim(cfg, int(cond.shape[1]))
-
-    time_features = None
-    time_gap_scale = None
-    time_feature_source = "none"
-    time_feature_mode = _time_feature_mode(cfg)
-    if time_feature_mode != "none":
-        time_gap_scale = _fit_time_gap_scale(
-            None if timestamps is None else np.asarray(timestamps, dtype=np.int64),
-            train_end=len(params_raw),
-            segment_ends=None,
-        )
-        time_features = _build_time_features(
-            None if timestamps is None else np.asarray(timestamps, dtype=np.int64),
-            gap_scale=float(time_gap_scale),
-            segment_ends=None,
-            include_elapsed=bool(time_feature_mode == "gap_elapsed"),
-        )
-        if time_features is None:
-            time_features = np.zeros((len(params_raw), _time_feature_dim(time_feature_mode)), dtype=np.float32)
-            time_feature_source = "missing_timestamps_zero_fill"
-        else:
-            time_feature_source = "timestamps"
-
-    return WindowedParamSequenceDataset(
-        params=params,
-        mids=mids,
-        history_len=cfg.history_len,
-        stride=stride,
-        params_mean=mu,
-        params_std=sig,
-        future_horizon=_future_horizon_from_cfg(cfg),
-        cond=cond,
-        cond_mean=c_mu,
-        cond_std=c_sig,
-        time_features=time_features,
-        time_gap_scale=time_gap_scale,
-        time_feature_source=time_feature_source,
-        global_offset=0,
-    )
-
-
 def default_lobster_synth_profile_path() -> str:
     return DEFAULT_LOBSTER_SYNTH_PROFILE
 
 
-def validate_lobster_synth_profile(profile: Dict[str, object], *, source: str = "") -> Dict[str, object]:
+def validate_lobster_synth_profile(profile: dict[str, object], *, source: str = "") -> dict[str, object]:
     profiles = profile.get("profiles", [])
     if not isinstance(profiles, list) or not profiles:
         raise ValueError(f"LOBSTER synthetic profile at {source or '<memory>'} contains no regimes.")
@@ -779,10 +707,10 @@ def validate_lobster_synth_profile(profile: Dict[str, object], *, source: str = 
     return profile
 
 
-@lru_cache(maxsize=None)
-def load_lobster_synth_profile(path: Optional[str] = None) -> Dict[str, object]:
+@cache
+def load_lobster_synth_profile(path: str | None = None) -> dict[str, object]:
     resolved = path or default_lobster_synth_profile_path()
-    with open(resolved, "r", encoding="utf-8") as f:
+    with open(resolved, encoding="utf-8") as f:
         profile = json.load(f)
     return validate_lobster_synth_profile(profile, source=str(resolved))
 
@@ -792,7 +720,7 @@ def download_lobster_synthetic_profile(
     *,
     url: str = LOBIFLOW_SYNTHETIC_PROFILE_URL,
     force: bool = False,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     resolved = os.fspath(path or default_lobster_synth_profile_path())
     if force or not _verified_file(
         resolved,
@@ -815,8 +743,8 @@ def _generate_synthetic_l2(
     seed: int,
     eps: float = 1e-8,
     *,
-    profile_path: Optional[str] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    profile_path: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Generate LOBSTER-calibrated synthetic L2 data with persistent liquidity regimes."""
     rng = np.random.default_rng(seed)
     L = levels
@@ -855,7 +783,7 @@ def _generate_synthetic_l2(
         seg_len = int(rng.lognormal(mean=math.log(target), sigma=0.5))
         return min(remaining, max(128, seg_len))
 
-    def _set_regime(regime: Dict[str, object], *, reset: bool) -> None:
+    def _set_regime(regime: dict[str, object], *, reset: bool) -> None:
         nonlocal current_regime, spread_log, imbalance, ask_gap_state, bid_gap_state, ask_log_v_state, bid_log_v_state
         current_regime = regime
 
@@ -981,10 +909,10 @@ def _resolve_split_bounds(
     T: int,
     train_frac: float = 0.7,
     val_frac: float = 0.1,
-    test_frac: Optional[float] = None,
-    train_end: Optional[int] = None,
-    val_end: Optional[int] = None,
-) -> Tuple[int, int]:
+    test_frac: float | None = None,
+    train_end: int | None = None,
+    val_end: int | None = None,
+) -> tuple[int, int]:
     """Return (train_end, val_end) as absolute timestep boundaries in [0, T].
 
     Splits are interpreted over raw timesteps (params rows).
@@ -1015,7 +943,7 @@ def _slice_segment_with_history(
     start_t: int,
     end_t: int,
     history_len: int,
-) -> Tuple[np.ndarray, int]:
+) -> tuple[np.ndarray, int]:
     """Slice arr so targets in [start_t, end_t) are valid with history.
 
     Returns
@@ -1040,10 +968,10 @@ def _resolve_segment_split_bounds(
     *,
     train_frac: float,
     val_frac: float,
-    test_frac: Optional[float],
-    train_end: Optional[int],
-    val_end: Optional[int],
-) -> Tuple[int, int]:
+    test_frac: float | None,
+    train_end: int | None,
+    val_end: int | None,
+) -> tuple[int, int]:
     segment_ends = np.asarray(segment_ends, dtype=np.int64)
     if len(segment_ends) < 3:
         raise ValueError("Need at least 3 segments for train/val/test splits.")
@@ -1084,18 +1012,18 @@ def _make_windowed_dataset_from_arrays(
     stride: int,
     start_t: int,
     end_t: int,
-    params_mean: Optional[np.ndarray],
-    params_std: Optional[np.ndarray],
-    cond_full: Optional[np.ndarray],
-    cond_mean: Optional[np.ndarray],
-    cond_std: Optional[np.ndarray],
-    time_features_full: Optional[np.ndarray],
-    time_gap_scale: Optional[float],
+    params_mean: np.ndarray | None,
+    params_std: np.ndarray | None,
+    cond_full: np.ndarray | None,
+    cond_mean: np.ndarray | None,
+    cond_std: np.ndarray | None,
+    time_features_full: np.ndarray | None,
+    time_gap_scale: float | None,
     time_feature_source: str = "none",
-    segment_ends_full: Optional[np.ndarray] = None,
-    valid_start_mask_full: Optional[np.ndarray] = None,
-    dataset_kind: Optional[str] = None,
-    dataset_metadata: Optional[Dict[str, object]] = None,
+    segment_ends_full: np.ndarray | None = None,
+    valid_start_mask_full: np.ndarray | None = None,
+    dataset_kind: str | None = None,
+    dataset_metadata: dict[str, object] | None = None,
 ) -> WindowedParamSequenceDataset:
     """Construct a split dataset [start_t,end_t) with left history buffer and fixed normalization stats."""
     H = int(cfg.history_len)
@@ -1194,20 +1122,20 @@ def build_dataset_splits_from_arrays(
     mids: np.ndarray,
     cfg: OTFlowConfig,
     *,
-    timestamps: Optional[np.ndarray] = None,
-    cond_raw_full: Optional[np.ndarray] = None,
+    timestamps: np.ndarray | None = None,
+    cond_raw_full: np.ndarray | None = None,
     stride_train: int = 1,
     stride_eval: int = 1,
     train_frac: float = 0.7,
     val_frac: float = 0.1,
-    test_frac: Optional[float] = None,
-    train_end: Optional[int] = None,
-    val_end: Optional[int] = None,
-    segment_ends: Optional[np.ndarray] = None,
-    valid_start_mask: Optional[np.ndarray] = None,
-    dataset_kind: Optional[str] = None,
-    dataset_metadata: Optional[Dict[str, object]] = None,
-) -> Dict[str, object]:
+    test_frac: float | None = None,
+    train_end: int | None = None,
+    val_end: int | None = None,
+    segment_ends: np.ndarray | None = None,
+    valid_start_mask: np.ndarray | None = None,
+    dataset_kind: str | None = None,
+    dataset_metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Chronological train/val/test split with train-only normalization statistics.
 
     Parameters
@@ -1418,10 +1346,10 @@ def build_dataset_splits_from_npz_l2(
     stride_eval: int = 1,
     train_frac: float = 0.7,
     val_frac: float = 0.1,
-    test_frac: Optional[float] = None,
-    train_end: Optional[int] = None,
-    val_end: Optional[int] = None,
-) -> Dict[str, object]:
+    test_frac: float | None = None,
+    train_end: int | None = None,
+    val_end: int | None = None,
+) -> dict[str, object]:
     """Chronological split for a *preprocessed* standardized L2 NPZ file.
 
     For datasets that are not off-the-shelf (exchange dumps, Kaggle files, etc.),
@@ -1568,10 +1496,10 @@ def build_dataset_splits_from_cryptos(
     stride_eval: int = 1,
     train_frac: float = 0.7,
     val_frac: float = 0.1,
-    test_frac: Optional[float] = None,
-    train_end: Optional[int] = None,
-    val_end: Optional[int] = None,
-) -> Dict[str, object]:
+    test_frac: float | None = None,
+    train_end: int | None = None,
+    val_end: int | None = None,
+) -> dict[str, object]:
     """Named dataset helper for the prepared Tardis crypto L2 archive."""
     resolved_path = path or default_cryptos_npz_path()
     if not os.path.exists(resolved_path):
@@ -1599,10 +1527,10 @@ def build_dataset_splits_from_lobster_synthetic(
     stride_eval: int = 1,
     train_frac: float = 0.7,
     val_frac: float = 0.1,
-    test_frac: Optional[float] = None,
-    train_end: Optional[int] = None,
-    val_end: Optional[int] = None,
-) -> Dict[str, object]:
+    test_frac: float | None = None,
+    train_end: int | None = None,
+    val_end: int | None = None,
+) -> dict[str, object]:
     resolved_profile = profile_path or default_lobster_synth_profile_path()
     if not os.path.exists(resolved_profile):
         download_lobster_synthetic_profile(resolved_profile)
@@ -1644,7 +1572,7 @@ def build_dataset_splits_from_lobster_synthetic(
 # -----------------------------
 def compute_basic_l2_metrics(
     ask_p: np.ndarray, ask_v: np.ndarray, bid_p: np.ndarray, bid_v: np.ndarray
-) -> Dict[str, float]:
+) -> dict[str, float]:
     spread = ask_p[:, 0] - bid_p[:, 0]
     depth = ask_v.sum(axis=1) + bid_v.sum(axis=1)
     imb = (bid_v.sum(axis=1) - ask_v.sum(axis=1)) / (depth + 1e-8)

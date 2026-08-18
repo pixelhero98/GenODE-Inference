@@ -6,8 +6,9 @@ import csv
 import hashlib
 import json
 from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -126,15 +127,15 @@ from genode.solver_protocol import normalize_solver_keys, normalize_solver_nfe_f
 RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_seen_unseen_phase_context_v4"
 CONTEXT_REWARD_PROTOCOL_VERSION = "conditional_primary_metric_context_rewards_v2"
 DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
-DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = CANONICAL_SEEN_NFES
-DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
+DEFAULT_TARGET_NFE_VALUES: tuple[int, ...] = CANONICAL_SEEN_NFES
+DEFAULT_SEEDS: tuple[int, ...] = (0, 1, 2)
 CONTEXT_EMBEDDING_EXPORT_MAX_BATCH_SIZE = 64
 CONTEXT_EMBEDDING_EXPORT_FALLBACK_BATCH_SIZE = 2
-DEFAULT_SCHEDULES: Tuple[str, ...] = EXPERIMENTAL_FIXED_SCHEDULE_KEYS
+DEFAULT_SCHEDULES: tuple[str, ...] = EXPERIMENTAL_FIXED_SCHEDULE_KEYS
 SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_evaluation_phase_context_capped_v4"
-SUPPORTED_SPLIT_PHASES: Tuple[str, ...] = (LOCKED_TEST_PHASE, VALIDATION_PHASE, TRAIN_TUNING_PHASE)
+SUPPORTED_SPLIT_PHASES: tuple[str, ...] = (LOCKED_TEST_PHASE, VALIDATION_PHASE, TRAIN_TUNING_PHASE)
 
-ROW_RECORD_FIELDS: Tuple[str, ...] = (
+ROW_RECORD_FIELDS: tuple[str, ...] = (
     "benchmark_family",
     "canonical_layout_version",
     "scenario_key",
@@ -247,7 +248,7 @@ ROW_RECORD_FIELDS: Tuple[str, ...] = (
     "train_tuning_val_split_fraction",
 )
 
-CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
+CONTEXT_ROW_FIELDS: tuple[str, ...] = (
     "benchmark_family",
     "canonical_layout_version",
     "scenario_key",
@@ -373,7 +374,7 @@ _assert_unique_fields("ROW_RECORD_FIELDS", ROW_RECORD_FIELDS)
 _assert_unique_fields("CONTEXT_ROW_FIELDS", CONTEXT_ROW_FIELDS)
 
 
-def _optional_float(value: Any) -> Optional[float]:
+def _optional_float(value: Any) -> float | None:
     if value is None:
         return None
     try:
@@ -385,21 +386,21 @@ def _optional_float(value: Any) -> Optional[float]:
     return cast
 
 
-def _mean(values: Sequence[float]) -> Optional[float]:
+def _mean(values: Sequence[float]) -> float | None:
     arr = np.asarray([float(x) for x in values if x is not None and np.isfinite(float(x))], dtype=np.float64)
     if arr.size == 0:
         return None
     return float(np.mean(arr))
 
 
-def _std(values: Sequence[float]) -> Optional[float]:
+def _std(values: Sequence[float]) -> float | None:
     arr = np.asarray([float(x) for x in values if x is not None and np.isfinite(float(x))], dtype=np.float64)
     if arr.size <= 1:
         return 0.0 if arr.size == 1 else None
     return float(np.std(arr, ddof=1))
 
 
-def _safe_relative_gain(value: Any, baseline_value: Any) -> Optional[float]:
+def _safe_relative_gain(value: Any, baseline_value: Any) -> float | None:
     v = _optional_float(value)
     b = _optional_float(baseline_value)
     if v is None or b is None or abs(float(b)) <= 1e-12:
@@ -407,7 +408,7 @@ def _safe_relative_gain(value: Any, baseline_value: Any) -> Optional[float]:
     return float(1.0 - float(v) / float(b))
 
 
-def _safe_log_utility_gain(value: Any, baseline_value: Any, *, eps: float = 1e-12) -> Optional[float]:
+def _safe_log_utility_gain(value: Any, baseline_value: Any, *, eps: float = 1e-12) -> float | None:
     v = _optional_float(value)
     b = _optional_float(baseline_value)
     if v is None or b is None:
@@ -458,7 +459,7 @@ def _validate_recorder_artifact_paths(
     run_config_path: Path,
     combined_summary_path: Path,
     write_context_rows: bool,
-    input_paths: Optional[Mapping[str, Path]] = None,
+    input_paths: Mapping[str, Path] | None = None,
 ) -> None:
     suffix_checks = [
         (jsonl_path, ".jsonl", "row JSONL name"),
@@ -475,7 +476,7 @@ def _validate_recorder_artifact_paths(
         if path.suffix.casefold() != suffix:
             raise ValueError(f"{label} must end in {suffix!r}.")
 
-    artifacts: Dict[str, Path] = {
+    artifacts: dict[str, Path] = {
         "row JSONL": jsonl_path,
         "row CSV": csv_path,
         "run configuration": run_config_path,
@@ -491,7 +492,7 @@ def _validate_recorder_artifact_paths(
                 ),
             }
         )
-    names_by_path: Dict[Path, List[str]] = {}
+    names_by_path: dict[Path, list[str]] = {}
     for name, path in artifacts.items():
         names_by_path.setdefault(path.resolve(strict=False), []).append(name)
     output_collisions = {str(path): names for path, names in names_by_path.items() if len(names) > 1}
@@ -512,8 +513,8 @@ def _validate_recorder_artifact_paths(
         )
 
 
-def _runner_input_artifact_paths(cli_args: argparse.Namespace) -> Dict[str, Path]:
-    inputs: Dict[str, Path] = {}
+def _runner_input_artifact_paths(cli_args: argparse.Namespace) -> dict[str, Path]:
+    inputs: dict[str, Path] = {}
     for label, value in (
         ("backbone manifest", getattr(cli_args, "backbone_manifest", "")),
         ("schedule summary", getattr(cli_args, "schedule_summary_json", "")),
@@ -543,7 +544,7 @@ def _runner_input_artifact_paths(cli_args: argparse.Namespace) -> Dict[str, Path
     return inputs
 
 
-def _resolve_recorder_artifact_paths(out_root: Path, cli_args: argparse.Namespace) -> Dict[str, Path]:
+def _resolve_recorder_artifact_paths(out_root: Path, cli_args: argparse.Namespace) -> dict[str, Path]:
     paths = {
         "jsonl": _runner_output_path(
             out_root,
@@ -585,9 +586,9 @@ def _resolve_recorder_artifact_paths(out_root: Path, cli_args: argparse.Namespac
     return paths
 
 
-def _parse_schedule_names(text: str) -> List[str]:
+def _parse_schedule_names(text: str) -> list[str]:
     names = [name.strip().lower() for name in parse_csv(text)]
-    unknown: List[str] = []
+    unknown: list[str] = []
     for name in names:
         try:
             reference_clock_provenance(name)
@@ -598,14 +599,14 @@ def _parse_schedule_names(text: str) -> List[str]:
     return names
 
 
-def _parse_summary_schedule_names(text: str) -> List[str]:
+def _parse_summary_schedule_names(text: str) -> list[str]:
     names = [name.strip().lower() for name in parse_csv(text)]
     return names
 
 
-def _duplicate_values(values: Sequence[str]) -> List[str]:
+def _duplicate_values(values: Sequence[str]) -> list[str]:
     seen: set[str] = set()
-    duplicates: List[str] = []
+    duplicates: list[str] = []
     duplicate_seen: set[str] = set()
     for value in values:
         text = str(value)
@@ -622,8 +623,8 @@ def _raise_if_duplicate_values(values: Sequence[str], *, label: str) -> None:
         raise ValueError(f"Duplicate {label}: {duplicates}")
 
 
-def _load_schedule_summary_cases(path_text: str) -> List[Dict[str, Any]]:
-    cases: List[Dict[str, Any]] = []
+def _load_schedule_summary_cases(path_text: str) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
     if not str(path_text).strip():
         return cases
     path = resolve_project_path(str(path_text))
@@ -684,7 +685,7 @@ def _load_schedule_summary_cases(path_text: str) -> List[Dict[str, Any]]:
     return cases
 
 
-def parse_molecule_datasets(text: str) -> Tuple[str, ...]:
+def parse_molecule_datasets(text: str) -> tuple[str, ...]:
     requested = tuple(parse_csv(str(text)))
     if not requested:
         return ()
@@ -695,7 +696,7 @@ def parse_molecule_datasets(text: str) -> Tuple[str, ...]:
     return requested
 
 
-def _target_nfe_values_for_args(cli_args: argparse.Namespace) -> List[int]:
+def _target_nfe_values_for_args(cli_args: argparse.Namespace) -> list[int]:
     role = str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN) or NFE_ROLE_SEEN)
     canonical = tuple(int(value) for value in canonical_nfes_for_role(role))
     raw = str(getattr(cli_args, "target_nfe_values", "") or "").strip()
@@ -711,7 +712,7 @@ def _target_nfe_values_for_args(cli_args: argparse.Namespace) -> List[int]:
     return [int(value) for value in values]
 
 
-def _checkpoint_steps_for_args(cli_args: argparse.Namespace) -> List[int]:
+def _checkpoint_steps_for_args(cli_args: argparse.Namespace) -> list[int]:
     raw = str(getattr(cli_args, "checkpoint_steps", "") or "").strip()
     if raw:
         values = parse_int_csv(raw)
@@ -747,7 +748,7 @@ def _args_for_checkpoint_step(cli_args: argparse.Namespace, checkpoint_step: int
     return copied
 
 
-def _path_fingerprint(path: str | Path) -> Dict[str, Any]:
+def _path_fingerprint(path: str | Path) -> dict[str, Any]:
     resolved = resolve_project_path(str(path))
     payload = path_fingerprint(resolved)
     payload["logical_path"] = _logical_artifact_path(resolved)
@@ -763,7 +764,7 @@ def _logical_artifact_path(path: str | Path) -> str:
         return str(resolved.name)
 
 
-def _data_path_fingerprints(cli_args: argparse.Namespace) -> Dict[str, Any]:
+def _data_path_fingerprints(cli_args: argparse.Namespace) -> dict[str, Any]:
     conditional_paths = {
         "cryptos": str(cli_args.cryptos_path).strip() or default_cryptos_data_path(),
         "lobster_synthetic": str(getattr(cli_args, "lobster_synthetic_profile_path", "")).strip()
@@ -798,7 +799,7 @@ def _fingerprint_identities(value: Any) -> Any:
     return value
 
 
-def _sanitized_cli_args(cli_args: argparse.Namespace) -> Dict[str, Any]:
+def _sanitized_cli_args(cli_args: argparse.Namespace) -> dict[str, Any]:
     path_fields = {
         "out_root",
         "dataset_root",
@@ -810,7 +811,7 @@ def _sanitized_cli_args(cli_args: argparse.Namespace) -> Dict[str, Any]:
         "long_term_st_path",
         "schedule_summary_json",
     }
-    payload: Dict[str, Any] = {}
+    payload: dict[str, Any] = {}
     for key, value in vars(cli_args).items():
         if key in path_fields:
             text = str(value).strip()
@@ -820,7 +821,7 @@ def _sanitized_cli_args(cli_args: argparse.Namespace) -> Dict[str, Any]:
     return payload
 
 
-def _context_reward_protocol_payload(cli_args: argparse.Namespace) -> Dict[str, Any]:
+def _context_reward_protocol_payload(cli_args: argparse.Namespace) -> dict[str, Any]:
     conditional_datasets = parse_conditional_generation_datasets(str(cli_args.conditional_generation_datasets))
     return {
         "version": CONTEXT_REWARD_PROTOCOL_VERSION,
@@ -847,7 +848,7 @@ def _context_sample_cap(cli_args: argparse.Namespace) -> int:
     return int(cap)
 
 
-def _split_example_cap(cli_args: argparse.Namespace, split_phase: str) -> Tuple[int | None, str]:
+def _split_example_cap(cli_args: argparse.Namespace, split_phase: str) -> tuple[int | None, str]:
     context_cap = _context_sample_cap(cli_args)
     if str(split_phase) == TRAIN_TUNING_PHASE:
         return int(context_cap), "train_tuning_context_sample_count"
@@ -895,7 +896,7 @@ def _choose_stratified_train_tuning_positions(
     dataset: str,
     salt: str,
     max_examples: int | None = None,
-) -> Tuple[List[int], int]:
+) -> tuple[list[int], int]:
     target_examples = train_tuning_target_example_count(
         int(total),
         fraction=float(fraction),
@@ -923,7 +924,7 @@ def _train_tuning_metadata(
     uncapped_candidate_examples: int,
     sampling_mode: str = TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
     reference_examples: Any = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return {
         "train_tuning_fraction": float(cli_args.eval_train_fraction),
         "train_tuning_seed": int(tuning_seed),
@@ -945,7 +946,7 @@ def _cap_context_indices(
     seed: int,
     salt: str,
     uncapped_candidate_examples: int | None = None,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     candidate = [int(idx) for idx in indices]
     selected_cap = int(cap)
     if selected_cap <= 0:
@@ -984,12 +985,12 @@ def _cap_context_index_groups(
     cap: int,
     seed: int,
     salt: str,
-) -> Tuple[List[np.ndarray], List[Dict[str, Any]], Dict[str, Any]]:
+) -> tuple[list[np.ndarray], list[dict[str, Any]], dict[str, Any]]:
     selected_cap = int(cap)
     if selected_cap <= 0:
         raise ValueError(f"selected_examples_cap must be positive, got {selected_cap!r}.")
-    normalized: List[Dict[str, Any]] = []
-    flat_candidates: List[Tuple[int, int]] = []
+    normalized: list[dict[str, Any]] = []
+    flat_candidates: list[tuple[int, int]] = []
     uncapped_total = 0
     for group_idx, group in enumerate(groups):
         candidate = [int(idx) for idx in group.get("candidate_indices", [])]
@@ -1006,7 +1007,7 @@ def _cap_context_index_groups(
         flat_candidates.extend((int(group_idx), int(pos)) for pos in range(len(candidate)))
     if not flat_candidates:
         raise ValueError("Global context selection requires at least one candidate example.")
-    offsets: List[int] = []
+    offsets: list[int] = []
     cursor = 0
     for group in normalized:
         offsets.append(int(cursor))
@@ -1036,12 +1037,12 @@ def _cap_context_index_groups(
             kept_positions.extend(int(available_positions[int(pos)]) for pos in chosen)
         kept_positions = sorted(kept_positions)
         was_capped = True
-    selected_by_group: List[List[int]] = [[] for _ in normalized]
+    selected_by_group: list[list[int]] = [[] for _ in normalized]
     for flat_pos in kept_positions:
         group_idx, candidate_pos = flat_candidates[int(flat_pos)]
         selected_by_group[group_idx].append(int(normalized[group_idx]["candidate_indices"][candidate_pos]))
     selected_total = int(sum(len(indices) for indices in selected_by_group))
-    records: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     for group, selected in zip(normalized, selected_by_group, strict=False):
         record = dict(group.get("selection_record", {}))
         record.update(
@@ -1074,7 +1075,7 @@ def _cap_context_index_groups(
 
 def _selection_metadata_row_fields(
     selection_meta: Mapping[str, Any], *, cap_source: str, context_sample_count: int
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     fields = {
         "example_selection_protocol": str(selection_meta["example_selection_protocol"]),
         "context_sample_count": int(context_sample_count),
@@ -1176,7 +1177,7 @@ def _row_signature(
     )
 
 
-def _row_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
+def _row_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
     return (
         row.get("protocol_hash"),
         row.get("benchmark_family"),
@@ -1217,8 +1218,8 @@ def _write_context_row_csv(csv_path: Path, rows: Sequence[Mapping[str, Any]]) ->
             writer.writerow({field: row.get(field) for field in CONTEXT_ROW_FIELDS})
 
 
-def _load_context_rows(csv_path: Path) -> Dict[str, Dict[str, Any]]:
-    rows: Dict[str, Dict[str, Any]] = {}
+def _load_context_rows(csv_path: Path) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
     if not csv_path.exists():
         return rows
     with csv_path.open("r", newline="", encoding="utf-8") as fh:
@@ -1231,7 +1232,7 @@ def _load_context_rows(csv_path: Path) -> Dict[str, Dict[str, Any]]:
     return rows
 
 
-def _load_rows(jsonl_path: Path, *, protocol_hash: str) -> Dict[Tuple[Any, ...], Dict[str, Any]]:
+def _load_rows(jsonl_path: Path, *, protocol_hash: str) -> dict[tuple[Any, ...], dict[str, Any]]:
     rows, _ = _load_rows_with_duplicate_report(jsonl_path, protocol_hash=protocol_hash)
     return rows
 
@@ -1240,10 +1241,10 @@ def _load_rows_with_duplicate_report(
     jsonl_path: Path,
     *,
     protocol_hash: str,
-) -> Tuple[Dict[Tuple[Any, ...], Dict[str, Any]], Dict[str, Any]]:
-    rows: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
-    duplicate_keys: set[Tuple[Any, ...]] = set()
-    duplicate_examples: List[List[Any]] = []
+) -> tuple[dict[tuple[Any, ...], dict[str, Any]], dict[str, Any]]:
+    rows: dict[tuple[Any, ...], dict[str, Any]] = {}
+    duplicate_keys: set[tuple[Any, ...]] = set()
+    duplicate_examples: list[list[Any]] = []
     duplicate_extra_count = 0
     if not jsonl_path.exists():
         return rows, {"duplicate_key_count": 0, "duplicate_extra_count": 0, "duplicate_examples": []}
@@ -1270,7 +1271,7 @@ def _load_rows_with_duplicate_report(
     }
 
 
-def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str, Any]:
+def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> dict[str, Any]:
     out_root.mkdir(parents=True, exist_ok=True)
     artifact_paths = _resolve_recorder_artifact_paths(out_root, cli_args)
     jsonl_path = artifact_paths["jsonl"]
@@ -1496,7 +1497,7 @@ def _time_bin_for_target(t0: int, chosen_t0s: Sequence[int]) -> str:
     return str(min(9, int(np.floor(10.0 * rank / max(1, values.size)))))
 
 
-def _positive_int_or_none(value: Any) -> Optional[int]:
+def _positive_int_or_none(value: Any) -> int | None:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -1511,7 +1512,7 @@ def _context_embedding_export_batch_size(cfg: Any | None = None) -> int:
         raise ValueError(
             "CONTEXT_EMBEDDING_EXPORT_MAX_BATCH_SIZE and CONTEXT_EMBEDDING_EXPORT_FALLBACK_BATCH_SIZE must be positive."
         )
-    configured_batch_size: Optional[int] = None
+    configured_batch_size: int | None = None
     if cfg is not None:
         configured_batch_size = _positive_int_or_none(getattr(cfg, "batch_size", None))
         train_cfg = getattr(cfg, "train", None)
@@ -1528,7 +1529,7 @@ def _extract_conditional_context_embeddings(
     chosen_t0s: Sequence[int],
     device: torch.device,
     batch_size: int | None = None,
-) -> Dict[int, List[float]]:
+) -> dict[int, list[float]]:
     if not chosen_t0s:
         return {}
     backbone = getattr(model, "backbone", None)
@@ -1542,14 +1543,14 @@ def _extract_conditional_context_embeddings(
     model_train = getattr(model, "train", None)
     if callable(model_eval):
         model_eval()
-    out: Dict[int, List[float]] = {}
+    out: dict[int, list[float]] = {}
     try:
         with torch.no_grad():
             chosen = [int(t0) for t0 in chosen_t0s]
             for start in range(0, len(chosen), effective_batch_size):
                 batch_t0s = chosen[start : start + effective_batch_size]
                 hist_rows = []
-                cond_rows: List[torch.Tensor] = []
+                cond_rows: list[torch.Tensor] = []
                 saw_unconditional_row = False
                 for t0 in batch_t0s:
                     hist, _tgt, _fut, cond, _meta = _parse_batch(_get_dataset_item_by_t(ds, int(t0)))
@@ -1612,10 +1613,10 @@ def _conditional_context_records(
     evaluation_protocol_hash: str = "",
     chosen_t0s_hash: str = "",
     train_tuning_context_metadata: Mapping[str, Any] | None = None,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     from genode.gico.policy import schedule_grid_hash, stable_context_id
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     history_len = int(getattr(cfg, "history_len", 0) or 0)
     aggregate_metrics = dict(metric_row or {})
     uniform_aggregate_metrics = dict(uniform_metric_row or {})
@@ -1760,7 +1761,7 @@ def _conditional_context_records(
     return rows
 
 
-def _existing_complete_row(row_recorder: Mapping[str, Any], row_key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
+def _existing_complete_row(row_recorder: Mapping[str, Any], row_key: tuple[Any, ...]) -> dict[str, Any] | None:
     row = row_recorder["rows_by_key"].get(row_key)
     if row is not None and str(row.get("row_status")) == "complete":
         return dict(row)
@@ -1779,9 +1780,9 @@ def _pending_scheduler_cases(
     target_nfe: int,
     solver_key: str,
     scheduler_cases: Sequence[Mapping[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    existing: List[Dict[str, Any]] = []
-    pending: List[Dict[str, Any]] = []
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    existing: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
     for case in scheduler_cases:
         scheduler_key = str(case["scheduler_key"])
         case_solver = str(case.get("solver_key", "") or "")
@@ -1850,7 +1851,7 @@ def _schedule_row_resume_identity(
     scheduler_key: str,
     member_key: str = "",
     stratum: str = "",
-) -> Tuple[Any, ...]:
+) -> tuple[Any, ...]:
     return (
         str(benchmark_family),
         str(dataset),
@@ -1865,7 +1866,7 @@ def _schedule_row_resume_identity(
     )
 
 
-def _schedule_row_resume_identity_from_row(row: Mapping[str, Any]) -> Tuple[Any, ...]:
+def _schedule_row_resume_identity_from_row(row: Mapping[str, Any]) -> tuple[Any, ...]:
     return _schedule_row_resume_identity(
         benchmark_family=str(row.get("benchmark_family", "")),
         dataset=str(row.get("dataset", row.get("scenario_key", ""))),
@@ -1880,7 +1881,7 @@ def _schedule_row_resume_identity_from_row(row: Mapping[str, Any]) -> Tuple[Any,
     )
 
 
-def _expected_schedule_row_identities(cli_args: argparse.Namespace) -> Tuple[Tuple[Any, ...], ...]:
+def _expected_schedule_row_identities(cli_args: argparse.Namespace) -> tuple[tuple[Any, ...], ...]:
     split_phase = str(cli_args.split_phase)
     selected_seeds = parse_int_csv(str(cli_args.seeds))
     target_nfes = _target_nfe_values_for_args(cli_args)
@@ -1890,7 +1891,7 @@ def _expected_schedule_row_identities(cli_args: argparse.Namespace) -> Tuple[Tup
         str(getattr(cli_args, "schedule_summary_json", "")).strip()
         or str(getattr(cli_args, "summary_scheduler_names", "")).strip()
     )
-    identities: set[Tuple[Any, ...]] = set()
+    identities: set[tuple[Any, ...]] = set()
 
     def add_identities_for_dataset(
         *,
@@ -1977,7 +1978,7 @@ def _expected_schedule_row_identities(cli_args: argparse.Namespace) -> Tuple[Tup
     return tuple(sorted(identities, key=lambda item: tuple(str(part) for part in item)))
 
 
-def _positive_int_field(row: Mapping[str, Any], field: str) -> Optional[int]:
+def _positive_int_field(row: Mapping[str, Any], field: str) -> int | None:
     value = row.get(field)
     if value in (None, ""):
         return None
@@ -1988,7 +1989,7 @@ def _positive_int_field(row: Mapping[str, Any], field: str) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
-def _expected_context_rows_for_parent(row: Mapping[str, Any]) -> Optional[int]:
+def _expected_context_rows_for_parent(row: Mapping[str, Any]) -> int | None:
     for field in ("selected_examples", "eval_examples", "eval_windows", "num_eval_samples"):
         parsed = _positive_int_field(row, field)
         if parsed is not None:
@@ -2002,7 +2003,7 @@ def _schedule_context_outputs_complete(
     cli_args: argparse.Namespace,
     complete_rows: Sequence[Mapping[str, Any]],
     protocol_hash: str,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     if not _write_context_rows_enabled(cli_args):
         return True, ""
     context_csv_path = _runner_output_path(
@@ -2026,13 +2027,13 @@ def _schedule_context_outputs_complete(
         for row in _load_context_rows(context_csv_path).values()
         if str(row.get("protocol_hash", "")) == str(protocol_hash)
     ]
-    context_rows_by_parent: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    context_rows_by_parent: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in context_rows:
         parent = str(row.get("parent_row_signature", "") or "").strip()
         if parent:
             context_rows_by_parent[parent].append(row)
-    missing_parent_contexts: List[str] = []
-    short_parent_contexts: List[str] = []
+    missing_parent_contexts: list[str] = []
+    short_parent_contexts: list[str] = []
     for row in complete_rows:
         parent = str(row.get("row_signature", "") or "").strip()
         if not parent:
@@ -2064,7 +2065,7 @@ def _schedule_context_outputs_complete(
     return True, ""
 
 
-def schedule_row_output_status(out_root: Path, cli_args: argparse.Namespace) -> Dict[str, Any]:
+def schedule_row_output_status(out_root: Path, cli_args: argparse.Namespace) -> dict[str, Any]:
     out_root = resolve_project_path(str(out_root))
     protocol_hash = _protocol_config_fingerprint(cli_args)
     run_config_path = out_root / "run_config.json"
@@ -2154,7 +2155,7 @@ def schedule_row_output_status(out_root: Path, cli_args: argparse.Namespace) -> 
     }
 
 
-def _choose_molecule_indices(ds: Any, *, count: int, seed: int) -> List[int]:
+def _choose_molecule_indices(ds: Any, *, count: int, seed: int) -> list[int]:
     total = int(len(ds))
     if total <= 0:
         raise ValueError("Empty molecule evaluation split.")
@@ -2200,8 +2201,8 @@ def _molecule_context_records(
     uniform_by_context_id: Mapping[str, Mapping[str, Any]] | None,
     rollout_steps: int,
     train_tuning_context_metadata: Mapping[str, Any] | None = None,
-) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     uniform_by_context = dict(uniform_by_context_id or {})
     for metric_row in per_context_metrics:
         raw_context_id = str(metric_row["context_id"])
@@ -2325,8 +2326,8 @@ def _existing_uniform_context_rows(
     solver_key: str,
     target_nfe: int,
     checkpoint_id: str,
-) -> Dict[str, Mapping[str, Any]]:
-    out: Dict[str, Mapping[str, Any]] = {}
+) -> dict[str, Mapping[str, Any]]:
+    out: dict[str, Mapping[str, Any]] = {}
     for row in row_recorder.get("context_rows_by_signature", {}).values():
         if str(row.get("scheduler_key")) != UNIFORM_SCHEDULER_KEY:
             continue
@@ -2344,12 +2345,12 @@ def _existing_uniform_context_rows(
     return out
 
 
-def _fixed_schedule_details(scheduler_key: str, runtime_nfe: int) -> Dict[str, Any]:
+def _fixed_schedule_details(scheduler_key: str, runtime_nfe: int) -> dict[str, Any]:
     fixed_grid = build_schedule_grid(str(scheduler_key), int(runtime_nfe))
     if fixed_grid is None:
         raise ValueError(f"Unable to build fixed grid for scheduler={scheduler_key}")
     grid_hash = schedule_grid_hash(fixed_grid)
-    details: Dict[str, Any] = {
+    details: dict[str, Any] = {
         "time_grid": [float(x) for x in fixed_grid],
         "schedule_grid_hash": str(grid_hash),
         "reference_time_alignment": schedule_time_alignment(str(scheduler_key)),
@@ -2360,11 +2361,11 @@ def _fixed_schedule_details(scheduler_key: str, runtime_nfe: int) -> Dict[str, A
     return details
 
 
-def _schedule_details_from_case(case: Mapping[str, Any], runtime_nfe: int) -> Dict[str, Any]:
+def _schedule_details_from_case(case: Mapping[str, Any], runtime_nfe: int) -> dict[str, Any]:
     if "time_grid" not in case:
         return _fixed_schedule_details(str(case["scheduler_key"]), int(runtime_nfe))
     grid = validate_time_grid(case["time_grid"], macro_steps=int(runtime_nfe))
-    details: Dict[str, Any] = {
+    details: dict[str, Any] = {
         "time_grid": [float(x) for x in grid],
         "schedule_grid_hash": str(case.get("schedule_grid_hash") or schedule_grid_hash(grid)),
         "reference_time_alignment": str(case.get("reference_time_alignment", "summary_density_time_grid")),
@@ -2382,7 +2383,7 @@ def _schedule_details_from_case(case: Mapping[str, Any], runtime_nfe: int) -> Di
     return details
 
 
-def _evaluation_protocol_fields(result_row: Mapping[str, Any], *, eval_horizon: int) -> Dict[str, Any]:
+def _evaluation_protocol_fields(result_row: Mapping[str, Any], *, eval_horizon: int) -> dict[str, Any]:
     protocol = dict(result_row.get("evaluation_protocol", {}) or {})
     encoded = json.dumps(protocol, sort_keys=True, separators=(",", ":"))
     return {
@@ -2409,7 +2410,7 @@ def _build_row(
     metrics: Mapping[str, Any],
     row_signature: str,
     protocol_hash: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     selection_metric = selection_metric_for_family(str(benchmark_family))
     nfe = normalize_solver_nfe_fields(
         str(solver_key),
@@ -2522,7 +2523,7 @@ def _scheduler_cases_for_datasets(
     datasets: Iterable[str],
     *,
     include_summary_cases: bool = True,
-) -> Dict[str, List[Dict[str, Any]]]:
+) -> dict[str, list[dict[str, Any]]]:
     schedule_names = _parse_schedule_names(str(cli_args.baseline_scheduler_names))
     _raise_if_duplicate_values(schedule_names, label="fixed diffusion-flow schedules")
     if UNIFORM_SCHEDULER_KEY in schedule_names:
@@ -2547,8 +2548,8 @@ def _scheduler_cases_for_datasets(
     if overlap:
         raise ValueError(f"Summary-derived schedules duplicate fixed schedules: {overlap}")
     cases = [{"scheduler_key": key} for key in schedule_names] + summary_cases
-    case_keys: set[Tuple[str, str, str, str]] = set()
-    duplicate_case_keys: List[List[str]] = []
+    case_keys: set[tuple[str, str, str, str]] = set()
+    duplicate_case_keys: list[list[str]] = []
     for case in cases:
         case_key = (
             str(case.get("scheduler_key", "")),
@@ -2573,12 +2574,12 @@ def _run_forecast_phase(
     split_phase: str,
     seeds: Sequence[int],
     scheduler_cases_by_dataset: Mapping[str, Sequence[Mapping[str, Any]]],
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     dataset_root = resolve_project_path(str(cli_args.dataset_root))
     shared_backbone_root = resolve_project_path(str(cli_args.shared_backbone_root))
     device = resolve_torch_device(str(cli_args.device))
-    dataset_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
-    rows: List[Dict[str, Any]] = []
+    dataset_cache: dict[tuple[str, int], dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
     datasets = parse_forecast_datasets(str(cli_args.forecast_datasets))
     target_nfes = _target_nfe_values_for_args(cli_args)
     checkpoint_steps = _checkpoint_steps_for_args(cli_args)
@@ -2607,7 +2608,7 @@ def _run_forecast_phase(
                 eval_ds = splits["val"]
             else:
                 eval_ds = splits["test"]
-            selection_groups: List[Dict[str, Any]] = []
+            selection_groups: list[dict[str, Any]] = []
             for seed in seeds:
                 if str(split_phase) == TRAIN_TUNING_PHASE:
                     if selected_examples_cap is None:
@@ -2660,7 +2661,7 @@ def _run_forecast_phase(
                 seed=int(cli_args.train_tuning_seed) + 1_000 * dataset_idx + int(checkpoint_step),
                 salt=f"forecast|{dataset}|{split_phase}|{checkpoint_step}",
             )
-            selections_by_seed: Dict[int, Tuple[np.ndarray, Dict[str, Any], int]] = {}
+            selections_by_seed: dict[int, tuple[np.ndarray, dict[str, Any], int]] = {}
             for selected, record in zip(selected_groups, selection_records, strict=False):
                 selections_by_seed[int(record["seed"])] = (selected, record, int(record["tuning_seed"]))
             for seed in seeds:
@@ -2684,7 +2685,7 @@ def _run_forecast_phase(
                             scheduler_cases=scheduler_cases,
                         )
                         rows.extend(existing_rows)
-                        cell_uniform_metrics: Optional[Mapping[str, Any]] = None
+                        cell_uniform_metrics: Mapping[str, Any] | None = None
                         for existing_row in existing_rows:
                             if str(existing_row.get("scheduler_key")) == UNIFORM_SCHEDULER_KEY:
                                 cell_uniform_metrics = existing_row
@@ -2846,11 +2847,11 @@ def _run_conditional_generation_phase(
     split_phase: str,
     seeds: Sequence[int],
     scheduler_cases_by_dataset: Mapping[str, Sequence[Mapping[str, Any]]],
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     shared_backbone_root = resolve_project_path(str(cli_args.shared_backbone_root))
     device = resolve_torch_device(str(cli_args.device))
-    dataset_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
-    rows: List[Dict[str, Any]] = []
+    dataset_cache: dict[tuple[str, int], dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
     datasets = parse_conditional_generation_datasets(str(cli_args.conditional_generation_datasets))
     target_nfes = _target_nfe_values_for_args(cli_args)
     checkpoint_steps = _checkpoint_steps_for_args(cli_args)
@@ -2905,7 +2906,7 @@ def _run_conditional_generation_phase(
                         else int(resolved_eval_windows(step_args, str(dataset), split_key))
                     )
                 )
-            selection_groups: List[Dict[str, Any]] = []
+            selection_groups: list[dict[str, Any]] = []
             for seed in seeds:
                 if str(split_phase) == TRAIN_TUNING_PHASE:
                     selection_seed = int(cli_args.train_tuning_seed) + int(seed) + 1_000 * dataset_idx
@@ -2949,7 +2950,7 @@ def _run_conditional_generation_phase(
                 seed=1_000 * int(dataset_idx) + int(checkpoint_step),
                 salt=f"conditional|{dataset}|{split_phase}|{checkpoint_step}",
             )
-            selections_by_seed: Dict[int, Tuple[np.ndarray, Dict[str, Any], int]] = {}
+            selections_by_seed: dict[int, tuple[np.ndarray, dict[str, Any], int]] = {}
             for selected, record in zip(selected_groups, selection_records, strict=False):
                 selections_by_seed[int(record["seed"])] = (selected, record, int(record["selection_seed"]))
             for seed in seeds:
@@ -2972,7 +2973,7 @@ def _run_conditional_generation_phase(
                             scheduler_cases=list(scheduler_cases_by_dataset[str(dataset)]),
                         )
                         rows.extend(existing_rows)
-                        cell_uniform_metrics: Optional[Mapping[str, Any]] = None
+                        cell_uniform_metrics: Mapping[str, Any] | None = None
                         for existing_row in existing_rows:
                             if str(existing_row.get("scheduler_key")) == UNIFORM_SCHEDULER_KEY:
                                 cell_uniform_metrics = existing_row
@@ -2985,13 +2986,13 @@ def _run_conditional_generation_phase(
                             target_nfe=int(target_nfe),
                             checkpoint_id=str(checkpoint["checkpoint_id"]),
                         )
-                        cell_uniform_per_window_metrics_by_t0: Dict[int, Dict[str, Any]] = {
+                        cell_uniform_per_window_metrics_by_t0: dict[int, dict[str, Any]] = {
                             int(row["target_t"]): dict(row)
                             for row in existing_uniform_context_rows.values()
                             if str(row.get("context_schema")) == "conditional_generation_window"
                             and row.get("target_t", "") not in ("", None)
                         }
-                        conditional_embeddings_by_t0: Dict[int, List[float]] = {}
+                        conditional_embeddings_by_t0: dict[int, list[float]] = {}
                         if _write_context_rows_enabled(cli_args):
                             conditional_embeddings_by_t0 = _extract_conditional_context_embeddings(
                                 model=model,
@@ -3145,7 +3146,7 @@ def _run_conditional_generation_phase(
                                         else None
                                     ),
                                 )
-                                context_embeddings: Dict[str, List[float]] = {}
+                                context_embeddings: dict[str, list[float]] = {}
                                 for context_row in context_rows:
                                     t0 = int(context_row["target_t"])
                                     if t0 in conditional_embeddings_by_t0:
@@ -3182,20 +3183,20 @@ def _run_molecule_phase(
     split_phase: str,
     seeds: Sequence[int],
     scheduler_cases_by_dataset: Mapping[str, Sequence[Mapping[str, Any]]],
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     manifest_path = resolve_project_path(str(cli_args.backbone_manifest))
     if not manifest_path.exists():
         raise FileNotFoundError(f"Molecule schedule evaluation requires backbone manifest: {manifest_path}")
     backbone_manifest = load_backbone_manifest(manifest_path)
     group_root = resolve_project_path(str(getattr(cli_args, "molecule_group_root", default_molecule_group_root())))
     device = resolve_torch_device(str(cli_args.device))
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     datasets = parse_molecule_datasets(str(getattr(cli_args, "molecule_datasets", "")))
     target_nfes = _target_nfe_values_for_args(cli_args)
     checkpoint_steps = _checkpoint_steps_for_args(cli_args)
     nfe_role = str(getattr(cli_args, "nfe_role", NFE_ROLE_SEEN) or NFE_ROLE_SEEN)
     split_key = _molecule_split_for_phase(str(split_phase))
-    cache: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
+    cache: dict[tuple[str, str, str, int], dict[str, Any]] = {}
     for dataset_idx, dataset in enumerate(datasets):
         group_manifest = load_molecule_group_manifest(str(dataset), group_root)
         members = [dict(member) for member in trainable_molecule_group_members(group_manifest)]
@@ -3203,8 +3204,8 @@ def _run_molecule_phase(
             raise ValueError(f"Molecule group {dataset!r} has no trainable fixed-shape members.")
         for checkpoint_step in checkpoint_steps:
             selected_examples_cap, selected_examples_cap_source = _split_example_cap(cli_args, str(split_phase))
-            selection_groups: List[Dict[str, Any]] = []
-            work_items: List[Dict[str, Any]] = []
+            selection_groups: list[dict[str, Any]] = []
+            work_items: list[dict[str, Any]] = []
             for member_idx, member in enumerate(members):
                 member_key = str(member["member_key"])
                 stratum = str(member["stratum"])
@@ -3343,7 +3344,7 @@ def _run_molecule_phase(
                             scheduler_cases=list(scheduler_cases_by_dataset[str(dataset)]),
                         )
                         rows.extend(existing_rows)
-                        uniform_context_by_id: Dict[str, Mapping[str, Any]] = _existing_uniform_context_rows(
+                        uniform_context_by_id: dict[str, Mapping[str, Any]] = _existing_uniform_context_rows(
                             row_recorder,
                             dataset=str(dataset),
                             split_phase=str(split_phase),
@@ -3514,8 +3515,8 @@ def _run_molecule_phase(
 
 
 def _candidate_rows_by_phase(
-    rows: Sequence[Mapping[str, Any]], split_phase: str, solver_names: Optional[Sequence[str]] = None
-) -> List[Dict[str, Any]]:
+    rows: Sequence[Mapping[str, Any]], split_phase: str, solver_names: Sequence[str] | None = None
+) -> list[dict[str, Any]]:
     solver_filter = None if solver_names is None else {str(x) for x in solver_names}
     out = []
     for row in rows:
@@ -3529,8 +3530,8 @@ def _candidate_rows_by_phase(
     return out
 
 
-def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    groups: Dict[Tuple[Any, ...], List[Mapping[str, Any]]] = {}
+def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
     for row in rows:
         key = (
             row.get("benchmark_family"),
@@ -3543,7 +3544,7 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
             row.get("train_budget_label"),
         )
         groups.setdefault(key, []).append(row)
-    summaries: List[Dict[str, Any]] = []
+    summaries: list[dict[str, Any]] = []
     metric_names = (
         "forecast_crps",
         "forecast_mse",
@@ -3576,7 +3577,7 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
     )
     for key, group in sorted(groups.items(), key=lambda item: tuple(str(x) for x in item[0])):
         family, dataset, nfe_role, checkpoint_step, target_nfe, solver_key, scheduler_key, budget = key
-        summary: Dict[str, Any] = {
+        summary: dict[str, Any] = {
             "benchmark_family": family,
             "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
             "scenario_key": dataset,
@@ -3625,7 +3626,7 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
     return summaries
 
 
-def _aggregate_main_table(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+def _aggregate_main_table(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     seed_summaries = _aggregate_seed_rows(rows)
     augmented = augment_rows_with_relative_metrics(seed_summaries)
     return {
@@ -3640,7 +3641,7 @@ def _aggregate_main_table(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
+def _prep_summary(cli_args: argparse.Namespace) -> dict[str, Any]:
     schedules = _parse_schedule_names(str(cli_args.baseline_scheduler_names))
     summary_schedules = _parse_summary_schedule_names(str(getattr(cli_args, "summary_scheduler_names", "")))
     solvers = list(normalize_solver_keys(str(cli_args.solver_names)))
@@ -3649,7 +3650,7 @@ def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
     manifest_path = (
         resolve_project_path(str(cli_args.backbone_manifest)) if str(cli_args.backbone_manifest).strip() else None
     )
-    manifest_summary: Dict[str, Any] = {"path": None, "ready_count": None, "missing_count": None}
+    manifest_summary: dict[str, Any] = {"path": None, "ready_count": None, "missing_count": None}
     if manifest_path is not None:
         resolved = manifest_path
         manifest_summary["path"] = _logical_artifact_path(resolved)
@@ -3765,7 +3766,7 @@ def build_argparser() -> argparse.ArgumentParser:
     return ap
 
 
-def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> Dict[str, Any]:
+def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> dict[str, Any]:
     out_root = resolve_project_path(str(cli_args.out_root))
     out_root.mkdir(parents=True, exist_ok=True)
     artifact_paths = _resolve_recorder_artifact_paths(out_root, cli_args)
@@ -3808,7 +3809,7 @@ def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> 
         str(getattr(cli_args, "schedule_summary_json", "")).strip()
         or str(getattr(cli_args, "summary_scheduler_names", "")).strip()
     )
-    scheduler_cases: Dict[str, List[Dict[str, Any]]] = {}
+    scheduler_cases: dict[str, list[dict[str, Any]]] = {}
     if forecast_datasets:
         scheduler_cases.update(
             _scheduler_cases_for_datasets(

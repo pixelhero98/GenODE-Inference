@@ -5,9 +5,10 @@ import fnmatch
 import json
 import re
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 from zipfile import ZipFile
 
 import numpy as np
@@ -72,17 +73,17 @@ ATOM_COVALENT_RADIUS = {
 @dataclass(frozen=True)
 class MoleculeProcessedData:
     coords: np.ndarray
-    atom_symbols: Tuple[str, ...]
+    atom_symbols: tuple[str, ...]
     iso_ids: np.ndarray
     trajectory_ids: np.ndarray
-    trajectory_keys: Tuple[str, ...]
+    trajectory_keys: tuple[str, ...]
     segment_ends: np.ndarray
-    frame_counts: Dict[int, int]
+    frame_counts: dict[int, int]
     duplicate_step_mask: np.ndarray
     transition_step_mask: np.ndarray
     discontinuity_step_mask: np.ndarray
     frame_rmsd: np.ndarray
-    metadata: Dict[str, Any]
+    metadata: dict[str, Any]
 
     @property
     def dataset_key(self) -> str:
@@ -117,7 +118,7 @@ class MoleculeStats:
     context_std: np.ndarray
     reference_coords: np.ndarray
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "target_mean": self.target_mean.tolist(),
             "target_std": self.target_std.tolist(),
@@ -194,7 +195,7 @@ def molecule_processed_metadata_path(
     return root / "molecule_3d_metadata.json"
 
 
-def _xyz_names(zf: ZipFile) -> List[str]:
+def _xyz_names(zf: ZipFile) -> list[str]:
     return sorted(name for name in zf.namelist() if name.lower().endswith(".xyz") and not name.endswith("/"))
 
 
@@ -210,7 +211,7 @@ def _category_from_name(name: str) -> str:
     return f"{match.group(1)}_{match.group(2).rstrip('_.-')}" if match else ""
 
 
-def _iso_id_from_name(name: str) -> Optional[int]:
+def _iso_id_from_name(name: str) -> int | None:
     match = re.search(r"Iso(\d+)", name)
     return int(match.group(1)) if match else None
 
@@ -227,14 +228,14 @@ def _trajectory_key_from_name(name: str, trajectory_idx: int) -> str:
     return f"trajectory_{int(trajectory_idx):05d}"
 
 
-def _name_sort_key(name: str) -> Tuple[str, int, str]:
+def _name_sort_key(name: str) -> tuple[str, int, str]:
     iso_id = _iso_id_from_name(name)
     return (_category_from_name(name), int(iso_id) if iso_id is not None else 10**12, name)
 
 
 def _formula(symbols: Sequence[str]) -> str:
     counts = Counter(str(symbol) for symbol in symbols)
-    ordered: List[str] = []
+    ordered: list[str] = []
     for symbol in ("C", "H"):
         if symbol in counts:
             ordered.append(symbol)
@@ -242,7 +243,7 @@ def _formula(symbols: Sequence[str]) -> str:
     return "".join(f"{symbol}{counts[symbol] if counts[symbol] > 1 else ''}" for symbol in ordered)
 
 
-def _read_first_symbols_from_zip(zf: ZipFile, name: str) -> Tuple[str, ...]:
+def _read_first_symbols_from_zip(zf: ZipFile, name: str) -> tuple[str, ...]:
     with zf.open(name) as fh:
         while True:
             line = fh.readline()
@@ -272,9 +273,9 @@ def _read_xyz_trajectory_from_zip(
     name: str,
     *,
     atom_count_expected: int | None = None,
-) -> Tuple[Tuple[str, ...], np.ndarray]:
-    symbols: Optional[Tuple[str, ...]] = None
-    frames: List[np.ndarray] = []
+) -> tuple[tuple[str, ...], np.ndarray]:
+    symbols: tuple[str, ...] | None = None
+    frames: list[np.ndarray] = []
     with zf.open(name) as fh:
         while True:
             line = fh.readline()
@@ -289,7 +290,7 @@ def _read_xyz_trajectory_from_zip(
             if atom_count_expected is not None and atom_count != int(atom_count_expected):
                 raise ValueError(f"{name}: expected {int(atom_count_expected)} atoms, found {atom_count}.")
             fh.readline()
-            frame_symbols: List[str] = []
+            frame_symbols: list[str] = []
             frame_coords = np.empty((atom_count, MOLECULE_TOKEN_DIM), dtype=np.float32)
             for atom_idx in range(atom_count):
                 raw = fh.readline()
@@ -313,15 +314,15 @@ def _read_xyz_trajectory_from_zip(
     return symbols, np.stack(frames, axis=0)
 
 
-def discover_molecule_xyz_strata(zip_path: str | Path) -> Dict[str, Dict[str, Any]]:
+def discover_molecule_xyz_strata(zip_path: str | Path) -> dict[str, dict[str, Any]]:
     zip_path = Path(zip_path).expanduser().resolve()
     if not zip_path.exists():
         raise FileNotFoundError(f"Missing molecule trajectory zip: {zip_path}")
-    groups: Dict[str, List[str]] = {}
+    groups: dict[str, list[str]] = {}
     with ZipFile(zip_path) as zf:
         for name in _xyz_names(zf):
             groups.setdefault(_category_from_name(name), []).append(name)
-        summaries: Dict[str, Dict[str, Any]] = {}
+        summaries: dict[str, dict[str, Any]] = {}
         for category, names in sorted(groups.items()):
             first_symbols = _read_first_symbols_from_zip(zf, names[0])
             fixed_order = True
@@ -381,9 +382,9 @@ def _member_key(source_zip_name: str, stratum: str) -> str:
     return _clean_path_token(f"{stem}__{str(stratum)}", label="member_key")
 
 
-def discover_trainable_molecule_strata(zip_paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    seen: set[Tuple[str, str]] = set()
+def discover_trainable_molecule_strata(zip_paths: Sequence[str | Path]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
     for raw_path in zip_paths:
         zip_path = Path(raw_path).expanduser().resolve()
         if not zip_path.exists():
@@ -421,7 +422,7 @@ def build_balanced_molecule_stratum_groups(
     zip_paths: Sequence[str | Path],
     *,
     dataset_keys: Sequence[str] = MOLECULE_GROUP_DATASET_KEYS,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     keys = tuple(_clean_path_token(key, label="dataset_key") for key in dataset_keys)
     if len(keys) <= 0:
         raise ValueError("At least one molecule group dataset key is required.")
@@ -469,10 +470,10 @@ def write_molecule_group_manifests(
     group_root: str | Path | None = None,
     *,
     dataset_keys: Sequence[str] = MOLECULE_GROUP_DATASET_KEYS,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     grouping = build_balanced_molecule_stratum_groups(zip_paths, dataset_keys=dataset_keys)
     root = default_molecule_group_root() if group_root is None else resolve_project_path(group_root)
-    manifest_paths: Dict[str, str] = {}
+    manifest_paths: dict[str, str] = {}
     for group in grouping["groups"]:
         dataset_key = str(group["dataset_key"])
         manifest_path = root / dataset_key / "group_manifest.json"
@@ -499,7 +500,7 @@ def write_molecule_group_manifests(
     }
 
 
-def load_molecule_group_manifest(dataset_key: str, group_root: str | Path | None = None) -> Dict[str, Any]:
+def load_molecule_group_manifest(dataset_key: str, group_root: str | Path | None = None) -> dict[str, Any]:
     manifest_path = default_molecule_group_manifest_path(dataset_key, group_root)
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     expected_key = _clean_path_token(dataset_key, label="dataset_key")
@@ -532,10 +533,10 @@ def load_molecule_group_manifest(dataset_key: str, group_root: str | Path | None
     return payload
 
 
-def trainable_molecule_group_members(manifest: Mapping[str, Any]) -> List[Dict[str, Any]]:
+def trainable_molecule_group_members(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Return canonical fixed-shape trainable members from a group manifest."""
 
-    members: List[Dict[str, Any]] = []
+    members: list[dict[str, Any]] = []
     for raw_member in manifest.get("strata", []):
         member = dict(raw_member)
         stratum = str(member.get("stratum", "")).strip()
@@ -564,8 +565,8 @@ def prepare_molecule_xyz_group_datasets(
     *,
     dataset_keys: Sequence[str] = MOLECULE_GROUP_DATASET_KEYS,
     split_seed: int = DEFAULT_MOLECULE_SPLIT_SEED,
-) -> Dict[str, Any]:
-    zip_by_name: Dict[str, Path] = {}
+) -> dict[str, Any]:
+    zip_by_name: dict[str, Path] = {}
     for path in zip_paths:
         source_zip_name = _source_zip_display_name(path)
         if source_zip_name in zip_by_name:
@@ -573,10 +574,10 @@ def prepare_molecule_xyz_group_datasets(
         zip_by_name[source_zip_name] = Path(path).expanduser().resolve()
     manifest_summary = write_molecule_group_manifests(zip_paths, group_root, dataset_keys=dataset_keys)
     root = default_molecule_group_root() if group_root is None else resolve_project_path(group_root)
-    prepared: Dict[str, Any] = {}
+    prepared: dict[str, Any] = {}
     for dataset_key in manifest_summary["grouping"]["dataset_keys"]:
         manifest = load_molecule_group_manifest(str(dataset_key), root)
-        rows: Dict[str, Any] = {}
+        rows: dict[str, Any] = {}
         for member_idx, member in enumerate(trainable_molecule_group_members(manifest)):
             source_zip = zip_by_name[str(member["source_zip_name"])]
             dataset_root = resolve_portable_relative_path(
@@ -625,7 +626,7 @@ def kabsch_rotation(moving: np.ndarray, reference: np.ndarray) -> np.ndarray:
 
 def align_window_to_reference(
     window: np.ndarray, reference_coords: np.ndarray, anchor_offset: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     window_f = np.asarray(window, dtype=np.float32)
     anchor = window_f[int(anchor_offset)]
     center = anchor.mean(axis=0, keepdims=True)
@@ -653,7 +654,7 @@ def kabsch_aligned_rmsd(a: np.ndarray, b: np.ndarray) -> float:
 
 def _frame_quality_masks(
     coords: np.ndarray, segment_ends: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     total = int(coords.shape[0])
     duplicates = np.zeros(total, dtype=bool)
     transitions = np.zeros(total, dtype=bool)
@@ -681,7 +682,7 @@ def _length_stratum(frame_count: int) -> str:
     return "long_gte_3000"
 
 
-def _target_split_counts(n_items: int) -> Dict[str, int]:
+def _target_split_counts(n_items: int) -> dict[str, int]:
     n = int(n_items)
     if n <= 0:
         return {"train": 0, "val": 0, "test": 0}
@@ -700,7 +701,7 @@ def _deterministic_trajectory_split(
     frame_counts: Mapping[int, int],
     *,
     seed: int,
-) -> Dict[str, Tuple[int, ...]]:
+) -> dict[str, tuple[int, ...]]:
     ids = [int(value) for value in sorted(frame_counts)]
     counts = _target_split_counts(len(ids))
     targets = {"train": 0.7, "val": 0.1, "test": 0.2}
@@ -708,7 +709,7 @@ def _deterministic_trajectory_split(
     shuffled = list(ids)
     rng.shuffle(shuffled)
     order = sorted(shuffled, key=lambda value: (int(frame_counts[int(value)]), value), reverse=True)
-    assigned: Dict[str, List[int]] = {"train": [], "val": [], "test": []}
+    assigned: dict[str, list[int]] = {"train": [], "val": [], "test": []}
     assigned_frames = {"train": 0, "val": 0, "test": 0}
     total_frames = float(max(1, sum(int(frame_counts[int(value)]) for value in ids)))
     for trajectory_id in order:
@@ -728,8 +729,8 @@ def _deterministic_trajectory_split(
     return {split: tuple(sorted(values)) for split, values in assigned.items()}
 
 
-def _length_strata_counts(ids: Sequence[int], frame_counts: Mapping[int, int]) -> Dict[str, int]:
-    out: Dict[str, int] = {}
+def _length_strata_counts(ids: Sequence[int], frame_counts: Mapping[int, int]) -> dict[str, int]:
+    out: dict[str, int] = {}
     for trajectory_id in ids:
         key = _length_stratum(int(frame_counts[int(trajectory_id)]))
         out[key] = out.get(key, 0) + 1
@@ -741,10 +742,10 @@ def _trajectory_split_stats(
     split_trajectory_ids: Mapping[str, Sequence[int]],
     *,
     trajectory_keys: Sequence[str],
-    iso_by_trajectory: Mapping[int, Optional[int]],
-) -> Dict[str, Any]:
+    iso_by_trajectory: Mapping[int, int | None],
+) -> dict[str, Any]:
     total = int(sum(int(frame_counts[int(value)]) for values in split_trajectory_ids.values() for value in values))
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "split_trajectory_ids": {
             split: [int(value) for value in values] for split, values in split_trajectory_ids.items()
         },
@@ -784,7 +785,7 @@ def prepare_molecule_xyz_zip(
     stratum: str | None = None,
     split_seed: int = DEFAULT_MOLECULE_SPLIT_SEED,
     trainable: bool | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     key = _clean_path_token(dataset_key, label="dataset_key", default=DEFAULT_MOLECULE_DATASET_KEY)
     stratum_name = _clean_optional_stratum(stratum)
     zip_path = Path(zip_path).expanduser().resolve()
@@ -797,15 +798,15 @@ def prepare_molecule_xyz_zip(
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_coords: List[np.ndarray] = []
-    iso_ids: List[int] = []
-    trajectory_ids: List[int] = []
-    trajectory_keys: List[str] = []
-    source_names_out: List[str] = []
-    segment_ends: List[int] = []
-    trajectory_frame_counts: Dict[int, int] = {}
-    iso_by_trajectory: Dict[int, Optional[int]] = {}
-    expected_symbols: Optional[Tuple[str, ...]] = None
+    all_coords: list[np.ndarray] = []
+    iso_ids: list[int] = []
+    trajectory_ids: list[int] = []
+    trajectory_keys: list[str] = []
+    source_names_out: list[str] = []
+    segment_ends: list[int] = []
+    trajectory_frame_counts: dict[int, int] = {}
+    iso_by_trajectory: dict[int, int | None] = {}
+    expected_symbols: tuple[str, ...] | None = None
     total = 0
 
     with ZipFile(zip_path) as zf:
@@ -872,7 +873,7 @@ def prepare_molecule_xyz_zip(
         discontinuity_step_mask=discontinuity_mask,
         frame_rmsd=frame_rmsd,
     )
-    metadata: Dict[str, Any] = {
+    metadata: dict[str, Any] = {
         "dataset_key": key,
         "stratum": stratum_name,
         "member_key": _member_key(zip_path.name, stratum_name or category or key),
@@ -924,11 +925,11 @@ def prepare_molecule_xyz_all_strata(
     include_pattern: str = "*",
     exclude_pattern: str = "",
     split_seed: int = DEFAULT_MOLECULE_SPLIT_SEED,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     key = _clean_path_token(dataset_key, label="dataset_key", default=DEFAULT_MOLECULE_DATASET_KEY)
     root = default_molecule_processed_dir(key, None) if processed_root is None else resolve_project_path(processed_root)
     strata = discover_molecule_xyz_strata(zip_path)
-    summaries: Dict[str, Any] = {}
+    summaries: dict[str, Any] = {}
     for _stratum_key, summary in strata.items():
         stratum_name = str(summary.get("stratum") or "")
         if not stratum_name:
@@ -1032,7 +1033,7 @@ def ensure_molecule_processed(
     prepare: bool = True,
     dataset_key: str | None = None,
     stratum: str | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     metadata_path = molecule_processed_metadata_path(processed_dir, dataset_key=dataset_key, stratum=stratum)
     npz_path = molecule_processed_npz_path(processed_dir, dataset_key=dataset_key, stratum=stratum)
     if metadata_path.exists() and npz_path.exists():
@@ -1059,13 +1060,13 @@ def _segment_starts(segment_ends: np.ndarray) -> np.ndarray:
     return np.concatenate(([0], np.asarray(segment_ends[:-1], dtype=np.int64)))
 
 
-def _split_segment_indices(data: MoleculeProcessedData, split: str) -> List[Tuple[int, int, int]]:
+def _split_segment_indices(data: MoleculeProcessedData, split: str) -> list[tuple[int, int, int]]:
     split_trajectory_ids = data.metadata.get("split_trajectory_ids")
     if not isinstance(split_trajectory_ids, Mapping) or str(split) not in split_trajectory_ids:
         raise ValueError(f"Processed molecule metadata is missing split_trajectory_ids[{split!r}].")
     selected_trajectory_ids = {int(value) for value in split_trajectory_ids[str(split)]}
     starts = _segment_starts(data.segment_ends)
-    out: List[Tuple[int, int, int]] = []
+    out: list[tuple[int, int, int]] = []
     for start, end in zip(starts, data.segment_ends, strict=False):
         trajectory_id = int(data.trajectory_ids[int(start)])
         if trajectory_id in selected_trajectory_ids:
@@ -1110,7 +1111,7 @@ def _window_has_mask(
 
 def _valid_targets_for_segments(
     data: MoleculeProcessedData,
-    segments: Sequence[Tuple[int, int, int]],
+    segments: Sequence[tuple[int, int, int]],
     *,
     history_len: int,
     future_horizon: int,
@@ -1118,7 +1119,7 @@ def _valid_targets_for_segments(
     exclude_duplicate_targets: bool,
     stride: int,
 ) -> np.ndarray:
-    starts: List[np.ndarray] = []
+    starts: list[np.ndarray] = []
     for seg_start, seg_end, _ in segments:
         first_target = int(seg_start) + int(history_len)
         last_target_exclusive = int(seg_end) - int(future_horizon) + 1
@@ -1290,11 +1291,11 @@ def _stats_from_training_windows(
 
 def _target_exclusion_counts(
     data: MoleculeProcessedData,
-    segments: Sequence[Tuple[int, int, int]],
+    segments: Sequence[tuple[int, int, int]],
     *,
     history_len: int,
     future_horizon: int,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     total_candidates = 0
     duplicate_target = 0
     discontinuity_target = 0
@@ -1403,7 +1404,7 @@ class MoleculeWindowDataset(torch.utils.data.Dataset):
         starts = _segment_starts(self.data.segment_ends)
         return starts[idx]
 
-    def _raw_eval_arrays(self, target_idx: int) -> Dict[str, np.ndarray]:
+    def _raw_eval_arrays(self, target_idx: int) -> dict[str, np.ndarray]:
         window = self.data.coords[int(target_idx) - self.H : int(target_idx) + self.future_horizon]
         local, center, rotation = align_window_to_reference(
             window,
@@ -1432,7 +1433,7 @@ class MoleculeWindowDataset(torch.utils.data.Dataset):
             raise ValueError(f"Need at least {self.H} molecule history frames, got {history.shape[0]}.")
         return _context_features_from_local(history[-self.H :], self.atom_static)
 
-    def eval_item(self, idx: int) -> Dict[str, Any]:
+    def eval_item(self, idx: int) -> dict[str, Any]:
         target_idx = int(self.start_indices[int(idx)])
         arrays = self._raw_eval_arrays(target_idx)
         seg_start = int(self.segment_start_for_t(target_idx))
@@ -1537,7 +1538,7 @@ def build_molecule_dataset_splits(
     stats: MoleculeStats | Mapping[str, Any] | None = None,
     dataset_key: str | None = None,
     stratum: str | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     del cfg
     data = load_molecule_processed(processed_dir, dataset_key=dataset_key, stratum=stratum)
     train_segments = _split_segment_indices(data, "train")
@@ -1731,12 +1732,12 @@ def build_molecule_group_dataset_splits(
     rollout_mode: str = "autoregressive",
     stride_train: int = 1,
     stride_eval: int = 1,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     manifest = load_molecule_group_manifest(dataset_key, group_root)
     root = default_molecule_group_root() if group_root is None else resolve_project_path(group_root)
     base_cfg = OTFlowConfig() if cfg is None else cfg
-    strata: Dict[str, Any] = {}
-    aggregate: Dict[str, Any] = {
+    strata: dict[str, Any] = {}
+    aggregate: dict[str, Any] = {
         "dataset_key": str(dataset_key),
         "benchmark_family": MOLECULE_BENCHMARK_FAMILY,
         "stratum_count": 0,

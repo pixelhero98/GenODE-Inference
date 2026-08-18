@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from collections.abc import Sequence
 
 import numpy as np
 import torch
 
 NATIVE_INFO_GROWTH_ROW_KEY = "info_growth_hardness"
 NATIVE_INFO_GROWTH_TRACE_KEY = "info_growth_hardness_by_step"
-BASE_MODEL_SIGNAL_SPECS: Tuple[Tuple[str, str], ...] = (
+BASE_MODEL_SIGNAL_SPECS: tuple[tuple[str, str], ...] = (
     ("disagreement", "disagreement_by_step"),
     ("residual_norm", "residual_norm_by_step"),
     ("hybrid_signal", "hybrid_signal_by_step"),
@@ -19,8 +19,8 @@ BASE_MODEL_SIGNAL_SPECS: Tuple[Tuple[str, str], ...] = (
     ("top_book_residual_norm", "top_book_residual_norm_by_step"),
     ("top_book_hybrid_signal", "top_book_hybrid_signal_by_step"),
 )
-MODEL_SIGNAL_SPECS: Tuple[Tuple[str, str], ...] = BASE_MODEL_SIGNAL_SPECS
-NATIVE_SIGNAL_TRACE_KEYS: Tuple[str, ...] = tuple(out_key for _, out_key in MODEL_SIGNAL_SPECS) + (
+MODEL_SIGNAL_SPECS: tuple[tuple[str, str], ...] = BASE_MODEL_SIGNAL_SPECS
+NATIVE_SIGNAL_TRACE_KEYS: tuple[str, ...] = tuple(out_key for _, out_key in MODEL_SIGNAL_SPECS) + (
     NATIVE_INFO_GROWTH_TRACE_KEY,
 )
 

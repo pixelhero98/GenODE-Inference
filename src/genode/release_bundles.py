@@ -5,9 +5,10 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 import torch

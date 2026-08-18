@@ -4,27 +4,35 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import shutil
-import tempfile
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import torch
 from torch import Tensor
 
 from genode.artifacts.identity import semantic_sha256
+from genode.gico.image_artifact_io import (
+    image_gico_directory_root,
+    load_float64_npy,
+    staged_image_gico_directory,
+    validate_image_gico_directory,
+    write_float64_npy,
+)
 from genode.gico.image_causal_artifacts import LoadedImageGICOCausalArtifact
 from genode.gico.image_causal_policy import FrozenImageGICOCausalRealization
 from genode.gico.image_causal_rng import image_gico_causal_uniforms_sha256
 from genode.gico.image_causal_stick import (
     DENSITY_BIN_COUNT,
+    TOKEN_COUNT,
+    decode_cube_companded_tokens,
     inverse_cdf_clock_nodes,
+    stick_actions_to_density,
 )
 from genode.gico.image_conditional import (
     IMAGE_GICO_CONDITIONAL_HIDDEN_DIM,
@@ -46,6 +54,7 @@ from genode.gico.image_supervision import (
     image_gico_supervision_array_sha256,
     normalize_image_gico_student_kind,
 )
+from genode.gico.image_training_rng import resolve_image_gico_training_device
 from genode.path_safety import is_link_or_reparse_point
 from genode.provenance import file_sha256
 from genode.solvers.euler import integrate_euler
@@ -54,6 +63,7 @@ from genode.solvers.protocol import SolverResult
 IMAGE_GICO_DETERMINISTIC_ARTIFACT_PROTOCOL = "image_gico_deterministic_barycenter_artifact_v1"
 IMAGE_GICO_DETERMINISTIC_ARTIFACT_NAMESPACE = "image-gico-deterministic-barycenter-artifact-v1"
 IMAGE_GICO_DETERMINISTIC_STATE_NAMESPACE = "image-gico-deterministic-barycenter-state-v1"
+_SHA256_IDENTITY = re.compile(r"(?:[a-z][a-z0-9_.-]*:)?[0-9a-f]{64}\Z")
 
 
 def _state_sha256(state: Mapping[str, Tensor]) -> str:
@@ -86,6 +96,34 @@ def _materialization_array_sha256(value: np.ndarray, *, field: str) -> str:
             "content_sha256": hashlib.sha256(array.tobytes(order="C")).hexdigest(),
         },
         namespace="image-gico-materialized-array-v1",
+    )
+
+
+def _materialization_identity(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or _SHA256_IDENTITY.fullmatch(value) is None:
+        raise ValueError(f"{field} must be a lowercase SHA-256 identity.")
+    return value
+
+
+def _materialization_lineage_sha256(
+    *,
+    student_kind: ImageGICOStudentKind,
+    target_nfe: int,
+    context_indices: tuple[int, ...],
+    artifact_sha256: str,
+    supervision_sha256: str,
+    uniforms_sha256: str | None,
+) -> str:
+    return semantic_sha256(
+        {
+            "student_kind": student_kind,
+            "target_nfe": target_nfe,
+            "context_indices": list(context_indices),
+            "artifact_sha256": artifact_sha256,
+            "supervision_sha256": supervision_sha256,
+            "uniforms_sha256": uniforms_sha256,
+        },
+        namespace="image-gico-materialization-lineage-v1",
     )
 
 
@@ -271,6 +309,7 @@ def train_image_gico_deterministic_student(
 
     if not isinstance(supervision, ImageGICOSupervision):
         raise TypeError("supervision must be ImageGICOSupervision.")
+    supervision.verify()
     if supervision.supervision_kind == "unconditional_mixture":
         if config is not None:
             raise ValueError("Unconditional barycenters do not train a context model.")
@@ -289,8 +328,7 @@ def train_image_gico_deterministic_student(
     if payload is None:
         raise ValueError("Conditional supervision omitted its target payload.")
     targets = ImageGICOConditionalTargets.from_payload(payload)
-    execution_device = torch.device(device)
-    cuda_devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    execution_device, cuda_devices = resolve_image_gico_training_device(device)
     with torch.random.fork_rng(devices=cuda_devices):
         result = train_image_gico_backbone_context(
             targets,
@@ -309,42 +347,6 @@ def train_image_gico_deterministic_student(
     )
 
 
-def _write_deployment_array(path: Path, value: np.ndarray) -> dict[str, Any]:
-    np.save(path, np.ascontiguousarray(value, dtype="<f8"), allow_pickle=False)
-    return {
-        "file": path.name,
-        "sha256": file_sha256(path),
-        "shape": list(value.shape),
-        "dtype": "float64-le",
-    }
-
-
-def _load_deployment_array(root: Path, descriptor: object, *, field: str) -> np.ndarray:
-    if not isinstance(descriptor, Mapping) or set(descriptor) != {
-        "file",
-        "sha256",
-        "shape",
-        "dtype",
-    }:
-        raise ValueError(f"Invalid {field} descriptor.")
-    filename = descriptor["file"]
-    if not isinstance(filename, str) or Path(filename).name != filename:
-        raise ValueError(f"Invalid {field} filename.")
-    path = root / filename
-    if is_link_or_reparse_point(path) or not path.is_file() or file_sha256(path) != descriptor["sha256"]:
-        raise ValueError(f"{field} deployment array changed.")
-    value = np.load(path, allow_pickle=False)
-    result = np.ascontiguousarray(value, dtype=np.float64)
-    if (
-        list(result.shape) != descriptor["shape"]
-        or descriptor["dtype"] != "float64-le"
-        or not bool(np.isfinite(result).all())
-    ):
-        raise ValueError(f"{field} deployment metadata changed.")
-    result.setflags(write=False)
-    return result
-
-
 def save_image_gico_deterministic_artifact(
     result: ImageGICODeterministicTrainingResult,
     supervision: ImageGICOSupervision,
@@ -354,6 +356,7 @@ def save_image_gico_deterministic_artifact(
         raise TypeError("result must be ImageGICODeterministicTrainingResult.")
     if not isinstance(supervision, ImageGICOSupervision):
         raise TypeError("supervision must be ImageGICOSupervision.")
+    supervision.verify()
     if result.supervision_sha256 != supervision.sha256:
         raise ValueError("Training result and supervision differ.")
     if supervision.supervision_kind == "conditional_kid":
@@ -375,12 +378,16 @@ def save_image_gico_deterministic_artifact(
         schedule_keys=supervision.schedule_keys,
         model=result.model,
     )
-    target = Path(output_dir).expanduser().resolve()
-    if target.exists() or target.is_symlink():
-        raise FileExistsError(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage-", dir=target.parent))
-    try:
+    expected_members = {"manifest.json", "normalized-contexts.npy"}
+    if result.model is None:
+        expected_members.add("direct-barycenter.npy")
+    else:
+        expected_members.add("deterministic-state.pt")
+    with staged_image_gico_directory(
+        output_dir,
+        expected_members=expected_members,
+        label="Image GICO deterministic artifact directory",
+    ) as stage:
         state_identity: str | None = None
         state_file_sha256: str | None = None
         model_config: dict[str, object] | None = None
@@ -395,14 +402,14 @@ def save_image_gico_deterministic_artifact(
             state_file_sha256 = file_sha256(state_path)
             model_config = result.model.config.as_payload()
         arrays = {
-            "normalized_contexts": _write_deployment_array(
+            "normalized_contexts": write_float64_npy(
                 stage / "normalized-contexts.npy",
                 supervision.normalized_contexts,
             )
         }
         direct_barycenter_sha256: str | None = None
         if result.model is None:
-            arrays["direct_barycenter"] = _write_deployment_array(
+            arrays["direct_barycenter"] = write_float64_npy(
                 stage / "direct-barycenter.npy",
                 supervision.barycenter_density_mass,
             )
@@ -439,10 +446,6 @@ def save_image_gico_deterministic_artifact(
             encoding="utf-8",
             newline="\n",
         )
-        os.replace(stage, target)
-    except Exception:
-        shutil.rmtree(stage, ignore_errors=True)
-        raise
     return MappingProxyType(manifest)
 
 
@@ -511,9 +514,12 @@ def load_image_gico_deterministic_artifact(
 ) -> LoadedImageGICODeterministicArtifact:
     if supervision is not None and not isinstance(supervision, ImageGICOSupervision):
         raise TypeError("supervision must be ImageGICOSupervision or None.")
-    root = Path(output_dir).expanduser().resolve(strict=True)
-    if is_link_or_reparse_point(root) or not root.is_dir():
-        raise ValueError("Deterministic artifact root must be a regular directory.")
+    if supervision is not None:
+        supervision.verify()
+    root = image_gico_directory_root(
+        output_dir,
+        label="Image GICO deterministic artifact directory",
+    )
     manifest_path = root / "manifest.json"
     if is_link_or_reparse_point(manifest_path) or not manifest_path.is_file():
         raise ValueError("Deterministic manifest must be a regular file.")
@@ -551,8 +557,11 @@ def load_image_gico_deterministic_artifact(
     }
     if manifest.get("state_sha256") is not None:
         expected_members.add("deterministic-state.pt")
-    if {path.name for path in root.iterdir()} != expected_members:
-        raise ValueError("Deterministic artifact files are unexpected.")
+    validate_image_gico_directory(
+        root,
+        expected_members=expected_members,
+        label="Image GICO deterministic artifact directory",
+    )
     if (
         manifest.get("artifact") != "image_gico_deterministic_barycenter_student"
         or manifest.get("protocol") != IMAGE_GICO_DETERMINISTIC_ARTIFACT_PROTOCOL
@@ -577,7 +586,7 @@ def load_image_gico_deterministic_artifact(
     if expected_artifact_sha256 is not None and artifact_identity != expected_artifact_sha256:
         raise ValueError("Deterministic artifact differs from the expected identity.")
 
-    contexts = _load_deployment_array(root, arrays["normalized_contexts"], field="normalized_contexts")
+    contexts = load_float64_npy(root, arrays["normalized_contexts"], field="normalized_contexts")
     if (
         contexts.ndim != 2
         or contexts.shape[0] < 1
@@ -596,7 +605,7 @@ def load_image_gico_deterministic_artifact(
     direct_barycenter = (
         None
         if "direct_barycenter" not in arrays
-        else _load_deployment_array(root, arrays["direct_barycenter"], field="direct_barycenter")
+        else load_float64_npy(root, arrays["direct_barycenter"], field="direct_barycenter")
     )
     if supervision is not None and (
         manifest.get("supervision_sha256") != supervision.sha256
@@ -707,21 +716,49 @@ class ImageGICOScheduleMaterialization:
     density_mass_sha256: str = dataclass_field(init=False, repr=False)
     time_grids_sha256: str = dataclass_field(init=False, repr=False)
     tokens_sha256: str | None = dataclass_field(init=False, repr=False)
+    lineage_sha256: str = dataclass_field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         kind = normalize_image_gico_student_kind(self.student_kind)
-        density = np.ascontiguousarray(self.density_mass, dtype=np.float64)
-        grids = np.ascontiguousarray(self.time_grids, dtype=np.float64)
-        expected_rows = len(self.context_indices)
+        if isinstance(self.context_indices, (str, bytes)) or not isinstance(
+            self.context_indices,
+            Sequence,
+        ):
+            raise TypeError("context_indices must be a nonempty sequence of integers.")
+        indices = tuple(self.context_indices)
+        expected_rows = len(indices)
+        if isinstance(self.target_nfe, bool) or not isinstance(self.target_nfe, int):
+            raise TypeError("target_nfe must be an integer.")
         if self.target_nfe not in (2, 4, 8):
             raise ValueError("target_nfe must be 2, 4, or 8.")
         if expected_rows == 0 or any(
-            isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in self.context_indices
+            isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in indices
         ):
             raise ValueError("context_indices must contain nonnegative integers.")
+        artifact_identity = _materialization_identity(
+            self.artifact_sha256,
+            field="artifact_sha256",
+        )
+        supervision_identity = _materialization_identity(
+            self.supervision_sha256,
+            field="supervision_sha256",
+        )
+        density = np.array(self.density_mass, dtype=np.float64, order="C", copy=True)
+        grids = np.array(self.time_grids, dtype=np.float64, order="C", copy=True)
         if density.shape != (expected_rows, DENSITY_BIN_COUNT):
             raise ValueError("density_mass has the wrong materialization shape.")
-        if bool(np.any(density < 0.0)) or not bool(np.allclose(np.sum(density, axis=-1), 1.0, rtol=0.0, atol=1e-10)):
+        if (
+            not bool(np.isfinite(density).all())
+            or bool(np.any(density < 0.0))
+            or not bool(
+                np.allclose(
+                    np.sum(density, axis=-1),
+                    1.0,
+                    rtol=0.0,
+                    atol=1e-10,
+                )
+            )
+        ):
             raise ValueError("Materialized density rows must be probability masses.")
         if grids.shape != (expected_rows, self.target_nfe + 1):
             raise ValueError("time_grids has the wrong materialization shape.")
@@ -732,23 +769,47 @@ class ImageGICOScheduleMaterialization:
             or not bool(np.all(grids[:, -1] == 1.0))
         ):
             raise ValueError("Materialized time grids must be finite, complete, and strictly increasing.")
+        expected_grids = inverse_cdf_clock_nodes(
+            density,
+            self.target_nfe,
+            np.linspace(0.0, 1.0, DENSITY_BIN_COUNT + 1, dtype=np.float64),
+        )
+        if not np.array_equal(grids, expected_grids):
+            raise ValueError("Materialized time grids do not match the canonical inverse-CDF density clock.")
         tokens = self.tokens
+        uniforms_identity = self.uniforms_sha256
         if kind == "stochastic_causal_ar":
-            if tokens is None or self.uniforms_sha256 is None:
+            if tokens is None or uniforms_identity is None:
                 raise ValueError("Stochastic materialization requires replay evidence.")
-            tokens = np.ascontiguousarray(tokens, dtype=np.int64)
+            raw_tokens = np.asarray(tokens)
+            if not np.issubdtype(raw_tokens.dtype, np.integer):
+                raise TypeError("Stochastic token paths must use an integer dtype.")
+            tokens = np.array(raw_tokens, dtype=np.int64, order="C", copy=True)
             if tokens.shape != (expected_rows, DENSITY_BIN_COUNT - 1):
                 raise ValueError("Stochastic token paths have the wrong shape.")
-        elif tokens is not None or self.uniforms_sha256 is not None:
+            if bool(np.any((tokens < 0) | (tokens >= TOKEN_COUNT))):
+                raise ValueError(f"Stochastic token paths must lie in [0, {TOKEN_COUNT - 1}].")
+            decoded_density = stick_actions_to_density(decode_cube_companded_tokens(tokens))
+            if not np.array_equal(decoded_density, density):
+                raise ValueError("Stochastic token paths do not decode to density_mass.")
+            uniforms_identity = _materialization_identity(
+                uniforms_identity,
+                field="uniforms_sha256",
+            )
+        elif tokens is not None or uniforms_identity is not None:
             raise ValueError("Deterministic materialization cannot carry random evidence.")
         density.setflags(write=False)
         grids.setflags(write=False)
         if tokens is not None:
             tokens.setflags(write=False)
         object.__setattr__(self, "student_kind", kind)
+        object.__setattr__(self, "context_indices", indices)
         object.__setattr__(self, "density_mass", density)
         object.__setattr__(self, "time_grids", grids)
         object.__setattr__(self, "tokens", tokens)
+        object.__setattr__(self, "artifact_sha256", artifact_identity)
+        object.__setattr__(self, "supervision_sha256", supervision_identity)
+        object.__setattr__(self, "uniforms_sha256", uniforms_identity)
         object.__setattr__(
             self,
             "density_mass_sha256",
@@ -764,13 +825,39 @@ class ImageGICOScheduleMaterialization:
             "tokens_sha256",
             None if tokens is None else _materialization_array_sha256(tokens, field="tokens"),
         )
+        object.__setattr__(
+            self,
+            "lineage_sha256",
+            _materialization_lineage_sha256(
+                student_kind=kind,
+                target_nfe=self.target_nfe,
+                context_indices=indices,
+                artifact_sha256=artifact_identity,
+                supervision_sha256=supervision_identity,
+                uniforms_sha256=uniforms_identity,
+            ),
+        )
 
     def verify(self) -> None:
+        try:
+            current = ImageGICOScheduleMaterialization(
+                student_kind=self.student_kind,
+                target_nfe=self.target_nfe,
+                context_indices=self.context_indices,
+                density_mass=self.density_mass,
+                time_grids=self.time_grids,
+                artifact_sha256=self.artifact_sha256,
+                supervision_sha256=self.supervision_sha256,
+                tokens=self.tokens,
+                uniforms_sha256=self.uniforms_sha256,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Frozen image GICO materialization was mutated or violates its contract.") from exc
         if (
-            _materialization_array_sha256(self.density_mass, field="density_mass") != self.density_mass_sha256
-            or _materialization_array_sha256(self.time_grids, field="time_grids") != self.time_grids_sha256
-            or (None if self.tokens is None else _materialization_array_sha256(self.tokens, field="tokens"))
-            != self.tokens_sha256
+            current.density_mass_sha256 != self.density_mass_sha256
+            or current.time_grids_sha256 != self.time_grids_sha256
+            or current.tokens_sha256 != self.tokens_sha256
+            or current.lineage_sha256 != self.lineage_sha256
         ):
             raise ValueError("Frozen image GICO materialization was mutated.")
 
@@ -827,6 +914,7 @@ def materialize_image_gico_schedule(
             with torch.inference_mode():
                 density = model(contexts, target_nfes).detach().cpu().to(torch.float64).numpy()
             density = np.ascontiguousarray(density, dtype=np.float64)
+            density /= np.sum(density, axis=-1, keepdims=True, dtype=np.float64)
         grids = inverse_cdf_clock_nodes(density, target_nfe, reference)
         return ImageGICOScheduleMaterialization(
             student_kind=kind,
@@ -880,21 +968,35 @@ def execute_image_gico_euler(
     if not isinstance(materialization, ImageGICOScheduleMaterialization):
         raise TypeError("materialization must be ImageGICOScheduleMaterialization.")
     materialization.verify()
-    if not isinstance(initial_state, Tensor) or initial_state.shape[0] != len(materialization.context_indices):
+    if (
+        not isinstance(initial_state, Tensor)
+        or initial_state.ndim < 1
+        or initial_state.shape[0] != len(materialization.context_indices)
+    ):
         raise ValueError("initial_state batch size must match materialization.")
+    execution_grid = np.array(materialization.time_grids, dtype=np.float64, copy=True)
+    materialization.verify()
     grid = torch.as_tensor(
-        np.array(materialization.time_grids, dtype=np.float64, copy=True),
+        execution_grid,
         dtype=initial_state.dtype,
         device=initial_state.device,
     )
-    result = integrate_euler(
-        field,
-        initial_state,
-        target_nfe=materialization.target_nfe,
-        time_grid=grid,
-    )
+    frozen_grid = grid.clone()
+    try:
+        result = integrate_euler(
+            field,
+            initial_state,
+            target_nfe=materialization.target_nfe,
+            time_grid=grid,
+        )
+    except Exception as exc:
+        if not torch.equal(grid, frozen_grid):
+            raise RuntimeError("Euler execution changed the frozen materialization grid.") from exc
+        raise
     if result.field_evaluations != materialization.target_nfe:
         raise RuntimeError("Euler execution violated exact NFE accounting.")
+    if not torch.equal(grid, frozen_grid) or not torch.equal(result.time_grid, frozen_grid):
+        raise RuntimeError("Euler execution changed the frozen materialization grid.")
     return result
 
 

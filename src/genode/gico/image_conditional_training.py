@@ -21,6 +21,10 @@ from genode.gico.image_conditional import (
     ImageGICOConditionalTargets,
     validate_image_gico_backbone_context_tensor,
 )
+from genode.gico.image_training_rng import (
+    resolve_image_gico_training_device,
+    seed_image_gico_training_generators,
+)
 
 IMAGE_GICO_BACKBONE_CONTEXT_TEACHER_PROTOCOL = "image_gico_backbone_context_nfe_density_teacher_v4"
 IMAGE_GICO_BACKBONE_CONTEXT_TRAINING_PROTOCOL = "image_gico_backbone_context_training_v4"
@@ -534,9 +538,10 @@ def _teacher_oof_diagnostics(
     class_count = context_table.shape[0]
     with torch.enable_grad():
         for heldout in range(schedule_count):
-            torch.manual_seed(config.seed + heldout + 1)
-            if rewards.device.type == "cuda":
-                torch.cuda.manual_seed_all(config.seed + heldout + 1)
+            seed_image_gico_training_generators(
+                config.seed + heldout + 1,
+                rewards.device,
+            )
             fold_teacher = _train_teacher(
                 rewards,
                 density_sources,
@@ -611,21 +616,22 @@ def train_image_gico_backbone_context(
     training = ImageGICOBackboneContextTrainingConfig() if config is None else config
     if not isinstance(training, ImageGICOBackboneContextTrainingConfig):
         raise TypeError("config must be ImageGICOBackboneContextTrainingConfig.")
-    execution_device = torch.device(device)
+    execution_device, _ = resolve_image_gico_training_device(device)
     context_table = validate_image_gico_backbone_context_tensor(
         normalized_context_table,
         field="normalized_context_table",
         expected_rows=IMAGE_GICO_CLASS_COUNT,
         device=execution_device,
     )
-    torch.manual_seed(training.seed)
-    if execution_device.type == "cuda":
-        torch.cuda.manual_seed_all(training.seed)
-    density_sources = torch.as_tensor(
-        fixed_density_mass,
-        dtype=torch.float32,
-        device=execution_device,
-    )
+    seed_image_gico_training_generators(training.seed, execution_device)
+    if isinstance(fixed_density_mass, Tensor):
+        density_sources = fixed_density_mass.detach().to(dtype=torch.float32, device=execution_device)
+    else:
+        density_sources = torch.tensor(
+            fixed_density_mass,
+            dtype=torch.float32,
+            device=execution_device,
+        )
     schedule_count = len(targets.schedule_keys)
     expected_density_shape = (
         len(IMAGE_TARGET_NFES),
@@ -663,9 +669,7 @@ def train_image_gico_backbone_context(
         schedule_keys=targets.schedule_keys,
         config=training,
     )
-    torch.manual_seed(training.seed)
-    if execution_device.type == "cuda":
-        torch.cuda.manual_seed_all(training.seed)
+    seed_image_gico_training_generators(training.seed, execution_device)
     teacher = _train_teacher(
         rewards,
         density_sources,

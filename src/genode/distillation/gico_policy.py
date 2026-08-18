@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import math
 import pickle
+from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any
 
 import numpy as np
 import torch
@@ -66,7 +67,7 @@ _CURRENT_STUDENT_MODEL_CONFIG_FIELDS = frozenset(
 
 def validate_gico_teacher_training_metadata(
     metadata: Mapping[str, Any] | None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Require explicit metric protocols before current-schema validation."""
 
     teacher_training = dict(metadata or {})

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from genode.gico.image_cli import main
 
@@ -157,3 +158,49 @@ def test_image_gico_cli_end_to_end_has_portable_lineage(tmp_path: Path) -> None:
         text = manifest_path.read_text(encoding="utf-8")
         assert str(tmp_path).replace("\\", "/") not in text.replace("\\", "/")
         assert ":\\" not in text
+
+
+def _materialize_arguments(tmp_path: Path) -> list[str]:
+    return [
+        "materialize",
+        "--student",
+        "stochastic_causal_ar",
+        "--artifact",
+        str(tmp_path / "artifact"),
+        "--target-nfe",
+        "4",
+        "--context-indices",
+        "0",
+        "--output",
+        str(tmp_path / "schedule"),
+    ]
+
+
+def test_materialize_rejects_two_random_sources_at_argument_boundary(tmp_path: Path) -> None:
+    uniforms = tmp_path / "uniforms.npy"
+    with pytest.raises(SystemExit):
+        main(
+            [
+                *_materialize_arguments(tmp_path),
+                "--uniforms",
+                str(uniforms),
+                "--request-sha256",
+                "1" * 64,
+            ]
+        )
+
+
+@pytest.mark.parametrize("random_arguments", [[], ["--uniforms", "uniforms.npy"]])
+def test_materialize_sample_keys_require_request_sha256(
+    tmp_path: Path,
+    random_arguments: list[str],
+) -> None:
+    with pytest.raises(ValueError, match="--sample-keys requires --request-sha256"):
+        main(
+            [
+                *_materialize_arguments(tmp_path),
+                *random_arguments,
+                "--sample-keys",
+                "sample-0",
+            ]
+        )

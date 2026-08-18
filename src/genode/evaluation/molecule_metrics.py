@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -40,7 +41,7 @@ from genode.solver_protocol import (
 )
 
 MOLECULE_CONTEXT_SCHEMA = "molecule_3d_window"
-MOLECULE_PRIMARY_METRICS: Tuple[str, ...] = (
+MOLECULE_PRIMARY_METRICS: tuple[str, ...] = (
     "molecule_kabsch_rmsd_3d",
     "molecule_ensemble_velocity_norm_w1",
     "molecule_ensemble_acceleration_norm_w1",
@@ -63,7 +64,7 @@ def _project_display_path(path: str | Path) -> str:
 
 
 def _safe_mean(values: Sequence[Any]) -> float:
-    nums: List[float] = []
+    nums: list[float] = []
     for value in values:
         try:
             numeric = float(value)
@@ -92,7 +93,7 @@ def _wasserstein_1d(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean(np.abs(np.quantile(x, qs) - np.quantile(y, qs))))
 
 
-def _coordinate_cw1(pred_rows: np.ndarray, true_rows: np.ndarray) -> Dict[str, float]:
+def _coordinate_cw1(pred_rows: np.ndarray, true_rows: np.ndarray) -> dict[str, float]:
     pred = np.asarray(pred_rows, dtype=np.float64)
     true = np.asarray(true_rows, dtype=np.float64)
     if pred.size == 0 or true.size == 0:
@@ -129,7 +130,7 @@ def _bond_pairs(reference_coords: np.ndarray, atom_symbols: Sequence[str]) -> np
 
 def _validity_metrics(
     pred: np.ndarray, true: np.ndarray, atom_symbols: Sequence[str], bond_pairs: np.ndarray
-) -> Dict[str, float]:
+) -> dict[str, float]:
     finite = float(np.isfinite(pred).all())
     pred_dist = _pairwise_distances(pred)
     clash_count = 0
@@ -159,7 +160,7 @@ def molecule_coordinate_metrics(
     *,
     atom_symbols: Sequence[str],
     bond_pairs: np.ndarray,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     pred = np.asarray(pred_coords, dtype=np.float32)
     true = np.asarray(true_coords, dtype=np.float32)
     diff = pred - true
@@ -182,8 +183,8 @@ def molecule_distributional_metrics(
     pred_coords: np.ndarray,
     true_coords: np.ndarray,
     current_coords: np.ndarray,
-    previous_coords: Optional[np.ndarray],
-) -> Dict[str, float]:
+    previous_coords: np.ndarray | None,
+) -> dict[str, float]:
     pred = np.asarray(pred_coords, dtype=np.float32)
     true = np.asarray(true_coords, dtype=np.float32)
     current = np.asarray(current_coords, dtype=np.float32)
@@ -193,7 +194,7 @@ def molecule_distributional_metrics(
         raise ValueError(
             f"Expected current coordinate array to match pred/true shape, got current={current.shape}, pred={pred.shape}."
         )
-    previous: Optional[np.ndarray]
+    previous: np.ndarray | None
     if previous_coords is None:
         previous = None
     else:
@@ -233,7 +234,7 @@ def _sample_molecule_ar_rollout(
     seed: int,
 ) -> np.ndarray:
     history = np.asarray(history_coords, dtype=np.float32).copy()
-    generated: List[np.ndarray] = []
+    generated: list[np.ndarray] = []
     for step_idx in range(int(rollout_steps)):
         context = ds.context_features_from_history_coords(history)
         hist = (context - ds.stats.context_mean[None, :]) / ds.stats.context_std[None, :]
@@ -252,8 +253,8 @@ def _sample_molecule_ar_rollout(
 
 
 def _motion_norms_from_paths(
-    paths: np.ndarray, previous_frame: Optional[np.ndarray]
-) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    paths: np.ndarray, previous_frame: np.ndarray | None
+) -> tuple[np.ndarray, np.ndarray | None]:
     arr = np.asarray(paths, dtype=np.float32)
     if arr.ndim != 4:
         raise ValueError(f"Expected coordinate paths [samples, frames, atoms, 3], got {arr.shape}.")
@@ -275,7 +276,7 @@ def molecule_rollout_motion_metrics(
     pred_rollouts: np.ndarray,
     true_future: np.ndarray,
     history_coords: np.ndarray,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     pred = np.asarray(pred_rollouts, dtype=np.float32)
     true = np.asarray(true_future, dtype=np.float32)
     history = np.asarray(history_coords, dtype=np.float32)
@@ -314,7 +315,7 @@ def molecule_rollout_motion_metrics(
         str(h + 1): _wasserstein_1d(pred_velocity[:, h, :], true_velocity[:, h, :]) for h in range(steps)
     }
     if pred_acceleration is None or true_acceleration is None:
-        acceleration_by_horizon: Dict[str, float] = {str(h + 1): float("nan") for h in range(steps)}
+        acceleration_by_horizon: dict[str, float] = {str(h + 1): float("nan") for h in range(steps)}
         acceleration_ensemble = float("nan")
     else:
         acceleration_by_horizon = {
@@ -345,7 +346,7 @@ def _molecule_context_embedding(
     ds,
     item: Mapping[str, Any],
     device: torch.device,
-) -> List[float]:
+) -> list[float]:
     backbone = getattr(model, "backbone", None)
     if backbone is None:
         raise ValueError("Molecule context export requires model.backbone.")
@@ -374,8 +375,8 @@ def molecule_context_embeddings_for_indices(
     stratum: str,
     split_phase: str,
     device: torch.device,
-) -> Dict[str, List[float]]:
-    embeddings: Dict[str, List[float]] = {}
+) -> dict[str, list[float]]:
+    embeddings: dict[str, list[float]] = {}
     for example_idx in [int(idx) for idx in example_indices]:
         item = ds.eval_item(int(example_idx))
         raw_id = molecule_context_id(
@@ -436,14 +437,14 @@ def _molecule_window_metrics(
     solver_key: str,
     device: torch.device,
     seed: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     true_future = np.asarray(item["future_coords"], dtype=np.float32)
     current = np.asarray(item["current_coords"], dtype=np.float32)
     history_coords = np.asarray(item.get("history_coords", []), dtype=np.float32)
     previous = history_coords[-2] if history_coords.ndim == 3 and history_coords.shape[0] >= 2 else None
-    sample_rollouts: List[np.ndarray] = []
-    kabsch_values: List[float] = []
-    first_horizon_metrics: List[Dict[str, float]] = []
+    sample_rollouts: list[np.ndarray] = []
+    kabsch_values: list[float] = []
+    first_horizon_metrics: list[dict[str, float]] = []
     for sample_idx in range(int(sample_count)):
         pred_future = _sample_molecule_ar_rollout(
             model=model,
@@ -474,7 +475,7 @@ def _molecule_window_metrics(
     previous_many = None if previous is None else np.broadcast_to(previous[None, :, :], first_pred.shape)
     distributional = molecule_distributional_metrics(first_pred, first_true, current_many, previous_many)
     motion = molecule_rollout_motion_metrics(stacked, true_future, history_coords)
-    row: Dict[str, Any] = {
+    row: dict[str, Any] = {
         "molecule_kabsch_rmsd_3d": _safe_mean(kabsch_values),
         "molecule_ensemble_velocity_norm_w1": distributional.get("molecule_ensemble_velocity_norm_w1"),
         "molecule_ensemble_acceleration_norm_w1": distributional.get("molecule_ensemble_acceleration_norm_w1"),
@@ -522,7 +523,7 @@ def evaluate_molecule_rollout_schedule(
     formula: str = "",
     source_zip_name: str = "",
     device: torch.device | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     dev = torch.device("cpu") if device is None else device
     indices = [int(idx) for idx in example_indices]
     if not indices:
@@ -537,7 +538,7 @@ def evaluate_molecule_rollout_schedule(
     atom_symbols = ds.data.atom_symbols
     bond_pairs = _bond_pairs(ds.stats.reference_coords, atom_symbols)
     backup = _apply_sample_overrides(model, cfg, time_grid=tuple(float(x) for x in grid))
-    per_context: List[Dict[str, Any]] = []
+    per_context: list[dict[str, Any]] = []
     try:
         for example_idx in indices:
             item = ds.eval_item(int(example_idx))
@@ -607,7 +608,7 @@ def evaluate_molecule_rollout_schedule(
             )
     finally:
         _restore_sample_overrides(model, cfg, backup)
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         "benchmark_family": SCENARIO_FAMILY_MOLECULE,
         "dataset_key": str(dataset_key),
         "member_key": str(member_key),
@@ -637,7 +638,7 @@ def load_molecule_checkpoint_splits(
     rollout_steps: int,
     stride_eval: int,
     device: torch.device,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     resolved_checkpoint = resolve_project_path(str(checkpoint_path))
     checkpoint_payload = load_otflow_checkpoint_payload(
         resolved_checkpoint,
@@ -680,9 +681,9 @@ def load_molecule_checkpoint_splits(
     }
 
 
-def _aggregate(rows: Sequence[Mapping[str, float]]) -> Dict[str, Dict[str, float]]:
+def _aggregate(rows: Sequence[Mapping[str, float]]) -> dict[str, dict[str, float]]:
     keys = sorted({key for row in rows for key in row})
-    out: Dict[str, Dict[str, float]] = {}
+    out: dict[str, dict[str, float]] = {}
     for key in keys:
         values = np.asarray([float(row[key]) for row in rows if key in row], dtype=np.float64)
         if len(values) == 0:
@@ -696,9 +697,9 @@ def _aggregate(rows: Sequence[Mapping[str, float]]) -> Dict[str, Dict[str, float
     return out
 
 
-def _numeric_leaves(value: Any, prefix: Tuple[str, ...] = ()) -> List[Tuple[Tuple[str, ...], float]]:
+def _numeric_leaves(value: Any, prefix: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], float]]:
     if isinstance(value, Mapping):
-        rows: List[Tuple[Tuple[str, ...], float]] = []
+        rows: list[tuple[tuple[str, ...], float]] = []
         for key, child in value.items():
             rows.extend(_numeric_leaves(child, (*prefix, str(key))))
         return rows
@@ -707,7 +708,7 @@ def _numeric_leaves(value: Any, prefix: Tuple[str, ...] = ()) -> List[Tuple[Tupl
     return []
 
 
-def _set_nested_metric(payload: Dict[str, Any], path: Sequence[str], value: float) -> None:
+def _set_nested_metric(payload: dict[str, Any], path: Sequence[str], value: float) -> None:
     cursor = payload
     for part in path[:-1]:
         cursor = cursor.setdefault(str(part), {})
@@ -719,11 +720,11 @@ def aggregate_molecule_group_evaluation(
     dataset_key: str,
     stratum_summaries: Sequence[Mapping[str, Any]],
     group_root: str | Path | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     manifest = load_molecule_group_manifest(str(dataset_key), group_root)
     allowed_strata = {str(row["stratum"]) for row in manifest.get("strata", [])}
-    weighted: Dict[Tuple[str, ...], List[Tuple[float, float]]] = {}
-    per_stratum: List[Dict[str, Any]] = []
+    weighted: dict[tuple[str, ...], list[tuple[float, float]]] = {}
+    per_stratum: list[dict[str, Any]] = []
     for summary in stratum_summaries:
         stratum = str(summary.get("stratum", ""))
         if stratum not in allowed_strata:
@@ -738,7 +739,7 @@ def aggregate_molecule_group_evaluation(
         )
         for path, value in _numeric_leaves(summary.get("metrics", {})):
             weighted.setdefault(path, []).append((float(value), weight))
-    metrics: Dict[str, Any] = {}
+    metrics: dict[str, Any] = {}
     for path, values in sorted(weighted.items()):
         total_weight = float(sum(weight for _, weight in values))
         if total_weight <= 0.0:
@@ -756,7 +757,7 @@ def aggregate_molecule_group_evaluation(
 
 
 @torch.no_grad()
-def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
+def evaluate_molecule_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
     nfe = normalize_solver_nfe_fields(
         str(getattr(args, "solver_key", getattr(args, "solver", "euler"))),
         getattr(args, "target_nfe", getattr(args, "nfe", 16)),
@@ -831,15 +832,15 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
 
     atom_symbols = ds.data.atom_symbols
     bond_pairs = _bond_pairs(ds.stats.reference_coords, atom_symbols)
-    all_rows: List[Dict[str, float]] = []
-    clean_rows: List[Dict[str, float]] = []
-    transition_rows: List[Dict[str, float]] = []
-    horizon_rows: Dict[int, List[Dict[str, float]]] = {}
-    distribution_rows: List[Dict[str, float]] = []
-    motion_rows: List[Dict[str, float]] = []
-    rollout_velocity_horizon_rows: Dict[int, List[Dict[str, float]]] = {}
-    rollout_acceleration_horizon_rows: Dict[int, List[Dict[str, float]]] = {}
-    dist_inputs: Dict[str, Dict[str, List[np.ndarray]]] = {
+    all_rows: list[dict[str, float]] = []
+    clean_rows: list[dict[str, float]] = []
+    transition_rows: list[dict[str, float]] = []
+    horizon_rows: dict[int, list[dict[str, float]]] = {}
+    distribution_rows: list[dict[str, float]] = []
+    motion_rows: list[dict[str, float]] = []
+    rollout_velocity_horizon_rows: dict[int, list[dict[str, float]]] = {}
+    rollout_acceleration_horizon_rows: dict[int, list[dict[str, float]]] = {}
+    dist_inputs: dict[str, dict[str, list[np.ndarray]]] = {
         scope: {"pred": [], "true": [], "current": [], "previous": []}
         for scope in ("all_first_horizon", "clean_first_horizon", "transition_first_horizon")
     }
@@ -850,9 +851,9 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
         current = np.asarray(item["current_coords"], dtype=np.float32)
         history_coords = np.asarray(item.get("history_coords", []), dtype=np.float32)
         previous = history_coords[-2] if history_coords.ndim == 3 and history_coords.shape[0] >= 2 else None
-        sample_metrics: List[Dict[str, float]] = []
-        sample_kabsch: List[float] = []
-        sample_rollouts: List[np.ndarray] = []
+        sample_metrics: list[dict[str, float]] = []
+        sample_kabsch: list[float] = []
+        sample_rollouts: list[np.ndarray] = []
         for sample_idx in range(int(args.sample_count)):
             pred_future = _sample_molecule_ar_rollout(
                 model=model,
@@ -922,7 +923,7 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
             )
 
     horizon_summary = {str(h): _aggregate(rows) for h, rows in sorted(horizon_rows.items())}
-    distributional_summary: Dict[str, Dict[str, float]] = {}
+    distributional_summary: dict[str, dict[str, float]] = {}
     for scope, arrays in dist_inputs.items():
         if not arrays["pred"]:
             distributional_summary[scope] = {}
@@ -933,7 +934,7 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
             np.stack(arrays["current"], axis=0),
             np.stack(arrays["previous"], axis=0) if len(arrays["previous"]) == len(arrays["pred"]) else None,
         )
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         "checkpoint": _project_display_path(checkpoint_path),
         "dataset_key": dataset_key,
         "scenario_key": scenario_key,
@@ -972,15 +973,15 @@ def evaluate_molecule_checkpoint(args: argparse.Namespace) -> Dict[str, Any]:
     return summary
 
 
-def _parse_csv(text: str) -> List[str]:
+def _parse_csv(text: str) -> list[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
-def _parse_int_csv(text: str) -> List[int]:
+def _parse_int_csv(text: str) -> list[int]:
     return [int(part) for part in _parse_csv(text)]
 
 
-def _molecule_solver_cases(args: argparse.Namespace) -> List[Tuple[str, int, int]]:
+def _molecule_solver_cases(args: argparse.Namespace) -> list[tuple[str, int, int]]:
     solvers = normalize_solver_keys(str(getattr(args, "solver_names", "") or getattr(args, "solver", "euler")))
     role = str(getattr(args, "nfe_role", NFE_ROLE_SEEN) or NFE_ROLE_SEEN)
     raw_nfes = str(getattr(args, "target_nfe_values", "") or "").strip()
@@ -990,7 +991,7 @@ def _molecule_solver_cases(args: argparse.Namespace) -> List[Tuple[str, int, int
         target_nfes = list(canonical_nfes_for_role(role))
     else:
         target_nfes = [int(getattr(args, "target_nfe", getattr(args, "nfe", 16)))]
-    cases: List[Tuple[str, int, int]] = []
+    cases: list[tuple[str, int, int]] = []
     for solver in solvers:
         for target_nfe in target_nfes:
             runtime_nfe = solver_macro_steps(solver, int(target_nfe))
@@ -998,9 +999,9 @@ def _molecule_solver_cases(args: argparse.Namespace) -> List[Tuple[str, int, int
     return cases
 
 
-def evaluate_molecule_checkpoint_grid(args: argparse.Namespace) -> Dict[str, Any]:
+def evaluate_molecule_checkpoint_grid(args: argparse.Namespace) -> dict[str, Any]:
     cases = _molecule_solver_cases(args)
-    evaluations: List[Dict[str, Any]] = []
+    evaluations: list[dict[str, Any]] = []
     for solver_key, target_nfe, runtime_nfe in cases:
         case_args = argparse.Namespace(**vars(args))
         case_args.solver_key = str(solver_key)

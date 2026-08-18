@@ -475,6 +475,8 @@ class GICOCanonicalTests(unittest.TestCase):
         self.assertEqual(summary["teacher_pair_count"], 70)
         self.assertEqual(summary["losses"][0]["teacher_pair_count"], 70)
         self.assertLess(summary["losses"][0]["teacher_batch_pair_count"], summary["teacher_pair_count"])
+        self.assertIn("teacher_final_retrain", summary)
+        self.assertNotIn("final_teacher_retrain", summary)
 
     def test_models_do_not_expose_series_conditioning(self) -> None:
         setting_batch = torch.stack(

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 from genode.path_safety import is_link_or_reparse_point
 from genode.provenance import file_sha256

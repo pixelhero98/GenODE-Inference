@@ -8,10 +8,11 @@ import math
 import time
 import zipfile
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 
@@ -44,35 +45,35 @@ LOCAL_DEFECT_TRACE_KEY = "validation_local_defect_trace"
 INFO_GROWTH_TRACE_KEY = "validation_info_growth_trace"
 DEFAULT_DENSITY_FLOOR_ETA = 0.05
 DEFAULT_MAIN_PTG_KEY = "ptg_info_growth_raw"
-PTG_X_LABELS: Dict[str, str] = {
+PTG_X_LABELS: dict[str, str] = {
     "ptg_info_growth_raw": "Info-growth PTG",
     "ptg_info_growth_reversed": "Info-growth PTG, reversed time",
     "ptg_local_defect_eta005": "Local-defect PTG",
     "ptg_local_defect_reversed_eta005": "Local-defect PTG, reversed time",
 }
 
-DATASET_ORDER: Tuple[str, ...] = (
+DATASET_ORDER: tuple[str, ...] = (
     "solar_energy_10m",
     "traffic_hourly",
     "weather_daily",
 )
-DATASET_LABELS: Dict[str, str] = {
+DATASET_LABELS: dict[str, str] = {
     "solar_energy_10m": "Solar",
     "traffic_hourly": "Traffic",
     "weather_daily": "Weather",
 }
-SOLVER_ORDER: Tuple[str, ...] = ("euler", "heun", "midpoint_rk2", "dpmpp2m")
-SOLVER_LABELS: Dict[str, str] = {
+SOLVER_ORDER: tuple[str, ...] = ("euler", "heun", "midpoint_rk2", "dpmpp2m")
+SOLVER_LABELS: dict[str, str] = {
     "euler": "Euler",
     "heun": "Heun",
     "midpoint_rk2": "Midpoint RK2",
     "dpmpp2m": "DPM++2M",
 }
-TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
-TRANSFER_SCHEDULES: Tuple[str, ...] = TRANSFER_SCHEDULE_KEYS
-INTEGRATION_SCHEDULES: Tuple[str, ...] = ("uniform", *TRANSFER_SCHEDULES)
-SCHEDULE_LABELS: Dict[str, str] = {key: schedule_display_name(key) for key in INTEGRATION_SCHEDULES}
-DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2, 3, 4)
+TARGET_NFES: tuple[int, ...] = CANONICAL_SEEN_NFES
+TRANSFER_SCHEDULES: tuple[str, ...] = TRANSFER_SCHEDULE_KEYS
+INTEGRATION_SCHEDULES: tuple[str, ...] = ("uniform", *TRANSFER_SCHEDULES)
+SCHEDULE_LABELS: dict[str, str] = {key: schedule_display_name(key) for key in INTEGRATION_SCHEDULES}
+DEFAULT_SEEDS: tuple[int, ...] = (0, 1, 2, 3, 4)
 DEFAULT_REFERENCE_MACRO_FACTOR = 4.0
 DEFAULT_DENSE_REFERENCE_MACRO_FACTOR = 16.0
 DEFAULT_CALIBRATION_TRACE_SAMPLES = 1
@@ -100,11 +101,11 @@ class PtgResult:
     rho_integral: float
 
 
-def parse_csv(text: str) -> List[str]:
+def parse_csv(text: str) -> list[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
-def parse_int_csv(text: str) -> List[int]:
+def parse_int_csv(text: str) -> list[int]:
     return [int(part) for part in parse_csv(text)]
 
 
@@ -123,7 +124,7 @@ def write_json(payload: Mapping[str, Any], path: Path) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default) + "\n", encoding="utf-8")
 
 
-def load_json(path: Path) -> Dict[str, Any]:
+def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -156,7 +157,7 @@ def normalize_hardness_for_ptg(
     reference_time_grid: Sequence[float],
     *,
     eps_multiplier: float = 1e-8,
-) -> Tuple[np.ndarray, np.ndarray, float, float]:
+) -> tuple[np.ndarray, np.ndarray, float, float]:
     h = np.clip(_finite_1d(hardness, name="hardness"), 0.0, None)
     grid = validate_time_grid(reference_time_grid, name="reference_time_grid")
     if grid.size != h.size + 1:
@@ -177,7 +178,7 @@ def schedule_density_on_reference_grid(
     reference_time_grid: Sequence[float],
     *,
     min_density: float = 1e-12,
-) -> Tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float]:
     schedule = validate_time_grid(schedule_grid, name="schedule_grid")
     reference = validate_time_grid(reference_time_grid, name="reference_time_grid")
     ref_widths = np.diff(reference)
@@ -213,7 +214,7 @@ def stabilize_density(
     reference_time_grid: Sequence[float],
     *,
     eta: float,
-) -> Tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float]:
     rho = _finite_1d(density, name="density")
     grid = validate_time_grid(reference_time_grid, name="reference_time_grid")
     if grid.size != rho.size + 1:
@@ -226,7 +227,7 @@ def stabilize_density(
     return stabilized, integral
 
 
-def reverse_schedule_grid(schedule_grid: Sequence[float]) -> List[float]:
+def reverse_schedule_grid(schedule_grid: Sequence[float]) -> list[float]:
     grid = validate_time_grid(schedule_grid, name="schedule_grid")
     reversed_grid = 1.0 - grid[::-1]
     reversed_grid[0] = 0.0
@@ -240,7 +241,7 @@ def local_defect_trace_from_oracle(
     *,
     solver_order_p: float,
     eps: float = 1e-12,
-) -> List[float]:
+) -> list[float]:
     oracle = np.clip(_finite_1d(oracle_local_error, name="oracle_local_error"), 0.0, None)
     grid = validate_time_grid(reference_time_grid, name="reference_time_grid")
     if grid.size != oracle.size + 1:
@@ -279,7 +280,7 @@ def ptg_from_trace(
     )
 
 
-def mean_trace(traces: Sequence[Sequence[float]], *, name: str) -> List[float]:
+def mean_trace(traces: Sequence[Sequence[float]], *, name: str) -> list[float]:
     if not traces:
         raise ValueError(f"{name} must contain at least one trace.")
     arrays = [_finite_1d(trace, name=f"{name}[{idx}]") for idx, trace in enumerate(traces)]
@@ -290,7 +291,7 @@ def mean_trace(traces: Sequence[Sequence[float]], *, name: str) -> List[float]:
     return [float(x) for x in np.mean(np.stack(arrays, axis=0), axis=0).tolist()]
 
 
-def _select_indices(length: int, n_windows: int, seed: int) -> List[int]:
+def _select_indices(length: int, n_windows: int, seed: int) -> list[int]:
     length = int(length)
     n_windows = int(n_windows)
     if length <= 0:
@@ -355,7 +356,7 @@ def solver_runtime_name(solver_key: str) -> str:
     return str(SOLVER_RUNTIME_NAMES[key])
 
 
-def build_fixed_schedule_grid(schedule_key: str, runtime_nfe: int) -> List[float]:
+def build_fixed_schedule_grid(schedule_key: str, runtime_nfe: int) -> list[float]:
     from genode.schedule_transfer.otflow_paper_registry import build_schedule_grid
 
     grid = build_schedule_grid(str(schedule_key), int(runtime_nfe))
@@ -377,7 +378,7 @@ def solver_order_for_ptg(solver_key: str) -> float:
     raise ValueError(f"Unsupported solver key {solver_key!r}.")
 
 
-def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
+def collect_payload(args: argparse.Namespace) -> dict[str, Any]:
     import torch
 
     from genode.data.otflow_paths import project_paper_dataset_root
@@ -411,7 +412,7 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
 
     cli_args = _runner_cli_args(args)
     device = resolve_torch_device(str(args.device))
-    cells: List[Dict[str, Any]] = []
+    cells: list[dict[str, Any]] = []
     dataset_root = project_paper_dataset_root()
     for dataset in datasets:
         dataset_idx = DATASET_ORDER.index(str(dataset))
@@ -437,11 +438,11 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
                             reference_macro_factor=float(args.reference_macro_factor),
                         )
                     )
-                    per_seed: List[Dict[str, Any]] = []
-                    info_growth_traces: List[List[float]] = []
-                    oracle_traces: List[List[float]] = []
-                    local_defect_traces: List[List[float]] = []
-                    reference_time_grid: Optional[List[float]] = None
+                    per_seed: list[dict[str, Any]] = []
+                    info_growth_traces: list[list[float]] = []
+                    oracle_traces: list[list[float]] = []
+                    local_defect_traces: list[list[float]] = []
+                    reference_time_grid: list[float] | None = None
                     solver_p = solver_order_for_ptg(str(solver_key))
                     for seed in seeds:
                         seed = int(seed)
@@ -534,7 +535,7 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
 
     return {
         "artifact": "ptg_observed_gain_inputs",
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "generated_at_utc": datetime.now(UTC).isoformat(),
         "project_root": "project_root",
         "datasets": datasets,
         "solvers": solvers,
@@ -553,7 +554,7 @@ def collect_payload(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
-def _eval_dataset_for_integration(ds: Any, *, test_windows: int, seed: int) -> Tuple[Any, int]:
+def _eval_dataset_for_integration(ds: Any, *, test_windows: int, seed: int) -> tuple[Any, int]:
     n_examples = int(len(ds))
     if n_examples <= 0:
         raise ValueError("Locked-test split is empty; cannot collect integration error.")
@@ -574,14 +575,14 @@ def _sample_forecast_endpoints_norm(
     time_grid: Sequence[float],
     seed: int,
     batch_size: int = 64,
-) -> Tuple[List[np.ndarray], float]:
+) -> tuple[list[np.ndarray], float]:
     import torch
 
     from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _restore_sample_overrides
     from genode.models.otflow_train_val import seed_all
 
     device = cfg.train.device
-    endpoints: List[np.ndarray] = []
+    endpoints: list[np.ndarray] = []
     elapsed = 0.0
     effective_batch_size = max(1, int(batch_size))
     backup = _apply_sample_overrides(model, cfg, solver=str(solver_name), time_grid=tuple(float(x) for x in time_grid))
@@ -615,7 +616,7 @@ def _mean_endpoint_l2(endpoints: Sequence[np.ndarray], references: Sequence[np.n
         raise ValueError(f"Endpoint/reference count mismatch: {len(endpoints)} vs {len(references)}.")
     if not endpoints:
         raise ValueError("Cannot compute integration error from an empty endpoint list.")
-    errors: List[float] = []
+    errors: list[float] = []
     for idx, (endpoint, reference) in enumerate(zip(endpoints, references, strict=False)):
         endpoint_arr = np.asarray(endpoint, dtype=np.float64).reshape(-1)
         reference_arr = np.asarray(reference, dtype=np.float64).reshape(-1)
@@ -627,14 +628,14 @@ def _mean_endpoint_l2(endpoints: Sequence[np.ndarray], references: Sequence[np.n
     return float(np.mean(np.asarray(errors, dtype=np.float64)))
 
 
-def _dense_uniform_grid(n_steps: int) -> List[float]:
+def _dense_uniform_grid(n_steps: int) -> list[float]:
     steps = int(n_steps)
     if steps <= 0:
         raise ValueError(f"n_steps must be positive, got {n_steps}.")
     return [float(i) / float(steps) for i in range(steps + 1)]
 
 
-def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
+def collect_integration_error_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     import torch
 
     from genode.data.otflow_paths import project_paper_dataset_root
@@ -675,13 +676,13 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
     cli_args = _runner_cli_args(args)
     device = resolve_torch_device(str(args.device))
     dataset_root = project_paper_dataset_root()
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     completed_seed_keys = set()
     rows_csv = Path(args.rows_csv) if getattr(args, "rows_csv", None) is not None else None
     if bool(getattr(args, "resume", False)) and rows_csv is not None and rows_csv.exists():
         with rows_csv.open("r", newline="", encoding="utf-8") as handle:
             rows = [dict(row) for row in csv.DictReader(handle)]
-        grouped_schedules: Dict[Tuple[str, str, int, int], set] = defaultdict(set)
+        grouped_schedules: dict[tuple[str, str, int, int], set] = defaultdict(set)
         for row in rows:
             grouped_schedules[
                 (
@@ -758,8 +759,8 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
                             seed=int(seed),
                             batch_size=int(args.integration_batch_size),
                         )
-                        schedule_errors: Dict[str, float] = {}
-                        schedule_seconds: Dict[str, float] = {}
+                        schedule_errors: dict[str, float] = {}
+                        schedule_seconds: dict[str, float] = {}
                         for schedule_key in schedules:
                             endpoints, elapsed_seconds = _sample_forecast_endpoints_norm(
                                 model,
@@ -834,12 +835,12 @@ def collect_integration_error_rows(args: argparse.Namespace) -> List[Dict[str, A
     return rows
 
 
-def aggregate_integration_error_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    groups: Dict[Tuple[str, int, str, str], List[Mapping[str, Any]]] = defaultdict(list)
+def aggregate_integration_error_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, int, str, str], list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
         key = (str(row["dataset"]), int(row["target_nfe"]), str(row["solver_key"]), str(row["schedule_key"]))
         groups[key].append(row)
-    stats_rows: List[Dict[str, Any]] = []
+    stats_rows: list[dict[str, Any]] = []
     for key in sorted(groups):
         group = groups[key]
         first = group[0]
@@ -882,7 +883,7 @@ def write_csv_rows(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
     if not rows:
         raise ValueError(f"Cannot write an empty CSV: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames: List[str] = []
+    fieldnames: list[str] = []
     for row in rows:
         for key in row:
             if key not in fieldnames:
@@ -894,10 +895,10 @@ def write_csv_rows(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
             writer.writerow(row)
 
 
-def load_integration_gain_rows(path: Path) -> Dict[Tuple[str, int, str, str], Dict[str, Any]]:
+def load_integration_gain_rows(path: Path) -> dict[tuple[str, int, str, str], dict[str, Any]]:
     with Path(path).open("r", newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    selected: Dict[Tuple[str, int, str, str], Dict[str, Any]] = {}
+    selected: dict[tuple[str, int, str, str], dict[str, Any]] = {}
     for row in rows:
         dataset = str(row["dataset"])
         solver_key = str(row["solver_key"])
@@ -934,12 +935,12 @@ def load_integration_gain_rows(path: Path) -> Dict[Tuple[str, int, str, str], Di
     return selected
 
 
-def _load_zip_csv(zip_path: Path, member_name: str) -> List[Dict[str, str]]:
+def _load_zip_csv(zip_path: Path, member_name: str) -> list[dict[str, str]]:
     with zipfile.ZipFile(zip_path) as archive, archive.open(member_name) as handle:
         return list(csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8")))
 
 
-def observed_gain_from_relative_row(row: Mapping[str, str]) -> Dict[str, float]:
+def observed_gain_from_relative_row(row: Mapping[str, str]) -> dict[str, float]:
     gain_crps = 100.0 * (1.0 - float(row["relative_crps_vs_uniform_mean"]))
     gain_mase = 100.0 * (1.0 - float(row["relative_mase_vs_uniform_mean"]))
     return {
@@ -949,9 +950,9 @@ def observed_gain_from_relative_row(row: Mapping[str, str]) -> Dict[str, float]:
     }
 
 
-def load_observed_gain_rows(zip_path: Path) -> Dict[Tuple[str, int, str, str], Dict[str, Any]]:
+def load_observed_gain_rows(zip_path: Path) -> dict[tuple[str, int, str, str], dict[str, Any]]:
     rows = _load_zip_csv(Path(zip_path), RELATIVE_STATS_NAME)
-    selected: Dict[Tuple[str, int, str, str], Dict[str, Any]] = {}
+    selected: dict[tuple[str, int, str, str], dict[str, Any]] = {}
     for row in rows:
         dataset = str(row["dataset"])
         solver_key = str(row["solver_key"])
@@ -1029,10 +1030,10 @@ def _ptg_variant(
 
 def build_points(
     payload: Mapping[str, Any],
-    integration_rows: Mapping[Tuple[str, int, str, str], Mapping[str, Any]],
-) -> List[Dict[str, Any]]:
+    integration_rows: Mapping[tuple[str, int, str, str], Mapping[str, Any]],
+) -> list[dict[str, Any]]:
     validate_input_payload(payload)
-    points: List[Dict[str, Any]] = []
+    points: list[dict[str, Any]] = []
     for cell in payload["cells"]:
         dataset = str(cell["dataset"])
         solver_key = str(cell["solver_key"])
@@ -1136,7 +1137,7 @@ def write_points_csv(points: Sequence[Mapping[str, Any]], path: Path) -> None:
             writer.writerow(point)
 
 
-def spearman_correlation(x: Sequence[float], y: Sequence[float]) -> Tuple[float, Optional[float]]:
+def spearman_correlation(x: Sequence[float], y: Sequence[float]) -> tuple[float, float | None]:
     x_arr = np.asarray(x, dtype=np.float64)
     y_arr = np.asarray(y, dtype=np.float64)
     if x_arr.size != y_arr.size or x_arr.size < 2:
@@ -1147,7 +1148,7 @@ def spearman_correlation(x: Sequence[float], y: Sequence[float]) -> Tuple[float,
     return float(result.statistic), float(result.pvalue)
 
 
-def _axis_limits(values: np.ndarray, *, pad_fraction: float = 0.08) -> Tuple[float, float]:
+def _axis_limits(values: np.ndarray, *, pad_fraction: float = 0.08) -> tuple[float, float]:
     finite = values[np.isfinite(values)]
     if finite.size == 0:
         return -1.0, 1.0
@@ -1159,11 +1160,11 @@ def _axis_limits(values: np.ndarray, *, pad_fraction: float = 0.08) -> Tuple[flo
 
 def summarize_ptg_points(
     points: Sequence[Mapping[str, Any]], *, main_ptg_key: str = DEFAULT_MAIN_PTG_KEY
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if not points:
         raise ValueError("Cannot summarize an empty point set.")
     y = [float(point["observed_integration_gain_percent"]) for point in points]
-    variants: Dict[str, Dict[str, Any]] = {}
+    variants: dict[str, dict[str, Any]] = {}
     for key, label in PTG_X_LABELS.items():
         if any(key not in point for point in points):
             continue
@@ -1182,7 +1183,7 @@ def summarize_ptg_points(
     main_rho = float(main.get("spearman_rho", float("nan")))
     return {
         "artifact": "ptg_observed_gain_diagnostics",
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "generated_at_utc": datetime.now(UTC).isoformat(),
         "main_ptg_key": str(main_ptg_key),
         "main_spearman_rho": main_rho,
         "main_spearman_positive": bool(math.isfinite(main_rho) and main_rho > 0.0),
@@ -1343,7 +1344,7 @@ def plot_points(
     pdf_path: Path,
     dpi: int = 600,
     x_key: str = DEFAULT_MAIN_PTG_KEY,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     fig, _ax = build_figure(points, x_key=str(x_key))
     png_path.parent.mkdir(parents=True, exist_ok=True)
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1363,7 +1364,7 @@ def plot_points_with_diagnostics(
     diagnostics_json_path: Path,
     dpi: int = 600,
     main_ptg_key: str = DEFAULT_MAIN_PTG_KEY,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     diagnostics = summarize_ptg_points(points, main_ptg_key=str(main_ptg_key))
     outputs = plot_points(
         points,
@@ -1381,8 +1382,8 @@ def plot_points_with_diagnostics(
     return {**outputs, "diagnostics_json": str(diagnostics_json_path), "paper_facing_written": True}
 
 
-def synthetic_payload() -> Dict[str, Any]:
-    cells: List[Dict[str, Any]] = []
+def synthetic_payload() -> dict[str, Any]:
+    cells: list[dict[str, Any]] = []
     for dataset_idx, dataset in enumerate(DATASET_ORDER):
         for solver_idx, solver_key in enumerate(SOLVER_ORDER):
             for target_nfe in TARGET_NFES:
@@ -1445,8 +1446,8 @@ def synthetic_payload() -> Dict[str, Any]:
     }
 
 
-def synthetic_observed_rows() -> Dict[Tuple[str, int, str, str], Dict[str, Any]]:
-    rows: Dict[Tuple[str, int, str, str], Dict[str, Any]] = {}
+def synthetic_observed_rows() -> dict[tuple[str, int, str, str], dict[str, Any]]:
+    rows: dict[tuple[str, int, str, str], dict[str, Any]] = {}
     for dataset_idx, dataset in enumerate(DATASET_ORDER):
         for solver_idx, solver_key in enumerate(SOLVER_ORDER):
             for nfe_idx, target_nfe in enumerate(TARGET_NFES):
@@ -1533,7 +1534,7 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     parser = build_argparser()
     args = parser.parse_args(argv)
     if args.command == "collect":

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Mapping, Sequence, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -20,7 +21,7 @@ def _json_hash(payload: Mapping[str, Any], *, prefix: str) -> str:
     return f"{prefix}_{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:24]}"
 
 
-def uniform_reference_grid(bin_count: int = DEFAULT_DENSITY_BIN_COUNT) -> Tuple[float, ...]:
+def uniform_reference_grid(bin_count: int = DEFAULT_DENSITY_BIN_COUNT) -> tuple[float, ...]:
     bins = int(bin_count)
     if bins <= 0:
         raise ValueError(f"bin_count must be positive, got {bin_count!r}.")
@@ -28,7 +29,7 @@ def uniform_reference_grid(bin_count: int = DEFAULT_DENSITY_BIN_COUNT) -> Tuple[
     return tuple(float(x) for x in grid.tolist())
 
 
-def validate_reference_grid(reference_time_grid: Sequence[float]) -> Tuple[float, ...]:
+def validate_reference_grid(reference_time_grid: Sequence[float]) -> tuple[float, ...]:
     values = np.asarray([float(x) for x in reference_time_grid], dtype=np.float64)
     if values.ndim != 1 or values.size < 2:
         raise ValueError("reference_time_grid must be one-dimensional with at least two edges.")
@@ -50,7 +51,7 @@ def sanitize_density_mass(
     density_mass: Sequence[float],
     *,
     eps: float = DEFAULT_DENSITY_EPS,
-) -> Tuple[float, ...]:
+) -> tuple[float, ...]:
     mass = np.asarray([float(x) for x in density_mass], dtype=np.float64)
     if mass.ndim != 1 or mass.size <= 0:
         raise ValueError("density_mass must be a non-empty 1D vector.")
@@ -91,7 +92,7 @@ def reverse_density_mass(
     density_mass: Sequence[float],
     *,
     eps: float = DEFAULT_DENSITY_EPS,
-) -> Tuple[float, ...]:
+) -> tuple[float, ...]:
     return sanitize_density_mass(tuple(reversed(tuple(float(x) for x in density_mass))), eps=float(eps))
 
 
@@ -102,7 +103,7 @@ def average_density_masses(
     left_weight: float = 0.5,
     right_weight: float = 0.5,
     eps: float = DEFAULT_DENSITY_EPS,
-) -> Tuple[float, ...]:
+) -> tuple[float, ...]:
     left = np.asarray(sanitize_density_mass(left_density_mass, eps=0.0), dtype=np.float64)
     right = np.asarray(sanitize_density_mass(right_density_mass, eps=0.0), dtype=np.float64)
     if left.shape != right.shape:
@@ -120,7 +121,7 @@ def grid_to_density_mass(
     reference_time_grid: Sequence[float] | None = None,
     macro_steps: int | None = None,
     eps: float = 0.0,
-) -> Tuple[float, ...]:
+) -> tuple[float, ...]:
     steps = int(macro_steps) if macro_steps is not None else len(tuple(time_grid)) - 1
     grid = np.asarray(validate_time_grid(time_grid, macro_steps=steps), dtype=np.float64)
     reference = np.asarray(
@@ -156,7 +157,7 @@ def density_mass_to_time_grid(
     macro_steps: int,
     reference_time_grid: Sequence[float] | None = None,
     eps: float = DEFAULT_DENSITY_EPS,
-) -> Tuple[float, ...]:
+) -> tuple[float, ...]:
     steps = int(macro_steps)
     if steps <= 0:
         raise ValueError(f"macro_steps must be positive, got {macro_steps!r}.")

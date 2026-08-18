@@ -5,10 +5,11 @@ import os
 import pickle
 import re
 import tempfile
+from collections.abc import Mapping
 from dataclasses import fields
 from numbers import Real
 from pathlib import Path
-from typing import Any, Mapping, get_args, get_origin, get_type_hints
+from typing import Any, get_args, get_origin, get_type_hints
 
 import torch
 

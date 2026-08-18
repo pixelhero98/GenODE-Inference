@@ -34,7 +34,15 @@ def _is_generated_path(path: Path) -> bool:
 def _source_release_files() -> list[Path]:
     try:
         result = subprocess.run(
-            ["git", "-C", str(PROJECT_ROOT), "ls-files"],
+            [
+                "git",
+                "-C",
+                str(PROJECT_ROOT),
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
             check=True,
             capture_output=True,
             text=True,
@@ -93,14 +101,55 @@ class GenODEInterfaceTests(unittest.TestCase):
         markdown_files = sorted(
             path.relative_to(PROJECT_ROOT).as_posix() for path in _source_release_files() if path.suffix == ".md"
         )
-        self.assertEqual(markdown_files, ["README.md", "THIRD_PARTY_NOTICES.md"])
+        self.assertEqual(
+            markdown_files,
+            [
+                "CONTRIBUTING.md",
+                "README.md",
+                "SECURITY.md",
+                "THIRD_PARTY_NOTICES.md",
+            ],
+        )
         text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("frozen_backbone_policy_context_v1", text)
         self.assertIn("exactly 23 schedules", text)
         self.assertIn("genode-train-gico", text)
         self.assertIn("genode-report-gico-locked-test", text)
+        self.assertIn("[CONTRIBUTING.md](CONTRIBUTING.md)", text)
+        self.assertIn("[SECURITY.md](SECURITY.md)", text)
         self.assertNotIn("allow_noncanonical", text)
         self.assertNotIn("teacher-oracle", text.lower())
+
+    def test_publication_ci_covers_supported_matrix_and_image_cli(self) -> None:
+        workflow = (PROJECT_ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        for required in (
+            'python-version: "3.11"',
+            'numpy_spec: "numpy>=1.26,<2"',
+            'python-version: "3.13"',
+            'numpy_spec: "numpy>=2,<3"',
+            "python -m ruff format --check .",
+            "python -m compileall -q src tests",
+            "Inspect wheel and source distribution",
+            "Install and test the source distribution",
+            "genode-image-gico",
+            "build-targets",
+            "train-deterministic",
+            "train-stochastic",
+            "validate",
+            "materialize",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, workflow)
+
+    def test_source_distribution_manifest_includes_publication_metadata(self) -> None:
+        manifest = (PROJECT_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+        for required in (
+            "include CONTRIBUTING.md",
+            "include SECURITY.md",
+            "include tests/__init__.py",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, manifest)
 
     def test_no_tracked_scripts_or_legacy_docs_tree(self) -> None:
         self.assertFalse((PROJECT_ROOT / "scripts").exists())

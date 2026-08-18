@@ -9,10 +9,10 @@ import shutil
 import stat
 import tempfile
 import time
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -249,7 +249,7 @@ class DistillationContexts:
     histories: torch.Tensor
     conditions: torch.Tensor | None = None
 
-    def validate(self) -> "DistillationContexts":
+    def validate(self) -> DistillationContexts:
         if not self.context_ids:
             raise ValueError("At least one context is required for demonstration collection.")
         normalized_ids = tuple(str(value).strip() for value in self.context_ids)
@@ -412,7 +412,7 @@ def _noise_seed(
 ) -> int:
     # Common random numbers make teacher endpoints directly comparable across
     # solver/NFE settings for the same context and rollout.
-    encoded = (f"{int(base_seed)}\0{context_fingerprint}\0{int(rollout_index)}").encode("utf-8")
+    encoded = (f"{int(base_seed)}\0{context_fingerprint}\0{int(rollout_index)}").encode()
     digest = hashlib.sha256(encoded).digest()
     return int.from_bytes(digest[:8], "big") % (2**63 - 1)
 

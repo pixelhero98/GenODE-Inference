@@ -37,6 +37,13 @@ from genode.gico.image_conditional_training import (
     ImageGICOBackboneContextTrainingConfig,
     train_image_gico_backbone_context,
 )
+from genode.gico.image_students import (
+    load_image_gico_deterministic_artifact,
+    materialize_image_gico_schedule,
+    save_image_gico_deterministic_artifact,
+    train_image_gico_deterministic_student,
+)
+from genode.gico.image_supervision import build_image_gico_conditional_supervision
 from genode.schedules.policy import ScheduleBatch
 
 
@@ -225,26 +232,69 @@ def test_imagenet_teacher_student_artifact_round_trip_and_euler_evaluation(
     class_kid = generator.normal(size=(3, schedule_count, 1_000)).astype(np.float32)
     jackknife = np.repeat(class_kid[..., None], 64, axis=-1)
     jackknife += np.linspace(-0.01, 0.01, 64, dtype=np.float32)[None, None, None, :]
-    masses = generator.uniform(size=(3, schedule_count, 64)).astype(np.float32)
-    masses /= masses.sum(axis=-1, keepdims=True)
+    masses = generator.uniform(size=(3, schedule_count, 64)).astype(np.float64)
+    masses /= masses.sum(axis=-1, keepdims=True, dtype=np.float64)
+    schedule_sha256s = tuple(
+        semantic_sha256({"schedule_key": key}, namespace="test-image-schedule") for key in IMAGE_SCHEDULE_KEYS
+    )
+    density_mass_sha256s = tuple(
+        tuple(
+            semantic_sha256(masses[nfe_index, schedule_index].tolist(), namespace="test-image-density")
+            for schedule_index in range(schedule_count)
+        )
+        for nfe_index in range(3)
+    )
     targets = build_image_gico_conditional_targets(
         class_kid=class_kid,
         jackknife_class_kid=jackknife,
         reward_scales=np.asarray((0.25, 0.5, 1.0), dtype=np.float32),
         fixed_density_mass=masses,
         schedule_keys=IMAGE_SCHEDULE_KEYS,
-        schedule_sha256s=tuple(f"schedule-{index}" for index in range(schedule_count)),
-        density_mass_sha256s=tuple(
-            tuple(f"density-{nfe}-{schedule}" for schedule in range(schedule_count)) for nfe in (2, 4, 8)
-        ),
+        schedule_sha256s=schedule_sha256s,
+        density_mass_sha256s=density_mass_sha256s,
         feature_groups=groups,
-        reward_evidence_sha256="evidence:" + "4" * 64,
-        fixed_support_sha256="support:" + "5" * 64,
+        reward_evidence_sha256=semantic_sha256("evidence", namespace="test-image-reward-evidence"),
+        fixed_support_sha256=semantic_sha256(masses.tolist(), namespace="test-image-fixed-support"),
         backbone_model_key=backbone.manifest.model_key,
         backbone_protocol_sha256=backbone.manifest.protocol_sha256,
         backbone_checkpoint_sha256=backbone.manifest.checkpoint.sha256,
         feature_protocol_sha256=groups.feature_protocol_sha256,
     )
+    supervision = build_image_gico_conditional_supervision(
+        targets=targets,
+        fixed_density_mass=masses,
+        normalized_contexts=prepared.normalized_context_table,
+    )
+    unified_result = train_image_gico_deterministic_student(
+        supervision,
+        config=ImageGICOBackboneContextTrainingConfig(
+            teacher_steps=1,
+            student_steps=1,
+            teacher_batch_size=8,
+        ),
+    )
+    unified_dir = tmp_path / "unified-deterministic-policy"
+    unified_manifest = save_image_gico_deterministic_artifact(
+        unified_result,
+        supervision,
+        unified_dir,
+    )
+    unified_artifact = load_image_gico_deterministic_artifact(
+        unified_dir,
+        expected_artifact_sha256=unified_manifest["artifact_sha256"],
+    )
+    materialized = materialize_image_gico_schedule(
+        "deterministic_barycenter",
+        deterministic_artifact=unified_artifact,
+        causal_artifact=None,
+        target_nfe=4,
+        context_indices=[0, 999],
+    )
+    assert materialized.density_mass.shape == (2, 64)
+    assert materialized.time_grids.shape == (2, 5)
+    assert materialized.artifact_sha256 == unified_manifest["artifact_sha256"]
+    assert materialized.supervision_sha256 == supervision.sha256
+
     result = train_image_gico_backbone_context(
         targets,
         fixed_density_mass=masses,

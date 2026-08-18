@@ -36,7 +36,7 @@ class ProgressBar:
         self._started = False
         self._tty = bool(getattr(self.stream, "isatty", lambda: False)())
 
-    def __enter__(self) -> "ProgressBar":
+    def __enter__(self) -> ProgressBar:
         if self.enabled and self.total > 0:
             self._emit(force=True)
         return self

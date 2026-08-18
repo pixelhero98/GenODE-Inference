@@ -151,7 +151,7 @@ def test_store_split_and_rollout_seed_depend_on_physical_identity(tmp_path: Path
     assert first_metadata["contexts_source_sha256"] == in_memory_context_source_sha256(("alpha", "beta"), fingerprints)
 
     expected_seed = int.from_bytes(
-        hashlib.sha256(f"23\0{fingerprints[0]}\0{0}".encode("utf-8")).digest()[:8],
+        hashlib.sha256(f"23\0{fingerprints[0]}\0{0}".encode()).digest()[:8],
         "big",
     ) % (2**63 - 1)
     assert _noise_seed(23, context_fingerprint=fingerprints[0], rollout_index=0) == expected_seed

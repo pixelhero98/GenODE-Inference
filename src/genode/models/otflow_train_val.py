@@ -16,9 +16,10 @@ import hashlib
 import json
 import random
 import time
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -57,7 +58,7 @@ def seed_all(seed: int = 0):
     torch.cuda.manual_seed_all(normalized_seed)
 
 
-def capture_rng_state() -> Dict[str, Any]:
+def capture_rng_state() -> dict[str, Any]:
     """Capture RNG state for restart checkpoints."""
     numpy_state = np.random.get_state()
     return {
@@ -75,7 +76,7 @@ def capture_rng_state() -> Dict[str, Any]:
     }
 
 
-def restore_rng_state(state: Optional[Mapping[str, Any]]) -> None:
+def restore_rng_state(state: Mapping[str, Any] | None) -> None:
     """Restore RNG state captured by :func:`capture_rng_state`."""
     if not state:
         return
@@ -121,7 +122,7 @@ def make_loader(
     shuffle: bool = True,
     num_workers: int = 0,
     drop_last: bool = False,
-    generator: Optional[torch.Generator] = None,
+    generator: torch.Generator | None = None,
 ) -> DataLoader:
     """Build a DataLoader with safe defaults for small split sizes.
 
@@ -236,7 +237,7 @@ def _temporary_eval_seed(seed: int):
             torch.cuda.set_rng_state_all(cuda_states)
 
 
-def resolve_context_length(max_available: int, *, horizon: int, cfg: Optional[OTFlowConfig]) -> int:
+def resolve_context_length(max_available: int, *, horizon: int, cfg: OTFlowConfig | None) -> int:
     max_available = max(1, int(max_available))
     if cfg is None or not bool(getattr(cfg, "adaptive_context", False)):
         return max_available
@@ -259,7 +260,7 @@ def crop_history_window(hist: torch.Tensor, context_len: int) -> torch.Tensor:
     raise ValueError(f"Unsupported history tensor rank: {hist.dim()}")
 
 
-def sample_training_context_length(max_available: int, cfg: Optional[OTFlowConfig]) -> int:
+def sample_training_context_length(max_available: int, cfg: OTFlowConfig | None) -> int:
     max_available = max(1, int(max_available))
     if cfg is None or not bool(getattr(cfg, "train_variable_context", False)):
         return max_available
@@ -285,7 +286,7 @@ def _model_snapshot_dim(model: torch.nn.Module, context_dim: int) -> int:
     return int(getattr(model_cfg, "snapshot_dim", int(context_dim)))
 
 
-def _future_time_context_seq(ds, t0: int, horizon: int) -> Optional[torch.Tensor]:
+def _future_time_context_seq(ds, t0: int, horizon: int) -> torch.Tensor | None:
     if hasattr(ds, "future_time_features"):
         features = ds.future_time_features(int(t0), int(horizon))
         if features is not None:
@@ -340,11 +341,11 @@ def _compute_training_loss(
     *,
     tgt: torch.Tensor,
     hist: torch.Tensor,
-    fut: Optional[torch.Tensor],
-    cond: Optional[torch.Tensor],
+    fut: torch.Tensor | None,
+    cond: torch.Tensor | None,
     meta: Any,
-    loss_mode: Optional[str],
-) -> Tuple[torch.Tensor, Dict[str, float]]:
+    loss_mode: str | None,
+) -> tuple[torch.Tensor, dict[str, float]]:
     if isinstance(model, OTFlow):
         return model.loss(tgt, hist, fut=fut, cond=cond, meta=meta)
 
@@ -359,10 +360,10 @@ def evaluate_average_loss(
     cfg: OTFlowConfig,
     *,
     model_name: str = "otflow",
-    max_batches: Optional[int] = None,
-    loss_mode: Optional[str] = None,
+    max_batches: int | None = None,
+    loss_mode: str | None = None,
     shuffle: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Evaluate the mean training objective on a dataset split."""
     _normalize_model_name(model_name)
     device = cfg.device
@@ -421,7 +422,7 @@ def _loader_epoch_seed(base_seed: int, epoch: int) -> int:
     return int((int(base_seed) + (int(epoch) + 1) * 0x9E3779B97F4A7C15) % _MAX_TORCH_GENERATOR_SEED)
 
 
-def _tensor_mapping_to_cpu(mapping: Optional[Mapping[str, torch.Tensor]]) -> Optional[Dict[str, torch.Tensor]]:
+def _tensor_mapping_to_cpu(mapping: Mapping[str, torch.Tensor] | None) -> dict[str, torch.Tensor] | None:
     if mapping is None:
         return None
     return {str(key): value.detach().cpu().clone() for key, value in mapping.items()}
@@ -433,33 +434,24 @@ def train_loop(
     model_name: str = "otflow",
     steps: int = 10_000,
     log_every: int = 200,
-    model: Optional[torch.nn.Module] = None,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    loss_mode: Optional[str] = None,
+    model: torch.nn.Module | None = None,
+    optimizer: torch.optim.Optimizer | None = None,
+    loss_mode: str | None = None,
     shuffle: bool = True,
-    on_step: Optional[Callable[[int, torch.nn.Module, float, Dict[str, float]], None]] = None,
-    initial_model_state: Optional[Mapping[str, torch.Tensor]] = None,
-    optimizer_state: Optional[Mapping[str, Any]] = None,
-    scheduler_state: Optional[Mapping[str, Any]] = None,
-    scaler_state: Optional[Mapping[str, Any]] = None,
-    ema_state: Optional[Mapping[str, torch.Tensor]] = None,
-    swa_model_state: Optional[Mapping[str, Any]] = None,
-    rng_state: Optional[Mapping[str, Any]] = None,
-    loader_state: Optional[Mapping[str, Any]] = None,
+    on_step: Callable[[int, torch.nn.Module, float, dict[str, float]], None] | None = None,
+    initial_model_state: Mapping[str, torch.Tensor] | None = None,
+    optimizer_state: Mapping[str, Any] | None = None,
+    scheduler_state: Mapping[str, Any] | None = None,
+    scaler_state: Mapping[str, Any] | None = None,
+    ema_state: Mapping[str, torch.Tensor] | None = None,
+    swa_model_state: Mapping[str, Any] | None = None,
+    rng_state: Mapping[str, Any] | None = None,
+    loader_state: Mapping[str, Any] | None = None,
     start_step: int = 0,
-    on_training_state: Optional[
-        Callable[
-            [
-                int,
-                torch.nn.Module,
-                torch.optim.Optimizer,
-                Optional[Any],
-                torch.cuda.amp.GradScaler,
-                Dict[str, Any],
-            ],
-            None,
-        ]
-    ] = None,
+    on_training_state: Callable[
+        [int, torch.nn.Module, torch.optim.Optimizer, Any | None, torch.cuda.amp.GradScaler, dict[str, Any]], None
+    ]
+    | None = None,
 ) -> torch.nn.Module:
     """Train a model on next-step prediction in normalized param space.
 
@@ -638,10 +630,10 @@ def train_loop(
 def generate_continuation(
     model: torch.nn.Module,
     hist: torch.Tensor,
-    cond_seq: Optional[torch.Tensor],
+    cond_seq: torch.Tensor | None,
     steps: int,
     nfe: int,
-    future_context_seq: Optional[torch.Tensor] = None,
+    future_context_seq: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Continuation in normalized param space.
 
@@ -818,10 +810,10 @@ def _hist_l1(x: np.ndarray, y: np.ndarray, bins: int = 64) -> float:
     return float(np.sum(np.abs(px - py)))
 
 
-def _impact_response_curve(imb: np.ndarray, ret: np.ndarray, lags: Sequence[int] = (1, 5, 10, 20)) -> Dict[str, float]:
+def _impact_response_curve(imb: np.ndarray, ret: np.ndarray, lags: Sequence[int] = (1, 5, 10, 20)) -> dict[str, float]:
     imb = np.asarray(imb, dtype=np.float64).ravel()
     ret = np.asarray(ret, dtype=np.float64).ravel()
-    out: Dict[str, float] = {}
+    out: dict[str, float] = {}
     if imb.size == 0 or ret.size == 0:
         return {str(int(lag)): float("nan") for lag in lags}
     ret_csum = np.concatenate(([0.0], np.cumsum(ret, dtype=np.float64)))
@@ -836,7 +828,7 @@ def _impact_response_curve(imb: np.ndarray, ret: np.ndarray, lags: Sequence[int]
     return out
 
 
-def _validity_metrics(ask_p: np.ndarray, ask_v: np.ndarray, bid_p: np.ndarray, bid_v: np.ndarray) -> Dict[str, float]:
+def _validity_metrics(ask_p: np.ndarray, ask_v: np.ndarray, bid_p: np.ndarray, bid_v: np.ndarray) -> dict[str, float]:
     eps = 1e-8
     crossed = (ask_p[:, 0] <= bid_p[:, 0]).astype(np.float32)
     ask_monotonic_bad = (np.diff(ask_p, axis=1) <= 0).any(axis=1).astype(np.float32)
@@ -874,7 +866,7 @@ def _downstream_device(cfg: OTFlowConfig) -> torch.device:
     return device
 
 
-def _standardize_pair(train_x: np.ndarray, test_x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _standardize_pair(train_x: np.ndarray, test_x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     mu = train_x.mean(axis=0, keepdims=True).astype(np.float32)
     sig = (train_x.std(axis=0, keepdims=True) + 1e-6).astype(np.float32)
     return ((train_x - mu) / sig).astype(np.float32), ((test_x - mu) / sig).astype(np.float32)
@@ -920,8 +912,8 @@ def _train_small_multiclass_mlp(
     hidden_dim: int = 64,
     epochs: int = 12,
     batch_size: int = 512,
-    num_classes: Optional[int] = None,
-) -> Tuple[torch.nn.Module, int]:
+    num_classes: int | None = None,
+) -> tuple[torch.nn.Module, int]:
     train_x = np.asarray(train_x, dtype=np.float32)
     train_y = np.asarray(train_y, dtype=np.int64)
     if len(train_x) == 0:
@@ -976,7 +968,7 @@ def _train_small_multiclass_mlp_f1(
     hidden_dim: int = 64,
     epochs: int = 12,
     batch_size: int = 512,
-    num_classes: Optional[int] = None,
+    num_classes: int | None = None,
 ) -> float:
     test_x = np.asarray(test_x, dtype=np.float32)
     test_y = np.asarray(test_y, dtype=np.int64)
@@ -1045,7 +1037,7 @@ def _train_small_discriminator_auc(
     return _binary_auc(test_y, probs)
 
 
-def _future_moves_from_params(params_raw: np.ndarray, label_horizon: int) -> Tuple[np.ndarray, np.ndarray]:
+def _future_moves_from_params(params_raw: np.ndarray, label_horizon: int) -> tuple[np.ndarray, np.ndarray]:
     params_raw = np.asarray(params_raw, dtype=np.float32)
     T = int(len(params_raw))
     hh = int(label_horizon)
@@ -1069,7 +1061,7 @@ def _ternary_labels(moves: np.ndarray, threshold: float) -> np.ndarray:
     return labels
 
 
-def _subsample_examples(x: np.ndarray, y: np.ndarray, max_examples: int, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+def _subsample_examples(x: np.ndarray, y: np.ndarray, max_examples: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
     if len(x) <= int(max_examples):
         return x, y
     rng = np.random.default_rng(seed)
@@ -1078,12 +1070,12 @@ def _subsample_examples(x: np.ndarray, y: np.ndarray, max_examples: int, seed: i
 
 
 def _collect_downstream_examples(
-    rows: Sequence[Dict[str, Any]],
+    rows: Sequence[dict[str, Any]],
     *,
     label_horizon: int,
     max_examples_per_split: int,
     seed: int,
-) -> Dict[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     real_x = []
     real_moves = []
     gen_x = []
@@ -1131,7 +1123,7 @@ def _pairwise_split(
     *,
     seed: int,
     train_frac: float = 0.7,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n = int(min(len(real_x), len(gen_x)))
     if n <= 1:
         empty = np.zeros((0, real_x.shape[1] if real_x.ndim == 2 else gen_x.shape[1]), dtype=np.float32)
@@ -1149,7 +1141,7 @@ def _pairwise_split(
     return train_x, train_y, test_x, test_y
 
 
-def _aggregate_core_l2_distribution_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def _aggregate_core_l2_distribution_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     pooled_gen = {k: [] for k in CORE_L2_STATS}
     pooled_true = {k: [] for k in CORE_L2_STATS}
     per_window = {k: [] for k in CORE_L2_STATS}
@@ -1231,13 +1223,13 @@ def _signal_feature_vector(
     *,
     sampling_rate_hz: float,
     channel_names: Sequence[str],
-) -> Tuple[np.ndarray, List[str]]:
+) -> tuple[np.ndarray, list[str]]:
     arr = np.asarray(signal, dtype=np.float64)
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D signal array [T, C], got shape {arr.shape}.")
 
-    features: List[float] = []
-    names: List[str] = []
+    features: list[float] = []
+    names: list[str] = []
     for channel_index, channel_name in enumerate(channel_names):
         channel = arr[:, int(channel_index)]
         channel = channel[np.isfinite(channel)]
@@ -1271,15 +1263,15 @@ def _signal_feature_vector(
 
 
 def _collect_signal_feature_examples(
-    rows: Sequence[Dict[str, Any]],
+    rows: Sequence[dict[str, Any]],
     *,
     sampling_rate_hz: float,
     channel_names: Sequence[str],
-) -> Dict[str, Any]:
-    real_features: List[np.ndarray] = []
-    gen_features: List[np.ndarray] = []
-    history_scores: List[float] = []
-    feature_names: Optional[List[str]] = None
+) -> dict[str, Any]:
+    real_features: list[np.ndarray] = []
+    gen_features: list[np.ndarray] = []
+    history_scores: list[float] = []
+    feature_names: list[str] | None = None
     for row in rows:
         seq = row.get("seq", {})
         gen_signal = seq.get("gen_signal_raw")
@@ -1337,8 +1329,8 @@ def _aggregate_signal_feature_distances(
     real_x: np.ndarray,
     gen_x: np.ndarray,
     feature_names: Sequence[str],
-    condition_labels: Optional[np.ndarray] = None,
-) -> Dict[str, Any]:
+    condition_labels: np.ndarray | None = None,
+) -> dict[str, Any]:
     real_x = np.asarray(real_x, dtype=np.float64)
     gen_x = np.asarray(gen_x, dtype=np.float64)
     if real_x.shape != gen_x.shape:
@@ -1346,11 +1338,11 @@ def _aggregate_signal_feature_distances(
     if real_x.ndim != 2:
         raise ValueError("Signal feature arrays must be 2D.")
 
-    unconditional_by_stat: Dict[str, float] = {}
-    conditional_by_stat: Dict[str, float] = {}
-    unconditional_l1_by_stat: Dict[str, float] = {}
-    conditional_l1_by_stat: Dict[str, float] = {}
-    stat_scales: Dict[str, float] = {}
+    unconditional_by_stat: dict[str, float] = {}
+    conditional_by_stat: dict[str, float] = {}
+    unconditional_l1_by_stat: dict[str, float] = {}
+    conditional_l1_by_stat: dict[str, float] = {}
+    stat_scales: dict[str, float] = {}
     labels = None if condition_labels is None else np.asarray(condition_labels, dtype=np.int64).reshape(-1)
     if labels is not None and labels.shape[0] != real_x.shape[0]:
         raise ValueError("Signal condition_labels must match the number of examples.")
@@ -1407,18 +1399,18 @@ def _compare_signal_sequences(
     sampling_rate_hz: float,
     channel_names: Sequence[str],
     max_acf_lag: int = 20,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     gen_arr = np.asarray(gen_signal, dtype=np.float64)
     true_arr = np.asarray(true_signal, dtype=np.float64)
     length = min(int(gen_arr.shape[0]), int(true_arr.shape[0]))
     gen_arr = gen_arr[:length]
     true_arr = true_arr[:length]
 
-    mae_by_channel: Dict[str, float] = {}
-    rmse_by_channel: Dict[str, float] = {}
-    acf_by_channel: Dict[str, Dict[str, float]] = {}
-    spectral_errors: List[float] = []
-    signal_errors: List[float] = []
+    mae_by_channel: dict[str, float] = {}
+    rmse_by_channel: dict[str, float] = {}
+    acf_by_channel: dict[str, dict[str, float]] = {}
+    spectral_errors: list[float] = []
+    signal_errors: list[float] = []
 
     for channel_index, channel_name in enumerate(channel_names):
         gen_col = gen_arr[:, int(channel_index)]
@@ -1463,15 +1455,15 @@ def _compare_signal_sequences(
 
 
 def _evaluate_generation_main_metrics(
-    rows: Sequence[Dict[str, Any]],
+    rows: Sequence[dict[str, Any]],
     cfg: OTFlowConfig,
     *,
     horizon: int,
     seed: int,
     max_examples_per_split: int = 20_000,
     dataset_kind: str = "l2",
-    dataset_metadata: Optional[Mapping[str, Any]] = None,
-) -> Dict[str, Any]:
+    dataset_metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     dataset_kind = str(dataset_kind)
     dataset_metadata = dict(dataset_metadata or {})
     if dataset_kind == LONG_TERM_ST_DATASET_KEY:
@@ -1611,11 +1603,11 @@ def _evaluate_generation_main_metrics(
 
 def _param_horizon_metrics(
     gen_params: np.ndarray, true_params: np.ndarray, horizons: Sequence[int]
-) -> Dict[str, Dict[str, float]]:
+) -> dict[str, dict[str, float]]:
     T = min(len(gen_params), len(true_params))
     g = gen_params[:T]
     r = true_params[:T]
-    out: Dict[str, Dict[str, float]] = {}
+    out: dict[str, dict[str, float]] = {}
     for h in horizons:
         hh = int(h)
         if hh <= 0 or hh > T:
@@ -1644,7 +1636,7 @@ def compare_l2_sequences(
     bid_p_true: np.ndarray,
     bid_v_true: np.ndarray,
     max_acf_lag: int = 20,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     T = int(min(len(gen_params), len(true_params)))
     gen_params = gen_params[:T]
     true_params = true_params[:T]
@@ -1784,11 +1776,11 @@ def eval_one_window(
     horizon: int = 200,
     nfe: int = 1,
     seed: int = 0,
-    t0: Optional[int] = None,
+    t0: int | None = None,
     horizons_eval: Sequence[int] = (1, 10, 50, 100, 200),
     return_sequences: bool = False,
     main_metrics_only: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     horizon = int(horizon)
     dataset_kind = str(getattr(ds, "dataset_kind", "l2"))
     dataset_metadata = dict(getattr(ds, "dataset_metadata", {}) or {})
@@ -1871,7 +1863,7 @@ def eval_one_window(
                 }
         basic_gen = {}
         basic_true = {}
-        out: Dict[str, Any] = {
+        out: dict[str, Any] = {
             "gen": basic_gen,
             "true": basic_true,
             "cmp": cmp_metrics,
@@ -1935,7 +1927,7 @@ def eval_one_window(
     basic_gen = {} if main_metrics_only else compute_basic_l2_metrics(ask_p_g, ask_v_g, bid_p_g, bid_v_g)
     basic_true = {} if main_metrics_only else compute_basic_l2_metrics(ask_p_r, ask_v_r, bid_p_r, bid_v_r)
 
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "gen": basic_gen,
         "true": basic_true,
         "cmp": cmp_metrics,
@@ -1972,7 +1964,7 @@ def eval_one_window(
 def _aggregate_nested_dicts(dicts):
     flat_rows = [flatten_dict(d) for d in dicts]
     keys = sorted(set().union(*[set(fr.keys()) for fr in flat_rows]))
-    aggs: Dict[str, Dict[str, float]] = {}
+    aggs: dict[str, dict[str, float]] = {}
     for k in keys:
         vals = [fr[k] for fr in flat_rows if k in fr and np.isfinite(fr[k])]
         if not vals:
@@ -1981,17 +1973,17 @@ def _aggregate_nested_dicts(dicts):
     return unflatten_to_nested(aggs)
 
 
-def _wrap_scalar_as_mean_std(value: float) -> Dict[str, float]:
+def _wrap_scalar_as_mean_std(value: float) -> dict[str, float]:
     return {"mean": float(value), "std": 0.0}
 
 
-def _wrap_optional_scalar_as_mean_std(value: Any) -> Dict[str, Any]:
+def _wrap_optional_scalar_as_mean_std(value: Any) -> dict[str, Any]:
     if value is None:
         return {"mean": None, "std": None}
     return _wrap_scalar_as_mean_std(float(value))
 
 
-def _optional_numeric(value: Any) -> Optional[float]:
+def _optional_numeric(value: Any) -> float | None:
     if value in (None, ""):
         return None
     try:
@@ -2003,12 +1995,12 @@ def _optional_numeric(value: Any) -> Optional[float]:
     return float(numeric)
 
 
-def _per_window_metric_rows(rows: Sequence[Dict[str, Any]], dataset_kind: str) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
+def _per_window_metric_rows(rows: Sequence[dict[str, Any]], dataset_kind: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     for eval_row in rows:
         cmp = dict(eval_row.get("cmp", {}) or {})
         meta = dict(eval_row.get("meta", {}) or {})
-        row: Dict[str, Any] = {"target_t": int(meta.get("t", len(out)))}
+        row: dict[str, Any] = {"target_t": int(meta.get("t", len(out)))}
         score = _optional_numeric(cmp.get("score_main"))
         if score is not None:
             row["score_main"] = float(score)
@@ -2022,7 +2014,7 @@ def _per_window_metric_rows(rows: Sequence[Dict[str, Any]], dataset_kind: str) -
             if spectral_mae is not None:
                 row["imbalance_specific_error"] = float(spectral_mae)
                 row["c_l1"] = float(spectral_mae)
-            temporal_errors: List[float] = []
+            temporal_errors: list[float] = []
             for payload in dict(cmp.get("temporal", {}) or {}).values():
                 if isinstance(payload, dict):
                     acf_l1 = _optional_numeric(payload.get("acf_l1"))
@@ -2063,11 +2055,11 @@ def eval_many_windows(
     n_windows: int = 50,
     seed: int = 0,
     horizons_eval: Sequence[int] = (1, 10, 50, 100, 200),
-    chosen_t0s: Optional[Sequence[int]] = None,
-    generation_seed_base: Optional[int] = None,
-    metrics_seed: Optional[int] = None,
+    chosen_t0s: Sequence[int] | None = None,
+    generation_seed_base: int | None = None,
+    metrics_seed: int | None = None,
     main_metrics_only: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     dataset_kind = str(getattr(ds, "dataset_kind", "l2"))
     dataset_metadata = dict(getattr(ds, "dataset_metadata", {}) or {})
     rng = np.random.default_rng(seed)
@@ -2213,7 +2205,7 @@ def eval_rollout_horizons(
     nfe: int = 1,
     n_windows: int = 50,
     seed: int = 0,
-) -> Dict[int, Dict[str, Any]]:
+) -> dict[int, dict[str, Any]]:
     out = {}
     for h in horizons:
         out[int(h)] = eval_many_windows(
@@ -2235,7 +2227,7 @@ def benchmark_sampling_latency(
     n_trials: int = 20,
     warmup: int = 3,
     seed: int = 0,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     rng = np.random.default_rng(seed)
     valid_ts = _valid_eval_indices(ds, horizon)
     if len(valid_ts) == 0:
@@ -2291,7 +2283,7 @@ def eval_speed_quality_nfe(
     n_windows: int = 30,
     seed: int = 0,
     n_trials_latency: int = 10,
-) -> Dict[int, Dict[str, Any]]:
+) -> dict[int, dict[str, Any]]:
     results = {}
     for nfe in nfe_list:
         q = eval_many_windows(ds, model, cfg, horizon=horizon, nfe=int(nfe), n_windows=n_windows, seed=seed)
@@ -2305,7 +2297,7 @@ def eval_speed_quality_nfe(
 # -----------------------------
 # Ablations (C)
 # -----------------------------
-def clone_cfg_with_overrides(cfg: OTFlowConfig, overrides: Dict[str, Any]) -> OTFlowConfig:
+def clone_cfg_with_overrides(cfg: OTFlowConfig, overrides: dict[str, Any]) -> OTFlowConfig:
     cfg2 = copy.deepcopy(cfg)
     cfg2.apply_overrides(**overrides)
     return cfg2
@@ -2315,7 +2307,7 @@ def run_ablation_grid(
     ds_train: WindowedParamSequenceDataset,
     ds_eval: WindowedParamSequenceDataset,
     base_cfg: OTFlowConfig,
-    ablations: Sequence[Tuple[str, Dict[str, Any]]],
+    ablations: Sequence[tuple[str, dict[str, Any]]],
     model_name: str = "otflow",
     train_steps: int = 10_000,
     eval_horizon: int = 200,
@@ -2323,7 +2315,7 @@ def run_ablation_grid(
     n_windows: int = 30,
     seed: int = 0,
     log_every: int = 200,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
     suite = {}
     model_name = _normalize_model_name(model_name)
@@ -2354,7 +2346,7 @@ def run_ablation_grid(
 
 
 def summarize_ablation_for_table(
-    ablation_results: Dict[str, Any],
+    ablation_results: dict[str, Any],
     keys: Sequence[str] = (
         "eval.cmp.score_main.mean",
         "eval.cmp.main.temporal_tstr_f1.mean",
@@ -2394,7 +2386,7 @@ def save_qualitative_window_npz(
     horizon: int = 200,
     nfe: int = 1,
     seed: int = 0,
-    t0: Optional[int] = None,
+    t0: int | None = None,
 ):
     res = eval_one_window(ds, model, cfg, horizon=horizon, nfe=nfe, seed=seed, t0=t0, return_sequences=True)
     seq = res["seq"]
@@ -2419,7 +2411,7 @@ def save_qualitative_window_npz(
     print(f"Saved qualitative window to {save_path}")
 
 
-def save_json(obj: Dict[str, Any], path: str):
+def save_json(obj: dict[str, Any], path: str):
     def _conv(x):
         if isinstance(x, (np.floating,)):
             return float(x)

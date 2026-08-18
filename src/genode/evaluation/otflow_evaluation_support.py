@@ -6,10 +6,11 @@ import json
 import math
 import os
 import time
+from collections.abc import Mapping, Sequence
 from collections.abc import Mapping as MappingABC
 from dataclasses import fields
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -83,7 +84,7 @@ DEFAULT_SHARED_BACKBONE_ROOT = project_results_root() / "shared_backbones" / "ot
 DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE = "transformer"
 DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS = 20_000
 CANONICAL_TEMPORAL_ROLLOUT_MODE = "non_ar"
-CONDITIONAL_GENERATION_PHYSICAL_BATCH_SIZE_BY_DATASET: Dict[str, int] = {
+CONDITIONAL_GENERATION_PHYSICAL_BATCH_SIZE_BY_DATASET: dict[str, int] = {
     "cryptos": 8,
     "lobster_synthetic": 8,
     LONG_TERM_ST_DATASET_KEY: 2,
@@ -103,8 +104,8 @@ DEFAULT_FORECAST_DATASETS = tuple(CANONICAL_FORECAST_PAPER_DATASETS)
 SUPPORTED_FORECAST_DATASETS = tuple(CANONICAL_FORECAST_PAPER_DATASETS)
 DEFAULT_CONDITIONAL_GENERATION_DATASETS = tuple(CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS)
 SUPPORTED_CONDITIONAL_GENERATION_DATASETS = tuple(ALL_SUPPORTED_CONDITIONAL_GENERATION_DATASETS)
-ALL_SOLVER_ORDER: Tuple[str, ...] = CANONICAL_SOLVER_KEYS
-SOLVER_RUNTIME_NAMES: Dict[str, str] = dict(CANONICAL_SOLVER_RUNTIME_NAMES)
+ALL_SOLVER_ORDER: tuple[str, ...] = CANONICAL_SOLVER_KEYS
+SOLVER_RUNTIME_NAMES: dict[str, str] = dict(CANONICAL_SOLVER_RUNTIME_NAMES)
 
 
 def _empirical_crps(samples: np.ndarray, target: np.ndarray) -> float:
@@ -123,19 +124,19 @@ def _point_mase(prediction: np.ndarray, target: np.ndarray, scale: float) -> flo
     return float(np.mean(np.abs(prediction - target)) / safe_scale)
 
 
-def parse_csv(text: str) -> List[str]:
+def parse_csv(text: str) -> list[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
-def parse_int_csv(text: str) -> List[int]:
+def parse_int_csv(text: str) -> list[int]:
     return [int(part) for part in parse_csv(text)]
 
 
-def parse_float_csv(text: str) -> List[float]:
+def parse_float_csv(text: str) -> list[float]:
     return [float(part) for part in parse_csv(text)]
 
 
-def parse_forecast_datasets(text: str) -> List[str]:
+def parse_forecast_datasets(text: str) -> list[str]:
     names = parse_csv(text)
     unknown = [name for name in names if name not in SUPPORTED_FORECAST_DATASETS]
     if unknown:
@@ -143,7 +144,7 @@ def parse_forecast_datasets(text: str) -> List[str]:
     return names
 
 
-def parse_conditional_generation_datasets(text: str) -> List[str]:
+def parse_conditional_generation_datasets(text: str) -> list[str]:
     names = parse_csv(text)
     unknown = [name for name in names if name not in SUPPORTED_CONDITIONAL_GENERATION_DATASETS]
     if unknown:
@@ -194,7 +195,7 @@ def train_tuning_target_example_count(
     fraction: float,
     sampling_mode: str = TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
     strata: int = 20,
-    reference_examples: Optional[int] = None,
+    reference_examples: int | None = None,
     train_split_fraction: float = DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION,
     val_split_fraction: float = DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION,
 ) -> int:
@@ -227,9 +228,9 @@ def train_tuning_target_example_count(
     return min(total, max(1, target))
 
 
-def _strata_ranges(total: int, strata: int) -> List[Tuple[int, int]]:
+def _strata_ranges(total: int, strata: int) -> list[tuple[int, int]]:
     strata_count = max(1, min(int(strata), int(total)))
-    ranges: List[Tuple[int, int]] = []
+    ranges: list[tuple[int, int]] = []
     for stratum in range(strata_count):
         start = int(math.floor(float(stratum) * float(total) / float(strata_count)))
         end = int(math.floor(float(stratum + 1) * float(total) / float(strata_count)))
@@ -238,11 +239,11 @@ def _strata_ranges(total: int, strata: int) -> List[Tuple[int, int]]:
     return ranges
 
 
-def _allocate_stratified_target_counts(total: int, strata: int, target: int) -> List[int]:
+def _allocate_stratified_target_counts(total: int, strata: int, target: int) -> list[int]:
     ranges = _strata_ranges(int(total), int(strata))
     capped_target = min(int(total), max(1, int(target)))
     raw_counts = []
-    counts: List[int] = []
+    counts: list[int] = []
     for idx, (start, end) in enumerate(ranges):
         size = int(end - start)
         raw = float(capped_target) * float(size) / float(total)
@@ -275,10 +276,10 @@ def choose_forecast_train_tuning_indices(
     dataset: str = "",
     salt: str = "train_tuning",
     sampling_mode: str = TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION,
-    reference_examples: Optional[int] = None,
+    reference_examples: int | None = None,
     train_split_fraction: float = DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION,
     val_split_fraction: float = DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION,
-    max_examples: Optional[int] = None,
+    max_examples: int | None = None,
 ) -> np.ndarray:
     """Deterministically sample train windows by temporal strata."""
     total = int(len(ds))
@@ -294,7 +295,7 @@ def choose_forecast_train_tuning_indices(
         if cap is not None and target > cap:
             ranges = _strata_ranges(total, int(strata))
             counts = _allocate_stratified_target_counts(total, int(strata), int(cap))
-            selected: List[int] = []
+            selected: list[int] = []
             for stratum, ((start, end), keep) in enumerate(zip(ranges, counts, strict=False)):
                 if int(keep) <= 0:
                     continue
@@ -308,7 +309,7 @@ def choose_forecast_train_tuning_indices(
         if frac >= 1.0:
             return np.arange(total, dtype=np.int64)
         strata_count = max(1, min(int(strata), total))
-        selected: List[int] = []
+        selected: list[int] = []
         for stratum in range(strata_count):
             start = int(math.floor(float(stratum) * float(total) / float(strata_count)))
             end = int(math.floor(float(stratum + 1) * float(total) / float(strata_count)))
@@ -353,7 +354,7 @@ def choose_forecast_train_tuning_indices(
     return np.asarray(sorted(selected), dtype=np.int64)
 
 
-def _parse_forecast_batch(batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
+def _parse_forecast_batch(batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, Any]:
     if len(batch) == 3:
         hist, tgt, meta = batch
         return hist, tgt, None, meta
@@ -363,7 +364,7 @@ def _parse_forecast_batch(batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[t
     raise ValueError(f"Unexpected forecast batch format with {len(batch)} items.")
 
 
-def _optional_int(value: Any) -> Optional[int]:
+def _optional_int(value: Any) -> int | None:
     if value is None or str(value) == "":
         return None
     return int(value)
@@ -376,8 +377,8 @@ def _forecast_example_detail_metadata(
     *,
     dataset_key: str,
     split_phase: str,
-) -> Dict[str, Any]:
-    metadata: Dict[str, Any] = {}
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
     if hasattr(ds, "example_metadata"):
         loaded = ds.example_metadata(int(example_idx))
         if not isinstance(loaded, Mapping):
@@ -432,7 +433,7 @@ def resolve_reference_macro_steps(
     return max(32, int(round(factor * int(runtime_nfe))))
 
 
-def _resolved_backbone_manifest_path(cli_args: argparse.Namespace) -> Optional[Path]:
+def _resolved_backbone_manifest_path(cli_args: argparse.Namespace) -> Path | None:
     raw = str(getattr(cli_args, "backbone_manifest", "") or "").strip()
     if not raw:
         return None
@@ -442,7 +443,7 @@ def _resolved_backbone_manifest_path(cli_args: argparse.Namespace) -> Optional[P
     return path
 
 
-def _load_ready_backbone_manifest(cli_args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+def _load_ready_backbone_manifest(cli_args: argparse.Namespace) -> dict[str, Any] | None:
     manifest_path = _resolved_backbone_manifest_path(cli_args)
     if manifest_path is None:
         return None
@@ -454,8 +455,8 @@ def _resolved_manifest_artifact(
     *,
     benchmark_family: str,
     dataset_key: str,
-    train_steps: Optional[int] = None,
-) -> Optional[Dict[str, Any]]:
+    train_steps: int | None = None,
+) -> dict[str, Any] | None:
     manifest_payload = _load_ready_backbone_manifest(cli_args)
     if manifest_payload is None:
         return None
@@ -469,7 +470,7 @@ def _resolved_manifest_artifact(
     )
 
 
-def _safe_json(path: Path) -> Optional[Dict[str, Any]]:
+def _safe_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
@@ -484,8 +485,8 @@ def _missing_shared_checkpoint_paths(
     shared_backbone_root: Path,
     forecast_datasets: Sequence[str],
     conditional_generation_datasets: Sequence[str],
-) -> List[Path]:
-    missing: List[Path] = []
+) -> list[Path]:
+    missing: list[Path] = []
     for dataset in forecast_datasets:
         ckpt_path = shared_backbone_root / FORECAST_FAMILY / str(dataset) / "model.pt"
         if not ckpt_path.exists():
@@ -503,7 +504,7 @@ def _missing_shared_checkpoint_paths(
     return missing
 
 
-def _requested_checkpoint_steps(cli_args: argparse.Namespace) -> List[int]:
+def _requested_checkpoint_steps(cli_args: argparse.Namespace) -> list[int]:
     raw = str(getattr(cli_args, "checkpoint_steps", "") or "").strip()
     if raw:
         return parse_int_csv(raw)
@@ -517,7 +518,7 @@ def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
     )
     shared_backbone_root = resolve_project_path(str(cli_args.shared_backbone_root))
     checkpoint_steps = _requested_checkpoint_steps(cli_args)
-    errors: List[str] = []
+    errors: list[str] = []
     for dataset in list(forecast_datasets) + list(conditional_generation_datasets):
         try:
             resolved_eval_horizon(cli_args, str(dataset))
@@ -527,8 +528,8 @@ def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
             errors.append(str(exc))
     manifest_payload = _load_ready_backbone_manifest(cli_args)
     if manifest_payload is not None:
-        missing_artifacts: List[str] = []
-        missing_manifest_checkpoints: List[Path] = []
+        missing_artifacts: list[str] = []
+        missing_manifest_checkpoints: list[Path] = []
         for dataset in forecast_datasets:
             for expected_steps in checkpoint_steps:
                 try:
@@ -848,7 +849,7 @@ def load_otflow_checkpoint_payload(
     return payload
 
 
-def load_checkpoint_model(ckpt_path: Path, device: torch.device) -> Tuple[OTFlow, Any]:
+def load_checkpoint_model(ckpt_path: Path, device: torch.device) -> tuple[OTFlow, Any]:
     from genode.models.config import OTFlowConfig
 
     ckpt = load_otflow_checkpoint_payload(ckpt_path, expected_identity="OTFlow model checkpoint")
@@ -892,14 +893,14 @@ def load_checkpoint_model(ckpt_path: Path, device: torch.device) -> Tuple[OTFlow
     return model, cfg
 
 
-def _metadata_path_for_checkpoint(manifest_artifact: Optional[Mapping[str, Any]], ckpt_path: Path) -> Path:
+def _metadata_path_for_checkpoint(manifest_artifact: Mapping[str, Any] | None, ckpt_path: Path) -> Path:
     if manifest_artifact is not None and str(manifest_artifact.get("metadata_path", "") or "").strip():
         return resolve_project_path(str(manifest_artifact["metadata_path"]))
     return Path(ckpt_path).resolve().with_name("checkpoint_metadata.json")
 
 
 def _metadata_int_value(
-    manifest_artifact: Optional[Mapping[str, Any]],
+    manifest_artifact: Mapping[str, Any] | None,
     metadata: Mapping[str, Any],
     key: str,
     default: int,
@@ -912,7 +913,7 @@ def _metadata_int_value(
 
 
 def _metadata_str_value(
-    manifest_artifact: Optional[Mapping[str, Any]],
+    manifest_artifact: Mapping[str, Any] | None,
     metadata: Mapping[str, Any],
     key: str,
     default: str = "",
@@ -947,7 +948,7 @@ def _validate_metadata_identity(
     expected_train_steps: int,
     expected_history_len: int,
     expected_future_block_len: int,
-    expected_field_network_type: Optional[str] = None,
+    expected_field_network_type: str | None = None,
 ) -> None:
     if not metadata:
         raise RuntimeError(f"Checkpoint {ckpt_path} is missing checkpoint_metadata.json for {dataset}.")
@@ -1036,7 +1037,7 @@ def _validate_conditional_generation_checkpoint_task(
     expected_train_steps: int,
     expected_history_len: int,
     expected_future_block_len: int,
-    splits: Optional[Mapping[str, Any]] = None,
+    splits: Mapping[str, Any] | None = None,
 ) -> None:
     _validate_metadata_identity(
         metadata=metadata,
@@ -1098,7 +1099,7 @@ def load_forecast_checkpoint_splits(
     shared_backbone_root: Path,
     dataset: str,
     device: torch.device,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     expected_train_steps = int(getattr(cli_args, "otflow_train_steps", 20000))
     resolved_eval_horizon(cli_args, str(dataset))
     resolved_future_block_len(cli_args, str(dataset))
@@ -1193,7 +1194,7 @@ def load_conditional_generation_checkpoint_splits(
     shared_backbone_root: Path,
     dataset: str,
     device: torch.device,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     expected_train_steps = int(resolved_train_steps(cli_args, str(dataset)))
     experiment_spec = experiment_plan_by_key()[str(dataset)]
     expected_history_len = int(experiment_spec.history_len)
@@ -1328,24 +1329,24 @@ def collect_forecast_calibration(
     seed: int,
     calibration_trace_samples: int = 1,
     info_growth_scale_multiplier: float = 1.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     trace_samples = int(calibration_trace_samples)
     if trace_samples <= 0:
         raise ValueError(f"calibration_trace_samples must be positive, got {calibration_trace_samples}")
 
-    reference_time_grid: Optional[np.ndarray] = None
-    disagreement_rows: List[np.ndarray] = []
-    residual_rows: List[np.ndarray] = []
-    oracle_rows: List[np.ndarray] = []
-    trace_rows: List[Dict[str, Any]] = []
+    reference_time_grid: np.ndarray | None = None
+    disagreement_rows: list[np.ndarray] = []
+    residual_rows: list[np.ndarray] = []
+    oracle_rows: list[np.ndarray] = []
+    trace_rows: list[dict[str, Any]] = []
     device = cfg.train.device
 
     for example_idx in range(len(ds_val)):
         hist_t, _, _, _ = _parse_forecast_batch(ds_val[int(example_idx)])
         hist = hist_t[None].to(device).float()
-        disagreement_samples: List[np.ndarray] = []
-        residual_samples: List[np.ndarray] = []
-        oracle_samples: List[np.ndarray] = []
+        disagreement_samples: list[np.ndarray] = []
+        residual_samples: list[np.ndarray] = []
+        oracle_samples: list[np.ndarray] = []
         for sample_idx in range(trace_samples):
             seed_all(int(seed) + int(example_idx) + 1_000_000 * int(sample_idx))
             _, trace = model.sample_future_trace(
@@ -1434,26 +1435,26 @@ def evaluate_forecast_schedule(
     time_grid: Sequence[float],
     num_eval_samples: int,
     seed: int,
-    logical_seed: Optional[int] = None,
-    target_nfe: Optional[int] = None,
+    logical_seed: int | None = None,
+    target_nfe: int | None = None,
     scheduler_key: str = "",
     dataset_key: str = "",
     split_phase: str = "",
     checkpoint_id: str = "",
-    example_indices: Optional[Sequence[int]] = None,
+    example_indices: Sequence[int] | None = None,
     batch_size: int = 1,
     progress_label: str = "",
     return_per_example_rows: bool = False,
     return_context_embeddings: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     device = cfg.train.device
-    mse_values: List[float] = []
-    crps_values: List[float] = []
-    mase_values: List[float] = []
-    latencies: List[float] = []
-    per_example_rows: List[Dict[str, Any]] = []
-    context_embeddings: Dict[str, List[float]] = {}
-    context_embedding_width: Optional[int] = None
+    mse_values: list[float] = []
+    crps_values: list[float] = []
+    mase_values: list[float] = []
+    latencies: list[float] = []
+    per_example_rows: list[dict[str, Any]] = []
+    context_embeddings: dict[str, list[float]] = {}
+    context_embedding_width: int | None = None
     effective_batch_size = max(1, int(batch_size))
     evaluation_seed = int(seed)
     logical_panel_seed = int(evaluation_seed if logical_seed is None else logical_seed)
@@ -1499,10 +1500,10 @@ def evaluate_forecast_schedule(
         with ProgressBar(len(chunk_starts), str(progress_label), enabled=progress_enabled) as progress:
             for chunk_start in chunk_starts:
                 chunk_indices = example_list[chunk_start : chunk_start + effective_batch_size]
-                hist_rows: List[torch.Tensor] = []
-                true_blocks: List[np.ndarray] = []
-                mase_scales: List[float] = []
-                metadata_rows: List[Dict[str, Any]] = []
+                hist_rows: list[torch.Tensor] = []
+                true_blocks: list[np.ndarray] = []
+                mase_scales: list[float] = []
+                metadata_rows: list[dict[str, Any]] = []
                 for example_idx in chunk_indices:
                     hist_t, tgt_t, fut_t, meta = _parse_forecast_batch(ds[int(example_idx)])
                     hist_rows.append(hist_t.float())
@@ -1522,7 +1523,7 @@ def evaluate_forecast_schedule(
                     true_blocks.append(ds.denormalize_block(true_block_norm, int(example_idx)).reshape(-1))
                     mase_scales.append(float(ds.mase_denom(int(example_idx))))
                 hist = torch.stack(hist_rows, dim=0).to(device).float()
-                chunk_context_embeddings: Optional[np.ndarray] = None
+                chunk_context_embeddings: np.ndarray | None = None
                 if return_context_embeddings:
                     backbone = getattr(model, "backbone", None)
                     if backbone is None:
@@ -1541,7 +1542,7 @@ def evaluate_forecast_schedule(
                             "Frozen-backbone policy context width changed across forecast batches: "
                             f"expected {context_embedding_width}, got {chunk_width}."
                         )
-                chunk_context_ids: List[str] = []
+                chunk_context_ids: list[str] = []
                 if return_per_example_rows or return_context_embeddings:
                     from genode.gico.policy import stable_context_id
 
@@ -1565,7 +1566,7 @@ def evaluate_forecast_schedule(
                                 float(value)
                                 for value in chunk_context_embeddings[context_idx].astype(np.float32).tolist()
                             ]
-                chunk_draws: List[np.ndarray] = []
+                chunk_draws: list[np.ndarray] = []
                 for sample_idx in range(int(num_eval_samples)):
                     seed_all(int(evaluation_seed) + 1_000_000 * int(chunk_start) + int(sample_idx))
                     if device.type == "cuda" and torch.cuda.is_available():

@@ -5,8 +5,9 @@ import csv
 import hashlib
 import json
 import math
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 
@@ -43,7 +44,7 @@ from genode.gico.density_representation import (
     uniform_reference_grid,
 )
 from genode.gico.models import validate_time_grid
-from genode.gico.objectives import attach_reward_columns, crps_mase_reward, rewards_by_setting, seed_mean_metric_rows
+from genode.gico.objectives import attach_reward_columns, rewards_by_setting, seed_mean_metric_rows
 from genode.gico.policy import load_context_embedding_table, save_context_embedding_table
 from genode.gico.schedule_hash import schedule_grid_hash
 from genode.gico.ser_ptg_reference import (
@@ -67,13 +68,13 @@ from genode.solver_protocol import (
     normalize_solver_nfe_fields,
 )
 
-DEFAULT_SOLVERS: Tuple[str, ...] = CANONICAL_SOLVER_KEYS
-DEFAULT_TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
+DEFAULT_SOLVERS: tuple[str, ...] = CANONICAL_SOLVER_KEYS
+DEFAULT_TARGET_NFES: tuple[int, ...] = CANONICAL_SEEN_NFES
 SELECTED_STUDENT_SCHEDULE_KEY = "gico"
 SELECTED_STUDENT_SCHEDULE_NAME = "GICO"
 EVALUATOR_SIGNATURE_VERSION = "schedule_summary_evaluator_seen_unseen"
 SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_summary_context_capped_v1"
-SER_REFERENCE_SCHEDULE_KEYS: Tuple[str, ...] = (
+SER_REFERENCE_SCHEDULE_KEYS: tuple[str, ...] = (
     SER_PTG_SCHEDULE_KEY,
     SER_PTG_REVERSED_SCHEDULE_KEY,
     SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
@@ -83,12 +84,12 @@ SER_REFERENCE_SCHEDULE_KEYS: Tuple[str, ...] = (
 def _filter_rows_to_schedule_keys(
     rows: Sequence[Mapping[str, Any]],
     schedule_keys: Sequence[str],
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     allowed = {str(key) for key in schedule_keys}
     return [dict(row) for row in rows if str(row.get("scheduler_key", "")) in allowed]
 
 
-SCHEDULE_ROW_FIELDS: Tuple[str, ...] = (
+SCHEDULE_ROW_FIELDS: tuple[str, ...] = (
     "benchmark_family",
     "split_phase",
     "seed",
@@ -172,7 +173,7 @@ SCHEDULE_ROW_FIELDS: Tuple[str, ...] = (
     "validity_flags_json",
 )
 
-CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
+CONTEXT_ROW_FIELDS: tuple[str, ...] = (
     "benchmark_family",
     "parent_row_signature",
     "protocol_hash",
@@ -215,15 +216,15 @@ CONTEXT_ROW_FIELDS: Tuple[str, ...] = (
 )
 
 
-def _parse_csv(text: str) -> List[str]:
+def _parse_csv(text: str) -> list[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
-def _parse_int_csv(text: str) -> List[int]:
+def _parse_int_csv(text: str) -> list[int]:
     return [int(part) for part in _parse_csv(text)]
 
 
-def _optional_float(value: Any) -> Optional[float]:
+def _optional_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
     try:
@@ -233,14 +234,14 @@ def _optional_float(value: Any) -> Optional[float]:
     return float(val) if math.isfinite(val) else None
 
 
-def _mean(values: Iterable[Any]) -> Optional[float]:
+def _mean(values: Iterable[Any]) -> float | None:
     vals = [float(v) for v in (_optional_float(x) for x in values) if v is not None]
     if not vals:
         return None
     return float(np.mean(np.asarray(vals, dtype=np.float64)))
 
 
-def _std(values: Iterable[Any]) -> Optional[float]:
+def _std(values: Iterable[Any]) -> float | None:
     vals = [float(v) for v in (_optional_float(x) for x in values) if v is not None]
     if not vals:
         return None
@@ -249,7 +250,7 @@ def _std(values: Iterable[Any]) -> Optional[float]:
     return float(np.std(np.asarray(vals, dtype=np.float64), ddof=1))
 
 
-def _safe_gain(value: Any, reference: Any) -> Optional[float]:
+def _safe_gain(value: Any, reference: Any) -> float | None:
     v = _optional_float(value)
     r = _optional_float(reference)
     if v is None or r is None or abs(float(r)) <= 1e-12:
@@ -257,7 +258,7 @@ def _safe_gain(value: Any, reference: Any) -> Optional[float]:
     return float(1.0 - float(v) / float(r))
 
 
-def _safe_high_gain(value: Any, reference: Any) -> Optional[float]:
+def _safe_high_gain(value: Any, reference: Any) -> float | None:
     v = _optional_float(value)
     r = _optional_float(reference)
     if v is None or r is None or abs(float(r)) <= 1e-12:
@@ -278,9 +279,9 @@ def _logical_artifact_path(path: str | Path) -> str:
         return str(resolved)
 
 
-def _path_fingerprint(path: str | Path) -> Dict[str, Any]:
+def _path_fingerprint(path: str | Path) -> dict[str, Any]:
     resolved = resolve_project_path(str(path))
-    payload: Dict[str, Any] = {"path": _logical_artifact_path(resolved), "exists": bool(resolved.exists())}
+    payload: dict[str, Any] = {"path": _logical_artifact_path(resolved), "exists": bool(resolved.exists())}
     if resolved.is_file():
         stat = resolved.stat()
         payload.update({"kind": "file", "size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)})
@@ -299,7 +300,7 @@ def _context_sample_cap(args: argparse.Namespace) -> int:
     return int(cap)
 
 
-def _split_example_cap(args: argparse.Namespace, split_phase: str) -> Tuple[int | None, str]:
+def _split_example_cap(args: argparse.Namespace, split_phase: str) -> tuple[int | None, str]:
     context_cap = _context_sample_cap(args)
     if str(split_phase) == TRAIN_TUNING_PHASE:
         return int(context_cap), "context_sample_count"
@@ -321,7 +322,7 @@ def _cap_context_indices(
     seed: int,
     salt: str,
     uncapped_candidate_examples: int | None = None,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     candidate = [int(idx) for idx in indices]
     selected_cap = int(cap)
     if selected_cap <= 0:
@@ -410,7 +411,7 @@ def schedule_display_name_for_key(schedule_key: str) -> str:
     return schedule_display_name(key)
 
 
-def _derived_ser_time_grid(schedule_key: str, base_grid: Sequence[float], *, macro_steps: int) -> Tuple[float, ...]:
+def _derived_ser_time_grid(schedule_key: str, base_grid: Sequence[float], *, macro_steps: int) -> tuple[float, ...]:
     base = validate_time_grid(base_grid, macro_steps=int(macro_steps))
     if str(schedule_key) == SER_PTG_REVERSED_SCHEDULE_KEY:
         return validate_time_grid([1.0 - float(value) for value in reversed(base)], macro_steps=int(macro_steps))
@@ -427,7 +428,7 @@ def _derived_ser_time_grid(schedule_key: str, base_grid: Sequence[float], *, mac
 
 
 def _register_prediction(
-    predictions: Dict[Tuple[str, str, int], Dict[str, Any]],
+    predictions: dict[tuple[str, str, int], dict[str, Any]],
     *,
     scheduler_key: str,
     schedule_name: str,
@@ -469,7 +470,7 @@ def load_schedule_predictions(
     solver_names: Sequence[str] = DEFAULT_SOLVERS,
     target_nfe_values: Sequence[int] = DEFAULT_TARGET_NFES,
     require_complete: bool = True,
-) -> Dict[Tuple[str, str, int], Dict[str, Any]]:
+) -> dict[tuple[str, str, int], dict[str, Any]]:
     path = resolve_project_path(str(schedule_summary_path))
     payload = json.loads(path.read_text(encoding="utf-8"))
     if str(payload.get("dataset", dataset)) != str(dataset):
@@ -478,8 +479,8 @@ def load_schedule_predictions(
         )
     allowed_solvers = {str(name) for name in solver_names}
     allowed_nfes = {int(value) for value in target_nfe_values}
-    predictions: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
-    expected_schedule_keys: List[str] = []
+    predictions: dict[tuple[str, str, int], dict[str, Any]] = {}
+    expected_schedule_keys: list[str] = []
     schedules = payload.get("schedules")
     if schedules:
         schedule_items = list(schedules)
@@ -600,7 +601,7 @@ def _row_signature(
     )
 
 
-def _row_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
+def _row_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
     return (
         row.get("protocol_hash"),
         row.get("split_phase"),
@@ -612,8 +613,8 @@ def _row_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
     )
 
 
-def _load_existing_rows(jsonl_path: Path, *, protocol_hash: str) -> Dict[Tuple[Any, ...], Dict[str, Any]]:
-    rows: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+def _load_existing_rows(jsonl_path: Path, *, protocol_hash: str) -> dict[tuple[Any, ...], dict[str, Any]]:
+    rows: dict[tuple[Any, ...], dict[str, Any]] = {}
     if not jsonl_path.exists():
         return rows
     with jsonl_path.open("r", encoding="utf-8") as fh:
@@ -648,8 +649,8 @@ def _write_context_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             writer.writerow({field: row.get(field) for field in CONTEXT_ROW_FIELDS})
 
 
-def _load_context_rows(path: Path) -> Dict[str, Dict[str, Any]]:
-    rows: Dict[str, Dict[str, Any]] = {}
+def _load_context_rows(path: Path) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
     if not path.exists():
         return rows
     with path.open("r", newline="", encoding="utf-8") as fh:
@@ -663,7 +664,7 @@ def _load_context_rows(path: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def _merge_context_embeddings_checked(
-    existing: Dict[str, Sequence[float]],
+    existing: dict[str, Sequence[float]],
     extra: Mapping[str, Sequence[float]],
 ) -> None:
     for key, value in extra.items():
@@ -686,7 +687,7 @@ def _schedule_row(
     prediction: Mapping[str, Any],
     metrics: Mapping[str, Any],
     protocol_hash: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     solver_key = str(prediction["solver_key"])
     target_nfe = int(prediction["target_nfe"])
     scheduler_key = str(prediction["scheduler_key"])
@@ -783,16 +784,16 @@ def _load_forecast_rows_csv(
     path: str | Path,
     *,
     dataset: str,
-    split_phase: Optional[str],
+    split_phase: str | None,
     seeds: Sequence[int],
     solver_names: Sequence[str],
     target_nfe_values: Sequence[int],
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     resolved = resolve_project_path(str(path))
     seed_set = {int(seed) for seed in seeds}
     solver_set = {str(solver) for solver in solver_names}
     nfe_set = {int(nfe) for nfe in target_nfe_values}
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     if not resolved.exists():
         return rows
     with resolved.open("r", newline="", encoding="utf-8") as fh:
@@ -842,7 +843,7 @@ def _missing_cells(
     solver_names: Sequence[str],
     target_nfe_values: Sequence[int],
     schedule_keys: Sequence[str],
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     observed = {
         (
             int(row.get("seed", -1)),
@@ -852,7 +853,7 @@ def _missing_cells(
         )
         for row in rows
     }
-    missing: List[Dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
     for seed in seeds:
         for solver in solver_names:
             for target_nfe in target_nfe_values:
@@ -870,16 +871,16 @@ def _missing_cells(
     return missing
 
 
-def _aggregate_schedule_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    groups: Dict[Tuple[str, int, str], List[Mapping[str, Any]]] = {}
+def _aggregate_schedule_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, int, str], list[Mapping[str, Any]]] = {}
     for row in rows:
         key = (str(row.get("solver_key")), int(row.get("target_nfe", -1)), str(row.get("scheduler_key")))
         groups.setdefault(key, []).append(row)
-    summaries: List[Dict[str, Any]] = []
+    summaries: list[dict[str, Any]] = []
     for (solver_key, target_nfe, scheduler_key), group in sorted(
         groups.items(), key=lambda item: (item[0][0], item[0][1], item[0][2])
     ):
-        summary: Dict[str, Any] = {
+        summary: dict[str, Any] = {
             "solver_key": solver_key,
             "target_nfe": int(target_nfe),
             "scheduler_key": scheduler_key,
@@ -937,33 +938,11 @@ def _metric_higher_is_better(metric: str) -> bool:
     return str(metric) in {"u_comp_uniform", "temporal_tstr_f1"}
 
 
-def _candidate_centered_rewards_by_setting(
-    rows: Sequence[Mapping[str, Any]],
-) -> Dict[Tuple[str, int], Dict[str, float]]:
-    by_setting: Dict[Tuple[str, int], List[Mapping[str, Any]]] = {}
-    for row in rows:
-        by_setting.setdefault((str(row["solver_key"]), int(row["target_nfe"])), []).append(row)
-    rewards: Dict[Tuple[str, int], Dict[str, float]] = {}
-    for setting, setting_rows in by_setting.items():
-        crps_center = min(float(row["crps"]) for row in setting_rows)
-        mase_center = min(float(row["mase"]) for row in setting_rows)
-        rewards[setting] = {
-            str(row["scheduler_key"]): crps_mase_reward(
-                float(row["crps"]),
-                float(row["mase"]),
-                crps_center=float(crps_center),
-                mase_center=float(mase_center),
-            )
-            for row in setting_rows
-        }
-    return rewards
-
-
 def _selection_rewards(
     *,
     candidate_rows: Sequence[Mapping[str, Any]],
     reference_rows: Sequence[Mapping[str, Any]] = (),
-) -> Tuple[List[Dict[str, Any]], Dict[Tuple[str, int], Dict[str, float]], str, List[str]]:
+) -> tuple[list[dict[str, Any]], dict[tuple[str, int], dict[str, float]], str, list[str]]:
     aggregated_candidates = seed_mean_metric_rows(candidate_rows)
     aggregated_references = seed_mean_metric_rows(reference_rows)
     if not aggregated_references:
@@ -1000,7 +979,7 @@ def select_best_validation_schedule(
     rows: Sequence[Mapping[str, Any]],
     *,
     reference_rows: Sequence[Mapping[str, Any]] = (),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     candidate_rows = [
         dict(row)
         for row in rows
@@ -1011,15 +990,15 @@ def select_best_validation_schedule(
     aggregated, rewards, utility_reference, fixed_reference_schedule_keys = _selection_rewards(
         candidate_rows=candidate_rows, reference_rows=reference_rows
     )
-    by_setting: Dict[Tuple[str, int], List[Mapping[str, Any]]] = {}
+    by_setting: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
     for row in aggregated:
         by_setting.setdefault((str(row["solver_key"]), int(row["target_nfe"])), []).append(row)
-    scores: Dict[str, List[float]] = {}
-    crps_scores: Dict[str, List[float]] = {}
-    mase_scores: Dict[str, List[float]] = {}
-    worst_metric_scores: Dict[str, List[float]] = {}
-    schedule_metadata: Dict[str, Dict[str, Any]] = {}
-    per_cell: List[Dict[str, Any]] = []
+    scores: dict[str, list[float]] = {}
+    crps_scores: dict[str, list[float]] = {}
+    mase_scores: dict[str, list[float]] = {}
+    worst_metric_scores: dict[str, list[float]] = {}
+    schedule_metadata: dict[str, dict[str, Any]] = {}
+    per_cell: list[dict[str, Any]] = []
     for setting, setting_rows in sorted(by_setting.items(), key=lambda item: item[0]):
         for row in setting_rows:
             schedule_key = str(row["scheduler_key"])
@@ -1099,7 +1078,7 @@ def select_best_validation_schedule(
 
 def write_selected_schedule_summary(
     source_summary_path: str | Path, selection: Mapping[str, Any], out_path: str | Path
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     source_path = resolve_project_path(str(source_summary_path))
     payload = json.loads(source_path.read_text(encoding="utf-8"))
     selected_key = str(selection["selected_schedule_key"])
@@ -1153,7 +1132,7 @@ def build_comparison_summary(
     seeds: Sequence[int],
     solver_names: Sequence[str],
     target_nfe_values: Sequence[int],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     family = str(benchmark_family or FORECAST_FAMILY)
     if family != FORECAST_FAMILY:
         if family == "temporal_conditional_generation":
@@ -1175,18 +1154,18 @@ def build_comparison_summary(
             + [dict(row) for row in student_rows]
         )
         aggregate_rows = _aggregate_schedule_rows(all_rows)
-        by_cell: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+        by_cell: dict[tuple[str, int], list[dict[str, Any]]] = {}
         for row in aggregate_rows:
             by_cell.setdefault((str(row["solver_key"]), int(row["target_nfe"])), []).append(row)
         student_schedule_keys = sorted({str(row.get("scheduler_key")) for row in student_rows})
-        rankings: List[Dict[str, Any]] = []
+        rankings: list[dict[str, Any]] = []
         for solver in solver_names:
             for target_nfe in target_nfe_values:
                 cell_rows = by_cell.get((str(solver), int(target_nfe)), [])
                 uniform = next((row for row in cell_rows if row["scheduler_key"] == "uniform"), None)
                 ser_ptg = next((row for row in cell_rows if row["scheduler_key"] == SER_PTG_SCHEDULE_KEY), None)
                 baselines = [row for row in cell_rows if row["scheduler_key"] in BASELINE_SCHEDULE_KEYS]
-                ranking: Dict[str, Any] = {
+                ranking: dict[str, Any] = {
                     "benchmark_family": family,
                     "solver_key": str(solver),
                     "target_nfe": int(target_nfe),
@@ -1215,7 +1194,7 @@ def build_comparison_summary(
                     [row for row in cell_rows if str(row["scheduler_key"]) in student_schedule_keys],
                     key=lambda row: str(row["scheduler_key"]),
                 ):
-                    comparison: Dict[str, Any] = {"scheduler_key": student_row["scheduler_key"]}
+                    comparison: dict[str, Any] = {"scheduler_key": student_row["scheduler_key"]}
                     for metric in metric_keys:
                         mean_key = f"{metric}_mean"
                         comparison[f"student_{metric}_mean"] = student_row.get(mean_key)
@@ -1290,10 +1269,10 @@ def build_comparison_summary(
         + [dict(row) for row in student_rows]
     )
     aggregate_rows = _aggregate_schedule_rows(all_rows)
-    by_cell: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    by_cell: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for row in aggregate_rows:
         by_cell.setdefault((str(row["solver_key"]), int(row["target_nfe"])), []).append(row)
-    rankings: List[Dict[str, Any]] = []
+    rankings: list[dict[str, Any]] = []
     student_schedule_keys = sorted({str(row.get("scheduler_key")) for row in student_rows})
     for solver in solver_names:
         for target_nfe in target_nfe_values:
@@ -1311,7 +1290,7 @@ def build_comparison_summary(
             best_mase = min(baselines, key=lambda row: _finite_metric(row, "mase"), default=None)
             ordered_crps = sorted(cell_rows, key=lambda row: (_finite_metric(row, "crps"), str(row["scheduler_key"])))
             ordered_mase = sorted(cell_rows, key=lambda row: (_finite_metric(row, "mase"), str(row["scheduler_key"])))
-            ranking: Dict[str, Any] = {
+            ranking: dict[str, Any] = {
                 "solver_key": str(solver),
                 "target_nfe": int(target_nfe),
                 "crps_ranking": [row["scheduler_key"] for row in ordered_crps],
@@ -1446,7 +1425,7 @@ def build_comparison_summary(
     }
 
 
-def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
+def evaluate_schedule_summary(args: argparse.Namespace) -> dict[str, Any]:
     out_dir = resolve_project_path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
     seeds = _parse_int_csv(str(args.seeds))
@@ -1484,7 +1463,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
     if rows_by_key:
         _write_csv(csv_path, list(rows_by_key.values()))
     context_rows_by_signature = _load_context_rows(context_csv_path) if bool(args.write_context_rows) else {}
-    context_embeddings: Dict[str, Sequence[float]] = (
+    context_embeddings: dict[str, Sequence[float]] = (
         load_context_embedding_table(context_embeddings_path)
         if bool(args.write_context_rows) and context_embeddings_path.exists()
         else {}
@@ -1686,7 +1665,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
                                 )
                         progress.update()
     rows = list(rows_by_key.values())
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         "evaluator_signature": EVALUATOR_SIGNATURE_VERSION,
         "dataset": str(args.dataset),
         "split_phase": split_phase,
@@ -1765,7 +1744,7 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> Dict[str, Any]:
             target_nfe_values=target_nfes,
         )
         baseline_rows = _filter_rows_to_schedule_keys(baseline_rows, BASELINE_SCHEDULE_KEYS)
-        comparator_rows: List[Dict[str, Any]] = []
+        comparator_rows: list[dict[str, Any]] = []
         if str(args.comparator_rows).strip():
             comparator_rows = _load_rows_csv(
                 args.comparator_rows,

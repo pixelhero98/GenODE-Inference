@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 
 def json_hash(payload: Mapping[str, object], *, prefix: str) -> str:

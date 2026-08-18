@@ -121,6 +121,43 @@ def test_supervision_loader_rejects_array_tampering(tmp_path: Path) -> None:
         load_image_gico_supervision(output)
 
 
+def test_supervision_save_rejects_post_construction_law_mutation(tmp_path: Path) -> None:
+    supervision = _unconditional_supervision()
+    construction_identity = supervision.sha256
+    supervision.mixture_weights.setflags(write=True)
+    first = float(supervision.mixture_weights[0, 0, 0])
+    last = float(supervision.mixture_weights[0, 0, -1])
+    supervision.mixture_weights[0, 0, 0] = last
+    supervision.mixture_weights[0, 0, -1] = first
+
+    assert supervision.sha256 == construction_identity
+    with pytest.raises(ValueError, match="scientific law was mutated"):
+        supervision.verify()
+    output = tmp_path / "mutated-supervision"
+    with pytest.raises(ValueError, match="scientific law was mutated"):
+        save_image_gico_supervision(supervision, output)
+    assert not output.exists()
+
+
+def test_supervision_rejects_consistent_law_rebinding() -> None:
+    supervision = _unconditional_supervision()
+    supervision.mixture_weights.setflags(write=True)
+    first = float(supervision.mixture_weights[0, 0, 0])
+    last = float(supervision.mixture_weights[0, 0, -1])
+    supervision.mixture_weights[0, 0, 0] = last
+    supervision.mixture_weights[0, 0, -1] = first
+    supervision.barycenter_density_mass.setflags(write=True)
+    supervision.barycenter_density_mass[...] = np.einsum(
+        "ncs,nsb->ncb",
+        supervision.mixture_weights,
+        supervision.fixed_density_mass,
+        dtype=np.float64,
+    )
+
+    with pytest.raises(ValueError, match="construction identity was mutated"):
+        supervision.verify()
+
+
 def test_conditional_supervision_enforces_reward_alias_and_barycenter_law() -> None:
     schedule_count = len(IMAGE_SCHEDULE_KEYS)
     backbone = _frozen_imagenet_backbone(digest="3" * 64, offset=0.125)
@@ -139,7 +176,10 @@ def test_conditional_supervision_enforces_reward_alias_and_barycenter_law() -> N
     support /= support.sum(axis=-1, keepdims=True)
     support[:, 2] = support[:, 1]
     density_hashes = tuple(
-        tuple(f"density-{nfe_index}-{1 if schedule_index == 2 else schedule_index}" for schedule_index in range(23))
+        tuple(
+            f"density:{(nfe_index * schedule_count + (1 if schedule_index == 2 else schedule_index)):064x}"
+            for schedule_index in range(schedule_count)
+        )
         for nfe_index in range(3)
     )
     targets = build_image_gico_conditional_targets(
@@ -148,7 +188,7 @@ def test_conditional_supervision_enforces_reward_alias_and_barycenter_law() -> N
         reward_scales=np.asarray((0.25, 0.5, 1.0), dtype=np.float32),
         fixed_density_mass=support,
         schedule_keys=IMAGE_SCHEDULE_KEYS,
-        schedule_sha256s=tuple(f"schedule-{index}" for index in range(schedule_count)),
+        schedule_sha256s=tuple(f"schedule:{index:064x}" for index in range(schedule_count)),
         density_mass_sha256s=density_hashes,
         feature_groups=groups,
         reward_evidence_sha256="evidence:" + "4" * 64,
@@ -188,7 +228,7 @@ def test_conditional_supervision_enforces_reward_alias_and_barycenter_law() -> N
         )
 
     bad_hashes = [list(row) for row in density_hashes]
-    bad_hashes[0][2] = "alias-evasion"
+    bad_hashes[0][2] = "density:" + "f" * 64
     alias_evasion = replace(targets, density_mass_sha256s=tuple(tuple(row) for row in bad_hashes))
     with pytest.raises(ValueError, match="aliases disagree"):
         build_image_gico_conditional_supervision(

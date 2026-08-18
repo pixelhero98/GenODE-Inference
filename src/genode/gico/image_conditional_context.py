@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Mapping
 
 import numpy as np
 import torch

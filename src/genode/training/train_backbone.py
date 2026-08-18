@@ -6,9 +6,10 @@ import hashlib
 import json
 import math
 import time
+from collections.abc import Mapping, Sequence
 from numbers import Real
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 import torch
 
@@ -57,8 +58,8 @@ def _project_display_path(path: str | Path) -> str:
         return resolved.name
 
 
-def _json_ready_stats(stats: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
+def _json_ready_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
     for key, value in stats.items():
         if isinstance(value, (str, int, float, bool)) or value is None:
             out[key] = value
@@ -74,13 +75,6 @@ def _dataset_spec(dataset: str):
     if str(dataset) not in plans:
         raise KeyError(f"Unknown dataset={dataset!r}; expected one of {sorted(plans)}.")
     return plans[str(dataset)]
-
-
-def _forecast_spec(dataset: str):
-    spec = _dataset_spec(str(dataset))
-    if str(spec.benchmark_family) != FORECAST_FAMILY:
-        raise ValueError(f"{dataset!r} has benchmark_family={spec.benchmark_family!r}, not {FORECAST_FAMILY!r}.")
-    return spec
 
 
 def _conditional_spec(dataset: str):
@@ -177,7 +171,7 @@ def ensure_forecast_dataset(dataset_root: Path, dataset: str, *, prepare: bool) 
     download_monash_dataset(dataset_root, dataset)
 
 
-def _active_backbone_budgets(dataset: str, benchmark_family: str) -> Tuple[int, ...]:
+def _active_backbone_budgets(dataset: str, benchmark_family: str) -> tuple[int, ...]:
     if str(benchmark_family) == FORECAST_FAMILY:
         return tuple(ACTIVE_FORECAST_BACKBONE_BUDGETS.get(str(dataset), ()))
     if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
@@ -187,7 +181,7 @@ def _active_backbone_budgets(dataset: str, benchmark_family: str) -> Tuple[int, 
 
 def _parse_checkpoint_steps(
     raw: str | Sequence[int] | None, *, dataset: str, benchmark_family: str, max_steps: int
-) -> Tuple[int, ...]:
+) -> tuple[int, ...]:
     if raw is None or str(raw).strip() == "":
         planned = _active_backbone_budgets(str(dataset), str(benchmark_family))
         steps = [int(value) for value in planned if int(value) <= int(max_steps)]
@@ -204,7 +198,7 @@ def _parse_checkpoint_steps(
     return tuple(sorted(set(values)))
 
 
-def _clone_state_dict_cpu(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+def _clone_state_dict_cpu(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
 
@@ -233,7 +227,7 @@ def _atomic_torch_save(payload: Mapping[str, Any], path: Path) -> None:
     tmp_path.replace(path)
 
 
-def _torch_load(path: Path) -> Dict[str, Any]:
+def _torch_load(path: Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict):
         raise ValueError(f"Expected training state at {path} to contain a dict payload.")
@@ -255,7 +249,7 @@ def _temporal_training_signature(
     checkpoint_steps: Sequence[int],
     split_stats: Mapping[str, Any],
     checkpoint_export_mode: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return {
         "version": TEMPORAL_BACKBONE_TRAINING_STATE_VERSION,
         "dataset": str(args.dataset),
@@ -301,7 +295,7 @@ def _resolve_training_state_path(
     )
 
 
-def _load_compatible_training_state(path: Path, *, signature_hash: str) -> Dict[str, Any]:
+def _load_compatible_training_state(path: Path, *, signature_hash: str) -> dict[str, Any]:
     payload = _torch_load(path)
     version = str(payload.get("version", ""))
     if version != TEMPORAL_BACKBONE_TRAINING_STATE_VERSION:
@@ -314,7 +308,7 @@ def _load_compatible_training_state(path: Path, *, signature_hash: str) -> Dict[
     return payload
 
 
-def _load_backbone_artifact_checkpoint(path: Path) -> Dict[str, Any]:
+def _load_backbone_artifact_checkpoint(path: Path) -> dict[str, Any]:
     payload = _torch_load(path)
     if not isinstance(payload.get("cfg"), Mapping):
         raise ValueError(f"Backbone checkpoint {path} is missing cfg metadata.")
@@ -341,9 +335,9 @@ def _save_backbone_artifact(
     split_stats: Mapping[str, Any],
     selection: Mapping[str, Any],
     benchmark_family: str = FORECAST_FAMILY,
-    field_network_type: Optional[str] = None,
+    field_network_type: str | None = None,
     checkpoint_export_protocol: str = CHECKPOINT_EXPORT_PROTOCOL_BEST_VALIDATION,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     artifact_root.mkdir(parents=True, exist_ok=True)
     checkpoint_id = build_backbone_checkpoint_id(
         backbone_name=BACKBONE_NAME_OTFLOW,
@@ -427,7 +421,7 @@ def _conditional_dataset_args(args: argparse.Namespace, cfg: OTFlowConfig) -> ar
 
 def _train_temporal_backbone(
     args: argparse.Namespace, *, benchmark_family: str, spec: Any, cfg: OTFlowConfig, splits: Mapping[str, Any]
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     checkpoint_steps = _parse_checkpoint_steps(
         getattr(args, "checkpoint_steps", None),
         dataset=str(args.dataset),
@@ -469,7 +463,7 @@ def _train_temporal_backbone(
     if val_max_batches is not None:
         val_max_batches = int(val_max_batches)
 
-    best: Dict[str, Any] = {
+    best: dict[str, Any] = {
         "score": None,
         "state_dict": None,
         "step": 0,
@@ -477,7 +471,7 @@ def _train_temporal_backbone(
         "validation": None,
         "train_loss": None,
     }
-    exported: List[Dict[str, Any]] = []
+    exported: list[dict[str, Any]] = []
     exported_budget_steps: set[int] = set()
 
     start_step = 0
@@ -528,7 +522,7 @@ def _train_temporal_backbone(
         step: int,
         train_loss: float,
         validation: Mapping[str, Any],
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         score = _validated_validation_score(validation)
         return {
             "selection_metric": "validation_loss",
@@ -616,7 +610,7 @@ def _train_temporal_backbone(
         step: int,
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
-        scheduler: Optional[Any],
+        scheduler: Any | None,
         scaler: torch.cuda.amp.GradScaler,
         loop_state: Mapping[str, Any],
         force: bool = False,
@@ -649,7 +643,7 @@ def _train_temporal_backbone(
         }
         _atomic_torch_save(payload, training_state_path)
 
-    def _on_step(step: int, model: torch.nn.Module, train_loss: float, logs: Dict[str, float]) -> None:
+    def _on_step(step: int, model: torch.nn.Module, train_loss: float, logs: dict[str, float]) -> None:
         del logs
         is_budget_step = int(step) in checkpoint_step_set
         should_validate = is_budget_step or (not exact_budget_export and val_every > 0 and int(step) % val_every == 0)
@@ -709,9 +703,9 @@ def _train_temporal_backbone(
         step: int,
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
-        scheduler: Optional[Any],
+        scheduler: Any | None,
         scaler: torch.cuda.amp.GradScaler,
-        loop_state: Dict[str, Any],
+        loop_state: dict[str, Any],
     ) -> None:
         force = int(step) in checkpoint_step_set or int(step) >= int(args.steps)
         _save_restart_state(
@@ -749,7 +743,7 @@ def _train_temporal_backbone(
     )
     del model
 
-    missing_or_stale: List[int] = []
+    missing_or_stale: list[int] = []
     for budget in checkpoint_steps:
         artifact_root = _artifact_root_for_budget(int(budget))
         metadata_path = artifact_root / "checkpoint_metadata.json"
@@ -823,7 +817,7 @@ def _train_temporal_backbone(
     return summary
 
 
-def train_backbone(args: argparse.Namespace) -> Dict[str, Any]:
+def train_backbone(args: argparse.Namespace) -> dict[str, Any]:
     seed_all(int(args.seed))
     dataset_root = resolve_project_path(str(args.dataset_root))
     spec = _dataset_spec(str(args.dataset))

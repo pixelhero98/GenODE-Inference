@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any
 
 import torch
 
@@ -17,8 +18,8 @@ from genode.solver_protocol import (
     solver_macro_steps,
 )
 
-SOLVER_TO_ID: Dict[str, int] = solver_id_map(CANONICAL_SOLVER_KEYS)
-TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
+SOLVER_TO_ID: dict[str, int] = solver_id_map(CANONICAL_SOLVER_KEYS)
+TARGET_NFES: tuple[int, ...] = CANONICAL_SEEN_NFES
 DEFAULT_NFE_REFERENCE = 16
 SETTING_ENCODER_MODE_CONTINUOUS_V3 = "continuous_v3"
 SERIES_ENCODING_NONE_CONTEXT_ONLY = "none_context_only"
@@ -26,7 +27,7 @@ DEFAULT_SERIES_ENCODING = SERIES_ENCODING_NONE_CONTEXT_ONLY
 SOLVER_METADATA_VERSION = "solver_metadata"
 
 
-def validate_time_grid(grid: Sequence[float], *, macro_steps: int) -> Tuple[float, ...]:
+def validate_time_grid(grid: Sequence[float], *, macro_steps: int) -> tuple[float, ...]:
     values = tuple(float(x) for x in grid)
     if len(values) != int(macro_steps) + 1:
         raise ValueError(f"Grid length {len(values)} does not match macro_steps={macro_steps}.")
@@ -52,7 +53,7 @@ def _hash_unit(text: str) -> float:
     return float(int.from_bytes(digest[:8], "big") / float(2**64 - 1))
 
 
-def _fourier_phase_features(phase: float, frequencies: Sequence[float]) -> Tuple[float, ...]:
+def _fourier_phase_features(phase: float, frequencies: Sequence[float]) -> tuple[float, ...]:
     return tuple(
         component
         for frequency in frequencies
@@ -73,7 +74,7 @@ def validate_series_encoding(value: str | None = None) -> str:
     return encoding
 
 
-def _positive_sorted_ints(values: Sequence[Any], *, label: str) -> Tuple[int, ...]:
+def _positive_sorted_ints(values: Sequence[Any], *, label: str) -> tuple[int, ...]:
     out = tuple(sorted({int(value) for value in values}))
     if not out or any(value <= 0 for value in out):
         raise ValueError(f"{label} must contain positive integer NFEs.")
@@ -83,13 +84,13 @@ def _positive_sorted_ints(values: Sequence[Any], *, label: str) -> Tuple[int, ..
 @dataclass(frozen=True)
 class SettingEncoderConfig:
     mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3
-    observed_target_nfes: Tuple[int, ...] = TARGET_NFES
+    observed_target_nfes: tuple[int, ...] = TARGET_NFES
     nfe_reference: int = DEFAULT_NFE_REFERENCE
-    rope_frequencies: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
+    rope_frequencies: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
     solver_metadata_version: str = SOLVER_METADATA_VERSION
     series_encoding: str = DEFAULT_SERIES_ENCODING
 
-    def to_payload(self) -> Dict[str, Any]:
+    def to_payload(self) -> dict[str, Any]:
         return {
             "mode": str(self.mode),
             "observed_target_nfes": [int(value) for value in self.observed_target_nfes],

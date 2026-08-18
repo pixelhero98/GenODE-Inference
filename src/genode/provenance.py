@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any
 
 from genode.data.otflow_paths import display_project_path
 
@@ -32,7 +33,7 @@ def path_fingerprint(
     path: str | Path,
     *,
     manifest_names: Sequence[str] = ("manifest.json", "backbone_manifest.json", "package_manifest.json"),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Describe an input using sanitized location metadata and stable content hashes.
 
     Directory inputs must expose at least one named authoritative manifest. This
@@ -41,7 +42,7 @@ def path_fingerprint(
     """
 
     resolved = Path(path).expanduser().resolve()
-    record: Dict[str, Any] = {
+    record: dict[str, Any] = {
         "logical_path": display_project_path(resolved),
         "exists": bool(resolved.exists()),
     }
@@ -87,7 +88,7 @@ def path_fingerprint(
     return record
 
 
-def fingerprint_identity(record: Mapping[str, Any]) -> Dict[str, Any]:
+def fingerprint_identity(record: Mapping[str, Any]) -> dict[str, Any]:
     """Strip display-only paths from a fingerprint before protocol hashing."""
 
     return {key: value for key, value in record.items() if key != "logical_path"}

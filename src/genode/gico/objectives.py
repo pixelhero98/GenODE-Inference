@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 
@@ -15,8 +15,8 @@ from genode.canonical_experiment_layout import (
 )
 
 MetricRow = Mapping[str, object]
-SettingKey = Tuple[str, int]
-ScheduleKey = Tuple[str, int, str]
+SettingKey = tuple[str, int]
+ScheduleKey = tuple[str, int, str]
 DEFAULT_REWARD_EPS = 1e-12
 UNIFORM_SCHEDULE_KEY = "uniform"
 METRIC_DIRECTION_LOWER = "lower"
@@ -29,15 +29,15 @@ class MetricObjectiveSpec:
     utility_key: str
     direction: str
     weight: float = 1.0
-    aliases: Tuple[str, ...] = ()
+    aliases: tuple[str, ...] = ()
     applicable_key: str = ""
 
 
-FORECAST_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+FORECAST_METRIC_SPECS: tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec("crps", "u_crps_uniform", METRIC_DIRECTION_LOWER, 0.5, aliases=("forecast_crps",)),
     MetricObjectiveSpec("mase", "u_mase_uniform", METRIC_DIRECTION_LOWER, 0.5, aliases=("forecast_mase",)),
 )
-CONDITIONAL_PRIMARY_LOB_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+CONDITIONAL_PRIMARY_LOB_METRIC_SPECS: tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec("temporal_uw1", "u_temporal_uw1_uniform", METRIC_DIRECTION_LOWER, 1.0 / 3.0),
     MetricObjectiveSpec("temporal_cw1", "u_temporal_cw1_uniform", METRIC_DIRECTION_LOWER, 1.0 / 3.0),
     MetricObjectiveSpec(
@@ -48,11 +48,11 @@ CONDITIONAL_PRIMARY_LOB_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
         applicable_key="temporal_tstr_f1_applicable",
     ),
 )
-CONDITIONAL_PRIMARY_ECG_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+CONDITIONAL_PRIMARY_ECG_METRIC_SPECS: tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec("temporal_uw1", "u_temporal_uw1_uniform", METRIC_DIRECTION_LOWER, 0.5),
     MetricObjectiveSpec("temporal_cw1", "u_temporal_cw1_uniform", METRIC_DIRECTION_LOWER, 0.5),
 )
-CONDITIONAL_DIAGNOSTIC_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+CONDITIONAL_DIAGNOSTIC_METRIC_SPECS: tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec("u_l1", "u_temporal_u_l1_uniform", METRIC_DIRECTION_LOWER, 0.0),
     MetricObjectiveSpec("c_l1", "u_temporal_c_l1_uniform", METRIC_DIRECTION_LOWER, 0.0),
     MetricObjectiveSpec(
@@ -66,11 +66,11 @@ CONDITIONAL_DIAGNOSTIC_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
         "impact_response_error", "u_temporal_impact_response_error_uniform", METRIC_DIRECTION_LOWER, 0.0
     ),
 )
-CONDITIONAL_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+CONDITIONAL_METRIC_SPECS: tuple[MetricObjectiveSpec, ...] = (
     *CONDITIONAL_PRIMARY_LOB_METRIC_SPECS,
     *CONDITIONAL_DIAGNOSTIC_METRIC_SPECS,
 )
-MOLECULE_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
+MOLECULE_METRIC_SPECS: tuple[MetricObjectiveSpec, ...] = (
     MetricObjectiveSpec("molecule_kabsch_rmsd_3d", "u_molecule_kabsch_rmsd_3d_uniform", METRIC_DIRECTION_LOWER, 0.40),
     MetricObjectiveSpec(
         "molecule_ensemble_velocity_norm_w1",
@@ -94,28 +94,28 @@ MOLECULE_METRIC_SPECS: Tuple[MetricObjectiveSpec, ...] = (
         0.15,
     ),
 )
-OBJECTIVE_SPECS_BY_FAMILY: Dict[str, Tuple[MetricObjectiveSpec, ...]] = {
+OBJECTIVE_SPECS_BY_FAMILY: dict[str, tuple[MetricObjectiveSpec, ...]] = {
     SCENARIO_FAMILY_FORECAST: FORECAST_METRIC_SPECS,
     SCENARIO_FAMILY_CONDITIONAL_GENERATION: CONDITIONAL_METRIC_SPECS,
     SCENARIO_FAMILY_MOLECULE: MOLECULE_METRIC_SPECS,
 }
 
 
-def objective_specs_for_family(benchmark_family: str) -> Tuple[MetricObjectiveSpec, ...]:
+def objective_specs_for_family(benchmark_family: str) -> tuple[MetricObjectiveSpec, ...]:
     family = str(benchmark_family).strip()
     if family not in OBJECTIVE_SPECS_BY_FAMILY:
         raise ValueError(f"Unsupported benchmark_family for GICO teacher targets: {benchmark_family!r}")
     return OBJECTIVE_SPECS_BY_FAMILY[family]
 
 
-def teacher_objective_specs_for_family(benchmark_family: str) -> Tuple[MetricObjectiveSpec, ...]:
+def teacher_objective_specs_for_family(benchmark_family: str) -> tuple[MetricObjectiveSpec, ...]:
     family = str(benchmark_family).strip()
     if family == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
         return CONDITIONAL_PRIMARY_LOB_METRIC_SPECS
     return objective_specs_for_family(family)
 
 
-def teacher_objective_specs_for_scenario(scenario_key: str) -> Tuple[MetricObjectiveSpec, ...]:
+def teacher_objective_specs_for_scenario(scenario_key: str) -> tuple[MetricObjectiveSpec, ...]:
     key = str(scenario_key).strip()
     family = scenario_family_for_key(key)
     if family == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
@@ -127,21 +127,21 @@ def teacher_objective_specs_for_scenario(scenario_key: str) -> Tuple[MetricObjec
     return objective_specs_for_family(family)
 
 
-def objective_utility_keys_for_family(benchmark_family: str) -> Tuple[str, ...]:
+def objective_utility_keys_for_family(benchmark_family: str) -> tuple[str, ...]:
     return tuple(spec.utility_key for spec in objective_specs_for_family(benchmark_family))
 
 
-def teacher_objective_utility_keys_for_family(benchmark_family: str) -> Tuple[str, ...]:
+def teacher_objective_utility_keys_for_family(benchmark_family: str) -> tuple[str, ...]:
     return tuple(spec.utility_key for spec in teacher_objective_specs_for_family(benchmark_family))
 
 
-def teacher_objective_utility_keys_for_scenario(scenario_key: str) -> Tuple[str, ...]:
+def teacher_objective_utility_keys_for_scenario(scenario_key: str) -> tuple[str, ...]:
     return tuple(spec.utility_key for spec in teacher_objective_specs_for_scenario(scenario_key))
 
 
-def teacher_metric_profile_for_scenario(scenario_key: str) -> Dict[str, object]:
+def teacher_metric_profile_for_scenario(scenario_key: str) -> dict[str, object]:
     specs = teacher_objective_specs_for_scenario(str(scenario_key))
-    diagnostic_specs: Tuple[MetricObjectiveSpec, ...] = ()
+    diagnostic_specs: tuple[MetricObjectiveSpec, ...] = ()
     if scenario_family_for_key(str(scenario_key)) == SCENARIO_FAMILY_CONDITIONAL_GENERATION:
         diagnostic_specs = CONDITIONAL_DIAGNOSTIC_METRIC_SPECS
     return {
@@ -155,7 +155,7 @@ def teacher_metric_profile_for_scenario(scenario_key: str) -> Dict[str, object]:
     }
 
 
-def objective_weight_map_for_keys(target_keys: Sequence[str]) -> Dict[str, float]:
+def objective_weight_map_for_keys(target_keys: Sequence[str]) -> dict[str, float]:
     spec_by_utility = {spec.utility_key: spec for specs in OBJECTIVE_SPECS_BY_FAMILY.values() for spec in specs}
     return {str(key): float(spec_by_utility[str(key)].weight) for key in target_keys if str(key) in spec_by_utility}
 
@@ -236,14 +236,14 @@ def uniform_anchored_objective_columns(
     *,
     uniform_schedule_key: str = UNIFORM_SCHEDULE_KEY,
     eps: float = DEFAULT_REWARD_EPS,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     schedule_key = str(row.get("scheduler_key", ""))
     is_uniform = schedule_key == str(uniform_schedule_key)
-    utilities: Dict[str, float] = {}
-    weights: Dict[str, float] = {}
-    metric_directions: Dict[str, str] = {}
-    references: Dict[str, float] = {}
-    out: Dict[str, object] = {
+    utilities: dict[str, float] = {}
+    weights: dict[str, float] = {}
+    metric_directions: dict[str, str] = {}
+    references: dict[str, float] = {}
+    out: dict[str, object] = {
         "u_comp_uniform": None,
         "reward_metric_count": 0,
         "reward_metric_weights_json": "{}",
@@ -310,16 +310,16 @@ def crps_mase_reward(
     return float(0.5 * (u_crps + u_mase))
 
 
-def seed_mean_metric_rows(rows: Iterable[MetricRow]) -> List[Dict[str, object]]:
+def seed_mean_metric_rows(rows: Iterable[MetricRow]) -> list[dict[str, object]]:
     """Aggregate repeated seed rows before reward construction.
 
     This removes row-order dependence when multiple seeds exist for one schedule.
     """
-    grouped: Dict[ScheduleKey, List[MetricRow]] = defaultdict(list)
+    grouped: dict[ScheduleKey, list[MetricRow]] = defaultdict(list)
     for row in rows:
         key = (str(row["solver_key"]), int(row["target_nfe"]), str(row["scheduler_key"]))
         grouped[key].append(row)
-    out: List[Dict[str, object]] = []
+    out: list[dict[str, object]] = []
     for (solver_key, target_nfe, scheduler_key), group in sorted(grouped.items(), key=lambda item: item[0]):
         crps_values = np.asarray([_finite_positive(row["crps"]) for row in group], dtype=np.float64)
         mase_values = np.asarray([_finite_positive(row["mase"]) for row in group], dtype=np.float64)
@@ -352,7 +352,7 @@ def seed_mean_metric_rows(rows: Iterable[MetricRow]) -> List[Dict[str, object]]:
     return out
 
 
-def _maybe_seed_mean_metric_rows(rows: Iterable[MetricRow]) -> List[Dict[str, object]]:
+def _maybe_seed_mean_metric_rows(rows: Iterable[MetricRow]) -> list[dict[str, object]]:
     materialized = [dict(row) for row in rows]
     if materialized and all("n_seeds" in row and "seed_values" in row for row in materialized):
         return materialized
@@ -363,14 +363,14 @@ def best_fixed_references_by_setting(
     rows: Iterable[MetricRow],
     *,
     fixed_schedule_keys: Sequence[str],
-) -> Dict[SettingKey, Dict[str, float]]:
+) -> dict[SettingKey, dict[str, float]]:
     """Return best fixed-baseline CRPS/MASE references for each solver/NFE cell."""
     fixed_keys = {str(key) for key in fixed_schedule_keys}
-    grouped: Dict[SettingKey, List[MetricRow]] = defaultdict(list)
+    grouped: dict[SettingKey, list[MetricRow]] = defaultdict(list)
     for row in _maybe_seed_mean_metric_rows(rows):
         if str(row["scheduler_key"]) in fixed_keys:
             grouped[(str(row["solver_key"]), int(row["target_nfe"]))].append(row)
-    references: Dict[SettingKey, Dict[str, float]] = {}
+    references: dict[SettingKey, dict[str, float]] = {}
     for setting, setting_rows in grouped.items():
         if not setting_rows:
             continue
@@ -387,7 +387,7 @@ def build_fixed_reference_table(
     *,
     fixed_schedule_keys: Sequence[str],
     uniform_schedule_key: str = UNIFORM_SCHEDULE_KEY,
-) -> Dict[SettingKey, Dict[str, object]]:
+) -> dict[SettingKey, dict[str, object]]:
     """Build per-setting best-fixed and uniform reference metrics.
 
     Input rows may be seed-level or already seed-aggregated; output values are
@@ -396,11 +396,11 @@ def build_fixed_reference_table(
     fixed_keys = tuple(str(key) for key in fixed_schedule_keys)
     fixed_key_set = set(fixed_keys)
     uniform_key = str(uniform_schedule_key)
-    grouped: Dict[SettingKey, List[MetricRow]] = defaultdict(list)
+    grouped: dict[SettingKey, list[MetricRow]] = defaultdict(list)
     for row in _maybe_seed_mean_metric_rows(rows):
         if str(row["scheduler_key"]) in fixed_key_set:
             grouped[(str(row["solver_key"]), int(row["target_nfe"]))].append(row)
-    references: Dict[SettingKey, Dict[str, object]] = {}
+    references: dict[SettingKey, dict[str, object]] = {}
     for setting, setting_rows in grouped.items():
         if not setting_rows:
             continue
@@ -433,7 +433,7 @@ def reward_columns_for_row(
     reference: Mapping[str, object],
     *,
     eps: float = DEFAULT_REWARD_EPS,
-) -> Dict[str, float | str | int | None]:
+) -> dict[str, float | str | int | None]:
     """Return materialized utility/reference columns for one seed-mean row."""
     crps = _finite_positive(row["crps"])
     mase = _finite_positive(row["mase"])
@@ -442,7 +442,7 @@ def reward_columns_for_row(
     e = float(eps)
     u_crps_best = directional_uniform_utility(crps, best_fixed_crps, direction=METRIC_DIRECTION_LOWER, eps=e)
     u_mase_best = directional_uniform_utility(mase, best_fixed_mase, direction=METRIC_DIRECTION_LOWER, eps=e)
-    out: Dict[str, float | str | int | None] = {
+    out: dict[str, float | str | int | None] = {
         "best_fixed_crps": float(best_fixed_crps),
         "best_fixed_mase": float(best_fixed_mase),
         "best_fixed_crps_schedule": str(reference.get("best_fixed_crps_schedule", "")),
@@ -495,11 +495,11 @@ def attach_reward_columns(
     *,
     fixed_schedule_keys: Sequence[str],
     eps: float = DEFAULT_REWARD_EPS,
-) -> List[Dict[str, object]]:
+) -> list[dict[str, object]]:
     """Attach best-fixed and uniform utility columns to seed-mean rows."""
     seed_mean_rows = _maybe_seed_mean_metric_rows(rows)
     references = build_fixed_reference_table(seed_mean_rows, fixed_schedule_keys=fixed_schedule_keys)
-    out: List[Dict[str, object]] = []
+    out: list[dict[str, object]] = []
     for row in seed_mean_rows:
         setting = (str(row["solver_key"]), int(row["target_nfe"]))
         if setting not in references:
@@ -517,17 +517,17 @@ def rewards_by_setting(
     *,
     fixed_schedule_keys: Sequence[str] | None = None,
     eps: float = DEFAULT_REWARD_EPS,
-) -> Dict[SettingKey, Dict[str, float]]:
+) -> dict[SettingKey, dict[str, float]]:
     if fixed_schedule_keys is None:
         from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS
 
         fixed_schedule_keys = BASELINE_SCHEDULE_KEYS
-    grouped: Dict[SettingKey, List[MetricRow]] = defaultdict(list)
+    grouped: dict[SettingKey, list[MetricRow]] = defaultdict(list)
     seed_mean_rows = _maybe_seed_mean_metric_rows(rows)
     references = build_fixed_reference_table(seed_mean_rows, fixed_schedule_keys=fixed_schedule_keys)
     for row in seed_mean_rows:
         grouped[(str(row["solver_key"]), int(row["target_nfe"]))].append(row)
-    rewards: Dict[SettingKey, Dict[str, float]] = {}
+    rewards: dict[SettingKey, dict[str, float]] = {}
     for setting, setting_rows in grouped.items():
         if setting not in references:
             raise ValueError(
@@ -548,7 +548,7 @@ def rewards_by_setting(
     return rewards
 
 
-def best_schedule_by_setting(rows: Iterable[MetricRow]) -> Dict[SettingKey, str]:
+def best_schedule_by_setting(rows: Iterable[MetricRow]) -> dict[SettingKey, str]:
     rewards = rewards_by_setting(rows)
     return {
         setting: max(schedule_rewards.items(), key=lambda item: float(item[1]))[0]

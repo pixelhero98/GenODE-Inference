@@ -9,10 +9,11 @@ import struct
 import tempfile
 import unicodedata
 import zipfile
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Iterable, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO
 
 from genode.artifact_bundle import (
     bundle_journal_path,

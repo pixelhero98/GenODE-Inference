@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any
 
 from genode.canonical_experiment_layout import (
     CANONICAL_UNSEEN_TARGET_WEIGHT,
@@ -40,7 +41,7 @@ class GicoAblationArm:
     def uses_unseen_targets(self) -> bool:
         return self.student_training_mode == STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS
 
-    def objective_settings(self) -> Dict[str, Any]:
+    def objective_settings(self) -> dict[str, Any]:
         return {
             "student_target_mixture_mode": self.student_target_mixture_mode,
             "student_target_elite_fraction": float(self.student_target_elite_fraction),
@@ -52,7 +53,7 @@ class GicoAblationArm:
             "student_teacher_score_include_unseen_targets": bool(self.student_teacher_score_include_unseen_targets),
         }
 
-    def manifest_record(self) -> Dict[str, Any]:
+    def manifest_record(self) -> dict[str, Any]:
         return {
             "arm_id": self.arm_id,
             "paper_group": self.paper_group,
@@ -63,7 +64,7 @@ class GicoAblationArm:
         }
 
 
-_ALL_ARMS: Tuple[GicoAblationArm, ...] = (
+_ALL_ARMS: tuple[GicoAblationArm, ...] = (
     GicoAblationArm("A0_full_score000_seen_only", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "full", 0.00, "main"),
     GicoAblationArm("A1_full_score005_seen_only", STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT, "full", 0.05, "main"),
     GicoAblationArm(
@@ -129,7 +130,7 @@ _ALL_ARMS: Tuple[GicoAblationArm, ...] = (
     ),
 )
 
-_PRESETS: Mapping[str, Tuple[GicoAblationArm, ...]] = {
+_PRESETS: Mapping[str, tuple[GicoAblationArm, ...]] = {
     GICO_ABLATION_PRESET_PAPER_MAIN: tuple(arm for arm in _ALL_ARMS if arm.paper_group == "main"),
     GICO_ABLATION_PRESET_PAPER_MAIN_PLUS_APPENDIX: _ALL_ARMS,
 }
@@ -139,7 +140,7 @@ def gico_ablation_preset_choices() -> Sequence[str]:
     return tuple(_PRESETS)
 
 
-def gico_ablation_arms(preset: str = DEFAULT_GICO_ABLATION_PRESET) -> Tuple[GicoAblationArm, ...]:
+def gico_ablation_arms(preset: str = DEFAULT_GICO_ABLATION_PRESET) -> tuple[GicoAblationArm, ...]:
     try:
         return _PRESETS[str(preset)]
     except KeyError as exc:

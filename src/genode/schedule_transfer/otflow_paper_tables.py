@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
 
@@ -10,7 +11,7 @@ from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FO
 @dataclass(frozen=True)
 class TableMetricBlock:
     nfe: int
-    metrics: Tuple[str, ...]
+    metrics: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -19,7 +20,7 @@ class TableLayout:
     title: str
     row_group_label: str
     schedule_label: str
-    metric_blocks: Tuple[TableMetricBlock, ...]
+    metric_blocks: tuple[TableMetricBlock, ...]
 
 
 def build_forecast_table_layout(nfe_values: Sequence[int]) -> TableLayout:
@@ -106,11 +107,11 @@ def build_conditional_generation_pilot_table_layout(nfe_values: Sequence[int]) -
     )
 
 
-def table_layout_to_dict(layout: TableLayout) -> Dict[str, Any]:
+def table_layout_to_dict(layout: TableLayout) -> dict[str, Any]:
     return asdict(layout)
 
 
-def markdown_header_stub(layout: TableLayout) -> List[str]:
+def markdown_header_stub(layout: TableLayout) -> list[str]:
     first_row = [layout.row_group_label, layout.schedule_label]
     second_row = ["", ""]
     divider = ["---", "---"]
@@ -143,7 +144,7 @@ def _schedule_key(row: Mapping[str, Any]) -> str:
     return aliases.get(text, text)
 
 
-def _relative_match_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
+def _relative_match_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
     return (
         _row_value(row, "benchmark_family"),
         _row_value(row, "split_phase"),
@@ -159,7 +160,7 @@ def _relative_match_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
     )
 
 
-def _safe_relative_gain(metric_value: Any, baseline_value: Any) -> Optional[float]:
+def _safe_relative_gain(metric_value: Any, baseline_value: Any) -> float | None:
     try:
         metric = float(metric_value)
         baseline = float(baseline_value)
@@ -170,7 +171,7 @@ def _safe_relative_gain(metric_value: Any, baseline_value: Any) -> Optional[floa
     return float(1.0 - (metric / baseline))
 
 
-def _relative_gain_value(row: Mapping[str, Any], relative_key: str) -> Optional[float]:
+def _relative_gain_value(row: Mapping[str, Any], relative_key: str) -> float | None:
     value = _row_value(row, relative_key, f"{relative_key}_mean")
     try:
         cast = float(value)
@@ -185,13 +186,13 @@ def _metric_value(row: Mapping[str, Any], metric_key: str) -> Any:
     return _row_value(row, metric_key, f"{metric_key}_mean")
 
 
-def augment_rows_with_relative_metrics(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    baseline_rows: Dict[Tuple[Any, ...], Mapping[str, Any]] = {}
+def augment_rows_with_relative_metrics(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    baseline_rows: dict[tuple[Any, ...], Mapping[str, Any]] = {}
     for row in rows:
         if _schedule_key(row) == "uniform":
             baseline_rows[_relative_match_key(row)] = row
 
-    enriched: List[Dict[str, Any]] = []
+    enriched: list[dict[str, Any]] = []
     for row in rows:
         payload = dict(row)
         baseline = baseline_rows.get(_relative_match_key(row))

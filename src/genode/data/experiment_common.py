@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import copy
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Dict, List, Mapping
 
 import torch
 
@@ -70,7 +70,7 @@ OTFLOW_PAPER_BACKBONE_PRESETS: Mapping[str, Mapping[str, object]] = {
 }
 OTFLOW_PAPER_BACKBONE_PRESET: Mapping[str, object] = OTFLOW_PAPER_BACKBONE_PRESETS["cryptos"]
 
-OTFLOW_QUALITY_PRESETS: Mapping[str, Dict[str, object]] = {
+OTFLOW_QUALITY_PRESETS: Mapping[str, dict[str, object]] = {
     "cryptos": {
         "levels": 10,
         "token_dim": 4,
@@ -112,7 +112,7 @@ OTFLOW_QUALITY_PRESETS: Mapping[str, Dict[str, object]] = {
     },
 }
 
-OTFLOW_SPEED_PRESETS: Mapping[str, Dict[str, object]] = {
+OTFLOW_SPEED_PRESETS: Mapping[str, dict[str, object]] = {
     dataset: {
         **copy.deepcopy(dict(preset)),
         "eval_nfe": 1,
@@ -120,7 +120,7 @@ OTFLOW_SPEED_PRESETS: Mapping[str, Dict[str, object]] = {
     for dataset, preset in OTFLOW_QUALITY_PRESETS.items()
 }
 
-OTFLOW_PRESET_VARIANTS: Mapping[str, Mapping[str, Dict[str, object]]] = {
+OTFLOW_PRESET_VARIANTS: Mapping[str, Mapping[str, dict[str, object]]] = {
     "quality": OTFLOW_QUALITY_PRESETS,
     "speed": OTFLOW_SPEED_PRESETS,
 }
@@ -225,26 +225,26 @@ def mkdir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def parse_int_list(text: str) -> List[int]:
+def parse_int_list(text: str) -> list[int]:
     if not text:
         return []
     return [int(part.strip()) for part in text.split(",") if part.strip()]
 
 
-def parse_float_list(text: str) -> List[float]:
+def parse_float_list(text: str) -> list[float]:
     if not text:
         return []
     return [float(part.strip()) for part in text.split(",") if part.strip()]
 
 
-def get_otflow_paper_backbone_preset(dataset: str) -> Dict[str, object]:
+def get_otflow_paper_backbone_preset(dataset: str) -> dict[str, object]:
     dataset_key = str(dataset).strip()
     if dataset_key not in OTFLOW_PAPER_BACKBONE_PRESETS:
         raise ValueError(f"No OTFlow paper preset defined for dataset={dataset!r}")
     return copy.deepcopy(dict(OTFLOW_PAPER_BACKBONE_PRESETS[dataset_key]))
 
 
-def get_otflow_dataset_preset(dataset: str, variant: str = "quality") -> Dict[str, object]:
+def get_otflow_dataset_preset(dataset: str, variant: str = "quality") -> dict[str, object]:
     variant_key = str(variant).strip().lower()
     if variant_key not in OTFLOW_PRESET_VARIANTS:
         raise ValueError(f"Unknown OTFlow preset variant={variant!r}")

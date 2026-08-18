@@ -10,9 +10,10 @@ import stat
 import tempfile
 import unicodedata
 import zipfile
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any
 
 import numpy as np
 import torch
@@ -36,7 +37,7 @@ from genode.path_safety import (
 )
 
 LONG_TERM_ST_EXPECTED_RECORDS = 86
-LONG_TERM_ST_PATIENT_GROUPS: Tuple[Tuple[str, ...], ...] = (
+LONG_TERM_ST_PATIENT_GROUPS: tuple[tuple[str, ...], ...] = (
     ("s20271", "s20272", "s20273", "s20274"),
     ("s30731", "s30732"),
     ("s30741", "s30742"),
@@ -51,7 +52,7 @@ def medical_staging_root() -> Path:
     raise RuntimeError("Set OTFLOW_MEDICAL_STAGING_ROOT to prepare raw medical datasets.")
 
 
-def _train_prefix_standardizer(values: np.ndarray, train_prefix_end: int) -> Tuple[float, float]:
+def _train_prefix_standardizer(values: np.ndarray, train_prefix_end: int) -> tuple[float, float]:
     arr = np.asarray(values[: int(train_prefix_end)], dtype=np.float32)
     if arr.size <= 0:
         raise ValueError("Train prefix must be non-empty for normalization.")
@@ -73,7 +74,7 @@ def _time_feature_dim(time_feature_mode: str) -> int:
     raise ValueError(f"Unknown time_feature_mode={time_feature_mode!r}")
 
 
-def _regular_time_features(start: int, stop: int, *, time_feature_mode: str) -> Optional[np.ndarray]:
+def _regular_time_features(start: int, stop: int, *, time_feature_mode: str) -> np.ndarray | None:
     length = max(0, int(stop) - int(start))
     dim = _time_feature_dim(str(time_feature_mode))
     if dim == 0:
@@ -150,8 +151,8 @@ class LongTermSTHeader:
     n_sig: int
     sampling_rate_hz: float
     signal_length: int
-    channel_names: Tuple[str, ...]
-    dat_names: Tuple[str, ...]
+    channel_names: tuple[str, ...]
+    dat_names: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -167,7 +168,7 @@ class LongTermSTSeriesSpec:
     source_total_length: int
 
 
-def _coerce_archive_paths(archive_paths: Optional[Union[str, Path, Sequence[str | Path]]]) -> List[Path]:
+def _coerce_archive_paths(archive_paths: str | Path | Sequence[str | Path] | None) -> list[Path]:
     if archive_paths is None:
         root = long_term_st_raw_archive_dir()
         candidates = sorted(root.glob("long_term_st*.zip")) if root.exists() else []
@@ -220,8 +221,8 @@ def _parse_long_term_st_header(record_id: str, text: str) -> LongTermSTHeader:
     signal_length = int(first[3])
     if len(lines) < 1 + n_sig:
         raise ValueError(f"WFDB header for {record_id} has fewer signal lines than n_sig={n_sig}.")
-    dat_names: List[str] = []
-    channel_names: List[str] = []
+    dat_names: list[str] = []
+    channel_names: list[str] = []
     for channel_index, line in enumerate(lines[1 : 1 + n_sig]):
         parts = line.split()
         if not parts:
@@ -243,10 +244,10 @@ def _parse_long_term_st_header(record_id: str, text: str) -> LongTermSTHeader:
 
 def _scan_long_term_st_archives(
     archive_paths: Sequence[Path],
-) -> Tuple[Dict[str, LongTermSTHeader], Dict[str, Tuple[Path, str]], List[Dict[str, Any]]]:
-    headers: Dict[str, LongTermSTHeader] = {}
-    dat_members: Dict[str, Tuple[Path, str]] = {}
-    archive_rows: List[Dict[str, Any]] = []
+) -> tuple[dict[str, LongTermSTHeader], dict[str, tuple[Path, str]], list[dict[str, Any]]]:
+    headers: dict[str, LongTermSTHeader] = {}
+    dat_members: dict[str, tuple[Path, str]] = {}
+    archive_rows: list[dict[str, Any]] = []
     for archive_path in archive_paths:
         archive_rows.append(
             {
@@ -278,7 +279,7 @@ def _scan_long_term_st_archives(
     return headers, dat_members, archive_rows
 
 
-def _copy_zip_member(member: Tuple[Path, str], *, target_root: Path, target_name: str) -> None:
+def _copy_zip_member(member: tuple[Path, str], *, target_root: Path, target_name: str) -> None:
     archive_path, member_name = member
     relative = portable_relative_path(target_name, label="Long-Term ST extraction file")
     if len(relative.parts) != 1:
@@ -337,8 +338,8 @@ def _extract_long_term_st_wfdb_members(
     source_dir: Path,
     archive_paths: Sequence[Path],
     headers: Mapping[str, LongTermSTHeader],
-    dat_members: Mapping[str, Tuple[Path, str]],
-) -> List[str]:
+    dat_members: Mapping[str, tuple[Path, str]],
+) -> list[str]:
     absolute_source_dir = source_dir.expanduser().absolute()
     if is_link_or_reparse_point(absolute_source_dir):
         raise ValueError(
@@ -354,9 +355,9 @@ def _extract_long_term_st_wfdb_members(
             f"{absolute_source_dir}."
         )
     absolute_source_dir = absolute_source_dir.resolve(strict=True)
-    missing_dat_names: List[str] = []
+    missing_dat_names: list[str] = []
 
-    header_members: Dict[str, Tuple[Path, str]] = {}
+    header_members: dict[str, tuple[Path, str]] = {}
     for archive_path in archive_paths:
         with zipfile.ZipFile(archive_path) as zf:
             for info in zf.infolist():
@@ -382,7 +383,7 @@ def _extract_long_term_st_wfdb_members(
     return missing_dat_names
 
 
-def _split_long_term_st_groups(group_ids: Sequence[str], train_frac: float, val_frac: float) -> Dict[str, str]:
+def _split_long_term_st_groups(group_ids: Sequence[str], train_frac: float, val_frac: float) -> dict[str, str]:
     groups = sorted({str(group_id) for group_id in group_ids})
     if len(groups) < 3:
         raise ValueError("Long-Term ST requires at least 3 record groups for train/val/test splits.")
@@ -392,7 +393,7 @@ def _split_long_term_st_groups(group_ids: Sequence[str], train_frac: float, val_
         val_count = max(1, len(groups) - train_count - 1)
     if train_count + val_count >= len(groups):
         train_count = max(1, len(groups) - val_count - 1)
-    split_by_group: Dict[str, str] = {}
+    split_by_group: dict[str, str] = {}
     for idx, group_id in enumerate(groups):
         if idx < train_count:
             split_by_group[group_id] = "train"
@@ -471,7 +472,7 @@ def _validate_long_term_st_manifest_series_specs(payload: Mapping[str, Any], man
         raise ValueError("Long-Term ST manifest must contain non-empty series_specs.")
 
     prepared_dir = manifest_path.parent.resolve()
-    group_split: Dict[str, str] = {}
+    group_split: dict[str, str] = {}
     split_counts = {"train": 0, "val": 0, "test": 0}
     known_group_by_record = {record_id: "_".join(group) for group in LONG_TERM_ST_PATIENT_GROUPS for record_id in group}
     for idx, row in enumerate(rows):
@@ -508,7 +509,7 @@ def _validate_long_term_st_manifest_series_specs(payload: Mapping[str, Any], man
         raise ValueError(f"Long-Term ST manifest has empty split(s): {', '.join(empty_splits)}.")
 
 
-def _validate_long_term_st_manifest(path: Path, *, history_len: int, horizon: int) -> Dict[str, Any]:
+def _validate_long_term_st_manifest(path: Path, *, history_len: int, horizon: int) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if str(payload.get("dataset_key")) != LONG_TERM_ST_DATASET_KEY:
         raise ValueError(f"Unexpected Long-Term ST manifest dataset_key={payload.get('dataset_key')!r}.")
@@ -529,14 +530,14 @@ def _validate_long_term_st_manifest(path: Path, *, history_len: int, horizon: in
 def prepare_long_term_st_dataset(
     out_dir: str | Path | None = None,
     *,
-    archive_paths: Optional[Union[str, Path, Sequence[str | Path]]] = None,
+    archive_paths: str | Path | Sequence[str | Path] | None = None,
     force: bool = False,
-    expected_record_count: Optional[int] = LONG_TERM_ST_EXPECTED_RECORDS,
+    expected_record_count: int | None = LONG_TERM_ST_EXPECTED_RECORDS,
     history_len: int = LONG_TERM_ST_HISTORY_LEN,
     horizon: int = LONG_TERM_ST_HORIZON_LEN,
     train_frac: float = 0.7,
     val_frac: float = 0.1,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     prepared_candidate = Path(out_dir or default_long_term_st_data_path()).expanduser().absolute()
     if is_link_or_reparse_point(prepared_candidate):
         raise ValueError(
@@ -588,12 +589,12 @@ def prepare_long_term_st_dataset(
     )
     prepared_series_dir.mkdir(parents=True, exist_ok=True)
     missing_dat_set = set(missing_dat_names)
-    skipped_records: List[Dict[str, str]] = []
-    series_rows: List[Dict[str, Any]] = []
+    skipped_records: list[dict[str, str]] = []
+    series_rows: list[dict[str, Any]] = []
     used_records: set[str] = set()
     used_record_slugs: set[str] = set()
-    min_prepared_length: Optional[int] = None
-    max_prepared_length: Optional[int] = None
+    min_prepared_length: int | None = None
+    max_prepared_length: int | None = None
 
     for record_index, (record_id, header) in enumerate(sorted(headers.items())):
         safe_record = _safe_record_name(
@@ -760,7 +761,7 @@ def prepare_long_term_st_dataset(
 
 
 class _LongTermSTParamsView:
-    def __init__(self, dataset: "LazyLongTermSTConditionalDataset"):
+    def __init__(self, dataset: LazyLongTermSTConditionalDataset):
         self._dataset = dataset
 
     def __len__(self) -> int:
@@ -791,8 +792,8 @@ class LazyLongTermSTConditionalDataset(torch.utils.data.Dataset):
         mean: float,
         std: float,
         stride: int,
-        sampler_num_samples: Optional[int] = None,
-        dataset_metadata: Optional[Mapping[str, Any]] = None,
+        sampler_num_samples: int | None = None,
+        dataset_metadata: Mapping[str, Any] | None = None,
     ):
         super().__init__()
         self.dataset_key = LONG_TERM_ST_DATASET_KEY
@@ -813,7 +814,7 @@ class LazyLongTermSTConditionalDataset(torch.utils.data.Dataset):
         self.time_gap_scale = None
         self.dataset_metadata = dict(dataset_metadata or {})
         self.stride = int(max(1, stride))
-        self._arrays: Dict[int, np.ndarray] = {}
+        self._arrays: dict[int, np.ndarray] = {}
         self._segment_starts = np.cumsum(
             np.asarray([0] + [int(spec.total_length) for spec in self.series_specs[:-1]], dtype=np.int64),
             dtype=np.int64,
@@ -833,7 +834,7 @@ class LazyLongTermSTConditionalDataset(torch.utils.data.Dataset):
             self.sampler_num_samples = None
 
     def _build_start_indices(self) -> np.ndarray:
-        starts: List[int] = []
+        starts: list[int] = []
         for series_idx, spec in enumerate(self.series_specs):
             first = int(self.history_len)
             last_exclusive = int(spec.total_length) - int(self.horizon) + 1
@@ -860,21 +861,21 @@ class LazyLongTermSTConditionalDataset(torch.utils.data.Dataset):
                 mmap.close()
         self._arrays.clear()
 
-    def __enter__(self) -> "LazyLongTermSTConditionalDataset":
+    def __enter__(self) -> LazyLongTermSTConditionalDataset:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
 
-    def _series_index_for_global_t(self, t: Union[int, np.ndarray]) -> np.ndarray:
+    def _series_index_for_global_t(self, t: int | np.ndarray) -> np.ndarray:
         arr = np.asarray(t, dtype=np.int64)
         return np.searchsorted(self.segment_ends, arr, side="right").astype(np.int64)
 
-    def segment_end_for_t(self, t: Union[int, np.ndarray]) -> np.ndarray:
+    def segment_end_for_t(self, t: int | np.ndarray) -> np.ndarray:
         idx = self._series_index_for_global_t(t)
         return self.segment_ends[idx]
 
-    def _resolve_global_slice(self, start: int, stop: int) -> Tuple[int, int, int]:
+    def _resolve_global_slice(self, start: int, stop: int) -> tuple[int, int, int]:
         if int(start) < 0 or int(stop) < int(start) or int(stop) > int(self.total_length):
             raise IndexError(f"Invalid Long-Term ST slice [{int(start)}, {int(stop)}).")
         series_idx = int(self._series_index_for_global_t(int(start)))
@@ -894,7 +895,7 @@ class LazyLongTermSTConditionalDataset(torch.utils.data.Dataset):
             values = ((values - self.params_mean[None, :]) / self.params_std[None, :]).astype(np.float32)
         return values.astype(np.float32, copy=False)
 
-    def example_metadata(self, idx: int) -> Dict[str, Any]:
+    def example_metadata(self, idx: int) -> dict[str, Any]:
         target_t = int(self.start_indices[int(idx)])
         series_idx, local_t, _ = self._resolve_global_slice(target_t, target_t + 1)
         spec = self.series_specs[int(series_idx)]
@@ -915,7 +916,7 @@ class LazyLongTermSTConditionalDataset(torch.utils.data.Dataset):
             "target_stop": int(target_t + self.horizon),
         }
 
-    def future_time_features(self, t0: int, horizon: int) -> Optional[torch.Tensor]:
+    def future_time_features(self, t0: int, horizon: int) -> torch.Tensor | None:
         del t0, horizon
         return None
 
@@ -952,8 +953,8 @@ def build_dataset_splits_from_long_term_st(
     stride_eval: int = LONG_TERM_ST_DEFAULT_STRIDE,
     train_frac: float = 0.7,
     val_frac: float = 0.1,
-    test_frac: Optional[float] = None,
-) -> Dict[str, object]:
+    test_frac: float | None = None,
+) -> dict[str, object]:
     del test_frac
     if int(cfg.history_len) != int(LONG_TERM_ST_HISTORY_LEN):
         raise ValueError(
@@ -994,7 +995,7 @@ def build_dataset_splits_from_long_term_st(
         "source_sampling_rate_hz": float(manifest["source_sampling_rate_hz"]),
         "conditioning": "context_only",
     }
-    splits: Dict[str, object] = {}
+    splits: dict[str, object] = {}
     for split_name, stride in (("train", stride_train), ("val", stride_eval), ("test", stride_eval)):
         split_specs = [spec for spec in series_specs if spec.split == split_name]
         splits[split_name] = LazyLongTermSTConditionalDataset(

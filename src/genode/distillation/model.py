@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Mapping
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -114,7 +115,7 @@ class EndpointFlowMap(nn.Module):
             raise ValueError("Flow-map initialization requires a transformer OTFlow teacher.")
         self.map_network.load_state_dict(teacher_network.state_dict(), strict=True)
 
-    def model_config(self) -> Dict[str, Any]:
+    def model_config(self) -> dict[str, Any]:
         return {
             "architecture": "endpoint_flow_map",
             "sample_state_dim": int(self.cfg.sample_state_dim),
@@ -233,7 +234,7 @@ class FlowMapSampler:
         flow_map: EndpointFlowMap,
         *,
         setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig,
-        gico_policy: "GICOSchedulePolicy | None" = None,
+        gico_policy: GICOSchedulePolicy | None = None,
     ):
         conditioner = getattr(backbone_model, "backbone", backbone_model)
         if not hasattr(conditioner, "build_conditioning"):

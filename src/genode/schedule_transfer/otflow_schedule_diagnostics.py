@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -25,11 +26,11 @@ def _sample_eval_trace(
     model,
     hist_t: torch.Tensor,
     *,
-    cond_t: Optional[torch.Tensor],
+    cond_t: torch.Tensor | None,
     steps: int,
     solver: str,
     oracle_local_error: bool = False,
-) -> Tuple[torch.Tensor, Dict[str, Any], int]:
+) -> tuple[torch.Tensor, dict[str, Any], int]:
     prediction_horizon = _prediction_horizon(model)
     if prediction_horizon > 1 and hasattr(model, "sample_future_trace"):
         x_block, trace = model.sample_future_trace(
@@ -55,7 +56,7 @@ def _append_rollout_context_features(
     block: torch.Tensor,
     *,
     x_hist: torch.Tensor,
-    future_context_seq: Optional[torch.Tensor],
+    future_context_seq: torch.Tensor | None,
     cursor: int,
     take: int,
 ) -> torch.Tensor:
@@ -110,9 +111,9 @@ def _collect_rollout_diagnostics(
     n_windows: int,
     seed: int,
     solver: str,
-    chosen_t0s: Optional[Sequence[int]] = None,
-    generation_seed_base: Optional[int] = None,
-) -> Dict[str, Any]:
+    chosen_t0s: Sequence[int] | None = None,
+    generation_seed_base: int | None = None,
+) -> dict[str, Any]:
     if chosen_t0s is None:
         chosen = _choose_valid_windows(ds, horizon=horizon, n_windows=n_windows, seed=seed)
     else:

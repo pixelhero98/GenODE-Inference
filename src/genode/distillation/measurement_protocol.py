@@ -5,9 +5,10 @@ import json
 import math
 import platform
 import re
+from collections.abc import Mapping, Sequence
 from importlib import metadata
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from genode.checkpoint_validation import validate_strict_integer
 from genode.data.otflow_paths import resolve_project_path

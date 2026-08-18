@@ -7,7 +7,7 @@ Consolidates helpers used across the OTFlow runtime and paper tooling.
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
 import numpy as np
 
@@ -15,9 +15,9 @@ import numpy as np
 # -------------------------------------------
 # Dict flattening / unflattening
 # -------------------------------------------
-def flatten_dict(d: Dict[str, Any], prefix: str = "") -> Dict[str, float]:
+def flatten_dict(d: dict[str, Any], prefix: str = "") -> dict[str, float]:
     """Recursively flatten a nested dict to dotted-path -> float entries."""
-    out: Dict[str, float] = {}
+    out: dict[str, float] = {}
     for k, v in d.items():
         kk = f"{prefix}.{k}" if prefix else str(k)
         if isinstance(v, dict):
@@ -27,9 +27,9 @@ def flatten_dict(d: Dict[str, Any], prefix: str = "") -> Dict[str, float]:
     return out
 
 
-def unflatten_to_nested(flat_aggs: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
+def unflatten_to_nested(flat_aggs: dict[str, dict[str, float]]) -> dict[str, Any]:
     """Reverse of flatten_dict (one level of aggregation stats per key)."""
-    root: Dict[str, Any] = {}
+    root: dict[str, Any] = {}
     for path, stats in flat_aggs.items():
         cur = root
         keys = path.split(".")
@@ -48,7 +48,7 @@ def microstructure_series(
     bid_p: np.ndarray,
     bid_v: np.ndarray,
     eps: float = 1e-8,
-) -> Dict[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """Compute common microstructure series from raw L2 arrays.
 
     Returns dict with keys: mid, spread, depth, imb, ret.

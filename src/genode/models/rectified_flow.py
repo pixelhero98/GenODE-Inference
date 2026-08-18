@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import List, Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,7 +38,7 @@ class RectifiedFlow(nn.Module):
         else:
             raise ValueError(f"Unknown fu_net_type={cfg.model.fu_net_type}")
 
-    def _conditioning_parts(self, cond_state) -> List[torch.Tensor]:
+    def _conditioning_parts(self, cond_state) -> list[torch.Tensor]:
         parts = [cond_state.ctx, cond_state.ctx_summary, cond_state.t_emb]
         if cond_state.cond_emb is not None:
             parts.append(cond_state.cond_emb)
@@ -51,8 +49,8 @@ class RectifiedFlow(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         hist: torch.Tensor,
-        cond: Optional[torch.Tensor] = None,
-        conditioning_cache: Optional[ConditioningCache] = None,
+        cond: torch.Tensor | None = None,
+        conditioning_cache: ConditioningCache | None = None,
     ) -> torch.Tensor:
         cond_state = self.backbone.build_conditioning(hist=hist, x_ref=x_t, t=t, cond=cond, cache=conditioning_cache)
         if self.fu_net_type == "transformer":
@@ -67,12 +65,12 @@ class RectifiedFlow(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         hist: torch.Tensor,
-        cond: Optional[torch.Tensor] = None,
-        conditioning_cache: Optional[ConditioningCache] = None,
+        cond: torch.Tensor | None = None,
+        conditioning_cache: ConditioningCache | None = None,
     ) -> torch.Tensor:
         return self._field_forward(x_t, t, hist, cond=cond, conditioning_cache=conditioning_cache)
 
-    def fm_loss(self, x: torch.Tensor, hist: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def fm_loss(self, x: torch.Tensor, hist: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
         batch_size = x.shape[0]
         z = torch.randn_like(x)
         t = torch.rand(batch_size, 1, device=x.device)
@@ -82,9 +80,7 @@ class RectifiedFlow(nn.Module):
         return F.mse_loss(v_hat, v_target)
 
     @torch.no_grad()
-    def sample(
-        self, hist: torch.Tensor, cond: Optional[torch.Tensor] = None, steps: Optional[int] = None
-    ) -> torch.Tensor:
+    def sample(self, hist: torch.Tensor, cond: torch.Tensor | None = None, steps: int | None = None) -> torch.Tensor:
         state_dim = self.cfg.sample_state_dim
         batch_size = hist.shape[0]
         x = torch.randn(batch_size, state_dim, device=hist.device)

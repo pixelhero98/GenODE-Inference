@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Dict, Mapping, Tuple
 
 from genode.schedule_transfer.reference_clocks import (
     DEFAULT_REFERENCE_CLOCK_KEYS,
@@ -12,49 +12,49 @@ from genode.solver_protocol import CANONICAL_SOLVER_KEYS
 
 CANONICAL_LAYOUT_VERSION = "seen_unseen_nfe_layout"
 
-CANONICAL_SEEN_NFES: Tuple[int, ...] = (4, 8, 12, 16)
-CANONICAL_UNSEEN_NFES: Tuple[int, ...] = (6, 10, 14, 20)
-CANONICAL_CHECKPOINT_STEPS: Tuple[int, ...] = (4000, 8000, 12000, 16000, 20000)
+CANONICAL_SEEN_NFES: tuple[int, ...] = (4, 8, 12, 16)
+CANONICAL_UNSEEN_NFES: tuple[int, ...] = (6, 10, 14, 20)
+CANONICAL_CHECKPOINT_STEPS: tuple[int, ...] = (4000, 8000, 12000, 16000, 20000)
 CANONICAL_CONTEXT_SAMPLE_COUNT = 188
 CANONICAL_UNSEEN_TARGET_WEIGHT = 0.25
 
 NFE_ROLE_SEEN = "seen"
 NFE_ROLE_UNSEEN = "unseen"
-NFE_ROLES: Tuple[str, ...] = (NFE_ROLE_SEEN, NFE_ROLE_UNSEEN)
+NFE_ROLES: tuple[str, ...] = (NFE_ROLE_SEEN, NFE_ROLE_UNSEEN)
 
 SCENARIO_FAMILY_FORECAST = "temporal_extrapolation"
 SCENARIO_FAMILY_CONDITIONAL_GENERATION = "temporal_conditional_generation"
 SCENARIO_FAMILY_MOLECULE = "molecule_3d_coordinate_generation"
 
-FORECAST_SCENARIO_KEYS: Tuple[str, ...] = (
+FORECAST_SCENARIO_KEYS: tuple[str, ...] = (
     "solar_energy_10m",
     "traffic_hourly",
     "weather_daily",
 )
-CONDITIONAL_GENERATION_SCENARIO_KEYS: Tuple[str, ...] = (
+CONDITIONAL_GENERATION_SCENARIO_KEYS: tuple[str, ...] = (
     "cryptos",
     "lobster_synthetic",
     "long_term_st",
 )
-MOLECULE_SCENARIO_KEYS: Tuple[str, ...] = (
+MOLECULE_SCENARIO_KEYS: tuple[str, ...] = (
     "molecule_3d_set1",
     "molecule_3d_set2",
     "molecule_3d_set3",
 )
-CANONICAL_SCENARIO_KEYS: Tuple[str, ...] = (
+CANONICAL_SCENARIO_KEYS: tuple[str, ...] = (
     *FORECAST_SCENARIO_KEYS,
     *CONDITIONAL_GENERATION_SCENARIO_KEYS,
     *MOLECULE_SCENARIO_KEYS,
 )
 
-PHYSICAL_SCHEDULE_KEYS: Tuple[str, ...] = REFERENCE_CLOCK_BASE_KEYS
-REVERSED_SCHEDULE_KEYS: Tuple[str, ...] = REFERENCE_CLOCK_REVERSED_KEYS
+PHYSICAL_SCHEDULE_KEYS: tuple[str, ...] = REFERENCE_CLOCK_BASE_KEYS
+REVERSED_SCHEDULE_KEYS: tuple[str, ...] = REFERENCE_CLOCK_REVERSED_KEYS
 # Density-averaged and SER clocks remain available only through explicit, non-canonical inputs.
-AVERAGED_REVERSED_SCHEDULE_KEYS: Tuple[str, ...] = ()
-CANONICAL_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
+AVERAGED_REVERSED_SCHEDULE_KEYS: tuple[str, ...] = ()
+CANONICAL_SUPERVISION_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
 
 REVERSED_SCHEDULE_BASE: Mapping[str, str] = {key: key.removesuffix("_reversed") for key in REVERSED_SCHEDULE_KEYS}
-AVERAGED_SCHEDULE_COMPONENTS: Mapping[str, Tuple[str, str]] = {}
+AVERAGED_SCHEDULE_COMPONENTS: Mapping[str, tuple[str, str]] = {}
 
 SCHEDULE_FAMILY_PHYSICAL = "physical"
 SCHEDULE_FAMILY_REVERSED = "reversed"
@@ -62,7 +62,7 @@ SCHEDULE_FAMILY_AVERAGED_REVERSED = "averaged_reversed"
 
 STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT = "seen_only_zero_shot"
 STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS = "seen_plus_unseen_targets"
-STUDENT_TRAINING_MODES: Tuple[str, ...] = (
+STUDENT_TRAINING_MODES: tuple[str, ...] = (
     STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
     STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS,
 )
@@ -75,7 +75,7 @@ class ScenarioSpec:
     public_dataset_key: str
 
 
-def canonical_scenario_specs() -> Tuple[ScenarioSpec, ...]:
+def canonical_scenario_specs() -> tuple[ScenarioSpec, ...]:
     return tuple(
         [
             ScenarioSpec(key=key, family=SCENARIO_FAMILY_FORECAST, public_dataset_key=key)
@@ -100,7 +100,7 @@ def scenario_family_for_key(scenario_key: str) -> str:
     raise KeyError(f"Unknown canonical scenario key: {scenario_key!r}")
 
 
-def canonical_nfes_for_role(nfe_role: str) -> Tuple[int, ...]:
+def canonical_nfes_for_role(nfe_role: str) -> tuple[int, ...]:
     role = str(nfe_role).strip().lower()
     if role == NFE_ROLE_SEEN:
         return CANONICAL_SEEN_NFES
@@ -130,7 +130,7 @@ def density_source_key_for_schedule(schedule_key: str) -> str:
     return key
 
 
-def canonical_layout_summary() -> Dict[str, object]:
+def canonical_layout_summary() -> dict[str, object]:
     return {
         "canonical_layout_version": CANONICAL_LAYOUT_VERSION,
         "seen_nfes": list(CANONICAL_SEEN_NFES),

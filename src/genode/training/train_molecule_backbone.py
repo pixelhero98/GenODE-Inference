@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -121,7 +122,7 @@ def build_molecule_cfg(args: argparse.Namespace, *, atom_count: int, context_fea
     return cfg
 
 
-def _parse_budget_steps(raw: str, *, train_steps: int) -> List[int]:
+def _parse_budget_steps(raw: str, *, train_steps: int) -> list[int]:
     values = [int(part) for part in str(raw).split(",") if part.strip()]
     if not values:
         values = [int(train_steps)]
@@ -137,13 +138,13 @@ def _evaluate_iso_balanced_loss(
     model: torch.nn.Module,
     cfg: OTFlowConfig,
     *,
-    max_batches: Optional[int],
-) -> Dict[str, Any]:
+    max_batches: int | None,
+) -> dict[str, Any]:
     if len(ds) <= 0:
         raise ValueError("Cannot evaluate Iso-balanced loss on an empty molecule dataset.")
     group_values = np.unique(ds.data.trajectory_ids[ds.start_indices])
-    per_iso: Dict[str, Any] = {}
-    losses: List[float] = []
+    per_iso: dict[str, Any] = {}
+    losses: list[float] = []
     total_examples = 0
     weighted_loss = 0.0
     for group_id in group_values:
@@ -198,7 +199,7 @@ def _save_molecule_artifact(
     budget_steps: int,
     split_stats: Mapping[str, Any],
     selection: Mapping[str, Any],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     artifact_root.mkdir(parents=True, exist_ok=True)
     checkpoint_path = artifact_root / "model.pt"
     checkpoint_cfg = _checkpoint_cfg_for_budget(cfg, int(budget_steps))
@@ -224,7 +225,7 @@ def _save_molecule_artifact(
         },
         checkpoint_path,
     )
-    metadata: Dict[str, Any] = {
+    metadata: dict[str, Any] = {
         "checkpoint_id": checkpoint_id,
         "dataset_key": dataset_key,
         "stratum": stratum,
@@ -254,7 +255,7 @@ def _save_molecule_artifact(
     return metadata
 
 
-def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
+def train_molecule_backbone(args: argparse.Namespace) -> dict[str, Any]:
     seed_all(int(args.seed))
     dataset_key = str(getattr(args, "dataset_key", DEFAULT_MOLECULE_DATASET_KEY) or DEFAULT_MOLECULE_DATASET_KEY)
     stratum = str(getattr(args, "stratum", "") or "")
@@ -296,14 +297,14 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
     val_max_batches = None if args.val_max_batches is None else int(args.val_max_batches)
     budget_steps = _parse_budget_steps(str(args.budget_steps), train_steps=int(args.steps))
 
-    best: Dict[str, Any] = {
+    best: dict[str, Any] = {
         "score": None,
         "state_dict": None,
         "step": 0,
         "validation": None,
         "train_loss": None,
     }
-    budget_best: Dict[int, Dict[str, Any]] = {}
+    budget_best: dict[int, dict[str, Any]] = {}
 
     def _record_validation_candidate(
         *,
@@ -338,7 +339,7 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
                 "train_loss": float(best["train_loss"]),
             }
 
-    def _on_step(step: int, model: torch.nn.Module, train_loss: float, logs: Dict[str, float]) -> None:
+    def _on_step(step: int, model: torch.nn.Module, train_loss: float, logs: dict[str, float]) -> None:
         del logs
         should_validate = (int(step) % val_every == 0) or int(step) == int(args.steps)
         if not should_validate:
@@ -390,7 +391,7 @@ def train_molecule_backbone(args: argparse.Namespace) -> Dict[str, Any]:
 
     variant = str(args.variant or "ar_h1")
     member_key = str(splits["stats"].get("member_key", ""))
-    budget_artifacts: Dict[str, Any] = {}
+    budget_artifacts: dict[str, Any] = {}
     final_budget = int(max(budget_steps))
     for budget in budget_steps:
         candidate = budget_best[int(budget)]

@@ -14,7 +14,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        include:
+          - python-version: "3.11"
+            numpy_spec: "numpy>=1.26,<2"
+          - python-version: "3.13"
+            numpy_spec: "numpy>=2,<3"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -22,8 +26,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install --upgrade pip
+      - run: python -m pip install "${{ matrix.numpy_spec }}"
       - run: python -m pip install -e ".[medical,test]"
       - run: python -m ruff check .
+      - run: python -m ruff format --check .
+      - run: python -m compileall -q src tests
       - run: python -m pytest -q
       - run: python -m pip check
       - run: git diff --check
@@ -38,6 +45,9 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[medical,test]"
+      - run: python -m ruff check .
+      - run: python -m ruff format --check .
+      - run: python -m compileall -q src tests
       - run: python -m pytest -q
       - run: python -m pip check
       - run: git diff --check
@@ -52,6 +62,118 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip build
       - run: python -m build
+      - name: Inspect wheel and source distribution
+        run: |
+          python - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import re
+          import tarfile
+          import zipfile
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          sdists = sorted(Path("dist").glob("*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit("Expected exactly one wheel and one source distribution.")
+
+          denied_parts = {
+              "__pycache__",
+              "checkpoints",
+              "logs",
+              "mlruns",
+              "outputs",
+              "reports",
+              "results",
+              "tensorboard",
+              "wandb",
+              "weights",
+          }
+          denied_suffixes = {
+              ".ckpt",
+              ".joblib",
+              ".log",
+              ".npy",
+              ".npz",
+              ".out",
+              ".pickle",
+              ".pkl",
+              ".pt",
+              ".pth",
+          }
+          content_patterns = {
+              "cluster path": re.compile(
+                  rb"isam" rb"bard|b3" rb"5z|ma" rb"cs3|/scr" rb"atch/|/pro" rb"jects/|"
+                  rb"sl" rb"urm|sba" rb"tch|pixelhero\.b3" rb"5z",
+                  re.IGNORECASE,
+              ),
+              "retired image policy": re.compile(
+                  rb"image_clock_mixture|complete[-_]clock|gico[-_]clock[-_]policy|clock[-_ ]mixture",
+                  re.IGNORECASE,
+              ),
+              "credential": re.compile(
+                  rb"AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+                  rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+              ),
+          }
+
+          def validate_name(name: str) -> None:
+              path = PurePosixPath(name)
+              if path.is_absolute() or ".." in path.parts or (path.parts and ":" in path.parts[0]):
+                  raise SystemExit(f"Unsafe archive member: {name}")
+              lowered = {part.casefold() for part in path.parts}
+              if lowered & denied_parts or path.suffix.casefold() in denied_suffixes:
+                  raise SystemExit(f"Unexpected generated or result member: {name}")
+
+          def validate_content(name: str, data: bytes) -> None:
+              for description, pattern in content_patterns.items():
+                  if pattern.search(data):
+                      raise SystemExit(f"Found {description} in {name}")
+
+          with zipfile.ZipFile(wheels[0]) as archive:
+              wheel_names = set(archive.namelist())
+              for name in wheel_names:
+                  validate_name(name)
+                  validate_content(name, archive.read(name))
+              required_wheel = {
+                  "genode/gico/image_cli.py",
+                  "genode/gico/image_causal_policy.py",
+                  "genode/gico/image_students.py",
+              }
+              if not required_wheel <= wheel_names:
+                  raise SystemExit("Wheel omitted an active image GICO module.")
+              if any("image_clock_mixture" in name for name in wheel_names):
+                  raise SystemExit("Wheel contains a retired image GICO module.")
+              if not any(name.endswith("/licenses/LICENSE") for name in wheel_names):
+                  raise SystemExit("Wheel omitted the MIT license.")
+              if not any(name.endswith("/licenses/THIRD_PARTY_NOTICES.md") for name in wheel_names):
+                  raise SystemExit("Wheel omitted third-party notices.")
+
+          with tarfile.open(sdists[0], "r:gz") as archive:
+              sdist_names = {member.name for member in archive.getmembers()}
+              for member in archive.getmembers():
+                  validate_name(member.name)
+                  if member.issym() or member.islnk() or member.isdev():
+                      raise SystemExit(f"Source distribution contains a link or device: {member.name}")
+                  if member.isfile():
+                      extracted = archive.extractfile(member)
+                      if extracted is None:
+                          raise SystemExit(f"Could not read source distribution member: {member.name}")
+                      validate_content(member.name, extracted.read())
+              root_names = {PurePosixPath(name).parts[0] for name in sdist_names if PurePosixPath(name).parts}
+              if len(root_names) != 1:
+                  raise SystemExit("Source distribution must have one root directory.")
+              root = next(iter(root_names))
+              required_sdist = {
+                  f"{root}/CONTRIBUTING.md",
+                  f"{root}/LICENSE",
+                  f"{root}/README.md",
+                  f"{root}/SECURITY.md",
+                  f"{root}/THIRD_PARTY_NOTICES.md",
+                  f"{root}/tests/__init__.py",
+                  f"{root}/tests/test_image_gico_cli.py",
+              }
+              if not required_sdist <= sdist_names:
+                  raise SystemExit("Source distribution omitted publication or test metadata.")
+          PY
       - run: python -m pip install --force-reinstall dist/*.whl
       - run: |
           for command in \
@@ -73,8 +195,34 @@ jobs:
             genode-build-release-archive \
             genode-collect-flow-map-demonstrations \
             genode-train-flow-map \
-            genode-evaluate-flow-map
+            genode-evaluate-flow-map \
+            genode-image-gico
           do
             "$command" --help
           done
+      - run: |
+          for subcommand in \
+            build-targets \
+            train-deterministic \
+            train-stochastic \
+            validate \
+            materialize
+          do
+            genode-image-gico "$subcommand" --help
+          done
       - run: python -m pip check
+      - name: Install and test the source distribution
+        run: |
+          SDIST=$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+          python -m venv "$RUNNER_TEMP/genode-sdist-venv"
+          SDIST_PYTHON="$RUNNER_TEMP/genode-sdist-venv/bin/python"
+          "$SDIST_PYTHON" -m pip install --upgrade pip
+          "$SDIST_PYTHON" -m pip install "${SDIST}[test]"
+          mkdir "$RUNNER_TEMP/genode-sdist-source"
+          tar -xzf "$SDIST" -C "$RUNNER_TEMP/genode-sdist-source"
+          SDIST_ROOT=$(find "$RUNNER_TEMP/genode-sdist-source" -mindepth 1 -maxdepth 1 -type d -print -quit)
+          cd "$SDIST_ROOT"
+          "$SDIST_PYTHON" -m pytest -q \
+            tests/test_image_gico_cli.py \
+            tests/test_image_gico_supervision.py
+          "$RUNNER_TEMP/genode-sdist-venv/bin/genode-image-gico" --help

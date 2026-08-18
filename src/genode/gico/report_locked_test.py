@@ -4,8 +4,9 @@ import argparse
 import csv
 import json
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -79,6 +80,7 @@ from genode.gico.policy import (
     validate_gico_density_token_attention,
     validate_gico_teacher_training_metadata,
 )
+from genode.gico.schema import consistent_metadata_value
 from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
 from genode.runtime import ProgressBar, resolve_torch_device
 from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, run_fixed_schedule_variant
@@ -93,16 +95,16 @@ CALIBRATION_HOLDOUT_PHASES = (CONTEXT_DISJOINT_PHASE,)
 SOURCE_SPLIT_PHASES = (TRAIN_TUNING_PHASE, VALIDATION_PHASE, LOCKED_TEST_PHASE)
 
 
-def _parse_csv(text: str) -> List[str]:
+def _parse_csv(text: str) -> list[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
-def _parse_int_csv(text: str) -> List[int]:
+def _parse_int_csv(text: str) -> list[int]:
     return [int(part) for part in _parse_csv(text)]
 
 
-def _read_csvs(paths_text: str) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+def _read_csvs(paths_text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     for path_text in _parse_csv(paths_text):
         rows.extend(read_metric_rows_csv(resolve_project_path(path_text)))
     return rows
@@ -113,7 +115,7 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
         return
-    fields: List[str] = []
+    fields: list[str] = []
     seen: set[str] = set()
     for row in rows:
         for key in row:
@@ -230,7 +232,7 @@ def _checkpoint_step_from_row(row: Mapping[str, Any]) -> int:
     return int(raw)
 
 
-def _row_group_key(row: Mapping[str, Any]) -> Tuple[str, str, int, str, int, int, str]:
+def _row_group_key(row: Mapping[str, Any]) -> tuple[str, str, int, str, int, int, str]:
     return (
         _source_split_phase(row),
         str(row.get("dataset", row.get("dataset_key", ""))),
@@ -242,8 +244,8 @@ def _row_group_key(row: Mapping[str, Any]) -> Tuple[str, str, int, str, int, int
     )
 
 
-def _representative_context_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    grouped: Dict[Tuple[str, str, int, str, int, str], Dict[str, Any]] = {}
+def _representative_context_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, int, str, int, str], dict[str, Any]] = {}
     for row in rows:
         key = _row_group_key(row)
         if key not in grouped:
@@ -258,7 +260,7 @@ def _representative_context_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict
     return [grouped[key] for key in sorted(grouped)]
 
 
-def _context_match_key(row: Mapping[str, Any]) -> Tuple[str, str, int, str, int, int, str]:
+def _context_match_key(row: Mapping[str, Any]) -> tuple[str, str, int, str, int, int, str]:
     return (
         _source_split_phase(row),
         str(row.get("dataset", row.get("dataset_key", ""))),
@@ -273,9 +275,9 @@ def _context_match_key(row: Mapping[str, Any]) -> Tuple[str, str, int, str, int,
 def _filter_rows_to_contexts(
     rows: Sequence[Mapping[str, Any]],
     representatives: Sequence[Mapping[str, Any]],
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     wanted = {_context_match_key(row) for row in representatives}
-    filtered: List[Dict[str, Any]] = []
+    filtered: list[dict[str, Any]] = []
     for row in rows:
         try:
             key = _context_match_key(row)
@@ -288,7 +290,7 @@ def _filter_rows_to_contexts(
 
 def _load_student_checkpoint(
     path: str | Path,
-) -> Tuple[Any, EmbeddingNormalizer, Tuple[float, ...], Dict[str, Any]]:
+) -> tuple[Any, EmbeddingNormalizer, tuple[float, ...], dict[str, Any]]:
     checkpoint_path = resolve_project_path(str(path))
     payload = require_current_gico_checkpoint_payload(
         torch.load(checkpoint_path, map_location="cpu", weights_only=True),
@@ -364,14 +366,23 @@ def _load_student_checkpoint(
 def _teacher_final_retrain_metadata(
     checkpoint_payload: Mapping[str, Any],
     training_summary: Mapping[str, Any],
-) -> Dict[str, Any]:
-    return dict(
-        checkpoint_payload.get("teacher_final_retrain")
-        or checkpoint_payload.get("final_teacher_retrain")
-        or training_summary.get("teacher_final_retrain")
-        or training_summary.get("final_teacher_retrain")
-        or {}
+) -> dict[str, Any]:
+    for label, payload in (
+        ("GICO checkpoint", checkpoint_payload),
+        ("GICO training summary", training_summary),
+    ):
+        if "final_teacher_retrain" in payload:
+            raise ValueError(f"{label} uses retired metadata key 'final_teacher_retrain'.")
+    value = consistent_metadata_value(
+        (checkpoint_payload, training_summary),
+        "teacher_final_retrain",
+        source="GICO checkpoint and training summary",
     )
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("teacher_final_retrain must be a mapping.")
+    return dict(value)
 
 
 def _clean_metadata_string(value: Any) -> str:
@@ -388,7 +399,7 @@ def _model_conditioning_style(payload: Mapping[str, Any], config_key: str) -> st
 def _conditioning_metadata_for_summary(
     checkpoint_payload: Mapping[str, Any],
     training_summary: Mapping[str, Any],
-) -> Dict[str, str]:
+) -> dict[str, str]:
     candidates = {
         style
         for style in (
@@ -410,8 +421,8 @@ def _conditioning_metadata_for_summary(
     return {"conditioning_style": next(iter(candidates))}
 
 
-def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str) -> List[Dict[str, Any]]:
-    grouped: Dict[Tuple[str, int, str, int, int, str], List[Mapping[str, Any]]] = defaultdict(list)
+def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int, str, int, int, str], list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[
             (
@@ -423,9 +434,9 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str)
                 str(row["scheduler_key"]),
             )
         ].append(row)
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for (dataset, seed, solver, target_nfe, checkpoint_step, scheduler_key), group in sorted(grouped.items()):
-        row: Dict[str, Any] = {
+        row: dict[str, Any] = {
             "dataset": dataset,
             "split_phase": str(split_phase),
             "seed": int(seed),
@@ -486,15 +497,15 @@ def _aggregate_seed_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str)
     return out
 
 
-def _aggregate_molecule_member_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str) -> List[Dict[str, Any]]:
-    grouped: Dict[Tuple[str, str], List[Mapping[str, Any]]] = defaultdict(list)
+def _aggregate_molecule_member_rows(rows: Sequence[Mapping[str, Any]], *, split_phase: str) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
         member_key = str(row.get("member_key") or row.get("axis_member") or "").strip()
         stratum = str(row.get("stratum") or row.get("axis_stratum") or "").strip()
         if not member_key or not stratum:
             raise ValueError("Molecule member aggregate rows require member_key/stratum on every context row.")
         grouped[(member_key, stratum)].append(row)
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for (member_key, stratum), group in sorted(grouped.items()):
         for row in _aggregate_seed_rows(group, split_phase=split_phase):
             first = group[0]
@@ -511,7 +522,7 @@ def _aggregate_molecule_member_rows(rows: Sequence[Mapping[str, Any]], *, split_
     return out
 
 
-def _numeric_metric_means(rows: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+def _numeric_metric_means(rows: Sequence[Mapping[str, Any]]) -> dict[str, float]:
     excluded = {
         "seed",
         "target_nfe",
@@ -519,7 +530,7 @@ def _numeric_metric_means(rows: Sequence[Mapping[str, Any]]) -> Dict[str, float]
         "series_idx",
         "example_idx",
     }
-    values: Dict[str, List[float]] = defaultdict(list)
+    values: dict[str, list[float]] = defaultdict(list)
     for row in rows:
         for key, value in row.items():
             if str(key) in excluded or str(key).endswith("_std"):
@@ -577,7 +588,7 @@ def _output_prefix(split_phase: str, selection_mode: str, report_label: str = ""
     return f"{safe}_gico"
 
 
-def _molecule_member_from_row(row: Mapping[str, Any]) -> Tuple[str, str]:
+def _molecule_member_from_row(row: Mapping[str, Any]) -> tuple[str, str]:
     member_key = str(row.get("member_key") or row.get("axis_member") or "").strip()
     stratum = str(row.get("stratum") or row.get("axis_stratum") or "").strip()
     if not member_key or not stratum:
@@ -585,7 +596,7 @@ def _molecule_member_from_row(row: Mapping[str, Any]) -> Tuple[str, str]:
     return member_key, stratum
 
 
-def _molecule_group_member_lookup(dataset: str, group_root: Path) -> Dict[Tuple[str, str], Dict[str, Any]]:
+def _molecule_group_member_lookup(dataset: str, group_root: Path) -> dict[tuple[str, str], dict[str, Any]]:
     manifest = load_molecule_group_manifest(str(dataset), group_root)
     return {
         (str(member["member_key"]), str(member["stratum"])): dict(member)
@@ -642,7 +653,7 @@ def _infer_int_values_from_rows(
     field: str,
     requested: str = "",
     arg_name: str | None = None,
-) -> Tuple[int, ...]:
+) -> tuple[int, ...]:
     if str(requested or "").strip():
         return tuple(_parse_int_csv(str(requested)))
     values = sorted({int(row[field]) for row in rows if str(row.get(field, "")).strip()})
@@ -651,7 +662,7 @@ def _infer_int_values_from_rows(
     return tuple(int(value) for value in values)
 
 
-def _infer_solver_values_from_rows(rows: Sequence[Mapping[str, Any]], *, requested: str = "") -> Tuple[str, ...]:
+def _infer_solver_values_from_rows(rows: Sequence[Mapping[str, Any]], *, requested: str = "") -> tuple[str, ...]:
     if str(requested or "").strip():
         return tuple(normalize_solver_keys(str(requested)))
     values = sorted(
@@ -669,7 +680,7 @@ def _filter_representatives_to_matrix(
     seeds: Sequence[int],
     solvers: Sequence[str],
     target_nfes: Sequence[int],
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     seed_set = {int(seed) for seed in seeds}
     solver_set = {normalize_solver_key(str(solver)) for solver in solvers}
     nfe_set = {int(value) for value in target_nfes}
@@ -692,7 +703,7 @@ def _attach_uniform_rewards_to_gico_row(
     uniform_row: Mapping[str, Any] | None,
     benchmark_family: str,
     dataset: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     out = dict(row)
     if uniform_row is None:
         raise ValueError(
@@ -714,7 +725,7 @@ def _attach_uniform_rewards_to_gico_row(
     return out
 
 
-def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
+def report_gico_locked_test(args: argparse.Namespace) -> dict[str, Any]:
     student, normalizer, reference_time_grid, checkpoint_payload = _load_student_checkpoint(
         str(args.gico_student_checkpoint),
     )
@@ -796,7 +807,7 @@ def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     molecule_group_root = resolve_project_path(
         str(getattr(args, "molecule_group_root", "") or default_molecule_group_root())
     )
-    molecule_members_for_coverage: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    molecule_members_for_coverage: dict[tuple[str, str], dict[str, Any]] = {}
     if benchmark_family == SCENARIO_FAMILY_MOLECULE:
         molecule_members_for_coverage = _molecule_group_member_lookup(dataset, molecule_group_root)
         expected_cells = {
@@ -884,7 +895,7 @@ def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
         checkpoint = None
         molecule_manifest = load_backbone_manifest(resolve_project_path(str(args.backbone_manifest)))
         molecule_members = molecule_members_for_coverage or _molecule_group_member_lookup(dataset, molecule_group_root)
-        molecule_cache: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+        molecule_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
     else:
         raise NotImplementedError(f"GICO locked-test reporting does not support benchmark_family={benchmark_family!r}.")
     if checkpoint is not None:
@@ -899,8 +910,8 @@ def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     out_dir = resolve_project_path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
     output_prefix = _output_prefix(split_phase, selection_mode, str(getattr(args, "report_label", "")))
-    decision_rows: List[Dict[str, Any]] = []
-    per_context_rows: List[Dict[str, Any]] = []
+    decision_rows: list[dict[str, Any]] = []
+    per_context_rows: list[dict[str, Any]] = []
     predictions = predict_gico_density_many(
         student,
         rows=representatives,
@@ -1163,7 +1174,7 @@ def report_gico_locked_test(args: argparse.Namespace) -> Dict[str, Any]:
     )
     comparison_file = f"{output_prefix}_comparison_summary.json"
     conditioning_metadata = _conditioning_metadata_for_summary(checkpoint_payload, training_summary)
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         "artifact": artifact_name,
         "protocol": GICO_PROTOCOL,
         "student_policy_type": "continuous_density",

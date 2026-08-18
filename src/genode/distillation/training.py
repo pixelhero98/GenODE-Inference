@@ -5,9 +5,10 @@ import hashlib
 import json
 import math
 from collections import OrderedDict
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Mapping
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -103,7 +104,7 @@ def _context_split(
         raise ValueError("Context-disjoint validation requires at least two contexts.")
     ranked = sorted(
         context_fingerprints,
-        key=lambda index: hashlib.sha256(f"{split_seed}\0{context_fingerprints[index]}".encode("utf-8")).digest(),
+        key=lambda index: hashlib.sha256(f"{split_seed}\0{context_fingerprints[index]}".encode()).digest(),
     )
     validation_count = min(
         len(ranked) - 1,
@@ -588,7 +589,7 @@ class DemonstrationStore:
                 complete_ranges.append((context_range, records))
         ranked = sorted(
             complete_ranges,
-            key=lambda item: hashlib.sha256(f"{int(seed)}\0{item[0][0]}\0{item[0][1]}".encode("utf-8")).digest(),
+            key=lambda item: hashlib.sha256(f"{int(seed)}\0{item[0][0]}\0{item[0][1]}".encode()).digest(),
         )
         if not ranked:
             raise ValueError("No validation context shards are available.")

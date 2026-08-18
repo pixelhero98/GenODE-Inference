@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 import numpy as np
 import torch
@@ -41,7 +42,7 @@ def _metric_value(result: Mapping[str, Any], metric: str) -> Any:
     return float(result["cmp"]["extra"][metric]["mean"])
 
 
-def _metric_bundle(result: Mapping[str, Any]) -> Dict[str, Any]:
+def _metric_bundle(result: Mapping[str, Any]) -> dict[str, Any]:
     return {metric: _metric_value(result, metric) for metric in ALL_METRICS}
 
 
@@ -49,11 +50,11 @@ def _choose_valid_windows(ds, horizon: int, n_windows: int, seed: int) -> np.nda
     return select_eval_window_starts(ds, horizon=int(horizon), n_windows=int(n_windows), seed=int(seed))
 
 
-def _sample_cfg_snapshot(cfg) -> Dict[str, Any]:
+def _sample_cfg_snapshot(cfg) -> dict[str, Any]:
     return dict(cfg.to_dict()["sample"])
 
 
-def _apply_sample_overrides(model: torch.nn.Module, cfg, **overrides: Any) -> Dict[str, Any]:
+def _apply_sample_overrides(model: torch.nn.Module, cfg, **overrides: Any) -> dict[str, Any]:
     backup = _sample_cfg_snapshot(cfg)
     clean = {key: value for key, value in overrides.items() if value is not None}
     if clean:

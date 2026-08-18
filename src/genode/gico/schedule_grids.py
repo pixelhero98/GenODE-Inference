@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from genode.data.otflow_paths import resolve_project_path
 from genode.gico.density_representation import (
@@ -15,7 +16,7 @@ from genode.gico.policy import density_mass_for_row
 from genode.solver_protocol import normalize_solver_key, normalize_solver_nfe_fields
 
 CANONICAL_DENSITY_BIN_COUNT = 64
-ScheduleGridKey = Tuple[Any, ...]
+ScheduleGridKey = tuple[Any, ...]
 
 
 def checkpoint_step_from_payload(
@@ -30,8 +31,8 @@ def checkpoint_step_from_payload(
     return None
 
 
-def load_schedule_summary_grids(paths: Sequence[str]) -> Dict[ScheduleGridKey, Tuple[float, ...]]:
-    grids: Dict[ScheduleGridKey, Tuple[float, ...]] = {}
+def load_schedule_summary_grids(paths: Sequence[str]) -> dict[ScheduleGridKey, tuple[float, ...]]:
+    grids: dict[ScheduleGridKey, tuple[float, ...]] = {}
     for path_text in paths:
         path = resolve_project_path(path_text)
         if not path.exists():
@@ -100,8 +101,8 @@ def schedule_grid_coverage_report(
     *,
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
     reference_time_grid: Sequence[float],
-) -> Dict[str, Any]:
-    missing: List[Dict[str, Any]] = []
+) -> dict[str, Any]:
+    missing: list[dict[str, Any]] = []
     for row in rows:
         try:
             density_mass_for_row(row, schedule_grids=schedule_grids, reference_time_grid=reference_time_grid)
@@ -130,7 +131,7 @@ def validate_schedule_grid_coverage(
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
     reference_time_grid: Sequence[float],
     label: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     report = schedule_grid_coverage_report(
         rows,
         schedule_grids=schedule_grids,

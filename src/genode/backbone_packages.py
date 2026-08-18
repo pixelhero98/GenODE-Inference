@@ -6,9 +6,10 @@ import json
 import re
 import shutil
 import subprocess
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any
 
 from genode.canonical_experiment_layout import (
     CANONICAL_CHECKPOINT_STEPS,
@@ -115,7 +116,7 @@ def _strip_known_prefix(path_text: str) -> str:
 
 def _source_path(source_root: Path, path_text: str | Path) -> Path:
     raw = Path(path_text)
-    candidates: List[Path] = []
+    candidates: list[Path] = []
     if raw.is_absolute():
         candidates.append(raw)
     else:
@@ -174,7 +175,7 @@ def _resolve_manifest_relative_path(manifest_path: Path, value: Any, *, path_bas
     return str((base / _strip_known_prefix(value)).resolve())
 
 
-def load_portable_backbone_manifest(path: str | Path) -> Dict[str, Any]:
+def load_portable_backbone_manifest(path: str | Path) -> dict[str, Any]:
     resolved = Path(path).resolve()
     payload = json.loads(resolved.read_text(encoding="utf-8"))
     path_base = str(payload.get("path_base", "") or "").strip()
@@ -227,11 +228,11 @@ def _rewrite_json_paths(value: Any) -> Any:
     return value
 
 
-def _copy_tree_or_file(source_root: Path, package_root: Path, rel_path: str) -> List[Dict[str, Any]]:
+def _copy_tree_or_file(source_root: Path, package_root: Path, rel_path: str) -> list[dict[str, Any]]:
     src = _source_path(source_root, rel_path)
     if not src.exists():
         raise FileNotFoundError(f"Package source path is missing: {rel_path} resolved to {src}")
-    copied: List[Dict[str, Any]] = []
+    copied: list[dict[str, Any]] = []
     if src.is_file():
         dst = package_root / _safe_rel(rel_path)
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -247,7 +248,7 @@ def _copy_tree_or_file(source_root: Path, package_root: Path, rel_path: str) -> 
     return copied
 
 
-def _file_record(package_root: Path, path: Path, *, role: str) -> Dict[str, Any]:
+def _file_record(package_root: Path, path: Path, *, role: str) -> dict[str, Any]:
     rel = path.relative_to(package_root).as_posix()
     return {
         "path": rel,
@@ -265,8 +266,8 @@ def _artifact_belongs_to_family(artifact: Mapping[str, Any], spec: BackbonePacka
     )
 
 
-def _scenario_artifact_counts(artifacts: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
+def _scenario_artifact_counts(artifacts: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
     for artifact in artifacts:
         scenario = str(artifact.get("dataset_key", ""))
         counts[scenario] = counts.get(scenario, 0) + 1
@@ -291,8 +292,8 @@ def _artifact_identity(artifact: Mapping[str, Any]) -> tuple[str, ...]:
     )
 
 
-def _validate_artifact_grid(artifacts: Sequence[Mapping[str, Any]], spec: BackbonePackageFamily) -> List[str]:
-    errors: List[str] = []
+def _validate_artifact_grid(artifacts: Sequence[Mapping[str, Any]], spec: BackbonePackageFamily) -> list[str]:
+    errors: list[str] = []
     if len(artifacts) != int(spec.expected_artifact_count):
         errors.append(
             f"Package family {spec.key!r} has {len(artifacts)} artifacts; expected {int(spec.expected_artifact_count)}."
@@ -302,10 +303,10 @@ def _validate_artifact_grid(artifacts: Sequence[Mapping[str, Any]], spec: Backbo
         errors.append(f"Package family {spec.key!r} contains duplicate artifact identities.")
     expected_steps = {int(step) for step in TRAIN_BUDGET_STEPS}
     if spec.benchmark_family == MOLECULE_FAMILY:
-        members_by_scenario: Dict[str, set[tuple[str, str, str]]] = {
+        members_by_scenario: dict[str, set[tuple[str, str, str]]] = {
             str(scenario): set() for scenario in spec.scenarios
         }
-        steps_by_member: Dict[tuple[str, str, str, str], set[int]] = {}
+        steps_by_member: dict[tuple[str, str, str, str], set[int]] = {}
         for artifact in artifacts:
             scenario = str(artifact.get("dataset_key", ""))
             member = (
@@ -325,7 +326,7 @@ def _validate_artifact_grid(artifacts: Sequence[Mapping[str, Any]], spec: Backbo
                     f"Molecule member {'/'.join(member)} has train steps {sorted(observed_steps)}; expected {sorted(expected_steps)}."
                 )
     else:
-        steps_by_scenario: Dict[str, set[int]] = {str(scenario): set() for scenario in spec.scenarios}
+        steps_by_scenario: dict[str, set[int]] = {str(scenario): set() for scenario in spec.scenarios}
         for artifact in artifacts:
             steps_by_scenario.setdefault(str(artifact.get("dataset_key", "")), set()).add(
                 int(artifact.get("train_steps", -1))
@@ -344,9 +345,9 @@ def _normalize_artifact_for_package(
     *,
     source_root: Path,
     package_root: Path,
-) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     normalized = dict(artifact)
-    records: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     for field in PATH_FIELDS:
         raw_value = str(artifact.get(field, "") or "").strip()
         if not raw_value:
@@ -367,7 +368,7 @@ def _normalize_manifest_for_package(
     artifacts: Sequence[Mapping[str, Any]],
     *,
     spec: BackbonePackageFamily,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     payload = {key: value for key, value in source_manifest.items() if key != "artifacts"}
     payload.update(
         {
@@ -424,7 +425,7 @@ def package_backbone_family(
     stage_dir: str | Path | None = None,
     overwrite: bool = False,
     make_zip: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     spec = FAMILY_SPECS[str(family)]
     resolved_source = Path(source_root or project_root()).expanduser().resolve()
     resolved_output = Path(output_dir).expanduser().resolve()
@@ -457,8 +458,8 @@ def package_backbone_family(
             "Source backbone manifest is incomplete for this family:\n- " + "\n- ".join(artifact_grid_errors)
         )
 
-    records: List[Dict[str, Any]] = []
-    normalized_artifacts: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    normalized_artifacts: list[dict[str, Any]] = []
     for artifact in artifacts:
         normalized, artifact_records = _normalize_artifact_for_package(
             artifact,
@@ -467,7 +468,7 @@ def package_backbone_family(
         )
         normalized_artifacts.append(normalized)
         records.extend(artifact_records)
-    data_records: List[Dict[str, Any]] = []
+    data_records: list[dict[str, Any]] = []
     for rel_path in spec.data_roots:
         data_records.extend(_copy_tree_or_file(resolved_source, package_root, rel_path))
     records.extend(data_records)
@@ -556,8 +557,8 @@ def _iter_json_strings(value: Any) -> Iterable[str]:
         yield value
 
 
-def _validate_file_record(package_root: Path, record: Mapping[str, Any]) -> List[str]:
-    errors: List[str] = []
+def _validate_file_record(package_root: Path, record: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
     rel = str(record.get("path", ""))
     try:
         safe = _safe_rel(rel)
@@ -599,9 +600,9 @@ def _checkpoint_label(artifact: Mapping[str, Any]) -> str:
     return "/".join(part for part in parts if part)
 
 
-def _validate_artifact_checkpoint_integrity(artifact: Mapping[str, Any], checkpoint_path: Path) -> List[str]:
+def _validate_artifact_checkpoint_integrity(artifact: Mapping[str, Any], checkpoint_path: Path) -> list[str]:
     label = _checkpoint_label(artifact)
-    errors: List[str] = []
+    errors: list[str] = []
     if not checkpoint_path.exists():
         return [f"Provided artifact {label} is missing its checkpoint file."]
     if not checkpoint_path.is_file():
@@ -646,9 +647,9 @@ def validate_backbone_package(
     *,
     expected_family: str | None = None,
     require_clean_paths: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     root = Path(package_root).expanduser().resolve()
-    errors: List[str] = []
+    errors: list[str] = []
     package_manifest_path = root / PACKAGE_MANIFEST_NAME
     if not package_manifest_path.exists():
         errors.append(f"Missing {PACKAGE_MANIFEST_NAME}")
@@ -762,9 +763,9 @@ def validate_provided_backbone_manifest(
     *,
     scenario_key: str = "",
     benchmark_family: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     resolved_manifest = resolve_project_path(str(manifest_path))
-    errors: List[str] = []
+    errors: list[str] = []
     if not resolved_manifest.exists():
         return {
             "status": "failed",
@@ -810,7 +811,7 @@ def validate_provided_backbone_manifest(
         errors.append(
             f"Provided backbone artifacts have train steps {sorted(observed_steps)}; expected at least {sorted(expected_steps)}."
         )
-    lookup_counts: Dict[tuple[Any, ...], int] = {}
+    lookup_counts: dict[tuple[Any, ...], int] = {}
     for artifact in matching_artifacts:
         key = (
             str(artifact.get("backbone_name", "")),
@@ -833,7 +834,7 @@ def validate_provided_backbone_manifest(
                     f"Provided temporal scenario has {count} ready {expected_backbone_name} artifacts for train_steps={step}; expected 1."
                 )
     if benchmark_family == MOLECULE_FAMILY:
-        members: Dict[tuple[str, str, str], set[int]] = {}
+        members: dict[tuple[str, str, str], set[int]] = {}
         for artifact in matching_artifacts:
             member = (
                 str(artifact.get("member_key", "")),
@@ -892,7 +893,7 @@ def apply_backbone_package_to_args(args: argparse.Namespace) -> argparse.Namespa
     return args
 
 
-def backbone_package_protocol_payload(args: argparse.Namespace) -> Dict[str, Any]:
+def backbone_package_protocol_payload(args: argparse.Namespace) -> dict[str, Any]:
     raw_root = str(getattr(args, "backbone_package_root", "") or "").strip()
     if not raw_root:
         return {"use_provided_backbones": bool(getattr(args, "use_provided_backbones", False))}

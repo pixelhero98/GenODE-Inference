@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import shutil
-import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -15,6 +12,7 @@ import numpy as np
 import torch
 
 from genode.artifacts.identity import semantic_sha256
+from genode.gico.image_artifact_io import staged_image_gico_directory
 from genode.gico.image_causal_artifacts import (
     load_image_gico_causal_artifact,
     save_image_gico_causal_artifact,
@@ -181,12 +179,14 @@ def _sample_keys(value: str | None, *, count: int) -> tuple[str, ...]:
 
 def _publish_materialization(output: str | Path, payload: Any) -> dict[str, Any]:
     payload.verify()
-    target = Path(output).expanduser().resolve()
-    if target.exists() or target.is_symlink():
-        raise FileExistsError(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage-", dir=target.parent))
-    try:
+    expected_members = {"manifest.json", "density-mass.npy", "time-grids.npy"}
+    if payload.tokens is not None:
+        expected_members.add("tokens.npy")
+    with staged_image_gico_directory(
+        output,
+        expected_members=expected_members,
+        label="Image GICO materialization directory",
+    ) as stage:
         density_path = stage / "density-mass.npy"
         time_grid_path = stage / "time-grids.npy"
         np.save(density_path, payload.density_mass, allow_pickle=False)
@@ -219,14 +219,14 @@ def _publish_materialization(output: str | Path, payload: Any) -> dict[str, Any]
             encoding="utf-8",
             newline="\n",
         )
-        os.replace(stage, target)
-    except Exception:
-        shutil.rmtree(stage, ignore_errors=True)
-        raise
     return manifest
 
 
 def _materialize(args: argparse.Namespace) -> int:
+    if args.uniforms is not None and args.request_sha256 is not None:
+        raise ValueError("--uniforms and --request-sha256 are mutually exclusive.")
+    if args.sample_keys is not None and args.request_sha256 is None:
+        raise ValueError("--sample-keys requires --request-sha256.")
     indices = _context_indices(args.context_indices)
     deterministic = None
     causal = None
@@ -299,8 +299,9 @@ def _parser() -> argparse.ArgumentParser:
     materialize.add_argument("--artifact", required=True)
     materialize.add_argument("--target-nfe", type=int, choices=(2, 4, 8), required=True)
     materialize.add_argument("--context-indices", required=True)
-    materialize.add_argument("--uniforms")
-    materialize.add_argument("--request-sha256")
+    random_source = materialize.add_mutually_exclusive_group()
+    random_source.add_argument("--uniforms")
+    random_source.add_argument("--request-sha256")
     materialize.add_argument("--sample-keys")
     materialize.add_argument("--device", default="cpu")
     materialize.add_argument("--output", required=True)

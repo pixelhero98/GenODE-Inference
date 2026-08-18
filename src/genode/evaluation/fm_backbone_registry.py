@@ -4,9 +4,10 @@ import importlib.util
 import json
 import os
 import shutil
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 from genode.data.molecule_xyz import (
     MOLECULE_GROUP_DATASET_KEYS,
@@ -44,18 +45,18 @@ DEFAULT_MOLECULE_VARIANT = "ar_h1"
 DEFAULT_SEED = 0
 CANONICAL_TEMPORAL_ROLLOUT_MODE = "non_ar"
 CANONICAL_MOLECULE_ROLLOUT_MODE = "autoregressive"
-TRAIN_BUDGET_STEPS: Tuple[int, ...] = (4000, 8000, 12000, 16000, 20000)
+TRAIN_BUDGET_STEPS: tuple[int, ...] = (4000, 8000, 12000, 16000, 20000)
 STANDARD_ARTIFACT_SUMMARY_NAME = "artifact_summary.json"
 MANIFEST_VERSION = "fm_backbone_manifest"
 AUDIT_VERSION = "fm_backbone_manifest_check"
 IMPORTED_EXTERNAL_SOURCE_KIND = "imported_external"
 
-ACTIVE_FORECAST_BACKBONE_BUDGETS: Mapping[str, Tuple[int, ...]] = {
+ACTIVE_FORECAST_BACKBONE_BUDGETS: Mapping[str, tuple[int, ...]] = {
     "solar_energy_10m": (4000, 8000, 12000, 16000, 20000),
     "traffic_hourly": (4000, 8000, 12000, 16000, 20000),
     "weather_daily": (4000, 8000, 12000, 16000, 20000),
 }
-ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS: Mapping[str, Tuple[int, ...]] = {
+ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS: Mapping[str, tuple[int, ...]] = {
     "cryptos": (4000, 8000, 12000, 16000, 20000),
     "lobster_synthetic": (4000, 8000, 12000, 16000, 20000),
     LONG_TERM_ST_DATASET_KEY: (4000, 8000, 12000, 16000, 20000),
@@ -74,24 +75,24 @@ class BackboneArtifactSpec:
     summary_path: str
     status: str
     seed: int = DEFAULT_SEED
-    checkpoint_budget_steps: Optional[int] = None
-    effective_train_steps: Optional[int] = None
-    checkpoint_export_protocol: Optional[str] = None
+    checkpoint_budget_steps: int | None = None
+    effective_train_steps: int | None = None
+    checkpoint_export_protocol: str | None = None
     source_kind: str = "planned"
-    metadata_path: Optional[str] = None
-    field_network_type: Optional[str] = None
-    notes: Optional[str] = None
-    model_cond_dim: Optional[int] = None
-    compatibility_error: Optional[str] = None
-    member_key: Optional[str] = None
-    stratum: Optional[str] = None
-    atom_count: Optional[int] = None
-    formula: Optional[str] = None
-    source_zip_name: Optional[str] = None
-    trajectory_count: Optional[int] = None
-    variant: Optional[str] = None
+    metadata_path: str | None = None
+    field_network_type: str | None = None
+    notes: str | None = None
+    model_cond_dim: int | None = None
+    compatibility_error: str | None = None
+    member_key: str | None = None
+    stratum: str | None = None
+    atom_count: int | None = None
+    formula: str | None = None
+    source_zip_name: str | None = None
+    trajectory_count: int | None = None
+    variant: str | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -105,7 +106,7 @@ def train_budget_label(train_steps: int) -> str:
     return f"{steps}_steps"
 
 
-def _metadata_int(metadata: Mapping[str, Any] | None, key: str) -> Optional[int]:
+def _metadata_int(metadata: Mapping[str, Any] | None, key: str) -> int | None:
     if metadata is None:
         return None
     value = metadata.get(key)
@@ -114,7 +115,7 @@ def _metadata_int(metadata: Mapping[str, Any] | None, key: str) -> Optional[int]
     return int(value)
 
 
-def _metadata_str(metadata: Mapping[str, Any] | None, key: str) -> Optional[str]:
+def _metadata_str(metadata: Mapping[str, Any] | None, key: str) -> str | None:
     if metadata is None:
         return None
     value = str(metadata.get(key, "") or "").strip()
@@ -148,9 +149,9 @@ def build_backbone_checkpoint_id(
     dataset_key: str,
     train_steps: int,
     seed: int = DEFAULT_SEED,
-    field_network_type: Optional[str] = None,
-    member_key: Optional[str] = None,
-    stratum: Optional[str] = None,
+    field_network_type: str | None = None,
+    member_key: str | None = None,
+    stratum: str | None = None,
 ) -> str:
     if str(benchmark_family) == FORECAST_FAMILY:
         family_token = "temporal_extrapolation"
@@ -167,14 +168,6 @@ def build_backbone_checkpoint_id(
         parts.append(str(member_key or stratum or "molecule_stratum"))
     parts.extend([train_budget_label(int(train_steps)), f"seed{int(seed)}"])
     return "_".join(parts)
-
-
-def _active_budget_map(benchmark_family: str) -> Mapping[str, Tuple[int, ...]]:
-    if str(benchmark_family) == FORECAST_FAMILY:
-        return ACTIVE_FORECAST_BACKBONE_BUDGETS
-    if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
-        return ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS
-    raise ValueError(f"Unsupported benchmark_family={benchmark_family}")
 
 
 def _forecast_artifact_root(matrix_root: Path, backbone_name: str, dataset_key: str, train_steps: int) -> Path:
@@ -260,7 +253,7 @@ def _expected_materialized_paths(
     member_key: str = "",
     stratum: str = "",
     variant: str = DEFAULT_MOLECULE_VARIANT,
-) -> Dict[str, Path]:
+) -> dict[str, Path]:
     artifact_root = expected_artifact_root(
         matrix_root,
         backbone_name=str(backbone_name),
@@ -297,7 +290,7 @@ def _existing_summary_path(
     return preferred
 
 
-def _safe_json(path: Path) -> Optional[Dict[str, Any]]:
+def _safe_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
@@ -310,7 +303,7 @@ def _metadata_cond_dim(metadata: Mapping[str, Any]) -> int:
     return int(metadata.get("cond_dim") or 0)
 
 
-def _checkpoint_signature(checkpoint_path: Path) -> Tuple[Optional[Dict[str, int | str]], Optional[str]]:
+def _checkpoint_signature(checkpoint_path: Path) -> tuple[dict[str, int | str] | None, str | None]:
     try:
         import torch
 
@@ -340,14 +333,14 @@ def _metadata_value(metadata: Mapping[str, Any], key: str) -> Any:
 
 
 def _otflow_artifact_compatibility(
-    metadata: Optional[Mapping[str, Any]],
+    metadata: Mapping[str, Any] | None,
     checkpoint_path: Path,
     *,
     benchmark_family: str,
     dataset_key: str,
     train_steps: int,
-    field_network_type: Optional[str],
-) -> Tuple[Optional[int], str, Optional[str]]:
+    field_network_type: str | None,
+) -> tuple[int | None, str, str | None]:
     if not metadata:
         return None, "invalid", "Missing checkpoint metadata."
     signature, error = _checkpoint_signature(checkpoint_path)
@@ -357,7 +350,7 @@ def _otflow_artifact_compatibility(
         return None, "invalid", "Checkpoint signature inspection returned no result."
     model_cond_dim = int(signature["model_cond_dim"])
     spec = experiment_plan_by_key()[str(dataset_key)]
-    errors: List[str] = []
+    errors: list[str] = []
 
     required_checks = (
         ("dataset_key", str(dataset_key), str),
@@ -427,8 +420,8 @@ def _molecule_manifest_members(
     *,
     molecule_group_root: str | Path | None = None,
     dataset_keys: Sequence[str] = MOLECULE_GROUP_DATASET_KEYS,
-) -> List[Dict[str, Any]]:
-    members: List[Dict[str, Any]] = []
+) -> list[dict[str, Any]]:
+    members: list[dict[str, Any]] = []
     for dataset_key in tuple(str(key) for key in dataset_keys):
         manifest_path = (
             (
@@ -468,7 +461,7 @@ def _molecule_manifest_members(
 
 
 def _molecule_artifact_compatibility(
-    metadata: Optional[Mapping[str, Any]],
+    metadata: Mapping[str, Any] | None,
     *,
     dataset_key: str,
     member_key: str,
@@ -478,10 +471,10 @@ def _molecule_artifact_compatibility(
     formula: str,
     source_zip_name: str,
     variant: str,
-) -> Tuple[str, Optional[str]]:
+) -> tuple[str, str | None]:
     if not metadata:
         return "invalid", "Missing checkpoint metadata."
-    errors: List[str] = []
+    errors: list[str] = []
     required_checks = (
         ("dataset_key", str(dataset_key), str),
         ("member_key", str(member_key), str),
@@ -530,7 +523,7 @@ def _existing_matrix_artifact(
     dataset_key: str,
     train_steps: int,
     seed: int,
-) -> Optional[BackboneArtifactSpec]:
+) -> BackboneArtifactSpec | None:
     paths = _expected_materialized_paths(
         matrix_root,
         backbone_name=str(backbone_name),
@@ -605,7 +598,7 @@ def _existing_molecule_artifact(
     train_steps: int,
     seed: int,
     variant: str = DEFAULT_MOLECULE_VARIANT,
-) -> Optional[BackboneArtifactSpec]:
+) -> BackboneArtifactSpec | None:
     dataset_key = str(member["dataset_key"])
     stratum = str(member["stratum"])
     member_key = str(member["member_key"])
@@ -685,7 +678,7 @@ def _existing_otflow_reuse_artifact(
     dataset_key: str,
     train_steps: int,
     seed: int,
-) -> Optional[BackboneArtifactSpec]:
+) -> BackboneArtifactSpec | None:
     if int(train_steps) != 20000:
         return None
     if str(benchmark_family) == FORECAST_FAMILY:
@@ -768,7 +761,7 @@ def _rewrite_normalized_json_payload(
     metadata_path: Path,
     summary_path: Path,
     normalized_from: Path,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     data = dict(payload)
     if "checkpoint_path" in data:
         data["checkpoint_path"] = _project_display_path(checkpoint_path)
@@ -874,10 +867,10 @@ def normalize_imported_backbone_artifacts(
     matrix_root: str | Path | None = None,
     imported_root: str | Path | None = None,
     budget_steps: Sequence[int] = TRAIN_BUDGET_STEPS,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     resolved_matrix_root = Path(matrix_root or project_backbone_matrix_root()).resolve()
     resolved_import_root = Path(imported_root or default_imported_otflow_backbone_root()).resolve()
-    normalized: List[Dict[str, Any]] = []
+    normalized: list[dict[str, Any]] = []
     if not resolved_import_root.exists():
         return {
             "matrix_root": _project_display_path(resolved_matrix_root),
@@ -1072,13 +1065,13 @@ def materialize_backbone_manifest(
     budget_steps: Sequence[int] = TRAIN_BUDGET_STEPS,
     seed: int = DEFAULT_SEED,
     write_path: str | Path | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     resolved_matrix_root = Path(matrix_root or project_backbone_matrix_root()).resolve()
     resolved_reuse_root = Path(otflow_reuse_root or default_otflow_reuse_root()).resolve()
     resolved_import_root = Path(imported_backbone_root or default_imported_otflow_backbone_root()).resolve()
     resolved_molecule_backbone_root = Path(molecule_backbone_root or default_molecule_backbone_root()).resolve()
     resolved_molecule_group_root = Path(molecule_group_root or default_molecule_group_root()).resolve()
-    artifacts: List[Dict[str, Any]] = []
+    artifacts: list[dict[str, Any]] = []
     ready_count = 0
     molecule_member_by_key = {
         (str(member["dataset_key"]), str(member["member_key"]), str(member["stratum"])): member
@@ -1162,7 +1155,7 @@ def _resolve_manifest_relative_path(manifest_path: Path, value: Any, *, path_bas
     return os.path.abspath(os.path.join(base, os.fspath(raw)))
 
 
-def load_backbone_manifest(path: str | Path) -> Dict[str, Any]:
+def load_backbone_manifest(path: str | Path) -> dict[str, Any]:
     manifest_path = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     path_base = str(payload.get("path_base", "") or "").strip()
@@ -1203,12 +1196,12 @@ def find_backbone_artifact(
     status: str = "ready",
     member_key: str | None = None,
     stratum: str | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if str(benchmark_family) == MOLECULE_FAMILY and member_key is None and stratum is None:
         raise ValueError(
             "Molecule backbone artifact lookup requires member_key or stratum to avoid ambiguous group matches."
         )
-    matches: List[Dict[str, Any]] = []
+    matches: list[dict[str, Any]] = []
     for artifact in manifest_payload.get("artifacts", []):
         if (
             str(artifact.get("backbone_name")) == str(backbone_name)
@@ -1236,7 +1229,7 @@ def build_runtime_probe(
     lobster_synthetic_profile_path: str | Path | None = None,
     long_term_st_path: str | Path | None = None,
     molecule_group_root: str | Path | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     resolved_dataset_root = Path(dataset_root or project_paper_dataset_root()).resolve()
     resolved_lobster_profile_path = Path(
         lobster_synthetic_profile_path or default_lobster_synthetic_profile_path()
@@ -1283,7 +1276,7 @@ def build_backbone_readiness_audit(
     budget_steps: Sequence[int] = TRAIN_BUDGET_STEPS,
     seed: int = DEFAULT_SEED,
     write_path: str | Path | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     normalization = normalize_imported_backbone_artifacts(
         matrix_root=matrix_root,
         imported_root=imported_backbone_root,

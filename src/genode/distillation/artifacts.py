@@ -5,8 +5,9 @@ import json
 import os
 import re
 import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -46,9 +47,9 @@ def context_fingerprint(history: Any, condition: Any | None = None) -> str:
     """
 
     digest = hashlib.sha256()
-    digest.update(f"{CONTEXT_BINDING_DOMAIN}\0".encode("utf-8"))
+    digest.update(f"{CONTEXT_BINDING_DOMAIN}\0".encode())
     for name, value in (("history", history), ("condition", condition)):
-        digest.update(f"{name}\0".encode("utf-8"))
+        digest.update(f"{name}\0".encode())
         if value is None:
             digest.update(b"absent\0")
             continue
@@ -76,7 +77,7 @@ def context_fingerprint(history: Any, condition: Any | None = None) -> str:
     return digest.hexdigest()
 
 
-def context_binding(context_fingerprints: Sequence[Any]) -> Dict[str, Any]:
+def context_binding(context_fingerprints: Sequence[Any]) -> dict[str, Any]:
     fingerprints = sorted(str(value).strip() for value in context_fingerprints)
     if not fingerprints or any(_SHA256_PATTERN.fullmatch(value) is None for value in fingerprints):
         raise ValueError("Context fingerprints must be non-empty lowercase SHA-256 digests.")
@@ -118,7 +119,7 @@ def in_memory_context_source_sha256(
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def validate_context_binding(payload: Mapping[str, Any]) -> Dict[str, Any]:
+def validate_context_binding(payload: Mapping[str, Any]) -> dict[str, Any]:
     binding = dict(payload)
     required = {
         "algorithm",
@@ -206,7 +207,7 @@ def _resolve_context_source_metadata(
     *,
     context_ids: Sequence[str],
     context_fingerprints: Sequence[str],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     resolved = dict(metadata)
     kind = str(resolved.get("contexts_source_kind", "in_memory")).strip()
     if kind not in CONTEXT_SOURCE_KINDS:
@@ -265,7 +266,7 @@ def write_npz_shard(
     root: str | Path,
     relative_path: str,
     arrays: Mapping[str, Any],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     root_path = Path(root).expanduser().resolve()
     relative = portable_relative_path(relative_path, label="shard path")
     if relative.suffix != ".npz":
@@ -343,7 +344,7 @@ def _portable_shard_record(
     record: Mapping[str, Any],
     *,
     label: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     core_fields = {"path", "size_bytes", "sha256", "arrays"}
     portable_metadata_fields = {
         "solver_key",
@@ -360,7 +361,7 @@ def _portable_shard_record(
     return portable
 
 
-def _validate_shard_record(root: Path, record: Mapping[str, Any], *, label: str) -> Dict[str, Any]:
+def _validate_shard_record(root: Path, record: Mapping[str, Any], *, label: str) -> dict[str, Any]:
     path_value = str(record.get("path", ""))
     resolved = resolve_portable_relative_path(root, path_value, label=f"{label} path", reject_links=True)
     if not resolved.is_file():
@@ -506,7 +507,7 @@ def _validate_demonstration_metadata(metadata: Mapping[str, Any]) -> None:
             raise ValueError("Demonstration context binding count does not match metadata context_count.")
 
 
-def load_demonstration_manifest(path: str | Path) -> Dict[str, Any]:
+def load_demonstration_manifest(path: str | Path) -> dict[str, Any]:
     manifest_path = Path(path).expanduser().resolve()
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))

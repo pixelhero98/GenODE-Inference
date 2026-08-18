@@ -2,32 +2,33 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal, InvalidOperation
-from functools import lru_cache
+from functools import cache, lru_cache
 from numbers import Integral
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 
 from genode.artifacts.identity import semantic_sha256
 
-AYS_SD15_TIMESTEPS: Tuple[int, ...] = (999, 850, 736, 645, 545, 455, 343, 233, 124, 24)
-AYS_SD15_SIGMAS: Tuple[float, ...] = (14.615, 6.475, 3.861, 2.697, 1.886, 1.396, 0.963, 0.652, 0.399, 0.152, 0.0)
+AYS_SD15_TIMESTEPS: tuple[int, ...] = (999, 850, 736, 645, 545, 455, 343, 233, 124, 24)
+AYS_SD15_SIGMAS: tuple[float, ...] = (14.615, 6.475, 3.861, 2.697, 1.886, 1.396, 0.963, 0.652, 0.399, 0.152, 0.0)
 SD15_NUM_TRAIN_TIMESTEPS = 1000
 SD15_BETA_START = 0.00085
 SD15_BETA_END = 0.012
 SD15_BETA_SCHEDULE = "scaled_linear"
-GITS_CIFAR10_SIGMAS: Tuple[float, ...] = (80.0, 10.9836, 3.8811, 1.5840, 0.5666, 0.1698, 0.0020)
+GITS_CIFAR10_SIGMAS: tuple[float, ...] = (80.0, 10.9836, 3.8811, 1.5840, 0.5666, 0.1698, 0.0020)
 OTS_VP_LINEAR_BETA_0 = 0.1
 OTS_VP_LINEAR_BETA_1 = 20.0
 OTS_VP_LINEAR_EPS = 1e-3
 FLOWTS_POWER = 0.03
 
-DEFAULT_LATE_P_VALUES: Tuple[Decimal, ...] = tuple(Decimal(value) for value in ("1.5", "2", "4", "8"))
+DEFAULT_LATE_P_VALUES: tuple[Decimal, ...] = tuple(Decimal(value) for value in ("1.5", "2", "4", "8"))
 
-REFERENCE_CLOCK_BASE_KEYS: Tuple[str, ...] = (
+REFERENCE_CLOCK_BASE_KEYS: tuple[str, ...] = (
     "uniform",
     "ays_sd15_native",
     "ays_sd15_log_sigma",
@@ -41,10 +42,10 @@ REFERENCE_CLOCK_BASE_KEYS: Tuple[str, ...] = (
     "late_p_8",
     "flowts_power_0p03",
 )
-REFERENCE_CLOCK_REVERSED_KEYS: Tuple[str, ...] = tuple(
+REFERENCE_CLOCK_REVERSED_KEYS: tuple[str, ...] = tuple(
     f"{key}_reversed" for key in REFERENCE_CLOCK_BASE_KEYS if key != "uniform"
 )
-DEFAULT_REFERENCE_CLOCK_KEYS: Tuple[str, ...] = REFERENCE_CLOCK_BASE_KEYS + REFERENCE_CLOCK_REVERSED_KEYS
+DEFAULT_REFERENCE_CLOCK_KEYS: tuple[str, ...] = REFERENCE_CLOCK_BASE_KEYS + REFERENCE_CLOCK_REVERSED_KEYS
 
 _LATE_P_KEY_RE = re.compile(r"^late_p_(?P<value>[0-9]+(?:p[0-9]+)?)$")
 
@@ -64,13 +65,13 @@ class ReferenceClockSpec:
     source_commit: str
     source_license: str
     source_path: str
-    source_nodes: Tuple[float, ...] = ()
+    source_nodes: tuple[float, ...] = ()
     derivation: str = "source_reference"
     realization_sha256: str = ""
     realization_environment: str = ""
     notes: str = ""
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["source_nodes"] = list(self.source_nodes)
         return payload
@@ -81,7 +82,7 @@ _GITS_COMMIT = "68d5ce427f261962b89ce3b0ee8f6b29f0577328"
 _OTS_COMMIT = "95d4ac6b8a3d1d389ab63a197e1b05d8512b6a99"
 _FLOWTS_COMMIT = "1ec35fb1d3d89d91a1607a9f949a515347d54c8c"
 
-OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS: Tuple[int, ...] = (
+OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS: tuple[int, ...] = (
     2,
     3,
     4,
@@ -95,7 +96,7 @@ OTS_VP_LINEAR_SUPPORTED_STEP_COUNTS: Tuple[int, ...] = (
     16,
     20,
 )
-OTS_VP_LINEAR_OFFICIAL_TIMES: Mapping[int, Tuple[float, ...]] = MappingProxyType(
+OTS_VP_LINEAR_OFFICIAL_TIMES: Mapping[int, tuple[float, ...]] = MappingProxyType(
     {
         2: (0.9999999999999998, 0.2968592779377656, 0.001000000000000059),
         3: (
@@ -238,7 +239,7 @@ OTS_VP_LINEAR_OFFICIAL_TIMES: Mapping[int, Tuple[float, ...]] = MappingProxyType
         ),
     }
 )
-OTS_VP_LINEAR_OFFICIAL_LAMBDAS: Mapping[int, Tuple[float, ...]] = MappingProxyType(
+OTS_VP_LINEAR_OFFICIAL_LAMBDAS: Mapping[int, tuple[float, ...]] = MappingProxyType(
     {
         2: (-5.024978406659204, -0.19457526997875002, 4.557714932729866),
         3: (
@@ -403,7 +404,7 @@ OTS_VP_LINEAR_TABLE_SHA256 = semantic_sha256(
 )
 
 
-def _base_specs() -> Dict[str, ReferenceClockSpec]:
+def _base_specs() -> dict[str, ReferenceClockSpec]:
     specs = {
         "uniform": ReferenceClockSpec(
             key="uniform",
@@ -613,7 +614,7 @@ def late_p_value_from_key(key: str) -> Decimal:
     return validate_late_p_value(match.group("value").replace("p", "."))
 
 
-def parse_extra_late_p_values(values: str | Sequence[Decimal | float | int | str]) -> Tuple[Decimal, ...]:
+def parse_extra_late_p_values(values: str | Sequence[Decimal | float | int | str]) -> tuple[Decimal, ...]:
     raw_values: Sequence[Decimal | float | int | str]
     if isinstance(values, str):
         raw_values = tuple(item.strip() for item in values.split(",") if item.strip())
@@ -624,7 +625,7 @@ def parse_extra_late_p_values(values: str | Sequence[Decimal | float | int | str
 
 def reference_clock_keys(
     extra_late_p_values: str | Sequence[Decimal | float | int | str] = (),
-) -> Tuple[str, ...]:
+) -> tuple[str, ...]:
     powers = tuple(sorted(set(DEFAULT_LATE_P_VALUES) | set(parse_extra_late_p_values(extra_late_p_values))))
     base_keys = (
         *REFERENCE_CLOCK_BASE_KEYS[:7],
@@ -640,7 +641,7 @@ def reference_clock_registry(
     base_specs = _base_specs()
     for power in parse_extra_late_p_values(extra_late_p_values):
         base_specs.setdefault(canonical_late_p_key(power), _late_p_spec(power))
-    registry: Dict[str, ReferenceClockSpec] = {}
+    registry: dict[str, ReferenceClockSpec] = {}
     for key in reference_clock_keys(extra_late_p_values):
         if key.endswith("_reversed"):
             base_key = key.removesuffix("_reversed")
@@ -657,10 +658,10 @@ def reference_clock_registry(
     return MappingProxyType(registry)
 
 
-def reference_clock_provenance(key: str) -> Dict[str, Any]:
+def reference_clock_provenance(key: str) -> dict[str, Any]:
     normalized = str(key).strip().lower()
     base_key = normalized.removesuffix("_reversed")
-    extras: Tuple[Decimal, ...] = ()
+    extras: tuple[Decimal, ...] = ()
     if base_key.startswith("late_p_"):
         extras = (late_p_value_from_key(base_key),)
     registry = reference_clock_registry(extras)
@@ -679,7 +680,7 @@ def _validate_n_steps(n_steps: int) -> int:
     return n_steps
 
 
-def _normalize_descending(values: Sequence[float]) -> Tuple[float, ...]:
+def _normalize_descending(values: Sequence[float]) -> tuple[float, ...]:
     array = np.asarray(values, dtype=np.float64)
     if array.ndim != 1 or array.size < 2 or not bool(np.all(np.isfinite(array))):
         raise ValueError("Reference nodes must be a finite one-dimensional sequence with at least two values.")
@@ -690,14 +691,14 @@ def _normalize_descending(values: Sequence[float]) -> Tuple[float, ...]:
     return tuple(float(value) for value in progression)
 
 
-def _resample(progression: Sequence[float], n_steps: int) -> Tuple[float, ...]:
+def _resample(progression: Sequence[float], n_steps: int) -> tuple[float, ...]:
     reference = np.asarray(progression, dtype=np.float64)
     src = np.linspace(0.0, 1.0, reference.size, dtype=np.float64)
     dst = np.linspace(0.0, 1.0, int(n_steps) + 1, dtype=np.float64)
     return _finalize(np.interp(dst, src, reference))
 
 
-def _finalize(values: Sequence[float]) -> Tuple[float, ...]:
+def _finalize(values: Sequence[float]) -> tuple[float, ...]:
     grid = np.asarray(values, dtype=np.float64).copy()
     if grid.ndim != 1 or grid.size < 2 or not bool(np.all(np.isfinite(grid))):
         raise ValueError("Reference clock grid must be finite and one-dimensional.")
@@ -707,7 +708,7 @@ def _finalize(values: Sequence[float]) -> Tuple[float, ...]:
     return tuple(float(value) for value in grid)
 
 
-def reverse_reference_clock_grid(grid: Sequence[float]) -> Tuple[float, ...]:
+def reverse_reference_clock_grid(grid: Sequence[float]) -> tuple[float, ...]:
     return _finalize([1.0 - float(value) for value in reversed(tuple(grid))])
 
 
@@ -728,20 +729,20 @@ def _sd15_sigma_ratio_t0() -> float:
     return math.sqrt((1.0 - alpha_bar_t0) / alpha_bar_t0)
 
 
-def _ays_progression(coordinate: str) -> Tuple[float, ...]:
+def _ays_progression(coordinate: str) -> tuple[float, ...]:
     if coordinate == "native":
         return _normalize_descending((*AYS_SD15_TIMESTEPS, 0.0))
     positive_sigmas = (*AYS_SD15_SIGMAS[:-1], _sd15_sigma_ratio_t0())
     return _normalize_descending(tuple(math.log(value) for value in positive_sigmas))
 
 
-def _gits_progression(coordinate: str) -> Tuple[float, ...]:
+def _gits_progression(coordinate: str) -> tuple[float, ...]:
     values = GITS_CIFAR10_SIGMAS if coordinate == "native" else tuple(math.log(value) for value in GITS_CIFAR10_SIGMAS)
     return _normalize_descending(values)
 
 
-@lru_cache(maxsize=None)
-def ots_vp_linear_source_nodes(n_steps: int) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+@cache
+def ots_vp_linear_source_nodes(n_steps: int) -> tuple[tuple[float, ...], tuple[float, ...]]:
     n_steps = _validate_n_steps(n_steps)
     try:
         times = OTS_VP_LINEAR_OFFICIAL_TIMES[n_steps]
@@ -754,12 +755,12 @@ def ots_vp_linear_source_nodes(n_steps: int) -> Tuple[Tuple[float, ...], Tuple[f
     return times, lambdas
 
 
-def build_reference_clock_grid(key: str, n_steps: int) -> Tuple[float, ...]:
+def build_reference_clock_grid(key: str, n_steps: int) -> tuple[float, ...]:
     normalized = str(key).strip().lower()
     n_steps = _validate_n_steps(n_steps)
     base_key = normalized.removesuffix("_reversed")
     try:
-        extra_late_p_values: Tuple[Decimal, ...] = (
+        extra_late_p_values: tuple[Decimal, ...] = (
             (late_p_value_from_key(base_key),) if base_key.startswith("late_p_") else ()
         )
         registry = reference_clock_registry(extra_late_p_values)

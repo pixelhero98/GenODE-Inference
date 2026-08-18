@@ -1,24 +1,24 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Dict, Iterable, Sequence, Tuple
 
-CANONICAL_SOLVER_KEYS: Tuple[str, ...] = ("euler", "dpmpp2m", "heun", "midpoint_rk2")
-CANONICAL_SOLVER_DISPLAY_NAMES: Dict[str, str] = {
+CANONICAL_SOLVER_KEYS: tuple[str, ...] = ("euler", "dpmpp2m", "heun", "midpoint_rk2")
+CANONICAL_SOLVER_DISPLAY_NAMES: dict[str, str] = {
     "euler": "Euler",
     "dpmpp2m": "DPM++2M",
     "heun": "Heun / RK2",
     "midpoint_rk2": "Midpoint RK2",
 }
-CANONICAL_SOLVER_RUNTIME_NAMES: Dict[str, str] = {
+CANONICAL_SOLVER_RUNTIME_NAMES: dict[str, str] = {
     "euler": "euler",
     "dpmpp2m": "dpmpp2m",
     "heun": "heun",
     "midpoint_rk2": "midpoint_rk2",
 }
-SOLVER_ALIASES: Dict[str, str] = {
+SOLVER_ALIASES: dict[str, str] = {
     "euler": "euler",
     "dpmpp2m": "dpmpp2m",
     "dpmpp_2m": "dpmpp2m",
@@ -44,7 +44,7 @@ def normalize_solver_key(value: str) -> str:
     return SOLVER_ALIASES[key]
 
 
-def normalize_solver_keys(values: Sequence[str] | str, *, reject_duplicates: bool = True) -> Tuple[str, ...]:
+def normalize_solver_keys(values: Sequence[str] | str, *, reject_duplicates: bool = True) -> tuple[str, ...]:
     if isinstance(values, str):
         raw = [part.strip() for part in values.split(",") if part.strip()]
     else:
@@ -176,7 +176,7 @@ def normalize_solver_nfe_fields(
     )
 
 
-def solver_id_map(keys: Iterable[str] = CANONICAL_SOLVER_KEYS) -> Dict[str, int]:
+def solver_id_map(keys: Iterable[str] = CANONICAL_SOLVER_KEYS) -> dict[str, int]:
     normalized = normalize_solver_keys(tuple(keys), reject_duplicates=True)
     return {key: idx for idx, key in enumerate(normalized)}
 

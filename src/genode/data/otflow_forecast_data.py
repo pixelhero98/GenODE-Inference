@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -85,7 +86,7 @@ def _time_feature_dim(time_feature_mode: str) -> int:
     raise ValueError(f"Unknown time_feature_mode={time_feature_mode!r}")
 
 
-def _regular_time_features(length: int, step_seconds: int, *, time_feature_mode: str) -> Optional[np.ndarray]:
+def _regular_time_features(length: int, step_seconds: int, *, time_feature_mode: str) -> np.ndarray | None:
     dim = _time_feature_dim(str(time_feature_mode))
     if dim == 0:
         return None
@@ -99,7 +100,7 @@ def _regular_time_features(length: int, step_seconds: int, *, time_feature_mode:
     return np.concatenate([gap_feature, elapsed_feature], axis=1).astype(np.float32)
 
 
-def _train_prefix_standardizer(values: np.ndarray, train_prefix_end: int) -> Tuple[float, float]:
+def _train_prefix_standardizer(values: np.ndarray, train_prefix_end: int) -> tuple[float, float]:
     train_prefix = np.asarray(values[: int(train_prefix_end)], dtype=np.float32)
     if train_prefix.size <= 0:
         raise ValueError("Train prefix must be non-empty for per-series normalization.")
@@ -116,7 +117,7 @@ class ForecastSeriesRecord:
     series_id: str
     raw_values: np.ndarray
     norm_values: np.ndarray
-    time_features: Optional[np.ndarray]
+    time_features: np.ndarray | None
     mean: float
     std: float
     total_length: int
@@ -207,7 +208,7 @@ class MonashForecastWindowDataset(torch.utils.data.Dataset):
             return 1.0
         return scale
 
-    def example_metadata(self, idx: int) -> Dict[str, Any]:
+    def example_metadata(self, idx: int) -> dict[str, Any]:
         ref = self.example_refs[int(idx)]
         series = self.series_records[int(ref.series_idx)]
         return {
@@ -226,7 +227,7 @@ class MonashForecastWindowDataset(torch.utils.data.Dataset):
             "test_start": int(series.test_start),
         }
 
-    def future_time_features(self, idx: int) -> Optional[torch.Tensor]:
+    def future_time_features(self, idx: int) -> torch.Tensor | None:
         ref = self.example_refs[int(idx)]
         series = self.series_records[int(ref.series_idx)]
         if series.time_features is None:
@@ -268,8 +269,8 @@ def _build_series_records(
     horizon: int,
     time_feature_mode: str,
     frequency_label: str,
-) -> Tuple[List[ForecastSeriesRecord], Dict[str, int]]:
-    records: List[ForecastSeriesRecord] = []
+) -> tuple[list[ForecastSeriesRecord], dict[str, int]]:
+    records: list[ForecastSeriesRecord] = []
     skipped_short = 0
     filled_missing = 0
     step_seconds = _frequency_seconds(frequency_label)
@@ -332,8 +333,8 @@ def _train_example_refs(
     history_len: int,
     horizon: int,
     stride: int,
-) -> List[ForecastExampleRef]:
-    refs: List[ForecastExampleRef] = []
+) -> list[ForecastExampleRef]:
+    refs: list[ForecastExampleRef] = []
     for series_idx, record in enumerate(series_records):
         max_target_t = int(record.train_prefix_end) - int(horizon)
         for target_t in range(int(history_len), int(max_target_t) + 1, int(max(1, stride))):
@@ -343,8 +344,8 @@ def _train_example_refs(
 
 def _holdout_example_refs(
     series_records: Sequence[ForecastSeriesRecord], *, split_name: str
-) -> List[ForecastExampleRef]:
-    refs: List[ForecastExampleRef] = []
+) -> list[ForecastExampleRef]:
+    refs: list[ForecastExampleRef] = []
     for series_idx, record in enumerate(series_records):
         if str(split_name) == "val":
             target_t = int(record.val_start)
@@ -365,7 +366,7 @@ def build_monash_forecast_splits(
     horizon: int,
     stride_train: int = 1,
     time_feature_mode: str = "gap_elapsed",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     time_feature_mode = str(time_feature_mode)
     manifest = load_monash_manifest(default_manifest_path(dataset_root, dataset_key))
     tsf_path = find_tsf_file(default_source_dir(dataset_root, dataset_key))

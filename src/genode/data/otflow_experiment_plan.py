@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping
 
 from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
 
@@ -108,11 +108,11 @@ SUPPORTED_CONDITIONAL_GENERATION_DATASETS: tuple[str, ...] = tuple(
 )
 
 
-def experiment_plan_specs() -> List[DatasetExperimentSpec]:
+def experiment_plan_specs() -> list[DatasetExperimentSpec]:
     return list(PAPER_EXPERIMENT_SPECS)
 
 
-def experiment_plan_by_key() -> Dict[str, DatasetExperimentSpec]:
+def experiment_plan_by_key() -> dict[str, DatasetExperimentSpec]:
     return {spec.dataset_key: spec for spec in SUPPORTED_EXPERIMENT_SPECS}
 
 
@@ -136,8 +136,8 @@ def supported_conditional_generation_dataset_keys() -> tuple[str, ...]:
     return tuple(SUPPORTED_CONDITIONAL_GENERATION_DATASETS)
 
 
-def validate_experiment_plan(specs: Iterable[DatasetExperimentSpec] | None = None) -> List[Dict[str, object]]:
-    rows: List[Dict[str, object]] = []
+def validate_experiment_plan(specs: Iterable[DatasetExperimentSpec] | None = None) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
     for spec in PAPER_EXPERIMENT_SPECS if specs is None else list(specs):
         divides = int(spec.experiment_horizon) % int(spec.future_block_len) == 0
         rows.append(

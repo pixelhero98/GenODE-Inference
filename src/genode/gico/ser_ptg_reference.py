@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -78,15 +79,15 @@ SER_PTG_REVERSED_SCHEDULE_KEY = "ser_ptg_local_defect_eta005_reversed"
 SER_PTG_AVG_REVERSED_SCHEDULE_KEY = "ser_ptg_local_defect_eta005_avg_reversed"
 SER_PTG_EXAMPLE_SELECTION_PROTOCOL = "ser_ptg_reference_global_context_capped_v3"
 SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL = "otflow_midpoint_local_defect_proxy_v1"
-DEFAULT_SOLVERS: Tuple[str, ...] = CANONICAL_SOLVER_KEYS
-DEFAULT_TARGET_NFES: Tuple[int, ...] = CANONICAL_SEEN_NFES
+DEFAULT_SOLVERS: tuple[str, ...] = CANONICAL_SOLVER_KEYS
+DEFAULT_TARGET_NFES: tuple[int, ...] = CANONICAL_SEEN_NFES
 
 
-def _parse_csv(text: str) -> List[str]:
+def _parse_csv(text: str) -> list[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
-def _parse_int_csv(text: str) -> List[int]:
+def _parse_int_csv(text: str) -> list[int]:
     return [int(part) for part in _parse_csv(text)]
 
 
@@ -97,7 +98,7 @@ def _positive_int(value: Any, *, name: str) -> int:
     return parsed
 
 
-def _optional_positive_int(value: Any, *, name: str) -> Optional[int]:
+def _optional_positive_int(value: Any, *, name: str) -> int | None:
     if value is None or str(value).strip() == "":
         return None
     parsed = int(value)
@@ -106,7 +107,7 @@ def _optional_positive_int(value: Any, *, name: str) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
-def _reference_example_cap_and_source(args: argparse.Namespace, *, reference_split: str) -> Tuple[int, str]:
+def _reference_example_cap_and_source(args: argparse.Namespace, *, reference_split: str) -> tuple[int, str]:
     context_cap = _positive_int(
         getattr(args, "context_sample_count", CANONICAL_CONTEXT_SAMPLE_COUNT), name="--context_sample_count"
     )
@@ -126,59 +127,16 @@ def _reference_example_cap_and_source(args: argparse.Namespace, *, reference_spl
     return int(context_cap), "context_sample_count"
 
 
-def _reference_example_cap(args: argparse.Namespace, *, reference_split: str) -> int:
-    cap, _source = _reference_example_cap_and_source(args, reference_split=reference_split)
-    return int(cap)
-
-
-def _deterministically_cap_indices(
-    indices: Sequence[int],
-    *,
-    cap: int,
-    seed: int,
-    salt: str,
-    uncapped_candidate_examples: Optional[int] = None,
-) -> Tuple[List[int], Dict[str, Any]]:
-    candidate = [int(idx) for idx in indices]
-    selected_cap = _positive_int(cap, name="selected_examples_cap")
-    uncapped_count = int(len(candidate) if uncapped_candidate_examples is None else uncapped_candidate_examples)
-    if uncapped_count < len(candidate):
-        raise ValueError(
-            "uncapped_candidate_examples cannot be smaller than the selected candidate list "
-            f"({uncapped_count} < {len(candidate)})."
-        )
-    if len(candidate) <= selected_cap:
-        selected = list(candidate)
-        was_capped = uncapped_count > len(selected)
-    else:
-        token = f"{SER_PTG_EXAMPLE_SELECTION_PROTOCOL}|{salt}|{int(seed)}|{len(candidate)}|{selected_cap}"
-        local_seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
-        rng = np.random.default_rng(local_seed)
-        keep_positions = sorted(
-            int(pos) for pos in rng.choice(np.arange(len(candidate)), size=selected_cap, replace=False).tolist()
-        )
-        selected = [candidate[pos] for pos in keep_positions]
-        was_capped = True
-    return selected, {
-        "example_selection_protocol": SER_PTG_EXAMPLE_SELECTION_PROTOCOL,
-        "uncapped_candidate_examples": int(uncapped_count),
-        "candidate_examples_after_initial_selection": int(len(candidate)),
-        "selected_examples": int(len(selected)),
-        "selected_examples_cap": int(selected_cap),
-        "selection_was_capped": bool(was_capped),
-    }
-
-
 def _deterministically_cap_index_groups(
     groups: Sequence[Mapping[str, Any]],
     *,
     cap: int,
     seed: int,
     salt: str,
-) -> Tuple[List[List[int]], List[Dict[str, Any]], Dict[str, Any]]:
+) -> tuple[list[list[int]], list[dict[str, Any]], dict[str, Any]]:
     selected_cap = _positive_int(cap, name="selected_examples_cap")
-    normalized: List[Dict[str, Any]] = []
-    flat_candidates: List[Tuple[int, int]] = []
+    normalized: list[dict[str, Any]] = []
+    flat_candidates: list[tuple[int, int]] = []
     uncapped_total = 0
     for group_idx, group in enumerate(groups):
         candidate = [int(idx) for idx in group.get("candidate_indices", [])]
@@ -195,7 +153,7 @@ def _deterministically_cap_index_groups(
         flat_candidates.extend((int(group_idx), int(pos)) for pos in range(len(candidate)))
     if not flat_candidates:
         raise ValueError("SER-PTG global selection requires at least one candidate example.")
-    offsets: List[int] = []
+    offsets: list[int] = []
     cursor = 0
     for group in normalized:
         offsets.append(int(cursor))
@@ -225,12 +183,12 @@ def _deterministically_cap_index_groups(
             kept_positions.extend(int(available_positions[int(pos)]) for pos in chosen)
         kept_positions = sorted(kept_positions)
         selection_was_capped = True
-    selected_by_group: List[List[int]] = [[] for _ in normalized]
+    selected_by_group: list[list[int]] = [[] for _ in normalized]
     for flat_pos in kept_positions:
         group_idx, candidate_pos = flat_candidates[int(flat_pos)]
         selected_by_group[group_idx].append(int(normalized[group_idx]["candidate_indices"][candidate_pos]))
     selected_total = int(sum(len(indices) for indices in selected_by_group))
-    records: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     for group, selected in zip(normalized, selected_by_group, strict=False):
         record = dict(group.get("selection_record", {}))
         record.update(
@@ -265,8 +223,8 @@ def _deterministically_cap_index_groups(
     )
 
 
-def _sum_int_records_by(records: Sequence[Mapping[str, Any]], key: str, value_key: str) -> Dict[str, int]:
-    totals: Dict[str, int] = {}
+def _sum_int_records_by(records: Sequence[Mapping[str, Any]], key: str, value_key: str) -> dict[str, int]:
+    totals: dict[str, int] = {}
     for record in records:
         group_key = str(record.get(key, ""))
         if not group_key:
@@ -283,7 +241,7 @@ def solver_order_for_ptg(solver_key: str) -> float:
     return solver_order_p(str(solver_key))
 
 
-def grid_geometry(time_grid: Sequence[float]) -> Dict[str, float]:
+def grid_geometry(time_grid: Sequence[float]) -> dict[str, float]:
     values = np.asarray([float(x) for x in time_grid], dtype=np.float64)
     internal = values[1:-1]
     intervals = np.diff(values)
@@ -298,7 +256,7 @@ def grid_geometry(time_grid: Sequence[float]) -> Dict[str, float]:
 
 def _prediction_with_density_metadata(
     prediction: Mapping[str, Any], *, scheduler_key: str, schedule_name: str, time_grid: Sequence[float]
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     macro_steps = int(prediction["macro_steps"])
     grid = validate_time_grid(time_grid, macro_steps=macro_steps)
     density_reference = uniform_reference_grid()
@@ -320,10 +278,10 @@ def _prediction_with_density_metadata(
     return copied
 
 
-def _derive_ser_reference_predictions(predictions: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    physical: List[Dict[str, Any]] = []
-    reversed_rows: List[Dict[str, Any]] = []
-    averaged_rows: List[Dict[str, Any]] = []
+def _derive_ser_reference_predictions(predictions: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    physical: list[dict[str, Any]] = []
+    reversed_rows: list[dict[str, Any]] = []
+    averaged_rows: list[dict[str, Any]] = []
     density_reference = uniform_reference_grid()
     for prediction in predictions:
         macro_steps = int(prediction["macro_steps"])
@@ -369,7 +327,7 @@ def _derive_ser_reference_predictions(predictions: Sequence[Mapping[str, Any]]) 
     }
 
 
-def _normalize_kappa(hardness: Sequence[float], reference_time_grid: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
+def _normalize_kappa(hardness: Sequence[float], reference_time_grid: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
     h = np.clip(np.asarray([float(x) for x in hardness], dtype=np.float64), 0.0, None)
     grid = np.asarray(validate_time_grid(reference_time_grid, macro_steps=len(h)), dtype=np.float64)
     widths = np.diff(grid)
@@ -387,7 +345,7 @@ def ser_ptg_density_mass_from_trace(
     *,
     solver_order_p: float,
     density_floor_eta: float = 0.05,
-) -> Tuple[float, ...]:
+) -> tuple[float, ...]:
     """Return the SER-PTG discrete probability mass over reference-grid bins."""
 
     kappa, widths = _normalize_kappa(hardness, reference_time_grid)
@@ -413,7 +371,7 @@ def ser_ptg_grid_from_trace(
     macro_steps: int,
     solver_order_p: float,
     density_floor_eta: float = 0.05,
-) -> Tuple[float, ...]:
+) -> tuple[float, ...]:
     mass = np.asarray(
         ser_ptg_density_mass_from_trace(
             hardness,
@@ -459,14 +417,14 @@ def collect_batched_local_defect_trace(
     calibration_trace_samples: int = 1,
     batch_size: int = 64,
     item_getter: Any | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     device = cfg.train.device
     indices = [int(idx) for idx in example_indices]
     if not indices:
         raise ValueError("SER-PTG trace collection requires at least one validation example.")
-    reference_time_grid: Optional[List[float]] = None
-    trace_rows: List[np.ndarray] = []
-    oracle_rows: List[np.ndarray] = []
+    reference_time_grid: list[float] | None = None
+    trace_rows: list[np.ndarray] = []
+    oracle_rows: list[np.ndarray] = []
     effective_batch_size = max(1, int(batch_size))
     for sample_idx in range(int(calibration_trace_samples)):
         for chunk_start in range(0, len(indices), effective_batch_size):
@@ -525,14 +483,14 @@ def collect_molecule_local_defect_trace(
     example_indices: Sequence[int],
     calibration_trace_samples: int = 1,
     batch_size: int = 64,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     device = cfg.train.device
     indices = [int(idx) for idx in example_indices]
     if not indices:
         raise ValueError("Molecule SER-PTG trace collection requires at least one example.")
-    reference_time_grid: Optional[List[float]] = None
-    trace_rows: List[np.ndarray] = []
-    oracle_rows: List[np.ndarray] = []
+    reference_time_grid: list[float] | None = None
+    trace_rows: list[np.ndarray] = []
+    oracle_rows: list[np.ndarray] = []
     effective_batch_size = max(1, int(batch_size))
     for sample_idx in range(int(calibration_trace_samples)):
         for chunk_start in range(0, len(indices), effective_batch_size):
@@ -572,7 +530,7 @@ def collect_molecule_local_defect_trace(
     }
 
 
-def _choose_molecule_indices(ds: Any, *, count: int, seed: int) -> List[int]:
+def _choose_molecule_indices(ds: Any, *, count: int, seed: int) -> list[int]:
     total = int(len(ds))
     if total <= 0:
         raise ValueError("Empty molecule SER reference split.")
@@ -584,7 +542,7 @@ def _choose_molecule_indices(ds: Any, *, count: int, seed: int) -> List[int]:
     return [int(x) for x in indices.tolist()]
 
 
-def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
+def build_ser_ptg_reference(args: argparse.Namespace) -> dict[str, Any]:
     dataset = str(args.dataset)
     family = scenario_family_for_key(dataset)
     solvers = list(normalize_solver_keys(str(args.solver_names)))
@@ -604,7 +562,7 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
     shared_backbone_root = resolve_project_path(str(args.shared_backbone_root))
     device = resolve_torch_device(str(args.device))
     split_key = "train" if reference_split == TRAIN_TUNING_PHASE else "val"
-    member_refs: List[Dict[str, Any]] = []
+    member_refs: list[dict[str, Any]] = []
     if family == SCENARIO_FAMILY_FORECAST:
         checkpoint = load_forecast_checkpoint_splits(
             cli_args=args,
@@ -671,7 +629,7 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
     else:
         raise ValueError(f"Unsupported SER-PTG scenario family: {family!r}")
     train_tuning_reference_examples = int(max(len(ref["checkpoint"]["splits"].get("val", [])) for ref in member_refs))
-    predictions: List[Dict[str, Any]] = []
+    predictions: list[dict[str, Any]] = []
     for solver_idx, solver_key in enumerate(solvers):
         solver_name = str(SOLVER_RUNTIME_NAMES[str(solver_key)])
         solver_p = solver_order_for_ptg(str(solver_key))
@@ -682,12 +640,12 @@ def build_ser_ptg_reference(args: argparse.Namespace) -> Dict[str, Any]:
                 int(macro_steps),
                 reference_macro_factor=float(args.reference_macro_factor),
             )
-            seed_traces: List[np.ndarray] = []
-            trace_weights: List[int] = []
-            reference_grid: Optional[List[float]] = None
+            seed_traces: list[np.ndarray] = []
+            trace_weights: list[int] = []
+            reference_grid: list[float] | None = None
             eval_examples = 0
             trace_count = 0
-            work_items: List[Dict[str, Any]] = []
+            work_items: list[dict[str, Any]] = []
             for seed in seeds:
                 for member_idx, ref in enumerate(member_refs):
                     checkpoint = ref["checkpoint"]

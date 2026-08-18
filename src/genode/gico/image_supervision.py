@@ -10,12 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import shutil
-import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, TypeAlias
@@ -23,9 +20,18 @@ from typing import Any, Literal, TypeAlias
 import numpy as np
 
 from genode.artifacts.identity import semantic_sha256
-from genode.gico.image_conditional import ImageGICOConditionalTargets
+from genode.gico.image_artifact_io import (
+    image_gico_directory_root,
+    load_float64_npy,
+    staged_image_gico_directory,
+    validate_image_gico_directory,
+    write_float64_npy,
+)
+from genode.gico.image_conditional import (
+    ImageGICOConditionalTargets,
+    validate_image_gico_density_alias_bindings,
+)
 from genode.path_safety import is_link_or_reparse_point
-from genode.provenance import file_sha256
 
 ImageGICOStudentKind: TypeAlias = Literal["deterministic_barycenter", "stochastic_causal_ar"]
 IMAGE_GICO_STUDENT_KINDS: tuple[ImageGICOStudentKind, ...] = (
@@ -112,16 +118,11 @@ def _validate_conditional_law(
 
     expected_weights = np.zeros_like(weights)
     density_hashes = tuple(tuple(row) for row in targets.density_mass_sha256s)
+    validate_image_gico_density_alias_bindings(density_hashes, support)
     for nfe_index, nfe_hashes in enumerate(density_hashes):
         groups_by_hash: dict[str, list[int]] = {}
         for schedule_index, density_hash in enumerate(nfe_hashes):
             groups_by_hash.setdefault(density_hash, []).append(schedule_index)
-        for left in range(len(nfe_hashes)):
-            for right in range(left + 1, len(nfe_hashes)):
-                same_hash = nfe_hashes[left] == nfe_hashes[right]
-                same_density = np.array_equal(support[nfe_index, left], support[nfe_index, right])
-                if same_hash != same_density:
-                    raise ValueError("Conditional density aliases disagree with the fixed support rows.")
         groups = tuple(groups_by_hash.values())
         logits = np.stack(
             [np.mean(rewards[nfe_index][:, group], axis=-1, dtype=np.float64) for group in groups],
@@ -152,6 +153,7 @@ class ImageGICOSupervision:
     source_identities: Mapping[str, str]
     context_binding_sha256: str
     conditional_target_payload: Mapping[str, Any] | None = None
+    _construction_sha256: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.supervision_kind not in {
@@ -277,6 +279,14 @@ class ImageGICOSupervision:
         object.__setattr__(self, "reward_diagnostics", MappingProxyType(diagnostics))
         object.__setattr__(self, "source_identities", sources)
         object.__setattr__(self, "conditional_target_payload", target_payload)
+        object.__setattr__(
+            self,
+            "_construction_sha256",
+            semantic_sha256(
+                self.identity_payload(),
+                namespace=IMAGE_GICO_SUPERVISION_NAMESPACE,
+            ),
+        )
 
     @property
     def context_count(self) -> int:
@@ -318,7 +328,30 @@ class ImageGICOSupervision:
 
     @property
     def sha256(self) -> str:
-        return semantic_sha256(self.identity_payload(), namespace=IMAGE_GICO_SUPERVISION_NAMESPACE)
+        return self._construction_sha256
+
+    def verify(self) -> None:
+        """Revalidate the frozen scientific law and its construction identity."""
+
+        try:
+            current = ImageGICOSupervision(
+                supervision_kind=self.supervision_kind,
+                target_nfes=self.target_nfes,
+                schedule_keys=self.schedule_keys,
+                fixed_density_mass=self.fixed_density_mass,
+                mixture_weights=self.mixture_weights,
+                barycenter_density_mass=self.barycenter_density_mass,
+                normalized_contexts=self.normalized_contexts,
+                normalized_rewards=self.normalized_rewards,
+                reward_diagnostics=self.reward_diagnostics,
+                source_identities=self.source_identities,
+                context_binding_sha256=self.context_binding_sha256,
+                conditional_target_payload=self.conditional_target_payload,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Image GICO supervision scientific law was mutated.") from exc
+        if current.sha256 != self._construction_sha256:
+            raise ValueError("Image GICO supervision construction identity was mutated.")
 
 
 def build_image_gico_conditional_supervision(
@@ -412,16 +445,6 @@ def build_image_gico_unconditional_supervision(
     )
 
 
-def _write_array(path: Path, value: np.ndarray) -> dict[str, Any]:
-    np.save(path, np.ascontiguousarray(value, dtype="<f8"), allow_pickle=False)
-    return {
-        "file": path.name,
-        "sha256": file_sha256(path),
-        "shape": list(value.shape),
-        "dtype": "float64-le",
-    }
-
-
 def save_image_gico_supervision(
     supervision: ImageGICOSupervision,
     output_dir: str | Path,
@@ -430,24 +453,43 @@ def save_image_gico_supervision(
 
     if not isinstance(supervision, ImageGICOSupervision):
         raise TypeError("supervision must be ImageGICOSupervision.")
-    target = Path(output_dir).expanduser().resolve()
-    if target.exists() or target.is_symlink():
-        raise FileExistsError(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage-", dir=target.parent))
-    try:
+    supervision.verify()
+    expected_members = {
+        "manifest.json",
+        "fixed-density-mass.npy",
+        "mixture-weights.npy",
+        "barycenter-density-mass.npy",
+        "normalized-contexts.npy",
+    }
+    if supervision.normalized_rewards is not None:
+        expected_members.add("normalized-rewards.npy")
+    with staged_image_gico_directory(
+        output_dir,
+        expected_members=expected_members,
+        label="Image GICO supervision directory",
+    ) as stage:
         arrays = {
-            "fixed_density_mass": _write_array(stage / "fixed-density-mass.npy", supervision.fixed_density_mass),
-            "mixture_weights": _write_array(stage / "mixture-weights.npy", supervision.mixture_weights),
-            "barycenter_density_mass": _write_array(
+            "fixed_density_mass": write_float64_npy(
+                stage / "fixed-density-mass.npy",
+                supervision.fixed_density_mass,
+            ),
+            "mixture_weights": write_float64_npy(
+                stage / "mixture-weights.npy",
+                supervision.mixture_weights,
+            ),
+            "barycenter_density_mass": write_float64_npy(
                 stage / "barycenter-density-mass.npy",
                 supervision.barycenter_density_mass,
             ),
-            "normalized_contexts": _write_array(stage / "normalized-contexts.npy", supervision.normalized_contexts),
+            "normalized_contexts": write_float64_npy(
+                stage / "normalized-contexts.npy",
+                supervision.normalized_contexts,
+            ),
         }
         if supervision.normalized_rewards is not None:
-            arrays["normalized_rewards"] = _write_array(
-                stage / "normalized-rewards.npy", supervision.normalized_rewards
+            arrays["normalized_rewards"] = write_float64_npy(
+                stage / "normalized-rewards.npy",
+                supervision.normalized_rewards,
             )
         manifest = {
             "artifact": "image_gico_supervision",
@@ -464,42 +506,13 @@ def save_image_gico_supervision(
             encoding="utf-8",
             newline="\n",
         )
-        os.replace(stage, target)
-    except Exception:
-        shutil.rmtree(stage, ignore_errors=True)
-        raise
     return MappingProxyType(manifest)
-
-
-def _load_array(root: Path, descriptor: object, *, field: str) -> np.ndarray:
-    if not isinstance(descriptor, Mapping) or set(descriptor) != {
-        "file",
-        "sha256",
-        "shape",
-        "dtype",
-    }:
-        raise ValueError(f"Invalid {field} array descriptor.")
-    filename = descriptor["file"]
-    if not isinstance(filename, str) or Path(filename).name != filename:
-        raise ValueError(f"Invalid {field} array filename.")
-    path = root / filename
-    if is_link_or_reparse_point(path) or not path.is_file():
-        raise ValueError(f"{field} must be a regular file.")
-    if file_sha256(path) != descriptor["sha256"]:
-        raise ValueError(f"{field} array hash changed.")
-    array = np.load(path, allow_pickle=False)
-    result = _frozen_float64(array, field=field, ndim=len(descriptor["shape"]))
-    if list(result.shape) != descriptor["shape"] or descriptor["dtype"] != "float64-le":
-        raise ValueError(f"{field} array metadata changed.")
-    return result
 
 
 def load_image_gico_supervision(output_dir: str | Path) -> ImageGICOSupervision:
     """Strictly load and re-hash a supervision directory."""
 
-    root = Path(output_dir).expanduser().resolve(strict=True)
-    if is_link_or_reparse_point(root) or not root.is_dir():
-        raise ValueError("Supervision root must be a regular directory.")
+    root = image_gico_directory_root(output_dir, label="Image GICO supervision directory")
     manifest_path = root / "manifest.json"
     if is_link_or_reparse_point(manifest_path) or not manifest_path.is_file():
         raise ValueError("Supervision manifest must be a regular file.")
@@ -539,10 +552,12 @@ def load_image_gico_supervision(output_dir: str | Path) -> ImageGICOSupervision:
     expected_members = {"manifest.json"} | {
         str(descriptor.get("file")) for descriptor in arrays.values() if isinstance(descriptor, Mapping)
     }
-    members = {path.name for path in root.iterdir()}
-    if members != expected_members or any(is_link_or_reparse_point(path) for path in root.iterdir()):
-        raise ValueError("Supervision files are incomplete, linked, or unexpected.")
-    loaded = {field: _load_array(root, arrays[field], field=field) for field in expected_arrays}
+    validate_image_gico_directory(
+        root,
+        expected_members=expected_members,
+        label="Image GICO supervision directory",
+    )
+    loaded = {field: load_float64_npy(root, arrays[field], field=field) for field in expected_arrays}
     supervision = ImageGICOSupervision(
         supervision_kind=manifest["supervision_kind"],
         target_nfes=tuple(manifest["target_nfes"]),

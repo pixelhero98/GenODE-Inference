@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -19,8 +20,8 @@ from genode.schedule_transfer.reference_clocks import (
 )
 from genode.solver_protocol import solver_eval_multiplier
 
-BASELINE_SCHEDULE_KEYS: Tuple[str, ...] = REFERENCE_CLOCK_BASE_KEYS
-TRANSFER_SCHEDULE_KEYS: Tuple[str, ...] = (
+BASELINE_SCHEDULE_KEYS: tuple[str, ...] = REFERENCE_CLOCK_BASE_KEYS
+TRANSFER_SCHEDULE_KEYS: tuple[str, ...] = (
     "ays_sd15_native",
     "ays_sd15_log_sigma",
     "gits_cifar10_native",
@@ -28,12 +29,12 @@ TRANSFER_SCHEDULE_KEYS: Tuple[str, ...] = (
     "ots_vp_linear_native",
     "ots_vp_linear_log_sigma",
 )
-EXPERIMENTAL_REVERSED_SCHEDULE_KEYS: Tuple[str, ...] = REFERENCE_CLOCK_REVERSED_KEYS
-EXPERIMENTAL_AVERAGED_FIXED_SCHEDULE_KEYS: Tuple[str, ...] = ()
-EXPERIMENTAL_FIXED_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
+EXPERIMENTAL_REVERSED_SCHEDULE_KEYS: tuple[str, ...] = REFERENCE_CLOCK_REVERSED_KEYS
+EXPERIMENTAL_AVERAGED_FIXED_SCHEDULE_KEYS: tuple[str, ...] = ()
+EXPERIMENTAL_FIXED_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
 
 
-def load_external_schedule_catalog() -> Dict[str, Dict[str, Any]]:
+def load_external_schedule_catalog() -> dict[str, dict[str, Any]]:
     return {
         key: spec.as_dict()
         for key, spec in reference_clock_registry().items()
@@ -41,7 +42,7 @@ def load_external_schedule_catalog() -> Dict[str, Dict[str, Any]]:
     }
 
 
-def build_schedule_grid(schedule_key: str, n_steps: int) -> Optional[Tuple[float, ...]]:
+def build_schedule_grid(schedule_key: str, n_steps: int) -> tuple[float, ...] | None:
     """Build a fixed reference grid, returning ``None`` only for externally supplied dynamic clocks."""
     key = str(schedule_key).strip().lower()
     try:
@@ -82,7 +83,7 @@ def schedule_density_family(schedule_key: str) -> str:
     return f"{provenance['family']}_{provenance['coordinate']}"
 
 
-def fixed_schedule_shape_statistics(time_grid: Sequence[float]) -> Dict[str, Optional[float]]:
+def fixed_schedule_shape_statistics(time_grid: Sequence[float]) -> dict[str, float | None]:
     grid = np.asarray(time_grid, dtype=np.float64)
     if grid.ndim != 1 or grid.size < 2:
         return {"runtime_grid_q25": None, "runtime_grid_q50": None, "runtime_grid_q75": None}
@@ -103,7 +104,7 @@ def run_fixed_schedule_variant(
     generation_seed_base: int,
     metrics_seed: int,
     score_main_only: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     solver_name = str(grid_spec["solver_name"])
     macro_steps = int(grid_spec["nfe"])
     target_total_field_evals = macro_steps * solver_eval_multiplier(solver_name)

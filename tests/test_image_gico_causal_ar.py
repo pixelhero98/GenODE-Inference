@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from genode.gico.image_causal_artifacts import (
+    image_gico_causal_state_sha256,
     load_image_gico_causal_artifact,
     save_image_gico_causal_artifact,
 )
@@ -19,9 +20,11 @@ from genode.gico.image_causal_rng import (
     image_gico_causal_uniforms_sha256,
 )
 from genode.gico.image_causal_stick import (
+    DENSITY_BIN_COUNT,
     MAXIMUM_CLOCK_NODE_DRIFT,
     STICK_ACTION_COUNT,
     ImageGICOCausalPathBank,
+    inverse_cdf_clock_nodes,
 )
 from genode.gico.image_causal_training import (
     ImageGICOCausalTrainingConfig,
@@ -30,6 +33,7 @@ from genode.gico.image_causal_training import (
     train_image_gico_causal_student,
 )
 from genode.gico.image_students import (
+    ImageGICOScheduleMaterialization,
     execute_image_gico_euler,
     load_image_gico_deterministic_artifact,
     materialize_image_gico_schedule,
@@ -40,6 +44,7 @@ from genode.gico.image_supervision import (
     IMAGE_GICO_TARGET_NFES,
     build_image_gico_unconditional_supervision,
 )
+from genode.gico.image_training_rng import resolve_image_gico_training_device
 
 
 def _support_and_weights() -> tuple[np.ndarray, np.ndarray]:
@@ -148,6 +153,21 @@ def test_counter_rng_replays_and_binds_artifact_request_and_sample_keys() -> Non
     assert image_gico_causal_uniforms_sha256(first) == image_gico_causal_uniforms_sha256(replay)
 
 
+def test_training_rng_scope_selects_only_the_execution_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert resolve_image_gico_training_device(torch.device("cpu")) == (torch.device("cpu"), [])
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    assert resolve_image_gico_training_device(torch.device("cuda:2")) == (
+        torch.device("cuda:2"),
+        [2],
+    )
+    assert resolve_image_gico_training_device(torch.device("cuda")) == (
+        torch.device("cuda:3"),
+        [3],
+    )
+
+
 def test_terminal_weighted_complete_path_objective() -> None:
     logits = torch.zeros((2, STICK_ACTION_COUNT, 256), dtype=torch.float32)
     tokens = torch.zeros((2, STICK_ACTION_COUNT), dtype=torch.int64)
@@ -170,7 +190,17 @@ def test_one_step_training_artifact_strict_load_materialization_and_exact_nfe(tm
     assert torch.equal(torch.random.get_rng_state(), training_rng_state)
     assert result.report.completed_updates == 1
     assert result.report.trainable_parameter_count == EXPECTED_TRAINABLE_PARAMETER_COUNT
+    assert result.report.model_state_sha256 == image_gico_causal_state_sha256(result.model)
     assert np.isfinite(result.report.final_batch_nll)
+
+    state = {name: tensor.detach().clone() for name, tensor in result.model.state_dict().items()}
+    with torch.no_grad():
+        result.model.global_logits[0, 0, 0].add_(1.0)
+    mutated_dir = tmp_path / "mutated-causal-artifact"
+    with pytest.raises(ValueError, match="current final model state"):
+        save_image_gico_causal_artifact(result, supervision, mutated_dir)
+    assert not mutated_dir.exists()
+    result.model.load_state_dict(state, strict=True)
 
     artifact_dir = tmp_path / "causal-artifact"
     manifest = save_image_gico_causal_artifact(result, supervision, artifact_dir)
@@ -210,6 +240,17 @@ def test_one_step_training_artifact_strict_load_materialization_and_exact_nfe(tm
     assert calls == execution.field_evaluations == execution.target_nfe == 4
     assert torch.allclose(execution.final_state, torch.ones_like(execution.final_state))
 
+    def grid_mutating_field(state: torch.Tensor, progress: torch.Tensor) -> torch.Tensor:
+        progress.add_(1e-3)
+        return torch.ones_like(state)
+
+    with pytest.raises(RuntimeError, match="changed the frozen materialization grid"):
+        execute_image_gico_euler(
+            grid_mutating_field,
+            torch.zeros((1, 3), dtype=torch.float64),
+            materialized,
+        )
+
     materialized.time_grids.setflags(write=True)
     materialized.time_grids[0, 1] += 1e-3
     with pytest.raises(ValueError, match="materialization was mutated"):
@@ -240,6 +281,48 @@ def test_one_step_training_artifact_strict_load_materialization_and_exact_nfe(tm
     (artifact_dir / "unexpected.txt").write_text("not part of the artifact", encoding="utf-8")
     with pytest.raises(ValueError, match="incomplete or unexpected"):
         load_image_gico_causal_artifact(artifact_dir, supervision)
+
+
+def test_materialization_binds_density_grid_and_lineage() -> None:
+    density = np.full((1, DENSITY_BIN_COUNT), 1.0 / DENSITY_BIN_COUNT, dtype=np.float64)
+    reference = np.linspace(0.0, 1.0, DENSITY_BIN_COUNT + 1, dtype=np.float64)
+    grid = inverse_cdf_clock_nodes(density, 4, reference)
+    with pytest.raises(ValueError, match="artifact_sha256"):
+        ImageGICOScheduleMaterialization(
+            student_kind="deterministic_barycenter",
+            target_nfe=4,
+            context_indices=(0,),
+            density_mass=density,
+            time_grids=grid,
+            artifact_sha256="not-a-hash",
+            supervision_sha256="b" * 64,
+        )
+
+    mismatched = np.array(grid, copy=True)
+    mismatched[0, 1] += 1e-3
+    with pytest.raises(ValueError, match="canonical inverse-CDF"):
+        ImageGICOScheduleMaterialization(
+            student_kind="deterministic_barycenter",
+            target_nfe=4,
+            context_indices=(0,),
+            density_mass=density,
+            time_grids=mismatched,
+            artifact_sha256="a" * 64,
+            supervision_sha256="b" * 64,
+        )
+
+    materialization = ImageGICOScheduleMaterialization(
+        student_kind="deterministic_barycenter",
+        target_nfe=4,
+        context_indices=(0,),
+        density_mass=density,
+        time_grids=grid,
+        artifact_sha256="a" * 64,
+        supervision_sha256="b" * 64,
+    )
+    object.__setattr__(materialization, "artifact_sha256", "c" * 64)
+    with pytest.raises(ValueError, match="materialization was mutated"):
+        materialization.verify()
 
 
 def test_direct_deterministic_artifact_loads_and_materializes_without_supervision(tmp_path: Path) -> None:

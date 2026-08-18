@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from numbers import Integral
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any
 
 from genode.artifacts.identity import semantic_sha256
 from genode.benchmarks.image.feature_protocol import (
@@ -30,14 +31,14 @@ IMAGE_GICO_TEACHER_SCORE_CLIP = 5.0
 
 CIFAR10_DATASET_KEY = "cifar10"
 IMAGENET64_DATASET_KEY = "imagenet64"
-IMAGE_DATASET_KEYS: Tuple[str, ...] = (
+IMAGE_DATASET_KEYS: tuple[str, ...] = (
     CIFAR10_DATASET_KEY,
     IMAGENET64_DATASET_KEY,
 )
 
 IMAGE_SOLVER_KEY = "euler"
-IMAGE_TARGET_NFES: Tuple[int, ...] = FIXED_SCHEDULE_TARGET_NFES
-IMAGE_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
+IMAGE_TARGET_NFES: tuple[int, ...] = FIXED_SCHEDULE_TARGET_NFES
+IMAGE_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
 
 KID_BLOCK_SIZE = 1_000
 KID_REWARD_TRAIN_BLOCKS = 20
@@ -89,7 +90,7 @@ PANEL_PHASE_LOCKED_MAIN = "locked_main"
 PANEL_PHASE_CONDITIONAL_REWARD_TRAIN = "conditional_reward_train"
 PANEL_PHASE_CONDITIONAL_SELECTION_SCREENING = "conditional_selection_screening"
 PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION = "conditional_survivor_confirmation"
-PANEL_PHASES: Tuple[str, ...] = (
+PANEL_PHASES: tuple[str, ...] = (
     PANEL_PHASE_REWARD_TRAIN,
     PANEL_PHASE_SELECTION_SCREENING,
     PANEL_PHASE_SURVIVOR_CONFIRMATION,
@@ -99,7 +100,7 @@ PANEL_PHASES: Tuple[str, ...] = (
     PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION,
 )
 
-_PANEL_SHAPES: Mapping[str, Tuple[int, int]] = {
+_PANEL_SHAPES: Mapping[str, tuple[int, int]] = {
     PANEL_PHASE_REWARD_TRAIN: (KID_REWARD_TRAIN_BLOCKS, KID_BLOCK_SIZE),
     PANEL_PHASE_SELECTION_SCREENING: (
         KID_SELECTION_SCREENING_BLOCKS,
@@ -136,7 +137,7 @@ class ImageBenchmarkSpec:
     def is_class_conditional(self) -> bool:
         return self.class_count > 0
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "key": self.key,
             "resolution": int(self.resolution),
@@ -188,7 +189,7 @@ def normalize_image_nfe(value: object) -> int:
     return parsed
 
 
-def panel_shape(phase: str) -> Tuple[int, int]:
+def panel_shape(phase: str) -> tuple[int, int]:
     key = str(phase).strip().lower()
     try:
         return _PANEL_SHAPES[key]
@@ -204,7 +205,7 @@ class EulerImageWorkload:
     survivor_confirmation_images: int = 0
     survivor_confirmation_backbone_evaluations: int = 0
 
-    def as_dict(self) -> Dict[str, int | str]:
+    def as_dict(self) -> dict[str, int | str]:
         return {
             "solver_key": IMAGE_SOLVER_KEY,
             "pair_count": int(self.pair_count),
@@ -217,7 +218,7 @@ class EulerImageWorkload:
 
 def image_schedule_keys(
     extra_late_p_values: str | Sequence[Decimal | float | int | str] = (),
-) -> Tuple[str, ...]:
+) -> tuple[str, ...]:
     return reference_clock_keys(extra_late_p_values)
 
 
@@ -252,7 +253,7 @@ def survivor_confirmation_workload(
         pair_count=pair_count,
         extra_late_p_values=extra_late_p_values,
     )
-    normalized: Dict[int, int] = dict.fromkeys(IMAGE_TARGET_NFES, 0)
+    normalized: dict[int, int] = dict.fromkeys(IMAGE_TARGET_NFES, 0)
     for raw_nfe, raw_count in survivors_by_nfe.items():
         nfe = normalize_image_nfe(raw_nfe)
         if isinstance(raw_count, bool) or not isinstance(raw_count, Integral):
@@ -276,12 +277,12 @@ def survivor_confirmation_workload(
 def image_protocol_metadata(
     *,
     extra_late_p_values: str | Sequence[Decimal | float | int | str] = (),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     schedule_keys = image_schedule_keys(extra_late_p_values)
     workload = euler_image_workload(
         extra_late_p_values=extra_late_p_values,
     )
-    metadata: Dict[str, Any] = {
+    metadata: dict[str, Any] = {
         "protocol_key": IMAGE_PROTOCOL_KEY,
         "protocol_version": IMAGE_PROTOCOL_VERSION,
         "solver_key": IMAGE_SOLVER_KEY,
@@ -342,10 +343,10 @@ def image_protocol_metadata(
     return metadata
 
 
-def locked_metric_execution_spec() -> Dict[str, Any]:
+def locked_metric_execution_spec() -> dict[str, Any]:
     """Return the complete report-bound numerical metric contract."""
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "protocol": LOCKED_METRIC_EXECUTION_PROTOCOL,
         "backend": {
             "distribution": TORCH_FIDELITY_DISTRIBUTION,

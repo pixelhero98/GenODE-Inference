@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from numbers import Integral
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import torch
 

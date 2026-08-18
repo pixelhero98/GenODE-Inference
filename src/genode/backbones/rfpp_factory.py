@@ -6,13 +6,13 @@ import pickle
 import sys
 import threading
 from collections import OrderedDict
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from numbers import Integral
 from pathlib import Path
 from types import MappingProxyType, ModuleType
-from typing import Iterator, Mapping
 
 import torch
 from torch import Tensor, nn

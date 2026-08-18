@@ -8,9 +8,9 @@ import re
 import stat
 import tempfile
 import uuid
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterator, Mapping
 
 from genode.path_safety import is_link_or_reparse_point
 from genode.provenance import file_sha256

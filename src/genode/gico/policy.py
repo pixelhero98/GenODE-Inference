@@ -5,9 +5,10 @@ import csv
 import json
 import math
 from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -62,17 +63,17 @@ from genode.schedule_transfer.reference_clocks import late_p_value_from_key
 from genode.solver_protocol import normalize_solver_key, normalize_solver_nfe_fields
 
 MetricRow = Mapping[str, Any]
-ContextPairKey = Tuple[str, str, int, str, int | None, str]
-TeacherSelectionCandidateGroupKey = Tuple[str, str, int, int | None, int | None, int | None, str]
-NFESequenceKey = Tuple[str, int | None, str, str, str, str]
-NFECandidateSequenceKey = Tuple[str, int | None, str, str, str, str, str]
-ScheduleGridKey = Tuple[str, str, int] | Tuple[str, str, int, int]
+ContextPairKey = tuple[str, str, int, str, int | None, str]
+TeacherSelectionCandidateGroupKey = tuple[str, str, int, int | None, int | None, int | None, str]
+NFESequenceKey = tuple[str, int | None, str, str, str, str]
+NFECandidateSequenceKey = tuple[str, int | None, str, str, str, str, str]
+ScheduleGridKey = tuple[str, str, int] | tuple[str, str, int, int]
 
 GICO_PROTOCOL = "gico_density"
-DEFAULT_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = CANONICAL_SUPERVISION_SCHEDULE_KEYS
-DEFAULT_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
-GICO_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
-EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS: Tuple[str, ...] = (
+DEFAULT_SUPERVISION_SCHEDULE_KEYS: tuple[str, ...] = CANONICAL_SUPERVISION_SCHEDULE_KEYS
+DEFAULT_SUPPORT_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
+GICO_SUPPORT_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
+EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS: tuple[str, ...] = (
     *DEFAULT_SUPERVISION_SCHEDULE_KEYS,
     "ser_ptg_local_defect_eta005",
     "ser_ptg_local_defect_eta005_reversed",
@@ -87,7 +88,7 @@ STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE = "teacher_weighted_soft_mixture"
 STUDENT_TARGET_MIXTURE_MODE_FULL = "full"
 STUDENT_TARGET_MIXTURE_MODE_ELITE = "elite"
 STUDENT_TARGET_MIXTURE_MODE_ELITE_BLEND = "elite_blend"
-STUDENT_TARGET_MIXTURE_MODES: Tuple[str, ...] = (
+STUDENT_TARGET_MIXTURE_MODES: tuple[str, ...] = (
     STUDENT_TARGET_MIXTURE_MODE_FULL,
     STUDENT_TARGET_MIXTURE_MODE_ELITE,
     STUDENT_TARGET_MIXTURE_MODE_ELITE_BLEND,
@@ -106,6 +107,7 @@ DEFAULT_GICO_STUDENT_BATCH_SIZE = 512
 MODEL_PAYLOAD_VERSION = 8
 _RETIRED_GICO_PAYLOAD_KEYS = frozenset(
     {
+        "final_teacher_retrain",
         "num_series",
         "series_index_map",
         "series_feature_dim",
@@ -130,18 +132,18 @@ TEACHER_OUTPUT_METRIC_VECTOR = "metric_vector"
 TEACHER_SCALARIZATION_WEIGHTED_AVERAGE = "weighted_metric_average"
 TEACHER_METRIC_TARGET_PROTOCOL_VECTOR = "family_metric_utility_vector"
 TEACHER_METRIC_MASK_PROTOCOL = "row_valid_component_mask"
-DEFAULT_TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = ("u_comp_uniform",)
-TEACHER_METRIC_TARGET_KEYS: Tuple[str, ...] = DEFAULT_TEACHER_METRIC_TARGET_KEYS
+DEFAULT_TEACHER_METRIC_TARGET_KEYS: tuple[str, ...] = ("u_comp_uniform",)
+TEACHER_METRIC_TARGET_KEYS: tuple[str, ...] = DEFAULT_TEACHER_METRIC_TARGET_KEYS
 TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET = "weighted_normalized_regret"
 DEFAULT_TEACHER_CHECKPOINT_SELECTION_MODE = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
 STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE = "validation_ce"
 DEFAULT_STUDENT_CHECKPOINT_SELECTION_MODE = STUDENT_CHECKPOINT_SELECTION_VALIDATION_CE
-DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS: Dict[str, float] = {
+DEFAULT_TEACHER_SELECTION_COMPONENT_WEIGHTS: dict[str, float] = {
     "context": 0.25,
     "density_family": 0.25,
     "unseen_nfe": 0.50,
 }
-DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS: Tuple[str, ...] = (
+DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS: tuple[str, ...] = (
     "flowts_power_0p03",
     "flowts_power_0p03_reversed",
 )
@@ -151,11 +153,21 @@ DEFAULT_TRANSFORMER_HEADS = 4
 DEFAULT_TRANSFORMER_DROPOUT = 0.05
 
 
+def _contains_retired_teacher_retrain_alias(value: object) -> bool:
+    if isinstance(value, Mapping):
+        return "final_teacher_retrain" in value or any(
+            _contains_retired_teacher_retrain_alias(child) for child in value.values()
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_retired_teacher_retrain_alias(child) for child in value)
+    return False
+
+
 def require_current_gico_checkpoint_payload(
     payload: Mapping[str, Any],
     *,
     label: str = "GICO checkpoint",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Require the current GICO schema without migrating retired payloads."""
 
     if not isinstance(payload, Mapping):
@@ -176,7 +188,10 @@ def require_current_gico_checkpoint_payload(
             f"{label} context_embedding_protocol must be "
             f"{FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL!r}; got {context_protocol!r}."
         )
-    retired_payload_keys = sorted(set(payload) & _RETIRED_GICO_PAYLOAD_KEYS)
+    retired_payload_keys = set(payload) & _RETIRED_GICO_PAYLOAD_KEYS
+    if _contains_retired_teacher_retrain_alias(payload):
+        retired_payload_keys.add("final_teacher_retrain")
+    retired_payload_keys = sorted(retired_payload_keys)
     if retired_payload_keys:
         raise ValueError(f"{label} uses retired metadata keys: {retired_payload_keys}.")
     for config_key in ("teacher_model_config", "student_model_config"):
@@ -225,7 +240,7 @@ def validate_canonical_conditioning_style(
     )
 
 
-def validate_gico_teacher_training_metadata(metadata: Mapping[str, Any] | None) -> Dict[str, Any]:
+def validate_gico_teacher_training_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     teacher_training = dict(metadata or {})
     teacher_target = str(teacher_training.get("teacher_target", ""))
     if teacher_target not in {"metric_vector", "metric_vector_uniform"}:
@@ -309,7 +324,7 @@ def validate_gico_attention_heads(attention_heads: int) -> int:
     return heads
 
 
-def _normalized_metric_weights(crps_weight: float, mase_weight: float) -> Tuple[float, float]:
+def _normalized_metric_weights(crps_weight: float, mase_weight: float) -> tuple[float, float]:
     crps = float(crps_weight)
     mase = float(mase_weight)
     if not math.isfinite(crps) or not math.isfinite(mase) or crps < 0.0 or mase < 0.0:
@@ -329,7 +344,7 @@ def _metric_weight_alias(target_key: str) -> str:
     return key
 
 
-def validate_teacher_metric_target_keys(keys: Sequence[str] | str | None) -> Tuple[str, ...]:
+def validate_teacher_metric_target_keys(keys: Sequence[str] | str | None) -> tuple[str, ...]:
     if keys is None:
         return TEACHER_METRIC_TARGET_KEYS
     raw = [part.strip() for part in keys.split(",")] if isinstance(keys, str) else [str(part).strip() for part in keys]
@@ -345,11 +360,11 @@ def validate_teacher_metric_target_keys(keys: Sequence[str] | str | None) -> Tup
 def normalize_teacher_utility_weights(
     target_keys: Sequence[str],
     weights: Mapping[str, float] | None = None,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     keys = validate_teacher_metric_target_keys(target_keys)
     raw = dict(weights or {})
     default_weights = objective_weight_map_for_keys(keys)
-    values: List[float] = []
+    values: list[float] = []
     for key in keys:
         alias = _metric_weight_alias(key)
         if key in raw:
@@ -373,7 +388,7 @@ def normalize_teacher_utility_weights(
 
 def teacher_utility_weights_for_summary(
     target_keys: Sequence[str], weights: Mapping[str, float] | None
-) -> Dict[str, float]:
+) -> dict[str, float]:
     normalized = normalize_teacher_utility_weights(target_keys, weights)
     if tuple(target_keys) == DEFAULT_TEACHER_METRIC_TARGET_KEYS:
         return {_metric_weight_alias(key): float(value) for key, value in normalized.items()}
@@ -392,7 +407,7 @@ def validate_teacher_objective_hyperparameters(
     rank_temperature: float,
     regression_weight: float,
     pair_margin: float,
-) -> Tuple[float, float, float]:
+) -> tuple[float, float, float]:
     temp = float(rank_temperature)
     reg = float(regression_weight)
     margin = float(pair_margin)
@@ -405,7 +420,7 @@ def validate_teacher_objective_hyperparameters(
     return temp, reg, margin
 
 
-def _summary_percentiles(values: Sequence[float]) -> Dict[str, float]:
+def _summary_percentiles(values: Sequence[float]) -> dict[str, float]:
     arr = np.asarray([float(value) for value in values], dtype=np.float64)
     if arr.size == 0:
         return {"mean": 0.0, "p05": 0.0, "p50": 0.0, "p95": 0.0}
@@ -443,7 +458,7 @@ def _validate_student_target_elite_config(
     elite_k: int,
     elite_min_count: int,
     elite_blend_all_weight: float,
-) -> Tuple[float, int, int, float]:
+) -> tuple[float, int, int, float]:
     fraction = float(elite_fraction)
     if not math.isfinite(fraction) or fraction <= 0.0 or fraction > 1.0:
         raise ValueError("student_target_elite_fraction must be finite and in (0, 1].")
@@ -492,7 +507,7 @@ def _student_target_active_weights(
     elite_min_count: int,
     elite_blend_all_weight: float,
     tie_breaker_keys: Sequence[str] | None = None,
-) -> Tuple[np.ndarray, Dict[str, float]]:
+) -> tuple[np.ndarray, dict[str, float]]:
     mode = validate_student_target_mixture_mode(mixture_mode)
     weights = np.asarray(full_weights, dtype=np.float64)
     if weights.ndim != 1 or weights.size <= 0:
@@ -555,8 +570,8 @@ def _student_teacher_score_eta(
     return float(weight) * min(1.0, float(current_step - warmup_steps) / float(ramp_steps))
 
 
-def _group_indices_by_pair_key(pair_keys: Sequence[ContextPairKey]) -> List[List[int]]:
-    grouped: Dict[ContextPairKey, List[int]] = defaultdict(list)
+def _group_indices_by_pair_key(pair_keys: Sequence[ContextPairKey]) -> list[list[int]]:
+    grouped: dict[ContextPairKey, list[int]] = defaultdict(list)
     for idx, key in enumerate(pair_keys):
         grouped[key].append(int(idx))
     return list(grouped.values())
@@ -587,7 +602,7 @@ def teacher_rank_pair_diagnostics(
     teacher_utility_weights: Mapping[str, float] | None = None,
     pair_margin: float = 0.0,
     pair_on_seed: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     keys = validate_teacher_metric_target_keys(target_keys)
     if not rows:
         return {
@@ -616,10 +631,10 @@ def teacher_rank_pair_diagnostics(
         target_keys=keys,
         target_mask=metric_target_mask,
     )
-    pair_keys: List[ContextPairKey] = [context_pair_key(row, pair_on_seed=True) for row in rows]
+    pair_keys: list[ContextPairKey] = [context_pair_key(row, pair_on_seed=True) for row in rows]
     if not pair_on_seed:
         pair_keys = [_context_pair_key_without_seed(key) for key in pair_keys]
-    grouped_by_key: Dict[ContextPairKey, List[int]] = defaultdict(list)
+    grouped_by_key: dict[ContextPairKey, list[int]] = defaultdict(list)
     for idx, key in enumerate(pair_keys):
         grouped_by_key[key].append(int(idx))
     values = [float(value) for value in targets.detach().cpu().tolist()]
@@ -629,7 +644,7 @@ def teacher_rank_pair_diagnostics(
     singleton_group_count = 0
     tie_only_group_count = 0
     max_group_size = 0
-    bad_examples: List[Dict[str, Any]] = []
+    bad_examples: list[dict[str, Any]] = []
     for key, indices in sorted(grouped_by_key.items(), key=lambda item: item[0]):
         max_group_size = max(max_group_size, len(indices))
         pair_count = 0
@@ -691,7 +706,7 @@ def _make_group_minibatch_sampler(
     order = np.arange(len(groups), dtype=np.int64)
     cursor = 0
 
-    def _next_indices() -> List[int]:
+    def _next_indices() -> list[int]:
         nonlocal cursor, order
         if cursor == 0:
             rng.shuffle(order)
@@ -702,7 +717,7 @@ def _make_group_minibatch_sampler(
         cursor += take
         if cursor >= len(order):
             cursor = 0
-        row_indices: List[int] = []
+        row_indices: list[int] = []
         for group_idx in selected:
             row_indices.extend(groups[int(group_idx)])
         return row_indices
@@ -718,7 +733,7 @@ def _make_index_minibatch_sampler(total_count: int, *, batch_size: int, seed: in
     order = np.arange(total, dtype=np.int64)
     cursor = 0
 
-    def _next_indices() -> List[int]:
+    def _next_indices() -> list[int]:
         nonlocal cursor, order
         if cursor == 0:
             rng.shuffle(order)
@@ -745,17 +760,6 @@ def _resolve_setting_encoder_config(
     if setting_encoder_config is None:
         return setting_encoder_config_from_payload({"mode": validate_setting_feature_mode(setting_feature_mode)})
     return setting_encoder_config_from_payload(setting_encoder_config)
-
-
-def _setting_features_for_config(
-    solver_key: str,
-    target_nfe: int,
-    *,
-    setting_feature_mode: str,
-    setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None,
-) -> torch.Tensor:
-    config = _resolve_setting_encoder_config(setting_feature_mode, setting_encoder_config)
-    return setting_features(str(solver_key), int(target_nfe), mode=setting_feature_mode, config=config)
 
 
 def _json_hash(payload: Mapping[str, Any], *, prefix: str) -> str:
@@ -974,7 +978,7 @@ def teacher_selection_candidate_group_key(row: MetricRow) -> TeacherSelectionCan
     )
 
 
-def complete_candidate_group_payload(key: TeacherSelectionCandidateGroupKey) -> Dict[str, Any]:
+def complete_candidate_group_payload(key: TeacherSelectionCandidateGroupKey) -> dict[str, Any]:
     return {
         "context_id": str(key[0]),
         "solver_key": str(key[1]),
@@ -997,22 +1001,22 @@ def _nfe_sequence_key(row: MetricRow) -> NFESequenceKey:
     )
 
 
-def _student_target_groups(rows: Sequence[MetricRow]) -> List[Tuple[ContextPairKey, List[MetricRow]]]:
-    grouped: Dict[ContextPairKey, List[MetricRow]] = defaultdict(list)
+def _student_target_groups(rows: Sequence[MetricRow]) -> list[tuple[ContextPairKey, list[MetricRow]]]:
+    grouped: dict[ContextPairKey, list[MetricRow]] = defaultdict(list)
     for row in rows:
         grouped[context_pair_key(row, pair_on_seed=True)].append(row)
     return [(key, group) for key, group in sorted(grouped.items(), key=lambda item: item[0])]
 
 
-def student_nfe_sequence_pairs(rows: Sequence[MetricRow]) -> List[Tuple[int, int, float]]:
+def student_nfe_sequence_pairs(rows: Sequence[MetricRow]) -> list[tuple[int, int, float]]:
     """Return adjacent target rows plus their positive NFE distance."""
-    sequence_items: Dict[NFESequenceKey, List[Tuple[int, int]]] = defaultdict(list)
+    sequence_items: dict[NFESequenceKey, list[tuple[int, int]]] = defaultdict(list)
     for index, (_, group) in enumerate(_student_target_groups(rows)):
         if not group:
             continue
         first = group[0]
         sequence_items[_nfe_sequence_key(first)].append((int(first["target_nfe"]), int(index)))
-    pairs: List[Tuple[int, int, float]] = []
+    pairs: list[tuple[int, int, float]] = []
     for items in sequence_items.values():
         ordered = sorted(items, key=lambda item: (int(item[0]), int(item[1])))
         for left, right in zip(ordered, ordered[1:], strict=False):
@@ -1021,12 +1025,12 @@ def student_nfe_sequence_pairs(rows: Sequence[MetricRow]) -> List[Tuple[int, int
     return pairs
 
 
-def student_nfe_sequence_pair_indices(rows: Sequence[MetricRow]) -> List[Tuple[int, int]]:
+def student_nfe_sequence_pair_indices(rows: Sequence[MetricRow]) -> list[tuple[int, int]]:
     """Return adjacent target row indices that share context/solver/series and differ only by ordered NFE."""
     return [(left, right) for left, right, _ in student_nfe_sequence_pairs(rows)]
 
 
-def _physical_nfe_sequence_key(row: MetricRow) -> Tuple[Any, ...]:
+def _physical_nfe_sequence_key(row: MetricRow) -> tuple[Any, ...]:
     return (
         str(row.get("dataset", row.get("dataset_key", ""))),
         str(row.get("source_split_phase") or row.get("split_phase", row.get("split", ""))),
@@ -1040,15 +1044,15 @@ def _physical_nfe_sequence_key(row: MetricRow) -> Tuple[Any, ...]:
     )
 
 
-def nfe_sequence_diagnostic_summary(rows: Sequence[MetricRow]) -> Dict[str, Any]:
-    sequence_groups: Dict[NFESequenceKey, set[int]] = defaultdict(set)
-    physical_groups: Dict[Tuple[Any, ...], set[int]] = defaultdict(set)
+def nfe_sequence_diagnostic_summary(rows: Sequence[MetricRow]) -> dict[str, Any]:
+    sequence_groups: dict[NFESequenceKey, set[int]] = defaultdict(set)
+    physical_groups: dict[tuple[Any, ...], set[int]] = defaultdict(set)
     for row in rows:
         nfe = int(row["target_nfe"])
         sequence_groups[_nfe_sequence_key(row)].add(nfe)
         physical_groups[_physical_nfe_sequence_key(row)].add(nfe)
-    sequence_nfe_sets: Dict[Tuple[int, ...], int] = defaultdict(int)
-    physical_nfe_sets: Dict[Tuple[int, ...], int] = defaultdict(int)
+    sequence_nfe_sets: dict[tuple[int, ...], int] = defaultdict(int)
+    physical_nfe_sets: dict[tuple[int, ...], int] = defaultdict(int)
     for nfes in sequence_groups.values():
         sequence_nfe_sets[tuple(sorted(nfes))] += 1
     for nfes in physical_groups.values():
@@ -1079,7 +1083,7 @@ def validate_gico_support_schedule_keys(
     support_schedule_keys: Sequence[str],
     *,
     allowed_schedule_keys: Sequence[str] = EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS,
-) -> Tuple[str, ...]:
+) -> tuple[str, ...]:
     keys = tuple(str(key).strip() for key in support_schedule_keys)
     if not keys:
         raise ValueError("support_schedule_keys must not be empty.")
@@ -1120,7 +1124,7 @@ def validate_density_family_holdout_schedule_keys(
     holdout_schedule_keys: Sequence[str],
     *,
     support_schedule_keys: Sequence[str],
-) -> Tuple[str, ...]:
+) -> tuple[str, ...]:
     keys = tuple(str(key).strip() for key in holdout_schedule_keys if str(key).strip())
     if not keys:
         return ()
@@ -1141,7 +1145,7 @@ def split_rows_by_density_family_holdout(
     *,
     holdout_schedule_keys: Sequence[str],
     support_schedule_keys: Sequence[str],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     keys = validate_density_family_holdout_schedule_keys(
         holdout_schedule_keys,
         support_schedule_keys=support_schedule_keys,
@@ -1158,8 +1162,8 @@ def split_rows_by_density_family_holdout(
                 "density-family holdout must run after uniform-anchored reward construction; "
                 f"found {unrewarded_count} unrewarded rows."
             )
-    fit_rows: List[Dict[str, Any]] = []
-    holdout_rows: List[Dict[str, Any]] = []
+    fit_rows: list[dict[str, Any]] = []
+    holdout_rows: list[dict[str, Any]] = []
     missing_rewards = [
         str(row["scheduler_key"])
         for row in rows
@@ -1198,7 +1202,7 @@ def attach_uniform_gico_rewards(
     utility_mase_weight: float = 0.5,
     pair_on_seed: bool = True,
     eps: float = DEFAULT_REWARD_EPS,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     materialized = [dict(row) for row in rows]
     crps_weight, mase_weight = _normalized_metric_weights(utility_crps_weight, utility_mase_weight)
     support_keys = validate_gico_support_schedule_keys(
@@ -1206,7 +1210,7 @@ def attach_uniform_gico_rewards(
     )
     support = {str(key) for key in support_keys}
     uniform_key = str(uniform_schedule_key)
-    grouped: Dict[ContextPairKey, List[Dict[str, Any]]] = defaultdict(list)
+    grouped: dict[ContextPairKey, list[dict[str, Any]]] = defaultdict(list)
     for row in materialized:
         schedule_key = str(row["scheduler_key"])
         if schedule_key not in support:
@@ -1214,7 +1218,7 @@ def attach_uniform_gico_rewards(
         row["context_id"] = context_id_from_row(row)
         grouped[context_pair_key(row, pair_on_seed=pair_on_seed)].append(row)
 
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for key, group in sorted(grouped.items(), key=lambda item: item[0]):
         counts = dict.fromkeys(support, 0)
         for row in group:
@@ -1270,7 +1274,7 @@ def split_rows_by_context_holdout(
     *,
     holdout_fraction: float,
     seed: int,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     frac = float(holdout_fraction)
     if frac <= 0.0:
         return [dict(row) for row in rows], []
@@ -1284,8 +1288,8 @@ def split_rows_by_context_holdout(
     rng.shuffle(shuffled)
     holdout_count = max(1, int(round(float(len(shuffled)) * frac)))
     holdout_ids = set(shuffled[:holdout_count])
-    fit_rows: List[Dict[str, Any]] = []
-    holdout_rows: List[Dict[str, Any]] = []
+    fit_rows: list[dict[str, Any]] = []
+    holdout_rows: list[dict[str, Any]] = []
     for row in rows:
         copied = dict(row)
         copied["context_id"] = context_id_from_row(copied)
@@ -1324,7 +1328,7 @@ def context_calibration_train_val_counts(
     validation_available: int | None = None,
     normalized_combined_reference: int | None = None,
     validation_fraction: float = DEFAULT_CONTEXT_CALIBRATION_VALIDATION_FRACTION,
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     total = recommended_context_calibration_count(
         int(available_contexts),
         normalized_combined_reference=normalized_combined_reference,
@@ -1343,8 +1347,8 @@ def sample_context_ids_stratified(
     *,
     sample_count: int | None = None,
     seed: int = 0,
-) -> List[str]:
-    by_context: Dict[str, Dict[str, Any]] = {}
+) -> list[str]:
+    by_context: dict[str, dict[str, Any]] = {}
     for row in rows:
         context_id = context_id_from_row(row)
         if context_id not in by_context:
@@ -1355,7 +1359,7 @@ def sample_context_ids_stratified(
     target = int(min(len(by_context), max(1, target)))
     if target >= len(by_context):
         return sorted(by_context)
-    strata: Dict[Tuple[str, str, str, str, str, str], List[str]] = defaultdict(list)
+    strata: dict[tuple[str, str, str, str, str, str], list[str]] = defaultdict(list)
     for context_id, row in by_context.items():
         dataset = str(row.get("axis_dataset", row.get("dataset", row.get("dataset_key", ""))))
         series = str(row.get("axis_series", row.get("series_id", row.get("series_idx", ""))))
@@ -1370,9 +1374,9 @@ def sample_context_ids_stratified(
         time_bin = explicit_time_bin or str(int(math.floor(float(target_t) / 24.0)))
         strata[(dataset, series, stratum, formula, trajectory, time_bin)].append(context_id)
     rng = np.random.default_rng(int(seed))
-    selected: List[str] = []
+    selected: list[str] = []
     stratum_items = sorted(strata.items(), key=lambda item: item[0])
-    allocations: List[Tuple[float, int, int]] = []
+    allocations: list[tuple[float, int, int]] = []
     for idx, (_, ids) in enumerate(stratum_items):
         raw = float(target) * float(len(ids)) / float(len(by_context))
         base = min(len(ids), int(math.floor(raw)))
@@ -1404,7 +1408,7 @@ class EmbeddingNormalizer:
     std: np.ndarray
 
     @classmethod
-    def fit(cls, embeddings: Mapping[str, Sequence[float]], context_ids: Iterable[str]) -> "EmbeddingNormalizer":
+    def fit(cls, embeddings: Mapping[str, Sequence[float]], context_ids: Iterable[str]) -> EmbeddingNormalizer:
         ids = [str(context_id) for context_id in context_ids]
         if not ids:
             raise ValueError("Embedding normalization requires at least one train context.")
@@ -1423,14 +1427,14 @@ class EmbeddingNormalizer:
             raise ValueError(f"Embedding shape {vector.shape} does not match normalizer shape {self.mean.shape}.")
         return ((vector - self.mean) / self.std).astype(np.float32)
 
-    def transform_table(self, embeddings: Mapping[str, Sequence[float]]) -> Dict[str, np.ndarray]:
+    def transform_table(self, embeddings: Mapping[str, Sequence[float]]) -> dict[str, np.ndarray]:
         return {str(context_id): self.transform_one(vector) for context_id, vector in embeddings.items()}
 
-    def to_payload(self) -> Dict[str, Any]:
+    def to_payload(self) -> dict[str, Any]:
         return {"mean": self.mean.astype(float).tolist(), "std": self.std.astype(float).tolist()}
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "EmbeddingNormalizer":
+    def from_payload(cls, payload: Mapping[str, Any]) -> EmbeddingNormalizer:
         return cls(mean=np.asarray(payload["mean"], dtype=np.float32), std=np.asarray(payload["std"], dtype=np.float32))
 
 
@@ -1442,7 +1446,7 @@ class DensityFeatureNormalizer:
     @classmethod
     def fit(
         cls, density_masses: Iterable[Sequence[float]], *, reference_time_grid: Sequence[float]
-    ) -> "DensityFeatureNormalizer":
+    ) -> DensityFeatureNormalizer:
         features = [density_log_features(mass, reference_time_grid=reference_time_grid) for mass in density_masses]
         if not features:
             raise ValueError("Density feature normalization requires at least one density mass.")
@@ -1460,11 +1464,11 @@ class DensityFeatureNormalizer:
             )
         return ((features - self.mean) / self.std).astype(np.float32)
 
-    def to_payload(self) -> Dict[str, Any]:
+    def to_payload(self) -> dict[str, Any]:
         return {"mean": self.mean.astype(float).tolist(), "std": self.std.astype(float).tolist()}
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "DensityFeatureNormalizer":
+    def from_payload(cls, payload: Mapping[str, Any]) -> DensityFeatureNormalizer:
         return cls(mean=np.asarray(payload["mean"], dtype=np.float32), std=np.asarray(payload["std"], dtype=np.float32))
 
 
@@ -1518,7 +1522,7 @@ def save_context_embedding_table(
     embeddings: Mapping[str, Sequence[float]],
     *,
     metadata: Mapping[str, Any] | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     resolved = Path(path)
     resolved.parent.mkdir(parents=True, exist_ok=True)
     sorted_ids = sorted(str(key) for key in embeddings)
@@ -1541,7 +1545,7 @@ def save_context_embedding_table(
     return manifest
 
 
-def load_context_embedding_table(path: str | Path) -> Dict[str, np.ndarray]:
+def load_context_embedding_table(path: str | Path) -> dict[str, np.ndarray]:
     with np.load(Path(path), allow_pickle=False) as payload:
         context_ids = [str(value) for value in payload["context_ids"].tolist()]
         embeddings = np.asarray(payload["embeddings"], dtype=np.float32)
@@ -1550,7 +1554,7 @@ def load_context_embedding_table(path: str | Path) -> Dict[str, np.ndarray]:
     return {context_id: embeddings[idx].astype(np.float32, copy=True) for idx, context_id in enumerate(context_ids)}
 
 
-def _student_target_representative_rows(rows: Sequence[MetricRow]) -> List[MetricRow]:
+def _student_target_representative_rows(rows: Sequence[MetricRow]) -> list[MetricRow]:
     return [group[0] for _, group in _student_target_groups(rows) if group]
 
 
@@ -1561,7 +1565,7 @@ def grid_for_schedule(
     *,
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None = None,
     checkpoint_step: int | None = None,
-) -> Tuple[float, ...]:
+) -> tuple[float, ...]:
     key = str(schedule_key)
     macro_steps = solver_macro_steps(str(solver_key), int(target_nfe))
     if key in AVERAGED_SCHEDULE_COMPONENTS:
@@ -1608,7 +1612,7 @@ def density_mass_for_row(
     *,
     schedule_grids: Mapping[ScheduleGridKey, Sequence[float]] | None,
     reference_time_grid: Sequence[float],
-) -> Tuple[float, ...]:
+) -> tuple[float, ...]:
     solver = str(row["solver_key"])
     target_nfe = int(row["target_nfe"])
     checkpoint_step = None
@@ -1768,7 +1772,7 @@ class _DensityConditioningMixin:
             out = block(out)
         return self.final_norm(out)
 
-    def model_config(self) -> Dict[str, Any]:
+    def model_config(self) -> dict[str, Any]:
         config = {
             "architecture": self.architecture,
             "setting_dim": int(self.setting_dim),
@@ -2079,7 +2083,7 @@ def build_gico_student_model(
     )
 
 
-def model_config_from_model(model: nn.Module) -> Dict[str, Any]:
+def model_config_from_model(model: nn.Module) -> dict[str, Any]:
     if hasattr(model, "model_config"):
         return dict(model.model_config())  # type: ignore[attr-defined]
     raise ValueError("GICO model is missing canonical architecture metadata.")
@@ -2093,7 +2097,7 @@ def _student_architecture(model: nn.Module) -> str:
     return validate_gico_architecture(str(getattr(model, "architecture", "")), role="student")
 
 
-def _teacher_target_spec_by_utility() -> Dict[str, MetricObjectiveSpec]:
+def _teacher_target_spec_by_utility() -> dict[str, MetricObjectiveSpec]:
     return {
         spec.utility_key: spec
         for specs in (FORECAST_METRIC_SPECS, CONDITIONAL_METRIC_SPECS, MOLECULE_METRIC_SPECS)
@@ -2127,7 +2131,7 @@ def _target_component_applicable(row: MetricRow, target_key: str) -> bool:
     return _truthy_row_value(value)
 
 
-def _row_reward_metric_weights(row: MetricRow, target_keys: Sequence[str]) -> Dict[str, float]:
+def _row_reward_metric_weights(row: MetricRow, target_keys: Sequence[str]) -> dict[str, float]:
     raw = row.get("reward_metric_weights_json", "")
     if raw in (None, ""):
         return {}
@@ -2137,7 +2141,7 @@ def _row_reward_metric_weights(row: MetricRow, target_keys: Sequence[str]) -> Di
         raise ValueError(f"Invalid reward_metric_weights_json for context {context_id_from_row(row)!r}.") from exc
     if not isinstance(payload, Mapping):
         raise ValueError("reward_metric_weights_json must decode to an object.")
-    out: Dict[str, float] = {}
+    out: dict[str, float] = {}
     for key in validate_teacher_metric_target_keys(target_keys):
         alias = _metric_weight_alias(key)
         if key in payload:
@@ -2178,7 +2182,7 @@ def _teacher_metric_weights(
     if rows is not None:
         if len(rows) != int(batch):
             raise ValueError("Teacher scalarization rows must match the score batch length.")
-        values: List[List[float]] = []
+        values: list[list[float]] = []
         default_weights = objective_weight_map_for_keys(keys)
         explicit_weights = (
             normalize_teacher_utility_weights(keys, teacher_utility_weights)
@@ -2221,13 +2225,13 @@ def _teacher_metric_targets(
     *,
     target_keys: Sequence[str],
     device: torch.device | str,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     keys = validate_teacher_metric_target_keys(target_keys)
-    values: List[Tuple[float, ...]] = []
-    masks: List[Tuple[float, ...]] = []
+    values: list[tuple[float, ...]] = []
+    masks: list[tuple[float, ...]] = []
     for row in rows:
-        row_values: List[float] = []
-        row_mask: List[float] = []
+        row_values: list[float] = []
+        row_mask: list[float] = []
         for key in keys:
             value = _finite_target_value(row.get(key))
             valid = value is not None and _target_component_applicable(row, key)
@@ -2274,19 +2278,19 @@ def _masked_smooth_l1_loss(pred: torch.Tensor, target: torch.Tensor, target_mask
 
 def _masked_metric_huber_values(
     pred: torch.Tensor, target: torch.Tensor, target_mask: torch.Tensor
-) -> List[float | None]:
+) -> list[float | None]:
     if pred.shape != target.shape or target_mask.shape != target.shape:
         raise ValueError("Masked teacher regression tensors must have matching shapes.")
     loss = F.smooth_l1_loss(pred, target, reduction="none") * target_mask.to(device=pred.device, dtype=pred.dtype)
     counts = torch.sum(target_mask.to(device=pred.device, dtype=pred.dtype), dim=0)
     totals = torch.sum(loss, dim=0)
-    out: List[float | None] = []
+    out: list[float | None] = []
     for total, count in zip(totals.detach().cpu().tolist(), counts.detach().cpu().tolist(), strict=False):
         out.append(None if float(count) <= 0.0 else float(total) / float(count))
     return out
 
 
-def teacher_metric_target_keys_for_model(teacher: nn.Module) -> Tuple[str, ...]:
+def teacher_metric_target_keys_for_model(teacher: nn.Module) -> tuple[str, ...]:
     _teacher_architecture(teacher)
     keys = getattr(teacher, "teacher_metric_targets", None)
     if keys is None and hasattr(teacher, "model_config"):
@@ -2330,7 +2334,7 @@ def _teacher_metric_scores_batched(
     }
     if len(batch_lengths) != 1:
         raise ValueError("Batched teacher scoring tensors must share the same batch length.")
-    chunks: List[torch.Tensor] = []
+    chunks: list[torch.Tensor] = []
     total = int(setting_features_batch.shape[0])
     step = max(1, int(batch_size))
     for start in range(0, total, step):
@@ -2412,7 +2416,7 @@ def _teacher_score_normalization_tensors(
     batch: int,
     device: torch.device | str,
     dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     mean_values = target_summary.get("teacher_score_normalization_mean_values")
     std_values = target_summary.get("teacher_score_normalization_std_values")
     if not isinstance(mean_values, Sequence) or not isinstance(std_values, Sequence):
@@ -2437,7 +2441,7 @@ def _student_teacher_score_objective(
     score_std: torch.Tensor,
     teacher_utility_weights: Mapping[str, float] | None,
     clip: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     student_mass = torch.softmax(logits, dim=-1)
     density_features = _density_mass_to_normalized_log_features_torch(
         student_mass,
@@ -2465,14 +2469,14 @@ def _pair_indices(
     *,
     margin: float,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     values = [float(value) for value in targets.detach().cpu().tolist()]
-    by_key: Dict[ContextPairKey, List[int]] = defaultdict(list)
+    by_key: dict[ContextPairKey, list[int]] = defaultdict(list)
     for idx, key in enumerate(pair_keys):
         by_key[key].append(int(idx))
-    left: List[int] = []
-    right: List[int] = []
-    signs: List[float] = []
+    left: list[int] = []
+    right: list[int] = []
+    signs: list[float] = []
     min_delta = float(margin)
     for indices in by_key.values():
         for pos, i in enumerate(indices):
@@ -2511,7 +2515,7 @@ def pairwise_rank_loss(
     return F.softplus(-logits).mean()
 
 
-def _rank_values_desc(values: Mapping[str, float]) -> Dict[str, float]:
+def _rank_values_desc(values: Mapping[str, float]) -> dict[str, float]:
     ordered = sorted(values.items(), key=lambda item: (-float(item[1]), str(item[0])))
     return {str(key): float(idx) for idx, (key, _) in enumerate(ordered)}
 
@@ -2543,24 +2547,24 @@ def _teacher_training_tensors(
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     teacher_metric_target_keys: Sequence[str] = TEACHER_METRIC_TARGET_KEYS,
     seed: int = 0,
-) -> Tuple[
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    List[ContextPairKey],
-    List[str],
-    List[Tuple[float, ...]],
+    list[ContextPairKey],
+    list[str],
+    list[tuple[float, ...]],
 ]:
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
-    setting_rows: List[torch.Tensor] = []
-    density_rows: List[np.ndarray] = []
-    context_rows: List[np.ndarray] = []
-    pair_keys: List[ContextPairKey] = []
-    schedule_keys: List[str] = []
-    density_masses: List[Tuple[float, ...]] = []
+    setting_rows: list[torch.Tensor] = []
+    density_rows: list[np.ndarray] = []
+    context_rows: list[np.ndarray] = []
+    pair_keys: list[ContextPairKey] = []
+    schedule_keys: list[str] = []
+    density_masses: list[tuple[float, ...]] = []
     for row in rows:
         context_embedding_id = context_embedding_id_from_row(row)
         if context_embedding_id not in context_embeddings:
@@ -2609,7 +2613,7 @@ def gico_teacher_diagnostics(
     teacher_utility_weights: Mapping[str, float] | None = None,
     complete_candidate_schedule_keys: Sequence[str] | None = None,
     device: torch.device | str = "cpu",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     rank_temperature, regression_weight, pair_margin = validate_teacher_objective_hyperparameters(
@@ -2628,7 +2632,7 @@ def gico_teacher_diagnostics(
     )
     fit_context_set = {str(value) for value in fit_context_ids}
     fit_series_set = {str(value) for value in fit_series_keys}
-    base: Dict[str, Any] = {
+    base: dict[str, Any] = {
         "split_name": str(split_name),
         "row_count": int(len(rows)),
         "context_count": int(len(contexts)),
@@ -2736,7 +2740,7 @@ def gico_teacher_diagnostics(
         teacher.train()
 
     expected_schedule_set = set(expected_candidate_schedules)
-    candidate_groups: Dict[TeacherSelectionCandidateGroupKey, Dict[str, List[int]]] = defaultdict(
+    candidate_groups: dict[TeacherSelectionCandidateGroupKey, dict[str, list[int]]] = defaultdict(
         lambda: defaultdict(list)
     )
     unexpected_schedule_groups = 0
@@ -2746,18 +2750,18 @@ def gico_teacher_diagnostics(
             unexpected_schedule_groups += 1
             continue
         candidate_groups[teacher_selection_candidate_group_key(row)][schedule].append(int(idx))
-    spearman_values: List[float] = []
+    spearman_values: list[float] = []
     best_candidate_hits = 0
     best_candidate_total = 0
-    soft_regret_values: List[float] = []
-    top1_regret_values: List[float] = []
-    oracle_utility_values: List[float] = []
-    teacher_expected_utility_values: List[float] = []
-    selected_utility_values: List[float] = []
+    soft_regret_values: list[float] = []
+    top1_regret_values: list[float] = []
+    oracle_utility_values: list[float] = []
+    teacher_expected_utility_values: list[float] = []
+    selected_utility_values: list[float] = []
     incomplete_candidate_groups = 0
     duplicate_schedule_groups = 0
     missing_schedule_groups = 0
-    complete_group_examples: List[Dict[str, Any]] = []
+    complete_group_examples: list[dict[str, Any]] = []
     for group_key, schedule_to_indices in candidate_groups.items():
         missing_schedules = [
             schedule for schedule in expected_candidate_schedules if len(schedule_to_indices.get(schedule, [])) != 1
@@ -2810,9 +2814,9 @@ def gico_teacher_diagnostics(
                     "top1_regret": top1_regret,
                 }
             )
-    sequence_delta_values: List[float] = []
-    sequence_second_diff_values: List[float] = []
-    by_candidate_sequence: Dict[NFECandidateSequenceKey, List[Tuple[int, int]]] = defaultdict(list)
+    sequence_delta_values: list[float] = []
+    sequence_second_diff_values: list[float] = []
+    by_candidate_sequence: dict[NFECandidateSequenceKey, list[tuple[int, int]]] = defaultdict(list)
     for idx, row in enumerate(rows):
         sequence_key = (*_nfe_sequence_key(row), str(schedule_keys[idx]))
         by_candidate_sequence[sequence_key].append((int(row["target_nfe"]), int(idx)))
@@ -2879,12 +2883,12 @@ def gico_teacher_diagnostics(
 
 
 def _selected_gico_teacher_checkpoint(
-    checkpoint_history: Sequence[Dict[str, Any]],
+    checkpoint_history: Sequence[dict[str, Any]],
     checkpoint_states: Mapping[int, Mapping[str, torch.Tensor]],
     *,
     required_split_names: Sequence[str] = (),
     component_weights: Mapping[str, float] | None = None,
-) -> Tuple[Dict[str, Any], Mapping[str, torch.Tensor] | None]:
+) -> tuple[dict[str, Any], Mapping[str, torch.Tensor] | None]:
     mode = TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET
 
     def _component_weight(name: str, weights: Mapping[str, float]) -> float:
@@ -2903,11 +2907,11 @@ def _selected_gico_teacher_checkpoint(
         raise ValueError("Weighted normalized regret selection requires checkpoint diagnostics.")
 
     required = tuple(str(name) for name in required_split_names)
-    scored: List[Dict[str, Any]] = []
+    scored: list[dict[str, Any]] = []
     required_metric_names = ("validation_soft_regret",)
     for entry in checkpoint_history:
         diagnostics = {str(key): dict(value) for key, value in dict(entry.get("diagnostics", {})).items()}
-        missing: List[str] = []
+        missing: list[str] = []
         for name in required:
             diag = diagnostics.get(name, {})
             for metric_name in required_metric_names:
@@ -3006,9 +3010,9 @@ def _selected_gico_teacher_checkpoint(
     if not active_splits:
         raise ValueError("Weighted normalized regret selection found no active diagnostic splits.")
 
-    raw_by_split: Dict[str, Dict[int, float]] = {}
+    raw_by_split: dict[str, dict[int, float]] = {}
     for name in active_splits:
-        split_values: Dict[int, float] = {}
+        split_values: dict[int, float] = {}
         for entry in valid_entries:
             diag = dict(dict(entry.get("diagnostics", {}) or {}).get(name, {}) or {})
             if diag.get("validation_soft_regret") is None:
@@ -3018,8 +3022,8 @@ def _selected_gico_teacher_checkpoint(
             split_values[int(entry["step"])] = float(diag["validation_soft_regret"])
         raw_by_split[name] = split_values
 
-    ranges: Dict[str, Dict[str, float]] = {}
-    normalized_by_split: Dict[str, Dict[int, float]] = {}
+    ranges: dict[str, dict[str, float]] = {}
+    normalized_by_split: dict[str, dict[int, float]] = {}
     for name, values in raw_by_split.items():
         lo = min(float(value) for value in values.values())
         hi = max(float(value) for value in values.values())
@@ -3111,11 +3115,11 @@ def _selected_gico_teacher_checkpoint(
 
 
 def select_weighted_normalized_regret_checkpoint(
-    checkpoint_history: Sequence[Dict[str, Any]],
+    checkpoint_history: Sequence[dict[str, Any]],
     *,
     required_split_names: Sequence[str] = (),
     component_weights: Mapping[str, float] | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     selection, _ = _selected_gico_teacher_checkpoint(
         checkpoint_history,
         {},
@@ -3180,7 +3184,7 @@ def train_gico_teacher(
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     teacher_utility_weights: Mapping[str, float] | None = None,
     device: torch.device | str = "cpu",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if not rows:
         raise ValueError("Teacher training requires at least one context reward row.")
     steps = int(steps)
@@ -3251,9 +3255,9 @@ def train_gico_teacher(
         seed=int(seed),
     )
     opt = torch.optim.AdamW(teacher.parameters(), lr=float(lr), weight_decay=1e-4)
-    losses: List[Dict[str, Any]] = []
-    checkpoint_history: List[Dict[str, Any]] = []
-    checkpoint_states: Dict[int, Mapping[str, torch.Tensor]] = {}
+    losses: list[dict[str, Any]] = []
+    checkpoint_history: list[dict[str, Any]] = []
+    checkpoint_states: dict[int, Mapping[str, torch.Tensor]] = {}
     fit_context_ids = sorted({context_id_from_row(row) for row in rows})
     fit_series_keys = sorted({series_key_from_row(row) for row in rows})
     diagnostic_candidate_schedule_map = {
@@ -3353,7 +3357,7 @@ def train_gico_teacher(
         )
     if selected_state is not None:
         teacher.load_state_dict(selected_state)
-    final_teacher_retrain = {
+    teacher_final_retrain = {
         "protocol": "gico_teacher_finalization",
         "performed": False,
         "reason": "selected_checkpoint_state_restored"
@@ -3410,7 +3414,7 @@ def train_gico_teacher(
         "teacher_checkpoint_every": int(checkpoint_every),
         "teacher_checkpoint_selection": checkpoint_selection,
         "teacher_checkpoint_selection_mode": selection_mode,
-        "final_teacher_retrain": final_teacher_retrain,
+        "teacher_final_retrain": teacher_final_retrain,
         "fit_context_count": int(len(fit_context_ids)),
         "fit_series_count": int(len(fit_series_keys)),
     }
@@ -3435,7 +3439,7 @@ def build_teacher_weighted_density_targets(
     student_target_elite_min_count: int = DEFAULT_STUDENT_TARGET_ELITE_MIN_COUNT,
     student_target_elite_blend_all_weight: float = DEFAULT_STUDENT_TARGET_ELITE_BLEND_ALL_WEIGHT,
     device: torch.device | str = "cpu",
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
     fixed_temperature = _finite_positive(temperature, label="teacher_temperature")
@@ -3459,29 +3463,29 @@ def build_teacher_weighted_density_targets(
     if not target_groups:
         raise ValueError("Student target construction requires at least one context group.")
     teacher_metric_target_keys = teacher_metric_target_keys_for_model(teacher)
-    setting_rows: List[torch.Tensor] = []
-    context_rows: List[np.ndarray] = []
-    target_masses: List[np.ndarray] = []
-    entropy_values: List[float] = []
-    ess_values: List[float] = []
-    max_weight_values: List[float] = []
-    full_entropy_values: List[float] = []
-    full_ess_values: List[float] = []
-    full_max_weight_values: List[float] = []
-    retained_full_weight_values: List[float] = []
-    dropped_full_weight_values: List[float] = []
-    weight_l1_distance_values: List[float] = []
-    target_l1_distance_values: List[float] = []
-    elite_count_values: List[float] = []
-    score_mean_values: List[float] = []
-    score_std_values: List[float] = []
-    candidate_counts: List[int] = []
+    setting_rows: list[torch.Tensor] = []
+    context_rows: list[np.ndarray] = []
+    target_masses: list[np.ndarray] = []
+    entropy_values: list[float] = []
+    ess_values: list[float] = []
+    max_weight_values: list[float] = []
+    full_entropy_values: list[float] = []
+    full_ess_values: list[float] = []
+    full_max_weight_values: list[float] = []
+    retained_full_weight_values: list[float] = []
+    dropped_full_weight_values: list[float] = []
+    weight_l1_distance_values: list[float] = []
+    target_l1_distance_values: list[float] = []
+    elite_count_values: list[float] = []
+    score_mean_values: list[float] = []
+    score_std_values: list[float] = []
+    candidate_counts: list[int] = []
     teacher.to(device)
     teacher.eval()
-    score_settings: List[torch.Tensor] = []
-    score_density: List[np.ndarray] = []
-    score_context: List[np.ndarray] = []
-    score_masses: Dict[int, Tuple[float, ...]] = {}
+    score_settings: list[torch.Tensor] = []
+    score_density: list[np.ndarray] = []
+    score_context: list[np.ndarray] = []
+    score_masses: dict[int, tuple[float, ...]] = {}
     for row in rows:
         context_embedding_id = context_embedding_id_from_row(row)
         if context_embedding_id not in context_embeddings:
@@ -3529,7 +3533,7 @@ def build_teacher_weighted_density_targets(
         for row, value in zip(rows, metric_score_mask.detach().cpu().tolist(), strict=False)
     }
     for _, group in target_groups:
-        counts: Dict[str, int] = dict.fromkeys(supervision_keys, 0)
+        counts: dict[str, int] = dict.fromkeys(supervision_keys, 0)
         for row in group:
             key = str(row["scheduler_key"])
             counts[key] = counts.get(key, 0) + 1
@@ -3544,8 +3548,8 @@ def build_teacher_weighted_density_targets(
             raise KeyError(f"Missing context embedding for {context_embedding_id}.")
         solver = str(first["solver_key"])
         target_nfe = int(first["target_nfe"])
-        masses: List[Tuple[float, ...]] = []
-        utilities: List[float] = []
+        masses: list[tuple[float, ...]] = []
+        utilities: list[float] = []
         setting_row = setting_features(solver, target_nfe, mode=feature_mode, config=encoder_config)
         reference_weight = score_weights_by_row_id[id(group[0])]
         reference_mask = score_mask_by_row_id[id(group[0])]
@@ -3734,7 +3738,7 @@ def train_gico_student(
     student_checkpoint_every: int = 100,
     final_retrain_mode: bool = False,
     device: torch.device | str = "cpu",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if not rows:
         raise ValueError("Student density training requires at least one fit row.")
     steps = int(steps)
@@ -3821,8 +3825,8 @@ def train_gico_student(
     unseen_target_mass: torch.Tensor | None = None
     unseen_score_mean: torch.Tensor | None = None
     unseen_score_std: torch.Tensor | None = None
-    unseen_representative_rows: List[MetricRow] = []
-    unseen_target_summary: Dict[str, Any] = {
+    unseen_representative_rows: list[MetricRow] = []
+    unseen_target_summary: dict[str, Any] = {
         "unseen_target_distillation_used": False,
         "unseen_target_weight": float(unseen_weight),
         "unseen_context_setting_count": 0,
@@ -3873,7 +3877,7 @@ def train_gico_student(
     validation_sx: torch.Tensor | None = None
     validation_cx: torch.Tensor | None = None
     validation_target_mass: torch.Tensor | None = None
-    validation_target_summary: Dict[str, Any] = {
+    validation_target_summary: dict[str, Any] = {
         "student_validation_context_setting_count": 0,
         "student_validation_context_count": 0,
     }
@@ -3915,9 +3919,9 @@ def train_gico_student(
             ),
         }
     opt = torch.optim.AdamW(student.parameters(), lr=float(lr), weight_decay=weight_decay)
-    losses: List[Dict[str, Any]] = []
-    checkpoint_history: List[Dict[str, Any]] = []
-    checkpoint_states: Dict[int, Mapping[str, torch.Tensor]] = {}
+    losses: list[dict[str, Any]] = []
+    checkpoint_history: list[dict[str, Any]] = []
+    checkpoint_states: dict[int, Mapping[str, torch.Tensor]] = {}
     next_student_batch = _make_index_minibatch_sampler(
         int(target_mass.shape[0]),
         batch_size=DEFAULT_GICO_STUDENT_BATCH_SIZE,
@@ -3937,7 +3941,7 @@ def train_gico_student(
         eval_sx: torch.Tensor,
         eval_cx: torch.Tensor,
         eval_target_mass: torch.Tensor,
-    ) -> Tuple[float, float]:
+    ) -> tuple[float, float]:
         was_training = bool(student.training)
         student.eval()
         total_ce = 0.0
@@ -4237,7 +4241,7 @@ def predict_gico_density(
     setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     device: torch.device | str = "cpu",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return predict_gico_density_many(
         student,
         rows=[row],
@@ -4258,13 +4262,13 @@ def predict_gico_density_many(
     setting_feature_mode: str = SETTING_ENCODER_MODE_CONTINUOUS_V3,
     setting_encoder_config: Mapping[str, Any] | SettingEncoderConfig | None = None,
     device: torch.device | str = "cpu",
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     if not rows:
         return []
     feature_mode = validate_setting_feature_mode(setting_feature_mode)
     encoder_config = _resolve_setting_encoder_config(feature_mode, setting_encoder_config)
-    setting_rows: List[torch.Tensor] = []
-    context_rows: List[np.ndarray] = []
+    setting_rows: list[torch.Tensor] = []
+    context_rows: list[np.ndarray] = []
     for row in rows:
         context_embedding_id = context_embedding_id_from_row(row)
         if context_embedding_id not in context_embeddings:
@@ -4281,7 +4285,7 @@ def predict_gico_density_many(
             torch.stack(setting_rows, dim=0).to(device=device),
             torch.tensor(np.stack(context_rows, axis=0), dtype=torch.float32, device=device),
         )
-    outputs: List[Dict[str, Any]] = []
+    outputs: list[dict[str, Any]] = []
     for row, mass_t in zip(rows, masses_t, strict=False):
         solver = str(row["solver_key"])
         target_nfe = int(row["target_nfe"])
@@ -4308,7 +4312,7 @@ def predict_gico_density_many(
     return outputs
 
 
-def read_metric_rows_csv(path: str | Path) -> List[Dict[str, Any]]:
+def read_metric_rows_csv(path: str | Path) -> list[dict[str, Any]]:
     with Path(path).open("r", newline="", encoding="utf-8") as fh:
         rows = [dict(row) for row in csv.DictReader(fh)]
     for row in rows:

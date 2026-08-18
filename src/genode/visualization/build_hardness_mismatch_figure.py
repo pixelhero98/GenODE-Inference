@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timezone
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -34,7 +35,7 @@ NATIVE_HARDNESS_TRACE_KEY = NATIVE_INFO_GROWTH_TRACE_KEY
 PAPER_FACING_TRACE_NAME = "native_info_growth"
 
 
-def parse_csv(text: str) -> List[str]:
+def parse_csv(text: str) -> list[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
@@ -49,7 +50,7 @@ def validate_time_grid(grid: Sequence[float], *, name: str = "time_grid") -> np.
     return arr
 
 
-def normalize_trace(values: Sequence[float]) -> List[float]:
+def normalize_trace(values: Sequence[float]) -> list[float]:
     arr = np.asarray(values, dtype=np.float64)
     if arr.ndim != 1 or arr.size == 0:
         raise ValueError("Native hardness trace must be a non-empty one-dimensional sequence.")
@@ -60,7 +61,7 @@ def normalize_trace(values: Sequence[float]) -> List[float]:
     return [float(x) for x in (arr / mean).tolist()]
 
 
-def schedule_node_summary(schedule_key: str, runtime_nfe: int) -> Dict[str, Any]:
+def schedule_node_summary(schedule_key: str, runtime_nfe: int) -> dict[str, Any]:
     key = str(schedule_key).strip().lower()
     if key not in SCHEDULE_ORDER:
         raise ValueError(f"Unsupported active schedule {schedule_key!r}.")
@@ -81,13 +82,13 @@ def schedule_node_summary(schedule_key: str, runtime_nfe: int) -> Dict[str, Any]
     }
 
 
-def synthetic_payload(*, runtime_nfe: int = 10) -> Dict[str, Any]:
+def synthetic_payload(*, runtime_nfe: int = 10) -> dict[str, Any]:
     reference_grid = np.linspace(0.0, 1.0, 41, dtype=np.float64)
     mid = 0.5 * (reference_grid[:-1] + reference_grid[1:])
     trace = 0.45 + 0.35 * np.sin(np.pi * mid) ** 2 + 0.20 * mid
     return {
         "artifact": "native_info_growth_hardness_payload",
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "generated_at_utc": datetime.now(UTC).isoformat(),
         "paper_facing_trace": PAPER_FACING_TRACE_NAME,
         "native_trace_key": NATIVE_HARDNESS_TRACE_KEY,
         "reference_time_grid": [float(x) for x in reference_grid.tolist()],
@@ -96,7 +97,7 @@ def synthetic_payload(*, runtime_nfe: int = 10) -> Dict[str, Any]:
     }
 
 
-def load_payload(path: Path) -> Dict[str, Any]:
+def load_payload(path: Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
@@ -136,7 +137,7 @@ def build_figure(payload: Mapping[str, Any]):
 
 def plot_payload(
     payload: Mapping[str, Any], *, png_path: Path = DEFAULT_PNG, pdf_path: Path = DEFAULT_PDF, dpi: int = 300
-) -> Dict[str, str]:
+) -> dict[str, str]:
     fig = build_figure(payload)
     try:
         png_path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,7 +165,7 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> Dict[str, Any]:
+def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     args = build_argparser().parse_args(argv)
     if args.command == "synthetic":
         payload = synthetic_payload(runtime_nfe=int(args.runtime_nfe))

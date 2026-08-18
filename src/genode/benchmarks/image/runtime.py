@@ -1138,7 +1138,7 @@ class ImageEulerSampler:
     def sample_gico(
         self,
         request: ImageGenerationRequest,
-        artifact: "BoundImageGICOConditionalArtifact",
+        artifact: BoundImageGICOConditionalArtifact,
     ) -> GeneratedImageBatch:
         """Execute class-conditional ImageNet GICO with label-derived context."""
 

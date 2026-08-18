@@ -6,9 +6,10 @@ import csv
 import json
 import math
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any
 
 from genode.canonical_experiment_layout import (
     CANONICAL_SUPERVISION_SCHEDULE_KEYS,
@@ -33,7 +34,7 @@ from genode.gico.schedule_grids import load_schedule_summary_grids, schedule_gri
 from genode.gico.schedule_hash import json_hash as _canonical_json_hash
 from genode.solver_protocol import normalize_solver_key
 
-DEFAULT_SUPPORT_SCHEDULE_KEYS: Tuple[str, ...] = CANONICAL_SUPERVISION_SCHEDULE_KEYS
+DEFAULT_SUPPORT_SCHEDULE_KEYS: tuple[str, ...] = CANONICAL_SUPERVISION_SCHEDULE_KEYS
 _MEMORY_SOURCE_PATH = Path("__memory__")
 
 
@@ -42,10 +43,10 @@ class _RowRecord:
     input_index: int
     source_path: Path
     source_row_number: int
-    row: Dict[str, Any]
+    row: dict[str, Any]
 
 
-def _parse_csv(text: str) -> List[str]:
+def _parse_csv(text: str) -> list[str]:
     return [part.strip() for part in str(text).split(",") if part.strip()]
 
 
@@ -176,7 +177,7 @@ def _logical_seed_from_row(row: Mapping[str, Any]) -> int | None:
 
 def _context_pair_key(
     row: Mapping[str, Any], *, pair_on_seed: bool = True
-) -> Tuple[str, str, int, str, int | None, str]:
+) -> tuple[str, str, int, str, int | None, str]:
     seed = _logical_seed_from_row(row) if pair_on_seed else None
     return (
         str(row.get("dataset", row.get("dataset_key", ""))),
@@ -190,11 +191,11 @@ def _context_pair_key(
 
 def _validate_gico_support_schedule_keys(
     support_schedule_keys: Sequence[str],
-) -> Tuple[str, ...]:
+) -> tuple[str, ...]:
     return validate_gico_support_schedule_keys(support_schedule_keys)
 
 
-def _validate_teacher_metric_target_keys(keys: Sequence[str] | str | None) -> Tuple[str, ...]:
+def _validate_teacher_metric_target_keys(keys: Sequence[str] | str | None) -> tuple[str, ...]:
     if keys is None:
         return ("u_comp_uniform",)
     raw = [part.strip() for part in keys.split(",")] if isinstance(keys, str) else [str(part).strip() for part in keys]
@@ -207,7 +208,7 @@ def _validate_teacher_metric_target_keys(keys: Sequence[str] | str | None) -> Tu
     return out
 
 
-def _teacher_target_spec_by_utility() -> Dict[str, Any]:
+def _teacher_target_spec_by_utility() -> dict[str, Any]:
     return {
         spec.utility_key: spec
         for specs in (FORECAST_METRIC_SPECS, CONDITIONAL_METRIC_SPECS, MOLECULE_METRIC_SPECS)
@@ -299,7 +300,7 @@ def _infer_single_dataset_key(rows: Sequence[Mapping[str, Any]]) -> str:
     return next(iter(datasets)) if datasets else ""
 
 
-def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
+def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
     raw = str(args.teacher_metric_target_keys).strip()
     if not raw or raw.lower() == "auto":
         dataset_key = _infer_single_dataset_key(rows)
@@ -312,10 +313,10 @@ def _resolve_teacher_metric_target_keys(args: argparse.Namespace, rows: Sequence
     return _validate_teacher_metric_target_keys(raw)
 
 
-def _read_rows_csvs(paths_text: str) -> Tuple[List[_RowRecord], List[str], List[Dict[str, Any]]]:
-    records: List[_RowRecord] = []
-    fieldnames: List[str] = []
-    inputs: List[Dict[str, Any]] = []
+def _read_rows_csvs(paths_text: str) -> tuple[list[_RowRecord], list[str], list[dict[str, Any]]]:
+    records: list[_RowRecord] = []
+    fieldnames: list[str] = []
+    inputs: list[dict[str, Any]] = []
     next_index = 0
     for path_text in _parse_csv(str(paths_text)):
         path = resolve_project_path(path_text)
@@ -349,14 +350,14 @@ def _read_rows_csvs(paths_text: str) -> Tuple[List[_RowRecord], List[str], List[
     return records, fieldnames, inputs
 
 
-def _observed_support(rows: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
+def _observed_support(rows: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
     observed = tuple(sorted({str(row["scheduler_key"]) for row in rows if str(row.get("scheduler_key", "")).strip()}))
     canonical_order = tuple(key for key in DEFAULT_SUPPORT_SCHEDULE_KEYS if key in observed)
     extras = tuple(key for key in observed if key not in canonical_order)
     return _validate_gico_support_schedule_keys(canonical_order + extras)
 
 
-def _location(record: _RowRecord) -> Dict[str, Any]:
+def _location(record: _RowRecord) -> dict[str, Any]:
     path = "<memory>" if record.source_path == _MEMORY_SOURCE_PATH else display_project_path(record.source_path)
     return {
         "input_index": int(record.input_index),
@@ -365,7 +366,7 @@ def _location(record: _RowRecord) -> Dict[str, Any]:
     }
 
 
-def _cell_payload(key: Tuple[Any, ...]) -> Dict[str, Any]:
+def _cell_payload(key: tuple[Any, ...]) -> dict[str, Any]:
     return {
         "dataset": str(key[0]),
         "solver_key": str(key[1]),
@@ -376,7 +377,7 @@ def _cell_payload(key: Tuple[Any, ...]) -> Dict[str, Any]:
     }
 
 
-def _row_cell_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
+def _row_cell_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
     return tuple(_context_pair_key(row, pair_on_seed=True))
 
 
@@ -388,11 +389,11 @@ def _optional_value(row: Mapping[str, Any], *keys: str) -> str:
     return ""
 
 
-def _context_identity_fingerprint(row: Mapping[str, Any]) -> Tuple[Tuple[str, str], ...] | None:
+def _context_identity_fingerprint(row: Mapping[str, Any]) -> tuple[tuple[str, str], ...] | None:
     context_schema = _optional_value(row, "context_schema")
     dataset = _optional_value(row, "axis_dataset", "dataset", "dataset_key")
     split_phase = _optional_value(row, "split_phase", "split")
-    payload: Dict[str, str] = {
+    payload: dict[str, str] = {
         "context_schema": context_schema,
         "dataset": dataset,
         "split_phase": split_phase,
@@ -420,17 +421,17 @@ def _context_identity_fingerprint(row: Mapping[str, Any]) -> Tuple[Tuple[str, st
     return tuple(sorted(payload.items()))
 
 
-def _fingerprint_payload(fingerprint: Tuple[Tuple[str, str], ...]) -> Dict[str, str]:
+def _fingerprint_payload(fingerprint: tuple[tuple[str, str], ...]) -> dict[str, str]:
     return {key: value for key, value in fingerprint if value}
 
 
 def _identity_conflict_report(
     records: Sequence[_RowRecord],
-) -> Tuple[List[Dict[str, Any]], set[int], Dict[int, str], List[Dict[str, Any]]]:
-    row_context_ids: Dict[int, str] = {}
-    row_fingerprints: Dict[int, Tuple[Tuple[str, str], ...]] = {}
-    row_errors: List[Dict[str, Any]] = []
-    checkpoint_scope_conflicts: List[Dict[str, Any]] = []
+) -> tuple[list[dict[str, Any]], set[int], dict[int, str], list[dict[str, Any]]]:
+    row_context_ids: dict[int, str] = {}
+    row_fingerprints: dict[int, tuple[tuple[str, str], ...]] = {}
+    row_errors: list[dict[str, Any]] = []
+    checkpoint_scope_conflicts: list[dict[str, Any]] = []
     dirty_rows: set[int] = set()
 
     for record in records:
@@ -478,8 +479,8 @@ def _identity_conflict_report(
         if fingerprint is not None:
             row_fingerprints[record.input_index] = fingerprint
 
-    by_context: Dict[str, Dict[Tuple[Tuple[str, str], ...], List[_RowRecord]]] = defaultdict(lambda: defaultdict(list))
-    by_identity: Dict[Tuple[Tuple[str, str], ...], Dict[str, List[_RowRecord]]] = defaultdict(lambda: defaultdict(list))
+    by_context: dict[str, dict[tuple[tuple[str, str], ...], list[_RowRecord]]] = defaultdict(lambda: defaultdict(list))
+    by_identity: dict[tuple[tuple[str, str], ...], dict[str, list[_RowRecord]]] = defaultdict(lambda: defaultdict(list))
     records_by_index = {record.input_index: record for record in records}
     for row_index, fingerprint in row_fingerprints.items():
         context_id = row_context_ids.get(row_index)
@@ -489,7 +490,7 @@ def _identity_conflict_report(
         by_context[context_id][fingerprint].append(record)
         by_identity[fingerprint][context_id].append(record)
 
-    conflicts: List[Dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
     for context_id, fingerprints in sorted(by_context.items()):
         if len(fingerprints) <= 1:
             continue
@@ -533,12 +534,12 @@ def _support_report(
     records: Sequence[_RowRecord],
     support_keys: Sequence[str],
     dirty_rows: set[int],
-) -> Tuple[Dict[str, Any], set[Tuple[Any, ...]], List[_RowRecord]]:
+) -> tuple[dict[str, Any], set[tuple[Any, ...]], list[_RowRecord]]:
     support_keys = tuple(str(key) for key in support_keys)
     support_set = set(support_keys)
-    grouped: Dict[Tuple[Any, ...], Dict[str, List[_RowRecord]]] = defaultdict(lambda: {key: [] for key in support_keys})
-    extra_support_cells: List[Dict[str, Any]] = []
-    row_errors: List[Dict[str, Any]] = []
+    grouped: dict[tuple[Any, ...], dict[str, list[_RowRecord]]] = defaultdict(lambda: {key: [] for key in support_keys})
+    extra_support_cells: list[dict[str, Any]] = []
+    row_errors: list[dict[str, Any]] = []
 
     for record in records:
         row = record.row
@@ -569,10 +570,10 @@ def _support_report(
             continue
         grouped[cell_key][schedule_key].append(record)
 
-    missing_support_cells: List[Dict[str, Any]] = []
-    duplicate_support_cells: List[Dict[str, Any]] = []
-    complete_cell_keys: set[Tuple[Any, ...]] = set()
-    complete_clean_cell_keys: set[Tuple[Any, ...]] = set()
+    missing_support_cells: list[dict[str, Any]] = []
+    duplicate_support_cells: list[dict[str, Any]] = []
+    complete_cell_keys: set[tuple[Any, ...]] = set()
+    complete_clean_cell_keys: set[tuple[Any, ...]] = set()
 
     for cell_key, counts in sorted(grouped.items(), key=lambda item: repr(item[0])):
         missing = [key for key in support_keys if len(counts.get(key, [])) == 0]
@@ -641,14 +642,14 @@ def _support_report(
     return report, complete_clean_cell_keys, complete_rows
 
 
-def _safe_cell_key(row: Mapping[str, Any]) -> Tuple[Any, ...] | None:
+def _safe_cell_key(row: Mapping[str, Any]) -> tuple[Any, ...] | None:
     try:
         return _row_cell_key(row)
     except Exception:
         return None
 
 
-def _coverage_for_rows(rows: Sequence[Mapping[str, Any]], metric_key: str) -> Dict[str, Any]:
+def _coverage_for_rows(rows: Sequence[Mapping[str, Any]], metric_key: str) -> dict[str, Any]:
     total = int(len(rows))
     present = int(sum(1 for row in rows if _has_nonempty_value(row, metric_key)))
     return {
@@ -664,7 +665,7 @@ def _metric_target_coverage(
     support_rows: Sequence[Mapping[str, Any]],
     complete_rows: Sequence[Mapping[str, Any]],
     target_keys: Sequence[str],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     metrics = []
     for metric_key in target_keys:
         metrics.append(
@@ -696,9 +697,9 @@ def _write_complete_rows(path: Path, fieldnames: Sequence[str], records: Sequenc
 def teacher_metric_target_coverage(
     rows: Sequence[Mapping[str, Any]],
     target_keys: Sequence[str] | str | None,
-) -> Dict[str, Dict[str, Any]]:
+) -> dict[str, dict[str, Any]]:
     keys = _validate_teacher_metric_target_keys(target_keys)
-    coverage: Dict[str, Dict[str, Any]] = {}
+    coverage: dict[str, dict[str, Any]] = {}
     for key in keys:
         applicable = 0
         valid = 0
@@ -737,9 +738,9 @@ def validate_teacher_metric_target_coverage(
     min_coverage_fraction: float = 1.0,
     min_valid_rows: int = 1,
     label: str = "GICO rows",
-) -> Dict[str, Dict[str, Any]]:
+) -> dict[str, dict[str, Any]]:
     coverage = teacher_metric_target_coverage(rows, target_keys)
-    failures: List[str] = []
+    failures: list[str] = []
     for key, item in coverage.items():
         valid_count = int(item["valid_count"])
         fraction = float(item["coverage_fraction"])
@@ -764,9 +765,9 @@ def _teacher_metric_target_validation_report(
     *,
     min_coverage_fraction: float,
     min_valid_rows: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     coverage = teacher_metric_target_coverage(rows, target_keys)
-    failures: List[Dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
     for key, item in coverage.items():
         valid_count = int(item["valid_count"])
         fraction = float(item["coverage_fraction"])
@@ -794,14 +795,14 @@ def _teacher_metric_target_validation_report(
 def _rank_pair_preflight_report(
     rows: Sequence[Mapping[str, Any]],
     target_keys: Sequence[str],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     diagnostics = teacher_rank_pair_diagnostics(
         rows,
         target_keys=target_keys,
         pair_margin=0.0,
         pair_on_seed=True,
     )
-    errors: List[str] = []
+    errors: list[str] = []
     if int(diagnostics.get("row_count", 0) or 0) > 0 and int(diagnostics.get("rankable_pair_count", 0) or 0) <= 0:
         errors.append(
             "No rankable teacher pairs were found across complete support cells; "
@@ -819,7 +820,7 @@ def build_gico_support_preflight_report(
     support_schedule_keys: Sequence[str],
     *,
     teacher_metric_target_keys: Sequence[str] | str | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     records = [
         _RowRecord(input_index=idx, source_path=_MEMORY_SOURCE_PATH, source_row_number=idx + 1, row=dict(row))
         for idx, row in enumerate(rows)
@@ -835,9 +836,9 @@ def build_gico_support_preflight_report(
         + len(support.get("support_semantic_errors", []))
         + int(len(identity_conflicts))
     )
-    target_keys: Tuple[str, ...] = ()
-    metric_target_report: Dict[str, Any] = {}
-    rank_pair_preflight: Dict[str, Any] = {"error_count": 0, "errors": []}
+    target_keys: tuple[str, ...] = ()
+    metric_target_report: dict[str, Any] = {}
+    rank_pair_preflight: dict[str, Any] = {"error_count": 0, "errors": []}
     if teacher_metric_target_keys:
         target_keys = _validate_teacher_metric_target_keys(teacher_metric_target_keys)
         complete_rows = [record.row for record in complete_records]
@@ -1002,7 +1003,7 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
-def preflight_gico_rows(args: argparse.Namespace) -> Dict[str, Any]:
+def preflight_gico_rows(args: argparse.Namespace) -> dict[str, Any]:
     records, fieldnames, inputs = _read_rows_csvs(str(args.rows_csv))
     rows = [record.row for record in records]
     support_keys = (
@@ -1020,7 +1021,7 @@ def preflight_gico_rows(args: argparse.Namespace) -> Dict[str, Any]:
     complete_clean_rows = [record.row for record in complete_records]
     complete_clean_contexts = sorted({_context_id_from_row(row) for row in complete_clean_rows})
     observed_context_ids: set[str] = set()
-    observed_context_row_errors: List[str] = []
+    observed_context_row_errors: list[str] = []
     for record in records:
         try:
             observed_context_ids.add(_context_id_from_row(record.row))
@@ -1029,7 +1030,7 @@ def preflight_gico_rows(args: argparse.Namespace) -> Dict[str, Any]:
                 f"{display_project_path(record.source_path)}:{record.source_row_number}: {exc}"
             )
     min_context_count = int(getattr(args, "min_context_count", 3))
-    context_count_errors: List[str] = []
+    context_count_errors: list[str] = []
     if min_context_count < 1:
         context_count_errors.append("min_context_count must be positive.")
     elif len(complete_clean_contexts) < min_context_count:
@@ -1046,7 +1047,7 @@ def preflight_gico_rows(args: argparse.Namespace) -> Dict[str, Any]:
         "errors": context_count_errors,
     }
     schedule_grid_error = ""
-    schedule_grid_report: Dict[str, Any] = {
+    schedule_grid_report: dict[str, Any] = {
         "row_count": int(len(rows)),
         "missing_grid_row_count": 0,
         "missing_grid_rows": [],
@@ -1077,7 +1078,7 @@ def preflight_gico_rows(args: argparse.Namespace) -> Dict[str, Any]:
     if metric_min_valid_rows < 0:
         raise ValueError("teacher_metric_min_valid_rows must be nonnegative.")
     metric_target_report = _metric_target_coverage(rows, support_rows, complete_clean_rows, target_keys)
-    rank_pair_preflight: Dict[str, Any] = {
+    rank_pair_preflight: dict[str, Any] = {
         "row_count": int(len(complete_clean_rows)),
         "rankable_pair_count": 0,
         "error_count": 0,
@@ -1120,7 +1121,7 @@ def preflight_gico_rows(args: argparse.Namespace) -> Dict[str, Any]:
     if str(args.report_json).strip():
         report_json_path = display_project_path(resolve_project_path(str(args.report_json)))
 
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "artifact": "gico_preflight_rows_report",
         "schema_version": "genode_gico_preflight_rows_v1",
         "rows_csv": inputs,

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -46,7 +45,7 @@ class CondEmbedder(nn.Module):
     def embed_t(self, t: torch.Tensor) -> torch.Tensor:
         return self.t_mlp(self.t_emb(t))
 
-    def embed_cond(self, cond: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    def embed_cond(self, cond: torch.Tensor | None) -> torch.Tensor | None:
         if self.cond_mlp is None or cond is None:
             return None
         return self.cond_mlp(cond)
@@ -57,7 +56,7 @@ class LSTMContextEncoder(nn.Module):
         super().__init__()
         self.rnn = nn.LSTM(cfg.context_dim, cfg.model.hidden_dim, num_layers=1, batch_first=True)
 
-    def forward(self, ctx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         out, (h, _) = self.rnn(ctx)
         return out, h[-1]
 
@@ -79,7 +78,7 @@ class AttentionPool(nn.Module):
 
 
 class TransformerContextEncoder(nn.Module):
-    def __init__(self, cfg: OTFlowConfig, *, causal: Optional[bool] = None):
+    def __init__(self, cfg: OTFlowConfig, *, causal: bool | None = None):
         super().__init__()
         hidden_dim = cfg.model.hidden_dim
         self.use_causal_mask = bool(cfg.model.ctx_causal if causal is None else causal)
@@ -94,16 +93,20 @@ class TransformerContextEncoder(nn.Module):
             activation="gelu",
             norm_first=True,
         )
-        self.enc = nn.TransformerEncoder(enc_layer, num_layers=cfg.model.ctx_layers)
+        self.enc = nn.TransformerEncoder(
+            enc_layer,
+            num_layers=cfg.model.ctx_layers,
+            enable_nested_tensor=False,
+        )
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.pool = AttentionPool(hidden_dim)
 
-    def _mask(self, seq_len: int, device: torch.device) -> Optional[torch.Tensor]:
+    def _mask(self, seq_len: int, device: torch.device) -> torch.Tensor | None:
         if not self.use_causal_mask:
             return None
         return torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
 
-    def forward(self, ctx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.in_proj(ctx)
         if x.shape[1] != self.pos.shape[1]:
             pos = F.interpolate(
@@ -147,7 +150,11 @@ class HybridContextEncoder(nn.Module):
             activation="gelu",
             norm_first=True,
         )
-        self.enc = nn.TransformerEncoder(enc_layer, num_layers=cfg.model.ctx_layers)
+        self.enc = nn.TransformerEncoder(
+            enc_layer,
+            num_layers=cfg.model.ctx_layers,
+            enable_nested_tensor=False,
+        )
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.summary_pool = AttentionPool(hidden_dim)
         self.summary_fuse = nn.Sequential(
@@ -184,7 +191,7 @@ class HybridContextEncoder(nn.Module):
             pieces.append(proj(pooled))
         return torch.cat(pieces, dim=1)
 
-    def forward(self, ctx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.in_proj(ctx)
         local = self.local_conv(x.transpose(1, 2))
         local = local[:, :, : x.shape[1]].transpose(1, 2)
@@ -202,7 +209,7 @@ class MultiScaleContextEncoder(nn.Module):
         self.scales = (1, 5, 10)
         self.pool_projs = nn.ModuleList([nn.Linear(cfg.context_dim, cfg.model.hidden_dim) for _ in self.scales[1:]])
 
-    def forward(self, ctx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h_base, pooled_base = self.base_encoder(ctx)
         bsz, total_steps, state_dim = ctx.shape
         multi_scale_tokens = [h_base]
@@ -250,7 +257,7 @@ class ConditioningState:
     ctx: torch.Tensor
     ctx_summary: torch.Tensor
     t_emb: torch.Tensor
-    cond_emb: Optional[torch.Tensor]
+    cond_emb: torch.Tensor | None
     ctx_tokens: torch.Tensor
 
 
@@ -258,7 +265,7 @@ class ConditioningState:
 class ConditioningCache:
     ctx_tokens: torch.Tensor
     summary: torch.Tensor
-    cond_emb: Optional[torch.Tensor] = None
+    cond_emb: torch.Tensor | None = None
 
 
 def _validate_policy_context_tensor(
@@ -287,7 +294,7 @@ def frozen_backbone_policy_context_from_cache(
     cache: ConditioningCache,
     *,
     protocol: str = FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
-    expected_width: Optional[int] = None,
+    expected_width: int | None = None,
     require_cond_emb: bool = False,
 ) -> torch.Tensor:
     """Derive the canonical policy representation from one existing field cache.
@@ -346,9 +353,9 @@ def frozen_backbone_policy_context(
     backbone: nn.Module,
     hist: torch.Tensor,
     *,
-    cond: Optional[torch.Tensor] = None,
+    cond: torch.Tensor | None = None,
     protocol: str = FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
-    expected_width: Optional[int] = None,
+    expected_width: int | None = None,
 ) -> torch.Tensor:
     """Precompute once and export the canonical frozen-field policy context."""
 
@@ -407,10 +414,10 @@ class SharedConditioningBackbone(nn.Module):
         self,
         hist: torch.Tensor,
         x_ref: torch.Tensor,
-        t: Optional[torch.Tensor] = None,
-        cond: Optional[torch.Tensor] = None,
+        t: torch.Tensor | None = None,
+        cond: torch.Tensor | None = None,
         force_zero_t: bool = False,
-        cache: Optional[ConditioningCache] = None,
+        cache: ConditioningCache | None = None,
     ) -> ConditioningState:
         if cache is None:
             cache = self.precompute(hist, cond=cond)
@@ -438,7 +445,7 @@ class SharedConditioningBackbone(nn.Module):
         self,
         hist: torch.Tensor,
         *,
-        cond: Optional[torch.Tensor] = None,
+        cond: torch.Tensor | None = None,
     ) -> ConditioningCache:
         ctx_tokens, ctx_summary = self.context_encoder(hist)
         summary = self.summary_proj(ctx_summary)

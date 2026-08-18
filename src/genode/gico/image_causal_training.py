@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -22,9 +23,44 @@ from genode.gico.image_causal_stick import (
     ImageGICOCausalPathBank,
 )
 from genode.gico.image_supervision import ImageGICOSupervision
+from genode.gico.image_training_rng import (
+    resolve_image_gico_training_device,
+    seed_image_gico_training_generators,
+)
 
 CAUSAL_TRAINING_CONFIG_PROTOCOL = "gico-causal-transformer-training-config-v2"
-CAUSAL_TRAINING_REPORT_PROTOCOL = "gico-causal-transformer-training-report-v2"
+CAUSAL_TRAINING_REPORT_PROTOCOL = "gico-causal-transformer-training-report-v3"
+IMAGE_GICO_CAUSAL_STATE_NAMESPACE = "image-gico-causal-ar-state-v2"
+
+
+def image_gico_causal_state_sha256(
+    state_or_model: Mapping[str, Tensor] | ImageGICOCausalTransformer,
+) -> str:
+    """Hash the qualified causal state layout without changing its protocol."""
+
+    state = state_or_model.state_dict() if isinstance(state_or_model, ImageGICOCausalTransformer) else state_or_model
+    if not isinstance(state, Mapping) or not state:
+        raise TypeError("state must be a nonempty tensor mapping.")
+    digest = hashlib.sha256()
+    digest.update(IMAGE_GICO_CAUSAL_STATE_NAMESPACE.encode("ascii"))
+    digest.update(b"\0")
+    for name, tensor in sorted(state.items()):
+        if not isinstance(name, str) or not isinstance(tensor, Tensor):
+            raise TypeError("state must map parameter names to tensors.")
+        value = tensor.detach().to(device="cpu").contiguous()
+        if not bool(torch.isfinite(value).all()):
+            raise ValueError(f"State tensor {name!r} is non-finite.")
+        encoded_name = name.encode("utf-8")
+        encoded_dtype = str(value.dtype).encode("ascii")
+        digest.update(len(encoded_name).to_bytes(4, "big"))
+        digest.update(encoded_name)
+        digest.update(len(encoded_dtype).to_bytes(2, "big"))
+        digest.update(encoded_dtype)
+        digest.update(len(value.shape).to_bytes(1, "big"))
+        for dimension in value.shape:
+            digest.update(int(dimension).to_bytes(8, "big"))
+        digest.update(value.numpy().tobytes(order="C"))
+    return f"{IMAGE_GICO_CAUSAL_STATE_NAMESPACE}:{digest.hexdigest()}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +112,7 @@ class ImageGICOCausalTrainingReport:
     config: dict[str, object]
     model_config: dict[str, object]
     supervision_sha256: str
+    model_state_sha256: str
     trainable_parameter_count: int
     initial_batch_nll: float
     final_batch_nll: float
@@ -90,6 +127,7 @@ class ImageGICOCausalTrainingReport:
             "config": self.config,
             "model_config": self.model_config,
             "supervision_sha256": self.supervision_sha256,
+            "model_state_sha256": self.model_state_sha256,
             "trainable_parameter_count": self.trainable_parameter_count,
             "initial_batch_nll": self.initial_batch_nll,
             "final_batch_nll": self.final_batch_nll,
@@ -195,14 +233,11 @@ def train_image_gico_causal_student(
 
     if not isinstance(supervision, ImageGICOSupervision):
         raise TypeError("supervision must be ImageGICOSupervision.")
+    supervision.verify()
     training = ImageGICOCausalTrainingConfig() if config is None else config
     if not isinstance(training, ImageGICOCausalTrainingConfig):
         raise TypeError("config must be ImageGICOCausalTrainingConfig.")
-    execution_device = torch.device(device)
-    if execution_device.type not in {"cpu", "cuda"}:
-        raise ValueError("device must be CPU or CUDA.")
-    if execution_device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA training was requested but CUDA is unavailable.")
+    execution_device, cuda_devices = resolve_image_gico_training_device(device)
     reference = np.linspace(
         0.0,
         1.0,
@@ -219,11 +254,8 @@ def train_image_gico_causal_student(
         dtype=torch.float32,
         device=execution_device,
     )
-    cuda_devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
     with torch.random.fork_rng(devices=cuda_devices):
-        torch.manual_seed(training.seed)
-        if execution_device.type == "cuda":
-            torch.cuda.manual_seed_all(training.seed)
+        seed_image_gico_training_generators(training.seed, execution_device)
         model = ImageGICOCausalTransformer(ImageGICOCausalConfig()).to(execution_device)
         if model.trainable_parameter_count != EXPECTED_TRAINABLE_PARAMETER_COUNT:
             raise RuntimeError("Causal student parameter count changed.")
@@ -288,10 +320,12 @@ def train_image_gico_causal_student(
             final_loss = float(loss.detach().cpu())
             final_gradient = float(gradient.detach().cpu())
         model.eval()
+    model_state_sha256 = image_gico_causal_state_sha256(model)
     report = ImageGICOCausalTrainingReport(
         config=training.as_payload(),
         model_config=model.config.as_payload(),
         supervision_sha256=supervision.sha256,
+        model_state_sha256=model_state_sha256,
         trainable_parameter_count=model.trainable_parameter_count,
         initial_batch_nll=first_loss,
         final_batch_nll=final_loss,
@@ -306,9 +340,11 @@ def train_image_gico_causal_student(
 __all__ = [
     "CAUSAL_TRAINING_CONFIG_PROTOCOL",
     "CAUSAL_TRAINING_REPORT_PROTOCOL",
+    "IMAGE_GICO_CAUSAL_STATE_NAMESPACE",
     "ImageGICOCausalTrainingConfig",
     "ImageGICOCausalTrainingReport",
     "ImageGICOCausalTrainingResult",
+    "image_gico_causal_state_sha256",
     "path_log_probs_from_teacher_forced_logits",
     "terminal_weighted_path_nll",
     "train_image_gico_causal_student",

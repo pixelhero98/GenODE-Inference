@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import shutil
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +15,12 @@ import torch
 from torch import Tensor
 
 from genode.artifacts.identity import semantic_sha256
+from genode.gico.image_artifact_io import (
+    load_float64_npy,
+    staged_image_gico_directory,
+    validate_image_gico_directory,
+    write_float64_npy,
+)
 from genode.gico.image_causal_policy import (
     EXPECTED_TRAINABLE_PARAMETER_COUNT,
     ImageGICOCausalConfig,
@@ -27,19 +30,19 @@ from genode.gico.image_causal_policy import (
 from genode.gico.image_causal_stick import ImageGICOCausalPathBank
 from genode.gico.image_causal_training import (
     CAUSAL_TRAINING_REPORT_PROTOCOL,
+    IMAGE_GICO_CAUSAL_STATE_NAMESPACE,
     ImageGICOCausalTrainingConfig,
     ImageGICOCausalTrainingResult,
+    image_gico_causal_state_sha256,
 )
 from genode.gico.image_supervision import (
     ImageGICOSupervision,
     image_gico_supervision_array_sha256,
 )
-from genode.path_safety import is_link_or_reparse_point
 from genode.provenance import file_sha256
 
-IMAGE_GICO_CAUSAL_ARTIFACT_PROTOCOL = "image_gico_causal_ar_artifact_v1"
-IMAGE_GICO_CAUSAL_ARTIFACT_NAMESPACE = "image-gico-causal-ar-artifact-v1"
-IMAGE_GICO_CAUSAL_STATE_NAMESPACE = "image-gico-causal-ar-state-v2"
+IMAGE_GICO_CAUSAL_ARTIFACT_PROTOCOL = "image_gico_causal_ar_artifact_v2"
+IMAGE_GICO_CAUSAL_ARTIFACT_NAMESPACE = "image-gico-causal-ar-artifact-v2"
 _ARTIFACT_FILES = {
     "manifest.json",
     "causal-state.pt",
@@ -62,44 +65,6 @@ def _array_content_sha256(value: np.ndarray, *, field: str) -> str:
     )
 
 
-def image_gico_causal_state_sha256(
-    state_or_model: Mapping[str, Tensor] | ImageGICOCausalTransformer,
-) -> str:
-    state = state_or_model.state_dict() if isinstance(state_or_model, ImageGICOCausalTransformer) else state_or_model
-    if not isinstance(state, Mapping) or not state:
-        raise TypeError("state must be a nonempty tensor mapping.")
-    digest = hashlib.sha256()
-    digest.update(IMAGE_GICO_CAUSAL_STATE_NAMESPACE.encode("ascii"))
-    digest.update(b"\0")
-    for name, tensor in sorted(state.items()):
-        if not isinstance(name, str) or not isinstance(tensor, Tensor):
-            raise TypeError("state must map parameter names to tensors.")
-        value = tensor.detach().to(device="cpu").contiguous()
-        if not bool(torch.isfinite(value).all()):
-            raise ValueError(f"State tensor {name!r} is non-finite.")
-        encoded_name = name.encode("utf-8")
-        encoded_dtype = str(value.dtype).encode("ascii")
-        digest.update(len(encoded_name).to_bytes(4, "big"))
-        digest.update(encoded_name)
-        digest.update(len(encoded_dtype).to_bytes(2, "big"))
-        digest.update(encoded_dtype)
-        digest.update(len(value.shape).to_bytes(1, "big"))
-        for dimension in value.shape:
-            digest.update(int(dimension).to_bytes(8, "big"))
-        digest.update(value.numpy().tobytes(order="C"))
-    return f"{IMAGE_GICO_CAUSAL_STATE_NAMESPACE}:{digest.hexdigest()}"
-
-
-def _write_array(path: Path, value: np.ndarray) -> dict[str, Any]:
-    np.save(path, np.ascontiguousarray(value, dtype="<f8"), allow_pickle=False)
-    return {
-        "file": path.name,
-        "sha256": file_sha256(path),
-        "shape": list(value.shape),
-        "dtype": "float64-le",
-    }
-
-
 def _state_snapshot(model: ImageGICOCausalTransformer) -> dict[str, Tensor]:
     return {
         name: tensor.detach().to(device="cpu").contiguous().clone()
@@ -111,6 +76,7 @@ def _validate_training_report(
     value: object,
     *,
     supervision_sha256: str,
+    model_state_sha256: str,
     path_bank: ImageGICOCausalPathBank,
 ) -> None:
     if not isinstance(value, Mapping):
@@ -120,6 +86,7 @@ def _validate_training_report(
         "config",
         "model_config",
         "supervision_sha256",
+        "model_state_sha256",
         "trainable_parameter_count",
         "initial_batch_nll",
         "final_batch_nll",
@@ -163,6 +130,7 @@ def _validate_training_report(
         or value.get("protocol") != CAUSAL_TRAINING_REPORT_PROTOCOL
         or value.get("model_config") != ImageGICOCausalConfig().as_payload()
         or value.get("supervision_sha256") != supervision_sha256
+        or value.get("model_state_sha256") != model_state_sha256
         or value.get("trainable_parameter_count") != EXPECTED_TRAINABLE_PARAMETER_COUNT
         or value.get("completed_updates") != parsed.updates
         or value.get("alias_support_sizes") != expected_support_sizes
@@ -185,39 +153,42 @@ def save_image_gico_causal_artifact(
         raise TypeError("result must be ImageGICOCausalTrainingResult.")
     if not isinstance(supervision, ImageGICOSupervision):
         raise TypeError("supervision must be ImageGICOSupervision.")
+    supervision.verify()
     if result.report.supervision_sha256 != supervision.sha256:
         raise ValueError("Training result and supervision identities disagree.")
     if not np.array_equal(result.path_bank.canonical_density_paths, supervision.fixed_density_mass):
         raise ValueError("Causal path-bank support differs from supervision.")
     if result.report.model_config != result.model.config.as_payload():
         raise ValueError("Causal training report and model configuration disagree.")
+    if result.model.trainable_parameter_count != EXPECTED_TRAINABLE_PARAMETER_COUNT:
+        raise ValueError("Causal model parameter count changed.")
+    state = _state_snapshot(result.model)
+    state_identity = image_gico_causal_state_sha256(state)
+    if result.report.model_state_sha256 != state_identity:
+        raise ValueError("Causal training report does not describe the current final model state.")
     _validate_training_report(
         result.report.as_payload(),
         supervision_sha256=supervision.sha256,
+        model_state_sha256=state_identity,
         path_bank=result.path_bank,
     )
-    if result.model.trainable_parameter_count != EXPECTED_TRAINABLE_PARAMETER_COUNT:
-        raise ValueError("Causal model parameter count changed.")
-    target = Path(output_dir).expanduser().resolve()
-    if target.exists() or target.is_symlink():
-        raise FileExistsError(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage-", dir=target.parent))
-    try:
-        state = _state_snapshot(result.model)
-        state_identity = image_gico_causal_state_sha256(state)
+    with staged_image_gico_directory(
+        output_dir,
+        expected_members=_ARTIFACT_FILES,
+        label="Image GICO causal artifact directory",
+    ) as stage:
         state_path = stage / "causal-state.pt"
         torch.save(state, state_path)
         arrays = {
-            "fixed_density_mass": _write_array(
+            "fixed_density_mass": write_float64_npy(
                 stage / "fixed-density-mass.npy",
                 result.path_bank.canonical_density_paths,
             ),
-            "reference_time_grid": _write_array(
+            "reference_time_grid": write_float64_npy(
                 stage / "reference-time-grid.npy",
                 result.path_bank.reference_time_grid,
             ),
-            "normalized_contexts": _write_array(
+            "normalized_contexts": write_float64_npy(
                 stage / "normalized-contexts.npy",
                 supervision.normalized_contexts,
             ),
@@ -255,39 +226,7 @@ def save_image_gico_causal_artifact(
             encoding="utf-8",
             newline="\n",
         )
-        os.replace(stage, target)
-    except Exception:
-        shutil.rmtree(stage, ignore_errors=True)
-        raise
     return MappingProxyType(manifest)
-
-
-def _load_array(root: Path, descriptor: object, *, field: str) -> np.ndarray:
-    if not isinstance(descriptor, Mapping) or set(descriptor) != {
-        "file",
-        "sha256",
-        "shape",
-        "dtype",
-    }:
-        raise ValueError(f"Invalid {field} descriptor.")
-    filename = descriptor["file"]
-    if not isinstance(filename, str) or Path(filename).name != filename:
-        raise ValueError(f"Invalid {field} filename.")
-    path = root / filename
-    if is_link_or_reparse_point(path) or not path.is_file():
-        raise ValueError(f"{field} must be a regular file.")
-    if file_sha256(path) != descriptor["sha256"]:
-        raise ValueError(f"{field} file hash changed.")
-    array = np.load(path, allow_pickle=False)
-    result = np.ascontiguousarray(array, dtype=np.float64)
-    if (
-        list(result.shape) != descriptor["shape"]
-        or descriptor["dtype"] != "float64-le"
-        or not bool(np.isfinite(result).all())
-    ):
-        raise ValueError(f"{field} metadata changed.")
-    result.setflags(write=False)
-    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,12 +295,13 @@ def load_image_gico_causal_artifact(
 
     if supervision is not None and not isinstance(supervision, ImageGICOSupervision):
         raise TypeError("supervision must be ImageGICOSupervision or None.")
-    root = Path(output_dir).expanduser().resolve(strict=True)
-    if is_link_or_reparse_point(root) or not root.is_dir():
-        raise ValueError("Causal artifact root must be a regular directory.")
-    members = {path.name for path in root.iterdir()}
-    if members != _ARTIFACT_FILES or any(is_link_or_reparse_point(path) for path in root.iterdir()):
-        raise ValueError("Causal artifact files are incomplete or unexpected.")
+    if supervision is not None:
+        supervision.verify()
+    root = validate_image_gico_directory(
+        output_dir,
+        expected_members=_ARTIFACT_FILES,
+        label="Image GICO causal artifact directory",
+    )
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     expected_manifest_fields = {
         "artifact",
@@ -406,9 +346,9 @@ def load_image_gico_causal_artifact(
         "reference_time_grid",
     }:
         raise ValueError("Causal support arrays are invalid.")
-    support = _load_array(root, arrays["fixed_density_mass"], field="fixed_density_mass")
-    reference = _load_array(root, arrays["reference_time_grid"], field="reference_time_grid")
-    contexts = _load_array(root, arrays["normalized_contexts"], field="normalized_contexts")
+    support = load_float64_npy(root, arrays["fixed_density_mass"], field="fixed_density_mass")
+    reference = load_float64_npy(root, arrays["reference_time_grid"], field="reference_time_grid")
+    contexts = load_float64_npy(root, arrays["normalized_contexts"], field="normalized_contexts")
     if (
         contexts.ndim != 2
         or contexts.shape[0] < 1
@@ -445,6 +385,7 @@ def load_image_gico_causal_artifact(
     _validate_training_report(
         manifest.get("training_report"),
         supervision_sha256=str(manifest["supervision_sha256"]),
+        model_state_sha256=str(manifest["state_sha256"]),
         path_bank=path_bank,
     )
     state_path = root / "causal-state.pt"

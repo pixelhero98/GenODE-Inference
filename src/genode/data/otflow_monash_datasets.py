@@ -7,9 +7,10 @@ import stat
 import tempfile
 import urllib.request
 import zipfile
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any
 
 from genode.data.otflow_experiment_plan import FORECAST_FAMILY
 from genode.path_safety import (
@@ -57,11 +58,11 @@ class TsfHeader:
     horizon: int
     missing: bool
     equal_length: bool
-    attribute_names: Tuple[str, ...]
+    attribute_names: tuple[str, ...]
     data_start_line: int
 
 
-MONASH_REFERENCE_DATASETS: Tuple[MonashDatasetSpec, ...] = (
+MONASH_REFERENCE_DATASETS: tuple[MonashDatasetSpec, ...] = (
     MonashDatasetSpec(
         key="solar_energy_10m",
         display_name="Solar Energy (Monash, 10m)",
@@ -104,7 +105,7 @@ MONASH_REFERENCE_DATASETS: Tuple[MonashDatasetSpec, ...] = (
 )
 
 
-def monash_reference_dataset_keys() -> Tuple[str, ...]:
+def monash_reference_dataset_keys() -> tuple[str, ...]:
     return tuple(spec.key for spec in MONASH_REFERENCE_DATASETS)
 
 
@@ -244,7 +245,7 @@ def _safe_extraction_root(destination_dir: Path) -> Path:
 def _extract_zip(archive_path: Path, destination_dir: Path) -> Path:
     destination_root = _safe_extraction_root(destination_dir)
     with zipfile.ZipFile(archive_path, "r") as archive:
-        extraction_plan: List[Tuple[zipfile.ZipInfo, Path]] = []
+        extraction_plan: list[tuple[zipfile.ZipInfo, Path]] = []
         seen_paths: set[str] = set()
         for member in archive.infolist():
             unix_mode = int(member.external_attr) >> 16
@@ -312,7 +313,7 @@ def parse_tsf_header(tsf_path: str | Path) -> TsfHeader:
     horizon = 0
     missing = False
     equal_length = False
-    attribute_names: List[str] = []
+    attribute_names: list[str] = []
     data_start_line = -1
     with Path(tsf_path).open("r", encoding="utf-8") as fh:
         for line_number, raw_line in enumerate(fh, start=1):
@@ -352,7 +353,7 @@ def parse_tsf_header(tsf_path: str | Path) -> TsfHeader:
     )
 
 
-def iter_tsf_series(tsf_path: str | Path) -> Iterator[Tuple[int, Dict[str, str], List[Optional[float]]]]:
+def iter_tsf_series(tsf_path: str | Path) -> Iterator[tuple[int, dict[str, str], list[float | None]]]:
     header = parse_tsf_header(tsf_path)
     attribute_count = int(len(header.attribute_names))
     with Path(tsf_path).open("r", encoding="utf-8") as fh:
@@ -367,7 +368,7 @@ def iter_tsf_series(tsf_path: str | Path) -> Iterator[Tuple[int, Dict[str, str],
                 raise ValueError(f"Malformed TSF data line {line_number} in {tsf_path}")
             attr_values = parts[:attribute_count]
             series_text = ":".join(parts[attribute_count:])
-            series_values: List[Optional[float]] = []
+            series_values: list[float | None] = []
             for token in series_text.split(","):
                 item = token.strip()
                 if not item or item == "?":
@@ -384,7 +385,7 @@ def _default_context_length(official_horizon: int, min_series_length: int) -> in
     return int(max(4, min(max_allowed, max(4 * horizon, 64))))
 
 
-def download_monash_dataset(dataset_root: str | Path, dataset_key: str) -> Dict[str, Any]:
+def download_monash_dataset(dataset_root: str | Path, dataset_key: str) -> dict[str, Any]:
     spec = get_monash_dataset_spec(dataset_key)
     source_dir = default_source_dir(dataset_root, dataset_key)
     archive_path = default_archive_path(dataset_root, dataset_key)
@@ -451,8 +452,8 @@ def download_monash_dataset(dataset_root: str | Path, dataset_key: str) -> Dict[
 
 
 def download_monash_paper_datasets(
-    dataset_root: str | Path, dataset_keys: Optional[Tuple[str, ...]] = None
-) -> List[Dict[str, Any]]:
+    dataset_root: str | Path, dataset_keys: tuple[str, ...] | None = None
+) -> list[dict[str, Any]]:
     keys = monash_reference_dataset_keys() if dataset_keys is None else tuple(str(key) for key in dataset_keys)
     return [download_monash_dataset(dataset_root, key) for key in keys]
 
@@ -476,7 +477,7 @@ def build_single_tail_holdout_plan(
     series_length: int,
     official_horizon: int,
     context_length: int,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     total = int(series_length)
     horizon = int(official_horizon)
     context = int(context_length)
@@ -497,7 +498,7 @@ def build_single_tail_holdout_plan(
     }
 
 
-def dataset_prep_stub(dataset_root: str | Path, dataset_key: str) -> Dict[str, Any]:
+def dataset_prep_stub(dataset_root: str | Path, dataset_key: str) -> dict[str, Any]:
     spec = get_monash_dataset_spec(dataset_key)
     manifest_path = default_manifest_path(dataset_root, dataset_key)
     status = "ready" if manifest_path.exists() else "missing_manifest"
@@ -523,7 +524,7 @@ def dataset_prep_stub(dataset_root: str | Path, dataset_key: str) -> Dict[str, A
     }
 
 
-def all_dataset_prep_stubs(dataset_root: str | Path) -> List[Dict[str, Any]]:
+def all_dataset_prep_stubs(dataset_root: str | Path) -> list[dict[str, Any]]:
     return [dataset_prep_stub(dataset_root, spec.key) for spec in MONASH_REFERENCE_DATASETS]
 
 

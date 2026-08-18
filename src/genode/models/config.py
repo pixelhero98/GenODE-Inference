@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import torch
 
@@ -16,7 +16,7 @@ class SequenceDataConfig:
     context_feature_dim: int = 0
     standardize: bool = True
     use_cond_features: bool = False
-    cond_depths: Tuple[int, ...] = (1, 3, 5, 10)
+    cond_depths: tuple[int, ...] = (1, 3, 5, 10)
     cond_vol_window: int = 50
     cond_standardize: bool = True
 
@@ -37,7 +37,7 @@ class SharedModelConfig:
     ctx_encoder: str = "transformer"
     ctx_causal: bool = True
     ctx_local_kernel: int = 5
-    ctx_pool_scales: Tuple[int, ...] = (4, 16)
+    ctx_pool_scales: tuple[int, ...] = (4, 16)
     ctx_heads: int = 4
     ctx_layers: int = 2
     diffusion_steps: int = 32
@@ -85,7 +85,7 @@ class SampleConfig:
     steps: int = 2
     cfg_scale: float = 1.0
     solver: str = "euler"
-    time_grid: Tuple[float, ...] = ()
+    time_grid: tuple[float, ...] = ()
     # Retained only so frozen OTFlow checkpoint configs remain loadable.
     adaptive_beta: float = 0.9
     adaptive_tau: float = 0.15
@@ -104,10 +104,10 @@ class SampleConfig:
     refine_trigger_mode: str = "zscore"
     refine_threshold_z: float = 1.5
     refine_threshold_raw: float = 0.0
-    refine_step_mu: Tuple[float, ...] = ()
-    refine_step_sigma: Tuple[float, ...] = ()
-    refine_step_threshold: Tuple[float, ...] = ()
-    refine_selected_steps: Tuple[int, ...] = ()
+    refine_step_mu: tuple[float, ...] = ()
+    refine_step_sigma: tuple[float, ...] = ()
+    refine_step_threshold: tuple[float, ...] = ()
+    refine_selected_steps: tuple[int, ...] = ()
     refine_fixed_last_k: int = 0
     refine_sigma_eps: float = 1e-6
     refine_disallow_final_step: bool = True
@@ -123,11 +123,11 @@ class OTFlowConfig:
 
     def __init__(
         self,
-        data: Optional[SequenceDataConfig] = None,
-        model: Optional[SharedModelConfig] = None,
-        fm: Optional[FMConfig] = None,
-        train: Optional[TrainConfig] = None,
-        sample: Optional[SampleConfig] = None,
+        data: SequenceDataConfig | None = None,
+        model: SharedModelConfig | None = None,
+        fm: FMConfig | None = None,
+        train: TrainConfig | None = None,
+        sample: SampleConfig | None = None,
         **flat_overrides: Any,
     ):
         object.__setattr__(self, "data", data if data is not None else SequenceDataConfig())
@@ -145,7 +145,7 @@ class OTFlowConfig:
                 return getattr(section, name)
         raise AttributeError(f"{type(self).__name__!s} has no attribute {name!r}")
 
-    def apply_overrides(self, **flat_overrides: Any) -> "OTFlowConfig":
+    def apply_overrides(self, **flat_overrides: Any) -> OTFlowConfig:
         for key, value in flat_overrides.items():
             matched = False
             for section_name in _CONFIG_SECTIONS:
@@ -191,7 +191,7 @@ class OTFlowConfig:
     def sample_state_dim(self) -> int:
         return int(self.snapshot_dim) * int(self.prediction_horizon)
 
-    def to_dict(self) -> Dict[str, Dict[str, Any]]:
+    def to_dict(self) -> dict[str, dict[str, Any]]:
         train_dict = asdict(self.train)
         if isinstance(train_dict.get("device"), torch.device):
             train_dict["device"] = str(train_dict["device"])
