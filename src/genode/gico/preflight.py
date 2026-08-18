@@ -955,7 +955,7 @@ def validate_gico_support_preflight_report(report: Mapping[str, Any], *, label: 
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Preflight GICO support rows without training.")
-    parser.add_argument("--rows_csv", required=True, help="Comma-separated per-example fixed/SER metric rows CSVs.")
+    parser.add_argument("--rows_csv", required=True, help="Comma-separated per-example schedule metric rows CSVs.")
     parser.add_argument(
         "--schedule_summary_json",
         default="",
@@ -970,7 +970,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--support_schedule_keys",
         default="",
-        help="Comma-separated fixed/SER supervision keys. Defaults to observed row keys, matching genode-train-gico.",
+        help="Comma-separated supervision keys. Defaults to observed row keys, matching genode-train-gico.",
     )
     parser.add_argument(
         "--teacher_metric_target_keys",

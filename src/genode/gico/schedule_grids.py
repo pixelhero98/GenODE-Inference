@@ -5,17 +5,10 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from genode.data.otflow_paths import resolve_project_path
-from genode.gico.density_representation import (
-    average_density_masses,
-    density_mass_to_time_grid,
-    grid_to_density_mass,
-    uniform_reference_grid,
-)
 from genode.gico.models import validate_time_grid
 from genode.gico.policy import density_mass_for_row
 from genode.solver_protocol import normalize_solver_key, normalize_solver_nfe_fields
 
-CANONICAL_DENSITY_BIN_COUNT = 64
 ScheduleGridKey = tuple[Any, ...]
 
 
@@ -67,32 +60,6 @@ def load_schedule_summary_grids(paths: Sequence[str]) -> dict[ScheduleGridKey, t
                 grids[base_key] = base_grid
                 if checkpoint_step is not None:
                     grids[(*base_key, int(checkpoint_step))] = base_grid
-                if schedule_key == "ser_ptg_local_defect_eta005":
-                    reversed_grid = validate_time_grid(
-                        [1.0 - float(value) for value in reversed(base_grid)],
-                        macro_steps=nfe.macro_steps,
-                    )
-                    reversed_key = ("ser_ptg_local_defect_eta005_reversed", solver, target_nfe)
-                    grids[reversed_key] = reversed_grid
-                    if checkpoint_step is not None:
-                        grids[(*reversed_key, int(checkpoint_step))] = reversed_grid
-                    reference = uniform_reference_grid(CANONICAL_DENSITY_BIN_COUNT)
-                    base_mass = grid_to_density_mass(
-                        base_grid, reference_time_grid=reference, macro_steps=nfe.macro_steps
-                    )
-                    reversed_mass = grid_to_density_mass(
-                        reversed_grid, reference_time_grid=reference, macro_steps=nfe.macro_steps
-                    )
-                    averaged_mass = average_density_masses(base_mass, reversed_mass)
-                    avg_key = ("ser_ptg_local_defect_eta005_avg_reversed", solver, target_nfe)
-                    avg_grid = density_mass_to_time_grid(
-                        averaged_mass,
-                        reference_time_grid=reference,
-                        macro_steps=nfe.macro_steps,
-                    )
-                    grids[avg_key] = avg_grid
-                    if checkpoint_step is not None:
-                        grids[(*avg_key, int(checkpoint_step))] = avg_grid
     return grids
 
 

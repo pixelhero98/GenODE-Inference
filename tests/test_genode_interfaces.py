@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import subprocess
 import tomllib
 import unittest
@@ -74,22 +75,49 @@ class GenODEInterfaceTests(unittest.TestCase):
             "genode-train-gico",
             "genode-preflight-gico-rows",
             "genode-report-gico-locked-test",
-            "genode-build-ser-ptg-reference",
             "genode-evaluate-schedule-summary",
             "genode-build-hardness-figure",
-            "genode-build-ptg-figure",
             "genode-package-backbone-family",
             "genode-validate-backbone-package",
             "genode-build-release-archive",
-            "genode-collect-flow-map-demonstrations",
-            "genode-train-flow-map",
-            "genode-evaluate-flow-map",
             "genode-image-gico",
         }
         self.assertEqual(set(scripts), expected)
         for target in scripts.values():
             module_name, func_name = str(target).split(":", 1)
             self.assertTrue(callable(getattr(importlib.import_module(module_name), func_name)))
+
+    def test_publication_metadata_is_gico_only(self) -> None:
+        data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        project = data["project"]
+
+        self.assertEqual(project["version"], "0.6.0")
+        self.assertEqual(
+            project["description"], "GICO inference-clock optimization for frozen flow-matching backbones."
+        )
+
+    def test_retired_feature_modules_and_commands_are_absent(self) -> None:
+        retired_modules = (
+            "genode." + "distillation",
+            "genode.gico." + "ser_" + "ptg_reference",
+            "genode.visualization." + "build_ptg_" + "observed_gain_figure",
+        )
+        for module_name in retired_modules:
+            with self.subTest(module_name=module_name):
+                spec = importlib.util.find_spec(module_name)
+                self.assertTrue(spec is None or spec.loader is None)
+
+        scripts = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["scripts"]
+        retired_commands = (
+            "genode-build-ser-" + "ptg-reference",
+            "genode-build-" + "ptg-figure",
+            "genode-collect-" + "flow-map-demonstrations",
+            "genode-train-" + "flow-map",
+            "genode-evaluate-" + "flow-map",
+        )
+        for command in retired_commands:
+            with self.subTest(command=command):
+                self.assertNotIn(command, scripts)
 
     def test_readme_locked_test_command_includes_uniform_baseline_rows(self) -> None:
         readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
@@ -133,6 +161,17 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertNotIn("## Guarantees", text)
         self.assertNotIn("allow_noncanonical", text)
         self.assertNotIn("teacher-oracle", text.lower())
+        for retired_term in (
+            "Consistency " + "distillation",
+            "endpoint " + "flow-map",
+            "genode-build-ser-" + "ptg-reference",
+            "genode-build-" + "ptg-figure",
+            "genode-collect-" + "flow-map-demonstrations",
+            "genode-train-" + "flow-map",
+            "genode-evaluate-" + "flow-map",
+        ):
+            with self.subTest(retired_term=retired_term):
+                self.assertNotIn(retired_term, text)
 
     def test_publication_ci_covers_supported_matrix_and_image_cli(self) -> None:
         workflow = (PROJECT_ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
@@ -151,6 +190,9 @@ class GenODEInterfaceTests(unittest.TestCase):
             "train-stochastic",
             "validate",
             "materialize",
+            "retired consistency feature",
+            "retired SER/PTG feature",
+            "retired_member_fragments",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, workflow)
@@ -209,17 +251,28 @@ class GenODEInterfaceTests(unittest.TestCase):
         }
         self.assertFalse(removed_options & options)
 
-    def test_full_pipeline_public_contract_includes_ablation_first(self) -> None:
-        from genode.pipeline.full_pipeline import build_argparser
+    def test_full_pipeline_public_contract_excludes_retired_ser_controls(self) -> None:
+        from genode.pipeline.full_pipeline import (
+            DEFAULT_ABLATION_FIRST_STAGES,
+            DEFAULT_STAGES,
+            PIPELINE_STAGE_ORDER,
+            build_argparser,
+        )
 
         parser = build_argparser()
         options = {option for action in parser._actions for option in action.option_strings}
 
         self.assertIn("--ablation_first", options)
         self.assertIn("--gico_ablation_preset", options)
-        self.assertIn("--ser_calibration_batch_size", options)
-        self.assertIn("--ser_val_windows", options)
-        self.assertIn("--ser_train_tuning_max_examples", options)
+        retired_options = {
+            "--ser_" + "calibration_batch_size",
+            "--ser_" + "val_windows",
+            "--ser_" + "train_tuning_max_examples",
+        }
+        self.assertFalse(retired_options & options)
+        retired_stage = "ser_" + "summaries"
+        for stages in (DEFAULT_STAGES, DEFAULT_ABLATION_FIRST_STAGES, PIPELINE_STAGE_ORDER):
+            self.assertNotIn(retired_stage, stages)
 
     def test_project_path_resolver_does_not_rewrite_package_prefixes(self) -> None:
         from genode.data import otflow_paths

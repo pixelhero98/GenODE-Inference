@@ -189,15 +189,15 @@ class GICOCanonicalTests(unittest.TestCase):
         row = {
             "solver_key": "euler",
             "target_nfe": 4,
-            "scheduler_key": "ser_ptg_test",
+            "scheduler_key": "adaptive_density_test",
             "train_steps": 4000,
         }
 
         mass = density_mass_for_row(
             row,
             schedule_grids={
-                ("ser_ptg_test", "euler", 4): unscoped_grid,
-                ("ser_ptg_test", "euler", 4, 4000): scoped_grid,
+                ("adaptive_density_test", "euler", 4): unscoped_grid,
+                ("adaptive_density_test", "euler", 4, 4000): scoped_grid,
             },
             reference_time_grid=reference,
         )
@@ -672,7 +672,7 @@ class GICOCanonicalTests(unittest.TestCase):
 
             scalar_policy_path = root / "categorical_student.pt"
             scalar_policy_payload = dict(payload)
-            scalar_policy_payload["student_policy_type"] = "categorical_support_fixed_ser"
+            scalar_policy_payload["student_policy_type"] = "retired_categorical_support"
             torch.save(scalar_policy_payload, scalar_policy_path)
             with self.assertRaisesRegex(ValueError, "continuous_density"):
                 _load_student_checkpoint(scalar_policy_path)

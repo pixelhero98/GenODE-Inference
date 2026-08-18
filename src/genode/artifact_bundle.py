@@ -685,23 +685,6 @@ def _recover_locked(
     _cleanup_finalized_transaction(journal=journal, targets=targets, payload=payload)
 
 
-def recover_artifact_bundle(
-    anchor: str | Path,
-    targets: Mapping[str, str | Path],
-    *,
-    validator: BundleValidator | None = None,
-    validate_previous: bool = True,
-) -> None:
-    normalized_anchor, normalized_targets = _normalize_bundle(anchor, targets)
-    with exclusive_bundle_lock(normalized_anchor):
-        _recover_locked(
-            normalized_anchor,
-            normalized_targets,
-            validator=validator,
-            previous_validator=validator if validate_previous else None,
-        )
-
-
 def preflight_artifact_bundle(
     anchor: str | Path,
     targets: Mapping[str, str | Path],
@@ -863,7 +846,6 @@ __all__ = [
     "exclusive_bundle_lock",
     "preflight_artifact_bundle",
     "promote_artifact_bundle",
-    "recover_artifact_bundle",
     "temporary_bundle_path",
     "validate_artifact_bundle",
     "validate_artifact_bundle_layout",

@@ -67,7 +67,6 @@ from genode.gico.policy import (
     DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT,
     STUDENT_TARGET_MIXTURE_MODES,
 )
-from genode.gico.ser_ptg_reference import SER_PTG_EXAMPLE_SELECTION_PROTOCOL, SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL
 from genode.schedule_transfer.reference_clocks import (
     canonical_late_p_key,
     parse_extra_late_p_values,
@@ -78,7 +77,6 @@ PIPELINE_VERSION = "canonical_multi_family_gico_pipeline"
 DEFAULT_STAGES = (
     "data_prep",
     "backbone_training",
-    "ser_summaries",
     "schedule_rows_seen",
     "schedule_rows_unseen",
     "gico_student_seen_only_zero_shot",
@@ -89,7 +87,6 @@ GICO_ABLATION_STUDENT_STAGE = "gico_ablation_students"
 GICO_ABLATION_LOCKED_TEST_STAGE = "gico_ablation_locked_test_reports"
 DEFAULT_ABLATION_FIRST_STAGES = (
     "data_prep",
-    "ser_summaries",
     "schedule_rows_seen",
     "schedule_rows_unseen",
     GICO_ABLATION_STUDENT_STAGE,
@@ -253,12 +250,6 @@ def _validate_inputs_preflight(args: argparse.Namespace) -> dict[str, Any]:
             "--gico_supervision_context_sample_count must be in "
             f"[1, {CANONICAL_CONTEXT_SAMPLE_COUNT}], got {int(args.context_sample_count)!r}."
         )
-    if int(args.ser_calibration_batch_size) <= 0:
-        raise ValueError("--ser_calibration_batch_size must be positive.")
-    if int(args.ser_val_windows) < 0:
-        raise ValueError("--ser_val_windows must be nonnegative.")
-    if int(args.ser_train_tuning_max_examples) < 0:
-        raise ValueError("--ser_train_tuning_max_examples must be nonnegative.")
     if int(args.locked_test_eval_windows) < 0:
         raise ValueError("--locked_test_eval_windows must be nonnegative.")
     effective_stages = set(_effective_stage_names(args))
@@ -348,12 +339,6 @@ def _protocol_payload(args: argparse.Namespace) -> dict[str, Any]:
         "gico_supervision_context_sample_count": int(args.context_sample_count),
         "schedule_row_split_phases": list(SCHEDULE_ROW_SPLIT_PHASES),
         "locked_test_eval_windows": int(args.locked_test_eval_windows),
-        "ser_calibration_batch_size": int(args.ser_calibration_batch_size),
-        "ser_val_windows": int(args.ser_val_windows),
-        "ser_train_tuning_max_examples": int(args.ser_train_tuning_max_examples),
-        "ser_train_tuning_effective_max_examples": _effective_ser_train_tuning_max_examples(args),
-        "ser_example_selection_protocol": SER_PTG_EXAMPLE_SELECTION_PROTOCOL,
-        "ser_local_defect_proxy_protocol": SER_PTG_LOCAL_DEFECT_PROXY_PROTOCOL,
         "schedule_context_selection_protocol": SCHEDULE_CONTEXT_SELECTION_PROTOCOL,
         "gico_teacher_steps": int(args.gico_teacher_steps),
         "gico_student_steps": int(args.gico_student_steps),
@@ -384,19 +369,6 @@ def _protocol_payload(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "backbone_package": backbone_package_protocol_payload(args),
     }
-
-
-def _effective_ser_train_tuning_max_examples(args: argparse.Namespace) -> int:
-    explicit = int(getattr(args, "ser_train_tuning_max_examples", 0))
-    if explicit > 0:
-        return int(explicit)
-    return int(getattr(args, "context_sample_count", CANONICAL_CONTEXT_SAMPLE_COUNT))
-
-
-def _effective_ser_train_tuning_max_examples_source(args: argparse.Namespace) -> str:
-    if int(getattr(args, "ser_train_tuning_max_examples", 0)) > 0:
-        return "train_tuning_max_examples"
-    return "context_sample_count"
 
 
 def _has_ablation_stage(commands: Sequence[StageCommand]) -> bool:
@@ -579,14 +551,6 @@ def _stage_outputs_complete(entry: StageCommand) -> tuple[bool, str]:
             return False, str(schedule_status.get("reason", "schedule-row output is incomplete"))
         ok, reason = _command_json_output_exists(
             command,
-            module="genode.gico.ser_ptg_reference",
-            out_arg="--out_dir",
-            relative_path="ser_ptg_schedule_summary.json",
-        )
-        if not ok:
-            return False, reason
-        ok, reason = _command_json_output_exists(
-            command,
             module="genode.gico.train_gico",
             out_arg="--out_dir",
             relative_path="gico_training_summary.json",
@@ -669,14 +633,6 @@ def _resume_completed_prefix(
             break
         completed.append(entry)
     return completed
-
-
-def _fixed_schedule_keys_for_runner(schedule_keys: Sequence[str]) -> list[str]:
-    return [str(key) for key in schedule_keys if "ser_ptg_local_defect" not in str(key)]
-
-
-def _ser_schedule_keys_for_runner(schedule_keys: Sequence[str]) -> list[str]:
-    return [str(key) for key in schedule_keys if "ser_ptg_local_defect" in str(key)]
 
 
 def _schedule_keys_for_gico(schedule_keys: Sequence[str]) -> str:
@@ -801,11 +757,9 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[Stag
     seen_nfes = ",".join(str(value) for value in _parse_int_csv(str(args.seen_nfes), CANONICAL_SEEN_NFES))
     unseen_nfes = ",".join(str(value) for value in _parse_int_csv(str(args.unseen_nfes), CANONICAL_UNSEEN_NFES))
     schedules = _requested_schedule_keys(args)
-    fixed_schedules = ",".join(_fixed_schedule_keys_for_runner(schedules))
-    ser_schedules = ",".join(_ser_schedule_keys_for_runner(schedules))
+    fixed_schedules = ",".join(schedules)
     support_schedules = _schedule_keys_for_gico(schedules)
     rows_root = run_root / "schedule_rows"
-    ser_root = run_root / "ser_summaries"
     gico_root = run_root / "gico"
     ablation_preset = str(getattr(args, "gico_ablation_preset", DEFAULT_GICO_ABLATION_PRESET))
     gico_ablation_root = _ablation_root(run_root, ablation_preset)
@@ -816,16 +770,8 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[Stag
     def _rows_dir(role: str, phase: str, checkpoint_step: int) -> Path:
         return rows_root / role / phase / f"{int(checkpoint_step)}_steps"
 
-    def _ser_summary_path(role: str, checkpoint_step: int) -> Path:
-        return ser_root / role / f"{int(checkpoint_step)}_steps" / "ser_ptg_schedule_summary.json"
-
     def _csv_list(role: str, phase: str, name: str) -> str:
         return ",".join(str(_rows_dir(role, phase, int(step)) / name) for step in checkpoint_values)
-
-    def _ser_summary_list(role: str) -> str:
-        if not ser_schedules:
-            return ""
-        return ",".join(str(_ser_summary_path(role, int(step))) for step in checkpoint_values)
 
     def _schedule_row_phase_budget_args(phase: str) -> list[Any]:
         if str(phase) == "train_tuning":
@@ -843,8 +789,6 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[Stag
             _csv_list("seen", "train_tuning", "context_rows.csv"),
             "--context_embeddings_npz",
             _csv_list("seen", "train_tuning", "context_embeddings.npz"),
-            "--schedule_summary_json",
-            _ser_summary_list("seen"),
             "--support_schedule_keys",
             support_schedules,
             "--extra_late_p_values",
@@ -870,8 +814,6 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[Stag
                     _csv_list("unseen", "train_tuning", "context_rows.csv"),
                     "--student_unseen_target_context_embeddings_npz",
                     _csv_list("unseen", "train_tuning", "context_embeddings.npz"),
-                    "--student_unseen_target_schedule_summary_json",
-                    _ser_summary_list("unseen"),
                     "--student_unseen_target_weight",
                     f"{float(unseen_target_weight):g}",
                 ]
@@ -890,14 +832,6 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[Stag
         commands: list[list[str]] = []
         for phase in split_phases:
             for checkpoint_step in checkpoint_values:
-                summary_args: list[Any] = []
-                if ser_schedules:
-                    summary_args = [
-                        "--schedule_summary_json",
-                        _ser_summary_path(role, int(checkpoint_step)),
-                        "--summary_scheduler_names",
-                        ser_schedules,
-                    ]
                 commands.append(
                     _python_module_command(
                         "genode.evaluation.diffusion_flow_time_reparameterization",
@@ -911,7 +845,6 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[Stag
                             int(checkpoint_step),
                             "--baseline_scheduler_names",
                             fixed_schedules,
-                            *summary_args,
                             "--split_phase",
                             phase,
                             *_schedule_row_phase_budget_args(phase),
@@ -955,8 +888,6 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[Stag
                             "--context_embeddings_npz",
                             locked_dir / "context_embeddings.npz",
                             "--baseline_rows",
-                            locked_dir / "context_rows.csv",
-                            "--comparator_rows",
                             locked_dir / "context_rows.csv",
                             "--benchmark_family",
                             family,
@@ -1018,47 +949,6 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[Stag
             )
         return commands
 
-    ser_commands = [
-        _python_module_command(
-            "genode.gico.ser_ptg_reference",
-            [
-                "--dataset",
-                dataset,
-                "--solver_names",
-                ",".join(str(key) for key in CANONICAL_SOLVER_KEYS),
-                "--target_nfe_values",
-                role_nfes[role],
-                "--reference_split",
-                "train_tuning",
-                "--otflow_train_steps",
-                int(checkpoint_step),
-                "--steps",
-                int(checkpoint_step),
-                "--context_sample_count",
-                int(args.context_sample_count),
-                "--calibration_batch_size",
-                int(args.ser_calibration_batch_size),
-                "--val_windows",
-                int(args.ser_val_windows),
-                "--train_tuning_max_examples",
-                _effective_ser_train_tuning_max_examples(args),
-                "--train_tuning_max_examples_source",
-                _effective_ser_train_tuning_max_examples_source(args),
-                *_data_path_args(args),
-                "--backbone_manifest",
-                str(args.backbone_manifest),
-                "--molecule_group_root",
-                str(args.molecule_group_root),
-                "--out_dir",
-                ser_root / role / f"{int(checkpoint_step)}_steps",
-                "--device",
-                str(args.device),
-            ],
-        )
-        for role in ("seen", "unseen")
-        for checkpoint_step in checkpoint_values
-        if ser_schedules
-    ]
     commands = [
         StageCommand(
             "data_prep",
@@ -1078,11 +968,6 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[Stag
             "backbone_training",
             _backbone_training_commands(args, dataset, checkpoints),
             "backbone_training_manifest.json",
-        ),
-        StageCommand(
-            "ser_summaries",
-            ser_commands,
-            "ser_summaries_manifest.json",
         ),
         StageCommand(
             "schedule_rows_seen",
@@ -1351,9 +1236,6 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Train-tuning context budget for GICO teacher/student supervision. Locked-test evaluation is controlled separately.",
     )
     parser.add_argument("--locked_test_eval_windows", type=int, default=0)
-    parser.add_argument("--ser_calibration_batch_size", type=int, default=64)
-    parser.add_argument("--ser_val_windows", type=int, default=0)
-    parser.add_argument("--ser_train_tuning_max_examples", type=int, default=0)
     parser.add_argument("--gico_teacher_steps", type=int, default=DEFAULT_GICO_TEACHER_STEPS)
     parser.add_argument("--gico_student_steps", type=int, default=DEFAULT_GICO_STUDENT_STEPS)
     parser.add_argument("--student_teacher_score_weight", type=float, default=DEFAULT_STUDENT_TEACHER_SCORE_WEIGHT)

@@ -56,7 +56,6 @@ from genode.gico.objectives import (
 )
 from genode.gico.schedule_hash import json_hash as _canonical_json_hash
 from genode.gico.schedule_hash import schedule_grid_hash
-from genode.gico.ser_ptg_reference import SER_PTG_SCHEDULE_KEY
 from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
 from genode.schedule_transfer.diffusion_flow_schedules import build_schedule_grid
 from genode.schedule_transfer.reference_clocks import late_p_value_from_key
@@ -73,12 +72,6 @@ GICO_PROTOCOL = "gico_density"
 DEFAULT_SUPERVISION_SCHEDULE_KEYS: tuple[str, ...] = CANONICAL_SUPERVISION_SCHEDULE_KEYS
 DEFAULT_SUPPORT_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
 GICO_SUPPORT_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_SUPERVISION_SCHEDULE_KEYS
-EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS: tuple[str, ...] = (
-    *DEFAULT_SUPERVISION_SCHEDULE_KEYS,
-    "ser_ptg_local_defect_eta005",
-    "ser_ptg_local_defect_eta005_reversed",
-    "ser_ptg_local_defect_eta005_avg_reversed",
-)
 DEFAULT_CONTEXT_CALIBRATION_TOTAL = CANONICAL_CONTEXT_SAMPLE_COUNT
 DEFAULT_CONTEXT_CALIBRATION_VALIDATION_FRACTION = 0.20
 MIN_CONTEXT_CALIBRATION_TOTAL = 72
@@ -246,25 +239,36 @@ def validate_gico_teacher_training_metadata(metadata: Mapping[str, Any] | None) 
     if teacher_target not in {"metric_vector", "metric_vector_uniform"}:
         raise ValueError("GICO checkpoint must come from a metric-vector teacher.")
     teacher_metric_targets = validate_teacher_metric_target_keys(teacher_training.get("teacher_metric_targets", ()))
+    target_protocol = str(teacher_training.get("teacher_metric_target_protocol", "")).strip()
+    if target_protocol != TEACHER_METRIC_TARGET_PROTOCOL_VECTOR:
+        raise ValueError(
+            "GICO checkpoint teacher_metric_target_protocol must be "
+            f"{TEACHER_METRIC_TARGET_PROTOCOL_VECTOR!r}; got {target_protocol!r}."
+        )
+    mask_protocol = str(teacher_training.get("teacher_metric_mask_protocol", "")).strip()
+    if mask_protocol != TEACHER_METRIC_MASK_PROTOCOL:
+        raise ValueError(
+            "GICO checkpoint teacher_metric_mask_protocol must be "
+            f"{TEACHER_METRIC_MASK_PROTOCOL!r}; got {mask_protocol!r}."
+        )
     if str(teacher_training.get("teacher_scalarization", "")) != TEACHER_SCALARIZATION_WEIGHTED_AVERAGE:
         raise ValueError(f"GICO checkpoint teacher_scalarization must be {TEACHER_SCALARIZATION_WEIGHTED_AVERAGE!r}.")
-    selection = dict(teacher_training.get("teacher_checkpoint_selection", {}) or {})
+    selection_value = teacher_training.get("teacher_checkpoint_selection")
+    if not isinstance(selection_value, Mapping):
+        raise ValueError("GICO checkpoint teacher_checkpoint_selection must be an object.")
+    selection = dict(selection_value)
     if str(selection.get("selection_protocol", "")) != TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET:
         raise ValueError(
-            f"GICO checkpoints must use teacher checkpoint selection "
+            "GICO checkpoint teacher_checkpoint_selection.selection_protocol must be "
             f"{TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET!r}."
         )
-    if bool(selection.get("locked_test_used_for_selection", False)):
-        raise ValueError("GICO teacher checkpoint selection metadata must not use locked-test labels.")
+    if selection.get("locked_test_used_for_selection") is not False:
+        raise ValueError("GICO checkpoint teacher_checkpoint_selection requires locked_test_used_for_selection=false.")
     return {
         "teacher_target": teacher_target,
         "teacher_metric_targets": teacher_metric_targets,
-        "teacher_metric_target_protocol": str(
-            teacher_training.get("teacher_metric_target_protocol", TEACHER_METRIC_TARGET_PROTOCOL_VECTOR)
-        ),
-        "teacher_metric_mask_protocol": str(
-            teacher_training.get("teacher_metric_mask_protocol", TEACHER_METRIC_MASK_PROTOCOL)
-        ),
+        "teacher_metric_target_protocol": target_protocol,
+        "teacher_metric_mask_protocol": mask_protocol,
         "teacher_scalarization": TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
         "teacher_checkpoint_selection": selection,
     }
@@ -1082,7 +1086,7 @@ def nfe_sequence_diagnostic_summary(rows: Sequence[MetricRow]) -> dict[str, Any]
 def validate_gico_support_schedule_keys(
     support_schedule_keys: Sequence[str],
     *,
-    allowed_schedule_keys: Sequence[str] = EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS,
+    allowed_schedule_keys: Sequence[str] = DEFAULT_SUPERVISION_SCHEDULE_KEYS,
 ) -> tuple[str, ...]:
     keys = tuple(str(key).strip() for key in support_schedule_keys)
     if not keys:
@@ -1112,8 +1116,6 @@ def density_family_for_schedule_key(schedule_key: str) -> str:
     key = str(schedule_key).strip()
     if key == UNIFORM_SCHEDULE_KEY:
         return "uniform_anchor"
-    if key == SER_PTG_SCHEDULE_KEY:
-        return "ser_oracle"
     if key in AVERAGED_SCHEDULE_COMPONENTS:
         return f"avg_{AVERAGED_SCHEDULE_COMPONENTS[key][0]}"
     suffix = "_reversed"
@@ -1214,7 +1216,7 @@ def attach_uniform_gico_rewards(
     for row in materialized:
         schedule_key = str(row["scheduler_key"])
         if schedule_key not in support:
-            raise ValueError(f"Unsupported GICO supervision row {schedule_key!r}; expected fixed/SER support.")
+            raise ValueError(f"Unsupported GICO supervision row {schedule_key!r}; expected fixed reference support.")
         row["context_id"] = context_id_from_row(row)
         grouped[context_pair_key(row, pair_on_seed=pair_on_seed)].append(row)
 
@@ -4328,7 +4330,6 @@ __all__ = [
     "DEFAULT_DENSITY_BIN_COUNT",
     "DEFAULT_SUPPORT_SCHEDULE_KEYS",
     "DEFAULT_SUPERVISION_SCHEDULE_KEYS",
-    "EXPERIMENTAL_SUPERVISION_SCHEDULE_KEYS",
     "DEFAULT_TEACHER_TARGET_TEMPERATURE",
     "STUDENT_TARGET_PROTOCOL_SOFT_MIXTURE",
     "STUDENT_TARGET_MIXTURE_MODE_FULL",

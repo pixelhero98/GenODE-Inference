@@ -49,7 +49,7 @@ CANONICAL_SCENARIO_KEYS: tuple[str, ...] = (
 
 PHYSICAL_SCHEDULE_KEYS: tuple[str, ...] = REFERENCE_CLOCK_BASE_KEYS
 REVERSED_SCHEDULE_KEYS: tuple[str, ...] = REFERENCE_CLOCK_REVERSED_KEYS
-# Density-averaged and SER clocks remain available only through explicit, non-canonical inputs.
+# Additional dynamic clocks remain available only through explicit, non-canonical inputs.
 AVERAGED_REVERSED_SCHEDULE_KEYS: tuple[str, ...] = ()
 CANONICAL_SUPERVISION_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
 

@@ -278,38 +278,6 @@ class GicoPreflightTests(unittest.TestCase):
         self.assertEqual(allow_report["status"], "issues_found")
         self.assertGreater(allow_report["issue_count"], 0)
 
-    def test_preflight_reports_missing_schedule_summary_grids(self) -> None:
-        ser_key = "ser_ptg_local_defect_eta005"
-        with tempfile.TemporaryDirectory() as tmpdir:
-            rows_csv = Path(tmpdir) / "rows.csv"
-            _write_rows(
-                rows_csv,
-                [
-                    _row("ctx_0", "uniform"),
-                    _row("ctx_0", ser_key),
-                    _row("ctx_1", "uniform"),
-                    _row("ctx_1", ser_key),
-                    _row("ctx_2", "uniform"),
-                    _row("ctx_2", ser_key),
-                ],
-            )
-            args = build_argparser().parse_args(
-                [
-                    "--rows_csv",
-                    str(rows_csv),
-                    "--support_schedule_keys",
-                    f"uniform,{ser_key}",
-                    "--teacher_metric_target_keys",
-                    "u_comp_uniform",
-                ]
-            )
-
-            report = preflight_gico_rows(args)
-
-        self.assertEqual(report["status"], "issues_found")
-        self.assertEqual(report["schedule_grid_preflight"]["missing_grid_row_count"], 3)
-        self.assertEqual(report["schedule_grid_preflight"]["missing_grid_rows"][0]["scheduler_key"], ser_key)
-
     def test_preflight_context_count_accepts_explicit_schema_identity_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             rows_csv = Path(tmpdir) / "rows.csv"

@@ -95,18 +95,18 @@ class GenericContextGicoTests(unittest.TestCase):
         self.assertEqual(args.context_embeddings_npz_name, "context_embeddings.npz")
         self.assertFalse(args.write_context_rows)
 
-    def test_locked_report_filters_shared_context_rows_to_baseline_and_ser_sets(self) -> None:
+    def test_locked_report_filters_shared_context_rows_to_requested_sets(self) -> None:
         rows = [
             {"scheduler_key": "uniform"},
             {"scheduler_key": "late_p_2"},
-            {"scheduler_key": "ser_ptg_local_defect_eta005"},
+            {"scheduler_key": "adaptive_density"},
             {"scheduler_key": "gico"},
         ]
         baseline_rows = report_locked_test._filter_rows_to_schedule_keys(rows, ["uniform", "late_p_2"])
-        ser_rows = report_locked_test._filter_rows_to_schedule_keys(rows, ["ser_ptg_local_defect_eta005"])
+        dynamic_rows = report_locked_test._filter_rows_to_schedule_keys(rows, ["adaptive_density"])
 
         self.assertEqual([row["scheduler_key"] for row in baseline_rows], ["uniform", "late_p_2"])
-        self.assertEqual([row["scheduler_key"] for row in ser_rows], ["ser_ptg_local_defect_eta005"])
+        self.assertEqual([row["scheduler_key"] for row in dynamic_rows], ["adaptive_density"])
 
     def test_forecast_unseen_rows_are_reward_materialized_before_student_distillation(self) -> None:
         def write_rows(path: Path, target_nfes: tuple[int, ...]) -> None:
@@ -1044,7 +1044,7 @@ class GenericContextGicoTests(unittest.TestCase):
                 "solver_key": "dpmpp2m",
                 "target_nfe": "4",
                 "checkpoint_step": "4000",
-                "scheduler_key": "ser_ptg_local_defect_eta005",
+                "scheduler_key": "adaptive_density",
                 "context_id": "ctx-4",
                 "context_embedding_id": "ckpt:ctx-4",
                 "checkpoint_id": "ckpt",
@@ -1114,7 +1114,6 @@ class GenericContextGicoTests(unittest.TestCase):
                 target_nfe_values="4",
                 molecule_group_root="",
                 baseline_rows=str(context_csv),
-                comparator_rows="",
                 dataset_root=str(tmp),
                 shared_backbone_root=str(tmp),
                 device="cpu",
@@ -1337,7 +1336,9 @@ class GenericContextGicoTests(unittest.TestCase):
             first_command = [full_pipeline.sys.executable, "-c", "print('first')"]
             second_command = [full_pipeline.sys.executable, "-c", "print('second')"]
             first_stage = full_pipeline.StageCommand("data_prep", [first_command], "data_prep_manifest.json")
-            second_stage = full_pipeline.StageCommand("ser_summaries", [second_command], "ser_summaries_manifest.json")
+            second_stage = full_pipeline.StageCommand(
+                "schedule_rows_seen", [second_command], "schedule_rows_seen_manifest.json"
+            )
             (run_root / "status.json").write_text(
                 json.dumps({"protocol_hash": protocol_hash, "status": "failed"}),
                 encoding="utf-8",
@@ -1366,7 +1367,7 @@ class GenericContextGicoTests(unittest.TestCase):
         self.assertEqual(run_mock.call_count, 1)
         self.assertEqual(run_mock.call_args.args[0], second_command)
         self.assertEqual(summary["skipped_stages"], ["data_prep"])
-        self.assertEqual(summary["executed_stages"], ["ser_summaries"])
+        self.assertEqual(summary["executed_stages"], ["schedule_rows_seen"])
 
     def test_full_pipeline_resume_reruns_partial_schedule_stage_despite_combined_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1660,7 +1661,6 @@ class GenericContextGicoTests(unittest.TestCase):
             [stage["stage"] for stage in summary["stages"]],
             [
                 "data_prep",
-                "ser_summaries",
                 "schedule_rows_seen",
                 "schedule_rows_unseen",
                 "gico_ablation_students",
@@ -1735,71 +1735,6 @@ class GenericContextGicoTests(unittest.TestCase):
         self.assertTrue(any("Backbone manifest is missing" in error for error in validation["errors"]))
         self.assertEqual(validation["manifest"], "backbone_manifest.json")
         self.assertNotIn(str(Path(tmpdir).resolve()), json.dumps(validation, sort_keys=True))
-
-    def test_full_pipeline_ser_controls_are_protocolized_without_entering_primary_commands(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            args = full_pipeline.build_argparser().parse_args(
-                [
-                    "--scenario_key",
-                    "lobster_synthetic",
-                    "--run_root",
-                    str(Path(tmpdir) / "run"),
-                    "--ablation_first",
-                    "--ser_calibration_batch_size",
-                    "1",
-                    "--ser_val_windows",
-                    "0",
-                    "--ser_train_tuning_max_examples",
-                    "17",
-                    "--dry_run",
-                ]
-            )
-            summary = full_pipeline.run_full_pipeline(args)
-        by_stage = {stage["stage"]: [" ".join(command) for command in stage["commands"]] for stage in summary["stages"]}
-        ser_commands = by_stage["ser_summaries"]
-        non_ser_commands = [
-            command for stage, commands in by_stage.items() if stage != "ser_summaries" for command in commands
-        ]
-        self.assertEqual(ser_commands, [])
-        self.assertTrue(all("--calibration_batch_size" not in command for command in non_ser_commands))
-        self.assertTrue(all("--val_windows" not in command for command in non_ser_commands))
-        self.assertTrue(all("--train_tuning_max_examples" not in command for command in non_ser_commands))
-        protocol = full_pipeline._protocol_payload(args)
-        self.assertEqual(protocol["ser_calibration_batch_size"], 1)
-        self.assertEqual(protocol["ser_val_windows"], 0)
-        self.assertEqual(protocol["ser_train_tuning_max_examples"], 17)
-        self.assertEqual(protocol["ser_train_tuning_effective_max_examples"], 17)
-        self.assertEqual(protocol["ser_example_selection_protocol"], "ser_ptg_reference_global_context_capped_v3")
-        self.assertEqual(protocol["ser_local_defect_proxy_protocol"], "otflow_midpoint_local_defect_proxy_v1")
-        self.assertEqual(protocol["schedule_context_selection_protocol"], "schedule_evaluation_phase_context_capped_v4")
-
-    def test_full_pipeline_default_ser_train_tuning_cap_tracks_context_count(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            args = full_pipeline.build_argparser().parse_args(
-                [
-                    "--scenario_key",
-                    "lobster_synthetic",
-                    "--run_root",
-                    str(Path(tmpdir) / "run"),
-                    "--ablation_first",
-                    "--context_sample_count",
-                    "123",
-                    "--dry_run",
-                ]
-            )
-            summary = full_pipeline.run_full_pipeline(args)
-        by_stage = {stage["stage"]: [" ".join(command) for command in stage["commands"]] for stage in summary["stages"]}
-        self.assertTrue(all("--train_tuning_max_examples 123" in command for command in by_stage["ser_summaries"]))
-        self.assertTrue(
-            all(
-                "--train_tuning_max_examples_source context_sample_count" in command
-                for command in by_stage["ser_summaries"]
-            )
-        )
-        protocol = full_pipeline._protocol_payload(args)
-        self.assertEqual(protocol["ser_train_tuning_max_examples"], 0)
-        self.assertEqual(protocol["ser_train_tuning_effective_max_examples"], 123)
-        self.assertEqual(protocol["gico_supervision_context_sample_count"], 123)
 
     def test_full_pipeline_does_not_apply_supervision_cap_to_locked_test_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1879,7 +1814,7 @@ class GenericContextGicoTests(unittest.TestCase):
         self.assertEqual(protocol["schedule_row_split_phases"], ["train_tuning", "locked_test"])
         self.assertEqual(protocol["locked_test_eval_windows"], 19)
 
-    def test_full_pipeline_no_ser_fixed_support_skips_validation_rows(self) -> None:
+    def test_full_pipeline_fixed_support_skips_validation_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             args = full_pipeline.build_argparser().parse_args(
                 [
@@ -1899,13 +1834,11 @@ class GenericContextGicoTests(unittest.TestCase):
             )
             summary = full_pipeline.run_full_pipeline(args)
         by_stage = {stage["stage"]: stage["commands"] for stage in summary["stages"]}
-        self.assertNotIn("ser_summaries", by_stage)
         schedule_commands = by_stage["schedule_rows_seen"] + by_stage["schedule_rows_unseen"]
         split_phases = [command[command.index("--split_phase") + 1] for command in schedule_commands]
         self.assertEqual(set(split_phases), {"train_tuning", "locked_test"})
         self.assertEqual(len(by_stage["schedule_rows_seen"]), 2)
         self.assertEqual(len(by_stage["schedule_rows_unseen"]), 2)
-        self.assertFalse(any("ser_ptg" in " ".join(command) for command in schedule_commands))
         self.assertFalse(any("--eval_windows_val" in command for command in schedule_commands))
         self.assertFalse(any(phase == "validation_tuning" for phase in split_phases))
         for command in schedule_commands:
@@ -1964,7 +1897,7 @@ class GenericContextGicoTests(unittest.TestCase):
             self.assertIn("--student_steps 43", command)
             self.assertIn("--seen_target_nfe_values 4,8", command)
             self.assertIn("--unseen_target_nfe_values 6,10", command)
-            self.assertIn("--schedule_summary_json", command)
+            self.assertNotIn("--schedule_summary_json", command)
             self.assertNotIn("--student_teacher_score_include_unseen_targets", command)
             if arm.student_target_mixture_mode == "elite_blend":
                 self.assertIn(
@@ -1973,7 +1906,7 @@ class GenericContextGicoTests(unittest.TestCase):
                 )
             if arm.uses_unseen_targets:
                 self.assertIn("--student_unseen_target_rows_csv", command)
-                self.assertIn("--student_unseen_target_schedule_summary_json", command)
+                self.assertNotIn("--student_unseen_target_schedule_summary_json", command)
                 self.assertIn("--student_unseen_target_weight 0.25", command)
             else:
                 self.assertNotIn("--student_unseen_target_rows_csv", command)

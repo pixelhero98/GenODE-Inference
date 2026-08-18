@@ -84,7 +84,7 @@ class ReferenceClockTests(unittest.TestCase):
         self.assertEqual(len(set(DEFAULT_REFERENCE_CLOCK_KEYS)), 23)
         runner_defaults = tuple(schedule_runner.build_argparser().parse_args([]).baseline_scheduler_names.split(","))
         self.assertEqual(runner_defaults, EXPECTED_DEFAULT_KEYS)
-        for removed in ("late_power_3", "ser_ptg_local_defect_eta005", "ays_avg_reversed"):
+        for removed in ("late_power_3", "ays_avg_reversed"):
             self.assertNotIn(removed, DEFAULT_REFERENCE_CLOCK_KEYS)
 
     def test_image_protocol_uses_dynamic_canonical_clock_count_and_provenance(self) -> None:

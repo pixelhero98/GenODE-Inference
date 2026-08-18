@@ -2,22 +2,12 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
-import numpy as np
 import pytest
 import torch
 
 from genode.checkpoint_validation import (
-    normalize_strict_solver_nfe_fields as normalize_solver_nfe_fields,
-)
-from genode.checkpoint_validation import (
     validate_tensor_state_dict,
 )
-from genode.distillation.gico_policy import (
-    build_gico_student_model,
-    validate_gico_teacher_training_metadata,
-)
-from genode.distillation.model import EndpointFlowMap, FlowMapSampler
-from genode.distillation.training import _validate_continuous_array
 from genode.gico.models import (
     build_setting_encoder_config,
     setting_feature_dim,
@@ -27,26 +17,9 @@ from genode.gico.policy import (
     TEACHER_METRIC_MASK_PROTOCOL,
     TEACHER_METRIC_TARGET_PROTOCOL_VECTOR,
     TEACHER_SCALARIZATION_WEIGHTED_AVERAGE,
+    build_gico_student_model,
+    validate_gico_teacher_training_metadata,
 )
-from genode.models.config import OTFlowConfig
-from genode.models.otflow_model import OTFlow
-
-
-def _tiny_config() -> OTFlowConfig:
-    return OTFlowConfig(
-        device=torch.device("cpu"),
-        levels=1,
-        token_dim=4,
-        history_len=2,
-        hidden_dim=8,
-        dropout=0.0,
-        ctx_heads=4,
-        ctx_layers=1,
-        fu_net_layers=1,
-        fu_net_heads=4,
-        use_amp=False,
-        use_minibatch_ot=False,
-    )
 
 
 def _setting_config():
@@ -65,40 +38,6 @@ def _teacher_training_metadata() -> dict[str, object]:
             "locked_test_used_for_selection": False,
         },
     }
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    (
-        ("target_nfe", True),
-        ("target_nfe", 4.0),
-        ("target_nfe", 4.5),
-        ("macro_steps", False),
-        ("macro_steps", 2.0),
-        ("macro_steps", 2.5),
-        ("realized_nfe", True),
-        ("realized_nfe", 4.0),
-        ("realized_nfe", 4.5),
-    ),
-)
-def test_solver_nfe_fields_reject_non_integer_types(field: str, value: object) -> None:
-    arguments = {field: value}
-    if field != "target_nfe":
-        arguments["target_nfe"] = 4
-
-    with pytest.raises(ValueError, match=f"non-integer {field}"):
-        normalize_solver_nfe_fields("heun", **arguments)
-
-
-def test_solver_nfe_fields_accept_plain_integer_text_at_artifact_boundary() -> None:
-    result = normalize_solver_nfe_fields(
-        "heun",
-        "4",  # type: ignore[arg-type]
-        macro_steps="2",
-        realized_nfe="4",
-    )
-
-    assert (result.target_nfe, result.macro_steps, result.realized_nfe) == (4, 2, 4)
 
 
 def test_tensor_state_validation_matches_target_exactly() -> None:
@@ -141,19 +80,8 @@ def test_tensor_state_validation_rejects_non_real_floating_tensors(dtype: torch.
         validate_tensor_state_dict(state, label="test state", target_module=module)
 
 
-def test_flow_map_and_gico_boundaries_reject_dtype_coercion() -> None:
+def test_gico_boundary_rejects_dtype_coercion() -> None:
     config = _setting_config()
-    flow_map = EndpointFlowMap(
-        _tiny_config(),
-        setting_dim=setting_feature_dim(config=config),
-        density_dim=8,
-    )
-    flow_state = OrderedDict((name, tensor.detach().clone()) for name, tensor in flow_map.state_dict().items())
-    flow_key = next(iter(flow_state))
-    flow_state[flow_key] = flow_state[flow_key].to(torch.float64)
-    with pytest.raises(ValueError, match="has dtype"):
-        flow_map.load_state_dict(flow_state)
-
     student = build_gico_student_model(
         setting_dim=setting_feature_dim(config=config),
         density_dim=8,
@@ -173,37 +101,6 @@ def test_flow_map_and_gico_boundaries_reject_dtype_coercion() -> None:
             student_state,
             label="GICO student state",
             target_module=student,
-        )
-
-
-def test_flow_map_sampler_rejects_nonfinite_model_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cfg = _tiny_config()
-    config = _setting_config()
-    flow_map = EndpointFlowMap(
-        cfg,
-        setting_dim=setting_feature_dim(config=config),
-        density_dim=8,
-    )
-    sampler = FlowMapSampler(
-        OTFlow(cfg).eval(),
-        flow_map,
-        setting_encoder_config=config,
-    )
-    monkeypatch.setattr(
-        flow_map,
-        "forward",
-        lambda initial, *args, **kwargs: torch.full_like(initial, float("nan")),
-    )
-
-    with pytest.raises(ValueError, match="Flow-map output"):
-        sampler.map_state(
-            torch.zeros(1, cfg.sample_state_dim),
-            hist=torch.zeros(1, cfg.history_len, cfg.context_dim),
-            solver_key="euler",
-            target_nfe=2,
-            density_mass=torch.full((1, 8), 1.0 / 8.0),
         )
 
 
@@ -230,30 +127,21 @@ def test_teacher_training_metadata_requires_explicit_supported_protocols(
         validate_gico_teacher_training_metadata(metadata)
 
 
-@pytest.mark.parametrize(
-    "array",
-    (
-        np.zeros((2, 3), dtype=np.int64),
-        np.zeros((2, 3), dtype=np.complex64),
-    ),
-)
-def test_continuous_demonstration_arrays_require_real_floating_dtype(
-    array: np.ndarray,
-) -> None:
-    with pytest.raises(ValueError, match="real floating-point dtype"):
-        _validate_continuous_array(array, name="Trajectory states", rank=2)
+@pytest.mark.parametrize("value", (None, {}, {"selection_protocol": "unsupported"}))
+def test_teacher_training_metadata_requires_explicit_locked_test_exclusion(value: object) -> None:
+    metadata = _teacher_training_metadata()
+    if value is None:
+        metadata.pop("teacher_checkpoint_selection")
+    else:
+        metadata["teacher_checkpoint_selection"] = value
 
+    with pytest.raises(ValueError, match="teacher_checkpoint_selection"):
+        validate_gico_teacher_training_metadata(metadata)
 
-def test_continuous_demonstration_arrays_require_expected_nonempty_rank() -> None:
-    with pytest.raises(ValueError, match="rank 3"):
-        _validate_continuous_array(
-            np.zeros((2, 3), dtype=np.float32),
-            name="Context shard ctx_tokens",
-            rank=3,
-        )
-    with pytest.raises(ValueError, match="non-empty"):
-        _validate_continuous_array(
-            np.zeros((2, 0, 3), dtype=np.float32),
-            name="Context shard ctx_tokens",
-            rank=3,
-        )
+    metadata = _teacher_training_metadata()
+    metadata["teacher_checkpoint_selection"] = {
+        "selection_protocol": TEACHER_CHECKPOINT_SELECTION_WEIGHTED_NORMALIZED_REGRET,
+        "locked_test_used_for_selection": True,
+    }
+    with pytest.raises(ValueError, match="locked_test_used_for_selection=false"):
+        validate_gico_teacher_training_metadata(metadata)

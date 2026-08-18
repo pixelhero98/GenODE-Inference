@@ -37,22 +37,10 @@ from genode.evaluation.otflow_evaluation_support import (
     train_tuning_sampler_key,
     train_tuning_target_example_count,
 )
-from genode.gico.density_representation import (
-    average_density_masses,
-    density_mass_to_time_grid,
-    grid_to_density_mass,
-    uniform_reference_grid,
-)
 from genode.gico.models import validate_time_grid
 from genode.gico.objectives import attach_reward_columns, rewards_by_setting, seed_mean_metric_rows
 from genode.gico.policy import load_context_embedding_table, save_context_embedding_table
 from genode.gico.schedule_hash import schedule_grid_hash
-from genode.gico.ser_ptg_reference import (
-    SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
-    SER_PTG_REVERSED_SCHEDULE_KEY,
-    SER_PTG_SCHEDULE_KEY,
-    grid_geometry,
-)
 from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
 from genode.models.otflow_train_val import save_json
 from genode.runtime import ProgressBar, resolve_torch_device
@@ -74,11 +62,6 @@ SELECTED_STUDENT_SCHEDULE_KEY = "gico"
 SELECTED_STUDENT_SCHEDULE_NAME = "GICO"
 EVALUATOR_SIGNATURE_VERSION = "schedule_summary_evaluator_seen_unseen"
 SCHEDULE_CONTEXT_SELECTION_PROTOCOL = "schedule_summary_context_capped_v1"
-SER_REFERENCE_SCHEDULE_KEYS: tuple[str, ...] = (
-    SER_PTG_SCHEDULE_KEY,
-    SER_PTG_REVERSED_SCHEDULE_KEY,
-    SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
-)
 
 
 def _filter_rows_to_schedule_keys(
@@ -400,31 +383,22 @@ def _protocol_hash(args: argparse.Namespace) -> str:
 
 def schedule_display_name_for_key(schedule_key: str) -> str:
     key = str(schedule_key)
-    if key == SER_PTG_SCHEDULE_KEY:
-        return "SER-PTG local defect eta=0.05"
-    if key == SER_PTG_REVERSED_SCHEDULE_KEY:
-        return "SER-PTG local defect eta=0.05 reversed"
-    if key == SER_PTG_AVG_REVERSED_SCHEDULE_KEY:
-        return "SER-PTG local defect eta=0.05 density average"
     if key == SELECTED_STUDENT_SCHEDULE_KEY:
         return SELECTED_STUDENT_SCHEDULE_NAME
     return schedule_display_name(key)
 
 
-def _derived_ser_time_grid(schedule_key: str, base_grid: Sequence[float], *, macro_steps: int) -> tuple[float, ...]:
-    base = validate_time_grid(base_grid, macro_steps=int(macro_steps))
-    if str(schedule_key) == SER_PTG_REVERSED_SCHEDULE_KEY:
-        return validate_time_grid([1.0 - float(value) for value in reversed(base)], macro_steps=int(macro_steps))
-    if str(schedule_key) == SER_PTG_AVG_REVERSED_SCHEDULE_KEY:
-        reference = uniform_reference_grid()
-        reversed_grid = validate_time_grid(
-            [1.0 - float(value) for value in reversed(base)], macro_steps=int(macro_steps)
-        )
-        base_mass = grid_to_density_mass(base, reference_time_grid=reference, macro_steps=int(macro_steps))
-        reversed_mass = grid_to_density_mass(reversed_grid, reference_time_grid=reference, macro_steps=int(macro_steps))
-        averaged_mass = average_density_masses(base_mass, reversed_mass)
-        return density_mass_to_time_grid(averaged_mass, reference_time_grid=reference, macro_steps=int(macro_steps))
-    return base
+def _grid_geometry(time_grid: Sequence[float]) -> dict[str, float]:
+    values = np.asarray([float(value) for value in time_grid], dtype=np.float64)
+    internal = values[1:-1]
+    intervals = np.diff(values)
+    return {
+        "internal_fraction_after_098": float(np.mean(internal > 0.98)) if internal.size else 0.0,
+        "internal_count_after_098": int(np.sum(internal > 0.98)),
+        "internal_count": int(internal.size),
+        "min_interval": float(np.min(intervals)) if intervals.size else 0.0,
+        "max_interval": float(np.max(intervals)) if intervals.size else 0.0,
+    }
 
 
 def _register_prediction(
@@ -534,8 +508,6 @@ def load_schedule_predictions(
                     prediction[meta_key] = schedule.get(meta_key)
             key = (scheduler_key, solver_key, target_nfe)
             if key in predictions:
-                if scheduler_key in SER_REFERENCE_SCHEDULE_KEYS:
-                    continue
                 raise ValueError(f"Duplicate schedule prediction for {key}.")
             _register_prediction(
                 predictions,
@@ -549,21 +521,6 @@ def load_schedule_predictions(
                 macro_steps=int(nfe.macro_steps),
                 realized_nfe=int(nfe.realized_nfe),
             )
-            if scheduler_key == SER_PTG_SCHEDULE_KEY:
-                for derived_key in (SER_PTG_REVERSED_SCHEDULE_KEY, SER_PTG_AVG_REVERSED_SCHEDULE_KEY):
-                    derived_grid = _derived_ser_time_grid(derived_key, time_grid, macro_steps=int(nfe.macro_steps))
-                    _register_prediction(
-                        predictions,
-                        scheduler_key=derived_key,
-                        schedule_name=schedule_display_name_for_key(derived_key),
-                        budget=budget,
-                        item={**prediction, "schedule_derivation": "ser_reference_density_transform"},
-                        time_grid=derived_grid,
-                        solver_key=solver_key,
-                        target_nfe=int(target_nfe),
-                        macro_steps=int(nfe.macro_steps),
-                        realized_nfe=int(nfe.realized_nfe),
-                    )
     if require_complete:
         schedule_keys = sorted(set(expected_schedule_keys))
         expected = {
@@ -693,7 +650,7 @@ def _schedule_row(
     scheduler_key = str(prediction["scheduler_key"])
     time_grid = [float(x) for x in prediction["time_grid"]]
     shape = fixed_schedule_shape_statistics(time_grid)
-    geom = grid_geometry(time_grid)
+    geom = _grid_geometry(time_grid)
     nfe = normalize_solver_nfe_fields(
         solver_key,
         target_nfe,
@@ -980,11 +937,7 @@ def select_best_validation_schedule(
     *,
     reference_rows: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
-    candidate_rows = [
-        dict(row)
-        for row in rows
-        if str(row.get("scheduler_key", "")) not in set(BASELINE_SCHEDULE_KEYS).union(SER_REFERENCE_SCHEDULE_KEYS)
-    ]
+    candidate_rows = [dict(row) for row in rows if str(row.get("scheduler_key", "")) not in set(BASELINE_SCHEDULE_KEYS)]
     if not candidate_rows:
         raise ValueError("No generated candidate rows were available for validation selection.")
     aggregated, rewards, utility_reference, fixed_reference_schedule_keys = _selection_rewards(
@@ -1125,7 +1078,6 @@ def build_comparison_summary(
     *,
     baseline_rows: Sequence[Mapping[str, Any]],
     student_rows: Sequence[Mapping[str, Any]],
-    comparator_rows: Sequence[Mapping[str, Any]] = (),
     dataset: str,
     benchmark_family: str = FORECAST_FAMILY,
     split_phase: str,
@@ -1148,11 +1100,7 @@ def build_comparison_summary(
             )
         else:
             raise ValueError(f"Unsupported benchmark_family={family!r} for comparison summary.")
-        all_rows = (
-            [dict(row) for row in baseline_rows]
-            + [dict(row) for row in comparator_rows]
-            + [dict(row) for row in student_rows]
-        )
+        all_rows = [dict(row) for row in baseline_rows] + [dict(row) for row in student_rows]
         aggregate_rows = _aggregate_schedule_rows(all_rows)
         by_cell: dict[tuple[str, int], list[dict[str, Any]]] = {}
         for row in aggregate_rows:
@@ -1163,7 +1111,6 @@ def build_comparison_summary(
             for target_nfe in target_nfe_values:
                 cell_rows = by_cell.get((str(solver), int(target_nfe)), [])
                 uniform = next((row for row in cell_rows if row["scheduler_key"] == "uniform"), None)
-                ser_ptg = next((row for row in cell_rows if row["scheduler_key"] == SER_PTG_SCHEDULE_KEY), None)
                 baselines = [row for row in cell_rows if row["scheduler_key"] in BASELINE_SCHEDULE_KEYS]
                 ranking: dict[str, Any] = {
                     "benchmark_family": family,
@@ -1215,10 +1162,6 @@ def build_comparison_summary(
                                 student_row.get(mean_key),
                                 None if best_baseline is None else best_baseline.get(mean_key),
                             )
-                            comparison[f"student_{metric}_gain_vs_ser_ptg"] = _safe_high_gain(
-                                student_row.get(mean_key),
-                                None if ser_ptg is None else ser_ptg.get(mean_key),
-                            )
                         else:
                             best_baseline = min(baselines, key=lambda row: _finite_metric(row, metric), default=None)
                             comparison[f"student_{metric}_gain_vs_uniform"] = _safe_gain(
@@ -1228,10 +1171,6 @@ def build_comparison_summary(
                             comparison[f"student_{metric}_gain_vs_best_baseline"] = _safe_gain(
                                 student_row.get(mean_key),
                                 None if best_baseline is None else best_baseline.get(mean_key),
-                            )
-                            comparison[f"student_{metric}_gain_vs_ser_ptg"] = _safe_gain(
-                                student_row.get(mean_key),
-                                None if ser_ptg is None else ser_ptg.get(mean_key),
                             )
                     ranking["student_comparisons"].append(comparison)
                 rankings.append(ranking)
@@ -1248,7 +1187,6 @@ def build_comparison_summary(
             "dataset": str(dataset),
             "split_phase": str(split_phase),
             "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
-            "ser_reference_schedule_keys": list(SER_REFERENCE_SCHEDULE_KEYS),
             "student_schedule_key": student_schedule_keys[0] if len(student_schedule_keys) == 1 else None,
             "student_schedule_keys": student_schedule_keys,
             "seeds": [int(seed) for seed in seeds],
@@ -1263,11 +1201,7 @@ def build_comparison_summary(
             "schedule_summaries": aggregate_rows,
             "cell_rankings": rankings,
         }
-    all_rows = (
-        [dict(row) for row in baseline_rows]
-        + [dict(row) for row in comparator_rows]
-        + [dict(row) for row in student_rows]
-    )
+    all_rows = [dict(row) for row in baseline_rows] + [dict(row) for row in student_rows]
     aggregate_rows = _aggregate_schedule_rows(all_rows)
     by_cell: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for row in aggregate_rows:
@@ -1284,7 +1218,6 @@ def build_comparison_summary(
             if student is None and len(student_schedule_keys) == 1:
                 student = next(iter(student_rows_for_cell), None)
             uniform = next((row for row in cell_rows if row["scheduler_key"] == "uniform"), None)
-            ser_ptg = next((row for row in cell_rows if row["scheduler_key"] == SER_PTG_SCHEDULE_KEY), None)
             baselines = [row for row in cell_rows if row["scheduler_key"] in BASELINE_SCHEDULE_KEYS]
             best_crps = min(baselines, key=lambda row: _finite_metric(row, "crps"), default=None)
             best_mase = min(baselines, key=lambda row: _finite_metric(row, "mase"), default=None)
@@ -1297,8 +1230,6 @@ def build_comparison_summary(
                 "mase_ranking": [row["scheduler_key"] for row in ordered_mase],
                 "best_baseline_by_crps": None if best_crps is None else best_crps["scheduler_key"],
                 "best_baseline_by_mase": None if best_mase is None else best_mase["scheduler_key"],
-                "ser_ptg_crps_mean": None if ser_ptg is None else ser_ptg.get("crps_mean"),
-                "ser_ptg_mase_mean": None if ser_ptg is None else ser_ptg.get("mase_mean"),
                 "student_comparisons": [],
             }
             for student_row in sorted(student_rows_for_cell, key=lambda row: str(row["scheduler_key"])):
@@ -1323,14 +1254,6 @@ def build_comparison_summary(
                             student_row.get("mase_mean"),
                             None if best_mase is None else best_mase.get("mase_mean"),
                         ),
-                        "student_relative_crps_gain_vs_ser_ptg": _safe_gain(
-                            student_row.get("crps_mean"),
-                            None if ser_ptg is None else ser_ptg.get("crps_mean"),
-                        ),
-                        "student_relative_mase_gain_vs_ser_ptg": _safe_gain(
-                            student_row.get("mase_mean"),
-                            None if ser_ptg is None else ser_ptg.get("mase_mean"),
-                        ),
                         "student_internal_fraction_after_098_mean": student_row.get("internal_fraction_after_098_mean"),
                     }
                 )
@@ -1351,12 +1274,6 @@ def build_comparison_summary(
                         "student_relative_mase_gain_vs_best_baseline": _safe_gain(
                             student.get("mase_mean"), None if best_mase is None else best_mase.get("mase_mean")
                         ),
-                        "student_relative_crps_gain_vs_ser_ptg": _safe_gain(
-                            student.get("crps_mean"), None if ser_ptg is None else ser_ptg.get("crps_mean")
-                        ),
-                        "student_relative_mase_gain_vs_ser_ptg": _safe_gain(
-                            student.get("mase_mean"), None if ser_ptg is None else ser_ptg.get("mase_mean")
-                        ),
                         "student_internal_fraction_after_098_mean": student.get("internal_fraction_after_098_mean"),
                     }
                 )
@@ -1375,25 +1292,11 @@ def build_comparison_summary(
         target_nfe_values=target_nfe_values,
         schedule_keys=student_schedule_keys,
     )
-    ser_missing = (
-        _missing_cells(
-            comparator_rows,
-            seeds=seeds,
-            solver_names=solver_names,
-            target_nfe_values=target_nfe_values,
-            schedule_keys=SER_REFERENCE_SCHEDULE_KEYS,
-        )
-        if comparator_rows
-        else []
-    )
     return {
         "evaluator_signature": EVALUATOR_SIGNATURE_VERSION,
         "dataset": str(dataset),
         "split_phase": str(split_phase),
         "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS),
-        "ser_ptg_schedule_key": SER_PTG_SCHEDULE_KEY,
-        "ser_reference_schedule_keys": list(SER_REFERENCE_SCHEDULE_KEYS),
-        "ser_ptg_is_baseline": SER_PTG_SCHEDULE_KEY in BASELINE_SCHEDULE_KEYS,
         "student_schedule_key": student_schedule_keys[0] if len(student_schedule_keys) == 1 else None,
         "student_schedule_keys": student_schedule_keys,
         "student_is_baseline": False
@@ -1408,13 +1311,6 @@ def build_comparison_summary(
         ),
         "observed_baseline_rows": int(len(baseline_rows)),
         "missing_baseline_cells": baseline_missing,
-        "expected_ser_ptg_rows": int(
-            len(seeds) * len(solver_names) * len(target_nfe_values) * len(SER_REFERENCE_SCHEDULE_KEYS)
-        )
-        if comparator_rows
-        else 0,
-        "observed_ser_ptg_rows": int(len(comparator_rows)),
-        "missing_ser_ptg_cells": ser_missing,
         "expected_student_rows": int(
             len(seeds) * len(solver_names) * len(target_nfe_values) * len(student_schedule_keys)
         ),
@@ -1744,30 +1640,16 @@ def evaluate_schedule_summary(args: argparse.Namespace) -> dict[str, Any]:
             target_nfe_values=target_nfes,
         )
         baseline_rows = _filter_rows_to_schedule_keys(baseline_rows, BASELINE_SCHEDULE_KEYS)
-        comparator_rows: list[dict[str, Any]] = []
-        if str(args.comparator_rows).strip():
-            comparator_rows = _load_rows_csv(
-                args.comparator_rows,
-                dataset=str(args.dataset),
-                split_phase=split_phase,
-                seeds=seeds,
-                solver_names=solver_names,
-                target_nfe_values=target_nfes,
-            )
-            comparator_rows = _filter_rows_to_schedule_keys(comparator_rows, SER_REFERENCE_SCHEDULE_KEYS)
         comparison = build_comparison_summary(
             baseline_rows=baseline_rows,
             student_rows=rows,
-            comparator_rows=comparator_rows,
             dataset=str(args.dataset),
             split_phase=split_phase,
             seeds=seeds,
             solver_names=solver_names,
             target_nfe_values=target_nfes,
         )
-        save_json(
-            comparison, str(out_dir / str(args.comparison_output_name or "student_vs_baselines_ser_ptg_summary.json"))
-        )
+        save_json(comparison, str(out_dir / str(args.comparison_output_name or "student_vs_baselines_summary.json")))
         summary["comparison_summary"] = comparison
     return summary
 
@@ -1785,9 +1667,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--row_csv_name", default="")
     parser.add_argument("--row_jsonl_name", default="")
     parser.add_argument("--summary_output_name", default="")
-    parser.add_argument("--comparison_output_name", default="student_vs_baselines_ser_ptg_summary.json")
+    parser.add_argument("--comparison_output_name", default="student_vs_baselines_summary.json")
     parser.add_argument("--baseline_rows", default="")
-    parser.add_argument("--comparator_rows", default="")
     parser.add_argument("--selection_reference_rows", default="")
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--solver_names", default=",".join(DEFAULT_SOLVERS))

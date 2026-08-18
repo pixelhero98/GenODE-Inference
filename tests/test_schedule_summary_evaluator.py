@@ -24,12 +24,9 @@ from genode.gico.evaluate_schedule_summary import (
     select_best_validation_schedule,
 )
 from genode.gico.schedule_grids import load_schedule_summary_grids
-from genode.gico.ser_ptg_reference import (
-    SER_PTG_AVG_REVERSED_SCHEDULE_KEY,
-    SER_PTG_REVERSED_SCHEDULE_KEY,
-    SER_PTG_SCHEDULE_KEY,
-)
 from genode.schedule_transfer.diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS
+
+DYNAMIC_SCHEDULE_KEY = "adaptive_density"
 
 
 def _uniform_grid(n_steps: int) -> list[float]:
@@ -139,17 +136,17 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         self.assertNotEqual(_protocol_hash(legacy), _protocol_hash(valnorm))
         self.assertNotEqual(_protocol_hash(valnorm), _protocol_hash(valnorm_alt_fraction))
 
-    def test_load_schedule_predictions_validates_ser_ptg_grid(self) -> None:
+    def test_load_schedule_predictions_validates_dynamic_grid(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "ser_summary.json"
+            path = Path(tmpdir) / "dynamic_summary.json"
             path.write_text(
                 json.dumps(
                     {
                         "dataset": "traffic_hourly",
                         "schedules": [
                             {
-                                "scheduler_key": SER_PTG_SCHEDULE_KEY,
-                                "schedule_name": "SER-PTG local defect eta=0.05",
+                                "scheduler_key": DYNAMIC_SCHEDULE_KEY,
+                                "schedule_name": "Adaptive density",
                                 "predictions": [
                                     {
                                         "solver_key": "heun",
@@ -170,22 +167,20 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 solver_names=("heun",),
                 target_nfe_values=(4,),
             )
-        self.assertIn((SER_PTG_SCHEDULE_KEY, "heun", 4), predictions)
-        self.assertIn((SER_PTG_REVERSED_SCHEDULE_KEY, "heun", 4), predictions)
-        self.assertIn((SER_PTG_AVG_REVERSED_SCHEDULE_KEY, "heun", 4), predictions)
-        self.assertEqual(predictions[(SER_PTG_SCHEDULE_KEY, "heun", 4)]["realized_nfe"], 4)
-        self.assertNotIn(SER_PTG_SCHEDULE_KEY, BASELINE_SCHEDULE_KEYS)
+        self.assertEqual(set(predictions), {(DYNAMIC_SCHEDULE_KEY, "heun", 4)})
+        self.assertEqual(predictions[(DYNAMIC_SCHEDULE_KEY, "heun", 4)]["realized_nfe"], 4)
+        self.assertNotIn(DYNAMIC_SCHEDULE_KEY, BASELINE_SCHEDULE_KEYS)
 
     def test_load_schedule_predictions_rejects_rk2_runtime_nfe_as_realized_nfe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "ser_summary.json"
+            path = Path(tmpdir) / "dynamic_summary.json"
             path.write_text(
                 json.dumps(
                     {
                         "dataset": "traffic_hourly",
                         "schedules": [
                             {
-                                "scheduler_key": SER_PTG_SCHEDULE_KEY,
+                                "scheduler_key": DYNAMIC_SCHEDULE_KEY,
                                 "predictions": [
                                     {
                                         "solver_key": "heun",
@@ -211,14 +206,14 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
 
     def test_load_schedule_predictions_accepts_runtime_macro_step_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "ser_summary.json"
+            path = Path(tmpdir) / "dynamic_summary.json"
             path.write_text(
                 json.dumps(
                     {
                         "dataset": "traffic_hourly",
                         "schedules": [
                             {
-                                "scheduler_key": SER_PTG_SCHEDULE_KEY,
+                                "scheduler_key": DYNAMIC_SCHEDULE_KEY,
                                 "predictions": [
                                     {
                                         "solver_key": "heun",
@@ -241,14 +236,14 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 target_nfe_values=(4,),
             )
 
-        row = predictions[(SER_PTG_SCHEDULE_KEY, "heun", 4)]
+        row = predictions[(DYNAMIC_SCHEDULE_KEY, "heun", 4)]
         self.assertEqual(row["runtime_nfe"], 2)
         self.assertEqual(row["macro_steps"], 2)
         self.assertEqual(row["realized_nfe"], 4)
 
     def test_schedule_grid_loader_registers_base_keys_for_checkpoint_scoped_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "ser_summary.json"
+            path = Path(tmpdir) / "dynamic_summary.json"
             path.write_text(
                 json.dumps(
                     {
@@ -256,7 +251,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                         "checkpoint_step": 4000,
                         "schedules": [
                             {
-                                "scheduler_key": SER_PTG_SCHEDULE_KEY,
+                                "scheduler_key": DYNAMIC_SCHEDULE_KEY,
                                 "predictions": [
                                     {
                                         "solver_key": "euler",
@@ -274,10 +269,10 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
 
             grids = load_schedule_summary_grids([str(path)])
 
-        self.assertIn((SER_PTG_SCHEDULE_KEY, "euler", 4), grids)
-        self.assertIn((SER_PTG_SCHEDULE_KEY, "euler", 4, 4000), grids)
-        self.assertIn((SER_PTG_REVERSED_SCHEDULE_KEY, "euler", 4), grids)
-        self.assertIn((SER_PTG_AVG_REVERSED_SCHEDULE_KEY, "euler", 4), grids)
+        self.assertEqual(
+            set(grids),
+            {(DYNAMIC_SCHEDULE_KEY, "euler", 4), (DYNAMIC_SCHEDULE_KEY, "euler", 4, 4000)},
+        )
 
     def test_load_schedule_predictions_rejects_empty_filtered_candidate_set(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -312,7 +307,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     require_complete=True,
                 )
 
-    def test_comparison_summary_keeps_ser_ptg_as_comparator(self) -> None:
+    def test_comparison_summary_compares_student_with_baselines(self) -> None:
         baseline_rows = [
             {
                 "seed": 0,
@@ -323,16 +318,6 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                 "mase": 3.0,
             }
             for schedule_key in BASELINE_SCHEDULE_KEYS
-        ]
-        ser_rows = [
-            {
-                "seed": 0,
-                "solver_key": "euler",
-                "target_nfe": 4,
-                "scheduler_key": SER_PTG_SCHEDULE_KEY,
-                "crps": 1.5,
-                "mase": 2.5,
-            }
         ]
         student_rows = [
             {
@@ -346,7 +331,6 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         ]
         summary = build_comparison_summary(
             baseline_rows=baseline_rows,
-            comparator_rows=ser_rows,
             student_rows=student_rows,
             dataset="traffic_hourly",
             split_phase="locked_test",
@@ -354,12 +338,10 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             solver_names=("euler",),
             target_nfe_values=(4,),
         )
-        self.assertFalse(summary["ser_ptg_is_baseline"])
-        self.assertEqual(summary["observed_ser_ptg_rows"], 1)
         self.assertEqual(summary["observed_student_rows"], 1)
         ranking = summary["cell_rankings"][0]
         self.assertEqual(ranking["crps_ranking"][0], SELECTED_STUDENT_SCHEDULE_KEY)
-        self.assertAlmostEqual(ranking["student_relative_crps_gain_vs_ser_ptg"], 1.0 - 1.25 / 1.5)
+        self.assertAlmostEqual(ranking["student_relative_crps_gain_vs_best_baseline"], 1.0 - 1.25 / 2.0)
         self.assertEqual(ranking["student_comparisons"][0]["scheduler_key"], SELECTED_STUDENT_SCHEDULE_KEY)
 
     def test_comparison_summary_supports_multiple_student_schedules(self) -> None:
@@ -387,7 +369,6 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         ]
         summary = build_comparison_summary(
             baseline_rows=baseline_rows,
-            comparator_rows=[],
             student_rows=student_rows,
             dataset="traffic_hourly",
             split_phase="validation_tuning",
@@ -403,7 +384,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         self.assertEqual([row["scheduler_key"] for row in comparisons], ["density_a", "density_b"])
         self.assertAlmostEqual(comparisons[1]["student_relative_crps_gain_vs_best_baseline"], 1.0 - 1.25 / 2.0)
 
-    def test_evaluator_filters_shared_comparison_rows_before_summary(self) -> None:
+    def test_evaluator_filters_shared_baseline_rows_before_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             schedule_path = root / "student_summary.json"
@@ -437,14 +418,6 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "scheduler_key": BASELINE_SCHEDULE_KEYS[0],
                     "crps": 2.0,
                     "mase": 3.0,
-                },
-                {
-                    "seed": 0,
-                    "solver_key": "euler",
-                    "target_nfe": 4,
-                    "scheduler_key": SER_PTG_SCHEDULE_KEY,
-                    "crps": 1.5,
-                    "mase": 2.5,
                 },
                 {
                     "seed": 0,
@@ -492,8 +465,6 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
                     "1",
                     "--baseline_rows",
                     str(root / "shared_rows.csv"),
-                    "--comparator_rows",
-                    str(root / "shared_rows.csv"),
                     "--device",
                     "cpu",
                 ]
@@ -531,7 +502,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
 
         call_kwargs = build_mock.call_args.kwargs
         self.assertEqual([row["scheduler_key"] for row in call_kwargs["baseline_rows"]], [BASELINE_SCHEDULE_KEYS[0]])
-        self.assertEqual([row["scheduler_key"] for row in call_kwargs["comparator_rows"]], [SER_PTG_SCHEDULE_KEY])
+        self.assertNotIn("comparator_rows", call_kwargs)
 
     def test_validation_schedule_selection_supports_arbitrary_candidate_keys(self) -> None:
         rows = []
@@ -551,7 +522,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
             ("gico_candidate_steps20", 20, 1.0, 2.0),
             ("gico_candidate_steps25", 25, 1.0, 2.0),
             ("gico_candidate_steps35", 35, 0.9, 1.9),
-            ("ser_ptg_residual_tail_s200_eps030", None, 1.2, 2.2),
+            ("adaptive_residual_tail", None, 1.2, 2.2),
         ):
             for seed in (0, 1, 2):
                 row = {
@@ -570,9 +541,7 @@ class ScheduleSummaryEvaluatorTests(unittest.TestCase):
         self.assertEqual(selection["selected_schedule_key"], "gico_candidate_steps35")
         self.assertEqual(selection["selected_gico_step_budget"], 35)
         self.assertEqual(selection["utility_reference"], "best_fixed_baseline_crps_mase")
-        self.assertTrue(
-            any(row["scheduler_key"] == "ser_ptg_residual_tail_s200_eps030" for row in selection["schedule_table"])
-        )
+        self.assertTrue(any(row["scheduler_key"] == "adaptive_residual_tail" for row in selection["schedule_table"]))
         self.assertNotIn("eps_rho", selection["schedule_table"][0])
         self.assertNotIn("kl_weight", selection["schedule_table"][0])
 

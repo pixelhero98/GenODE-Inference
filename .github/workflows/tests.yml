@@ -99,6 +99,16 @@ jobs:
               ".pt",
               ".pth",
           }
+          retired_member_fragments = (
+              "genode/" + "distillation/",
+              "genode/gico/" + "ser_" + "ptg_reference.py",
+              "genode/visualization/" + "build_ptg_" + "observed_gain_figure.py",
+              "tests/test_" + "distillation",
+              "tests/test_" + "measurement_protocol.py",
+              "tests/test_" + "quality_input_parsing.py",
+              "tests/test_ser_" + "ptg_reference.py",
+              "tests/test_ptg_" + "observed_gain_figure.py",
+          )
           content_patterns = {
               "cluster path": re.compile(
                   rb"isam" rb"bard|b3" rb"5z|ma" rb"cs3|/scr" rb"atch/|/pro" rb"jects/|"
@@ -107,6 +117,18 @@ jobs:
               ),
               "retired image policy": re.compile(
                   rb"image_clock_mixture|complete[-_]clock|gico[-_]clock[-_]policy|clock[-_ ]mixture",
+                  re.IGNORECASE,
+              ),
+              "retired consistency feature": re.compile(
+                  rb"genode\." rb"distillation|consistency[-_ ]" rb"distillation|"
+                  rb"endpoint[-_ ]" rb"flow[-_ ]" rb"map|"
+                  rb"genode-(?:collect-" rb"flow-" rb"map-demonstrations|train-" rb"flow-" rb"map|"
+                  rb"evaluate-" rb"flow-" rb"map)",
+                  re.IGNORECASE,
+              ),
+              "retired SER/PTG feature": re.compile(
+                  rb"ser[-_]" rb"ptg|ptg[-_]" rb"observed|"
+                  rb"genode-build-(?:ser-" rb"ptg-reference|ptg-figure)",
                   re.IGNORECASE,
               ),
               "credential": re.compile(
@@ -122,6 +144,9 @@ jobs:
               lowered = {part.casefold() for part in path.parts}
               if lowered & denied_parts or path.suffix.casefold() in denied_suffixes:
                   raise SystemExit(f"Unexpected generated or result member: {name}")
+              normalized = path.as_posix().casefold()
+              if any(fragment in normalized for fragment in retired_member_fragments):
+                  raise SystemExit(f"Distribution archive contains a retired feature member: {name}")
 
           def validate_content(name: str, data: bytes) -> None:
               for description, pattern in content_patterns.items():
@@ -186,16 +211,11 @@ jobs:
             genode-train-gico \
             genode-preflight-gico-rows \
             genode-report-gico-locked-test \
-            genode-build-ser-ptg-reference \
             genode-evaluate-schedule-summary \
             genode-build-hardness-figure \
-            genode-build-ptg-figure \
             genode-package-backbone-family \
             genode-validate-backbone-package \
             genode-build-release-archive \
-            genode-collect-flow-map-demonstrations \
-            genode-train-flow-map \
-            genode-evaluate-flow-map \
             genode-image-gico
           do
             "$command" --help

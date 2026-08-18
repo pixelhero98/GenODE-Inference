@@ -4,8 +4,6 @@ import os
 import stat
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-MANIFEST_PARENT_PATH_BASE = "manifest_parent"
-
 
 def portable_relative_path(value: str | os.PathLike[str], *, label: str = "path") -> PurePosixPath:
     """Validate and return a portable POSIX-relative path.
@@ -97,25 +95,9 @@ def resolve_portable_relative_path(
     return resolved
 
 
-def resolve_manifest_path_base(manifest_path: str | os.PathLike[str], value: object) -> Path:
-    """Resolve the single portable manifest anchor.
-
-    ``path_base`` is an enum rather than a filesystem path. Keeping the
-    manifest beside its declared base removes the need for ``.`` or ``..``
-    traversal while preserving relocatable member paths.
-    """
-
-    token = str(value or "").strip()
-    if token != MANIFEST_PARENT_PATH_BASE:
-        raise ValueError(f"Manifest path_base must be {MANIFEST_PARENT_PATH_BASE!r}, got {token!r}.")
-    return Path(manifest_path).expanduser().resolve().parent
-
-
 __all__ = [
     "first_link_or_reparse_component",
     "is_link_or_reparse_point",
     "portable_relative_path",
-    "MANIFEST_PARENT_PATH_BASE",
-    "resolve_manifest_path_base",
     "resolve_portable_relative_path",
 ]

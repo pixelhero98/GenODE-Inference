@@ -35,8 +35,6 @@ RETIRED_EVALUATION_KEYS = frozenset(
         "selected_gico_step_budget",
         "selected_schedule_key",
         "selected_source_schedule_key",
-        "ser_ptg_schedule_key",
-        "ser_reference_schedule_keys",
         "setting_encoder_mode",
         "setting_feature_mode",
         "student_gico_steps",

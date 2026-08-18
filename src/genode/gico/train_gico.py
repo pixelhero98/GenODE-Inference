@@ -973,13 +973,13 @@ def _validate_context_split_capacity(
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train GICO continuous-density from per-example fixed/SER rows.")
-    parser.add_argument("--rows_csv", required=True, help="Per-example fixed/SER metric rows CSV.")
+    parser = argparse.ArgumentParser(description="Train GICO continuous-density from per-example schedule rows.")
+    parser.add_argument("--rows_csv", required=True, help="Per-example schedule metric rows CSV.")
     parser.add_argument("--context_embeddings_npz", required=True, help="Frozen context embedding sidecar NPZ.")
     parser.add_argument(
         "--schedule_summary_json",
         default="",
-        help="Comma-separated schedule summaries for non-fixed references such as SER.",
+        help="Comma-separated schedule summaries for explicitly supplied dynamic references.",
     )
     parser.add_argument("--out_dir", required=True)
     parser.add_argument(
@@ -1008,7 +1008,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--teacher_density_holdout_schedule_keys",
         default=",".join(DEFAULT_DENSITY_FAMILY_HOLDOUT_SCHEDULE_KEYS),
-        help="Comma-separated fixed/SER support keys held out from the selector teacher for density-family diagnostics.",
+        help="Comma-separated support keys held out from the selector teacher for density-family diagnostics.",
     )
     parser.add_argument(
         "--teacher_unseen_selection_rows_csv",
@@ -1023,7 +1023,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--teacher_unseen_selection_schedule_summary_json",
         default="",
-        help="Schedule summaries for unseen selection rows, such as unseen SER references.",
+        help="Schedule summaries for unseen selection rows with explicitly supplied dynamic references.",
     )
     parser.add_argument(
         "--teacher_unseen_selection_target_nfe_values",
@@ -1042,7 +1042,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--student_unseen_target_schedule_summary_json",
         default="",
-        help="Schedule summaries for unseen target rows, such as unseen SER-derived references.",
+        help="Schedule summaries for unseen target rows with explicitly supplied dynamic references.",
     )
     parser.add_argument(
         "--unseen_target_nfe_values",

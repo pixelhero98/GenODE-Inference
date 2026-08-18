@@ -56,10 +56,6 @@ def schedule_display_name(schedule_key: str) -> str:
     try:
         return str(reference_clock_provenance(key)["display_name"])
     except KeyError:
-        if key == "ser_ptg_local_defect_eta005":
-            return "SER-PTG local defect eta=0.05 (explicit opt-in)"
-        if key == "ser_ptg_local_defect_eta005_reversed":
-            return "SER-PTG local defect eta=0.05 reversed (explicit opt-in)"
         return str(schedule_key)
 
 

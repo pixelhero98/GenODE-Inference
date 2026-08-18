@@ -297,20 +297,6 @@ checkpoint license notice was found. Review
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before obtaining or using
 external image assets.
 
-## Consistency distillation (secondary)
-
-The optional endpoint flow-map workflow is separate from primary GICO
-training:
-
-```bash
-genode-collect-flow-map-demonstrations --help
-genode-train-flow-map --help
-genode-evaluate-flow-map --help
-```
-
-Flow-map checkpoints remain bound to the frozen backbone and GICO checkpoint
-used to create them. Evaluation requires an explicit measurement protocol.
-
 ## Deterministic archives
 
 Build checkpoint-only, named-checkpoint, or frozen policy archives with:

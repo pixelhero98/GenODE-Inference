@@ -48,6 +48,28 @@ def _assert_archive_bundle_complete(output: Path) -> None:
     assert validate_deterministic_zip(archive_path)["status"] == "complete"
 
 
+def test_artifact_bundle_layout_rejects_final_symlink_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    referent = tmp_path / "referent.pt"
+    target = tmp_path / "student.pt"
+    referent.write_bytes(b"referent must remain unchanged")
+    try:
+        target.symlink_to(referent)
+    except OSError:
+        monkeypatch.setattr(
+            artifact_bundle,
+            "is_link_or_reparse_point",
+            lambda path: Path(path) == target,
+        )
+
+    with pytest.raises(ValueError, match="symlink, junction, or reparse"):
+        artifact_bundle.validate_artifact_bundle_layout(target, {"student": target})
+
+    assert referent.read_bytes() == b"referent must remain unchanged"
+
+
 def test_deterministic_zip_is_byte_identical_across_output_names(tmp_path: Path) -> None:
     first = tmp_path / "student-state.pt"
     second = tmp_path / "teacher-state.pt"

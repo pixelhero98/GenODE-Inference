@@ -43,7 +43,6 @@ from genode.evaluation.otflow_evaluation_support import (
     load_forecast_checkpoint_splits,
 )
 from genode.gico.evaluate_schedule_summary import (
-    SER_REFERENCE_SCHEDULE_KEYS,
     _filter_rows_to_schedule_keys,
     build_comparison_summary,
 )
@@ -848,16 +847,11 @@ def report_gico_locked_test(args: argparse.Namespace) -> dict[str, Any]:
     if not str(args.baseline_rows).strip():
         raise ValueError("GICO locked-test reporting requires --baseline_rows with matched uniform rows.")
     baseline_rows = _read_csvs(str(args.baseline_rows))
-    comparator_rows = _read_csvs(str(args.comparator_rows)) if str(args.comparator_rows).strip() else []
     baseline_rows = _filter_rows_to_schedule_keys(baseline_rows, BASELINE_SCHEDULE_KEYS)
-    comparator_rows = _filter_rows_to_schedule_keys(comparator_rows, SER_REFERENCE_SCHEDULE_KEYS)
     if baseline_rows:
         _benchmark_family_from_rows(baseline_rows, benchmark_family)
-    if comparator_rows:
-        _benchmark_family_from_rows(comparator_rows, benchmark_family)
     if selection_mode == SELECTION_MODE_CALIBRATION:
         baseline_rows = _filter_rows_to_contexts(baseline_rows, representatives)
-        comparator_rows = _filter_rows_to_contexts(comparator_rows, representatives)
     uniform_context_rows = {
         _context_match_key(row): dict(row)
         for row in baseline_rows
@@ -1140,7 +1134,6 @@ def report_gico_locked_test(args: argparse.Namespace) -> dict[str, Any]:
         comparison_student_rows = per_context_rows if selection_mode == SELECTION_MODE_CALIBRATION else aggregate_rows
         comparison = build_comparison_summary(
             baseline_rows=baseline_rows,
-            comparator_rows=comparator_rows,
             student_rows=comparison_student_rows,
             dataset=dataset,
             benchmark_family=benchmark_family,
@@ -1257,7 +1250,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--baseline_rows", default="", help="Required uniform baseline context-row CSVs used as reward anchors."
     )
-    parser.add_argument("--comparator_rows", default="")
     parser.add_argument("--benchmark_family", default="")
     parser.add_argument(
         "--dataset", default="", help="Dataset key. Defaults to the single dataset inferred from --context_rows."
