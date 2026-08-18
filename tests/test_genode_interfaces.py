@@ -117,6 +117,20 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertIn("genode-report-gico-locked-test", text)
         self.assertIn("[CONTRIBUTING.md](CONTRIBUTING.md)", text)
         self.assertIn("[SECURITY.md](SECURITY.md)", text)
+        self.assertIn("covers eight scenarios", text)
+        for scenario in (
+            "solar_energy_10m",
+            "traffic_hourly",
+            "weather_daily",
+            "CIFAR-10",
+            "ImageNet-64",
+            "molecule_3d_set1",
+            "molecule_3d_set2",
+            "molecule_3d_set3",
+        ):
+            self.assertIn(scenario, text)
+        self.assertNotIn("## 30-second entry point", text)
+        self.assertNotIn("## Guarantees", text)
         self.assertNotIn("allow_noncanonical", text)
         self.assertNotIn("teacher-oracle", text.lower())
 
