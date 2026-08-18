@@ -1,10 +1,10 @@
 # GenODE Inference
 
 GenODE learns **GICO** (Generative Inference Clock Optimization) policies for
-frozen flow-matching and ODE backbones. A GICO policy predicts a continuous
-density over integration time from the solver budget and the backbone's own
-context. Integrating and inverting that density produces a strictly increasing
-time grid while the generative backbone remains frozen.
+frozen flow-matching and ODE backbones. A GICO policy uses the frozen backbone's own context
+and the solver budget to predict a continuous density over integration time.
+Integrating and inverting that density produces a strictly increasing time grid
+while the generative backbone remains frozen.
 
 ```mermaid
 flowchart LR
