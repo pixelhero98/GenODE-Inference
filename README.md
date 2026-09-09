@@ -126,6 +126,8 @@ Protocol `genode-gico-v2` stores `policy.pt` plus a checksummed `manifest.json`.
 
 Evaluation rows can carry a fixed `density_mass`/`time_grid` pair or `sample_clocks`, a list containing one such pair per ensemble member. This supports independently sampled stochastic clocks while averaging repeated terminal measurements before constructing log improvements. Forecast evaluators export `sample_clocks`; molecular evaluators export the same pairs with rollout provenance in `sample_clock_records`. Training reference clocks remain fixed across repeats.
 
+ImageNet reports require all 1,000 classes in each paired panel. They average classes equally and estimate uncertainty across panels, accounting for shared reference-block noise within a panel.
+
 ```bash
 python -m ruff check .
 python -m ruff format --check .

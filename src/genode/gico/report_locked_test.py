@@ -64,7 +64,24 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
                 groups[(solver, row["nfe"], row["schedule_key"])].append(row)
     output = []
     for (solver, nfe, schedule), cells in sorted(groups.items()):
-        rewards = np.array([r["reward"] for r in cells])
+        units = cells
+        if cells[0]["task"] == "imagenet64":
+            # Classes in a paired block share sampling/reference uncertainty.
+            # Average all classes equally first; uncertainty is across blocks.
+            panels = defaultdict(list)
+            for cell in cells:
+                panels[content_hash(cell["reference_ids"])].append(cell)
+            units = []
+            for panel in panels.values():
+                if len(panel) != 1000 or {r.get("class_id") for r in panel} != set(range(1000)):
+                    raise ValueError("ImageNet reports require all 1000 classes exactly once per paired panel.")
+                units.append(
+                    {
+                        "reward": float(np.mean([r["reward"] for r in panel])),
+                        "metrics": {"kid": float(np.mean([r["metrics"]["kid"] for r in panel]))},
+                    }
+                )
+        rewards = np.array([r["reward"] for r in units])
         sem = float(rewards.std(ddof=1) / np.sqrt(len(rewards))) if len(rewards) > 1 else None
         width = float(t.ppf(0.975, len(rewards) - 1) * sem) if sem is not None else None
         output.append(
@@ -73,12 +90,13 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
                 "nfe": nfe,
                 "schedule": schedule,
                 "paired_contexts": len(cells),
+                "independent_units": len(units),
                 "reward_mean": float(rewards.mean()),
                 "reward_standard_error": sem,
                 "reward_ci95": [float(rewards.mean() - width), float(rewards.mean() + width)]
                 if width is not None
                 else None,
-                "raw_metrics": {k: float(np.mean([r["metrics"][k] for r in cells])) for k in cells[0]["metrics"]},
+                "raw_metrics": {k: float(np.mean([r["metrics"][k] for r in units])) for k in units[0]["metrics"]},
             }
         )
     return {
@@ -87,7 +105,9 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
         "split": split,
         "results": output,
         "selection_performed": False,
-        "uncertainty_unit": "paired_context_mean_over_replicates",
+        "uncertainty_unit": "paired_panel_mean_over_classes_and_replicates"
+        if rows[0]["task"] == "imagenet64"
+        else "paired_context_mean_over_replicates",
     }
 
 

@@ -94,3 +94,27 @@ def test_report_rejects_incompatible_or_leaked_evidence(field, value, match):
     rows[1][field] = value
     with pytest.raises(ValueError, match=match):
         summarize_measurements(rows, policy)
+
+
+def test_imagenet_report_uses_complete_equally_weighted_class_panels_as_uncertainty_units():
+    policy, _, _ = report_fixture()
+    calibration = calibrate_rewards(paired_rows(task="imagenet64"))
+    policy.metadata["reward_calibrations"] = {"euler": calibration.to_payload()}
+    templates = [
+        measurement(task="imagenet64", split="test", metrics={"kid": 2.0}),
+        measurement(task="imagenet64", split="test", schedule="late_p_3", metrics={"kid": 1.0}),
+    ]
+    rows = [
+        {**row, "class_id": label, "context_id": f"test-class:{label}"} for row in templates for label in range(1000)
+    ]
+    report = summarize_measurements(rows, policy)
+    result = next(r for r in report["results"] if r["schedule"] == "late_p_3")
+    assert result["paired_contexts"] == 1000
+    assert result["independent_units"] == 1
+    assert result["reward_standard_error"] is None
+    assert result["reward_mean"] == pytest.approx(1 / calibration.reward_scale)
+    assert result["raw_metrics"] == {"kid": 1.0}
+    assert report["uncertainty_unit"] == "paired_panel_mean_over_classes_and_replicates"
+    rows = [r for r in rows if r["class_id"] != 999]
+    with pytest.raises(ValueError, match="all 1000 classes"):
+        summarize_measurements(rows, policy)
