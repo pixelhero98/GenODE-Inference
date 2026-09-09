@@ -1,238 +1,153 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from pathlib import Path
+import copy
 
 import numpy as np
 import pytest
 
-from genode.benchmarks.image.protocol import IMAGE_SCHEDULE_KEYS
-from genode.gico.image_conditional import (
-    build_image_gico_conditional_targets,
-    build_image_gico_feature_groups,
-)
-from genode.gico.image_conditional_context import prepare_image_gico_backbone_context
-from genode.gico.image_supervision import (
-    IMAGE_GICO_CONTEXT_DIM,
-    IMAGE_GICO_TARGET_NFES,
-    build_image_gico_conditional_supervision,
-    build_image_gico_unconditional_supervision,
-    load_image_gico_supervision,
-    save_image_gico_supervision,
-)
-from tests.test_image_primary_runtime import _frozen_imagenet_backbone
+from genode.artifacts.identity import semantic_sha256
+from genode.gico.clocks import materialize, reference_densities
+from genode.gico.image_conditional import fit_feature_groups, paired_kid_shrinkage
+from genode.gico.image_supervision import prepare_image_rows
+from tests.test_image_primary_runtime import _frozen_cifar_backbone, _frozen_imagenet_backbone
 
 
-def _support_and_weights() -> tuple[np.ndarray, np.ndarray]:
-    coordinates = np.arange(64, dtype=np.float64) + 0.5
-    uniform = np.full(64, 1.0 / 64.0, dtype=np.float64)
-    sine = 1.0 + 0.15 * np.sin(2.0 * np.pi * coordinates / 64.0)
-    cosine = 1.0 + 0.15 * np.cos(2.0 * np.pi * coordinates / 64.0)
-    sine /= sine.sum(dtype=np.float64)
-    cosine /= cosine.sum(dtype=np.float64)
-    # The repeated sine schedule is a deliberate density alias.
-    support = np.stack([[uniform, sine, sine, cosine]] * 3)
-    weights = np.asarray(
-        [
-            [0.1, 0.2, 0.3, 0.4],
-            [0.25, 0.25, 0.25, 0.25],
-            [0.4, 0.1, 0.1, 0.4],
-        ],
-        dtype=np.float64,
+def image_manifest(task="cifar10"):
+    backbone = (
+        _frozen_cifar_backbone(digest="a" * 64)
+        if task == "cifar10"
+        else _frozen_imagenet_backbone(digest="b" * 64, offset=0)
     )
-    return support, weights
+    result = {"backbone_manifest": backbone.manifest.to_manifest_dict(), "rows": []}
+    if task == "imagenet64":
+        result["native_context_table"] = backbone.canonical_conditioning_table().tolist()
+        groups = {
+            "assignments": (np.arange(1000) % 32).tolist(),
+            "fit_split": "train",
+            "source_reference_id": "train-real",
+        }
+        result["feature_groups"] = {**groups, "sha256": semantic_sha256(groups, namespace="image-feature-groups")}
+    for split in ("train", "validation"):
+        for schedule in ("uniform", "late_p_3"):
+            mass = np.asarray(reference_densities("euler", 2)[schedule])
+            for label in range(1000 if task == "imagenet64" else 1):
+                kid = 0.1 if schedule == "uniform" else 0.09 - (label % 7) * 0.001
+                row = {
+                    "solver": "euler",
+                    "nfe": 2,
+                    "split": split,
+                    "seed": 3,
+                    "ensemble_size": 8,
+                    "reference_id": f"{split}-real",
+                    "measurement_protocol": "kid-paired-block-v1",
+                    "schedule_key": schedule,
+                    "density_mass": mass.tolist(),
+                    "time_grid": list(materialize(mass, "euler", 2)),
+                    "metrics": {"kid": kid},
+                }
+                if task == "imagenet64":
+                    row.update(class_id=label, jackknife_kid=[kid - 0.001, kid + 0.001])
+                result["rows"].append(row)
+    return result
 
 
-def _unconditional_supervision():
-    support, weights = _support_and_weights()
-    return build_image_gico_unconditional_supervision(
-        target_nfes=IMAGE_GICO_TARGET_NFES,
-        schedule_keys=("uniform", "sine-a", "sine-b", "cosine"),
-        fixed_density_mass=support,
-        mixture_weights=weights,
-        source_identities={"mixture_evidence": "a" * 64},
+def test_cifar_uses_zero_context_and_preserves_raw_paired_measurements():
+    manifest = image_manifest()
+    rows, contexts, metadata = prepare_image_rows(manifest)
+    assert len(rows) == 4 and set(map(tuple, contexts.values())) == {(0.0,)}
+    assert rows[0]["metrics"] == {"kid": 0.1}
+    assert all("reward_metrics" not in row for row in rows)
+    assert metadata["backbone_binding"]["context_source"] == "zero"
+    assert metadata["raw_metric_report"][0]["global_kid"] == 0.1
+    assert rows[0]["context_id"] != rows[2]["context_id"]
+    assert rows[0]["context_id"] == rows[1]["context_id"]
+
+
+def test_old_executed_clock_is_rejected():
+    manifest = image_manifest()
+    manifest["rows"][1]["time_grid"][1] += 0.01
+    with pytest.raises(ValueError, match="recollect"):
+        prepare_image_rows(manifest)
+
+
+def test_imagenet_preserves_raw_kid_and_only_fits_training_evidence():
+    manifest = image_manifest("imagenet64")
+    original = copy.deepcopy(manifest["rows"])
+    rows, contexts, metadata = prepare_image_rows(manifest)
+    assert len(contexts) == 2000
+    assert metadata["backbone_binding"]["context_source"] == "native_class_embedding"
+    assert metadata["raw_metric_report"][0]["unshrunk_class_conditional_kid"] == pytest.approx(0.1)
+    assert metadata["global_metric_report"] == []
+    assert all(row["metrics"] == before["metrics"] for row, before in zip(rows, original, strict=True))
+    assert all("reward_metrics" in row for row in rows if row["split"] == "train")
+    assert all("reward_metrics" not in row for row in rows if row["split"] == "validation")
+    train = [row for row in rows if row["split"] == "train"]
+    assert train[0]["reward_metrics"] == train[0]["metrics"]
+    assert sum(train[1000]["reward_estimator"]["coefficients"]) == pytest.approx(1)
+    manifest["feature_groups"]["fit_split"] = "validation"
+    with pytest.raises(ValueError, match="provenance"):
+        prepare_image_rows(manifest)
+
+
+def test_paired_jackknife_cancels_shared_noise_and_shrinkage_preserves_equal_class_weight():
+    kids = np.asarray([[[1.0, 1.0, 1.0, 1.0], [0.8, 0.7, 0.4, 0.3]]])
+    jackknife = kids[..., None] + np.asarray([-0.1, 0.1])
+    result = paired_kid_shrinkage(kids, jackknife, np.asarray([0, 0, 1, 1]), uniform_index=0, fit_split="train")
+    np.testing.assert_allclose(result["standard_errors"], 0, atol=1e-15)
+    np.testing.assert_allclose(result["shrunk_improvements"], kids[:, :1] - kids)
+    np.testing.assert_allclose(result["unshrunk_class_conditional_kid"], kids.mean(axis=-1))
+    assert np.allclose(result["coefficients"].sum(axis=-1), 1)
+    with pytest.raises(ValueError, match="training/calibration"):
+        paired_kid_shrinkage(kids, jackknife, np.asarray([0, 0, 1, 1]), uniform_index=0, fit_split="test")
+
+
+def test_training_feature_groups_are_reproducible_and_split_bound():
+    values = np.random.default_rng(1).normal(size=(20, 8))
+    first = fit_feature_groups(
+        values, fit_split="train", source_reference_id="real-train", group_count=3, component_count=4
     )
-
-
-def test_unconditional_supervision_is_an_explicit_singleton_zero_context() -> None:
-    supervision = _unconditional_supervision()
-
-    assert supervision.supervision_kind == "unconditional_mixture"
-    assert supervision.normalized_contexts.shape == (1, IMAGE_GICO_CONTEXT_DIM)
-    assert np.array_equal(supervision.normalized_contexts, np.zeros((1, IMAGE_GICO_CONTEXT_DIM)))
-    assert supervision.normalized_rewards is None
-    assert supervision.reward_diagnostics["synthetic_class_labels"] is False
-
-
-def test_unconditional_supervision_requires_authenticated_source_identity() -> None:
-    support, weights = _support_and_weights()
-    with pytest.raises(ValueError, match="SHA-256 identity"):
-        build_image_gico_unconditional_supervision(
-            target_nfes=IMAGE_GICO_TARGET_NFES,
-            schedule_keys=("uniform", "sine-a", "sine-b", "cosine"),
-            fixed_density_mass=support,
-            mixture_weights=weights,
-            source_identities={"mixture_evidence": "not-authenticated"},
-        )
-
-
-def test_shared_law_preserves_mass_and_constructs_the_exact_barycenter() -> None:
-    supervision = _unconditional_supervision()
-    expected = np.einsum(
-        "ncs,nsb->ncb",
-        supervision.mixture_weights,
-        supervision.fixed_density_mass,
-        dtype=np.float64,
+    assert first == fit_feature_groups(
+        values, fit_split="train", source_reference_id="real-train", group_count=3, component_count=4
     )
-
-    assert np.allclose(supervision.fixed_density_mass.sum(axis=-1), 1.0, rtol=0.0, atol=1e-12)
-    assert np.allclose(supervision.mixture_weights.sum(axis=-1), 1.0, rtol=0.0, atol=1e-12)
-    assert np.allclose(supervision.barycenter_density_mass.sum(axis=-1), 1.0, rtol=0.0, atol=1e-12)
-    assert np.allclose(supervision.barycenter_density_mass, expected, rtol=0.0, atol=2e-12)
-    # The aliases retain separate source weights in the shared supervision law.
-    assert np.array_equal(supervision.fixed_density_mass[:, 1], supervision.fixed_density_mass[:, 2])
-    assert np.all(supervision.mixture_weights[:, 0, 1:3].sum(axis=-1) > 0.0)
+    assert set(first["assignments"]) == {0, 1, 2}
+    with pytest.raises(ValueError, match="training/calibration"):
+        fit_feature_groups(values, fit_split="validation", source_reference_id="real-val")
 
 
-def test_supervision_round_trip_is_identity_preserving_and_no_replace(tmp_path: Path) -> None:
-    supervision = _unconditional_supervision()
-    output = tmp_path / "supervision"
-    manifest = save_image_gico_supervision(supervision, output)
-    loaded = load_image_gico_supervision(output)
-
-    assert manifest["supervision_sha256"] == supervision.sha256
-    assert loaded.sha256 == supervision.sha256
-    assert np.array_equal(loaded.fixed_density_mass, supervision.fixed_density_mass)
-    assert np.array_equal(loaded.mixture_weights, supervision.mixture_weights)
-    assert np.array_equal(loaded.barycenter_density_mass, supervision.barycenter_density_mass)
-    with pytest.raises(FileExistsError):
-        save_image_gico_supervision(supervision, output)
+def test_renaming_split_context_does_not_hide_panel_leakage():
+    manifest = image_manifest()
+    for row in manifest["rows"]:
+        row["reference_id"] = "same-panel"
+    with pytest.raises(ValueError, match="disjoint paired measurement panels"):
+        prepare_image_rows(manifest)
 
 
-def test_supervision_loader_rejects_array_tampering(tmp_path: Path) -> None:
-    output = tmp_path / "supervision"
-    save_image_gico_supervision(_unconditional_supervision(), output)
-    array_path = output / "mixture-weights.npy"
-    contents = bytearray(array_path.read_bytes())
-    contents[-1] ^= 1
-    array_path.write_bytes(contents)
-
-    with pytest.raises(ValueError, match="hash changed"):
-        load_image_gico_supervision(output)
-
-
-def test_supervision_save_rejects_post_construction_law_mutation(tmp_path: Path) -> None:
-    supervision = _unconditional_supervision()
-    construction_identity = supervision.sha256
-    supervision.mixture_weights.setflags(write=True)
-    first = float(supervision.mixture_weights[0, 0, 0])
-    last = float(supervision.mixture_weights[0, 0, -1])
-    supervision.mixture_weights[0, 0, 0] = last
-    supervision.mixture_weights[0, 0, -1] = first
-
-    assert supervision.sha256 == construction_identity
-    with pytest.raises(ValueError, match="scientific law was mutated"):
-        supervision.verify()
-    output = tmp_path / "mutated-supervision"
-    with pytest.raises(ValueError, match="scientific law was mutated"):
-        save_image_gico_supervision(supervision, output)
-    assert not output.exists()
+@pytest.mark.parametrize("opposing,expected_group_weight", [(False, 0.75), (True, 1.0)])
+def test_group_shrinkage_uses_covariance_of_paired_class_replicates(opposing, expected_group_weight):
+    kids = np.array([[[10.0, 10.0, 10.0, 10.0], [9.0, 9.0, 5.0, 5.0]]])
+    jackknife = np.repeat(kids[..., None], 2, axis=-1)
+    offsets = np.tile([-1.0, 1.0], (4, 1))
+    if opposing:
+        offsets[[1, 3]] *= -1
+    jackknife[0, 1] -= offsets
+    result = paired_kid_shrinkage(kids, jackknife, np.array([0, 0, 1, 1]), uniform_index=0, fit_split="train")
+    # Every class has variance1. Correlated group means retain variance1;
+    # opposite deviations cancel in each group mean and give variance0.
+    np.testing.assert_allclose(result["standard_errors"][0, 1], 1.0)
+    expected_coefficients = np.tile([0.0, expected_group_weight, 1 - expected_group_weight], (4, 1))
+    np.testing.assert_allclose(result["coefficients"][0, 1], expected_coefficients)
+    independent_group_weight = 3.5 / (3.5 + 0.5)
+    assert not np.isclose(expected_group_weight, independent_group_weight)
+    expected = expected_group_weight * np.array([1, 1, 5, 5]) + (1 - expected_group_weight) * 3
+    np.testing.assert_allclose(result["shrunk_improvements"][0, 1], expected)
 
 
-def test_supervision_rejects_consistent_law_rebinding() -> None:
-    supervision = _unconditional_supervision()
-    supervision.mixture_weights.setflags(write=True)
-    first = float(supervision.mixture_weights[0, 0, 0])
-    last = float(supervision.mixture_weights[0, 0, -1])
-    supervision.mixture_weights[0, 0, 0] = last
-    supervision.mixture_weights[0, 0, -1] = first
-    supervision.barycenter_density_mass.setflags(write=True)
-    supervision.barycenter_density_mass[...] = np.einsum(
-        "ncs,nsb->ncb",
-        supervision.mixture_weights,
-        supervision.fixed_density_mass,
-        dtype=np.float64,
-    )
-
-    with pytest.raises(ValueError, match="construction identity was mutated"):
-        supervision.verify()
-
-
-def test_conditional_supervision_enforces_reward_alias_and_barycenter_law() -> None:
-    schedule_count = len(IMAGE_SCHEDULE_KEYS)
-    backbone = _frozen_imagenet_backbone(digest="3" * 64, offset=0.125)
-    prepared = prepare_image_gico_backbone_context(backbone)
-    groups = build_image_gico_feature_groups(
-        np.random.default_rng(41).normal(size=(1_000, 64)),
-        source_panel_fingerprint="panel:" + "1" * 64,
-        feature_protocol_sha256="image-feature-protocol:" + "2" * 64,
-        real_feature_panel_sha256="real:" + "3" * 64,
-    )
-    generator = np.random.default_rng(42)
-    class_kid = generator.normal(size=(3, schedule_count, 1_000)).astype(np.float32)
-    jackknife = np.repeat(class_kid[..., None], 64, axis=-1)
-    jackknife += np.linspace(-0.01, 0.01, 64, dtype=np.float32)[None, None, None, :]
-    support = generator.uniform(size=(3, schedule_count, 64)).astype(np.float64)
-    support /= support.sum(axis=-1, keepdims=True)
-    support[:, 2] = support[:, 1]
-    density_hashes = tuple(
-        tuple(
-            f"density:{(nfe_index * schedule_count + (1 if schedule_index == 2 else schedule_index)):064x}"
-            for schedule_index in range(schedule_count)
-        )
-        for nfe_index in range(3)
-    )
-    targets = build_image_gico_conditional_targets(
-        class_kid=class_kid,
-        jackknife_class_kid=jackknife,
-        reward_scales=np.asarray((0.25, 0.5, 1.0), dtype=np.float32),
-        fixed_density_mass=support,
-        schedule_keys=IMAGE_SCHEDULE_KEYS,
-        schedule_sha256s=tuple(f"schedule:{index:064x}" for index in range(schedule_count)),
-        density_mass_sha256s=density_hashes,
-        feature_groups=groups,
-        reward_evidence_sha256="evidence:" + "4" * 64,
-        fixed_support_sha256="support:" + "5" * 64,
-        backbone_model_key=backbone.manifest.model_key,
-        backbone_protocol_sha256=backbone.manifest.protocol_sha256,
-        backbone_checkpoint_sha256=backbone.manifest.checkpoint.sha256,
-        feature_protocol_sha256=groups.feature_protocol_sha256,
-    )
-    supervision = build_image_gico_conditional_supervision(
-        targets=targets,
-        fixed_density_mass=support,
-        normalized_contexts=prepared.normalized_context_table,
-    )
-
-    assert np.array_equal(supervision.mixture_weights, np.asarray(targets.mixture_weights))
-    assert np.array_equal(supervision.normalized_rewards, np.asarray(targets.normalized_rewards))
-    assert np.allclose(
-        supervision.barycenter_density_mass,
-        np.einsum("ncs,nsb->ncb", supervision.mixture_weights, support),
-        rtol=0.0,
-        atol=2e-12,
-    )
-    assert np.array_equal(supervision.mixture_weights[:, :, 1], supervision.mixture_weights[:, :, 2])
-
-    bad_rewards = np.asarray(targets.normalized_rewards, dtype=np.float64).copy()
-    bad_rewards[0, 0, 0] = 6.0
-    clipped_target = replace(
-        targets,
-        normalized_rewards=tuple(tuple(tuple(row) for row in nfe) for nfe in bad_rewards),
-    )
-    with pytest.raises(ValueError, match="clipped"):
-        build_image_gico_conditional_supervision(
-            targets=clipped_target,
-            fixed_density_mass=support,
-            normalized_contexts=prepared.normalized_context_table,
-        )
-
-    bad_hashes = [list(row) for row in density_hashes]
-    bad_hashes[0][2] = "density:" + "f" * 64
-    alias_evasion = replace(targets, density_mass_sha256s=tuple(tuple(row) for row in bad_hashes))
-    with pytest.raises(ValueError, match="aliases disagree"):
-        build_image_gico_conditional_supervision(
-            targets=alias_evasion,
-            fixed_density_mass=support,
-            normalized_contexts=prepared.normalized_context_table,
-        )
+@pytest.mark.parametrize("task", ["cifar10", "imagenet64"])
+def test_image_split_panel_reuse_is_rejected_even_when_generation_seed_changes(task):
+    manifest = image_manifest(task)
+    for row in manifest["rows"]:
+        row["reference_id"] = "reused-reference-panel"
+        if row["split"] == "validation":
+            row["seed"] = 999
+    with pytest.raises(ValueError, match="disjoint paired measurement panels"):
+        prepare_image_rows(manifest)

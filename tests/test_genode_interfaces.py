@@ -81,6 +81,7 @@ class GenODEInterfaceTests(unittest.TestCase):
             "genode-validate-backbone-package",
             "genode-build-release-archive",
             "genode-image-gico",
+            "genode-latent-clock",
         }
         self.assertEqual(set(scripts), expected)
         for target in scripts.values():
@@ -91,7 +92,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         project = data["project"]
 
-        self.assertEqual(project["version"], "0.6.0")
+        self.assertEqual(project["version"], "0.7.0")
         self.assertEqual(
             project["description"], "GICO inference-clock optimization for frozen flow-matching backbones."
         )
@@ -119,11 +120,10 @@ class GenODEInterfaceTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertNotIn(command, scripts)
 
-    def test_readme_locked_test_command_includes_uniform_baseline_rows(self) -> None:
+    def test_readme_documents_locked_test_frozen_calibration(self) -> None:
         readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-        marker = "genode-report-gico-locked-test"
-        command_block = readme[readme.index(marker) : readme.index("## Development checks")]
-        self.assertIn("--baseline_rows", command_block)
+        self.assertIn("genode-report-gico-locked-test", readme)
+        self.assertIn("frozen calibration to paired test measurements without selection", readme)
 
     def test_release_markdown_is_current_and_scoped(self) -> None:
         markdown_files = sorted(
@@ -139,19 +139,17 @@ class GenODEInterfaceTests(unittest.TestCase):
             ],
         )
         text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("frozen_backbone_policy_context_v1", text)
-        self.assertIn("exactly 23 schedules", text)
+        self.assertIn("25 reference clocks", text)
         self.assertIn("genode-train-gico", text)
         self.assertIn("genode-report-gico-locked-test", text)
-        self.assertIn("[CONTRIBUTING.md](CONTRIBUTING.md)", text)
-        self.assertIn("[SECURITY.md](SECURITY.md)", text)
-        self.assertIn("covers eight scenarios", text)
         for scenario in (
             "solar_energy_10m",
             "traffic_hourly",
             "weather_daily",
-            "CIFAR-10",
-            "ImageNet-64",
+            "cifar10",
+            "imagenet64",
+            "sana",
+            "sd15",
             "molecule_3d_set1",
             "molecule_3d_set2",
             "molecule_3d_set3",
@@ -185,9 +183,10 @@ class GenODEInterfaceTests(unittest.TestCase):
             "Inspect wheel and source distribution",
             "Install and test the source distribution",
             "genode-image-gico",
-            "build-targets",
-            "train-deterministic",
-            "train-stochastic",
+            "prepare",
+            "train",
+            "genode-train-gico",
+            "genode-latent-clock",
             "validate",
             "materialize",
             "retired consistency feature",
@@ -214,65 +213,17 @@ class GenODEInterfaceTests(unittest.TestCase):
     def test_gico_trainer_public_contract_is_canonical(self) -> None:
         from genode.gico.train_gico import build_argparser
 
-        parser = build_argparser()
-        options = {option for action in parser._actions for option in action.option_strings}
+        options = {option for action in build_argparser()._actions for option in action.option_strings}
+        self.assertEqual(options, {"-h", "--help", "--config", "--student-kind", "--teacher-score-weight", "--dry-run"})
 
-        self.assertIn("--teacher_unseen_selection_rows_csv", options)
-        self.assertIn("--student_unseen_target_rows_csv", options)
-        self.assertIn("--student_unseen_target_" + "weight", options)
-        self.assertIn("--student_teacher_score_" + "weight", options)
-        self.assertIn("--student_teacher_score_warmup_" + "fraction", options)
-        self.assertIn("--student_teacher_score_include_" + "unseen_targets", options)
-        self.assertIn("--student_target_mixture_" + "mode", options)
-        self.assertIn("--student_target_elite_" + "fraction", options)
-        self.assertIn("--student_target_elite_" + "k", options)
-        self.assertIn("--student_target_elite_min_" + "count", options)
-        self.assertIn("--student_target_elite_blend_all_" + "weight", options)
-        removed_options = {
-            "--gico_" + "conditioning_style",
-            "--gico_teacher_" + "conditioning_style",
-            "--gico_student_" + "conditioning_style",
-            "--allow_noncanonical_conditioning",
-            "--density_bin_count",
-            "--teacher_checkpoint_" + "selection_mode",
-            "--student_checkpoint_" + "selection",
-            "--teacher_selection_component_" + "weights",
-            "--teacher_nfe_" + "proxy_anchor_values",
-            "--teacher_fit_checkpoint_" + "selection",
-            "--series_holdout_" + "fraction",
-            "--teacher_architecture",
-            "--student_architecture",
-            "--setting_encoder_mode",
-            "--setting_feature_mode",
-            "--series_unknown_" + "dropout",
-            "--student_pseudo_rows_csv",
-            "--student_pseudo_target_weight",
-            "--student_teacher_score_include_pseudo",
-        }
-        self.assertFalse(removed_options & options)
+    def test_full_pipeline_public_contract_routes_explicit_gico_configuration(self) -> None:
+        from genode.pipeline.full_pipeline import DEFAULT_STAGES, PIPELINE_STAGE_ORDER, build_argparser
 
-    def test_full_pipeline_public_contract_excludes_retired_ser_controls(self) -> None:
-        from genode.pipeline.full_pipeline import (
-            DEFAULT_ABLATION_FIRST_STAGES,
-            DEFAULT_STAGES,
-            PIPELINE_STAGE_ORDER,
-            build_argparser,
-        )
-
-        parser = build_argparser()
-        options = {option for action in parser._actions for option in action.option_strings}
-
-        self.assertIn("--ablation_first", options)
-        self.assertIn("--gico_ablation_preset", options)
-        retired_options = {
-            "--ser_" + "calibration_batch_size",
-            "--ser_" + "val_windows",
-            "--ser_" + "train_tuning_max_examples",
-        }
-        self.assertFalse(retired_options & options)
-        retired_stage = "ser_" + "summaries"
-        for stages in (DEFAULT_STAGES, DEFAULT_ABLATION_FIRST_STAGES, PIPELINE_STAGE_ORDER):
-            self.assertNotIn(retired_stage, stages)
+        options = {option for action in build_argparser()._actions for option in action.option_strings}
+        self.assertTrue({"--gico-config", "--student-kind", "--teacher-score-weight"} <= options)
+        self.assertEqual(DEFAULT_STAGES, ("backbone_training", "schedule_rows_seen", "schedule_rows_unseen"))
+        self.assertEqual(PIPELINE_STAGE_ORDER, ("data_prep", *DEFAULT_STAGES, "gico_training"))
+        self.assertNotIn("--ablation_first", options)
 
     def test_project_path_resolver_does_not_rewrite_package_prefixes(self) -> None:
         from genode.data import otflow_paths
@@ -298,11 +249,17 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertFalse(hasattr(policy, helper_name))
         self.assertNotIn(helper_name, getattr(policy, "__all__", ()))
 
-    def test_gico_policy_public_exports_are_unique(self) -> None:
+    def test_gico_policy_exposes_artifact_and_native_context_interfaces(self) -> None:
         from genode.gico import policy
 
-        exports = tuple(policy.__all__)
-        self.assertEqual(len(exports), len(set(exports)))
+        for name in (
+            "load_policy",
+            "save_artifact",
+            "load_context_embedding_table",
+            "save_context_embedding_table",
+            "stable_context_id",
+        ):
+            self.assertTrue(callable(getattr(policy, name)))
 
     def test_no_private_paths_or_upstream_namespace_in_tracked_text(self) -> None:
         blocked = (

@@ -27,7 +27,7 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install "${{ matrix.numpy_spec }}"
-      - run: python -m pip install -e ".[medical,test]"
+      - run: python -m pip install -e ".[test]"
       - run: python -m ruff check .
       - run: python -m ruff format --check .
       - run: python -m compileall -q src tests
@@ -44,7 +44,7 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[medical,test]"
+      - run: python -m pip install -e ".[test]"
       - run: python -m ruff check .
       - run: python -m ruff format --check .
       - run: python -m compileall -q src tests
@@ -116,7 +116,7 @@ jobs:
                   re.IGNORECASE,
               ),
               "retired image policy": re.compile(
-                  rb"image_clock_mixture|complete[-_]clock|gico[-_]clock[-_]policy|clock[-_ ]mixture",
+                  rb"image_clock_mixture|gico[-_]clock[-_]policy|clock[-_ ]mixture",
                   re.IGNORECASE,
               ),
               "retired consistency feature": re.compile(
@@ -160,8 +160,9 @@ jobs:
                   validate_content(name, archive.read(name))
               required_wheel = {
                   "genode/gico/image_cli.py",
-                  "genode/gico/image_causal_policy.py",
-                  "genode/gico/image_students.py",
+                  "genode/gico/networks.py",
+                  "genode/gico/rewards.py",
+                  "genode/gico/training.py",
               }
               if not required_wheel <= wheel_names:
                   raise SystemExit("Wheel omitted an active image GICO module.")
@@ -216,15 +217,15 @@ jobs:
             genode-package-backbone-family \
             genode-validate-backbone-package \
             genode-build-release-archive \
-            genode-image-gico
+            genode-image-gico \
+            genode-latent-clock
           do
             "$command" --help
           done
       - run: |
           for subcommand in \
-            build-targets \
-            train-deterministic \
-            train-stochastic \
+            prepare \
+            train \
             validate \
             materialize
           do

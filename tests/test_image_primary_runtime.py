@@ -17,33 +17,11 @@ from genode.backbones import (
     load_verified_image_backbone,
 )
 from genode.backbones import loading as backbone_loading
-from genode.benchmarks.image.protocol import IMAGE_SCHEDULE_KEYS
 from genode.benchmarks.image.runtime import (
     ImageEulerSampler,
     ImageGenerationRequest,
     policy_schedule_request_hashes,
 )
-from genode.gico.image_conditional import (
-    build_image_gico_conditional_targets,
-    build_image_gico_feature_groups,
-)
-from genode.gico.image_conditional_artifacts import (
-    BoundImageGICOConditionalArtifact,
-    load_image_gico_conditional_artifact,
-    save_image_gico_conditional_artifact,
-)
-from genode.gico.image_conditional_context import prepare_image_gico_backbone_context
-from genode.gico.image_conditional_training import (
-    ImageGICOBackboneContextTrainingConfig,
-    train_image_gico_backbone_context,
-)
-from genode.gico.image_students import (
-    load_image_gico_deterministic_artifact,
-    materialize_image_gico_schedule,
-    save_image_gico_deterministic_artifact,
-    train_image_gico_deterministic_student,
-)
-from genode.gico.image_supervision import build_image_gico_conditional_supervision
 from genode.schedules.policy import ScheduleBatch
 
 
@@ -213,199 +191,122 @@ def test_unconditional_cifar_executes_a_content_identified_policy() -> None:
     assert generated.schedule.schedule_policy_sha256 == policy.policy_sha256
 
 
-def test_imagenet_teacher_student_artifact_round_trip_and_euler_evaluation(
-    tmp_path: Path,
-) -> None:
-    schedule_count = len(IMAGE_SCHEDULE_KEYS)
-    assert schedule_count == 23
-    backbone = _frozen_imagenet_backbone(digest="3" * 64, offset=0.125)
-    prepared = prepare_image_gico_backbone_context(backbone)
-    assert prepared.normalized_context_table.shape == (1_000, 768)
+class _CommonPolicyFixture:
+    artifact_sha256 = "a" * 64
 
-    groups = build_image_gico_feature_groups(
-        np.random.default_rng(4).normal(size=(1_000, 64)),
-        source_panel_fingerprint="panel:" + "1" * 64,
-        feature_protocol_sha256="image-feature-protocol:" + "2" * 64,
-        real_feature_panel_sha256="real:" + "3" * 64,
+    def __init__(self, backbone, student_kind="stochastic"):
+        from genode.backbones.registry import get_image_backbone_spec
+        from genode.gico.image_conditional_context import native_contexts
+
+        _, binding = native_contexts(backbone)
+        self.metadata = {
+            "task": get_image_backbone_spec(backbone.manifest.model_key).dataset_key,
+            "backbone": backbone.manifest.model_key,
+            "backbone_binding": binding,
+        }
+        self.contexts = []
+        self.student_kind = student_kind
+
+    def density(self, context, solver, nfe, *, seed=0, request_id=""):
+        from genode.gico.clocks import clock_generator
+
+        self.contexts.append(np.asarray(context).copy())
+        assert solver == "euler"
+        identity = request_id if self.student_kind == "stochastic" else str(np.asarray(context).tolist())
+        values = torch.softmax(torch.randn(64, generator=clock_generator(seed, identity)), dim=0)
+        mass = values.numpy().astype(np.float64)
+        return mass / mass.sum()
+
+
+@pytest.mark.parametrize("student_kind", ["deterministic", "stochastic"])
+@pytest.mark.parametrize("clock_seed", [0, 8, 51])
+def test_common_image_measurement_exports_raw_mass_and_exact_decoded_grid(student_kind, clock_seed):
+    from dataclasses import replace
+
+    from genode.gico.clocks import materialize, verify_measurement_clock
+
+    backbone = _frozen_cifar_backbone(digest="b" * 64)
+    sampler = ImageEulerSampler(backbone, device="cpu")
+    policy = _CommonPolicyFixture(backbone, student_kind)
+    schedule = sampler.gico_schedule(
+        policy, target_nfe=8, class_labels=None, sample_keys=("first", "second"), clock_seed=clock_seed
     )
-    generator = np.random.default_rng(5)
-    class_kid = generator.normal(size=(3, schedule_count, 1_000)).astype(np.float32)
-    jackknife = np.repeat(class_kid[..., None], 64, axis=-1)
-    jackknife += np.linspace(-0.01, 0.01, 64, dtype=np.float32)[None, None, None, :]
-    masses = generator.uniform(size=(3, schedule_count, 64)).astype(np.float64)
-    masses /= masses.sum(axis=-1, keepdims=True, dtype=np.float64)
-    schedule_sha256s = tuple(
-        semantic_sha256({"schedule_key": key}, namespace="test-image-schedule") for key in IMAGE_SCHEDULE_KEYS
-    )
-    density_mass_sha256s = tuple(
-        tuple(
-            semantic_sha256(masses[nfe_index, schedule_index].tolist(), namespace="test-image-density")
-            for schedule_index in range(schedule_count)
+    assert schedule.gico_density_mass is not None
+    assert not torch.equal(schedule.gico_density_mass, schedule.density_mass)
+    for index in range(2):
+        row = {**schedule.gico_measurement_clock(index), "schedule_key": "candidate"}
+        verify_measurement_clock(row)
+        assert row["time_grid"] == list(materialize(row["density_mass"], "euler", 8))
+        np.testing.assert_array_equal(row["time_grid"], schedule.time_grid[index].numpy())
+        with pytest.raises(ValueError, match="recollect"):
+            verify_measurement_clock({**row, "density_mass": schedule.density_mass[index].tolist()})
+    # A caller cannot attach a different raw density to an otherwise valid grid.
+    with pytest.raises(ValueError, match="uniform mixture|shared density decoder"):
+        replace(schedule, gico_density_mass=schedule.density_mass)
+    # Shared deterministic rows also retain raw provenance when collapsed for hashing.
+    if student_kind == "deterministic":
+        single = replace(
+            schedule,
+            density_mass=schedule.density_mass[:1],
+            time_grid=schedule.time_grid[:1],
+            gico_density_mass=schedule.gico_density_mass[:1],
         )
-        for nfe_index in range(3)
-    )
-    targets = build_image_gico_conditional_targets(
-        class_kid=class_kid,
-        jackknife_class_kid=jackknife,
-        reward_scales=np.asarray((0.25, 0.5, 1.0), dtype=np.float32),
-        fixed_density_mass=masses,
-        schedule_keys=IMAGE_SCHEDULE_KEYS,
-        schedule_sha256s=schedule_sha256s,
-        density_mass_sha256s=density_mass_sha256s,
-        feature_groups=groups,
-        reward_evidence_sha256=semantic_sha256("evidence", namespace="test-image-reward-evidence"),
-        fixed_support_sha256=semantic_sha256(masses.tolist(), namespace="test-image-fixed-support"),
-        backbone_model_key=backbone.manifest.model_key,
-        backbone_protocol_sha256=backbone.manifest.protocol_sha256,
-        backbone_checkpoint_sha256=backbone.manifest.checkpoint.sha256,
-        feature_protocol_sha256=groups.feature_protocol_sha256,
-    )
-    supervision = build_image_gico_conditional_supervision(
-        targets=targets,
-        fixed_density_mass=masses,
-        normalized_contexts=prepared.normalized_context_table,
-    )
-    unified_result = train_image_gico_deterministic_student(
-        supervision,
-        config=ImageGICOBackboneContextTrainingConfig(
-            teacher_steps=1,
-            student_steps=1,
-            teacher_batch_size=8,
-        ),
-    )
-    unified_dir = tmp_path / "unified-deterministic-policy"
-    unified_manifest = save_image_gico_deterministic_artifact(
-        unified_result,
-        supervision,
-        unified_dir,
-    )
-    unified_artifact = load_image_gico_deterministic_artifact(
-        unified_dir,
-        expected_artifact_sha256=unified_manifest["artifact_sha256"],
-    )
-    materialized = materialize_image_gico_schedule(
-        "deterministic_barycenter",
-        deterministic_artifact=unified_artifact,
-        causal_artifact=None,
-        target_nfe=4,
-        context_indices=[0, 999],
-    )
-    assert materialized.density_mass.shape == (2, 64)
-    assert materialized.time_grids.shape == (2, 5)
-    assert materialized.artifact_sha256 == unified_manifest["artifact_sha256"]
-    assert materialized.supervision_sha256 == supervision.sha256
+        assert policy_schedule_request_hashes(schedule)[0] == single.sha256
 
-    result = train_image_gico_backbone_context(
-        targets,
-        fixed_density_mass=masses,
-        normalized_context_table=prepared.normalized_context_table,
-        context_binding_sha256=prepared.binding.binding_sha256,
-        config=ImageGICOBackboneContextTrainingConfig(
-            teacher_steps=1,
-            student_steps=2,
-            teacher_batch_size=8,
-        ),
-    )
-    policy_dir = tmp_path / "policy"
-    paths = save_image_gico_conditional_artifact(
-        policy_dir,
-        result,
-        groups,
-        targets,
-        prepared,
-    )
-    assert paths["teacher_state"].is_file()
-    assert paths["student_state"].is_file()
 
-    portable = load_image_gico_conditional_artifact(policy_dir)
-    bound = portable.bind(backbone)
-    with pytest.raises(TypeError, match="must be created by"):
-        BoundImageGICOConditionalArtifact(
-            policy=bound.policy,
-            prepared_context=bound.prepared_context,
-            feature_groups=bound.feature_groups,
-            targets=bound.targets,
-            manifest=bound.manifest,
-            _construction_token=object(),
-        )
-    labels = torch.tensor([0, 999], dtype=torch.int64)
-    contexts = bound.contexts_for_class_labels(labels)
-    raw_contexts = backbone.encode_conditioning(labels).cpu().numpy()
-    expected_contexts = torch.from_numpy(
-        np.ascontiguousarray(
-            (raw_contexts - prepared.normalizer.mean[None, :]) / prepared.normalizer.scale[None, :],
-            dtype=np.float32,
-        )
-    )
-    assert torch.equal(contexts, expected_contexts)
+@pytest.mark.parametrize("nfe", [2, 4, 8])
+def test_fixed_image_reference_evidence_matches_common_realization_at_every_nfe(nfe):
+    from genode.gico.clocks import reference_densities, verify_measurement_clock
+    from genode.schedules.fixed import build_default_fixed_schedules, build_fixed_schedule
+    from genode.schedules.specification import ScheduleSpecification
 
-    schedule = bound.policy.predict(contexts, target_nfe=4)
-    output_hash, grid_hash, execution_hash, mass_hash = policy_schedule_request_hashes(
-        schedule,
-        preserve_batch=True,
-    )
+    expected = reference_densities("euler", nfe)
+    schedules = build_default_fixed_schedules(nfe)
+    assert len(schedules) == len(expected) == 25
+    for schedule in schedules:
+        row = schedule.gico_measurement_clock()
+        assert row["density_mass"] == list(expected[row["schedule_key"]])
+        verify_measurement_clock(row)
+    with pytest.raises(ValueError, match="64 density bins"):
+        build_fixed_schedule(ScheduleSpecification("uniform"), nfe, density_bin_count=32)
+
+
+def test_common_image_policy_uses_native_context_and_independent_replayable_clock_rng():
+    backbone = _frozen_imagenet_backbone(digest="b" * 64, offset=0.0)
+    sampler = ImageEulerSampler(backbone, device="cpu")
+    policy = _CommonPolicyFixture(backbone)
+    schedule = sampler.gico_schedule(policy, target_nfe=2, class_labels=(2, 7), sample_keys=("a", "b"), clock_seed=8)
+    replay = sampler.gico_schedule(policy, target_nfe=2, class_labels=(2, 7), sample_keys=("a", "b"), clock_seed=8)
+    assert torch.equal(schedule.time_grid, replay.time_grid)
+    assert not torch.equal(schedule.time_grid[0], schedule.time_grid[1])
+    expected = backbone.encode_conditioning(torch.tensor([2, 7])).numpy()
+    np.testing.assert_array_equal(policy.contexts[:2], expected)
+    output_hash, grid_hash, execution_hash, mass_hash = policy_schedule_request_hashes(schedule)
     request = ImageGenerationRequest(
-        source_request_sha256=semantic_sha256(
-            {"request": "backbone-context-policy"},
-            namespace="test-image-request",
-        ),
+        source_request_sha256="c" * 64,
         backbone_manifest=backbone.manifest,
-        latent_seeds=(101, 103),
-        class_labels=(0, 999),
-        target_nfe=4,
-        schedule_policy_sha256=portable.artifact_sha256,
+        latent_seeds=(31, 47),
+        class_labels=(2, 7),
+        target_nfe=2,
+        schedule_policy_sha256=policy.artifact_sha256,
         schedule_output_sha256=output_hash,
         time_grid_sha256=grid_hash,
         execution_time_grid_sha256=execution_hash,
         density_mass_sha256=mass_hash,
     )
-    generated = ImageEulerSampler(
-        backbone,
-        device="cpu",
-        execution_batch_size=2,
-    ).sample_gico(request, bound)
-    assert generated.field_evaluations == 4
-    assert generated.schedule.source_kind == "contextual_schedule_policy"
-    assert torch.equal(generated.images, generated.noise.values)
-    assert generated.request.class_labels == (0, 999)
+    generated = sampler.sample_gico(request, policy, sample_keys=("a", "b"), clock_seed=8)
+    assert generated.field_evaluations == 2
+    assert len(policy.contexts) == 6  # Two precomputations and exactly one clock per executed image.
+    with pytest.raises(ValueError, match="output/grid/density"):
+        sampler.sample_gico(request, policy, sample_keys=("a", "b"), clock_seed=9)
+    policy.metadata["backbone_binding"]["checkpoint_sha256"] = "d" * 64
+    with pytest.raises(ValueError, match="backbone"):
+        sampler.gico_schedule(policy, target_nfe=2, class_labels=(2, 7), sample_keys=("a", "b"))
 
-    original_weight = bound.policy.model.global_logits_by_nfe[0, 0].item()
-    with torch.no_grad():
-        bound.policy.model.global_logits_by_nfe[0, 0] = original_weight + 0.25
-    with pytest.raises(ValueError, match="student state was modified"):
-        ImageEulerSampler(backbone, device="cpu").sample_gico(request, bound)
-    with torch.no_grad():
-        bound.policy.model.global_logits_by_nfe[0, 0] = original_weight
 
-    original_context = bound.policy.model.canonical_context_table[0, 0].item()
-    with torch.no_grad():
-        bound.policy.model.canonical_context_table[0, 0] = original_context + 0.25
-    with pytest.raises(ValueError, match="context table was modified"):
-        ImageEulerSampler(backbone, device="cpu").sample_gico(request, bound)
-    with torch.no_grad():
-        bound.policy.model.canonical_context_table[0, 0] = original_context
-
-    with pytest.raises(ValueError, match="must use sample_gico"):
-        ImageEulerSampler(backbone, device="cpu").sample_policy(
-            request,
-            bound.policy,
-            context=bound.contexts_for_class_labels(torch.tensor([999, 0])),
-        )
-
-    mismatched_identity_request = ImageGenerationRequest(
-        source_request_sha256=request.source_request_sha256,
-        backbone_manifest=request.backbone_manifest,
-        latent_seeds=request.latent_seeds,
-        class_labels=request.class_labels,
-        target_nfe=request.target_nfe,
-        schedule_policy_sha256="9" * 64,
-        schedule_output_sha256=request.schedule_output_sha256,
-        time_grid_sha256=request.time_grid_sha256,
-        execution_time_grid_sha256=request.execution_time_grid_sha256,
-        density_mass_sha256=request.density_mass_sha256,
-    )
-    with pytest.raises(ValueError, match="artifact identity"):
-        ImageEulerSampler(backbone, device="cpu").sample_gico(
-            mismatched_identity_request,
-            bound,
-        )
+def test_common_cifar_policy_receives_explicit_zero_context():
+    backbone = _frozen_cifar_backbone(digest="a" * 64)
+    sampler = ImageEulerSampler(backbone, device="cpu")
+    policy = _CommonPolicyFixture(backbone)
+    sampler.gico_schedule(policy, target_nfe=2, class_labels=None, sample_keys=("image",))
+    np.testing.assert_array_equal(policy.contexts, [[0.0]])

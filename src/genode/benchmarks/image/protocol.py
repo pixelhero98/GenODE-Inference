@@ -23,8 +23,8 @@ from genode.schedule_transfer.reference_clocks import (
 from genode.schedules.fixed import FIXED_SCHEDULE_TARGET_NFES
 from genode.schedules.specification import ScheduleSpecification
 
-IMAGE_PROTOCOL_VERSION = 6
-IMAGE_PROTOCOL_KEY = "image_euler_248_v6"
+IMAGE_PROTOCOL_VERSION = 7
+IMAGE_PROTOCOL_KEY = "image_euler_248_v7"
 IMAGE_GICO_TEACHER_SCORE_WEIGHT = 0.01
 IMAGE_GICO_TEACHER_SCORE_WARMUP_FRACTION = 0.60
 IMAGE_GICO_TEACHER_SCORE_CLIP = 5.0
@@ -301,7 +301,7 @@ def image_protocol_metadata(
             "selection_screening_blocks": KID_SELECTION_SCREENING_BLOCKS,
             "survivor_confirmation_blocks": KID_SURVIVOR_CONFIRMATION_BLOCKS,
             "reward_direction": "lower_is_better",
-            "reward_transform": "signed_robust_uniform_advantage",
+            "reward_transform": "paired_uniform_minus_candidate_kid_frozen_scalar_std",
         },
         "locked_metrics": {
             "sample_count": LOCKED_SAMPLE_COUNT,
@@ -324,8 +324,11 @@ def image_protocol_metadata(
             "locked_tuning": False,
         },
         "gico_student": {
-            "primary_target": "kid_reward_soft_density_mixture",
-            "objective": "target_to_policy_kl_minus_teacher_score",
+            "primary_target": "teacher_weighted_unique_reference_densities",
+            "deterministic_objective": "target_to_policy_kl_minus_teacher_score",
+            "stochastic_objective": "smoothed_autoregressive_gaussian_nll_minus_reparameterized_teacher_score",
+            "artifact_protocol": "genode-gico-v2",
+            "teacher_score_weights": [0.01, 0.05, 0.1],
             "teacher_evidence_phase": "reward_train",
             "teacher_score_weight": IMAGE_GICO_TEACHER_SCORE_WEIGHT,
             "teacher_score_schedule": "zero_then_linear_late_ramp",

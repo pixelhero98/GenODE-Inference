@@ -6,11 +6,15 @@ from dataclasses import dataclass
 from numbers import Integral
 
 CANONICAL_SOLVER_KEYS: tuple[str, ...] = ("euler", "dpmpp2m", "heun", "midpoint_rk2")
+# External latent-T2I solvers are valid metadata, but are not added to the
+# canonical flow-matching experiment matrix or its built-in runtime dispatch.
+EXTERNAL_SOLVER_ORDERS: dict[str, int] = {"ipndm": 2}
 CANONICAL_SOLVER_DISPLAY_NAMES: dict[str, str] = {
     "euler": "Euler",
     "dpmpp2m": "DPM++2M",
     "heun": "Heun / RK2",
     "midpoint_rk2": "Midpoint RK2",
+    "ipndm": "LD3 iPNDM (order 2)",
 }
 CANONICAL_SOLVER_RUNTIME_NAMES: dict[str, str] = {
     "euler": "euler",
@@ -33,6 +37,7 @@ SOLVER_ALIASES: dict[str, str] = {
     "midpoint-rk2": "midpoint_rk2",
     "rk2_midpoint": "midpoint_rk2",
     "midpoint rk2": "midpoint_rk2",
+    "ipndm": "ipndm",
 }
 _INTEGER_TEXT = re.compile(r"[+-]?\d+")
 
@@ -61,6 +66,8 @@ def normalize_solver_keys(values: Sequence[str] | str, *, reject_duplicates: boo
 
 def solver_runtime_name(solver_key: str) -> str:
     key = normalize_solver_key(solver_key)
+    if key in EXTERNAL_SOLVER_ORDERS:
+        raise ValueError(f"{key} requires its external latent-T2I runtime adapter.")
     return CANONICAL_SOLVER_RUNTIME_NAMES[key]
 
 
@@ -85,7 +92,8 @@ def solver_macro_steps(solver_key: str, target_nfe: int) -> int:
 
 
 def solver_effective_order(solver_key: str) -> int:
-    return 1 if normalize_solver_key(solver_key) == "euler" else 2
+    key = normalize_solver_key(solver_key)
+    return EXTERNAL_SOLVER_ORDERS.get(key, 1 if key == "euler" else 2)
 
 
 def solver_order_p(solver_key: str) -> float:

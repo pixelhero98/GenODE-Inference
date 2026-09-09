@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "genode"
-version = "0.6.0"
+version = "0.7.0"
 description = "GICO inference-clock optimization for frozen flow-matching backbones."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,8 +37,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-medical = ["wfdb>=4.1"]
 test = ["pytest>=8,<10", "ruff>=0.12"]
+latent-clock = ["botorch>=0.16,<0.17"]
 
 [project.urls]
 Homepage = "https://github.com/pixelhero98/GenODE-Inference"
@@ -61,6 +61,7 @@ genode-package-backbone-family = "genode.backbone_packages:package_main"
 genode-validate-backbone-package = "genode.backbone_packages:validate_main"
 genode-build-release-archive = "genode.release_bundles:main"
 genode-image-gico = "genode.gico.image_cli:main"
+genode-latent-clock = "genode.latent_clock.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

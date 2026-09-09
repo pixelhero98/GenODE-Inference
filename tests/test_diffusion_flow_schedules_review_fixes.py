@@ -1,14 +1,8 @@
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
-
-import torch
 
 from genode.gico.density_representation import average_density_masses, grid_to_density_mass, uniform_reference_grid
-from genode.schedule_transfer import diffusion_flow_schedules as schedule_module
-from genode.schedule_transfer import otflow_schedule_diagnostics as diagnostics_module
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
     EXPERIMENTAL_AVERAGED_FIXED_SCHEDULE_KEYS,
@@ -19,7 +13,6 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
     schedule_time_alignment,
 )
 from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
-from genode.schedule_transfer.otflow_schedule_diagnostics import _collect_rollout_diagnostics
 
 
 class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
@@ -40,7 +33,7 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
                     self.assertEqual(len(grid), runtime_steps + 1)
                     self.assertAlmostEqual(grid[0], 0.0)
                     self.assertAlmostEqual(grid[-1], 1.0)
-                    self.assertTrue(all(b > a for a, b in zip(grid, grid[1:], strict=False)))
+                    self.assertTrue(all((b > a for a, b in zip(grid, grid[1:], strict=False))))
 
     def test_schedule_grid_rejects_nonpositive_steps(self) -> None:
         for schedule_key in BASELINE_SCHEDULE_KEYS:
@@ -53,13 +46,12 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
 
     def test_flowts_power_sampling_grid_is_supported(self) -> None:
         grid = build_schedule_grid("flowts_power_0p03", 4)
-
         self.assertIsNotNone(grid)
         assert grid is not None
         self.assertEqual(len(grid), 5)
         self.assertAlmostEqual(grid[0], 0.0)
         self.assertAlmostEqual(grid[-1], 1.0)
-        self.assertTrue(all(b > a for a, b in zip(grid, grid[1:], strict=False)))
+        self.assertTrue(all((b > a for a, b in zip(grid, grid[1:], strict=False))))
 
     def test_experimental_reversed_schedule_grids_are_reversed_counterparts(self) -> None:
         self.assertNotIn("uniform_reversed", EXPERIMENTAL_REVERSED_SCHEDULE_KEYS)
@@ -77,7 +69,7 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
                 self.assertAlmostEqual(reversed_grid[0], 0.0)
                 self.assertAlmostEqual(reversed_grid[-1], 1.0)
                 self.assertTrue(
-                    all(right > left for left, right in zip(reversed_grid, reversed_grid[1:], strict=False))
+                    all((right > left for left, right in zip(reversed_grid, reversed_grid[1:], strict=False)))
                 )
                 expected = tuple(1.0 - value for value in reversed(base_grid))
                 for observed, target in zip(reversed_grid, expected, strict=False):
@@ -137,136 +129,6 @@ class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):
         gits = next(row for row in augmented if row["scheduler_key"] == "gits")
         self.assertAlmostEqual(gits["forecast_relative_crps_gain_vs_uniform"], 0.11)
         self.assertAlmostEqual(gits["forecast_relative_mase_gain_vs_uniform"], 0.25)
-
-    def test_fixed_schedule_reports_realized_heun_evaluations_without_retired_trigger_metrics(self) -> None:
-        result = {
-            "meta": {
-                "chosen_t0s": [3],
-                "chosen_t0s_hash": "paired",
-                "horizon": 1,
-                "dataset_kind": "demo",
-                "generation_seed_base": 7,
-                "metrics_seed": 11,
-                "main_metrics_only": False,
-                "per_window_metric_rows": [],
-            }
-        }
-        diagnostics = {
-            "n_rollout_calls": 1,
-            "macro_steps": 2,
-            "field_evals_by_step": [2.0, 2.0],
-            "disagreement_by_step": [0.0, 0.1],
-            "mean_field_evals_per_step": 2.0,
-            "mean_total_field_evals_per_rollout": 4.0,
-        }
-        with (
-            patch.object(schedule_module, "_apply_sample_overrides", return_value={}),
-            patch.object(
-                schedule_module,
-                "_restore_sample_overrides",
-            ),
-            patch.object(schedule_module, "eval_many_windows", return_value=result),
-            patch.object(
-                schedule_module,
-                "_collect_rollout_diagnostics",
-                return_value=diagnostics,
-            ),
-            patch.object(schedule_module, "_metric_bundle", return_value={}),
-        ):
-            row = schedule_module.run_fixed_schedule_variant(
-                model=object(),
-                ds=object(),
-                cfg=object(),
-                eval_horizon=1,
-                eval_windows=1,
-                grid_spec={
-                    "grid_name": "uniform",
-                    "grid_kind": "fixed",
-                    "selection_group": "uniform",
-                    "solver_name": "heun",
-                    "nfe": 2,
-                    "time_grid": (0.0, 0.5, 1.0),
-                },
-                chosen_t0s=(3,),
-                generation_seed_base=7,
-                metrics_seed=11,
-                score_main_only=False,
-            )
-
-        self.assertEqual(row["target_total_field_evals"], 4)
-        self.assertEqual(row["mean_total_field_evals_per_rollout"], 4.0)
-        self.assertNotIn("trigger_rate", row)
-        self.assertFalse({"trigger_rate", "trigger_by_step", "eligible_by_step"} & set(row["diag"]))
-
-    def test_rollout_diagnostics_rejects_empty_chosen_t0s(self) -> None:
-        cfg = SimpleNamespace(device=torch.device("cpu"))
-        ds = SimpleNamespace(cond=None)
-
-        with self.assertRaisesRegex(ValueError, "chosen_t0s must be a non-empty"):
-            _collect_rollout_diagnostics(
-                object(),
-                ds,
-                cfg,
-                horizon=2,
-                macro_steps=3,
-                n_windows=1,
-                seed=0,
-                solver="euler",
-                chosen_t0s=[],
-            )
-
-    def test_rollout_diagnostics_consumes_only_canonical_trace_fields(self) -> None:
-        hist = torch.zeros(2, 3)
-        trace = {
-            "field_evals_by_step": torch.tensor([[2.0, 2.0]]),
-            "disagreement": torch.tensor([[0.0, 0.25]]),
-            "mean_total_field_evals_per_rollout": 4.0,
-        }
-        with (
-            patch.object(diagnostics_module, "_get_dataset_item_by_t", return_value=object()),
-            patch.object(
-                diagnostics_module,
-                "_parse_batch",
-                return_value=(hist, None, None, None, None),
-            ),
-            patch.object(diagnostics_module, "resolve_context_length", return_value=2),
-            patch.object(
-                diagnostics_module,
-                "crop_history_window",
-                side_effect=lambda value, _: value,
-            ),
-            patch.object(diagnostics_module, "_future_time_context_seq", return_value=None),
-            patch.object(
-                diagnostics_module,
-                "_sample_eval_trace",
-                return_value=(torch.zeros(1, 1, 3), trace, 1),
-            ),
-        ):
-            result = _collect_rollout_diagnostics(
-                object(),
-                SimpleNamespace(cond=None),
-                SimpleNamespace(device=torch.device("cpu")),
-                horizon=1,
-                macro_steps=2,
-                n_windows=1,
-                seed=0,
-                solver="heun",
-                chosen_t0s=(0,),
-            )
-
-        self.assertEqual(
-            set(result),
-            {
-                "n_rollout_calls",
-                "macro_steps",
-                "field_evals_by_step",
-                "disagreement_by_step",
-                "mean_field_evals_per_step",
-                "mean_total_field_evals_per_rollout",
-            },
-        )
-        self.assertEqual(result["field_evals_by_step"], [2.0, 2.0])
-        self.assertEqual(result["mean_total_field_evals_per_rollout"], 4.0)
 
 
 if __name__ == "__main__":

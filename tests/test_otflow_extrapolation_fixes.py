@@ -333,10 +333,6 @@ class ExtrapolationFixesTest(unittest.TestCase):
         )["per_example_rows"][0]
         self.assertEqual(repeated["row_signature"], context_rows[0]["row_signature"])
 
-        from genode.gico.policy import student_nfe_sequence_pairs
-
-        self.assertEqual(student_nfe_sequence_pairs(context_rows), [(0, 1, 4.0), (1, 2, 4.0)])
-
     def test_collect_forecast_calibration_handles_sample_seed_above_numpy_limit(self) -> None:
         cfg = OTFlowConfig(
             device=torch.device("cpu"),

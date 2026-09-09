@@ -1,338 +1,136 @@
 # GenODE Inference
 
-GenODE learns **GICO** (Generative Inference Clock Optimization) policies for
-frozen flow-matching and ODE backbones. A GICO policy uses the frozen backbone's own context
-and the solver budget to predict a continuous density over integration time.
-Integrating and inverting that density produces a strictly increasing time grid
-while the generative backbone remains frozen.
+GenODE learns inference clocks for frozen generative backbones. A shared GICO teacher supervises either a deterministic density policy or an autoregressive stochastic density policy. Each task/backbone has separately trained weights. The generative backbone stays frozen.
 
-## Installation
+## Install
 
-GenODE requires Python 3.11 or newer. Install the package and its command-line
-tools from a clone of this repository:
+Python 3.11 or newer is required.
 
 ```bash
 git clone https://github.com/pixelhero98/GenODE-Inference.git
 cd GenODE-Inference
-python -m pip install .
-```
-
-For an editable development installation with the test suite:
-
-```bash
 python -m pip install -e ".[test]"
 python -m pytest -q
 ```
 
-The image runtime uses user-supplied external source trees and checkpoints; it
-does not download or redistribute them. Review
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before using image assets.
+The optional `latent-clock` extra supplies Bayesian-optimization dependencies. Image generators, text-to-image scorers, and pretrained weights are external assets; supply their source revisions and checkpoints explicitly. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Supported GICO scenarios
+## Tasks and rewards
 
-The publication workflow covers eight scenarios: three temporal extrapolation
-datasets, two image datasets, and three 3D molecular sets.
-
-| Family | Scenario key | Conditioning | Supervision objective |
-| --- | --- | --- | --- |
-| Temporal | `solar_energy_10m` | Frozen backbone summary, plus its auxiliary conditioning when present | Equal-weight CRPS and MASE improvement over the uniform clock |
-| Temporal | `traffic_hourly` | Frozen backbone summary, plus its auxiliary conditioning when present | Equal-weight CRPS and MASE improvement over the uniform clock |
-| Temporal | `weather_daily` | Frozen backbone summary, plus its auxiliary conditioning when present | Equal-weight CRPS and MASE improvement over the uniform clock |
-| Image | CIFAR-10 | Explicit singleton zero context; labels are rejected | Authenticated precomputed schedule-mixture evidence |
-| Image | ImageNet-64 | Native 1,000-class RF++/1-RF label embedding | KID improvement over the uniform clock |
-| 3D molecule | `molecule_3d_set1` | Frozen backbone policy context | Weighted geometric and kinematic improvement over the uniform clock |
-| 3D molecule | `molecule_3d_set2` | Frozen backbone policy context | Weighted geometric and kinematic improvement over the uniform clock |
-| 3D molecule | `molecule_3d_set3` | Frozen backbone policy context | Weighted geometric and kinematic improvement over the uniform clock |
-
-The image registry supports RF++ Config G and EDM VE as 1-RF for CIFAR-10,
-and RF++ Config E and EDM VE as 1-RF for ImageNet-64. Both image datasets
-support the deterministic and stochastic students described below.
-
-## Conditioning, reward, and training contracts
-
-### Temporal and 3D scenarios
-
-`frozen_backbone_policy_context_v1` is the projected summary consumed by the
-frozen field:
-
-```text
-policy_context = cache.summary
-policy_context = concat(cache.summary, cache.cond_emb)  # with auxiliary conditioning
-```
-
-The backbone is frozen and in evaluation mode. Contexts are finite, detached,
-width-checked, and produced without gradients. Raw encoder summaries are not
-selectable policy inputs.
-
-Each metric is expressed as a log improvement over the uniform schedule. For
-the temporal CRPS/MASE rows, repeated seeds are averaged within each
-solver/NFE/schedule cell before reward construction:
-
-```text
-lower-is-better utility = log((uniform + eps) / (candidate + eps))
-higher-is-better utility = log((candidate + eps) / (uniform + eps))
-```
-
-The three temporal scenarios use lower-is-better CRPS and MASE with weights
-`0.5, 0.5`. Each 3D set uses lower-is-better Kabsch RMSD with weight `0.40`,
-plus ensemble velocity W1, ensemble acceleration W1, rollout velocity W1, and
-rollout acceleration W1 with weight `0.15` each.
-
-For all six scenarios, the metric-vector teacher is trained with pairwise
-ranking and masked Huber regression. The configured metric weights scalarize
-its outputs, and its scores define a soft mixture over the fixed schedule
-densities. The continuous-density student minimizes cross-entropy/KL to that
-mixture, with the late-ramped clipped teacher-score term when enabled. Context
-holdouts and density-family holdouts are used for model selection; locked-test
-rows are never used to select or train the teacher or student.
-
-### Image scenarios
-
-ImageNet-64 uses the frozen model's native
-`native_model.model.map_label` representation and binds the 1,000-row context
-table to the backbone and checkpoint identities. CIFAR-10 is unconditional:
-its supervision contains one explicit all-zero context, and supplying a class
-label is an error. Contexts are never manufactured, truncated, or remapped.
-
-Both image students consume one validated `ImageGICOSupervision` law that
-binds NFEs 2, 4, and 8 to the fixed schedule support, mixture weights, density
-barycenter, context table, diagnostics, and semantic source identities.
-
-For ImageNet-64, KID is minimized and the raw advantage is
-`uniform KID - schedule KID`. Jackknife standard errors feed
-class-to-feature-group-to-global shrinkage, followed by reward-scale
-normalization and clipping to `[-5, 5]`. Exact density aliases are aggregated
-before softmax; their probability is then split consistently across duplicate
-schedules. The same mixture weights define the deterministic density
-barycenter. CIFAR-10 starts from authenticated precomputed mixture evidence, so
-the public constructor does not invent class labels or synthesize rewards.
-
-| Student kind | Training objective | Published default |
+| Task | Frozen native context | Terminal training reward |
 | --- | --- | --- |
-| `deterministic_barycenter` | Target-density KL, centered residual penalty, and a late-ramped clipped teacher-score term for conditional training | Conditional model with 256 hidden dimensions |
-| `stochastic_causal_ar` | Terminal-weighted complete-path NLL over strict prefix-trie support | 128 model dimensions, 256-token vocabulary, four heads, 192-dimensional FFN, one Transformer block, 16-dimensional NFE embedding (339,184 parameters) |
+| `solar_energy_10m`, `traffic_hourly`, `weather_daily` | Pooled backbone summary, including native auxiliary conditioning | Equal-weight CRPS and MASE log improvements |
+| `molecule_3d_set1`, `molecule_3d_set2`, `molecule_3d_set3` | Pooled backbone summary of observed history | Joint-trajectory ensemble energy-score log improvement |
+| `cifar10` | Explicit zero vector | Uniform KID minus candidate KID |
+| `imagenet64` | Native class embedding | Equally weighted class-conditional paired KID improvement |
+| `sana`, `sd15` | Pooled native text embedding | Equal-weight ImageReward and VQAScore differences, divided by frozen pilot component scales |
 
-For CIFAR-10, the deterministic artifact binds the authenticated barycenter
-directly, while the stochastic student learns the authenticated path mixture.
-For ImageNet-64, the deterministic teacher/student objective and the stochastic
-path objective are trained from the same conditional supervision law.
+Pair each candidate and uniform anchor on context, backbone, solver, NFE, generation seed, ensemble size, reference data, and measurement protocol. KID uses paired sample blocks. Average repeated terminal measurements within each comparison cell **before** computing log improvements.
 
-The stochastic policy uses 63 actions, 64 density bins, endpoint-aware
-cube-companded tokens, and a maximum clock-node quantization drift below
-`0.005`. At inference it samples one complete supported path from either
-caller-supplied uniforms or the replayable SHA-256 counter RNG. The
-deterministic policy materializes its barycenter directly. Inference uses
-neither rewards nor the teacher; it freezes the complete time grid before Euler
-integration and performs exactly the requested number of field evaluations.
+Positive errors use `log((anchor + epsilon) / (candidate + epsilon))`, where each frozen numerical floor is `1e-6 * median(positive uniform calibration values)`. Reject degenerate calibration. After component scalarization, divide by a single frozen reward standard deviation for each task/backbone/solver, balancing calibration contributions across training NFEs. Do not subtract a mean or use per-context or running normalization. Uniform rewards remain exactly zero. Text-to-image component scales use pilot measurements; its scalar scale uses training measurements.
 
-## GICO workflow: temporal and 3D
+ImageNet retains paired-jackknife, class-to-feature-group-to-global shrinkage estimated only from training/calibration evidence. Report unshrunk class-conditional KID separately from measured global KID/FID. Global metrics cannot be reconstructed from class KID alone.
 
-The same four-stage workflow applies to each temporal or molecular scenario.
-Use `--help` on any command to see the complete input schema.
+The molecular primary score is the fair finite-ensemble energy estimator:
 
-1. Run a dry check of the backbone and schedule pipeline, then run it without
-   `--dry_run` when its paths and configuration are correct.
-
-   ```bash
-   genode-run-full-pipeline --scenario_key traffic_hourly --dry_run
-   genode-run-full-pipeline --scenario_key traffic_hourly
-   ```
-
-2. Check that the schedule rows have complete contexts, fixed support, and
-   reward columns before training.
-
-   ```bash
-   genode-preflight-gico-rows \
-     --rows_csv rows.csv \
-     --report_json artifacts/gico/preflight.json \
-     --complete_rows_csv artifacts/gico/complete-rows.csv
-   ```
-
-3. Validate the resolved training configuration, then train the teacher and
-   student.
-
-   ```bash
-   genode-train-gico \
-     --rows_csv artifacts/gico/complete-rows.csv \
-     --context_embeddings_npz contexts.npz \
-     --out_dir artifacts/gico/model \
-     --dry_run
-
-   genode-train-gico \
-     --rows_csv artifacts/gico/complete-rows.csv \
-     --context_embeddings_npz contexts.npz \
-     --out_dir artifacts/gico/model
-   ```
-
-4. Evaluate the frozen student only after training and selection are complete.
-   Locked-test reporting requires an explicit uniform baseline.
-
-   ```bash
-   genode-report-gico-locked-test \
-     --gico_student_checkpoint artifacts/gico/model/gico_student.pt \
-     --training_summary artifacts/gico/model/gico_training_summary.json \
-     --context_rows locked-contexts.csv \
-     --context_embeddings_npz locked-contexts.npz \
-     --baseline_rows uniform-baseline.csv \
-     --out_dir artifacts/gico/locked-report
-   ```
-
-Use one output directory per scenario and keep calibration, validation, and
-locked-test inputs separate. `genode-run-schedules --help` documents the
-lower-level schedule runner when the full pipeline wrapper is not appropriate.
-
-## GICO workflow: images
-
-`genode-image-gico` provides one portable lifecycle for both image datasets and
-both student kinds:
-
-```bash
-# 1. Build the shared supervision law.
-genode-image-gico build-targets \
-  --manifest inputs/targets.json \
-  --output artifacts/supervision
-
-# 2. Train either or both students from that exact law.
-genode-image-gico train-deterministic \
-  --supervision artifacts/supervision \
-  --output artifacts/deterministic
-genode-image-gico train-stochastic \
-  --supervision artifacts/supervision \
-  --output artifacts/stochastic
-
-# 3. Validate lineage and artifact integrity.
-genode-image-gico validate \
-  --supervision artifacts/supervision \
-  --deterministic artifacts/deterministic \
-  --stochastic artifacts/stochastic
-
-# 4. Materialize a schedule without reward evidence or a teacher.
-genode-image-gico materialize \
-  --student deterministic_barycenter \
-  --artifact artifacts/deterministic \
-  --target-nfe 4 \
-  --context-indices 0 \
-  --output artifacts/schedule
+```text
+mean_m ||phi(X_m) - phi(y)||
+  - sum_{m != n} ||phi(X_m) - phi(X_n)|| / (2 M (M - 1))
 ```
 
-`build-targets` accepts a portable JSON manifest. Array paths are relative to
-the manifest, must stay inside its directory, and must name numeric `.npy`
-files loadable with `allow_pickle=False`. A conditional ImageNet-64 manifest
-has this form:
+It requires at least two independently generated complete trajectories. The frozen feature map preserves atom indices and horizon order, includes indexed pair distances and signed volumes relative to a non-collinear reference triangle, and uses deterministic atom-index tie breaking. Lengths and volumes use the training reference RMS pair distance and its cube; feature blocks use dimension normalization. The observed future is one observation, never a fabricated reference ensemble. Kabsch RMSD, motion discrepancies, clashes, and bond violations remain diagnostics.
+
+These are optimization objectives. Log transformations, mixtures of components, and teacher approximations do not establish proper scoring or benchmark improvement for the learned policy.
+
+## Shared architecture and optimization
+
+All roles use a two-layer, width-128, four-head, pre-normalized Transformer with a 256-wide feed-forward block and zero dropout. Conditioning combines native context, solver identity, and continuous NFE/macro-step features. Feature normalization is fitted on training data and frozen. Initial generation noise is never a policy input.
+
+* The teacher consumes conditioning and a candidate density and predicts the normalized metric-improvement vector. Its objective combines within-context/settings pairwise ranking (temperature 0.5) with weighted Huber regression (weight 0.25).
+* The deterministic student uses 64 density-bin queries. It minimizes KL from the teacher-weighted reference-density barycenter, plus a teacher-score term.
+* The stochastic student predicts 63 Gaussian log-density ratios autoregressively. Training-reference ratios are standardized; likelihood targets receive Gaussian noise with standard deviation 0.1. Predicted standard deviations are bounded to [0.05, 2]. The likelihood averages over all 63 coordinates. A reparameterized teacher-score term also trains this student.
+
+Both students use a uniform prior over unique realized reference densities and teacher softmax temperature 1. Stochastic target smoothing is an additional modeling choice. Teacher-score weights are **0.01, 0.05, 0.1**, default 0.01. The weight ramps linearly from zero after 60% of training; normalized teacher scores are clipped to [-5, 5]. Teacher parameters remain frozen while gradients pass through density inputs.
+
+The shared pool has 25 reference clocks, including late-p=3 and its reversal. Every reference is materialized through the same 64-bin representation as student outputs. Identical densities are deduplicated before mixture weighting. Historical evidence is reusable only if executed grids and measurement protocols match exactly; changed grids require new measurements.
+
+## Train and decode
+
+The common interface accepts JSON configuration:
 
 ```json
 {
-  "kind": "conditional_kid",
-  "conditional_targets": "conditional-targets.json",
-  "fixed_density_mass": "fixed-density-mass.npy",
-  "normalized_contexts": "normalized-contexts.npy"
+  "rows": "measurements.jsonl",
+  "contexts": "contexts.npz",
+  "calibration_rows": "calibration.jsonl",
+  "output": "policy",
+  "student_kind": "both",
+  "teacher_score_weight": 0.01,
+  "steps": 2000,
+  "batch_size": 32,
+  "seed": 0,
+  "device": "cuda",
+  "purpose": "research"
 }
 ```
 
-For CIFAR-10, set `kind` to `unconditional_mixture` and provide
-`target_nfes`, `schedule_keys`, `fixed_density_mass`, `mixture_weights`, and a
-nonempty `source_identities` object. The builder creates the required singleton
-zero context.
+Paths are relative to the configuration file. Each measurement row contains `task`, `backbone`, `solver`, integer `nfe`, `context_id`, explicit `split`, integer `seed`, `ensemble_size`, `reference_id`, `measurement_protocol`, `schedule_key`, `metrics`, 64 `density_mass` entries, and the executed `time_grid`. Metric keys are `crps/mase`, `energy_score`, `kid`, or `preference/alignment`. Training input contains disjoint `train` and `validation` contexts; calibration contains only `train` or `calibration`. Locked-test rows are forbidden during fitting. Store native contexts with `save_context_embedding_table`.
 
-Training configuration JSON is optional through `--config`. Stochastic
-materialization requires either an explicit `--uniforms` NumPy array or a
-`--request-sha256` with optional comma-separated `--sample-keys`. Publication
-is additive: existing destinations are rejected, identities and hashes are
-recorded, and absolute input paths are not stored. Run
-`genode-image-gico <command> --help` for all options.
-
-The same contracts are exported from `genode.gico`, including supervision
-builders, both student trainers, strict artifact loaders, schedule
-materialization, counter-uniform derivation, and exact-NFE Euler execution.
-`ImageGICOStudentKind` is the source of truth for student selection.
-
-## Default GICO reference clocks
-
-The default supervision pool contains exactly 23 schedules: 12 base schedules
-and the reversals of the 11 nonuniform schedules. Uniform is self-reversing.
-
-| Family | Active keys |
-| --- | --- |
-| Uniform | `uniform` |
-| AYS SD1.5 | `ays_sd15_native`, `ays_sd15_log_sigma` |
-| GITS CIFAR-10 example | `gits_cifar10_native`, `gits_cifar10_log_sigma` |
-| OTS linear VP | `ots_vp_linear_native`, `ots_vp_linear_log_sigma` |
-| Late-p | `late_p_1p5`, `late_p_2`, `late_p_4`, `late_p_8` |
-| FlowTS | `flowts_power_0p03` |
-
-Extra late-p supervision is opt-in. Values must be finite and inside
-`[1.5, 8]`; each adds both a base and reversed clock:
+Research molecular rows also carry the frozen `molecule_feature_map` dictionary from `MoleculeFeatureMap.to_dict()`. It is recorded in the policy artifact and checked against runtime reference geometry.
 
 ```bash
-genode-train-gico \
-  --rows_csv rows.csv \
-  --context_embeddings_npz contexts.npz \
-  --out_dir artifacts/gico/model \
-  --extra_late_p_values 2.25,3,6
+genode-train-gico --config train.json --dry-run
+genode-train-gico --config train.json --student-kind both --teacher-score-weight 0.01
 ```
 
-AYS and GITS use pinned published source nodes transferred deterministically to
-GenODE NFE grids; this does not imply rerunning their upstream optimizers. OTS
-uses pinned paired linear-VP tables, and FlowTS uses its released power-clock
-formula. Registry records bind the source model, solver, coordinate, revision,
-file, and license:
+Research evidence requires all 25 references in every cell. Explicit `purpose: functional` permits a reduced reference set for integration checks; it does not produce benchmark evidence. Checkpoints are selected using validation evidence, including a teacher density-family holdout. Output directories must be new.
 
-- [AYS constants in Diffusers](https://github.com/huggingface/diffusers/blob/50e7158093710f9c1b4ea9ff100137a91c9228f3/src/diffusers/schedulers/scheduling_utils.py)
-- [Diffusers scaled-linear DDIM realization](https://github.com/huggingface/diffusers/blob/50e7158093710f9c1b4ea9ff100137a91c9228f3/src/diffusers/schedulers/scheduling_ddim.py)
-- [GITS CIFAR-10 example](https://github.com/zju-pi/diff-sampler/tree/68d5ce427f261962b89ce3b0ee8f6b29f0577328)
-- [OTS in DM-NonUniform](https://github.com/scxue/DM-NonUniform/blob/95d4ac6b8a3d1d389ab63a197e1b05d8512b6a99/step_optim.py)
-- [FlowTS/FMTS sampler](https://github.com/UNITES-Lab/FlowTS/blob/1ec35fb1d3d89d91a1607a9f949a515347d54c8c/FMTS/Models/interpretable_diffusion/FMTS.py)
+```python
+from genode.gico.policy import load_policy
 
-## Image sources and licensing
+policy = load_policy("policy", student_kind="stochastic", expected_backbone="checkpoint-sha")
+grid = policy.materialize(native_context, "euler", 8, seed=412, request_id="example:member:0")
+```
 
-The image runtime registers four external backbones:
+Both students use one density-to-clock implementation. It mixes in exactly 1e-8 uniform density before inverse-CDF conversion, validates representable solver grids, and enforces exact NFE accounting. The clock RNG is separate from generation noise. Sample once per generated image or trajectory; reuse each molecular member's clock throughout its rollout. Inference performs no teacher scoring, rejection, or reward-based selection.
 
-- unconditional CIFAR-10 RF++ Config G and EDM VE as 1-RF;
-- class-conditional ImageNet-64 RF++ Config E and EDM VE as 1-RF.
+Forecast and molecular Python evaluators accept `policy` and `clock_seed`. Forecast policy evaluation uses batch size 1, paired with the same uniform protocol. Molecular policy evaluation conditions on the initial observed history and keeps the sampled clock throughout every horizon.
 
-Image source trees, datasets, feature weights, and checkpoints are supplied by
-the user and remain under their upstream terms. The pinned RF++ registry records
-the network implementation as `CC-BY-NC-SA-4.0` and notes that no separate
-checkpoint license notice was found. Review
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before obtaining or using
-external image assets.
+## Image and latent-image workflows
 
-## Deterministic archives
-
-Build checkpoint-only, named-checkpoint, or frozen policy archives with:
+CIFAR/ImageNet preparation validates paired feature-block evidence and native backbone/context bindings:
 
 ```bash
-genode-build-release-archive backbone-manifest --help
-genode-build-release-archive named-checkpoints --help
-genode-build-release-archive gico-policy --help
-genode-build-release-archive validate --archive release.zip
+genode-image-gico prepare --manifest raw.json --output evidence.json
+genode-image-gico train --evidence evidence.json --output policy --student-kind both --teacher-score-weight 0.01
+genode-image-gico validate --help
+genode-image-gico materialize --help
 ```
 
-Each build writes a deterministic ZIP, a canonical external
-`<archive>.manifest.json`, and an `<archive>.sha256` digest. Policy archives
-contain the validated teacher, student, density table, context normalizers, and
-portable GICO manifest; packaging does not retrain the policy.
+The input schema is documented by `prepare_image_rows` in `genode.gico.image_supervision`. Supply global metric measurements separately when reporting them.
 
-## Development checks
+SANA/SD1.5 collection records executed grids, density masses, native contexts, generation seeds, and scorer identities. Use `genode-latent-clock prepare-gico --help` to convert paired collection evidence and independent pilot rows into the common configuration, then:
+
+```bash
+genode-latent-clock fit-gico --config evidence/train_config.json --student-kind both
+genode-latent-clock prepare-collection --help
+```
+
+BO, PG, and LD3 remain separate comparison methods. Completed experiments remain historical results; this architecture change does not relabel or upgrade their policy states.
+
+## Artifacts and validation
+
+Protocol `genode-gico-v2` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, and fitting history. Incompatible old artifacts are rejected; there is no legacy architecture loader.
+
+`genode-report-gico-locked-test` applies an artifact's frozen calibration to paired test measurements without selection. `genode-evaluate-schedule-summary` performs the analogous validation report. Both require new output files.
 
 ```bash
 python -m ruff check .
 python -m ruff format --check .
-python -m compileall -q src tests
 python -m pytest -q
 python -m pip check
+python -m build
 git diff --check
 ```
 
-The release matrix covers Python 3.11 and 3.13 with NumPy 1.26 and 2.x, builds
-and inspects the wheel and source distribution, installs both in clean
-environments, and smoke-tests every public CLI.
-
-## License
-
-GenODE is released under the [MIT License](LICENSE). Third-party code,
-reference data, external model implementations, datasets, and checkpoint
-weights remain subject to their respective terms.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidance. Report
-vulnerabilities privately according to [SECURITY.md](SECURITY.md).
+Tests cover paired rewards, split isolation, geometric energy scoring, causal stochastic sampling, teacher-input gradients, density decoding, solver accounting, artifact integrity, and active task routing. External-asset functional checks and their environment-specific instructions belong outside the public package. Fixture coverage alone does not validate a pretrained generator or establish quality gains.

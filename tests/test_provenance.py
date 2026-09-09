@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from genode.gico.train_gico import _artifact_input_summary
 from genode.provenance import fingerprint_identity, path_fingerprint
 
 
@@ -41,27 +40,6 @@ class ProvenanceTests(unittest.TestCase):
             fingerprint = path_fingerprint(root)
             self.assertEqual(fingerprint["kind"], "directory")
             self.assertEqual(fingerprint["manifests"][0]["name"], "manifest.json")
-
-    def test_gico_input_summary_uses_content_not_location_or_mtime(self) -> None:
-        with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
-            first = Path(first_dir) / "rows.csv"
-            second = Path(second_dir) / "rows.csv"
-            first.write_text("scenario_key\ntraffic_hourly\n", encoding="utf-8")
-            second.write_bytes(first.read_bytes())
-            os.utime(second, (1, 1))
-
-            first_summary = _artifact_input_summary(str(first))[0]
-            second_summary = _artifact_input_summary(str(second))[0]
-            self.assertEqual(
-                {key: value for key, value in first_summary.items() if key != "logical_path"},
-                {key: value for key, value in second_summary.items() if key != "logical_path"},
-            )
-            self.assertNotIn("mtime_ns", first_summary)
-            self.assertNotIn(str(Path(first_dir).resolve()), first_summary["logical_path"])
-
-            second.write_text("scenario_key\nweather_daily\n", encoding="utf-8")
-            changed_summary = _artifact_input_summary(str(second))[0]
-            self.assertNotEqual(first_summary["sha256"], changed_summary["sha256"])
 
 
 if __name__ == "__main__":

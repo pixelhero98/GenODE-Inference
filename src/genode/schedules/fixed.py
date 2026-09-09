@@ -26,7 +26,7 @@ from genode.schedules.density import (
 from genode.schedules.progress import validate_time_grid
 from genode.schedules.specification import ScheduleSpecification
 
-FIXED_SCHEDULE_PROTOCOL = "image_reference_clock_schedule_v2"
+FIXED_SCHEDULE_PROTOCOL = "image_reference_clock_density64_v3"
 FIXED_SCHEDULE_TARGET_NFES = (2, 4, 8)
 _EXECUTABLE_BINDING_ATOL = 1e-12
 
@@ -96,7 +96,7 @@ def default_fixed_schedule_specifications(
     *,
     extra_late_p_values: str | Sequence[Decimal | float | int | str] = (),
 ) -> tuple[ScheduleSpecification, ...]:
-    """Return the canonical 23-clock image support plus requested late-p pairs."""
+    """Return the canonical 25-clock image support plus requested late-p pairs."""
 
     return tuple(ScheduleSpecification(key) for key in reference_clock_keys(extra_late_p_values))
 
@@ -108,6 +108,7 @@ class FixedSchedule:
     time_grid: Tensor
     reference_time_grid: Tensor
     density_mass: Tensor
+    gico_density_mass: Tensor
 
     def __post_init__(self) -> None:
         specification = _normalize_fixed_specification(self.specification)
@@ -122,6 +123,16 @@ class FixedSchedule:
             raise ValueError("FixedSchedule requires one time grid, reference grid, and density vector.")
         if not (grid.device == reference.device == mass.device and grid.dtype == reference.dtype == mass.dtype):
             raise ValueError("FixedSchedule tensors must share device and dtype.")
+        from genode.gico.clocks import materialize
+
+        raw = self.gico_density_mass
+        if not isinstance(raw, Tensor) or raw.shape != (64,):
+            raise ValueError("FixedSchedule requires its raw 64-bin GICO reference density.")
+        if raw.dtype != torch.float64 or grid.dtype != torch.float64 or raw.device != grid.device:
+            raise ValueError("FixedSchedule provenance requires float64 tensors on the same device.")
+        expected = grid.new_tensor(materialize(raw.detach().cpu().numpy(), "euler", target_nfe))
+        if not torch.equal(grid, expected):
+            raise ValueError("FixedSchedule must execute the exact shared 64-bin density realization.")
         canonical_mass = time_grid_to_density_mass(
             grid,
             reference_time_grid=reference,
@@ -156,6 +167,16 @@ class FixedSchedule:
             reference_time_grid=self.reference_time_grid,
         )
 
+    def gico_measurement_clock(self) -> dict:
+        """Export the raw reference density and exact executed grid for evidence."""
+        return {
+            "density_mass": self.gico_density_mass.detach().cpu().tolist(),
+            "time_grid": self.time_grid.detach().cpu().tolist(),
+            "solver": "euler",
+            "nfe": self.target_nfe,
+            "schedule_key": self.specification.schedule_key,
+        }
+
     @property
     def sha256(self) -> str:
         return semantic_sha256(
@@ -166,6 +187,9 @@ class FixedSchedule:
                 "target_nfe": self.target_nfe,
                 "time_grid_sha256": self.time_grid_sha256,
                 "density_mass_sha256": self.density_mass_sha256,
+                "gico_density_mass_sha256": density_mass_hash(
+                    self.gico_density_mass, reference_time_grid=self.reference_time_grid
+                ),
                 "calibration_sha256": None,
             },
             namespace="fixed-schedule",
@@ -180,14 +204,20 @@ def build_fixed_schedule(
     dtype: torch.dtype = torch.float64,
     device: torch.device | str | None = None,
 ) -> FixedSchedule:
-    """Build one canonical reference clock as an executable image schedule."""
+    """Materialize one reference clock through the common 64-bin representation."""
+
+    from genode.gico.clocks import materialize
+    from genode.gico.density_representation import grid_to_density_mass
 
     normalized = _normalize_fixed_specification(specification)
     target = _fixed_target_nfe(target_nfe)
-    if not dtype.is_floating_point:
-        raise TypeError("dtype must be a floating-point torch dtype.")
+    if isinstance(density_bin_count, bool) or density_bin_count != 64:
+        raise ValueError("GICO reference schedules require exactly 64 density bins.")
+    if dtype != torch.float64:
+        raise TypeError("GICO reference provenance requires torch.float64; runtime casts solver inputs separately.")
+    raw = grid_to_density_mass(build_reference_clock_grid(normalized.schedule_key, target), macro_steps=target, eps=0)
     grid = torch.tensor(
-        build_reference_clock_grid(normalized.schedule_key, target),
+        materialize(raw, "euler", target),
         dtype=dtype,
         device=device,
     )
@@ -207,6 +237,7 @@ def build_fixed_schedule(
         time_grid=grid,
         reference_time_grid=reference,
         density_mass=density_mass,
+        gico_density_mass=torch.tensor(raw, dtype=dtype, device=device),
     )
 
 

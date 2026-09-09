@@ -36,9 +36,7 @@ from genode.schedules.policy import (
 from genode.solvers.euler import integrate_euler
 
 if TYPE_CHECKING:
-    from genode.gico.image_conditional_artifacts import (
-        BoundImageGICOConditionalArtifact,
-    )
+    from genode.gico.policy import GICOPolicy
 
 
 IMAGE_GENERATION_REQUEST_PROTOCOL = "image_euler_generation_request_v2"
@@ -771,6 +769,12 @@ def _schedule_rows_are_shared(schedule: ScheduleBatch) -> bool:
             schedule.time_grid,
             first_grid.unsqueeze(0).expand_as(schedule.time_grid),
         )
+        and (
+            schedule.gico_density_mass is None
+            or torch.equal(
+                schedule.gico_density_mass, schedule.gico_density_mass[:1].expand_as(schedule.gico_density_mass)
+            )
+        )
     )
 
 
@@ -800,6 +804,7 @@ def policy_schedule_request_hashes(
             time_grid=first_grid.unsqueeze(0),
             target_nfe=schedule.target_nfe,
             specification=schedule.specification,
+            gico_density_mass=(None if schedule.gico_density_mass is None else schedule.gico_density_mass[:1]),
         )
         return (
             single.sha256,
@@ -1135,46 +1140,80 @@ class ImageEulerSampler:
             ),
         )
 
+    def gico_schedule(
+        self,
+        policy: GICOPolicy,
+        *,
+        target_nfe: int,
+        class_labels: Sequence[int] | None,
+        sample_keys: Sequence[str],
+        clock_seed: int = 0,
+    ) -> ScheduleBatch:
+        """Sample one complete common-policy clock per image, using native context.
+
+        Call this before constructing a content-bound generation request. Reuse
+        its sample keys and clock seed in sample_gico for exact replay.
+        """
+        import numpy as np
+
+        from genode.gico.clocks import materialize
+        from genode.gico.image_conditional_context import native_contexts
+        from genode.gico.networks import DENSITY_BINS, DENSITY_MIXTURE
+
+        keys = tuple(sample_keys)
+        if not keys or any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) != len(keys):
+            raise ValueError("GICO image sampling requires unique nonempty sample keys.")
+        labels = _class_labels(class_labels, backbone_manifest=self.backbone.manifest, sample_count=len(keys))
+        table, binding = native_contexts(self.backbone)
+        task = get_image_backbone_spec(self.backbone.manifest.model_key).dataset_key
+        if (
+            policy.metadata.get("task") != task
+            or policy.metadata.get("backbone") != self.backbone.manifest.model_key
+            or policy.metadata.get("backbone_binding") != binding
+        ):
+            raise ValueError("GICO artifact does not match the loaded backbone and native context binding.")
+        contexts = table[list(labels)] if labels is not None else np.repeat(table, len(keys), axis=0)
+        masses, grids, raw_masses = [], [], []
+        for context, key in zip(contexts, keys, strict=True):
+            mass = np.asarray(
+                policy.density(context, "euler", target_nfe, seed=clock_seed, request_id=key), dtype=np.float64
+            )
+            grids.append(materialize(mass, "euler", target_nfe))
+            raw_masses.append(mass)
+            guarded = (1 - DENSITY_MIXTURE) * mass + DENSITY_MIXTURE / DENSITY_BINS
+            masses.append(guarded / guarded.sum())
+        return ScheduleBatch(
+            density_mass=torch.tensor(np.asarray(masses), dtype=torch.float64),
+            reference_time_grid=torch.linspace(0, 1, DENSITY_BINS + 1, dtype=torch.float64),
+            time_grid=torch.tensor(grids, dtype=torch.float64),
+            target_nfe=target_nfe,
+            gico_density_mass=torch.tensor(np.asarray(raw_masses), dtype=torch.float64),
+        )
+
     def sample_gico(
         self,
         request: ImageGenerationRequest,
-        artifact: BoundImageGICOConditionalArtifact,
+        policy: GICOPolicy,
+        *,
+        sample_keys: Sequence[str],
+        clock_seed: int = 0,
     ) -> GeneratedImageBatch:
-        """Execute class-conditional ImageNet GICO with label-derived context."""
-
-        from genode.gico.image_conditional_artifacts import (
-            BoundImageGICOConditionalArtifact,
-        )
-
+        """Execute shared deterministic or stochastic GICO with separate clock RNG."""
         self._validate_request(request)
-        if not isinstance(artifact, BoundImageGICOConditionalArtifact):
-            raise TypeError("artifact must be a bound ImageNet GICO conditional artifact.")
-        if request.class_labels is None:
-            raise ValueError("Bound ImageNet GICO execution requires class labels.")
-        if artifact.artifact_sha256 != request.schedule_policy_sha256:
-            raise ValueError("Bound GICO artifact identity does not match the generation request.")
-        binding = artifact.prepared_context.binding
-        expected_backbone = (
-            request.backbone_manifest.model_key,
-            request.backbone_manifest.protocol_sha256,
-            request.backbone_manifest.checkpoint.sha256,
+        if len(sample_keys) != request.sample_count:
+            raise ValueError("GICO sample-key count must match the generation request.")
+        schedule = self.gico_schedule(
+            policy,
+            target_nfe=request.target_nfe,
+            class_labels=request.class_labels,
+            sample_keys=sample_keys,
+            clock_seed=clock_seed,
         )
-        observed_backbone = (
-            binding.backbone_model_key,
-            binding.backbone_protocol_sha256,
-            binding.backbone_checkpoint_sha256,
+        binding = _policy_output_binding(
+            schedule, request=request, source_kind="schedule_policy", schedule_policy_sha256=policy.artifact_sha256
         )
-        if observed_backbone != expected_backbone:
-            raise ValueError("Bound GICO context does not match the generation-request backbone.")
-        artifact.verify_execution_identity()
-        labels = torch.tensor(request.class_labels, dtype=torch.int64)
-        context = artifact.contexts_for_class_labels(labels)
-        return self._sample_verified_policy(
-            request,
-            artifact.policy,
-            context=context,
-            schedule_policy_sha256=artifact.artifact_sha256,
-        )
+        noise = generate_seeded_image_noise(request.dataset_key, request.latent_seeds)
+        return self._execute(request, noise=noise, time_grid=schedule.time_grid, schedule_binding=binding)
 
 
 __all__ = [

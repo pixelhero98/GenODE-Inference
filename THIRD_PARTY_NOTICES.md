@@ -1,5 +1,25 @@
 # Third-party notices
 
+## External text-to-image runtimes and scorers
+
+The latent-image adapters import user-supplied upstream checkouts and weights.
+They do not bundle these implementations, datasets, text encoders, VAEs, or
+checkpoints. Runtime manifests record the selected source revisions and asset
+fingerprints. The integration was developed against:
+
+- [SANA](https://github.com/NVlabs/Sana), revision
+  `6c3aeea94945692a902df8db25327eba040b5d91`.
+- [LD3](https://github.com/vinhsuhi/LD3), revision
+  `ec1bf603fb19696966ca30198ed209ae6488a3e5`, including its external Stable
+  Diffusion 1.5, CLIP, and autoencoder dependencies.
+- [ImageReward](https://github.com/THUDM/ImageReward) and
+  [T2V-Metrics](https://github.com/linzhiqiu/t2v_metrics), with ImageReward-v1.0
+  and CLIP-FlanT5-XXL VQAScore weights supplied separately.
+
+Source-code terms and model-weight terms may differ. Review the applicable
+upstream licenses and model cards before using or redistributing external
+assets; GenODE's MIT license does not relicense them.
+
 GenODE's reference-clock catalog records the exact upstream repository,
 revision, source location, and license for every transferred schedule. The
 implementations remain source-specific references; using their normalized

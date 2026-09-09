@@ -5,7 +5,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
+from genode.data.otflow_experiment_plan import FORECAST_FAMILY
 
 
 @dataclass(frozen=True)
@@ -48,65 +48,6 @@ def build_forecast_appendix_table_layout(nfe_values: Sequence[int]) -> TableLayo
     )
 
 
-def build_conditional_generation_table_layout(nfe_values: Sequence[int]) -> TableLayout:
-    return TableLayout(
-        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-        title="OTFlow conditional generation under matched NFE",
-        row_group_label="Sampling method",
-        schedule_label="Schedule",
-        metric_blocks=tuple(
-            TableMetricBlock(
-                nfe=int(nfe),
-                metrics=("temporal_uw1", "temporal_cw1", "temporal_tstr_f1"),
-            )
-            for nfe in nfe_values
-        ),
-    )
-
-
-def build_conditional_generation_appendix_table_layout(nfe_values: Sequence[int]) -> TableLayout:
-    return TableLayout(
-        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-        title="OTFlow conditional generation appendix metrics",
-        row_group_label="Sampling method",
-        schedule_label="Schedule",
-        metric_blocks=tuple(
-            TableMetricBlock(
-                nfe=int(nfe),
-                metrics=(
-                    "score_main",
-                    "relative_score_gain_vs_uniform",
-                    "disc_auc",
-                    "disc_auc_gap",
-                    "u_l1",
-                    "c_l1",
-                    "spread_specific_error",
-                    "imbalance_specific_error",
-                    "ret_vol_acf_error",
-                    "impact_response_error",
-                ),
-            )
-            for nfe in nfe_values
-        ),
-    )
-
-
-def build_conditional_generation_pilot_table_layout(nfe_values: Sequence[int]) -> TableLayout:
-    return TableLayout(
-        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-        title="OTFlow conditional-generation pilot under matched NFE",
-        row_group_label="Sampling method",
-        schedule_label="Schedule",
-        metric_blocks=tuple(
-            TableMetricBlock(
-                nfe=int(nfe),
-                metrics=("score_main", "latency_ms_per_sample", "realized_nfe"),
-            )
-            for nfe in nfe_values
-        ),
-    )
-
-
 def table_layout_to_dict(layout: TableLayout) -> dict[str, Any]:
     return asdict(layout)
 
@@ -136,11 +77,7 @@ def _row_value(row: Mapping[str, Any], *keys: str) -> Any:
 def _schedule_key(row: Mapping[str, Any]) -> str:
     raw = _row_value(row, "scheduler_key", "schedule_name", "grid_name", "schedule_display_name")
     text = str(raw).strip().lower() if raw is not None else ""
-    aliases = {
-        "uniform": "uniform",
-        "time-uniform": "uniform",
-        "time uniform": "uniform",
-    }
+    aliases = {"uniform": "uniform", "time-uniform": "uniform", "time uniform": "uniform"}
     return aliases.get(text, text)
 
 
@@ -168,7 +105,7 @@ def _safe_relative_gain(metric_value: Any, baseline_value: Any) -> float | None:
         return None
     if not math.isfinite(metric) or not math.isfinite(baseline) or baseline <= 0.0:
         return None
-    return float(1.0 - (metric / baseline))
+    return float(1.0 - metric / baseline)
 
 
 def _relative_gain_value(row: Mapping[str, Any], relative_key: str) -> float | None:
@@ -191,7 +128,6 @@ def augment_rows_with_relative_metrics(rows: Sequence[Mapping[str, Any]]) -> lis
     for row in rows:
         if _schedule_key(row) == "uniform":
             baseline_rows[_relative_match_key(row)] = row
-
     enriched: list[dict[str, Any]] = []
     for row in rows:
         payload = dict(row)
@@ -203,27 +139,15 @@ def augment_rows_with_relative_metrics(rows: Sequence[Mapping[str, Any]]) -> lis
         payload["forecast_relative_mase_gain_vs_uniform"] = _relative_gain_value(
             row, "forecast_relative_mase_gain_vs_uniform"
         )
-        payload["relative_score_gain_vs_uniform"] = _relative_gain_value(row, "relative_score_gain_vs_uniform")
         if baseline is not None and family == FORECAST_FAMILY:
             if payload["forecast_relative_crps_gain_vs_uniform"] is None:
                 payload["forecast_relative_crps_gain_vs_uniform"] = _safe_relative_gain(
-                    _metric_value(row, "forecast_crps"),
-                    _metric_value(baseline, "forecast_crps"),
+                    _metric_value(row, "forecast_crps"), _metric_value(baseline, "forecast_crps")
                 )
             if payload["forecast_relative_mase_gain_vs_uniform"] is None:
                 payload["forecast_relative_mase_gain_vs_uniform"] = _safe_relative_gain(
-                    _metric_value(row, "forecast_mase"),
-                    _metric_value(baseline, "forecast_mase"),
+                    _metric_value(row, "forecast_mase"), _metric_value(baseline, "forecast_mase")
                 )
-        if (
-            baseline is not None
-            and family == CONDITIONAL_GENERATION_FAMILY
-            and payload["relative_score_gain_vs_uniform"] is None
-        ):
-            payload["relative_score_gain_vs_uniform"] = _safe_relative_gain(
-                _metric_value(row, "score_main"),
-                _metric_value(baseline, "score_main"),
-            )
         enriched.append(payload)
     return enriched
 
@@ -234,9 +158,6 @@ __all__ = [
     "augment_rows_with_relative_metrics",
     "build_forecast_appendix_table_layout",
     "build_forecast_table_layout",
-    "build_conditional_generation_appendix_table_layout",
-    "build_conditional_generation_table_layout",
-    "build_conditional_generation_pilot_table_layout",
     "markdown_header_stub",
     "table_layout_to_dict",
 ]

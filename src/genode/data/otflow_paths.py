@@ -20,7 +20,6 @@ def resolve_project_path(path: str | Path) -> Path:
 
 def normalize_project_relative_path(path: str | Path) -> Path:
     """Normalize separators without rewriting caller-supplied path components."""
-
     raw = Path(path)
     if raw.is_absolute():
         return raw
@@ -72,22 +71,3 @@ def default_backbone_manifest_path() -> Path:
 
 def project_checkpoint_import_root() -> Path:
     return project_outputs_root() / "imported_backbones"
-
-
-def project_medical_staging_root() -> Path:
-    raw = str(os.environ.get("OTFLOW_MEDICAL_STAGING_ROOT", "") or "").strip()
-    if not raw:
-        raise RuntimeError("Set OTFLOW_MEDICAL_STAGING_ROOT to prepare raw medical datasets.")
-    return Path(raw).expanduser().resolve()
-
-
-def default_cryptos_data_path() -> str:
-    return str(project_data_root() / "cryptos_binance_spot_monthly_1s_l10.npz")
-
-
-def default_lobster_synthetic_profile_path() -> str:
-    return str(project_data_root() / "lobster_synthetic" / "lobster_free_sample_profile_10.json")
-
-
-def default_long_term_st_data_path() -> str:
-    return str(project_data_root() / "long_term_st_100hz_context_only")

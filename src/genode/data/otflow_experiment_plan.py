@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Locked paper experiment horizons and non-AR rollout chunk sizes."""
 
 from __future__ import annotations
@@ -8,10 +7,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
-
 FORECAST_FAMILY = "temporal_extrapolation"
-CONDITIONAL_GENERATION_FAMILY = "temporal_conditional_generation"
 
 
 @dataclass(frozen=True)
@@ -57,55 +53,13 @@ PAPER_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = (
         reasoning_axis="physical_time",
         rationale="Daily weather uses the official 30-day horizon with a 120-day context, keeping the schedule comparison horizon-wise.",
     ),
-    DatasetExperimentSpec(
-        dataset_key="cryptos",
-        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-        display_name="cryptos",
-        experiment_horizon=128,
-        future_block_len=128,
-        history_len=256,
-        reasoning_axis="event_count",
-        rationale="Conditional generation uses a horizon set to half the 256-event history length, with a horizon-wise rollout so the scheduler is evaluated on the full event trajectory rather than on repeated sub-blocks.",
-    ),
-    DatasetExperimentSpec(
-        dataset_key="lobster_synthetic",
-        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-        display_name="lobster_synthetic",
-        experiment_horizon=128,
-        future_block_len=128,
-        history_len=256,
-        reasoning_axis="event_count",
-        rationale="LOBSTER-calibrated synthetic order-book continuation uses the same event-count context and horizon as cryptos, generated from the public lobiflow profile.",
-    ),
-    DatasetExperimentSpec(
-        dataset_key=LONG_TERM_ST_DATASET_KEY,
-        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-        display_name="long_term_st",
-        experiment_horizon=3000,
-        future_block_len=3000,
-        history_len=12000,
-        reasoning_axis="physical_time",
-        rationale="Long-Term ST uses a context-only ECG continuation task after strict WFDB validation and downsampling from 250 Hz to 100 Hz.",
-    ),
 )
-
 EXPERIMENTAL_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = ()
-
 SUPPORTED_EXPERIMENT_SPECS: tuple[DatasetExperimentSpec, ...] = PAPER_EXPERIMENT_SPECS + EXPERIMENTAL_EXPERIMENT_SPECS
-
 CANONICAL_FORECAST_PAPER_DATASETS: tuple[str, ...] = tuple(
     spec.dataset_key for spec in PAPER_EXPERIMENT_SPECS if spec.benchmark_family == FORECAST_FAMILY
 )
-CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS: tuple[str, ...] = tuple(
-    spec.dataset_key for spec in PAPER_EXPERIMENT_SPECS if spec.benchmark_family == CONDITIONAL_GENERATION_FAMILY
-)
 CHECKPOINT_READY_FORECAST_DATASETS: tuple[str, ...] = tuple(CANONICAL_FORECAST_PAPER_DATASETS)
-CHECKPOINT_READY_CONDITIONAL_GENERATION_DATASETS: tuple[str, ...] = tuple(
-    CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS
-)
-SUPPORTED_CONDITIONAL_GENERATION_DATASETS: tuple[str, ...] = tuple(
-    spec.dataset_key for spec in SUPPORTED_EXPERIMENT_SPECS if spec.benchmark_family == CONDITIONAL_GENERATION_FAMILY
-)
 
 
 def experiment_plan_specs() -> list[DatasetExperimentSpec]:
@@ -120,20 +74,8 @@ def canonical_forecast_paper_dataset_keys() -> tuple[str, ...]:
     return tuple(CANONICAL_FORECAST_PAPER_DATASETS)
 
 
-def canonical_conditional_generation_paper_dataset_keys() -> tuple[str, ...]:
-    return tuple(CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS)
-
-
 def checkpoint_ready_forecast_dataset_keys() -> tuple[str, ...]:
     return tuple(CHECKPOINT_READY_FORECAST_DATASETS)
-
-
-def checkpoint_ready_conditional_generation_dataset_keys() -> tuple[str, ...]:
-    return tuple(CHECKPOINT_READY_CONDITIONAL_GENERATION_DATASETS)
-
-
-def supported_conditional_generation_dataset_keys() -> tuple[str, ...]:
-    return tuple(SUPPORTED_CONDITIONAL_GENERATION_DATASETS)
 
 
 def validate_experiment_plan(specs: Iterable[DatasetExperimentSpec] | None = None) -> list[dict[str, object]]:
@@ -160,7 +102,7 @@ def write_experiment_plan(out_root: str | Path) -> Mapping[str, object]:
     payload = {
         "locked": True,
         "selection_policy": {
-            "horizon_rule": "Use reviewer-facing long horizons in physical time for forecasting and event-count horizons for conditional generation.",
+            "horizon_rule": "Use reviewer-facing long horizons in physical time for forecasting.",
             "chunk_rule": "Use horizon-wise non-AR rollouts in the main experiments, i.e. future_block_len equals the experiment horizon.",
         },
         "datasets": [asdict(spec) for spec in PAPER_EXPERIMENT_SPECS],
@@ -171,24 +113,17 @@ def write_experiment_plan(out_root: str | Path) -> Mapping[str, object]:
 
 
 __all__ = [
-    "CONDITIONAL_GENERATION_FAMILY",
     "CANONICAL_FORECAST_PAPER_DATASETS",
-    "CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS",
     "CHECKPOINT_READY_FORECAST_DATASETS",
-    "CHECKPOINT_READY_CONDITIONAL_GENERATION_DATASETS",
     "EXPERIMENTAL_EXPERIMENT_SPECS",
-    "SUPPORTED_CONDITIONAL_GENERATION_DATASETS",
     "SUPPORTED_EXPERIMENT_SPECS",
     "DatasetExperimentSpec",
     "FORECAST_FAMILY",
     "PAPER_EXPERIMENT_SPECS",
     "canonical_forecast_paper_dataset_keys",
-    "canonical_conditional_generation_paper_dataset_keys",
     "checkpoint_ready_forecast_dataset_keys",
-    "checkpoint_ready_conditional_generation_dataset_keys",
     "experiment_plan_by_key",
     "experiment_plan_specs",
-    "supported_conditional_generation_dataset_keys",
     "validate_experiment_plan",
     "write_experiment_plan",
 ]

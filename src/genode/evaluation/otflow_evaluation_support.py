@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import time
 from collections.abc import Mapping, Sequence
 from collections.abc import Mapping as MappingABC
@@ -16,26 +15,13 @@ import numpy as np
 import torch
 
 from genode.canonical_experiment_layout import CANONICAL_CHECKPOINT_STEPS, SCENARIO_FAMILY_MOLECULE
-from genode.data.experiment_common import DATASET_PLANS, build_dataset_splits, get_otflow_paper_backbone_preset
 from genode.data.otflow_experiment_plan import (
-    CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS,
     CANONICAL_FORECAST_PAPER_DATASETS,
-    CONDITIONAL_GENERATION_FAMILY,
     FORECAST_FAMILY,
     experiment_plan_by_key,
 )
-from genode.data.otflow_experiment_plan import (
-    SUPPORTED_CONDITIONAL_GENERATION_DATASETS as ALL_SUPPORTED_CONDITIONAL_GENERATION_DATASETS,
-)
 from genode.data.otflow_forecast_data import build_monash_forecast_splits
-from genode.data.otflow_medical_constants import LONG_TERM_ST_DATASET_KEY
-from genode.data.otflow_paths import (
-    default_cryptos_data_path,
-    default_lobster_synthetic_profile_path,
-    default_long_term_st_data_path,
-    project_results_root,
-    resolve_project_path,
-)
+from genode.data.otflow_paths import project_results_root, resolve_project_path
 from genode.evaluation.fm_backbone_registry import (
     BACKBONE_NAME_OTFLOW,
     build_backbone_checkpoint_id,
@@ -44,10 +30,7 @@ from genode.evaluation.fm_backbone_registry import (
     train_budget_label,
 )
 from genode.evaluation.otflow_sampling_support import _apply_sample_overrides, _restore_sample_overrides
-from genode.models.conditioning import (
-    FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
-    frozen_backbone_policy_context,
-)
+from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL, frozen_backbone_policy_context
 from genode.models.otflow_model import OTFlow
 from genode.models.otflow_train_val import save_json, seed_all
 from genode.runtime import ProgressBar
@@ -67,7 +50,6 @@ from genode.solver_protocol import (
 VALIDATION_PHASE = "validation_tuning"
 LOCKED_TEST_PHASE = "locked_test"
 TRAIN_TUNING_PHASE = "train_tuning"
-
 TRAIN_TUNING_SAMPLING_MODE_WINDOW_FRACTION = "train_window_fraction"
 TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED = "validation_normalized"
 TRAIN_TUNING_SAMPLING_MODES = (
@@ -76,19 +58,11 @@ TRAIN_TUNING_SAMPLING_MODES = (
 )
 TRAIN_TUNING_SAMPLER_WINDOW_FRACTION = "temporal_stratified_hash"
 TRAIN_TUNING_SAMPLER_VALIDATION_NORMALIZED = "temporal_stratified_validation_normalized"
-DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION = 0.70
-DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION = 0.10
-
+DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION = 0.7
+DEFAULT_TRAIN_TUNING_VAL_SPLIT_FRACTION = 0.1
 UNIFORM_SCHEDULER_KEY = "uniform"
 DEFAULT_SHARED_BACKBONE_ROOT = project_results_root() / "shared_backbones" / "otflow_fullhorizon_seed0"
-DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE = "transformer"
-DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS = 20_000
 CANONICAL_TEMPORAL_ROLLOUT_MODE = "non_ar"
-CONDITIONAL_GENERATION_PHYSICAL_BATCH_SIZE_BY_DATASET: dict[str, int] = {
-    "cryptos": 8,
-    "lobster_synthetic": 8,
-    LONG_TERM_ST_DATASET_KEY: 2,
-}
 IGNORED_BASELINE_MODEL_CONFIG_KEYS = {
     "baseline_latent_dim",
     "vae_kl_weight",
@@ -99,11 +73,8 @@ IGNORED_BASELINE_MODEL_CONFIG_KEYS = {
     "gan_noise_dim",
     "cgan_recon_weight",
 }
-
 DEFAULT_FORECAST_DATASETS = tuple(CANONICAL_FORECAST_PAPER_DATASETS)
 SUPPORTED_FORECAST_DATASETS = tuple(CANONICAL_FORECAST_PAPER_DATASETS)
-DEFAULT_CONDITIONAL_GENERATION_DATASETS = tuple(CANONICAL_CONDITIONAL_GENERATION_PAPER_DATASETS)
-SUPPORTED_CONDITIONAL_GENERATION_DATASETS = tuple(ALL_SUPPORTED_CONDITIONAL_GENERATION_DATASETS)
 ALL_SOLVER_ORDER: tuple[str, ...] = CANONICAL_SOLVER_KEYS
 SOLVER_RUNTIME_NAMES: dict[str, str] = dict(CANONICAL_SOLVER_RUNTIME_NAMES)
 
@@ -141,14 +112,6 @@ def parse_forecast_datasets(text: str) -> list[str]:
     unknown = [name for name in names if name not in SUPPORTED_FORECAST_DATASETS]
     if unknown:
         raise ValueError(f"Unknown forecast datasets: {unknown}")
-    return names
-
-
-def parse_conditional_generation_datasets(text: str) -> list[str]:
-    names = parse_csv(text)
-    unknown = [name for name in names if name not in SUPPORTED_CONDITIONAL_GENERATION_DATASETS]
-    if unknown:
-        raise ValueError(f"Unknown conditional-generation datasets: {unknown}")
     return names
 
 
@@ -270,7 +233,7 @@ def _allocate_stratified_target_counts(total: int, strata: int, target: int) -> 
 def choose_forecast_train_tuning_indices(
     ds,
     *,
-    fraction: float = 0.20,
+    fraction: float = 0.2,
     seed: int = 0,
     strata: int = 20,
     dataset: str = "",
@@ -324,9 +287,8 @@ def choose_forecast_train_tuning_indices(
                 digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
                 scored.append((int(digest[:16], 16), idx))
             scored.sort(key=lambda item: (item[0], item[1]))
-            selected.extend(idx for _, idx in scored[:keep])
+            selected.extend((idx for _, idx in scored[:keep]))
         return np.asarray(sorted(set(selected)), dtype=np.int64)
-
     target = train_tuning_target_example_count(
         total,
         fraction=frac,
@@ -357,10 +319,10 @@ def choose_forecast_train_tuning_indices(
 def _parse_forecast_batch(batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, Any]:
     if len(batch) == 3:
         hist, tgt, meta = batch
-        return hist, tgt, None, meta
+        return (hist, tgt, None, meta)
     if len(batch) == 4:
         hist, tgt, fut, meta = batch
-        return hist, tgt, fut, meta
+        return (hist, tgt, fut, meta)
     raise ValueError(f"Unexpected forecast batch format with {len(batch)} items.")
 
 
@@ -371,12 +333,7 @@ def _optional_int(value: Any) -> int | None:
 
 
 def _forecast_example_detail_metadata(
-    ds,
-    example_idx: int,
-    meta: Any,
-    *,
-    dataset_key: str,
-    split_phase: str,
+    ds, example_idx: int, meta: Any, *, dataset_key: str, split_phase: str
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     if hasattr(ds, "example_metadata"):
@@ -407,10 +364,8 @@ def _forecast_example_detail_metadata(
 def selection_metric_for_family(benchmark_family: str) -> str:
     if str(benchmark_family) == FORECAST_FAMILY:
         return "forecast_crps"
-    if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
-        return "score_main"
     if str(benchmark_family) == SCENARIO_FAMILY_MOLECULE:
-        return "molecule_kabsch_rmsd_3d"
+        return "molecule_energy_score"
     raise ValueError(f"Unsupported benchmark_family={benchmark_family}")
 
 
@@ -419,10 +374,7 @@ def solver_experiment_scope(solver_key: str) -> str:
 
 
 def resolve_reference_macro_steps(
-    requested_macro_steps: int,
-    runtime_nfe: int,
-    *,
-    reference_macro_factor: float = 4.0,
+    requested_macro_steps: int, runtime_nfe: int, *, reference_macro_factor: float = 4.0
 ) -> int:
     requested = int(requested_macro_steps)
     if requested > 0:
@@ -451,11 +403,7 @@ def _load_ready_backbone_manifest(cli_args: argparse.Namespace) -> dict[str, Any
 
 
 def _resolved_manifest_artifact(
-    cli_args: argparse.Namespace,
-    *,
-    benchmark_family: str,
-    dataset_key: str,
-    train_steps: int | None = None,
+    cli_args: argparse.Namespace, *, benchmark_family: str, dataset_key: str, train_steps: int | None = None
 ) -> dict[str, Any] | None:
     manifest_payload = _load_ready_backbone_manifest(cli_args)
     if manifest_payload is None:
@@ -480,25 +428,10 @@ def _resolve_checkpoint_path(path: str | Path) -> Path:
     return resolve_project_path(str(path))
 
 
-def _missing_shared_checkpoint_paths(
-    *,
-    shared_backbone_root: Path,
-    forecast_datasets: Sequence[str],
-    conditional_generation_datasets: Sequence[str],
-) -> list[Path]:
+def _missing_shared_checkpoint_paths(*, shared_backbone_root: Path, forecast_datasets: Sequence[str]) -> list[Path]:
     missing: list[Path] = []
     for dataset in forecast_datasets:
         ckpt_path = shared_backbone_root / FORECAST_FAMILY / str(dataset) / "model.pt"
-        if not ckpt_path.exists():
-            missing.append(ckpt_path)
-    for dataset in conditional_generation_datasets:
-        ckpt_path = (
-            shared_backbone_root
-            / CONDITIONAL_GENERATION_FAMILY
-            / str(dataset)
-            / DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE
-            / "model.pt"
-        )
         if not ckpt_path.exists():
             missing.append(ckpt_path)
     return missing
@@ -513,13 +446,10 @@ def _requested_checkpoint_steps(cli_args: argparse.Namespace) -> list[int]:
 
 def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
     forecast_datasets = parse_forecast_datasets(str(cli_args.forecast_datasets))
-    conditional_generation_datasets = parse_conditional_generation_datasets(
-        str(cli_args.conditional_generation_datasets)
-    )
     shared_backbone_root = resolve_project_path(str(cli_args.shared_backbone_root))
     checkpoint_steps = _requested_checkpoint_steps(cli_args)
     errors: list[str] = []
-    for dataset in list(forecast_datasets) + list(conditional_generation_datasets):
+    for dataset in list(forecast_datasets):
         try:
             resolved_eval_horizon(cli_args, str(dataset))
             resolved_future_block_len(cli_args, str(dataset))
@@ -546,26 +476,9 @@ def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
                         missing_manifest_checkpoints.append(ckpt_path)
                 except KeyError:
                     missing_artifacts.append(f"{FORECAST_FAMILY}:{dataset}:{int(expected_steps)}")
-        for dataset in conditional_generation_datasets:
-            for expected_steps in checkpoint_steps:
-                try:
-                    artifact = find_backbone_artifact(
-                        manifest_payload,
-                        backbone_name=BACKBONE_NAME_OTFLOW,
-                        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-                        dataset_key=str(dataset),
-                        train_steps=int(expected_steps),
-                        status="ready",
-                    )
-                    ckpt_path = _resolve_checkpoint_path(str(artifact["checkpoint_path"]))
-                    if not ckpt_path.exists():
-                        missing_manifest_checkpoints.append(ckpt_path)
-                except KeyError:
-                    missing_artifacts.append(f"{CONDITIONAL_GENERATION_FAMILY}:{dataset}:{int(expected_steps)}")
         if missing_artifacts:
             errors.append(
-                "Backbone manifest is missing ready OTFlow checkpoints for the selected datasets: "
-                f"{', '.join(missing_artifacts)}"
+                f"Backbone manifest is missing ready OTFlow checkpoints for the selected datasets: {', '.join(missing_artifacts)}"
             )
         if missing_manifest_checkpoints:
             missing_lines = ", ".join(str(path) for path in missing_manifest_checkpoints)
@@ -574,15 +487,12 @@ def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
             )
     else:
         missing_checkpoints = _missing_shared_checkpoint_paths(
-            shared_backbone_root=shared_backbone_root,
-            forecast_datasets=forecast_datasets,
-            conditional_generation_datasets=conditional_generation_datasets,
+            shared_backbone_root=shared_backbone_root, forecast_datasets=forecast_datasets
         )
         if missing_checkpoints:
             missing_lines = ", ".join(str(path) for path in missing_checkpoints)
             errors.append(
-                "Missing shared checkpoints for the selected datasets. "
-                f"Provide checkpoint-ready datasets or produce the missing checkpoints first: {missing_lines}"
+                f"Missing shared checkpoints for the selected datasets. Provide checkpoint-ready datasets or produce the missing checkpoints first: {missing_lines}"
             )
     if errors:
         raise RuntimeError("Execution preflight failed:\n- " + "\n- ".join(errors))
@@ -617,40 +527,6 @@ def safe_spearman(x: Sequence[float], y: Sequence[float]) -> float:
     return float(corr)
 
 
-def _resolved_conditional_generation_physical_batch_size(dataset: str) -> int:
-    dataset_key = str(dataset)
-    default_value = int(CONDITIONAL_GENERATION_PHYSICAL_BATCH_SIZE_BY_DATASET[dataset_key])
-    env_name = ""
-    if dataset_key == LONG_TERM_ST_DATASET_KEY:
-        env_name = "OTFLOW_LONG_TERM_ST_PHYSICAL_BATCH_SIZE"
-    if not env_name:
-        return default_value
-    raw = str(os.environ.get(env_name, "") or "").strip()
-    if not raw:
-        return default_value
-    try:
-        override = int(raw)
-    except ValueError:
-        return default_value
-    return max(1, int(override))
-
-
-def _dataset_data_path(cli_args: argparse.Namespace, dataset: str) -> str:
-    if str(dataset) == "cryptos":
-        return str(getattr(cli_args, "cryptos_path", "") or default_cryptos_data_path())
-    if str(dataset) == "lobster_synthetic":
-        return str(getattr(cli_args, "lobster_synthetic_profile_path", "") or default_lobster_synthetic_profile_path())
-    if str(dataset) == LONG_TERM_ST_DATASET_KEY:
-        return str(getattr(cli_args, "long_term_st_path", "") or default_long_term_st_data_path())
-    raise ValueError(f"Unknown conditional-generation dataset: {dataset}")
-
-
-def resolved_train_steps(cli_args: argparse.Namespace, dataset: str) -> int:
-    if int(getattr(cli_args, "steps", 0)) > 0:
-        return int(cli_args.steps)
-    return int(DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS)
-
-
 def resolved_eval_horizon(cli_args: argparse.Namespace, dataset: str) -> int:
     spec = experiment_plan_by_key()[str(dataset)]
     override = int(getattr(cli_args, "eval_horizon", 0) or 0)
@@ -672,8 +548,7 @@ def resolved_future_block_len(cli_args: argparse.Namespace, dataset: str) -> int
         return int(expected)
     if override != expected:
         raise ValueError(
-            f"Non-canonical --future_block_len={override} for {dataset}; use 0 or the locked "
-            f"future_block_len {expected}."
+            f"Non-canonical --future_block_len={override} for {dataset}; use 0 or the locked future_block_len {expected}."
         )
     return int(expected)
 
@@ -683,120 +558,9 @@ def resolved_rollout_mode(cli_args: argparse.Namespace, dataset: str) -> str:
     value = raw.strip().lower()
     if value != CANONICAL_TEMPORAL_ROLLOUT_MODE:
         raise ValueError(
-            f"Non-canonical --rollout_mode={raw!r} for {dataset}; active temporal paper-matrix "
-            f"datasets require {CANONICAL_TEMPORAL_ROLLOUT_MODE!r}."
+            f"Non-canonical --rollout_mode={raw!r} for {dataset}; active temporal paper-matrix datasets require {CANONICAL_TEMPORAL_ROLLOUT_MODE!r}."
         )
     return CANONICAL_TEMPORAL_ROLLOUT_MODE
-
-
-def resolved_eval_windows(cli_args: argparse.Namespace, dataset: str, split: str) -> int:
-    if split not in {"val", "test"}:
-        raise ValueError(f"split must be 'val' or 'test', got {split!r}.")
-    raw = int(cli_args.eval_windows_val if split == "val" else cli_args.eval_windows_test)
-    if raw > 0:
-        return raw
-    plan = DATASET_PLANS[str(dataset)]
-    return int(plan.eval_windows_final)
-
-
-def build_conditional_generation_dataset_args_from_cfg(
-    cli_args: argparse.Namespace,
-    dataset: str,
-    field_network_type: str,
-    cfg,
-) -> argparse.Namespace:
-    plan = DATASET_PLANS[str(dataset)]
-    experiment_spec = experiment_plan_by_key()[str(dataset)]
-    preset = get_otflow_paper_backbone_preset(str(dataset))
-    batch_size = int(_resolved_conditional_generation_physical_batch_size(str(dataset)))
-    grad_accum_steps = max(1, int(math.ceil(32.0 / float(max(1, batch_size)))))
-    locked_future_block_len = int(resolved_future_block_len(cli_args, str(dataset)))
-    locked_history_len = int(experiment_spec.history_len)
-    locked_rollout_mode = str(resolved_rollout_mode(cli_args, str(dataset)))
-    train_cfg = getattr(cfg, "train", None)
-    model_cfg = getattr(cfg, "model", None)
-    args = argparse.Namespace(
-        dataset=str(dataset),
-        data_path=_dataset_data_path(cli_args, str(dataset)),
-        synthetic_length=int(plan.synthetic_length),
-        seed=int(getattr(cli_args, "dataset_seed", 0)),
-        device=str(cli_args.device),
-        steps=int(resolved_train_steps(cli_args, str(dataset))),
-        train_frac=plan.train_frac,
-        val_frac=plan.val_frac,
-        test_frac=plan.test_frac,
-        stride_train=plan.stride_train,
-        stride_eval=plan.stride_eval,
-        levels=int(preset["levels"]),
-        token_dim=int(preset.get("token_dim", 4)),
-        history_len=int(locked_history_len),
-        batch_size=int(batch_size),
-        lr=float(getattr(cli_args, "lr", getattr(train_cfg, "lr", 2e-4))),
-        weight_decay=float(getattr(cli_args, "weight_decay", getattr(train_cfg, "weight_decay", 1e-4))),
-        grad_clip=float(getattr(cli_args, "grad_clip", getattr(train_cfg, "grad_clip", 1.0))),
-        standardize=True,
-        use_cond_features=bool(preset.get("use_cond_features", False)),
-        cond_standardize=bool(preset.get("cond_standardize", True)),
-        hidden_dim=int(getattr(cli_args, "hidden_dim", getattr(cfg, "hidden_dim", 160))),
-        ctx_encoder=str(preset["ctx_encoder"]),
-        ctx_causal=bool(preset["ctx_causal"]),
-        ctx_local_kernel=int(preset["ctx_local_kernel"]),
-        ctx_pool_scales=str(preset["ctx_pool_scales"]),
-        use_time_features=bool(preset.get("use_time_features", preset.get("use_time_gaps", False))),
-        use_time_gaps=bool(preset.get("use_time_gaps", False)),
-        fu_net_type=str(field_network_type),
-        fu_net_layers=int(getattr(cli_args, "fu_net_layers", getattr(model_cfg, "fu_net_layers", 3))),
-        fu_net_heads=int(getattr(cli_args, "fu_net_heads", getattr(model_cfg, "fu_net_heads", 4))),
-        rollout_mode=str(locked_rollout_mode),
-        future_block_len=int(locked_future_block_len),
-        adaptive_context=False,
-        adaptive_context_ratio=None,
-        adaptive_context_min=None,
-        adaptive_context_max=None,
-        train_variable_context=False,
-        train_context_min=None,
-        train_context_max=None,
-        use_minibatch_ot=True,
-        solver="euler",
-        use_amp=True,
-        grad_accum_steps=int(grad_accum_steps),
-    )
-    args.steps = int(getattr(cfg.train, "steps", getattr(args, "steps", resolved_train_steps(cli_args, dataset))))
-    args.levels = int(cfg.levels)
-    args.token_dim = int(getattr(cfg, "token_dim", getattr(args, "token_dim", 4)))
-    checkpoint_history_len = int(getattr(cfg, "history_len", args.history_len))
-    if checkpoint_history_len != int(locked_history_len):
-        raise RuntimeError(
-            f"Conditional-generation checkpoint config history_len={checkpoint_history_len} does not match locked "
-            f"{dataset} history_len={int(locked_history_len)}."
-        )
-    args.history_len = int(locked_history_len)
-    args.batch_size = int(cfg.batch_size)
-    args.use_cond_features = bool(getattr(cfg, "use_cond_features", getattr(args, "use_cond_features", False)))
-    args.cond_standardize = bool(getattr(cfg, "cond_standardize", getattr(args, "cond_standardize", True)))
-    args.hidden_dim = int(cfg.hidden_dim)
-    args.ctx_encoder = str(getattr(cfg.model, "ctx_encoder", args.ctx_encoder))
-    args.ctx_causal = bool(getattr(cfg.model, "ctx_causal", args.ctx_causal))
-    args.ctx_local_kernel = int(getattr(cfg.model, "ctx_local_kernel", args.ctx_local_kernel))
-    args.use_time_features = bool(getattr(cfg.model, "use_time_features", getattr(args, "use_time_features", False)))
-    args.use_time_gaps = bool(getattr(cfg.model, "use_time_gaps", getattr(args, "use_time_gaps", False)))
-    args.fu_net_type = str(getattr(cfg.model, "fu_net_type", field_network_type))
-    args.fu_net_layers = int(getattr(cfg.model, "fu_net_layers", args.fu_net_layers))
-    args.fu_net_heads = int(getattr(cfg.model, "fu_net_heads", args.fu_net_heads))
-    args.rollout_mode = str(getattr(cfg.model, "rollout_mode", args.rollout_mode))
-    if args.rollout_mode.strip().lower() != CANONICAL_TEMPORAL_ROLLOUT_MODE:
-        raise RuntimeError(
-            f"Conditional-generation checkpoint config rollout_mode={args.rollout_mode!r} does not match locked "
-            f"{dataset} rollout_mode={CANONICAL_TEMPORAL_ROLLOUT_MODE!r}."
-        )
-    checkpoint_future_block_len = int(getattr(cfg.model, "future_block_len", args.future_block_len))
-    if checkpoint_future_block_len != int(locked_future_block_len):
-        raise RuntimeError(
-            f"Conditional-generation checkpoint config future_block_len={checkpoint_future_block_len} does not match locked "
-            f"{dataset} future_block_len={int(locked_future_block_len)}."
-        )
-    args.future_block_len = int(locked_future_block_len)
-    return args
 
 
 def _checkpoint_header_is_known_text_placeholder(header: bytes) -> bool:
@@ -809,9 +573,7 @@ def _checkpoint_header_is_known_text_placeholder(header: bytes) -> bool:
 
 
 def load_otflow_checkpoint_payload(
-    ckpt_path: str | Path,
-    *,
-    expected_identity: str = "OTFlow checkpoint",
+    ckpt_path: str | Path, *, expected_identity: str = "OTFlow checkpoint"
 ) -> Mapping[str, Any]:
     path = Path(ckpt_path).expanduser()
     if not path.exists():
@@ -833,13 +595,11 @@ def load_otflow_checkpoint_payload(
         payload = torch.load(str(path), map_location="cpu", weights_only=True)
     except Exception as exc:
         raise RuntimeError(
-            f"Invalid OTFlow checkpoint at {path} ({size_bytes} bytes; expected {expected_identity}): "
-            f"torch.load failed with {type(exc).__name__}: {exc}"
+            f"Invalid OTFlow checkpoint at {path} ({size_bytes} bytes; expected {expected_identity}): torch.load failed with {type(exc).__name__}: {exc}"
         ) from exc
     if not isinstance(payload, MappingABC):
         raise RuntimeError(
-            f"Invalid OTFlow checkpoint at {path}: expected a mapping payload for {expected_identity}, "
-            f"found {type(payload).__name__}."
+            f"Invalid OTFlow checkpoint at {path}: expected a mapping payload for {expected_identity}, found {type(payload).__name__}."
         )
     missing_keys = sorted({"cfg", "model_state"} - set(payload.keys()))
     if missing_keys:
@@ -880,17 +640,15 @@ def load_checkpoint_model(ckpt_path: Path, device: torch.device) -> tuple[OTFlow
             )
         setattr(cfg, section_name, cls(**section_values))
     cfg.train.device = device
-
     model = OTFlow(cfg).to(device)
     model_state = dict(ckpt["model_state"])
     load_result = model.load_state_dict(model_state, strict=True)
     if load_result.missing_keys or load_result.unexpected_keys:
         raise RuntimeError(
-            "Checkpoint model_state is incompatible: "
-            f"missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}"
+            f"Checkpoint model_state is incompatible: missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}"
         )
     model.eval()
-    return model, cfg
+    return (model, cfg)
 
 
 def _metadata_path_for_checkpoint(manifest_artifact: Mapping[str, Any] | None, ckpt_path: Path) -> Path:
@@ -900,10 +658,7 @@ def _metadata_path_for_checkpoint(manifest_artifact: Mapping[str, Any] | None, c
 
 
 def _metadata_int_value(
-    manifest_artifact: Mapping[str, Any] | None,
-    metadata: Mapping[str, Any],
-    key: str,
-    default: int,
+    manifest_artifact: Mapping[str, Any] | None, metadata: Mapping[str, Any], key: str, default: int
 ) -> int:
     for source in (manifest_artifact or {}, metadata):
         value = source.get(key)
@@ -913,10 +668,7 @@ def _metadata_int_value(
 
 
 def _metadata_str_value(
-    manifest_artifact: Mapping[str, Any] | None,
-    metadata: Mapping[str, Any],
-    key: str,
-    default: str = "",
+    manifest_artifact: Mapping[str, Any] | None, metadata: Mapping[str, Any], key: str, default: str = ""
 ) -> str:
     for source in (manifest_artifact or {}, metadata):
         value = str(source.get(key, "") or "").strip()
@@ -969,8 +721,7 @@ def _validate_metadata_identity(
         observed_field = str(_required_metadata_value(metadata, "field_network_type"))
         if observed_field != str(expected_field_network_type):
             raise RuntimeError(
-                f"Checkpoint {ckpt_path} metadata mismatch for {dataset}: "
-                f"field_network_type={observed_field!r}, expected {str(expected_field_network_type)!r}."
+                f"Checkpoint {ckpt_path} metadata mismatch for {dataset}: field_network_type={observed_field!r}, expected {str(expected_field_network_type)!r}."
             )
 
 
@@ -999,106 +750,28 @@ def _validate_forecast_checkpoint_task(
     metadata_cond_dim = _metadata_split_cond_dim(metadata)
     if int(checkpoint_model_cond_dim) != int(metadata_cond_dim):
         raise RuntimeError(
-            f"Forecast checkpoint {ckpt_path} cond_dim mismatch for {dataset}: "
-            f"checkpoint={int(checkpoint_model_cond_dim)}, metadata={int(metadata_cond_dim)}."
+            f"Forecast checkpoint {ckpt_path} cond_dim mismatch for {dataset}: checkpoint={int(checkpoint_model_cond_dim)}, metadata={int(metadata_cond_dim)}."
         )
     if int(checkpoint_train_steps) != int(expected_train_steps):
         raise RuntimeError(
-            f"Forecast checkpoint {ckpt_path} train_steps mismatch for {dataset}: "
-            f"checkpoint={int(checkpoint_train_steps)}, expected={int(expected_train_steps)}."
+            f"Forecast checkpoint {ckpt_path} train_steps mismatch for {dataset}: checkpoint={int(checkpoint_train_steps)}, expected={int(expected_train_steps)}."
         )
     if int(checkpoint_history_len) != int(experiment_spec.history_len):
         raise RuntimeError(
-            f"Forecast checkpoint {ckpt_path} history_len mismatch for {dataset}: "
-            f"checkpoint={int(checkpoint_history_len)}, expected={int(experiment_spec.history_len)}."
+            f"Forecast checkpoint {ckpt_path} history_len mismatch for {dataset}: checkpoint={int(checkpoint_history_len)}, expected={int(experiment_spec.history_len)}."
         )
     if int(checkpoint_future_block_len) != int(experiment_spec.future_block_len):
         raise RuntimeError(
-            f"Forecast checkpoint {ckpt_path} future_block_len mismatch for {dataset}: "
-            f"checkpoint={int(checkpoint_future_block_len)}, expected={int(experiment_spec.future_block_len)}."
+            f"Forecast checkpoint {ckpt_path} future_block_len mismatch for {dataset}: checkpoint={int(checkpoint_future_block_len)}, expected={int(experiment_spec.future_block_len)}."
         )
     if str(checkpoint_rollout_mode).strip().lower() != CANONICAL_TEMPORAL_ROLLOUT_MODE:
         raise RuntimeError(
-            f"Forecast checkpoint {ckpt_path} rollout_mode mismatch for {dataset}: "
-            f"checkpoint={str(checkpoint_rollout_mode)!r}, expected {CANONICAL_TEMPORAL_ROLLOUT_MODE!r}."
-        )
-
-
-def _validate_conditional_generation_checkpoint_task(
-    *,
-    dataset: str,
-    ckpt_path: Path,
-    metadata: Mapping[str, Any],
-    checkpoint_model_cond_dim: int,
-    checkpoint_train_steps: int,
-    checkpoint_history_len: int,
-    checkpoint_future_block_len: int,
-    checkpoint_rollout_mode: str,
-    expected_train_steps: int,
-    expected_history_len: int,
-    expected_future_block_len: int,
-    splits: Mapping[str, Any] | None = None,
-) -> None:
-    _validate_metadata_identity(
-        metadata=metadata,
-        ckpt_path=ckpt_path,
-        dataset=str(dataset),
-        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-        expected_train_steps=int(expected_train_steps),
-        expected_history_len=int(expected_history_len),
-        expected_future_block_len=int(expected_future_block_len),
-        expected_field_network_type=DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE,
-    )
-    metadata_cond_dim = _metadata_split_cond_dim(metadata)
-    if int(checkpoint_model_cond_dim) != int(metadata_cond_dim):
-        raise RuntimeError(
-            f"Conditional-generation checkpoint {ckpt_path} is incompatible with split metadata for {dataset}: "
-            f"model.cond_dim={int(checkpoint_model_cond_dim)}, split_stats.cond_dim={int(metadata_cond_dim)}."
-        )
-    if int(checkpoint_train_steps) != int(expected_train_steps):
-        raise RuntimeError(
-            f"Conditional-generation checkpoint {ckpt_path} train_steps mismatch: "
-            f"checkpoint={int(checkpoint_train_steps)}, expected={int(expected_train_steps)}."
-        )
-    if int(checkpoint_history_len) != int(expected_history_len):
-        raise RuntimeError(
-            f"Conditional-generation checkpoint {ckpt_path} history_len mismatch: "
-            f"checkpoint={int(checkpoint_history_len)}, expected={int(expected_history_len)}."
-        )
-    if int(checkpoint_future_block_len) != int(expected_future_block_len):
-        raise RuntimeError(
-            f"Conditional-generation checkpoint {ckpt_path} future_block_len mismatch: "
-            f"checkpoint={int(checkpoint_future_block_len)}, expected={int(expected_future_block_len)}."
-        )
-    if str(checkpoint_rollout_mode).strip().lower() != CANONICAL_TEMPORAL_ROLLOUT_MODE:
-        raise RuntimeError(
-            f"Conditional-generation checkpoint {ckpt_path} rollout_mode mismatch: "
-            f"checkpoint={str(checkpoint_rollout_mode)!r}, expected {CANONICAL_TEMPORAL_ROLLOUT_MODE!r}."
-        )
-    if splits is None:
-        return
-    stats = dict(splits.get("stats", {}) or {})
-    split_cond_dim = int(stats.get("cond_dim") or 0)
-    if split_cond_dim != int(checkpoint_model_cond_dim):
-        raise RuntimeError(
-            f"Conditional-generation checkpoint {ckpt_path} architecture does not match rebuilt {dataset} split: "
-            f"model.cond_dim={int(checkpoint_model_cond_dim)}, split_stats.cond_dim={int(split_cond_dim)}."
-        )
-    split_history = stats.get("history_len")
-    if split_history is not None and int(split_history) != int(checkpoint_history_len):
-        raise RuntimeError(
-            f"Conditional-generation checkpoint {ckpt_path} history_len does not match rebuilt {dataset} split: "
-            f"checkpoint={int(checkpoint_history_len)}, split_stats.history_len={int(split_history)}."
+            f"Forecast checkpoint {ckpt_path} rollout_mode mismatch for {dataset}: checkpoint={str(checkpoint_rollout_mode)!r}, expected {CANONICAL_TEMPORAL_ROLLOUT_MODE!r}."
         )
 
 
 def load_forecast_checkpoint_splits(
-    *,
-    cli_args: argparse.Namespace,
-    dataset_root: Path,
-    shared_backbone_root: Path,
-    dataset: str,
-    device: torch.device,
+    *, cli_args: argparse.Namespace, dataset_root: Path, shared_backbone_root: Path, dataset: str, device: torch.device
 ) -> dict[str, Any]:
     expected_train_steps = int(getattr(cli_args, "otflow_train_steps", 20000))
     resolved_eval_horizon(cli_args, str(dataset))
@@ -1135,22 +808,12 @@ def load_forecast_checkpoint_splits(
     metadata_path = _metadata_path_for_checkpoint(manifest_artifact, ckpt_path)
     metadata = _safe_json(metadata_path) or {}
     checkpoint_budget_steps = _metadata_int_value(
-        manifest_artifact,
-        metadata,
-        "checkpoint_budget_steps",
-        resolved_checkpoint_steps,
+        manifest_artifact, metadata, "checkpoint_budget_steps", resolved_checkpoint_steps
     )
     effective_train_steps = _metadata_int_value(
-        manifest_artifact,
-        metadata,
-        "effective_train_steps",
-        resolved_checkpoint_steps,
+        manifest_artifact, metadata, "effective_train_steps", resolved_checkpoint_steps
     )
-    checkpoint_export_protocol = _metadata_str_value(
-        manifest_artifact,
-        metadata,
-        "checkpoint_export_protocol",
-    )
+    checkpoint_export_protocol = _metadata_str_value(manifest_artifact, metadata, "checkpoint_export_protocol")
     model, cfg = load_checkpoint_model(ckpt_path, device=device)
     _validate_forecast_checkpoint_task(
         dataset=str(dataset),
@@ -1188,137 +851,6 @@ def load_forecast_checkpoint_splits(
     }
 
 
-def load_conditional_generation_checkpoint_splits(
-    *,
-    cli_args: argparse.Namespace,
-    shared_backbone_root: Path,
-    dataset: str,
-    device: torch.device,
-) -> dict[str, Any]:
-    expected_train_steps = int(resolved_train_steps(cli_args, str(dataset)))
-    experiment_spec = experiment_plan_by_key()[str(dataset)]
-    expected_history_len = int(experiment_spec.history_len)
-    expected_future_block_len = int(resolved_future_block_len(cli_args, str(dataset)))
-    resolved_rollout_mode(cli_args, str(dataset))
-    manifest_artifact = _resolved_manifest_artifact(
-        cli_args,
-        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-        dataset_key=str(dataset),
-        train_steps=int(expected_train_steps),
-    )
-    if manifest_artifact is not None:
-        ckpt_path = _resolve_checkpoint_path(str(manifest_artifact["checkpoint_path"]))
-        checkpoint_id = str(manifest_artifact["checkpoint_id"])
-        resolved_checkpoint_steps = int(manifest_artifact["train_steps"])
-        resolved_budget_label = str(manifest_artifact["train_budget_label"])
-        backbone_name = str(manifest_artifact.get("backbone_name", BACKBONE_NAME_OTFLOW))
-    else:
-        ckpt_path = (
-            shared_backbone_root
-            / CONDITIONAL_GENERATION_FAMILY
-            / str(dataset)
-            / DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE
-            / "model.pt"
-        )
-        metadata = (
-            _safe_json(
-                shared_backbone_root
-                / CONDITIONAL_GENERATION_FAMILY
-                / str(dataset)
-                / DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE
-                / "checkpoint_metadata.json"
-            )
-            or {}
-        )
-        resolved_checkpoint_steps = int(metadata.get("train_steps", int(expected_train_steps)))
-        resolved_budget_label = str(metadata.get("train_budget_label", train_budget_label(resolved_checkpoint_steps)))
-        checkpoint_id = str(
-            metadata.get("checkpoint_id")
-            or build_backbone_checkpoint_id(
-                backbone_name=BACKBONE_NAME_OTFLOW,
-                benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-                dataset_key=str(dataset),
-                train_steps=resolved_checkpoint_steps,
-                field_network_type=DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE,
-            )
-        )
-        backbone_name = BACKBONE_NAME_OTFLOW
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Conditional-generation checkpoint not found: {ckpt_path}")
-    metadata_path = _metadata_path_for_checkpoint(manifest_artifact, ckpt_path)
-    metadata = _safe_json(metadata_path) or {}
-    checkpoint_budget_steps = _metadata_int_value(
-        manifest_artifact,
-        metadata,
-        "checkpoint_budget_steps",
-        resolved_checkpoint_steps,
-    )
-    effective_train_steps = _metadata_int_value(
-        manifest_artifact,
-        metadata,
-        "effective_train_steps",
-        resolved_checkpoint_steps,
-    )
-    checkpoint_export_protocol = _metadata_str_value(
-        manifest_artifact,
-        metadata,
-        "checkpoint_export_protocol",
-    )
-    model, cfg = load_checkpoint_model(ckpt_path, device=device)
-    checkpoint_model_cond_dim = int(getattr(cfg.model, "cond_dim", 0))
-    checkpoint_train_steps = int(getattr(cfg.train, "steps", 0))
-    checkpoint_history_len = int(cfg.history_len)
-    checkpoint_future_block_len = int(getattr(cfg.model, "future_block_len", 1))
-    checkpoint_rollout_mode = str(getattr(cfg.model, "rollout_mode", ""))
-    _validate_conditional_generation_checkpoint_task(
-        dataset=str(dataset),
-        ckpt_path=ckpt_path,
-        metadata=metadata,
-        checkpoint_model_cond_dim=int(checkpoint_model_cond_dim),
-        checkpoint_train_steps=int(checkpoint_train_steps),
-        checkpoint_history_len=int(checkpoint_history_len),
-        checkpoint_future_block_len=int(checkpoint_future_block_len),
-        checkpoint_rollout_mode=str(checkpoint_rollout_mode),
-        expected_train_steps=int(expected_train_steps),
-        expected_history_len=int(expected_history_len),
-        expected_future_block_len=int(expected_future_block_len),
-    )
-    dataset_args = build_conditional_generation_dataset_args_from_cfg(
-        cli_args,
-        str(dataset),
-        DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE,
-        cfg,
-    )
-    splits = build_dataset_splits(dataset_args, cfg)
-    _validate_conditional_generation_checkpoint_task(
-        dataset=str(dataset),
-        ckpt_path=ckpt_path,
-        metadata=metadata,
-        checkpoint_model_cond_dim=int(checkpoint_model_cond_dim),
-        checkpoint_train_steps=int(checkpoint_train_steps),
-        checkpoint_history_len=int(checkpoint_history_len),
-        checkpoint_future_block_len=int(checkpoint_future_block_len),
-        checkpoint_rollout_mode=str(checkpoint_rollout_mode),
-        expected_train_steps=int(expected_train_steps),
-        expected_history_len=int(expected_history_len),
-        expected_future_block_len=int(expected_future_block_len),
-        splits=splits,
-    )
-    return {
-        "model": model,
-        "cfg": cfg,
-        "splits": splits,
-        "checkpoint_path": ckpt_path,
-        "checkpoint_id": str(checkpoint_id),
-        "backbone_name": str(backbone_name),
-        "train_steps": int(resolved_checkpoint_steps),
-        "checkpoint_budget_steps": int(checkpoint_budget_steps),
-        "effective_train_steps": int(effective_train_steps),
-        "checkpoint_export_protocol": str(checkpoint_export_protocol),
-        "train_budget_label": str(resolved_budget_label),
-    }
-
-
 def collect_forecast_calibration(
     model: OTFlow,
     ds_val,
@@ -1333,14 +865,12 @@ def collect_forecast_calibration(
     trace_samples = int(calibration_trace_samples)
     if trace_samples <= 0:
         raise ValueError(f"calibration_trace_samples must be positive, got {calibration_trace_samples}")
-
     reference_time_grid: np.ndarray | None = None
     disagreement_rows: list[np.ndarray] = []
     residual_rows: list[np.ndarray] = []
     oracle_rows: list[np.ndarray] = []
     trace_rows: list[dict[str, Any]] = []
     device = cfg.train.device
-
     for example_idx in range(len(ds_val)):
         hist_t, _, _, _ = _parse_forecast_batch(ds_val[int(example_idx)])
         hist = hist_t[None].to(device).float()
@@ -1348,22 +878,18 @@ def collect_forecast_calibration(
         residual_samples: list[np.ndarray] = []
         oracle_samples: list[np.ndarray] = []
         for sample_idx in range(trace_samples):
-            seed_all(int(seed) + int(example_idx) + 1_000_000 * int(sample_idx))
+            seed_all(int(seed) + int(example_idx) + 1000000 * int(sample_idx))
             _, trace = model.sample_future_trace(
-                hist,
-                steps=int(macro_steps),
-                solver=str(solver_name),
-                oracle_local_error=True,
+                hist, steps=int(macro_steps), solver=str(solver_name), oracle_local_error=True
             )
             grid = trace["time_grid"].detach().cpu().numpy().astype(np.float64)
             if reference_time_grid is None:
                 reference_time_grid = grid
-            elif not np.allclose(reference_time_grid, grid, atol=1e-8, rtol=1e-8):
+            elif not np.allclose(reference_time_grid, grid, atol=1e-08, rtol=1e-08):
                 raise ValueError("Forecast calibration trace time grids must match across validation examples.")
             disagreement_samples.append(trace["disagreement"][0].detach().cpu().numpy().astype(np.float64))
             residual_samples.append(trace["residual_norm"][0].detach().cpu().numpy().astype(np.float64))
             oracle_samples.append(trace["oracle_local_error"][0].detach().cpu().numpy().astype(np.float64))
-
         disagreement = np.stack(disagreement_samples, axis=0).mean(axis=0)
         residual = np.stack(residual_samples, axis=0).mean(axis=0)
         oracle = np.stack(oracle_samples, axis=0).mean(axis=0)
@@ -1382,7 +908,6 @@ def collect_forecast_calibration(
                     "oracle_local_error": float(oracle_value),
                 }
             )
-
     if not disagreement_rows:
         raise ValueError("Forecast validation split is empty; cannot calibrate native info-growth trace.")
     disagreement_arr = np.stack(disagreement_rows, axis=0)
@@ -1392,11 +917,7 @@ def collect_forecast_calibration(
     effective_scale = float(base_scale) * float(info_growth_scale_multiplier)
     if effective_scale <= 0.0:
         raise ValueError(f"info_growth_scale_multiplier must keep scale positive, got {info_growth_scale_multiplier}")
-    info_growth_arr = compute_info_growth_hardness_numpy(
-        residual_arr,
-        disagreement_arr,
-        scale=float(effective_scale),
-    )
+    info_growth_arr = compute_info_growth_hardness_numpy(residual_arr, disagreement_arr, scale=float(effective_scale))
     if reference_time_grid is None:
         reference_time_grid = np.linspace(0.0, 1.0, int(macro_steps) + 1, dtype=np.float64)
     corr_signal = info_growth_arr[:, 1:].reshape(-1)
@@ -1417,9 +938,7 @@ def collect_forecast_calibration(
         "oracle_local_error_by_step": [float(value) for value in oracle_arr.mean(axis=0).tolist()],
         NATIVE_INFO_GROWTH_TRACE_KEY: [float(value) for value in info_growth_arr.mean(axis=0).tolist()],
         "signal_correlations_vs_oracle": {
-            NATIVE_INFO_GROWTH_TRACE_KEY: {
-                "spearman": safe_spearman(corr_signal, corr_oracle),
-            }
+            NATIVE_INFO_GROWTH_TRACE_KEY: {"spearman": safe_spearman(corr_signal, corr_oracle)}
         },
     }
 
@@ -1446,7 +965,15 @@ def evaluate_forecast_schedule(
     progress_label: str = "",
     return_per_example_rows: bool = False,
     return_context_embeddings: bool = False,
+    policy=None,
+    clock_seed: int = 0,
 ) -> dict[str, Any]:
+    if policy is not None:
+        if batch_size != 1:
+            raise ValueError("Policy forecasting requires batch_size=1; pair its uniform run with the same protocol.")
+        if policy.metadata["task"] != dataset_key or policy.metadata["backbone"] != checkpoint_id:
+            raise ValueError("Forecast policy task/backbone does not match the frozen runtime.")
+        return_context_embeddings = True
     device = cfg.train.device
     mse_values: list[float] = []
     crps_values: list[float] = []
@@ -1485,6 +1012,9 @@ def evaluate_forecast_schedule(
                 "solver_name": str(solver_name),
                 "target_nfe": None if target_nfe is None else int(target_nfe),
                 "time_grid": [float(x) for x in time_grid],
+                "policy_sha256": None if policy is None else policy.artifact_sha256,
+                "student_kind": None if policy is None else policy.student_kind,
+                "clock_seed": None if policy is None else clock_seed,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1509,11 +1039,7 @@ def evaluate_forecast_schedule(
                     hist_rows.append(hist_t.float())
                     metadata_rows.append(
                         _forecast_example_detail_metadata(
-                            ds,
-                            int(example_idx),
-                            meta,
-                            dataset_key=str(dataset_key),
-                            split_phase=str(split_phase),
+                            ds, int(example_idx), meta, dataset_key=str(dataset_key), split_phase=str(split_phase)
                         )
                     )
                     true_parts = [tgt_t[None, :]]
@@ -1529,9 +1055,7 @@ def evaluate_forecast_schedule(
                     if backbone is None:
                         raise ValueError("return_context_embeddings requires model.backbone.")
                     embedding_tensor = frozen_backbone_policy_context(
-                        backbone,
-                        hist,
-                        protocol=FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL,
+                        backbone, hist, protocol=FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL
                     )
                     chunk_context_embeddings = embedding_tensor.detach().cpu().numpy().astype(np.float32)
                     chunk_width = int(chunk_context_embeddings.shape[1])
@@ -1539,8 +1063,7 @@ def evaluate_forecast_schedule(
                         context_embedding_width = chunk_width
                     elif context_embedding_width != chunk_width:
                         raise ValueError(
-                            "Frozen-backbone policy context width changed across forecast batches: "
-                            f"expected {context_embedding_width}, got {chunk_width}."
+                            f"Frozen-backbone policy context width changed across forecast batches: expected {context_embedding_width}, got {chunk_width}."
                         )
                 chunk_context_ids: list[str] = []
                 if return_per_example_rows or return_context_embeddings:
@@ -1567,11 +1090,22 @@ def evaluate_forecast_schedule(
                                 for value in chunk_context_embeddings[context_idx].astype(np.float32).tolist()
                             ]
                 chunk_draws: list[np.ndarray] = []
+                sample_time_grids = []
                 for sample_idx in range(int(num_eval_samples)):
-                    seed_all(int(evaluation_seed) + 1_000_000 * int(chunk_start) + int(sample_idx))
+                    seed_all(int(evaluation_seed) + 1000000 * int(chunk_start) + int(sample_idx))
                     if device.type == "cuda" and torch.cuda.is_available():
                         torch.cuda.synchronize(device)
                     start = time.perf_counter()
+                    if policy is not None:
+                        grid = policy.materialize(
+                            chunk_context_embeddings[0],
+                            solver_name,
+                            resolved_target_nfe,
+                            seed=clock_seed,
+                            request_id=f"{chunk_context_ids[0]}:{logical_panel_seed}:member:{sample_idx}",
+                        )
+                        _apply_sample_overrides(model, cfg, time_grid=grid)
+                        sample_time_grids.append(list(grid))
                     pred_norm = model.sample_future(hist, steps=int(runtime_nfe), solver=str(solver_name))
                     if device.type == "cuda" and torch.cuda.is_available():
                         torch.cuda.synchronize(device)
@@ -1594,14 +1128,14 @@ def evaluate_forecast_schedule(
                     crps_values.append(crps)
                     mase_values.append(mase)
                     if return_per_example_rows:
-                        from genode.gico.policy import schedule_grid_hash
+                        from genode.gico.schedule_hash import schedule_grid_hash
 
                         metadata = metadata_rows[row_idx]
                         raw_context_id = chunk_context_ids[row_idx]
                         context_id = raw_context_id
                         context_embedding_id = f"{checkpoint_id}:{raw_context_id}" if return_context_embeddings else ""
                         sample_seed_values = [
-                            int(evaluation_seed) + 1_000_000 * int(chunk_start) + int(sample_idx)
+                            int(evaluation_seed) + 1000000 * int(chunk_start) + int(sample_idx)
                             for sample_idx in range(int(num_eval_samples))
                         ]
                         row_signature_payload = {
@@ -1641,7 +1175,9 @@ def evaluate_forecast_schedule(
                                 "axis_trajectory": "",
                                 "axis_iso_id": "",
                                 "axis_flags": "",
-                                "schedule_grid_hash": schedule_grid_hash(time_grid),
+                                "schedule_grid_hash": schedule_grid_hash(time_grid) if policy is None else "",
+                                "sample_time_grids": sample_time_grids if policy is not None else None,
+                                "policy_sha256": None if policy is None else policy.artifact_sha256,
                                 "example_idx": int(metadata["example_idx"]),
                                 "series_id": str(metadata["series_id"]),
                                 "series_idx": int(metadata["series_idx"]),
@@ -1707,11 +1243,6 @@ def evaluate_forecast_schedule(
 
 __all__ = [
     "ALL_SOLVER_ORDER",
-    "CONDITIONAL_GENERATION_FAMILY",
-    "CONDITIONAL_GENERATION_PHYSICAL_BATCH_SIZE_BY_DATASET",
-    "DEFAULT_CONDITIONAL_GENERATION_TRAIN_STEPS",
-    "DEFAULT_CONDITIONAL_GENERATION_DATASETS",
-    "DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE",
     "DEFAULT_FORECAST_DATASETS",
     "DEFAULT_SHARED_BACKBONE_ROOT",
     "DEFAULT_TRAIN_TUNING_TRAIN_SPLIT_FRACTION",
@@ -1719,7 +1250,6 @@ __all__ = [
     "FORECAST_FAMILY",
     "LOCKED_TEST_PHASE",
     "SOLVER_RUNTIME_NAMES",
-    "SUPPORTED_CONDITIONAL_GENERATION_DATASETS",
     "SUPPORTED_FORECAST_DATASETS",
     "TRAIN_TUNING_PHASE",
     "TRAIN_TUNING_SAMPLING_MODE_VALIDATION_NORMALIZED",
@@ -1735,9 +1265,7 @@ __all__ = [
     "train_tuning_sampler_key",
     "train_tuning_target_example_count",
     "load_checkpoint_model",
-    "load_conditional_generation_checkpoint_splits",
     "load_forecast_checkpoint_splits",
-    "parse_conditional_generation_datasets",
     "parse_csv",
     "parse_float_csv",
     "parse_forecast_datasets",
@@ -1746,8 +1274,6 @@ __all__ = [
     "resolved_eval_horizon",
     "resolved_future_block_len",
     "resolved_rollout_mode",
-    "resolved_eval_windows",
-    "resolved_train_steps",
     "safe_spearman",
     "save_json",
     "selection_metric_for_family",

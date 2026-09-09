@@ -33,11 +33,11 @@ class CanonicalSeenUnseenLayoutTests(unittest.TestCase):
         self.assertEqual(CANONICAL_CHECKPOINT_STEPS, (4000, 8000, 12000, 16000, 20000))
         self.assertEqual(CANONICAL_CONTEXT_SAMPLE_COUNT, 188)
         self.assertEqual(CANONICAL_SOLVER_KEYS, ("euler", "dpmpp2m", "heun", "midpoint_rk2"))
-        self.assertEqual(len(CANONICAL_SCENARIO_KEYS), 9)
-        self.assertEqual(len(PHYSICAL_SCHEDULE_KEYS), 12)
-        self.assertEqual(len(REVERSED_SCHEDULE_KEYS), 11)
+        self.assertEqual(len(CANONICAL_SCENARIO_KEYS), 6)
+        self.assertEqual(len(PHYSICAL_SCHEDULE_KEYS), 13)
+        self.assertEqual(len(REVERSED_SCHEDULE_KEYS), 12)
         self.assertEqual(len(AVERAGED_REVERSED_SCHEDULE_KEYS), 0)
-        self.assertEqual(len(CANONICAL_SUPERVISION_SCHEDULE_KEYS), 23)
+        self.assertEqual(len(CANONICAL_SUPERVISION_SCHEDULE_KEYS), 25)
 
     def test_role_and_runner_defaults(self) -> None:
         seen_args = runner.build_argparser().parse_args([])
@@ -56,28 +56,12 @@ class CanonicalSeenUnseenLayoutTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not canonical"):
             runner._checkpoint_steps_for_args(bad_step)
 
-    def test_gico_parser_defaults(self) -> None:
-        args = build_gico_argparser().parse_args(
-            [
-                "--rows_csv",
-                "rows.csv",
-                "--context_embeddings_npz",
-                "ctx.npz",
-                "--out_dir",
-                "out",
-            ]
-        )
-        self.assertEqual(args.context_sample_count, CANONICAL_CONTEXT_SAMPLE_COUNT)
-        self.assertEqual(args.teacher_unseen_selection_target_nfe_values, "6,10,14,20")
-        self.assertAlmostEqual(float(args.student_unseen_target_weight), 0.25)
-        self.assertAlmostEqual(float(args.student_teacher_score_weight), 0.05)
-        self.assertAlmostEqual(float(args.student_teacher_score_warmup_fraction), 0.6)
-        self.assertFalse(args.student_teacher_score_include_unseen_targets)
-        self.assertEqual(args.student_target_mixture_mode, "full")
-        self.assertAlmostEqual(float(args.student_target_elite_fraction), 0.3)
-        self.assertEqual(int(args.student_target_elite_k), 0)
-        self.assertEqual(int(args.student_target_elite_min_count), 2)
-        self.assertAlmostEqual(float(args.student_target_elite_blend_all_weight), 0.2)
+    def test_gico_parser_preserves_config_defaults(self) -> None:
+        args = build_gico_argparser().parse_args(["--config", "training.json"])
+        self.assertEqual(args.config, "training.json")
+        self.assertIsNone(args.student_kind)
+        self.assertIsNone(args.teacher_score_weight)
+        self.assertFalse(args.dry_run)
 
     def test_solver_protocol_is_canonical_and_aliases_do_not_persist(self) -> None:
         self.assertEqual(normalize_solver_key("dpm++2m"), "dpmpp2m")

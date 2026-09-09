@@ -458,18 +458,18 @@ class MoleculeBackboneTests(unittest.TestCase):
             history_len=2,
             future_horizon=1,
             rollout_mode="autoregressive",
-            atom_count=2,
+            atom_count=3,
         )
         checkpoint_stats = molecule_xyz.MoleculeStats(
-            target_mean=np.zeros(6, dtype=np.float32),
-            target_std=np.ones(6, dtype=np.float32),
-            context_mean=np.zeros(22, dtype=np.float32),
-            context_std=np.ones(22, dtype=np.float32),
-            reference_coords=np.zeros((2, 3), dtype=np.float32),
+            target_mean=np.zeros(9, dtype=np.float32),
+            target_std=np.ones(9, dtype=np.float32),
+            context_mean=np.zeros(33, dtype=np.float32),
+            context_std=np.ones(33, dtype=np.float32),
+            reference_coords=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
         )
 
         class FakeDataset:
-            data = SimpleNamespace(atom_symbols=["C", "H"], atom_count=2)
+            data = SimpleNamespace(atom_symbols=["C", "H", "H"], atom_count=3)
             stats = checkpoint_stats
 
             def __len__(self) -> int:
@@ -489,7 +489,7 @@ class MoleculeBackboneTests(unittest.TestCase):
             split="val_clean",
             device="cpu",
             max_windows=0,
-            sample_count=1,
+            sample_count=2,
             nfe=1,
             solver="euler",
             stride_eval=5,
@@ -588,37 +588,33 @@ class MoleculeBackboneTests(unittest.TestCase):
             history_len=2,
             future_horizon=1,
             rollout_mode="autoregressive",
-            atom_count=2,
+            atom_count=3,
         )
         checkpoint_stats = molecule_xyz.MoleculeStats(
-            target_mean=np.zeros(6, dtype=np.float32),
-            target_std=np.ones(6, dtype=np.float32),
-            context_mean=np.zeros(22, dtype=np.float32),
-            context_std=np.ones(22, dtype=np.float32),
-            reference_coords=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+            target_mean=np.zeros(9, dtype=np.float32),
+            target_std=np.ones(9, dtype=np.float32),
+            context_mean=np.zeros(33, dtype=np.float32),
+            context_std=np.ones(33, dtype=np.float32),
+            reference_coords=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
         )
 
         def context_from_positions(first: np.ndarray, second: np.ndarray) -> np.ndarray:
-            context = np.zeros((2, 22), dtype=np.float32)
-            context[0] = np.concatenate(
-                [np.concatenate([first[0], np.zeros(8)]), np.concatenate([first[1], np.zeros(8)])]
-            )
-            context[1] = np.concatenate(
-                [np.concatenate([second[0], np.zeros(8)]), np.concatenate([second[1], np.zeros(8)])]
-            )
+            context = np.zeros((2, 33), dtype=np.float32)
+            context[0] = np.concatenate([np.concatenate([position, np.zeros(8)]) for position in first])
+            context[1] = np.concatenate([np.concatenate([position, np.zeros(8)]) for position in second])
             return context
 
         class FakeDataset:
             H = 2
             future_horizon = 1
-            data = SimpleNamespace(atom_symbols=["C", "H"], atom_count=2)
+            data = SimpleNamespace(atom_symbols=["C", "H", "H"], atom_count=3)
             stats = checkpoint_stats
 
             def __len__(self) -> int:
                 return 2
 
             def eval_item(self, idx: int):
-                previous = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+                previous = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
                 current = previous + float(idx) * 0.1
                 future = current + 0.05
                 return {
@@ -640,7 +636,7 @@ class MoleculeBackboneTests(unittest.TestCase):
         class FakeModel:
             def sample_future(self, hist_t, *, steps: int, solver: str):
                 del hist_t, steps, solver
-                return torch.full((1, 1, 6), 0.05, dtype=torch.float32)
+                return torch.full((1, 1, 9), 0.05, dtype=torch.float32)
 
         calls = []
 
@@ -663,7 +659,7 @@ class MoleculeBackboneTests(unittest.TestCase):
             split="test_clean",
             device="cpu",
             max_windows=2,
-            sample_count=1,
+            sample_count=2,
             rollout_steps=1,
             nfe=1,
             solver="euler",
@@ -715,9 +711,9 @@ class MoleculeBackboneTests(unittest.TestCase):
         self.assertEqual(set(dist["clean_first_horizon"]), expected)
         self.assertEqual(set(dist["transition_first_horizon"]), expected)
         self.assertEqual(len(calls), 3)
-        self.assertEqual(calls[0][0].shape, (2, 2, 3))
-        self.assertEqual(calls[1][0].shape, (1, 2, 3))
-        self.assertEqual(calls[2][0].shape, (1, 2, 3))
+        self.assertEqual(calls[0][0].shape, (4, 3, 3))
+        self.assertEqual(calls[1][0].shape, (2, 3, 3))
+        self.assertEqual(calls[2][0].shape, (2, 3, 3))
         self.assertIn("motion_distribution", summary["metrics"])
         self.assertIn("rollout_stability_by_horizon", summary["metrics"])
         self.assertEqual(summary["benchmark_family"], "molecule_3d_coordinate_generation")
@@ -778,28 +774,28 @@ class MoleculeBackboneTests(unittest.TestCase):
             history_len=2,
             future_horizon=1,
             rollout_mode="autoregressive",
-            atom_count=2,
+            atom_count=3,
         )
         checkpoint_stats = molecule_xyz.MoleculeStats(
-            target_mean=np.zeros(6, dtype=np.float32),
-            target_std=np.ones(6, dtype=np.float32),
-            context_mean=np.zeros(22, dtype=np.float32),
-            context_std=np.ones(22, dtype=np.float32),
-            reference_coords=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+            target_mean=np.zeros(9, dtype=np.float32),
+            target_std=np.ones(9, dtype=np.float32),
+            context_mean=np.zeros(33, dtype=np.float32),
+            context_std=np.ones(33, dtype=np.float32),
+            reference_coords=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
         )
 
         class FakeDataset:
             H = 2
-            data = SimpleNamespace(atom_symbols=["C", "H"], atom_count=2)
+            data = SimpleNamespace(atom_symbols=["C", "H", "H"], atom_count=3)
             stats = checkpoint_stats
 
             def eval_item(self, idx: int):
-                previous = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+                previous = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
                 current = previous + 0.1 * float(idx)
                 return {
-                    "context": np.zeros((2, 22), dtype=np.float32),
+                    "context": np.zeros((2, 33), dtype=np.float32),
                     "history_coords": np.stack([previous, current], axis=0).astype(np.float32),
-                    "future_coords": (current + 0.05)[None, :, :].astype(np.float32),
+                    "future_coords": np.stack([current + 0.05 * step for step in (1, 2, 3)]).astype(np.float32),
                     "current_coords": current.astype(np.float32),
                     "target_idx": 10 + idx,
                     "trajectory_key": "traj",
@@ -808,7 +804,7 @@ class MoleculeBackboneTests(unittest.TestCase):
 
             def context_features_from_history_coords(self, history_coords):
                 del history_coords
-                return np.zeros((2, 22), dtype=np.float32)
+                return np.zeros((2, 33), dtype=np.float32)
 
             def denormalize_target(self, values):
                 return np.asarray(values, dtype=np.float32)
@@ -821,7 +817,7 @@ class MoleculeBackboneTests(unittest.TestCase):
             def sample_future(self, hist_t, *, steps: int, solver: str):
                 del hist_t, steps, solver
                 self.grids.append(tuple(float(x) for x in self.cfg.sample.time_grid))
-                return torch.full((1, 1, 6), 0.05, dtype=torch.float32)
+                return torch.full((1, 1, 9), 0.05, dtype=torch.float32)
 
         model = FakeModel(cfg)
         result = molecule_metrics.evaluate_molecule_rollout_schedule(
@@ -834,8 +830,8 @@ class MoleculeBackboneTests(unittest.TestCase):
             runtime_nfe=2,
             time_grid=(0.0, 0.25, 1.0),
             example_indices=[0],
-            sample_count=1,
-            rollout_steps=1,
+            sample_count=2,
+            rollout_steps=3,
             seed=0,
             split_phase="locked_test",
             checkpoint_id="ckpt",
@@ -846,7 +842,12 @@ class MoleculeBackboneTests(unittest.TestCase):
             device=torch.device("cpu"),
         )
 
-        self.assertEqual(model.grids, [(0.0, 0.25, 1.0)])
+        self.assertEqual(model.grids, [(0.0, 0.25, 1.0)] * 6)
+        self.assertAlmostEqual(result["molecule_energy_score"], 0.0, places=6)
+        self.assertEqual(
+            result["metric_metadata"]["molecule_energy_score"]["feature_map"]["anchor_triangle"], [0, 1, 2]
+        )
+        self.assertEqual(json.loads(result["per_context_rows"][0]["sample_seed_values_json"]), [0, 1])
         self.assertEqual(tuple(cfg.sample.time_grid), ())
         self.assertEqual(result["per_context_rows"][0]["context_schema"], molecule_metrics.MOLECULE_CONTEXT_SCHEMA)
         self.assertAlmostEqual(float(result["molecule_kabsch_rmsd_3d"]), 0.0, places=6)

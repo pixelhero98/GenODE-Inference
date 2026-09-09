@@ -13,18 +13,13 @@ from typing import Any
 
 from genode.canonical_experiment_layout import (
     CANONICAL_CHECKPOINT_STEPS,
-    CONDITIONAL_GENERATION_SCENARIO_KEYS,
     FORECAST_SCENARIO_KEYS,
     MOLECULE_SCENARIO_KEYS,
     SCENARIO_FAMILY_MOLECULE,
 )
-from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY
+from genode.data.otflow_experiment_plan import FORECAST_FAMILY
 from genode.data.otflow_paths import project_root, resolve_project_path
-from genode.deterministic_archive import (
-    ArchiveEntry,
-    canonical_json_bytes,
-    write_deterministic_zip,
-)
+from genode.deterministic_archive import ArchiveEntry, canonical_json_bytes, write_deterministic_zip
 from genode.evaluation.fm_backbone_registry import BACKBONE_NAME_OTFLOW, BACKBONE_NAME_OTFLOW_MOLECULE
 
 PACKAGE_SCHEMA_VERSION = "genode_backbone_package_v1"
@@ -34,7 +29,6 @@ PATH_BASE_FROM_BACKBONE_MANIFEST = "../.."
 MANIFEST_VERSION = "fm_backbone_manifest"
 MOLECULE_FAMILY = SCENARIO_FAMILY_MOLECULE
 TRAIN_BUDGET_STEPS = CANONICAL_CHECKPOINT_STEPS
-
 PATH_FIELDS = ("checkpoint_path", "summary_path", "metadata_path")
 ROOT_FIELDS = (
     "matrix_root",
@@ -43,8 +37,8 @@ ROOT_FIELDS = (
     "molecule_group_root",
     "molecule_backbone_root",
 )
-_EMBEDDED_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+)")
-_EMBEDDED_POSIX_PATH = re.compile(r"(?<![:A-Za-z0-9/])/(?:[^/\s]+/)+[^/\s]+")
+_EMBEDDED_WINDOWS_PATH = re.compile("(?<![A-Za-z0-9])(?:[A-Za-z]:[\\\\/]|\\\\\\\\[^\\\\/\\s]+[\\\\/][^\\\\/\\s]+)")
+_EMBEDDED_POSIX_PATH = re.compile("(?<![:A-Za-z0-9/])/(?:[^/\\s]+/)+[^/\\s]+")
 REDACTED_LOCAL_PATH = "<local_path_redacted>"
 MIN_CHECKPOINT_SIZE_BYTES = 1024
 
@@ -68,18 +62,6 @@ FAMILY_SPECS: Mapping[str, BackbonePackageFamily] = {
         data_roots=tuple(f"paper_datasets/monash/{scenario}" for scenario in FORECAST_SCENARIO_KEYS),
         expected_artifact_count=len(FORECAST_SCENARIO_KEYS) * len(TRAIN_BUDGET_STEPS),
     ),
-    "temporal-generation": BackbonePackageFamily(
-        key="temporal-generation",
-        benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-        scenarios=CONDITIONAL_GENERATION_SCENARIO_KEYS,
-        zip_name="genode_temporal_generation_backbones_datasets.zip",
-        data_roots=(
-            "data/cryptos_binance_spot_monthly_1s_l10.npz",
-            "data/lobster_synthetic",
-            "data/long_term_st_100hz_context_only",
-        ),
-        expected_artifact_count=len(CONDITIONAL_GENERATION_SCENARIO_KEYS) * len(TRAIN_BUDGET_STEPS),
-    ),
     "molecule-coord-generation": BackbonePackageFamily(
         key="molecule-coord-generation",
         benchmark_family=MOLECULE_FAMILY,
@@ -98,7 +80,7 @@ def _as_posix(path: str | Path) -> str:
 
 def _safe_rel(path: str | Path) -> PurePosixPath:
     rel = PurePosixPath(_as_posix(path))
-    if rel.is_absolute() or ".." in rel.parts or not rel.parts or rel.parts[0].endswith(":"):
+    if rel.is_absolute() or ".." in rel.parts or (not rel.parts) or rel.parts[0].endswith(":"):
         raise ValueError(f"Unsafe package-relative path: {path!r}")
     return rel
 
@@ -106,7 +88,7 @@ def _safe_rel(path: str | Path) -> PurePosixPath:
 def _strip_known_prefix(path_text: str) -> str:
     text = _as_posix(path_text)
     parts = PurePosixPath(text).parts
-    if len(parts) >= 2 and parts[0] == "genode" and parts[1] in {"outputs", "data", "paper_datasets"}:
+    if len(parts) >= 2 and parts[0] == "genode" and (parts[1] in {"outputs", "data", "paper_datasets"}):
         return PurePosixPath(*parts[1:]).as_posix()
     for marker in ("outputs", "data", "paper_datasets"):
         if marker in parts:
@@ -250,19 +232,14 @@ def _copy_tree_or_file(source_root: Path, package_root: Path, rel_path: str) -> 
 
 def _file_record(package_root: Path, path: Path, *, role: str) -> dict[str, Any]:
     rel = path.relative_to(package_root).as_posix()
-    return {
-        "path": rel,
-        "role": role,
-        "size_bytes": int(path.stat().st_size),
-        "sha256": _sha256_file(path),
-    }
+    return {"path": rel, "role": role, "size_bytes": int(path.stat().st_size), "sha256": _sha256_file(path)}
 
 
 def _artifact_belongs_to_family(artifact: Mapping[str, Any], spec: BackbonePackageFamily) -> bool:
     return (
         str(artifact.get("benchmark_family")) == str(spec.benchmark_family)
         and str(artifact.get("dataset_key")) in {str(scenario) for scenario in spec.scenarios}
-        and str(artifact.get("status")) == "ready"
+        and (str(artifact.get("status")) == "ready")
     )
 
 
@@ -285,11 +262,7 @@ def _artifact_identity(artifact: Mapping[str, Any]) -> tuple[str, ...]:
             str(artifact.get("variant", "")),
             str(int(artifact.get("train_steps", -1))),
         )
-    return (
-        family,
-        str(artifact.get("dataset_key", "")),
-        str(int(artifact.get("train_steps", -1))),
-    )
+    return (family, str(artifact.get("dataset_key", "")), str(int(artifact.get("train_steps", -1))))
 
 
 def _validate_artifact_grid(artifacts: Sequence[Mapping[str, Any]], spec: BackbonePackageFamily) -> list[str]:
@@ -341,10 +314,7 @@ def _validate_artifact_grid(artifacts: Sequence[Mapping[str, Any]], spec: Backbo
 
 
 def _normalize_artifact_for_package(
-    artifact: Mapping[str, Any],
-    *,
-    source_root: Path,
-    package_root: Path,
+    artifact: Mapping[str, Any], *, source_root: Path, package_root: Path
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     normalized = dict(artifact)
     records: list[dict[str, Any]] = []
@@ -360,14 +330,11 @@ def _normalize_artifact_for_package(
         _copy_json_or_file(src, dst)
         normalized[field] = rel
         records.append(_file_record(package_root, dst, role=f"artifact:{field}"))
-    return normalized, records
+    return (normalized, records)
 
 
 def _normalize_manifest_for_package(
-    source_manifest: Mapping[str, Any],
-    artifacts: Sequence[Mapping[str, Any]],
-    *,
-    spec: BackbonePackageFamily,
+    source_manifest: Mapping[str, Any], artifacts: Sequence[Mapping[str, Any]], *, spec: BackbonePackageFamily
 ) -> dict[str, Any]:
     payload = {key: value for key, value in source_manifest.items() if key != "artifacts"}
     payload.update(
@@ -381,13 +348,6 @@ def _normalize_manifest_for_package(
             "imported_backbone_root": "outputs/imported_backbones/otflow",
             "molecule_group_root": "data/molecule_3d",
             "molecule_backbone_root": "outputs/molecule_3d_backbones",
-            "temporal_artifact_count": int(
-                sum(
-                    1
-                    for row in artifacts
-                    if str(row.get("benchmark_family")) in {FORECAST_FAMILY, CONDITIONAL_GENERATION_FAMILY}
-                )
-            ),
             "molecule_artifact_count": int(
                 sum(1 for row in artifacts if str(row.get("benchmark_family")) == MOLECULE_FAMILY)
             ),
@@ -446,8 +406,7 @@ def package_backbone_family(
         )
     if int(source_manifest.get("artifact_count", -1)) != int(EXPECTED_FULL_BACKBONE_ARTIFACT_COUNT):
         raise ValueError(
-            f"Source backbone manifest has artifact_count={source_manifest.get('artifact_count')}; "
-            f"expected {EXPECTED_FULL_BACKBONE_ARTIFACT_COUNT} canonical artifacts before packaging."
+            f"Source backbone manifest has artifact_count={source_manifest.get('artifact_count')}; expected {EXPECTED_FULL_BACKBONE_ARTIFACT_COUNT} canonical artifacts before packaging."
         )
     artifacts = [row for row in source_manifest.get("artifacts", []) if _artifact_belongs_to_family(row, spec)]
     if not artifacts:
@@ -457,14 +416,11 @@ def package_backbone_family(
         raise ValueError(
             "Source backbone manifest is incomplete for this family:\n- " + "\n- ".join(artifact_grid_errors)
         )
-
     records: list[dict[str, Any]] = []
     normalized_artifacts: list[dict[str, Any]] = []
     for artifact in artifacts:
         normalized, artifact_records = _normalize_artifact_for_package(
-            artifact,
-            source_root=resolved_source,
-            package_root=package_root,
+            artifact, source_root=resolved_source, package_root=package_root
         )
         normalized_artifacts.append(normalized)
         records.extend(artifact_records)
@@ -472,13 +428,11 @@ def package_backbone_family(
     for rel_path in spec.data_roots:
         data_records.extend(_copy_tree_or_file(resolved_source, package_root, rel_path))
     records.extend(data_records)
-
     packaged_manifest = _normalize_manifest_for_package(source_manifest, normalized_artifacts, spec=spec)
     backbone_manifest_path = package_root / PACKAGED_BACKBONE_MANIFEST
     backbone_manifest_path.parent.mkdir(parents=True, exist_ok=True)
     backbone_manifest_path.write_text(json.dumps(packaged_manifest, indent=2, sort_keys=True), encoding="utf-8")
     records.append(_file_record(package_root, backbone_manifest_path, role="backbone_manifest"))
-
     package_manifest = {
         "schema_version": PACKAGE_SCHEMA_VERSION,
         "family": spec.key,
@@ -495,12 +449,11 @@ def package_backbone_family(
     }
     package_manifest_path = package_root / PACKAGE_MANIFEST_NAME
     package_manifest_path.write_text(json.dumps(package_manifest, indent=2, sort_keys=True), encoding="utf-8")
-
     zip_path = resolved_output / spec.zip_name
     zip_manifest_path = zip_path.with_suffix(zip_path.suffix + ".package.json")
     if make_zip:
         resolved_output.mkdir(parents=True, exist_ok=True)
-        if zip_manifest_path.exists() and not overwrite:
+        if zip_manifest_path.exists() and (not overwrite):
             raise FileExistsError(f"Package zip manifest already exists: {zip_manifest_path}")
         roles_by_path = {str(record["path"]): str(record["role"]) for record in records}
         archive_entries = [
@@ -574,7 +527,7 @@ def _validate_file_record(package_root: Path, record: Mapping[str, Any]) -> list
     elif int(path.stat().st_size) != raw_size:
         errors.append(f"Size mismatch for {rel}")
     expected_hash = record.get("sha256")
-    if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
+    if not isinstance(expected_hash, str) or re.fullmatch("[0-9a-f]{64}", expected_hash) is None:
         errors.append(f"Missing or invalid SHA256 for {rel}")
     elif _sha256_file(path) != expected_hash:
         errors.append(f"SHA256 mismatch for {rel}")
@@ -617,24 +570,15 @@ def _validate_artifact_checkpoint_integrity(artifact: Mapping[str, Any], checkpo
     if errors:
         return errors
     if str(artifact.get("backbone_name", "")) == "otflow" and str(artifact.get("benchmark_family", "")) in {
-        FORECAST_FAMILY,
-        CONDITIONAL_GENERATION_FAMILY,
+        FORECAST_FAMILY
     }:
         try:
             from genode.evaluation.otflow_evaluation_support import load_otflow_checkpoint_payload
 
-            load_otflow_checkpoint_payload(
-                checkpoint_path,
-                expected_identity=f"provided backbone artifact {label}",
-            )
+            load_otflow_checkpoint_payload(checkpoint_path, expected_identity=f"provided backbone artifact {label}")
         except Exception as exc:
             detail = (
-                str(exc)
-                .replace(str(checkpoint_path), "checkpoint")
-                .replace(
-                    checkpoint_path.as_posix(),
-                    "checkpoint",
-                )
+                str(exc).replace(str(checkpoint_path), "checkpoint").replace(checkpoint_path.as_posix(), "checkpoint")
             )
             if _contains_local_marker(detail):
                 detail = type(exc).__name__
@@ -643,10 +587,7 @@ def _validate_artifact_checkpoint_integrity(artifact: Mapping[str, Any], checkpo
 
 
 def validate_backbone_package(
-    package_root: str | Path,
-    *,
-    expected_family: str | None = None,
-    require_clean_paths: bool = True,
+    package_root: str | Path, *, expected_family: str | None = None, require_clean_paths: bool = True
 ) -> dict[str, Any]:
     root = Path(package_root).expanduser().resolve()
     errors: list[str] = []
@@ -759,10 +700,7 @@ def _resolve_loaded_artifact_path(path_value: str) -> Path:
 
 
 def validate_provided_backbone_manifest(
-    manifest_path: str | Path,
-    *,
-    scenario_key: str = "",
-    benchmark_family: str = "",
+    manifest_path: str | Path, *, scenario_key: str = "", benchmark_family: str = ""
 ) -> dict[str, Any]:
     resolved_manifest = resolve_project_path(str(manifest_path))
     errors: list[str] = []
@@ -794,20 +732,18 @@ def validate_provided_backbone_manifest(
     )
     if wrong_backbone_names:
         errors.append(
-            f"Provided backbone artifacts for scenario={scenario_key!r}, family={benchmark_family!r} "
-            f"use backbone names {wrong_backbone_names}; expected {expected_backbone_name!r}."
+            f"Provided backbone artifacts for scenario={scenario_key!r}, family={benchmark_family!r} use backbone names {wrong_backbone_names}; expected {expected_backbone_name!r}."
         )
     matching_artifacts = [
         artifact for artifact in candidate_artifacts if str(artifact.get("backbone_name", "")) == expected_backbone_name
     ]
     if not matching_artifacts:
         errors.append(
-            f"No ready provided backbone artifacts match scenario={scenario_key!r}, "
-            f"family={benchmark_family!r}, backbone={expected_backbone_name!r}."
+            f"No ready provided backbone artifacts match scenario={scenario_key!r}, family={benchmark_family!r}, backbone={expected_backbone_name!r}."
         )
     expected_steps = {int(step) for step in TRAIN_BUDGET_STEPS}
     observed_steps = {int(artifact.get("train_steps", -1)) for artifact in matching_artifacts}
-    if matching_artifacts and not expected_steps.issubset(observed_steps):
+    if matching_artifacts and (not expected_steps.issubset(observed_steps)):
         errors.append(
             f"Provided backbone artifacts have train steps {sorted(observed_steps)}; expected at least {sorted(expected_steps)}."
         )
@@ -883,11 +819,6 @@ def apply_backbone_package_to_args(args: argparse.Namespace) -> argparse.Namespa
     args.backbone_manifest = str(package_root / PACKAGED_BACKBONE_MANIFEST)
     args.shared_backbone_root = str(package_root / "outputs" / "shared_backbones" / "otflow_fullhorizon_seed0")
     args.dataset_root = str(package_root / "paper_datasets")
-    args.cryptos_path = str(package_root / "data" / "cryptos_binance_spot_monthly_1s_l10.npz")
-    args.lobster_synthetic_profile_path = str(
-        package_root / "data" / "lobster_synthetic" / "lobster_free_sample_profile_10.json"
-    )
-    args.long_term_st_path = str(package_root / "data" / "long_term_st_100hz_context_only")
     args.molecule_group_root = str(package_root / "data" / "molecule_3d")
     args.molecule_backbone_root = str(package_root / "outputs" / "molecule_3d_backbones")
     return args

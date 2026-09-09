@@ -26,7 +26,7 @@ OTS_VP_LINEAR_BETA_1 = 20.0
 OTS_VP_LINEAR_EPS = 1e-3
 FLOWTS_POWER = 0.03
 
-DEFAULT_LATE_P_VALUES: tuple[Decimal, ...] = tuple(Decimal(value) for value in ("1.5", "2", "4", "8"))
+DEFAULT_LATE_P_VALUES: tuple[Decimal, ...] = tuple(Decimal(value) for value in ("1.5", "2", "3", "4", "8"))
 
 REFERENCE_CLOCK_BASE_KEYS: tuple[str, ...] = (
     "uniform",
@@ -38,6 +38,7 @@ REFERENCE_CLOCK_BASE_KEYS: tuple[str, ...] = (
     "ots_vp_linear_log_sigma",
     "late_p_1p5",
     "late_p_2",
+    "late_p_3",
     "late_p_4",
     "late_p_8",
     "flowts_power_0p03",

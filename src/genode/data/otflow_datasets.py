@@ -1,236 +1,26 @@
-"""otflow_datasets.py
-
-Data + representation utilities for Level-2 (L2) limit order books.
-
-Contains:
-- L2FeatureMap: valid-by-construction encoding/decoding (raw L2 <-> unconstrained params)
-- Standardization helpers
-- WindowedParamSequenceDataset (history->target windows; optional future horizon for rollout)
-- Builders for prepared NPZ, crypto, and LOBSTER-calibrated synthetic sequences
-- Basic raw-space metrics
-- Chronological split builders with train-only normalization (anti-leakage)
-
-Also includes derived microstructure conditioning features (cond) computed from the
-parameter sequence: spread, returns, abs returns, microprice deviation, multi-depth
-imbalance, changes in best sizes, and rolling volatility.
-"""
+"""Generic sequence windows and chronological splits with training-only normalization."""
 
 from __future__ import annotations
 
 import hashlib
-import json
-import math
 import os
 import tempfile
 import urllib.request
-from functools import cache
 
 import numpy as np
 import torch
 
-from genode.data.otflow_paths import default_lobster_synthetic_profile_path, project_data_root
 from genode.models.config import OTFlowConfig
 from genode.path_safety import is_link_or_reparse_point
 
 ArrayLike = np.ndarray | torch.Tensor
-DEFAULT_SYNTHETIC_LENGTH = 2_000_000
-DEFAULT_CRYPTOS_NPZ = str(project_data_root() / "cryptos_binance_spot_monthly_1s_l10.npz")
-LOBIFLOW_REVISION = "2d33cfd6b5e27d2483e2095b22d340813389cd0c"
-LOBIFLOW_CRYPTOS_NPZ_URL = (
-    f"https://huggingface.co/datasets/mpstoryfans/lobiflow/resolve/{LOBIFLOW_REVISION}/"
-    "data/cryptos/cryptos_binance_spot_monthly_1s_l10.npz?download=1"
-)
-LOBIFLOW_CRYPTOS_NPZ_SIZE_BYTES = 1_962_160_259
-LOBIFLOW_CRYPTOS_NPZ_SHA256 = "124fff5767387373323fcb0ec17cc8b8030fe945d037909786127de6d3942e67"
-DEFAULT_LOBSTER_SYNTH_PROFILE = default_lobster_synthetic_profile_path()
-LOBSTER_SYNTHETIC_DATASET_KEY = "lobster_synthetic"
-LOBIFLOW_SYNTHETIC_PROFILE_URL = (
-    f"https://huggingface.co/datasets/mpstoryfans/lobiflow/resolve/{LOBIFLOW_REVISION}/"
-    "data/synthetic/lobster_free_sample_profile_10.json"
-)
-LOBIFLOW_SYNTHETIC_PROFILE_SIZE_BYTES = 7_220
-LOBIFLOW_SYNTHETIC_PROFILE_SHA256 = "f92d3ffa3ef3bdbb67d8d45a337328b032727580a89177f967353dccbb40d50f"
 
 
-# -----------------------------
-# Feature map: valid L2 <-> unconstrained params
-# -----------------------------
-class L2FeatureMap:
-    """Encode/decode between raw L2 snapshots and an unconstrained vector.
-
-    Raw format expected by encode_sequence():
-      ask_p, ask_v, bid_p, bid_v each shape [T, L]
-
-    Parameter vector per snapshot (dim=4L):
-      [delta_mid, log_spread,
-       log_ask_gaps(2..L), log_bid_gaps(2..L),
-       log_ask_sizes(1..L), log_bid_sizes(1..L)]
-    """
-
-    def __init__(self, levels: int = 10, eps: float = 1e-8):
-        if isinstance(levels, bool) or not isinstance(levels, (int, np.integer)) or int(levels) <= 0:
-            raise ValueError(f"levels must be a positive integer, got {levels!r}.")
-        if isinstance(eps, bool):
-            raise ValueError(f"eps must be finite and positive, got {eps!r}.")
-        try:
-            eps_value = float(eps)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"eps must be finite and positive, got {eps!r}.") from exc
-        if not math.isfinite(eps_value) or eps_value <= 0.0:
-            raise ValueError(f"eps must be finite and positive, got {eps!r}.")
-        self.L = int(levels)
-        self.eps = eps_value
-
-    @staticmethod
-    def _finite_numeric_matrix(value: object, *, label: str) -> np.ndarray:
-        array = np.asarray(value)
-        if array.ndim != 2:
-            raise ValueError(f"{label} must be a rank-2 array, got shape {array.shape}.")
-        if array.shape[0] == 0:
-            raise ValueError(f"{label} must contain at least one row.")
-        if not np.issubdtype(array.dtype, np.number) or np.issubdtype(array.dtype, np.complexfloating):
-            raise ValueError(f"{label} must have a real numeric dtype, got {array.dtype}.")
-        if not bool(np.all(np.isfinite(array))):
-            raise ValueError(f"{label} must contain only finite values.")
-        return array.astype(np.float64, copy=False)
-
-    def encode_sequence(
-        self,
-        ask_p: np.ndarray,
-        ask_v: np.ndarray,
-        bid_p: np.ndarray,
-        bid_v: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        matrices = {
-            "ask_p": self._finite_numeric_matrix(ask_p, label="ask_p"),
-            "ask_v": self._finite_numeric_matrix(ask_v, label="ask_v"),
-            "bid_p": self._finite_numeric_matrix(bid_p, label="bid_p"),
-            "bid_v": self._finite_numeric_matrix(bid_v, label="bid_v"),
-        }
-        ask_p = matrices["ask_p"]
-        expected_shape = ask_p.shape
-        for label, matrix in matrices.items():
-            if matrix.shape != expected_shape:
-                raise ValueError(f"{label} shape {matrix.shape} does not match the required L2 shape {expected_shape}.")
-        T, levels = expected_shape
-        if levels != self.L:
-            raise ValueError(f"L2 input has {levels} levels; expected {self.L}.")
-        ask_v = matrices["ask_v"]
-        bid_p = matrices["bid_p"]
-        bid_v = matrices["bid_v"]
-
-        mid = 0.5 * (ask_p[:, 0] + bid_p[:, 0])
-        spread = np.maximum(ask_p[:, 0] - bid_p[:, 0], self.eps)
-
-        # delta mid
-        delta_mid = np.zeros(T, dtype=np.float32)
-        delta_mid[1:] = (mid[1:] - mid[:-1]).astype(np.float32)
-
-        # gaps (positive)
-        ask_gaps = np.maximum(np.diff(ask_p, axis=1), self.eps)
-        # reverse-then-diff to ensure positive ladder gaps for bid side, then reverse back
-        bid_gaps = np.maximum(np.diff(bid_p[:, ::-1], axis=1)[:, ::-1], self.eps)
-
-        # params
-        log_spread = np.log(spread + self.eps).astype(np.float32)
-        log_ask_gaps = np.log(ask_gaps + self.eps).astype(np.float32)  # [T, L-1]
-        log_bid_gaps = np.log(bid_gaps + self.eps).astype(np.float32)  # [T, L-1]
-        log_ask_v = np.log(np.maximum(ask_v, self.eps)).astype(np.float32)  # [T, L]
-        log_bid_v = np.log(np.maximum(bid_v, self.eps)).astype(np.float32)  # [T, L]
-
-        params = np.concatenate(
-            [
-                delta_mid[:, None],
-                log_spread[:, None],
-                log_ask_gaps,
-                log_bid_gaps,
-                log_ask_v,
-                log_bid_v,
-            ],
-            axis=1,
-        )
-        with np.errstate(over="ignore", invalid="ignore"):
-            params_float32 = params.astype(np.float32)
-            mid_float32 = mid.astype(np.float32)
-        if not bool(np.all(np.isfinite(params_float32))) or not bool(np.all(np.isfinite(mid_float32))):
-            raise ValueError("Encoded L2 parameters exceed the finite float32 representation.")
-
-        return params_float32, mid_float32
-
-    def decode_sequence(
-        self, params: np.ndarray, init_mid: float
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Decode params to raw L2 arrays using the mid immediately before the window.
-
-        Notes
-        -----
-        `delta_mid[t]` is interpreted as `mid[t] - mid[t-1]`. Therefore, `init_mid`
-        should be the previous mid (at t-1 for the first decoded row).
-        """
-        params = self._finite_numeric_matrix(params, label="params")
-        T, D = params.shape
-        L = self.L
-        expected_dim = 4 * L
-        if expected_dim != D:
-            raise ValueError(f"params has width {D}; expected exactly 4 * levels = {expected_dim}.")
-        if isinstance(init_mid, bool):
-            raise ValueError(f"init_mid must be finite, got {init_mid!r}.")
-        try:
-            initial_mid = float(init_mid)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"init_mid must be finite, got {init_mid!r}.") from exc
-        if not math.isfinite(initial_mid):
-            raise ValueError(f"init_mid must be finite, got {init_mid!r}.")
-
-        delta_mid = params[:, 0]
-        log_spread = params[:, 1]
-        log_ask_gaps = params[:, 2 : 2 + (L - 1)]
-        log_bid_gaps = params[:, 2 + (L - 1) : 2 + 2 * (L - 1)]
-        log_ask_v = params[:, 2 + 2 * (L - 1) : 2 + 2 * (L - 1) + L]
-        log_bid_v = params[:, 2 + 2 * (L - 1) + L :]
-
-        mid = np.zeros(T, dtype=np.float64)
-        prev_mid = initial_mid
-        for t in range(T):
-            prev_mid = prev_mid + float(delta_mid[t])
-            mid[t] = prev_mid
-
-        with np.errstate(over="ignore", invalid="ignore"):
-            spread = np.exp(log_spread)
-        ask1 = mid + 0.5 * spread
-        bid1 = mid - 0.5 * spread
-
-        ask_p = np.zeros((T, L), dtype=np.float64)
-        bid_p = np.zeros((T, L), dtype=np.float64)
-        ask_p[:, 0] = ask1
-        bid_p[:, 0] = bid1
-
-        with np.errstate(over="ignore", invalid="ignore"):
-            ask_gaps = np.exp(log_ask_gaps)
-            bid_gaps = np.exp(log_bid_gaps)
-        for i in range(1, L):
-            ask_p[:, i] = ask_p[:, i - 1] + ask_gaps[:, i - 1]
-            bid_p[:, i] = bid_p[:, i - 1] - bid_gaps[:, i - 1]
-
-        with np.errstate(over="ignore", invalid="ignore"):
-            ask_p = ask_p.astype(np.float32)
-            bid_p = bid_p.astype(np.float32)
-            ask_v = np.exp(log_ask_v).astype(np.float32)
-            bid_v = np.exp(log_bid_v).astype(np.float32)
-        decoded = (ask_p, ask_v, bid_p, bid_v)
-        if any(not bool(np.all(np.isfinite(value))) for value in decoded):
-            raise ValueError("Decoded L2 values exceed the finite float32 representation.")
-        return ask_p, ask_v, bid_p, bid_v
-
-
-# -----------------------------
-# Standardization helpers
-# -----------------------------
 def fit_standardizer(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Fit mean/std on x [T,D] only."""
     mu = x.mean(axis=0).astype(np.float32)
-    sig = (x.std(axis=0) + 1e-6).astype(np.float32)
-    return mu, sig
+    sig = (x.std(axis=0) + 1e-06).astype(np.float32)
+    return (mu, sig)
 
 
 def apply_standardizer(x: np.ndarray, mu: np.ndarray, sig: np.ndarray) -> np.ndarray:
@@ -239,12 +29,12 @@ def apply_standardizer(x: np.ndarray, mu: np.ndarray, sig: np.ndarray) -> np.nda
 
 def standardize_params(params: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     mu, sig = fit_standardizer(params)
-    return apply_standardizer(params, mu, sig), mu, sig
+    return (apply_standardizer(params, mu, sig), mu, sig)
 
 
 def standardize_cond(cond: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     mu, sig = fit_standardizer(cond)
-    return apply_standardizer(cond, mu, sig), mu, sig
+    return (apply_standardizer(cond, mu, sig), mu, sig)
 
 
 def _future_horizon_from_cfg(cfg: OTFlowConfig) -> int:
@@ -286,27 +76,13 @@ def _set_model_cond_dim(cfg: OTFlowConfig, cond_dim: int) -> None:
     cfg.model.cond_dim = resolved
 
 
-def _timestamps_from_loaded_npz(data: dict[str, np.ndarray]) -> np.ndarray | None:
-    for key in ("local_timestamps", "timestamps", "ts_event", "ts_recv", "ts"):
-        if key in data:
-            return np.asarray(data[key], dtype=np.int64)
-    return None
-
-
-def _fit_time_gap_scale(
-    timestamps: np.ndarray | None,
-    *,
-    train_end: int,
-    segment_ends: np.ndarray | None,
-) -> float:
+def _fit_time_gap_scale(timestamps: np.ndarray | None, *, train_end: int, segment_ends: np.ndarray | None) -> float:
     if timestamps is None or int(train_end) <= 1:
         return 1.0
-
     timestamps = np.asarray(timestamps, dtype=np.int64)
     train_end = min(int(train_end), int(len(timestamps)))
     if train_end <= 1:
         return 1.0
-
     chunks = []
     if segment_ends is None:
         if train_end > 1:
@@ -321,7 +97,6 @@ def _fit_time_gap_scale(
                 chunks.append(np.diff(timestamps[left:right]))
             if int(seg_end) >= int(train_end):
                 break
-
     if not chunks:
         return 1.0
     gaps = np.concatenate(chunks).astype(np.float64)
@@ -332,53 +107,40 @@ def _fit_time_gap_scale(
 
 
 def _build_time_gap_features(
-    timestamps: np.ndarray | None,
-    *,
-    gap_scale: float,
-    segment_ends: np.ndarray | None,
+    timestamps: np.ndarray | None, *, gap_scale: float, segment_ends: np.ndarray | None
 ) -> np.ndarray | None:
     if timestamps is None:
         return None
-
     timestamps = np.asarray(timestamps, dtype=np.int64)
     if timestamps.ndim != 1:
         raise ValueError(f"Expected 1D timestamps, got shape={timestamps.shape}.")
-
     gaps = np.zeros(len(timestamps), dtype=np.float64)
     if len(timestamps) > 1:
         gaps[1:] = np.diff(timestamps).astype(np.float64)
-
     if segment_ends is not None:
         seg_starts = _segment_starts_from_ends(np.asarray(segment_ends, dtype=np.int64))
         gaps[seg_starts] = 0.0
     else:
         gaps[0] = 0.0
-
     safe_scale = max(float(gap_scale), 1.0)
-    ratio = np.clip(gaps / safe_scale, 1e-4, 1e4)
+    ratio = np.clip(gaps / safe_scale, 0.0001, 10000.0)
     gap_feature = np.log(ratio).astype(np.float32)
     gap_feature[gaps <= 0.0] = 0.0
     return gap_feature[:, None]
 
 
 def _build_elapsed_time_features(
-    timestamps: np.ndarray | None,
-    *,
-    gap_scale: float,
-    segment_ends: np.ndarray | None,
+    timestamps: np.ndarray | None, *, gap_scale: float, segment_ends: np.ndarray | None
 ) -> np.ndarray | None:
     if timestamps is None:
         return None
-
     timestamps = np.asarray(timestamps, dtype=np.int64)
     if timestamps.ndim != 1:
         raise ValueError(f"Expected 1D timestamps, got shape={timestamps.shape}.")
-
     gaps = np.zeros(len(timestamps), dtype=np.float64)
     if len(timestamps) > 1:
         gaps[1:] = np.diff(timestamps).astype(np.float64)
     gaps = np.clip(gaps, 0.0, None)
-
     safe_scale = max(float(gap_scale), 1.0)
     elapsed = np.zeros(len(timestamps), dtype=np.float64)
     if segment_ends is None:
@@ -398,100 +160,19 @@ def _build_elapsed_time_features(
 
 
 def _build_time_features(
-    timestamps: np.ndarray | None,
-    *,
-    gap_scale: float,
-    segment_ends: np.ndarray | None,
-    include_elapsed: bool = True,
+    timestamps: np.ndarray | None, *, gap_scale: float, segment_ends: np.ndarray | None, include_elapsed: bool = True
 ) -> np.ndarray | None:
-    gap_feature = _build_time_gap_features(
-        timestamps,
-        gap_scale=float(gap_scale),
-        segment_ends=segment_ends,
-    )
+    gap_feature = _build_time_gap_features(timestamps, gap_scale=float(gap_scale), segment_ends=segment_ends)
     if gap_feature is None:
         return None
     if not bool(include_elapsed):
         return gap_feature.astype(np.float32)
-    elapsed_feature = _build_elapsed_time_features(
-        timestamps,
-        gap_scale=float(gap_scale),
-        segment_ends=segment_ends,
-    )
+    elapsed_feature = _build_elapsed_time_features(timestamps, gap_scale=float(gap_scale), segment_ends=segment_ends)
     if elapsed_feature is None:
         return None
     return np.concatenate([gap_feature, elapsed_feature], axis=1).astype(np.float32)
 
 
-# -----------------------------
-# Derived conditioning features (from params + mids)
-# -----------------------------
-def build_cond_features(params_raw: np.ndarray, mids: np.ndarray, cfg: OTFlowConfig) -> np.ndarray:
-    """Compute per-timestep conditioning features from raw params."""
-    L = cfg.levels
-    eps = cfg.eps
-    T = params_raw.shape[0]
-
-    log_spread = params_raw[:, 1]
-    spread = np.exp(log_spread)
-
-    # returns from mids
-    ret = np.zeros(T, dtype=np.float32)
-    ret[1:] = (mids[1:] - mids[:-1]) / (np.abs(mids[:-1]) + 1.0)
-    absret = np.abs(ret)
-
-    # volumes
-    off = 2 + 2 * (L - 1)
-    log_ask_v = params_raw[:, off : off + L]
-    log_bid_v = params_raw[:, off + L : off + 2 * L]
-    ask_v = np.exp(log_ask_v)
-    bid_v = np.exp(log_bid_v)
-
-    # best prices
-    ask1 = mids + 0.5 * spread
-    bid1 = mids - 0.5 * spread
-
-    # microprice deviation (normalized by spread)
-    micro = (ask1 * bid_v[:, 0] + bid1 * ask_v[:, 0]) / (ask_v[:, 0] + bid_v[:, 0] + eps)
-    micro_dev = (micro - mids) / (spread + eps)
-
-    # multi-depth imbalance + depth sums
-    feats = [
-        log_spread.astype(np.float32)[:, None],
-        ret[:, None],
-        absret[:, None],
-        micro_dev.astype(np.float32)[:, None],
-    ]
-    for k in cfg.cond_depths:
-        kk = int(min(L, max(1, k)))
-        b = bid_v[:, :kk].sum(axis=1)
-        a = ask_v[:, :kk].sum(axis=1)
-        imb = (b - a) / (b + a + eps)
-        feats.append(imb.astype(np.float32)[:, None])
-
-    # delta best sizes (relative)
-    d_bid1 = np.zeros(T, dtype=np.float32)
-    d_ask1 = np.zeros(T, dtype=np.float32)
-    d_bid1[1:] = (bid_v[1:, 0] - bid_v[:-1, 0]) / (bid_v[:-1, 0] + eps)
-    d_ask1[1:] = (ask_v[1:, 0] - ask_v[:-1, 0]) / (ask_v[:-1, 0] + eps)
-    feats.append(d_bid1[:, None])
-    feats.append(d_ask1[:, None])
-
-    # rolling volatility of returns
-    w = int(max(5, cfg.cond_vol_window))
-    vol = np.zeros(T, dtype=np.float32)
-    for t in range(T):
-        s = max(0, t - w + 1)
-        vol[t] = float(np.std(ret[s : t + 1]))
-    feats.append(vol[:, None])
-
-    cond = np.concatenate(feats, axis=1).astype(np.float32)
-    return cond
-
-
-# -----------------------------
-# Dataset
-# -----------------------------
 class WindowedParamSequenceDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -514,7 +195,7 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
         valid_start_mask: np.ndarray | None = None,
         dataset_kind: str | None = None,
         dataset_metadata: dict[str, object] | None = None,
-        global_offset: int = 0,  # Maps a split-local timestep to the source timeline.
+        global_offset: int = 0,
     ):
         super().__init__()
         self.params = params.astype(np.float32)
@@ -563,7 +244,6 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
             if not starts:
                 return np.empty(0, dtype=np.int64)
             starts = np.concatenate(starts)
-
         if self.valid_start_mask is not None:
             if len(self.valid_start_mask) != len(self.params):
                 raise ValueError("valid_start_mask length mismatch")
@@ -606,305 +286,35 @@ class WindowedParamSequenceDataset(torch.utils.data.Dataset):
         return torch.from_numpy(self.time_gap_features[int(t0) : int(t0) + int(horizon)].astype(np.float32, copy=True))
 
     def __getitem__(self, idx: int):
-        t = int(self.start_indices[idx])  # local index inside this split dataset
+        t = int(self.start_indices[idx])
         t_global = self.global_offset + t
-
         hist = self.params[t - self.H : t]
         hist_time = self._slice_time_features(t - self.H, t)
         if hist_time is not None:
-            hist = np.concatenate(
-                [hist, hist_time],
-                axis=1,
-            ).astype(np.float32, copy=False)
+            hist = np.concatenate([hist, hist_time], axis=1).astype(np.float32, copy=False)
         tgt = self.params[t]
-
         meta = {
-            "t": int(t),  # local
+            "t": int(t),
             "t_global": int(t_global),
             "mid_prev": float(self.mids[t - 1]),
             "init_mid_for_window": float(self.mids[t - self.H]),
         }
-
         fut_t = None
         if self.future_horizon > 0:
             fut = self.params[t + 1 : t + 1 + self.future_horizon]
             fut_t = torch.from_numpy(fut)
-
         hist_t = torch.from_numpy(hist)
         tgt_t = torch.from_numpy(tgt)
-
         if self.cond is None:
             if fut_t is None:
-                return hist_t, tgt_t, meta
-            return hist_t, tgt_t, fut_t, meta
-
+                return (hist_t, tgt_t, meta)
+            return (hist_t, tgt_t, fut_t, meta)
         c = torch.from_numpy(self.cond[t])
         if fut_t is None:
-            return hist_t, tgt_t, c, meta
-        return hist_t, tgt_t, fut_t, c, meta
+            return (hist_t, tgt_t, c, meta)
+        return (hist_t, tgt_t, fut_t, c, meta)
 
 
-# -----------------------------
-# Loaders / builders
-# -----------------------------
-def load_l2_npz(path: str) -> dict[str, np.ndarray]:
-    """Load a standardized L2 snapshot NPZ prepared by `lob_prepare_dataset.py`.
-
-    Required keys:
-      - ask_p, ask_v, bid_p, bid_v : [T,L] float arrays
-
-    Optional keys:
-      - mids : [T] float32
-      - params_raw : [T,4L] float32
-      - ts : [T] timestamps
-    """
-    with np.load(path, allow_pickle=False) as data:
-        out = {k: data[k] for k in data.files}
-    for k in ("ask_p", "ask_v", "bid_p", "bid_v", "mids", "params_raw"):
-        if k in out:
-            out[k] = out[k].astype(np.float32)
-    return out
-
-
-def default_lobster_synth_profile_path() -> str:
-    return DEFAULT_LOBSTER_SYNTH_PROFILE
-
-
-def validate_lobster_synth_profile(profile: dict[str, object], *, source: str = "") -> dict[str, object]:
-    profiles = profile.get("profiles", [])
-    if not isinstance(profiles, list) or not profiles:
-        raise ValueError(f"LOBSTER synthetic profile at {source or '<memory>'} contains no regimes.")
-    required = (
-        "rows",
-        "tick_size",
-        "log_spread_mean",
-        "log_spread_std",
-        "spread_phi",
-        "imb_mean",
-        "imb_std",
-        "imb_phi",
-        "ret_scale_ticks",
-        "jump_prob_5ticks",
-        "jump_prob_2ticks",
-        "seasonality_abs_ret",
-        "log_ask_gap_mean",
-        "log_ask_gap_std",
-        "log_bid_gap_mean",
-        "log_bid_gap_std",
-        "log_ask_vol_mean",
-        "log_ask_vol_std",
-        "log_bid_vol_mean",
-        "log_bid_vol_std",
-    )
-    for idx, regime in enumerate(profiles):
-        if not isinstance(regime, dict):
-            raise ValueError(f"LOBSTER profile regime {idx} must be an object.")
-        missing = [key for key in required if key not in regime]
-        if missing:
-            raise ValueError(f"LOBSTER profile regime {idx} is missing {missing}.")
-        if float(regime["tick_size"]) <= 0.0:
-            raise ValueError(f"LOBSTER profile regime {idx} has non-positive tick_size.")
-    return profile
-
-
-@cache
-def load_lobster_synth_profile(path: str | None = None) -> dict[str, object]:
-    resolved = path or default_lobster_synth_profile_path()
-    with open(resolved, encoding="utf-8") as f:
-        profile = json.load(f)
-    return validate_lobster_synth_profile(profile, source=str(resolved))
-
-
-def download_lobster_synthetic_profile(
-    path: str | os.PathLike[str] | None = None,
-    *,
-    url: str = LOBIFLOW_SYNTHETIC_PROFILE_URL,
-    force: bool = False,
-) -> dict[str, object]:
-    resolved = os.fspath(path or default_lobster_synth_profile_path())
-    if force or not _verified_file(
-        resolved,
-        expected_size=LOBIFLOW_SYNTHETIC_PROFILE_SIZE_BYTES,
-        expected_sha256=LOBIFLOW_SYNTHETIC_PROFILE_SHA256,
-    ):
-        _download_url_to_path(
-            str(url),
-            resolved,
-            expected_size=LOBIFLOW_SYNTHETIC_PROFILE_SIZE_BYTES,
-            expected_sha256=LOBIFLOW_SYNTHETIC_PROFILE_SHA256,
-        )
-        load_lobster_synth_profile.cache_clear()
-    return load_lobster_synth_profile(resolved)
-
-
-def _generate_synthetic_l2(
-    levels: int,
-    length: int,
-    seed: int,
-    eps: float = 1e-8,
-    *,
-    profile_path: str | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Generate LOBSTER-calibrated synthetic L2 data with persistent liquidity regimes."""
-    rng = np.random.default_rng(seed)
-    L = levels
-    T = int(length)
-    profile = load_lobster_synth_profile(profile_path)
-    regimes = [
-        regime
-        for regime in profile["profiles"]
-        if len(regime["log_ask_vol_mean"]) >= L and len(regime["log_bid_vol_mean"]) >= L
-    ]
-    if not regimes:
-        raise ValueError(f"No LOBSTER regimes support levels={L}.")
-
-    weights = np.asarray([math.sqrt(float(regime.get("rows", 1.0))) for regime in regimes], dtype=np.float64)
-    weights = weights / weights.sum()
-    tick_size = float(np.median([float(regime["tick_size"]) for regime in regimes]))
-    level_weights = np.exp(-0.35 * np.arange(L, dtype=np.float64))
-
-    ask_p = np.zeros((T, L), dtype=np.float32)
-    bid_p = np.zeros((T, L), dtype=np.float32)
-    ask_v = np.zeros((T, L), dtype=np.float32)
-    bid_v = np.zeros((T, L), dtype=np.float32)
-    mid_ticks = np.zeros(T, dtype=np.float64)
-
-    current_regime = None
-    spread_log = 0.0
-    imbalance = 0.0
-    ask_gap_state = np.zeros(max(0, L - 1), dtype=np.float64)
-    bid_gap_state = np.zeros(max(0, L - 1), dtype=np.float64)
-    ask_log_v_state = np.zeros(L, dtype=np.float64)
-    bid_log_v_state = np.zeros(L, dtype=np.float64)
-    segment_remaining = 0
-
-    def _sample_segment_length(remaining: int) -> int:
-        target = max(128.0, min(4096.0, float(max(1, T)) / 12.0))
-        seg_len = int(rng.lognormal(mean=math.log(target), sigma=0.5))
-        return min(remaining, max(128, seg_len))
-
-    def _set_regime(regime: dict[str, object], *, reset: bool) -> None:
-        nonlocal current_regime, spread_log, imbalance, ask_gap_state, bid_gap_state, ask_log_v_state, bid_log_v_state
-        current_regime = regime
-
-        ask_gap_mu = np.asarray(regime["log_ask_gap_mean"][: max(0, L - 1)], dtype=np.float64)
-        bid_gap_mu = np.asarray(regime["log_bid_gap_mean"][: max(0, L - 1)], dtype=np.float64)
-        ask_log_v_mu = np.asarray(regime["log_ask_vol_mean"][:L], dtype=np.float64)
-        bid_log_v_mu = np.asarray(regime["log_bid_vol_mean"][:L], dtype=np.float64)
-
-        if reset:
-            spread_log = float(regime["log_spread_mean"])
-            imbalance = float(regime["imb_mean"])
-            ask_gap_state = ask_gap_mu.copy()
-            bid_gap_state = bid_gap_mu.copy()
-            ask_log_v_state = ask_log_v_mu.copy()
-            bid_log_v_state = bid_log_v_mu.copy()
-            return
-
-        spread_log = 0.5 * spread_log + 0.5 * float(regime["log_spread_mean"])
-        imbalance = 0.5 * imbalance + 0.5 * float(regime["imb_mean"])
-        ask_gap_state = 0.5 * ask_gap_state + 0.5 * ask_gap_mu
-        bid_gap_state = 0.5 * bid_gap_state + 0.5 * bid_gap_mu
-        ask_log_v_state = 0.5 * ask_log_v_state + 0.5 * ask_log_v_mu
-        bid_log_v_state = 0.5 * bid_log_v_state + 0.5 * bid_log_v_mu
-
-    for t in range(T):
-        if segment_remaining <= 0:
-            next_regime = regimes[int(rng.choice(len(regimes), p=weights))]
-            _set_regime(next_regime, reset=(t == 0))
-            segment_remaining = _sample_segment_length(T - t)
-        segment_remaining -= 1
-
-        if current_regime is None:
-            raise RuntimeError("Synthetic profile generation failed to initialize a market regime.")
-        seasonality = current_regime["seasonality_abs_ret"]
-        season_idx = min(len(seasonality) - 1, int(len(seasonality) * t / max(1, T)))
-        season_scale = max(0.05, float(seasonality[season_idx]))
-
-        spread_phi = float(np.clip(current_regime["spread_phi"], 0.7, 0.995))
-        spread_std = max(0.05, float(current_regime["log_spread_std"]))
-        spread_noise = spread_std * math.sqrt(max(1.0 - spread_phi**2, 1e-4))
-        spread_log = (
-            float(current_regime["log_spread_mean"])
-            + spread_phi * (spread_log - float(current_regime["log_spread_mean"]))
-            + spread_noise * rng.normal()
-        )
-        spread_ticks = max(1.0, round(math.exp(spread_log)))
-
-        imb_phi = float(np.clip(current_regime["imb_phi"], 0.5, 0.995))
-        imb_std = max(0.02, float(current_regime["imb_std"]))
-        imb_noise = imb_std * math.sqrt(max(1.0 - imb_phi**2, 1e-4))
-        imbalance = (
-            float(current_regime["imb_mean"])
-            + imb_phi * (imbalance - float(current_regime["imb_mean"]))
-            + imb_noise * rng.normal()
-        )
-        imbalance = float(np.clip(imbalance, -0.98, 0.98))
-
-        ret_scale = max(0.02, float(current_regime["ret_scale_ticks"])) * math.sqrt(season_scale)
-        shock = rng.standard_t(df=5) / math.sqrt(5.0 / 3.0)
-        ret_ticks = 0.12 * imbalance + 0.45 * ret_scale * shock
-        if rng.random() < float(current_regime["jump_prob_5ticks"]):
-            ret_ticks += float(rng.choice((-1.0, 1.0)) * (5.0 + abs(rng.normal(scale=1.5))))
-        elif rng.random() < float(current_regime["jump_prob_2ticks"]):
-            ret_ticks += float(rng.choice((-1.0, 1.0)) * (2.0 + abs(rng.normal(scale=0.75))))
-        if t == 0:
-            mid_ticks[t] = round(100.0 / tick_size)
-        else:
-            mid_ticks[t] = mid_ticks[t - 1] + ret_ticks
-
-        if L > 1:
-            gap_rho = 0.9
-            ask_gap_mu = np.asarray(current_regime["log_ask_gap_mean"][: L - 1], dtype=np.float64)
-            ask_gap_std = np.asarray(current_regime["log_ask_gap_std"][: L - 1], dtype=np.float64)
-            bid_gap_mu = np.asarray(current_regime["log_bid_gap_mean"][: L - 1], dtype=np.float64)
-            bid_gap_std = np.asarray(current_regime["log_bid_gap_std"][: L - 1], dtype=np.float64)
-            gap_scale = math.sqrt(max(1.0 - gap_rho**2, 1e-4))
-            ask_gap_state = (
-                ask_gap_mu + gap_rho * (ask_gap_state - ask_gap_mu) + gap_scale * ask_gap_std * rng.normal(size=L - 1)
-            )
-            bid_gap_state = (
-                bid_gap_mu + gap_rho * (bid_gap_state - bid_gap_mu) + gap_scale * bid_gap_std * rng.normal(size=L - 1)
-            )
-            ask_gap_ticks = np.maximum(1.0, np.round(np.exp(ask_gap_state)))
-            bid_gap_ticks = np.maximum(1.0, np.round(np.exp(bid_gap_state)))
-        else:
-            ask_gap_ticks = np.empty(0, dtype=np.float64)
-            bid_gap_ticks = np.empty(0, dtype=np.float64)
-
-        vol_rho = 0.97
-        ask_log_v_mu = np.asarray(current_regime["log_ask_vol_mean"][:L], dtype=np.float64)
-        ask_log_v_std = np.asarray(current_regime["log_ask_vol_std"][:L], dtype=np.float64)
-        bid_log_v_mu = np.asarray(current_regime["log_bid_vol_mean"][:L], dtype=np.float64)
-        bid_log_v_std = np.asarray(current_regime["log_bid_vol_std"][:L], dtype=np.float64)
-        vol_scale = math.sqrt(max(1.0 - vol_rho**2, 1e-4))
-        ask_log_v_state = (
-            ask_log_v_mu + vol_rho * (ask_log_v_state - ask_log_v_mu) + vol_scale * ask_log_v_std * rng.normal(size=L)
-        )
-        bid_log_v_state = (
-            bid_log_v_mu + vol_rho * (bid_log_v_state - bid_log_v_mu) + vol_scale * bid_log_v_std * rng.normal(size=L)
-        )
-
-        imbalance_tilt = 0.35 * imbalance * level_weights
-        ask_v_row = np.exp(np.clip(ask_log_v_state - imbalance_tilt, math.log(eps), 16.0))
-        bid_v_row = np.exp(np.clip(bid_log_v_state + imbalance_tilt, math.log(eps), 16.0))
-
-        mid_price = mid_ticks[t] * tick_size
-        ask_p[t, 0] = mid_price + 0.5 * spread_ticks * tick_size
-        bid_p[t, 0] = mid_price - 0.5 * spread_ticks * tick_size
-        for i in range(1, L):
-            ask_p[t, i] = ask_p[t, i - 1] + ask_gap_ticks[i - 1] * tick_size
-            bid_p[t, i] = bid_p[t, i - 1] - bid_gap_ticks[i - 1] * tick_size
-
-        ask_v[t] = ask_v_row.astype(np.float32)
-        bid_v[t] = bid_v_row.astype(np.float32)
-
-    return ask_p, ask_v.astype(np.float32), bid_p, bid_v.astype(np.float32)
-
-
-# -----------------------------
-# Split-aware builders
-# -----------------------------
 def _resolve_split_bounds(
     T: int,
     train_frac: float = 0.7,
@@ -919,31 +329,22 @@ def _resolve_split_bounds(
     """
     if test_frac is None:
         test_frac = 1.0 - train_frac - val_frac
-
     if train_end is None or val_end is None:
         if train_frac <= 0 or val_frac < 0 or test_frac < 0:
             raise ValueError("Invalid split fractions.")
         s = train_frac + val_frac + test_frac
-        if abs(s - 1.0) > 1e-6:
+        if abs(s - 1.0) > 1e-06:
             raise ValueError(f"Split fractions must sum to 1.0, got {s:.6f}")
         train_end = int(round(T * train_frac))
         val_end = int(round(T * (train_frac + val_frac)))
-
     train_end = int(train_end)
     val_end = int(val_end)
-
-    if not (0 < train_end < val_end <= T):
+    if not 0 < train_end < val_end <= T:
         raise ValueError(f"Invalid split bounds: train_end={train_end}, val_end={val_end}, T={T}")
+    return (train_end, val_end)
 
-    return train_end, val_end
 
-
-def _slice_segment_with_history(
-    arr: np.ndarray,
-    start_t: int,
-    end_t: int,
-    history_len: int,
-) -> tuple[np.ndarray, int]:
+def _slice_segment_with_history(arr: np.ndarray, start_t: int, end_t: int, history_len: int) -> tuple[np.ndarray, int]:
     """Slice arr so targets in [start_t, end_t) are valid with history.
 
     Returns
@@ -955,7 +356,7 @@ def _slice_segment_with_history(
     """
     left = max(0, int(start_t) - int(history_len))
     arr_seg = arr[left : int(end_t)]
-    return arr_seg, left
+    return (arr_seg, left)
 
 
 def _segment_starts_from_ends(segment_ends: np.ndarray) -> np.ndarray:
@@ -977,13 +378,11 @@ def _resolve_segment_split_bounds(
         raise ValueError("Need at least 3 segments for train/val/test splits.")
     if int(segment_ends[-1]) != int(T):
         raise ValueError("segment_ends must terminate at T.")
-
     if test_frac is None:
         test_frac = 1.0 - train_frac - val_frac
-
     if train_end is None or val_end is None:
         s = train_frac + val_frac + test_frac
-        if abs(s - 1.0) > 1e-6:
+        if abs(s - 1.0) > 1e-06:
             raise ValueError(f"Split fractions must sum to 1.0, got {s:.6f}")
         n_segments = len(segment_ends)
         train_seg = max(1, int(round(n_segments * train_frac)))
@@ -998,10 +397,9 @@ def _resolve_segment_split_bounds(
         val_idx = min(max(val_idx, train_idx + 1), len(segment_ends) - 1)
         train_end = int(segment_ends[train_idx])
         val_end = int(segment_ends[val_idx])
-
-    if not (0 < train_end < val_end <= T):
+    if not 0 < train_end < val_end <= T:
         raise ValueError(f"Invalid segment split bounds: train_end={train_end}, val_end={val_end}, T={T}")
-    return int(train_end), int(val_end)
+    return (int(train_end), int(val_end))
 
 
 def _make_windowed_dataset_from_arrays(
@@ -1027,7 +425,6 @@ def _make_windowed_dataset_from_arrays(
 ) -> WindowedParamSequenceDataset:
     """Construct a split dataset [start_t,end_t) with left history buffer and fixed normalization stats."""
     H = int(cfg.history_len)
-
     local_segment_ends = None
     valid_start_mask_seg = None
     if segment_ends_full is None:
@@ -1052,13 +449,10 @@ def _make_windowed_dataset_from_arrays(
         local_segment_ends = (segment_ends_full[mask] - left).astype(np.int64)
         if valid_start_mask_full is not None:
             valid_start_mask_seg = np.asarray(valid_start_mask_full[left:right], dtype=bool)
-
-    # Apply pre-fit stats (or keep raw if disabled)
     if params_mean is not None and params_std is not None:
         params_seg = apply_standardizer(params_seg_raw, params_mean, params_std)
     else:
         params_seg = params_seg_raw.astype(np.float32)
-
     cond_seg = None
     if cond_full is not None:
         if segment_ends_full is None:
@@ -1071,7 +465,6 @@ def _make_windowed_dataset_from_arrays(
             cond_seg = apply_standardizer(cond_seg_raw, cond_mean, cond_std)
         else:
             cond_seg = cond_seg_raw.astype(np.float32)
-
     time_features_seg = None
     if time_features_full is not None:
         if segment_ends_full is None:
@@ -1081,7 +474,6 @@ def _make_windowed_dataset_from_arrays(
         else:
             time_features_seg = time_features_full[left:right]
         time_features_seg = time_features_seg.astype(np.float32, copy=False)
-
     ds = WindowedParamSequenceDataset(
         params=params_seg,
         mids=mids_seg,
@@ -1102,17 +494,12 @@ def _make_windowed_dataset_from_arrays(
         dataset_metadata=dataset_metadata,
         global_offset=left,
     )
-
-    # Restrict targets to exactly [start_t, end_t) in GLOBAL time
-    # local target t corresponds to global_offset + t
     g = ds.global_offset + ds.start_indices
     mask = (g >= int(start_t)) & (g < int(end_t))
     ds.start_indices = ds.start_indices[mask]
-
     if len(ds.start_indices) == 0:
         raise ValueError(
-            f"Empty split dataset: start_t={start_t}, end_t={end_t}, "
-            f"H={cfg.history_len}, stride={stride}. Increase segment length or reduce history_len."
+            f"Empty split dataset: start_t={start_t}, end_t={end_t}, H={cfg.history_len}, stride={stride}. Increase segment length or reduce history_len."
         )
     return ds
 
@@ -1159,7 +546,7 @@ def build_dataset_splits_from_arrays(
     if (
         not np.issubdtype(params_raw.dtype, np.number)
         or np.issubdtype(params_raw.dtype, np.complexfloating)
-        or not bool(np.all(np.isfinite(params_raw)))
+        or (not bool(np.all(np.isfinite(params_raw))))
     ):
         raise ValueError("params_raw must contain finite real numeric values.")
     expected_snapshot_dim = int(cfg.snapshot_dim)
@@ -1173,7 +560,7 @@ def build_dataset_splits_from_arrays(
     if (
         not np.issubdtype(mids.dtype, np.number)
         or np.issubdtype(mids.dtype, np.complexfloating)
-        or not bool(np.all(np.isfinite(mids)))
+        or (not bool(np.all(np.isfinite(mids))))
     ):
         raise ValueError("mids must contain finite real numeric values.")
     T = int(len(params_raw))
@@ -1185,15 +572,9 @@ def build_dataset_splits_from_arrays(
         raise ValueError("params_raw and cond_raw_full length mismatch")
     if valid_start_mask is not None and len(valid_start_mask) != T:
         raise ValueError("params_raw and valid_start_mask length mismatch")
-
     if segment_ends is None:
         train_end, val_end = _resolve_split_bounds(
-            T,
-            train_frac=train_frac,
-            val_frac=val_frac,
-            test_frac=test_frac,
-            train_end=train_end,
-            val_end=val_end,
+            T, train_frac=train_frac, val_frac=val_frac, test_frac=test_frac, train_end=train_end, val_end=val_end
         )
     else:
         train_end, val_end = _resolve_segment_split_bounds(
@@ -1205,25 +586,20 @@ def build_dataset_splits_from_arrays(
             train_end=train_end,
             val_end=val_end,
         )
-
-    # Train-only fit stats
     if cfg.standardize:
         p_mu, p_sig = fit_standardizer(params_raw[:train_end])
     else:
         p_mu = p_sig = None
-
     resolved_cond_raw_full = None if cond_raw_full is None else np.asarray(cond_raw_full, dtype=np.float32)
     c_mu = c_sig = None
     if resolved_cond_raw_full is None and cfg.use_cond_features:
-        resolved_cond_raw_full = build_cond_features(params_raw, mids, cfg)
+        raise ValueError("Conditional features must be supplied explicitly through cond_raw_full.")
     if resolved_cond_raw_full is not None:
         if not bool(cfg.use_cond_features):
             raise ValueError("External conditional features require cfg.data.use_cond_features=True.")
         if cfg.cond_standardize:
             c_mu, c_sig = fit_standardizer(resolved_cond_raw_full[:train_end])
-
         _set_model_cond_dim(cfg, int(resolved_cond_raw_full.shape[1]))
-
     time_features_full = None
     time_gap_scale = None
     time_feature_source = "none"
@@ -1245,14 +621,12 @@ def build_dataset_splits_from_arrays(
             time_feature_source = "missing_timestamps_zero_fill"
         else:
             time_feature_source = "timestamps"
-
-    # Build split datasets (each with left history buffer)
     ds_train = _make_windowed_dataset_from_arrays(
         params_full=params_raw,
         mids_full=mids,
         cfg=cfg,
         stride=stride_train,
-        start_t=cfg.history_len,  # first valid target with full history
+        start_t=cfg.history_len,
         end_t=train_end,
         params_mean=p_mu,
         params_std=p_sig,
@@ -1267,7 +641,6 @@ def build_dataset_splits_from_arrays(
         dataset_kind=dataset_kind,
         dataset_metadata=dataset_metadata,
     )
-
     ds_val = _make_windowed_dataset_from_arrays(
         params_full=params_raw,
         mids_full=mids,
@@ -1288,7 +661,6 @@ def build_dataset_splits_from_arrays(
         dataset_kind=dataset_kind,
         dataset_metadata=dataset_metadata,
     )
-
     ds_test = _make_windowed_dataset_from_arrays(
         params_full=params_raw,
         mids_full=mids,
@@ -1309,7 +681,6 @@ def build_dataset_splits_from_arrays(
         dataset_kind=dataset_kind,
         dataset_metadata=dataset_metadata,
     )
-
     stats = {
         "T": int(T),
         "train_end": int(train_end),
@@ -1334,60 +705,7 @@ def build_dataset_splits_from_arrays(
         if valid_start_mask is None
         else int(np.count_nonzero(np.asarray(valid_start_mask, dtype=bool))),
     }
-
     return {"train": ds_train, "val": ds_val, "test": ds_test, "stats": stats}
-
-
-def build_dataset_splits_from_npz_l2(
-    path: str,
-    cfg: OTFlowConfig,
-    *,
-    stride_train: int = 1,
-    stride_eval: int = 1,
-    train_frac: float = 0.7,
-    val_frac: float = 0.1,
-    test_frac: float | None = None,
-    train_end: int | None = None,
-    val_end: int | None = None,
-) -> dict[str, object]:
-    """Chronological split for a *preprocessed* standardized L2 NPZ file.
-
-    For datasets that are not off-the-shelf (exchange dumps, Kaggle files, etc.),
-    first convert them to the standardized NPZ using `lob_prepare_dataset.py`.
-    """
-    fm = L2FeatureMap(cfg.levels, cfg.eps)
-    data = load_l2_npz(path)
-
-    if "params_raw" in data and "mids" in data:
-        params_raw = data["params_raw"]
-        mids = data["mids"]
-    else:
-        for k in ("ask_p", "ask_v", "bid_p", "bid_v"):
-            if k not in data:
-                raise ValueError(f"NPZ missing required key '{k}'.")
-        ask_p, ask_v, bid_p, bid_v = data["ask_p"], data["ask_v"], data["bid_p"], data["bid_v"]
-        if ask_p.shape[1] != cfg.levels:
-            raise ValueError(f"Levels mismatch: file L={ask_p.shape[1]}, cfg.levels={cfg.levels}")
-        params_raw, mids = fm.encode_sequence(ask_p, ask_v, bid_p, bid_v)
-
-    return build_dataset_splits_from_arrays(
-        params_raw=params_raw,
-        mids=mids,
-        cfg=cfg,
-        timestamps=_timestamps_from_loaded_npz(data),
-        stride_train=stride_train,
-        stride_eval=stride_eval,
-        train_frac=train_frac,
-        val_frac=val_frac,
-        test_frac=test_frac,
-        train_end=train_end,
-        val_end=val_end,
-        segment_ends=data.get("segment_ends"),
-    )
-
-
-def default_cryptos_npz_path() -> str:
-    return DEFAULT_CRYPTOS_NPZ
 
 
 def _sha256_path(path: str | os.PathLike[str]) -> str:
@@ -1398,27 +716,18 @@ def _sha256_path(path: str | os.PathLike[str]) -> str:
     return digest.hexdigest()
 
 
-def _verified_file(
-    path: str | os.PathLike[str],
-    *,
-    expected_size: int,
-    expected_sha256: str,
-) -> bool:
+def _verified_file(path: str | os.PathLike[str], *, expected_size: int, expected_sha256: str) -> bool:
     resolved = os.fspath(path)
     return (
         not is_link_or_reparse_point(resolved)
         and os.path.isfile(resolved)
-        and os.path.getsize(resolved) == int(expected_size)
-        and _sha256_path(resolved) == str(expected_sha256).lower()
+        and (os.path.getsize(resolved) == int(expected_size))
+        and (_sha256_path(resolved) == str(expected_sha256).lower())
     )
 
 
 def _download_url_to_path(
-    url: str,
-    destination: str | os.PathLike[str],
-    *,
-    expected_size: int,
-    expected_sha256: str,
+    url: str, destination: str | os.PathLike[str], *, expected_size: int, expected_sha256: str
 ) -> str:
     if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size <= 0:
         raise ValueError(f"expected_size must be a positive integer, got {expected_size!r}.")
@@ -1428,18 +737,14 @@ def _download_url_to_path(
     resolved = os.fspath(destination)
     if is_link_or_reparse_point(resolved):
         raise ValueError(f"Download destination may not be a symlink, junction, or reparse point: {resolved}.")
-    if os.path.exists(resolved) and not os.path.isfile(resolved):
+    if os.path.exists(resolved) and (not os.path.isfile(resolved)):
         raise ValueError(f"Download destination must be a regular file path: {resolved}.")
     destination_dir = os.path.dirname(os.path.abspath(resolved))
     os.makedirs(destination_dir, exist_ok=True)
     temporary = ""
     try:
         with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=destination_dir,
-            prefix=f".{os.path.basename(resolved)}.",
-            suffix=".download",
-            delete=False,
+            mode="wb", dir=destination_dir, prefix=f".{os.path.basename(resolved)}.", suffix=".download", delete=False
         ) as out_fh:
             temporary = out_fh.name
             digest = hashlib.sha256()
@@ -1467,151 +772,11 @@ def _download_url_to_path(
     return resolved
 
 
-def download_cryptos_npz(
-    path: str | os.PathLike[str] | None = None,
-    *,
-    url: str = LOBIFLOW_CRYPTOS_NPZ_URL,
-    force: bool = False,
-) -> str:
-    resolved = os.fspath(path or default_cryptos_npz_path())
-    if force or not _verified_file(
-        resolved,
-        expected_size=LOBIFLOW_CRYPTOS_NPZ_SIZE_BYTES,
-        expected_sha256=LOBIFLOW_CRYPTOS_NPZ_SHA256,
-    ):
-        _download_url_to_path(
-            str(url),
-            resolved,
-            expected_size=LOBIFLOW_CRYPTOS_NPZ_SIZE_BYTES,
-            expected_sha256=LOBIFLOW_CRYPTOS_NPZ_SHA256,
-        )
-    return resolved
-
-
-def build_dataset_splits_from_cryptos(
-    path: str,
-    cfg: OTFlowConfig,
-    *,
-    stride_train: int = 1,
-    stride_eval: int = 1,
-    train_frac: float = 0.7,
-    val_frac: float = 0.1,
-    test_frac: float | None = None,
-    train_end: int | None = None,
-    val_end: int | None = None,
-) -> dict[str, object]:
-    """Named dataset helper for the prepared Tardis crypto L2 archive."""
-    resolved_path = path or default_cryptos_npz_path()
-    if not os.path.exists(resolved_path):
-        download_cryptos_npz(resolved_path)
-    return build_dataset_splits_from_npz_l2(
-        path=resolved_path,
-        cfg=cfg,
-        stride_train=stride_train,
-        stride_eval=stride_eval,
-        train_frac=train_frac,
-        val_frac=val_frac,
-        test_frac=test_frac,
-        train_end=train_end,
-        val_end=val_end,
-    )
-
-
-def build_dataset_splits_from_lobster_synthetic(
-    profile_path: str,
-    cfg: OTFlowConfig,
-    *,
-    length: int = DEFAULT_SYNTHETIC_LENGTH,
-    seed: int = 0,
-    stride_train: int = 1,
-    stride_eval: int = 1,
-    train_frac: float = 0.7,
-    val_frac: float = 0.1,
-    test_frac: float | None = None,
-    train_end: int | None = None,
-    val_end: int | None = None,
-) -> dict[str, object]:
-    resolved_profile = profile_path or default_lobster_synth_profile_path()
-    if not os.path.exists(resolved_profile):
-        download_lobster_synthetic_profile(resolved_profile)
-    validate_lobster_synth_profile(load_lobster_synth_profile(resolved_profile), source=resolved_profile)
-    ask_p, ask_v, bid_p, bid_v = _generate_synthetic_l2(
-        cfg.levels,
-        length,
-        seed,
-        cfg.eps,
-        profile_path=resolved_profile,
-    )
-    fm = L2FeatureMap(cfg.levels, cfg.eps)
-    params_raw, mids = fm.encode_sequence(ask_p, ask_v, bid_p, bid_v)
-    return build_dataset_splits_from_arrays(
-        params_raw=params_raw,
-        mids=mids,
-        cfg=cfg,
-        timestamps=None,
-        stride_train=stride_train,
-        stride_eval=stride_eval,
-        train_frac=train_frac,
-        val_frac=val_frac,
-        test_frac=test_frac,
-        train_end=train_end,
-        val_end=val_end,
-        dataset_kind=LOBSTER_SYNTHETIC_DATASET_KEY,
-        dataset_metadata={
-            "dataset_key": LOBSTER_SYNTHETIC_DATASET_KEY,
-            "source": "mpstoryfans/lobiflow data/synthetic/lobster_free_sample_profile_10.json",
-            "profile_name": os.path.basename(os.fspath(resolved_profile)),
-            "length": int(length),
-            "seed": int(seed),
-        },
-    )
-
-
-# -----------------------------
-# Basic metrics (raw space) for quick checks
-# -----------------------------
-def compute_basic_l2_metrics(
-    ask_p: np.ndarray, ask_v: np.ndarray, bid_p: np.ndarray, bid_v: np.ndarray
-) -> dict[str, float]:
-    spread = ask_p[:, 0] - bid_p[:, 0]
-    depth = ask_v.sum(axis=1) + bid_v.sum(axis=1)
-    imb = (bid_v.sum(axis=1) - ask_v.sum(axis=1)) / (depth + 1e-8)
-    return {
-        "spread_mean": float(np.mean(spread)),
-        "spread_std": float(np.std(spread)),
-        "depth_mean": float(np.mean(depth)),
-        "imb_mean": float(np.mean(imb)),
-        "imb_std": float(np.std(imb)),
-    }
-
-
 __all__ = [
-    "L2FeatureMap",
     "WindowedParamSequenceDataset",
-    "build_dataset_splits_from_arrays",
-    "build_dataset_splits_from_lobster_synthetic",
-    "build_dataset_splits_from_npz_l2",
-    "default_cryptos_npz_path",
-    "download_cryptos_npz",
-    "default_lobster_synth_profile_path",
-    "default_lobster_synthetic_profile_path",
-    "download_lobster_synthetic_profile",
-    "load_lobster_synth_profile",
-    "validate_lobster_synth_profile",
-    "standardize_params",
-    "standardize_cond",
-    "load_l2_npz",
-    "fit_standardizer",
     "apply_standardizer",
-    "build_cond_features",
-    "compute_basic_l2_metrics",
-    "DEFAULT_SYNTHETIC_LENGTH",
-    "LOBIFLOW_REVISION",
-    "LOBIFLOW_CRYPTOS_NPZ_URL",
-    "LOBIFLOW_CRYPTOS_NPZ_SIZE_BYTES",
-    "LOBIFLOW_CRYPTOS_NPZ_SHA256",
-    "LOBIFLOW_SYNTHETIC_PROFILE_URL",
-    "LOBIFLOW_SYNTHETIC_PROFILE_SIZE_BYTES",
-    "LOBIFLOW_SYNTHETIC_PROFILE_SHA256",
-    "LOBSTER_SYNTHETIC_DATASET_KEY",
+    "build_dataset_splits_from_arrays",
+    "fit_standardizer",
+    "standardize_cond",
+    "standardize_params",
 ]

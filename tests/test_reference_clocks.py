@@ -11,9 +11,6 @@ from genode.benchmarks.image.protocol import (
 )
 from genode.canonical_experiment_layout import CANONICAL_SUPERVISION_SCHEDULE_KEYS
 from genode.evaluation import diffusion_flow_time_reparameterization as schedule_runner
-from genode.gico.policy import grid_for_schedule, validate_gico_support_schedule_keys
-from genode.gico.train_gico import build_argparser as build_gico_argparser
-from genode.pipeline import full_pipeline
 from genode.schedule_transfer.diffusion_flow_schedules import load_external_schedule_catalog
 from genode.schedule_transfer.reference_clocks import (
     AYS_SD15_SIGMAS,
@@ -57,6 +54,7 @@ EXPECTED_DEFAULT_KEYS = (
     "ots_vp_linear_log_sigma",
     "late_p_1p5",
     "late_p_2",
+    "late_p_3",
     "late_p_4",
     "late_p_8",
     "flowts_power_0p03",
@@ -68,6 +66,7 @@ EXPECTED_DEFAULT_KEYS = (
     "ots_vp_linear_log_sigma_reversed",
     "late_p_1p5_reversed",
     "late_p_2_reversed",
+    "late_p_3_reversed",
     "late_p_4_reversed",
     "late_p_8_reversed",
     "flowts_power_0p03_reversed",
@@ -75,13 +74,13 @@ EXPECTED_DEFAULT_KEYS = (
 
 
 class ReferenceClockTests(unittest.TestCase):
-    def test_default_key_set_and_order_is_exactly_canonical_23(self) -> None:
+    def test_default_key_set_and_order_is_exactly_canonical_25(self) -> None:
         self.assertEqual(DEFAULT_REFERENCE_CLOCK_KEYS, EXPECTED_DEFAULT_KEYS)
         self.assertEqual(CANONICAL_SUPERVISION_SCHEDULE_KEYS, EXPECTED_DEFAULT_KEYS)
         self.assertEqual(tuple(reference_clock_registry()), EXPECTED_DEFAULT_KEYS)
         self.assertEqual(IMAGE_SCHEDULE_KEYS, EXPECTED_DEFAULT_KEYS)
-        self.assertEqual(len(DEFAULT_REFERENCE_CLOCK_KEYS), 23)
-        self.assertEqual(len(set(DEFAULT_REFERENCE_CLOCK_KEYS)), 23)
+        self.assertEqual(len(DEFAULT_REFERENCE_CLOCK_KEYS), 25)
+        self.assertEqual(len(set(DEFAULT_REFERENCE_CLOCK_KEYS)), 25)
         runner_defaults = tuple(schedule_runner.build_argparser().parse_args([]).baseline_scheduler_names.split(","))
         self.assertEqual(runner_defaults, EXPECTED_DEFAULT_KEYS)
         for removed in ("late_power_3", "ays_avg_reversed"):
@@ -89,24 +88,24 @@ class ReferenceClockTests(unittest.TestCase):
 
     def test_image_protocol_uses_dynamic_canonical_clock_count_and_provenance(self) -> None:
         metadata = image_protocol_metadata()
-        self.assertEqual(metadata["protocol_key"], "image_euler_248_v6")
-        self.assertEqual(metadata["schedule_count"], 23)
+        self.assertEqual(metadata["protocol_key"], "image_euler_248_v7")
+        self.assertEqual(metadata["schedule_count"], 25)
         self.assertEqual(tuple(metadata["schedule_keys"]), EXPECTED_DEFAULT_KEYS)
-        self.assertEqual(len(metadata["reference_clock_provenance"]), 23)
-        self.assertEqual(euler_image_workload().evidence_images, 2_070_000)
+        self.assertEqual(len(metadata["reference_clock_provenance"]), 25)
+        self.assertEqual(euler_image_workload().evidence_images, 2_250_000)
         self.assertEqual(
             euler_image_workload().backbone_image_evaluations,
-            9_660_000,
+            10_500_000,
         )
         for dataset in metadata["datasets"].values():
             self.assertEqual(
                 set(dataset),
                 {"key", "resolution", "class_count", "conditioning"},
             )
-        augmented = image_protocol_metadata(extra_late_p_values="3")
-        self.assertEqual(augmented["schedule_count"], 25)
-        self.assertIn("late_p_3", augmented["schedule_keys"])
-        self.assertIn("late_p_3_reversed", augmented["schedule_keys"])
+        augmented = image_protocol_metadata(extra_late_p_values="2.25")
+        self.assertEqual(augmented["schedule_count"], 27)
+        self.assertIn("late_p_2p25", augmented["schedule_keys"])
+        self.assertIn("late_p_2p25_reversed", augmented["schedule_keys"])
 
     def test_published_source_node_goldens(self) -> None:
         self.assertEqual(AYS_SD15_TIMESTEPS, (999, 850, 736, 645, 545, 455, 343, 233, 124, 24))
@@ -230,23 +229,25 @@ class ReferenceClockTests(unittest.TestCase):
                     self.assertAlmostEqual(observed, expected, places=14)
 
     def test_image_fixed_schedules_delegate_to_canonical_reference_clocks(self) -> None:
+        from genode.gico.clocks import materialize, reference_densities, verify_measurement_clock
+
         specifications = default_fixed_schedule_specifications()
         self.assertEqual(
             tuple(item.schedule_key for item in specifications),
             EXPECTED_DEFAULT_KEYS,
         )
         schedules = build_default_fixed_schedules(4)
-        self.assertEqual(len(schedules), 23)
+        self.assertEqual(len(schedules), 25)
         for schedule in schedules:
             with self.subTest(key=schedule.specification.schedule_key):
-                expected_grid = build_reference_clock_grid(
-                    schedule.specification.schedule_key,
-                    4,
-                )
+                raw = reference_densities("euler", 4)[schedule.specification.schedule_key]
+                expected_grid = materialize(raw, "euler", 4)
                 self.assertEqual(
                     tuple(float(value) for value in schedule.time_grid.tolist()),
                     expected_grid,
                 )
+                self.assertEqual(tuple(schedule.gico_density_mass.tolist()), raw)
+                verify_measurement_clock(schedule.gico_measurement_clock())
                 self.assertEqual(
                     schedule.clock_provenance,
                     reference_clock_provenance(schedule.specification.schedule_key),
@@ -272,8 +273,6 @@ class ReferenceClockTests(unittest.TestCase):
                 ScheduleSpecification("late_p_3", {"p": 3.0}),
                 4,
             )
-        with self.assertRaisesRegex(ValueError, "must be unique"):
-            validate_gico_support_schedule_keys(("uniform", "uniform"))
 
     def test_provenance_is_pinned_and_honest_about_transfer(self) -> None:
         expected = {
@@ -313,34 +312,6 @@ class ReferenceClockTests(unittest.TestCase):
                 build_reference_clock_grid("uniform", invalid_steps)
         with self.assertRaisesRegex(KeyError, "Unknown reference clock"):
             build_reference_clock_grid("uniform_reversed", 4)
-
-    def test_trainer_cli_and_density_grid_accept_explicit_late_p_augmentation(self) -> None:
-        args = build_gico_argparser().parse_args(
-            [
-                "--rows_csv",
-                "rows.csv",
-                "--context_embeddings_npz",
-                "contexts.npz",
-                "--out_dir",
-                "out",
-                "--extra_late_p_values",
-                "3,2.25,3.0",
-            ]
-        )
-        self.assertEqual(args.extra_late_p_values, "3,2.25,3.0")
-        keys = ("uniform", "late_p_2p25", "late_p_2p25_reversed", "late_p_3", "late_p_3_reversed")
-        self.assertEqual(validate_gico_support_schedule_keys(keys), keys)
-        grid = grid_for_schedule("late_p_3_reversed", "euler", 4)
-        self.assertEqual(len(grid), 5)
-        self.assertTrue(all(right > left for left, right in zip(grid, grid[1:], strict=False)))
-
-        pipeline_args = full_pipeline.build_argparser().parse_args(
-            ["--schedule_keys", "uniform,late_p_4", "--extra_late_p_values", "3,2.25,3.0"]
-        )
-        self.assertEqual(
-            full_pipeline._requested_schedule_keys(pipeline_args),
-            ["uniform", "late_p_2p25", "late_p_3", "late_p_4", "late_p_2p25_reversed", "late_p_3_reversed"],
-        )
 
 
 if __name__ == "__main__":

@@ -11,55 +11,28 @@ from genode.schedule_transfer.reference_clocks import (
 from genode.solver_protocol import CANONICAL_SOLVER_KEYS
 
 CANONICAL_LAYOUT_VERSION = "seen_unseen_nfe_layout"
-
 CANONICAL_SEEN_NFES: tuple[int, ...] = (4, 8, 12, 16)
 CANONICAL_UNSEEN_NFES: tuple[int, ...] = (6, 10, 14, 20)
 CANONICAL_CHECKPOINT_STEPS: tuple[int, ...] = (4000, 8000, 12000, 16000, 20000)
 CANONICAL_CONTEXT_SAMPLE_COUNT = 188
 CANONICAL_UNSEEN_TARGET_WEIGHT = 0.25
-
 NFE_ROLE_SEEN = "seen"
 NFE_ROLE_UNSEEN = "unseen"
 NFE_ROLES: tuple[str, ...] = (NFE_ROLE_SEEN, NFE_ROLE_UNSEEN)
-
 SCENARIO_FAMILY_FORECAST = "temporal_extrapolation"
-SCENARIO_FAMILY_CONDITIONAL_GENERATION = "temporal_conditional_generation"
 SCENARIO_FAMILY_MOLECULE = "molecule_3d_coordinate_generation"
-
-FORECAST_SCENARIO_KEYS: tuple[str, ...] = (
-    "solar_energy_10m",
-    "traffic_hourly",
-    "weather_daily",
-)
-CONDITIONAL_GENERATION_SCENARIO_KEYS: tuple[str, ...] = (
-    "cryptos",
-    "lobster_synthetic",
-    "long_term_st",
-)
-MOLECULE_SCENARIO_KEYS: tuple[str, ...] = (
-    "molecule_3d_set1",
-    "molecule_3d_set2",
-    "molecule_3d_set3",
-)
-CANONICAL_SCENARIO_KEYS: tuple[str, ...] = (
-    *FORECAST_SCENARIO_KEYS,
-    *CONDITIONAL_GENERATION_SCENARIO_KEYS,
-    *MOLECULE_SCENARIO_KEYS,
-)
-
+FORECAST_SCENARIO_KEYS: tuple[str, ...] = ("solar_energy_10m", "traffic_hourly", "weather_daily")
+MOLECULE_SCENARIO_KEYS: tuple[str, ...] = ("molecule_3d_set1", "molecule_3d_set2", "molecule_3d_set3")
+CANONICAL_SCENARIO_KEYS: tuple[str, ...] = (*FORECAST_SCENARIO_KEYS, *MOLECULE_SCENARIO_KEYS)
 PHYSICAL_SCHEDULE_KEYS: tuple[str, ...] = REFERENCE_CLOCK_BASE_KEYS
 REVERSED_SCHEDULE_KEYS: tuple[str, ...] = REFERENCE_CLOCK_REVERSED_KEYS
-# Additional dynamic clocks remain available only through explicit, non-canonical inputs.
 AVERAGED_REVERSED_SCHEDULE_KEYS: tuple[str, ...] = ()
 CANONICAL_SUPERVISION_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
-
 REVERSED_SCHEDULE_BASE: Mapping[str, str] = {key: key.removesuffix("_reversed") for key in REVERSED_SCHEDULE_KEYS}
 AVERAGED_SCHEDULE_COMPONENTS: Mapping[str, tuple[str, str]] = {}
-
 SCHEDULE_FAMILY_PHYSICAL = "physical"
 SCHEDULE_FAMILY_REVERSED = "reversed"
 SCHEDULE_FAMILY_AVERAGED_REVERSED = "averaged_reversed"
-
 STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT = "seen_only_zero_shot"
 STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS = "seen_plus_unseen_targets"
 STUDENT_TRAINING_MODES: tuple[str, ...] = (
@@ -80,10 +53,6 @@ def canonical_scenario_specs() -> tuple[ScenarioSpec, ...]:
         [
             ScenarioSpec(key=key, family=SCENARIO_FAMILY_FORECAST, public_dataset_key=key)
             for key in FORECAST_SCENARIO_KEYS
-        ]
-        + [
-            ScenarioSpec(key=key, family=SCENARIO_FAMILY_CONDITIONAL_GENERATION, public_dataset_key=key)
-            for key in CONDITIONAL_GENERATION_SCENARIO_KEYS
         ]
         + [
             ScenarioSpec(key=key, family=SCENARIO_FAMILY_MOLECULE, public_dataset_key=key)
@@ -158,7 +127,6 @@ __all__ = [
     "CANONICAL_SOLVER_KEYS",
     "CANONICAL_SUPERVISION_SCHEDULE_KEYS",
     "CANONICAL_UNSEEN_NFES",
-    "CONDITIONAL_GENERATION_SCENARIO_KEYS",
     "FORECAST_SCENARIO_KEYS",
     "MOLECULE_SCENARIO_KEYS",
     "NFE_ROLE_SEEN",
@@ -167,7 +135,6 @@ __all__ = [
     "PHYSICAL_SCHEDULE_KEYS",
     "REVERSED_SCHEDULE_BASE",
     "REVERSED_SCHEDULE_KEYS",
-    "SCENARIO_FAMILY_CONDITIONAL_GENERATION",
     "SCENARIO_FAMILY_FORECAST",
     "SCENARIO_FAMILY_MOLECULE",
     "SCHEDULE_FAMILY_AVERAGED_REVERSED",

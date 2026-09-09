@@ -42,6 +42,7 @@ class ScheduleBatch:
     time_grid: Tensor
     target_nfe: int
     specification: ScheduleSpecification | None = None
+    gico_density_mass: Tensor | None = None
 
     def __post_init__(self) -> None:
         target = _positive_integer(self.target_nfe, field="target_nfe")
@@ -81,6 +82,24 @@ class ScheduleBatch:
             ScheduleSpecification,
         ):
             raise TypeError("specification must be a ScheduleSpecification or None.")
+        if self.gico_density_mass is not None:
+            from genode.gico.clocks import materialize
+            from genode.gico.networks import DENSITY_BINS, DENSITY_MIXTURE
+
+            raw = self.gico_density_mass
+            if not isinstance(raw, Tensor) or raw.shape != mass.shape or raw.shape[-1] != DENSITY_BINS:
+                raise ValueError("GICO raw density must have shape [batch, 64].")
+            if raw.device != mass.device or raw.dtype != torch.float64 or mass.dtype != torch.float64:
+                raise ValueError("GICO schedule provenance requires float64 tensors on the same device.")
+            expected_grid = grid.new_tensor([materialize(row, "euler", target) for row in raw.detach().cpu().numpy()])
+            guarded = (1 - DENSITY_MIXTURE) * raw + DENSITY_MIXTURE / DENSITY_BINS
+            guarded = guarded / guarded.sum(dim=-1, keepdim=True)
+            if not torch.allclose(mass, guarded, rtol=0, atol=_EXECUTABLE_BINDING_ATOL):
+                raise ValueError("GICO density_mass must be its raw density with the uniform mixture applied once.")
+            if not torch.equal(grid, expected_grid):
+                raise ValueError("GICO time_grid must exactly match the shared density decoder.")
+            # Preserve the common decoder's exact nodes for measurement replay.
+            executable_grid = grid
         object.__setattr__(self, "target_nfe", target)
         object.__setattr__(self, "time_grid", executable_grid)
 
@@ -160,6 +179,19 @@ class ScheduleBatch:
     def density_bin_count(self) -> int:
         return int(self.density_mass.shape[-1])
 
+    def gico_measurement_clock(self, index: int) -> dict:
+        """Export unguarded masses and the exact common grid for paired evidence."""
+        if self.gico_density_mass is None:
+            raise ValueError("This schedule has no GICO raw-density provenance.")
+        if isinstance(index, bool) or not isinstance(index, Integral) or not 0 <= index < self.batch_size:
+            raise IndexError("GICO measurement index is outside the schedule batch.")
+        return {
+            "density_mass": self.gico_density_mass[index].detach().cpu().tolist(),
+            "time_grid": self.time_grid[index].detach().cpu().tolist(),
+            "solver": "euler",
+            "nfe": self.target_nfe,
+        }
+
     @property
     def sha256(self) -> str:
         return semantic_sha256(
@@ -171,6 +203,15 @@ class ScheduleBatch:
                     reference_time_grid=self.reference_time_grid,
                 ),
                 "time_grid_sha256": time_grid_hash(self.time_grid),
+                **(
+                    {
+                        "gico_density_mass_sha256": density_mass_hash(
+                            self.gico_density_mass, reference_time_grid=self.reference_time_grid
+                        )
+                    }
+                    if self.gico_density_mass is not None
+                    else {}
+                ),
             },
             namespace="schedule-batch",
         )

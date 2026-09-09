@@ -13,23 +13,13 @@ from typing import Any
 
 import torch
 
-from genode.data.experiment_common import DATASET_PLANS, build_dataset_splits, get_otflow_paper_backbone_preset
-from genode.data.otflow_experiment_plan import CONDITIONAL_GENERATION_FAMILY, FORECAST_FAMILY, experiment_plan_by_key
+from genode.data.otflow_experiment_plan import FORECAST_FAMILY, experiment_plan_by_key
 from genode.data.otflow_forecast_data import build_monash_forecast_splits
 from genode.data.otflow_monash_datasets import default_manifest_path, download_monash_dataset
-from genode.data.otflow_paths import (
-    default_cryptos_data_path,
-    default_lobster_synthetic_profile_path,
-    default_long_term_st_data_path,
-    project_paper_dataset_root,
-    project_root,
-    resolve_project_path,
-)
+from genode.data.otflow_paths import project_paper_dataset_root, project_root, resolve_project_path
 from genode.evaluation.fm_backbone_registry import (
-    ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS,
     ACTIVE_FORECAST_BACKBONE_BUDGETS,
     BACKBONE_NAME_OTFLOW,
-    DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE,
     build_backbone_checkpoint_id,
     expected_artifact_root,
     materialize_backbone_manifest,
@@ -77,15 +67,6 @@ def _dataset_spec(dataset: str):
     return plans[str(dataset)]
 
 
-def _conditional_spec(dataset: str):
-    spec = _dataset_spec(str(dataset))
-    if str(spec.benchmark_family) != CONDITIONAL_GENERATION_FAMILY:
-        raise ValueError(
-            f"{dataset!r} has benchmark_family={spec.benchmark_family!r}, not {CONDITIONAL_GENERATION_FAMILY!r}."
-        )
-    return spec
-
-
 def build_forecast_cfg(args: argparse.Namespace) -> OTFlowConfig:
     spec = experiment_plan_by_key()[str(args.dataset)]
     cfg = OTFlowConfig()
@@ -120,48 +101,6 @@ def build_forecast_cfg(args: argparse.Namespace) -> OTFlowConfig:
     return cfg
 
 
-def build_conditional_cfg(args: argparse.Namespace) -> OTFlowConfig:
-    spec = _conditional_spec(str(args.dataset))
-    plan = DATASET_PLANS[str(args.dataset)]
-    preset = get_otflow_paper_backbone_preset(str(args.dataset))
-    cfg = OTFlowConfig()
-    cfg.apply_overrides(
-        device=resolve_torch_device(str(args.device)),
-        levels=int(preset["levels"]),
-        token_dim=int(preset.get("token_dim", 4)),
-        history_len=int(spec.history_len),
-        steps=int(args.steps),
-        batch_size=(
-            int(getattr(args, "batch_size", 0))
-            if int(getattr(args, "batch_size", 0) or 0) > 0
-            else int(plan.batch_size)
-        ),
-        lr=float(args.lr),
-        weight_decay=float(args.weight_decay),
-        grad_clip=float(args.grad_clip),
-        standardize=True,
-        use_cond_features=bool(preset.get("use_cond_features", False)),
-        cond_standardize=bool(preset.get("cond_standardize", True)),
-        hidden_dim=int(args.hidden_dim),
-        ctx_encoder=str(preset["ctx_encoder"]),
-        ctx_causal=bool(preset["ctx_causal"]),
-        ctx_local_kernel=int(preset["ctx_local_kernel"]),
-        ctx_pool_scales=tuple(int(x) for x in str(preset["ctx_pool_scales"]).split(",") if x),
-        use_time_features=bool(preset.get("use_time_features", preset.get("use_time_gaps", False))),
-        use_time_gaps=bool(preset.get("use_time_gaps", False)),
-        rollout_mode="non_ar",
-        future_block_len=int(spec.future_block_len),
-        fu_net_type=DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE,
-        fu_net_layers=int(args.fu_net_layers),
-        fu_net_heads=int(args.fu_net_heads),
-        use_minibatch_ot=True,
-        solver="euler",
-        use_amp=bool(args.use_amp),
-        grad_accum_steps=int(args.grad_accum_steps),
-    )
-    return cfg
-
-
 def ensure_forecast_dataset(dataset_root: Path, dataset: str, *, prepare: bool) -> None:
     manifest = default_manifest_path(dataset_root, dataset)
     if manifest.exists():
@@ -174,8 +113,6 @@ def ensure_forecast_dataset(dataset_root: Path, dataset: str, *, prepare: bool) 
 def _active_backbone_budgets(dataset: str, benchmark_family: str) -> tuple[int, ...]:
     if str(benchmark_family) == FORECAST_FAMILY:
         return tuple(ACTIVE_FORECAST_BACKBONE_BUDGETS.get(str(dataset), ()))
-    if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
-        return tuple(ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS.get(str(dataset), ()))
     return ()
 
 
@@ -273,17 +210,10 @@ def _default_training_state_path(args: argparse.Namespace, *, benchmark_family: 
         / str(benchmark_family)
         / str(args.dataset)
     )
-    if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
-        root = root / DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE
     return root / f"{signature_hash[:16]}.pt"
 
 
-def _resolve_training_state_path(
-    args: argparse.Namespace,
-    *,
-    benchmark_family: str,
-    signature_hash: str,
-) -> Path:
+def _resolve_training_state_path(args: argparse.Namespace, *, benchmark_family: str, signature_hash: str) -> Path:
     explicit_out = str(getattr(args, "training_state_out", "") or "").strip()
     if explicit_out:
         return resolve_project_path(explicit_out)
@@ -349,10 +279,7 @@ def _save_backbone_artifact(
     )
     checkpoint_path = artifact_root / "model.pt"
     checkpoint_cfg = _checkpoint_cfg_for_budget(cfg, int(budget_steps))
-    torch.save(
-        {"cfg": checkpoint_cfg.to_dict(), "model_state": dict(state_dict)},
-        checkpoint_path,
-    )
+    torch.save({"cfg": checkpoint_cfg.to_dict(), "model_state": dict(state_dict)}, checkpoint_path)
     metadata = {
         "checkpoint_id": checkpoint_id,
         "dataset_key": str(dataset),
@@ -386,37 +313,7 @@ def _data_path_for_conditional(args: argparse.Namespace, dataset: str) -> str:
     explicit = str(getattr(args, "data_path", "") or "").strip()
     if explicit:
         return explicit
-    if str(dataset) == "cryptos":
-        return str(getattr(args, "cryptos_path", "") or default_cryptos_data_path())
-    if str(dataset) == "lobster_synthetic":
-        return str(getattr(args, "lobster_synthetic_profile_path", "") or default_lobster_synthetic_profile_path())
-    if str(dataset) == "long_term_st":
-        return str(getattr(args, "long_term_st_path", "") or default_long_term_st_data_path())
     return ""
-
-
-def _conditional_dataset_args(args: argparse.Namespace, cfg: OTFlowConfig) -> argparse.Namespace:
-    plan = DATASET_PLANS[str(args.dataset)]
-    return argparse.Namespace(
-        dataset=str(args.dataset),
-        data_path=_data_path_for_conditional(args, str(args.dataset)),
-        synthetic_length=int(getattr(args, "synthetic_length", 0) or int(plan.synthetic_length)),
-        seed=int(args.seed),
-        device=str(args.device),
-        steps=int(args.steps),
-        train_frac=float(plan.train_frac),
-        val_frac=float(plan.val_frac),
-        test_frac=float(plan.test_frac),
-        stride_train=int(getattr(args, "stride_train", plan.stride_train) or plan.stride_train),
-        stride_eval=int(getattr(args, "stride_eval", plan.stride_eval) or plan.stride_eval),
-        levels=int(cfg.levels),
-        token_dim=int(getattr(cfg, "token_dim", 4)),
-        history_len=int(cfg.history_len),
-        batch_size=int(cfg.batch_size),
-        lr=float(args.lr),
-        weight_decay=float(args.weight_decay),
-        grad_clip=float(args.grad_clip),
-    )
 
 
 def _train_temporal_backbone(
@@ -444,9 +341,7 @@ def _train_temporal_backbone(
     )
     signature_hash = _json_hash(signature)
     training_state_path = _resolve_training_state_path(
-        args,
-        benchmark_family=str(benchmark_family),
-        signature_hash=signature_hash,
+        args, benchmark_family=str(benchmark_family), signature_hash=signature_hash
     )
     explicit_resume_path = str(getattr(args, "resume_training_state", "") or "").strip()
     resume_state_path = resolve_project_path(explicit_resume_path) if explicit_resume_path else training_state_path
@@ -457,12 +352,10 @@ def _train_temporal_backbone(
         if resume_training_state
         else None
     )
-
     val_every = int(getattr(args, "val_every", 0) or 0)
     val_max_batches = getattr(args, "val_max_batches", None)
     if val_max_batches is not None:
         val_max_batches = int(val_max_batches)
-
     best: dict[str, Any] = {
         "score": None,
         "state_dict": None,
@@ -473,7 +366,6 @@ def _train_temporal_backbone(
     }
     exported: list[dict[str, Any]] = []
     exported_budget_steps: set[int] = set()
-
     start_step = 0
     initial_model_state = None
     optimizer_state = None
@@ -501,12 +393,7 @@ def _train_temporal_backbone(
         if isinstance(restored_exported, list):
             exported.extend(dict(item) for item in restored_exported if isinstance(item, Mapping))
         exported_budget_steps.update(int(value) for value in selector_state.get("exported_budget_steps", []) or [])
-
-    field_network_type = (
-        DEFAULT_CONDITIONAL_GENERATION_FIELD_NETWORK_TYPE
-        if str(benchmark_family) == CONDITIONAL_GENERATION_FAMILY
-        else None
-    )
+    field_network_type = None
 
     def _artifact_root_for_budget(step: int) -> Path:
         return expected_artifact_root(
@@ -517,12 +404,7 @@ def _train_temporal_backbone(
             train_steps=int(step),
         )
 
-    def _make_selection(
-        *,
-        step: int,
-        train_loss: float,
-        validation: Mapping[str, Any],
-    ) -> dict[str, Any]:
+    def _make_selection(*, step: int, train_loss: float, validation: Mapping[str, Any]) -> dict[str, Any]:
         score = _validated_validation_score(validation)
         return {
             "selection_metric": "validation_loss",
@@ -534,11 +416,7 @@ def _train_temporal_backbone(
         }
 
     def _record_candidate(
-        *,
-        step: int,
-        model: torch.nn.Module,
-        train_loss: float,
-        validation: Mapping[str, Any],
+        *, step: int, model: torch.nn.Module, train_loss: float, validation: Mapping[str, Any]
     ) -> None:
         score = _validated_validation_score(validation)
         should_update = best["score"] is None or score < float(best["score"])
@@ -554,9 +432,7 @@ def _train_temporal_backbone(
                 }
             )
 
-    def _validated_validation_score(
-        validation: Mapping[str, Any],
-    ) -> float:
+    def _validated_validation_score(validation: Mapping[str, Any]) -> float:
         if not isinstance(validation, Mapping):
             raise TypeError("Backbone validation result must be a mapping.")
         raw_score = validation.get("loss")
@@ -646,26 +522,17 @@ def _train_temporal_backbone(
     def _on_step(step: int, model: torch.nn.Module, train_loss: float, logs: dict[str, float]) -> None:
         del logs
         is_budget_step = int(step) in checkpoint_step_set
-        should_validate = is_budget_step or (not exact_budget_export and val_every > 0 and int(step) % val_every == 0)
+        should_validate = is_budget_step or (not exact_budget_export and val_every > 0 and (int(step) % val_every == 0))
         validation = None
         if should_validate:
             validation = evaluate_average_loss(
-                splits["val"],
-                model,
-                cfg,
-                model_name="otflow",
-                max_batches=val_max_batches,
-                shuffle=False,
+                splits["val"], model, cfg, model_name="otflow", max_batches=val_max_batches, shuffle=False
             )
         if exact_budget_export:
             if is_budget_step:
                 if validation is None:
                     raise RuntimeError("Exact-budget export requires validation at every budget step.")
-                selection = _make_selection(
-                    step=int(step),
-                    train_loss=float(train_loss),
-                    validation=validation,
-                )
+                selection = _make_selection(step=int(step), train_loss=float(train_loss), validation=validation)
                 _export_budget(
                     step=int(step),
                     state_dict=_clone_state_dict_cpu(model),
@@ -673,14 +540,8 @@ def _train_temporal_backbone(
                     checkpoint_export_protocol=CHECKPOINT_EXPORT_PROTOCOL_EXACT_BUDGET,
                 )
             return
-
         if validation is not None:
-            _record_candidate(
-                step=int(step),
-                model=model,
-                train_loss=float(train_loss),
-                validation=validation,
-            )
+            _record_candidate(step=int(step), model=model, train_loss=float(train_loss), validation=validation)
         if is_budget_step:
             if best["state_dict"] is None:
                 raise RuntimeError(f"No checkpoint candidate is available at step {int(step)}.")
@@ -722,7 +583,6 @@ def _train_temporal_backbone(
         print(f"Resuming temporal backbone from {_project_display_path(resume_state_path)} at step {int(start_step)}.")
     else:
         print(f"Writing temporal backbone restart state to {_project_display_path(training_state_path)}.")
-
     model = train_loop(
         splits["train"],
         cfg,
@@ -742,7 +602,6 @@ def _train_temporal_backbone(
         on_training_state=_on_training_state,
     )
     del model
-
     missing_or_stale: list[int] = []
     for budget in checkpoint_steps:
         artifact_root = _artifact_root_for_budget(int(budget))
@@ -790,10 +649,8 @@ def _train_temporal_backbone(
             continue
     if missing_or_stale:
         raise RuntimeError(
-            "Temporal backbone training finished without valid budget artifacts for "
-            f"{missing_or_stale}; expected protocol {expected_protocol!r}."
+            f"Temporal backbone training finished without valid budget artifacts for {missing_or_stale}; expected protocol {expected_protocol!r}."
         )
-
     manifest = materialize_backbone_manifest(budget_steps=checkpoint_steps, seed=int(args.seed))
     final_artifact_root = _artifact_root_for_budget(int(checkpoint_steps[-1]))
     summary = {
@@ -834,16 +691,6 @@ def train_backbone(args: argparse.Namespace) -> dict[str, Any]:
             time_feature_mode="gap_elapsed",
         )
         return _train_temporal_backbone(args, benchmark_family=FORECAST_FAMILY, spec=spec, cfg=cfg, splits=splits)
-    if str(spec.benchmark_family) == CONDITIONAL_GENERATION_FAMILY:
-        cfg = build_conditional_cfg(args)
-        splits = build_dataset_splits(_conditional_dataset_args(args, cfg), cfg)
-        return _train_temporal_backbone(
-            args,
-            benchmark_family=CONDITIONAL_GENERATION_FAMILY,
-            spec=spec,
-            cfg=cfg,
-            splits=splits,
-        )
     raise ValueError(f"Unsupported temporal backbone family: {spec.benchmark_family!r}")
 
 
@@ -851,16 +698,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train standalone genODE temporal OT flow-matching backbones.")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--dataset_root", default=str(project_paper_dataset_root()))
-    parser.add_argument("--data_path", default="")
-    parser.add_argument("--cryptos_path", default="")
-    parser.add_argument("--lobster_synthetic_profile_path", default="")
-    parser.add_argument("--long_term_st_path", default="")
-    parser.add_argument("--synthetic_length", type=int, default=0)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--steps", type=int, default=20_000)
+    parser.add_argument("--steps", type=int, default=20000)
     parser.add_argument("--batch_size", type=int, default=0, help="Batch size; 0 uses the canonical dataset default.")
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=0.0002)
+    parser.add_argument("--weight_decay", type=float, default=0.0001)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--hidden_dim", type=int, default=DEFAULT_HIDDEN_DIM)
     parser.add_argument("--ctx_encoder", default="hybrid")
@@ -884,10 +726,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--checkpoint_export_mode",
         choices=CHECKPOINT_EXPORT_MODES,
         default=CHECKPOINT_EXPORT_MODE_BEST_VALIDATION,
-        help=(
-            "How budget checkpoints are exported. exact_budget saves the model at each requested training budget; "
-            "best_validation_within_budget saves the lowest finite validation-loss state reached by each budget."
-        ),
+        help="How budget checkpoints are exported. exact_budget saves the model at each requested training budget; best_validation_within_budget saves the lowest finite validation-loss state reached by each budget.",
     )
     parser.add_argument(
         "--training_state_out",

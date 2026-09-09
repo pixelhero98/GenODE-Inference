@@ -19,7 +19,7 @@ def _args(**overrides):
         "device": "cpu",
         "steps": 2,
         "batch_size": 4,
-        "lr": 1e-3,
+        "lr": 0.001,
         "weight_decay": 0.0,
         "grad_clip": 1.0,
         "hidden_dim": 8,
@@ -54,22 +54,16 @@ class _FakeModel(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.tensor([0.0]))
         self.step = 0
 
-    def state_dict(self, *args, **kwargs):  # type: ignore[override]
+    def state_dict(self, *args, **kwargs):
         return {"weight": torch.tensor([float(self.step)])}
 
 
 class TrainBackboneTests(unittest.TestCase):
     def test_forecast_cfg_uses_non_sf_experiment_spec(self) -> None:
-        cfg = train_backbone_module.build_forecast_cfg(_args(dataset="solar_energy_10m", steps=20_000))
+        cfg = train_backbone_module.build_forecast_cfg(_args(dataset="solar_energy_10m", steps=20000))
         self.assertEqual(cfg.history_len, 1008)
         self.assertEqual(cfg.future_block_len, 1008)
-        self.assertEqual(cfg.steps, 20_000)
-
-    def test_conditional_cfg_uses_dataset_default_batch_size(self) -> None:
-        cfg = train_backbone_module.build_conditional_cfg(_args(dataset="long_term_st", batch_size=0, steps=20_000))
-        self.assertEqual(cfg.history_len, 12000)
-        self.assertEqual(cfg.future_block_len, 3000)
-        self.assertEqual(cfg.batch_size, 2)
+        self.assertEqual(cfg.steps, 20000)
 
     def test_train_backbone_exports_exact_budget_artifacts_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -99,26 +93,13 @@ class TrainBackboneTests(unittest.TestCase):
                     },
                 ),
                 patch.object(train_backbone_module, "train_loop", side_effect=fake_train_loop),
-                patch.object(
-                    train_backbone_module,
-                    "evaluate_average_loss",
-                    side_effect=fake_eval,
-                ),
-                patch.object(
-                    train_backbone_module,
-                    "project_backbone_matrix_root",
-                    return_value=matrix_root,
-                ),
-                patch.object(
-                    train_backbone_module,
-                    "materialize_backbone_manifest",
-                    return_value={"ready_count": 2},
-                ),
+                patch.object(train_backbone_module, "evaluate_average_loss", side_effect=fake_eval),
+                patch.object(train_backbone_module, "project_backbone_matrix_root", return_value=matrix_root),
+                patch.object(train_backbone_module, "materialize_backbone_manifest", return_value={"ready_count": 2}),
             ):
                 summary = train_backbone_module.train_backbone(
                     _args(dataset_root=tmpdir, checkpoint_export_mode="exact_budget")
                 )
-
             self.assertEqual(summary["checkpoint_export_mode"], "exact_budget")
             for steps in (1, 2):
                 artifact_root = (
@@ -159,24 +140,11 @@ class TrainBackboneTests(unittest.TestCase):
                     },
                 ),
                 patch.object(train_backbone_module, "train_loop", side_effect=fake_train_loop),
-                patch.object(
-                    train_backbone_module,
-                    "evaluate_average_loss",
-                    side_effect=fake_eval,
-                ),
-                patch.object(
-                    train_backbone_module,
-                    "project_backbone_matrix_root",
-                    return_value=matrix_root,
-                ),
-                patch.object(
-                    train_backbone_module,
-                    "materialize_backbone_manifest",
-                    return_value={"ready_count": 2},
-                ),
+                patch.object(train_backbone_module, "evaluate_average_loss", side_effect=fake_eval),
+                patch.object(train_backbone_module, "project_backbone_matrix_root", return_value=matrix_root),
+                patch.object(train_backbone_module, "materialize_backbone_manifest", return_value={"ready_count": 2}),
             ):
                 summary = train_backbone_module.train_backbone(_args(dataset_root=tmpdir))
-
             self.assertEqual(summary["checkpoint_steps"], [1, 2])
             for steps, selected_step in ((1, 1), (2, 2)):
                 artifact_root = (
@@ -200,15 +168,7 @@ class TrainBackboneTests(unittest.TestCase):
                 fake_model = _FakeModel()
 
                 def fake_train_loop(
-                    ds,
-                    cfg,
-                    *,
-                    model_name,
-                    steps,
-                    log_every,
-                    on_step,
-                    _fake_model=fake_model,
-                    **kwargs,
+                    ds, cfg, *, model_name, steps, log_every, on_step, _fake_model=fake_model, **kwargs
                 ):
                     del ds, cfg, model_name, steps, log_every, kwargs
                     _fake_model.step = 1
@@ -226,55 +186,29 @@ class TrainBackboneTests(unittest.TestCase):
                             "stats": {"history_len": 1008, "n_val_examples": 3},
                         },
                     ),
+                    patch.object(train_backbone_module, "train_loop", side_effect=fake_train_loop),
                     patch.object(
-                        train_backbone_module,
-                        "train_loop",
-                        side_effect=fake_train_loop,
+                        train_backbone_module, "evaluate_average_loss", side_effect=RuntimeError("validation failed")
                     ),
-                    patch.object(
-                        train_backbone_module,
-                        "evaluate_average_loss",
-                        side_effect=RuntimeError("validation failed"),
-                    ),
-                    patch.object(
-                        train_backbone_module,
-                        "project_backbone_matrix_root",
-                        return_value=matrix_root,
-                    ),
+                    patch.object(train_backbone_module, "project_backbone_matrix_root", return_value=matrix_root),
                     self.assertRaisesRegex(RuntimeError, "validation failed"),
                 ):
                     train_backbone_module.train_backbone(
-                        _args(
-                            dataset_root=tmpdir,
-                            steps=1,
-                            checkpoint_steps="1",
-                            checkpoint_export_mode=export_mode,
-                        )
+                        _args(dataset_root=tmpdir, steps=1, checkpoint_steps="1", checkpoint_export_mode=export_mode)
                     )
 
     def test_train_backbone_rejects_nonfinite_validation_losses(self) -> None:
         for export_mode in ("exact_budget", "best_validation_within_budget"):
             for invalid_loss in (float("nan"), float("inf"), float("-inf")):
                 with (
-                    self.subTest(
-                        export_mode=export_mode,
-                        invalid_loss=invalid_loss,
-                    ),
+                    self.subTest(export_mode=export_mode, invalid_loss=invalid_loss),
                     tempfile.TemporaryDirectory() as tmpdir,
                 ):
                     matrix_root = Path(tmpdir) / "matrix"
                     fake_model = _FakeModel()
 
                     def fake_train_loop(
-                        ds,
-                        cfg,
-                        *,
-                        model_name,
-                        steps,
-                        log_every,
-                        on_step,
-                        _fake_model=fake_model,
-                        **kwargs,
+                        ds, cfg, *, model_name, steps, log_every, on_step, _fake_model=fake_model, **kwargs
                     ):
                         del ds, cfg, model_name, steps, log_every, kwargs
                         _fake_model.step = 1
@@ -282,10 +216,7 @@ class TrainBackboneTests(unittest.TestCase):
                         return _fake_model
 
                     with (
-                        patch.object(
-                            train_backbone_module,
-                            "ensure_forecast_dataset",
-                        ),
+                        patch.object(train_backbone_module, "ensure_forecast_dataset"),
                         patch.object(
                             train_backbone_module,
                             "build_monash_forecast_splits",
@@ -295,36 +226,18 @@ class TrainBackboneTests(unittest.TestCase):
                                 "stats": {"history_len": 1008, "n_val_examples": 3},
                             },
                         ),
-                        patch.object(
-                            train_backbone_module,
-                            "train_loop",
-                            side_effect=fake_train_loop,
-                        ),
+                        patch.object(train_backbone_module, "train_loop", side_effect=fake_train_loop),
                         patch.object(
                             train_backbone_module,
                             "evaluate_average_loss",
-                            return_value={
-                                "loss": invalid_loss,
-                                "examples": 3,
-                                "batches": 1,
-                            },
+                            return_value={"loss": invalid_loss, "examples": 3, "batches": 1},
                         ),
-                        patch.object(
-                            train_backbone_module,
-                            "project_backbone_matrix_root",
-                            return_value=matrix_root,
-                        ),
-                        self.assertRaisesRegex(
-                            ValueError,
-                            "validation loss must be a finite real number",
-                        ),
+                        patch.object(train_backbone_module, "project_backbone_matrix_root", return_value=matrix_root),
+                        self.assertRaisesRegex(ValueError, "validation loss must be a finite real number"),
                     ):
                         train_backbone_module.train_backbone(
                             _args(
-                                dataset_root=tmpdir,
-                                steps=1,
-                                checkpoint_steps="1",
-                                checkpoint_export_mode=export_mode,
+                                dataset_root=tmpdir, steps=1, checkpoint_steps="1", checkpoint_export_mode=export_mode
                             )
                         )
 
@@ -345,12 +258,7 @@ class TrainBackboneTests(unittest.TestCase):
                 optimizer = torch.optim.SGD(fake_model.parameters(), lr=0.1)
                 scaler = torch.cuda.amp.GradScaler(enabled=False)
                 on_training_state(
-                    1,
-                    fake_model,
-                    optimizer,
-                    None,
-                    scaler,
-                    {"loader_state": {"seed": 11, "epoch": 0, "batch_index": 1}},
+                    1, fake_model, optimizer, None, scaler, {"loader_state": {"seed": 11, "epoch": 0, "batch_index": 1}}
                 )
                 raise RuntimeError("simulated timeout")
 
@@ -391,21 +299,11 @@ class TrainBackboneTests(unittest.TestCase):
                         },
                     ),
                     patch.object(train_backbone_module, "evaluate_average_loss", side_effect=fake_eval),
+                    patch.object(train_backbone_module, "project_backbone_matrix_root", return_value=matrix_root),
                     patch.object(
-                        train_backbone_module,
-                        "project_backbone_matrix_root",
-                        return_value=matrix_root,
+                        train_backbone_module, "materialize_backbone_manifest", return_value={"ready_count": 2}
                     ),
-                    patch.object(
-                        train_backbone_module,
-                        "materialize_backbone_manifest",
-                        return_value={"ready_count": 2},
-                    ),
-                    patch.object(
-                        train_backbone_module,
-                        "train_loop",
-                        side_effect=train_loop_side_effect,
-                    ),
+                    patch.object(train_backbone_module, "train_loop", side_effect=train_loop_side_effect),
                 ):
                     return train_backbone_module.train_backbone(args)
 
@@ -419,9 +317,7 @@ class TrainBackboneTests(unittest.TestCase):
                         save_training_state_every=1,
                     ),
                 )
-
             self.assertTrue(state_path.exists())
-
             summary = run_with_patches(
                 resumed_train_loop,
                 _args(
@@ -432,7 +328,6 @@ class TrainBackboneTests(unittest.TestCase):
                     save_training_state_every=1,
                 ),
             )
-
             self.assertTrue(summary["resumed_from_training_state"])
             self.assertEqual(summary["resume_start_step"], 1)
             self.assertEqual(resume_seen, {"start_step": 1, "weight": 1.0})
@@ -458,12 +353,7 @@ class TrainBackboneTests(unittest.TestCase):
                 optimizer = torch.optim.SGD(fake_model.parameters(), lr=0.1)
                 scaler = torch.cuda.amp.GradScaler(enabled=False)
                 on_training_state(
-                    1,
-                    fake_model,
-                    optimizer,
-                    None,
-                    scaler,
-                    {"loader_state": {"seed": 11, "epoch": 0, "batch_index": 1}},
+                    1, fake_model, optimizer, None, scaler, {"loader_state": {"seed": 11, "epoch": 0, "batch_index": 1}}
                 )
                 raise RuntimeError("simulated timeout")
 
@@ -480,21 +370,11 @@ class TrainBackboneTests(unittest.TestCase):
                         },
                     ),
                     patch.object(train_backbone_module, "evaluate_average_loss", side_effect=fake_eval),
+                    patch.object(train_backbone_module, "project_backbone_matrix_root", return_value=matrix_root),
                     patch.object(
-                        train_backbone_module,
-                        "project_backbone_matrix_root",
-                        return_value=matrix_root,
+                        train_backbone_module, "materialize_backbone_manifest", return_value={"ready_count": 2}
                     ),
-                    patch.object(
-                        train_backbone_module,
-                        "materialize_backbone_manifest",
-                        return_value={"ready_count": 2},
-                    ),
-                    patch.object(
-                        train_backbone_module,
-                        "train_loop",
-                        side_effect=train_loop_side_effect,
-                    ),
+                    patch.object(train_backbone_module, "train_loop", side_effect=train_loop_side_effect),
                 ):
                     return train_backbone_module.train_backbone(args)
 
@@ -508,14 +388,11 @@ class TrainBackboneTests(unittest.TestCase):
                         save_training_state_every=1,
                     ),
                 )
-
             with self.assertRaisesRegex(ValueError, "does not match this run signature"):
                 run_with_patches(
                     lambda *args, **kwargs: fake_model,
                     _args(
-                        dataset_root=tmpdir,
-                        training_state_out=str(state_path),
-                        resume_training_state=str(state_path),
+                        dataset_root=tmpdir, training_state_out=str(state_path), resume_training_state=str(state_path)
                     ),
                 )
 
@@ -556,26 +433,12 @@ class TrainBackboneTests(unittest.TestCase):
                     },
                 ),
                 patch.object(train_backbone_module, "train_loop", side_effect=fake_train_loop),
+                patch.object(train_backbone_module, "evaluate_average_loss", side_effect=fake_eval),
+                patch.object(train_backbone_module, "project_backbone_matrix_root", return_value=matrix_root),
                 patch.object(
-                    train_backbone_module,
-                    "evaluate_average_loss",
-                    side_effect=fake_eval,
+                    train_backbone_module, "_save_backbone_artifact", side_effect=save_then_remove_second_budget_model
                 ),
-                patch.object(
-                    train_backbone_module,
-                    "project_backbone_matrix_root",
-                    return_value=matrix_root,
-                ),
-                patch.object(
-                    train_backbone_module,
-                    "_save_backbone_artifact",
-                    side_effect=save_then_remove_second_budget_model,
-                ),
-                patch.object(
-                    train_backbone_module,
-                    "materialize_backbone_manifest",
-                    return_value={"ready_count": 2},
-                ),
+                patch.object(train_backbone_module, "materialize_backbone_manifest", return_value={"ready_count": 2}),
                 self.assertRaisesRegex(RuntimeError, "valid budget artifacts"),
             ):
                 train_backbone_module.train_backbone(_args(dataset_root=tmpdir, checkpoint_export_mode="exact_budget"))

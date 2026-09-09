@@ -6,18 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from genode.data.otflow_experiment_plan import (
-    canonical_conditional_generation_paper_dataset_keys,
-    canonical_forecast_paper_dataset_keys,
-    experiment_plan_by_key,
-)
+from genode.data.otflow_experiment_plan import canonical_forecast_paper_dataset_keys, experiment_plan_by_key
 from genode.data.otflow_paths import display_project_path
 from genode.evaluation.fm_backbone_registry import (
-    ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS,
     ACTIVE_FORECAST_BACKBONE_BUDGETS,
     BACKBONE_NAME_OTFLOW,
     BACKBONE_NAME_OTFLOW_MOLECULE,
-    CONDITIONAL_GENERATION_FAMILY,
     FORECAST_FAMILY,
     MOLECULE_FAMILY,
     build_backbone_readiness_audit,
@@ -28,16 +22,11 @@ from genode.evaluation.fm_backbone_registry import (
 from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
 
 FORECAST_KEYS = ("solar_energy_10m", "traffic_hourly", "weather_daily")
-CONDITIONAL_KEYS = ("cryptos", "lobster_synthetic", "long_term_st")
 
 
 def _checkpoint_metadata(benchmark_family: str, dataset_key: str, train_steps: int) -> dict:
     spec = experiment_plan_by_key()[str(dataset_key)]
-    family_token = (
-        "temporal_extrapolation"
-        if benchmark_family == FORECAST_FAMILY
-        else "temporal_conditional_generation_transformer"
-    )
+    family_token = "temporal_extrapolation"
     metadata = {
         "checkpoint_id": f"{dataset_key}_otflow_{family_token}_{train_steps // 1000}k_seed0",
         "dataset_key": str(dataset_key),
@@ -51,13 +40,8 @@ def _checkpoint_metadata(benchmark_family: str, dataset_key: str, train_steps: i
         "future_block_len": int(spec.future_block_len),
         "rollout_mode": "non_ar",
         "cond_dim": 0,
-        "split_stats": {
-            "cond_dim": 0,
-            "history_len": int(spec.history_len),
-        },
+        "split_stats": {"cond_dim": 0, "history_len": int(spec.history_len)},
     }
-    if benchmark_family == CONDITIONAL_GENERATION_FAMILY:
-        metadata["field_network_type"] = "transformer"
     return metadata
 
 
@@ -79,13 +63,11 @@ def _fake_checkpoint_signature(checkpoint_path: Path):
 
 
 class BackboneMatrixTests(unittest.TestCase):
-    def test_canonical_temporal_matrix_is_exactly_six_datasets(self) -> None:
+    def test_canonical_temporal_matrix_is_exactly_three_forecast_datasets(self) -> None:
         self.assertEqual(canonical_forecast_paper_dataset_keys(), FORECAST_KEYS)
-        self.assertEqual(canonical_conditional_generation_paper_dataset_keys(), CONDITIONAL_KEYS)
         self.assertEqual(tuple(ACTIVE_FORECAST_BACKBONE_BUDGETS), FORECAST_KEYS)
-        self.assertEqual(tuple(ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS), CONDITIONAL_KEYS)
 
-    def test_manifest_enumerates_all_30_active_target_artifacts(self) -> None:
+    def test_manifest_enumerates_all_15_active_target_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             payload = materialize_backbone_manifest(
                 matrix_root=Path(tmpdir) / "matrix",
@@ -94,16 +76,12 @@ class BackboneMatrixTests(unittest.TestCase):
                 molecule_group_root=Path(tmpdir) / "empty_molecule_groups",
                 write_path=Path(tmpdir) / "backbone_manifest.json",
             )
-        self.assertEqual(payload["artifact_count"], 30)
+        self.assertEqual(payload["artifact_count"], 15)
         self.assertEqual(payload["ready_count"], 0)
-        self.assertEqual(payload["missing_count"], 30)
+        self.assertEqual(payload["missing_count"], 15)
         self.assertTrue(all(artifact["backbone_name"] == BACKBONE_NAME_OTFLOW for artifact in payload["artifacts"]))
         active = {(row["benchmark_family"], row["dataset_key"]) for row in payload["artifacts"]}
-        self.assertEqual(
-            active,
-            {(FORECAST_FAMILY, key) for key in FORECAST_KEYS}
-            | {(CONDITIONAL_GENERATION_FAMILY, key) for key in CONDITIONAL_KEYS},
-        )
+        self.assertEqual(active, {(FORECAST_FAMILY, key) for key in FORECAST_KEYS})
 
     def test_manifest_loader_resolves_declared_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -124,9 +102,7 @@ class BackboneMatrixTests(unittest.TestCase):
                 ],
             }
             manifest_path.write_text(json.dumps(payload), encoding="utf-8")
-
             loaded = load_backbone_manifest(manifest_path)
-
         artifact = loaded["artifacts"][0]
         self.assertEqual(
             Path(artifact["checkpoint_path"]), root / "outputs" / "backbone_matrix" / "example" / "model.pt"
@@ -145,7 +121,6 @@ class BackboneMatrixTests(unittest.TestCase):
                 mount.symlink_to(storage, target_is_directory=True)
             except (OSError, NotImplementedError) as exc:
                 self.skipTest(f"directory symlinks are unavailable: {exc}")
-
             manifest_path = mount / "outputs" / "backbone_matrix" / "backbone_manifest.json"
             manifest_path.parent.mkdir(parents=True)
             manifest_path.write_text(
@@ -155,18 +130,12 @@ class BackboneMatrixTests(unittest.TestCase):
                         "path_base": "../..",
                         "artifact_count": 1,
                         "ready_count": 1,
-                        "artifacts": [
-                            {
-                                "checkpoint_path": "outputs/backbone_matrix/example/model.pt",
-                            }
-                        ],
+                        "artifacts": [{"checkpoint_path": "outputs/backbone_matrix/example/model.pt"}],
                     }
                 ),
                 encoding="utf-8",
             )
-
             loaded = load_backbone_manifest(manifest_path)
-
         self.assertEqual(
             Path(loaded["artifacts"][0]["checkpoint_path"]),
             mount / "outputs" / "backbone_matrix" / "example" / "model.pt",
@@ -186,10 +155,8 @@ class BackboneMatrixTests(unittest.TestCase):
             target = scratch_outputs / "backbone_matrix" / "example" / "model.pt"
             target.parent.mkdir(parents=True)
             target.write_bytes(b"ckpt")
-
             with patch("genode.data.otflow_paths.project_root", return_value=root):
                 display = display_project_path(target)
-
         self.assertEqual(display, "outputs/backbone_matrix/example/model.pt")
 
     def test_manifest_extends_temporal_grid_with_trainable_molecule_strata(self) -> None:
@@ -262,11 +229,10 @@ class BackboneMatrixTests(unittest.TestCase):
                 molecule_backbone_root=Path(tmpdir) / "molecule_backbones",
                 write_path=Path(tmpdir) / "backbone_manifest.json",
             )
-
-        self.assertEqual(payload["temporal_artifact_count"], 30)
+        self.assertEqual(sum(row["benchmark_family"] == FORECAST_FAMILY for row in payload["artifacts"]), 15)
         self.assertEqual(payload["molecule_stratum_count"], 2)
         self.assertEqual(payload["molecule_artifact_count"], 10)
-        self.assertEqual(payload["artifact_count"], 40)
+        self.assertEqual(payload["artifact_count"], 25)
         artifact = find_backbone_artifact(
             payload,
             backbone_name=BACKBONE_NAME_OTFLOW_MOLECULE,
@@ -299,12 +265,10 @@ class BackboneMatrixTests(unittest.TestCase):
             artifact_dir.mkdir(parents=True, exist_ok=True)
             (artifact_dir / "model.pt").write_bytes(b"ckpt")
             (artifact_dir / "checkpoint_metadata.json").write_text(
-                json.dumps(_checkpoint_metadata(FORECAST_FAMILY, "traffic_hourly", 20000)),
-                encoding="utf-8",
+                json.dumps(_checkpoint_metadata(FORECAST_FAMILY, "traffic_hourly", 20000)), encoding="utf-8"
             )
             with patch(
-                "genode.evaluation.fm_backbone_registry._checkpoint_signature",
-                side_effect=_fake_checkpoint_signature,
+                "genode.evaluation.fm_backbone_registry._checkpoint_signature", side_effect=_fake_checkpoint_signature
             ):
                 payload = materialize_backbone_manifest(
                     matrix_root=Path(tmpdir) / "matrix",
@@ -330,23 +294,19 @@ class BackboneMatrixTests(unittest.TestCase):
     def test_manifest_rejects_matching_length_autoregressive_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             imported_root = Path(tmpdir) / "imported"
-            artifact_dir = imported_root / CONDITIONAL_GENERATION_FAMILY / "cryptos" / "20k"
+            artifact_dir = imported_root / FORECAST_FAMILY / "traffic_hourly" / "20k"
             artifact_dir.mkdir(parents=True, exist_ok=True)
             (artifact_dir / "model.pt").write_bytes(b"ckpt")
             (artifact_dir / "checkpoint_metadata.json").write_text(
-                json.dumps(_checkpoint_metadata(CONDITIONAL_GENERATION_FAMILY, "cryptos", 20000)),
-                encoding="utf-8",
+                json.dumps(_checkpoint_metadata(FORECAST_FAMILY, "traffic_hourly", 20000)), encoding="utf-8"
             )
 
             def _ar_signature(checkpoint_path: Path):
                 signature, _ = _fake_checkpoint_signature(checkpoint_path)
                 signature["rollout_mode"] = "autoregressive"
-                return signature, None
+                return (signature, None)
 
-            with patch(
-                "genode.evaluation.fm_backbone_registry._checkpoint_signature",
-                side_effect=_ar_signature,
-            ):
+            with patch("genode.evaluation.fm_backbone_registry._checkpoint_signature", side_effect=_ar_signature):
                 readiness = build_backbone_readiness_audit(
                     matrix_root=Path(tmpdir) / "matrix",
                     otflow_reuse_root=Path(tmpdir) / "reuse",
@@ -357,25 +317,19 @@ class BackboneMatrixTests(unittest.TestCase):
                     write_path=Path(tmpdir) / "backbone_manifest.json",
                 )
                 payload = readiness["manifest"]
-
         rows = [
             row
             for row in payload["artifacts"]
-            if row["benchmark_family"] == CONDITIONAL_GENERATION_FAMILY and row["dataset_key"] == "cryptos"
+            if row["benchmark_family"] == FORECAST_FAMILY and row["dataset_key"] == "traffic_hourly"
         ]
         self.assertEqual(rows[0]["status"], "invalid")
         self.assertIn("checkpoint rollout_mode='autoregressive'", rows[0]["compatibility_error"])
 
-    def test_readiness_audit_normalizes_imported_backbones_and_reports_strict_30_grid_gaps(self) -> None:
+    def test_readiness_audit_normalizes_imported_backbones_and_reports_strict_15_grid_gaps(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             matrix_root = Path(tmpdir) / "matrix"
             imported_root = Path(tmpdir) / "imported"
-            missing = {
-                (FORECAST_FAMILY, "traffic_hourly", 4000),
-                (FORECAST_FAMILY, "weather_daily", 4000),
-                (CONDITIONAL_GENERATION_FAMILY, "lobster_synthetic", 4000),
-                (CONDITIONAL_GENERATION_FAMILY, "long_term_st", 8000),
-            }
+            missing = {(FORECAST_FAMILY, "traffic_hourly", 4000), (FORECAST_FAMILY, "weather_daily", 4000)}
 
             def _write_imported_artifact(benchmark_family: str, dataset_key: str, train_steps: int) -> None:
                 artifact_dir = imported_root / benchmark_family / dataset_key / f"{train_steps // 1000}k"
@@ -389,14 +343,8 @@ class BackboneMatrixTests(unittest.TestCase):
                 for train_steps in steps:
                     if (FORECAST_FAMILY, dataset_key, train_steps) not in missing:
                         _write_imported_artifact(FORECAST_FAMILY, dataset_key, train_steps)
-            for dataset_key, steps in ACTIVE_CONDITIONAL_GENERATION_BACKBONE_BUDGETS.items():
-                for train_steps in steps:
-                    if (CONDITIONAL_GENERATION_FAMILY, dataset_key, train_steps) not in missing:
-                        _write_imported_artifact(CONDITIONAL_GENERATION_FAMILY, dataset_key, train_steps)
-
             with patch(
-                "genode.evaluation.fm_backbone_registry._checkpoint_signature",
-                side_effect=_fake_checkpoint_signature,
+                "genode.evaluation.fm_backbone_registry._checkpoint_signature", side_effect=_fake_checkpoint_signature
             ):
                 readiness = build_backbone_readiness_audit(
                     matrix_root=matrix_root,
@@ -404,14 +352,12 @@ class BackboneMatrixTests(unittest.TestCase):
                     imported_backbone_root=imported_root,
                     molecule_group_root=Path(tmpdir) / "empty_molecule_groups",
                     dataset_root=Path(tmpdir) / "datasets",
-                    lobster_synthetic_profile_path=Path(tmpdir) / "lobster_profile.json",
                     write_path=Path(tmpdir) / "backbone_manifest.json",
                 )
-
-            self.assertEqual(readiness["manifest"]["artifact_count"], 30)
-            self.assertEqual(readiness["manifest"]["ready_count"], 26)
-            self.assertEqual(readiness["manifest"]["missing_count"], 4)
-            self.assertEqual(readiness["normalization"]["normalized_count"], 26)
+            self.assertEqual(readiness["manifest"]["artifact_count"], 15)
+            self.assertEqual(readiness["manifest"]["ready_count"], 13)
+            self.assertEqual(readiness["manifest"]["missing_count"], 2)
+            self.assertEqual(readiness["normalization"]["normalized_count"], 13)
             artifact = find_backbone_artifact(
                 readiness["manifest"],
                 backbone_name=BACKBONE_NAME_OTFLOW,
@@ -478,48 +424,9 @@ class BackboneMatrixTests(unittest.TestCase):
         ]
         enriched = augment_rows_with_relative_metrics(rows)
         by_schedule = {(row["train_steps"], row["schedule_name"]): row for row in enriched}
-        self.assertIsNone(by_schedule[(4000, "flowts_power_sampling")]["relative_score_gain_vs_uniform"])
         self.assertAlmostEqual(
-            by_schedule[(4000, "flowts_power_sampling")]["forecast_relative_crps_gain_vs_uniform"], 0.25
+            by_schedule[4000, "flowts_power_sampling"]["forecast_relative_crps_gain_vs_uniform"], 0.25
         )
-
-    def test_conditional_generation_relative_metrics_preserve_seed_paired_gain(self) -> None:
-        rows = [
-            {
-                "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
-                "split_phase": "locked_test",
-                "dataset": "cryptos",
-                "backbone_name": "otflow",
-                "checkpoint_id": "shared",
-                "train_steps": 20000,
-                "train_budget_label": "20k",
-                "target_nfe": 10,
-                "solver_key": "euler",
-                "scheduler_key": "uniform",
-                "seed": 0,
-                "score_main": 10.0,
-                "experiment_scope": "main",
-            },
-            {
-                "benchmark_family": CONDITIONAL_GENERATION_FAMILY,
-                "split_phase": "locked_test",
-                "dataset": "cryptos",
-                "backbone_name": "otflow",
-                "checkpoint_id": "shared",
-                "train_steps": 20000,
-                "train_budget_label": "20k",
-                "target_nfe": 10,
-                "solver_key": "euler",
-                "scheduler_key": "ays",
-                "seed": 0,
-                "score_main": 8.0,
-                "relative_score_gain_vs_uniform": -0.125,
-                "experiment_scope": "main",
-            },
-        ]
-        enriched = augment_rows_with_relative_metrics(rows)
-        by_schedule = {row["scheduler_key"]: row for row in enriched}
-        self.assertEqual(by_schedule["ays"]["relative_score_gain_vs_uniform"], -0.125)
 
 
 if __name__ == "__main__":

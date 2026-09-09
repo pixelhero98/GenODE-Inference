@@ -9,7 +9,7 @@ requests.
 GenODE requires Python 3.11 or newer. Create an isolated environment, then run:
 
 ```bash
-python -m pip install -e ".[medical,test]"
+python -m pip install -e ".[test]"
 python -m ruff check .
 python -m ruff format --check .
 python -m compileall -q src tests

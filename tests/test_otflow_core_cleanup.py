@@ -4,17 +4,12 @@ import random
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-from genode.data.otflow_datasets import L2FeatureMap, build_dataset_splits_from_arrays
-from genode.evaluation.otflow_evaluation_support import (
-    _forecast_example_detail_metadata,
-    load_checkpoint_model,
-    resolved_eval_windows,
-)
+from genode.data.otflow_datasets import build_dataset_splits_from_arrays
+from genode.evaluation.otflow_evaluation_support import _forecast_example_detail_metadata, load_checkpoint_model
 from genode.models.config import OTFlowConfig
 from genode.models.otflow_model import OTFLOW_TRACE_FIELDS, OTFlow
 from genode.models.otflow_train_val import _temporary_eval_seed, seed_all
@@ -22,6 +17,7 @@ from genode.models.otflow_train_val import _temporary_eval_seed, seed_all
 
 class OTFlowCoreCleanupTest(unittest.TestCase):
     def test_forecast_example_metadata_is_strict_and_row_metadata_wins(self) -> None:
+
         class Dataset:
             def example_metadata(self, example_idx: int):
                 self.requested = example_idx
@@ -38,12 +34,7 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         detail = _forecast_example_detail_metadata(
             dataset,
             7,
-            {
-                "series_id": "row-series",
-                "series_idx": 5,
-                "target_t": 34,
-                "history_start": 2,
-            },
+            {"series_id": "row-series", "series_idx": 5, "target_t": 34, "history_start": 2},
             dataset_key="requested-dataset",
             split_phase="locked_test",
         )
@@ -69,13 +60,7 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
                 raise RuntimeError("metadata failure")
 
         with self.assertRaisesRegex(RuntimeError, "metadata failure"):
-            _forecast_example_detail_metadata(
-                RaisingDataset(),
-                0,
-                {},
-                dataset_key="dataset",
-                split_phase="locked_test",
-            )
+            _forecast_example_detail_metadata(RaisingDataset(), 0, {}, dataset_key="dataset", split_phase="locked_test")
 
         class InvalidDataset:
             def example_metadata(self, example_idx: int):
@@ -83,105 +68,24 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
                 return ["not", "a", "mapping"]
 
         with self.assertRaisesRegex(TypeError, "must return a mapping"):
-            _forecast_example_detail_metadata(
-                InvalidDataset(),
-                0,
-                {},
-                dataset_key="dataset",
-                split_phase="locked_test",
-            )
-
-    def test_resolved_eval_windows_rejects_unknown_split(self) -> None:
-        with self.assertRaisesRegex(ValueError, "split must be 'val' or 'test'"):
-            resolved_eval_windows(SimpleNamespace(), "traffic_hourly", "training")
-
-    def test_l2_feature_map_rejects_invalid_constructor_values(self) -> None:
-        for levels in (0, -1, True, 1.5, "3"):
-            with self.subTest(levels=levels), self.assertRaisesRegex(ValueError, "levels must be a positive integer"):
-                L2FeatureMap(levels=levels)
-        for eps in (0.0, -1.0, float("nan"), True, "not-a-number"):
-            with self.subTest(eps=eps), self.assertRaisesRegex(ValueError, "eps must be finite and positive"):
-                L2FeatureMap(eps=eps)
-
-    def test_l2_feature_map_validates_every_input_shape_rank_and_value(self) -> None:
-        feature_map = L2FeatureMap(levels=3)
-        ask_p = np.asarray([[101.0, 102.0, 103.0], [101.5, 102.5, 103.5]], dtype=np.float32)
-        bid_p = np.asarray([[99.0, 98.0, 97.0], [99.5, 98.5, 97.5]], dtype=np.float32)
-        volume = np.ones((2, 3), dtype=np.float32)
-
-        params, mids = feature_map.encode_sequence(ask_p, volume, bid_p, volume)
-        self.assertEqual(params.shape, (2, 12))
-        self.assertEqual(mids.shape, (2,))
-
-        with self.assertRaisesRegex(ValueError, "ask_v shape"):
-            feature_map.encode_sequence(ask_p, volume[:, :2], bid_p, volume[:, :2])
-        with self.assertRaisesRegex(ValueError, "bid_p must be a rank-2 array"):
-            feature_map.encode_sequence(ask_p, volume, bid_p.reshape(-1), volume)
-        with self.assertRaisesRegex(ValueError, "ask_p must contain at least one row"):
-            feature_map.encode_sequence(ask_p[:0], volume[:0], bid_p[:0], volume[:0])
-        complex_prices = ask_p.astype(np.complex64)
-        with self.assertRaisesRegex(ValueError, "ask_p must have a real numeric dtype"):
-            feature_map.encode_sequence(complex_prices, volume, bid_p, volume)
-        nonfinite = volume.copy()
-        nonfinite[0, 0] = np.nan
-        with self.assertRaisesRegex(ValueError, "bid_v must contain only finite values"):
-            feature_map.encode_sequence(ask_p, volume, bid_p, nonfinite)
-        with self.assertRaisesRegex(ValueError, "L2 input has 3 levels; expected 2"):
-            L2FeatureMap(levels=2).encode_sequence(ask_p, volume, bid_p, volume)
-
-    def test_l2_feature_map_decode_uses_explicit_dimension_and_finiteness_checks(self) -> None:
-        feature_map = L2FeatureMap(levels=3)
-        with self.assertRaisesRegex(ValueError, "params must be a rank-2 array"):
-            feature_map.decode_sequence(np.zeros(12, dtype=np.float32), init_mid=100.0)
-        with self.assertRaisesRegex(ValueError, "params must contain at least one row"):
-            feature_map.decode_sequence(np.zeros((0, 12), dtype=np.float32), init_mid=100.0)
-        with self.assertRaisesRegex(ValueError, "params must have a real numeric dtype"):
-            feature_map.decode_sequence(np.zeros((2, 12), dtype=np.complex64), init_mid=100.0)
-        with self.assertRaisesRegex(ValueError, r"expected exactly 4 \* levels = 12"):
-            feature_map.decode_sequence(np.zeros((2, 8), dtype=np.float32), init_mid=100.0)
-        nonfinite = np.zeros((2, 12), dtype=np.float32)
-        nonfinite[0, 0] = np.inf
-        with self.assertRaisesRegex(ValueError, "params must contain only finite values"):
-            feature_map.decode_sequence(nonfinite, init_mid=100.0)
-        with self.assertRaisesRegex(ValueError, "init_mid must be finite"):
-            feature_map.decode_sequence(np.zeros((2, 12), dtype=np.float32), init_mid=float("nan"))
-        with self.assertRaisesRegex(ValueError, "init_mid must be finite"):
-            feature_map.decode_sequence(np.zeros((2, 12), dtype=np.float32), init_mid="not-a-number")
-        overflowing = np.zeros((2, 12), dtype=np.float32)
-        overflowing[:, 6:] = 1_000.0
-        with self.assertRaisesRegex(ValueError, "Decoded L2 values exceed"):
-            feature_map.decode_sequence(overflowing, init_mid=100.0)
+            _forecast_example_detail_metadata(InvalidDataset(), 0, {}, dataset_key="dataset", split_phase="locked_test")
 
     def test_split_builder_rejects_state_width_before_constructing_datasets(self) -> None:
         cfg = self._cfg()
         with self.assertRaisesRegex(ValueError, "does not match cfg.snapshot_dim=8"):
-            build_dataset_splits_from_arrays(
-                np.zeros((64, 7), dtype=np.float32),
-                np.zeros(64, dtype=np.float32),
-                cfg,
-            )
+            build_dataset_splits_from_arrays(np.zeros((64, 7), dtype=np.float32), np.zeros(64, dtype=np.float32), cfg)
         with self.assertRaisesRegex(ValueError, "finite real numeric values"):
-            build_dataset_splits_from_arrays(
-                np.zeros((64, 8), dtype=np.complex64),
-                np.zeros(64, dtype=np.float32),
-                cfg,
-            )
+            build_dataset_splits_from_arrays(np.zeros((64, 8), dtype=np.complex64), np.zeros(64, dtype=np.float32), cfg)
         with self.assertRaisesRegex(ValueError, "finite real numeric values"):
-            build_dataset_splits_from_arrays(
-                np.zeros((64, 8), dtype=np.float32),
-                np.zeros(64, dtype=np.complex64),
-                cfg,
-            )
+            build_dataset_splits_from_arrays(np.zeros((64, 8), dtype=np.float32), np.zeros(64, dtype=np.complex64), cfg)
 
     def test_seed_all_normalizes_generated_seed_above_numpy_limit(self) -> None:
         seed_all(2**32 + 123)
         np_draw = float(np.random.random())
         torch_draw = torch.rand(1)
-
         seed_all(123)
         self.assertEqual(np_draw, float(np.random.random()))
         self.assertTrue(torch.equal(torch_draw, torch.rand(1)))
-
         seed_all(2**32 + 123)
         self.assertEqual(np_draw, float(np.random.random()))
         self.assertTrue(torch.equal(torch_draw, torch.rand(1)))
@@ -193,12 +97,10 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         py_before = random.getstate()
         np_before = np.random.get_state()
         torch_before = torch.random.get_rng_state()
-
         with _temporary_eval_seed(2**32 + 123):
             py_draw = random.random()
             np_draw = float(np.random.random())
             torch_draw = torch.rand(1)
-
         py_after = random.getstate()
         np_after = np.random.get_state()
         torch_after = torch.random.get_rng_state()
@@ -207,7 +109,6 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         self.assertTrue(np.array_equal(np_before[1], np_after[1]))
         self.assertEqual(np_before[2:], np_after[2:])
         self.assertTrue(torch.equal(torch_before, torch_after))
-
         with _temporary_eval_seed(123):
             self.assertEqual(py_draw, random.random())
             self.assertEqual(np_draw, float(np.random.random()))
@@ -238,9 +139,7 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         model = OTFlow(cfg)
         hist = torch.randn(3, cfg.history_len, cfg.context_dim)
         x = torch.randn(3, cfg.snapshot_dim)
-
         loss, logs = model.loss(x, hist)
-
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(set(logs), {"mean", "ot_cost", "ot_used", "loss"})
         self.assertEqual(logs["ot_used"], 1.0)
@@ -251,9 +150,7 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         model = OTFlow(cfg)
         hist = torch.randn(3, cfg.history_len, cfg.context_dim)
         x = torch.randn(3, cfg.snapshot_dim)
-
         _, logs = model.loss(x, hist)
-
         self.assertEqual(logs["ot_used"], 0.0)
         self.assertEqual(logs["ot_cost"], 0.0)
 
@@ -264,9 +161,7 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         hist = torch.randn(2, cfg.history_len, cfg.context_dim)
         x = torch.randn(2, cfg.snapshot_dim)
         fut = torch.randn(2, 1, cfg.snapshot_dim)
-
         loss, logs = model.loss(x, hist, fut=fut)
-
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(set(logs), {"mean", "ot_cost", "ot_used", "loss"})
 
@@ -274,7 +169,6 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         cfg = self._cfg(use_minibatch_ot=True)
         model = OTFlow(cfg)
         hist = torch.randn(2, cfg.history_len, cfg.context_dim)
-
         for requested, canonical, evaluations_per_step in (
             ("euler", "euler", 1.0),
             ("dpm++2m", "dpmpp2m", 1.0),
@@ -284,7 +178,6 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
             with self.subTest(solver=requested):
                 torch.manual_seed(4)
                 sample, trace = model.sample_trace(hist, steps=4, solver=requested)
-
                 self.assertEqual(tuple(sample.shape), (2, cfg.snapshot_dim))
                 self.assertEqual(tuple(trace), OTFLOW_TRACE_FIELDS)
                 self.assertEqual(trace["solver"], canonical)
@@ -297,7 +190,6 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         cfg = self._cfg(use_minibatch_ot=False)
         model = OTFlow(cfg)
         hist = torch.randn(1, cfg.history_len, cfg.context_dim)
-
         for solver in (
             "dopri5",
             "dopri5_adaptive",
@@ -333,7 +225,6 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         )
         state = dict(model.state_dict())
         state["backbone.conditioner.h_mlp.net.0.weight"] = torch.zeros(16, 16)
-
         with tempfile.TemporaryDirectory() as tmp_dir:
             ckpt_path = Path(tmp_dir) / "model.pt"
             torch.save({"cfg": cfg_dict, "model_state": state}, ckpt_path)
@@ -346,7 +237,6 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
         model = OTFlow(cfg)
         state = dict(model.state_dict())
         state["backbone.conditioner.h_mlp.net.0.weight"] = torch.zeros(16, 16)
-
         with tempfile.TemporaryDirectory() as tmp_dir:
             ckpt_path = Path(tmp_dir) / "model.pt"
             torch.save({"cfg": cfg.to_dict(), "model_state": state}, ckpt_path)
@@ -365,18 +255,16 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
                 "timegan_supervision_weight": 10.0,
                 "timegan_moment_weight": 10.0,
                 "kovae_pred_weight": 1.0,
-                "kovae_ridge": 1e-3,
+                "kovae_ridge": 0.001,
                 "gan_noise_dim": 64,
                 "cgan_recon_weight": 5.0,
             }
         )
         cfg_dict["nf"] = {"flow_layers": 6, "flow_scale_clip": 2.0, "share_coupling_backbone": True}
-
         with tempfile.TemporaryDirectory() as tmp_dir:
             ckpt_path = Path(tmp_dir) / "model.pt"
             torch.save({"cfg": cfg_dict, "model_state": model.state_dict()}, ckpt_path)
             loaded, loaded_cfg = load_checkpoint_model(ckpt_path, torch.device("cpu"))
-
         self.assertIsInstance(loaded, OTFlow)
         self.assertFalse(hasattr(loaded_cfg.model, "baseline_latent_dim"))
 
