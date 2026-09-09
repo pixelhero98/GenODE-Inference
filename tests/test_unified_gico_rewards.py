@@ -50,6 +50,23 @@ def paired_rows(*, task="traffic_hourly"):
     return rows
 
 
+def test_solver_alias_rejected_before_fitting():
+    rows, contexts = reference_evidence()
+    for row in rows:
+        row["solver"] = "Euler"
+    with pytest.raises(ValueError, match="canonical name"):
+        prepare_evidence(rows, contexts)
+
+
+def test_log_improvement_does_not_overflow_for_finite_extreme_metrics():
+    calibration = calibrate_rewards(paired_rows())
+    calibration = RewardCalibration(**{**calibration.to_payload(), "floors": (1e-300, 1e-300)})
+    rows = paired_rows()
+    for row in rows:
+        row["metrics"] = dict.fromkeys(("crps", "mase"), 1e300 if row["schedule_key"] == "uniform" else 1e-300)
+    assert all(np.isfinite(row["reward"]) for row in construct_rewards(rows, calibration))
+
+
 def reference_evidence(*, task="traffic_hourly", complete=True):
     rows, contexts = [], {}
     keys = REFERENCE_KEYS if complete else ("uniform", "late_p_3", "late_p_3_reversed")

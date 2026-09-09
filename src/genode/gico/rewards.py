@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from genode.solver_protocol import normalize_solver_key
+
 TASK_METRICS = {
     "solar_energy_10m": ("crps", "mase"),
     "traffic_hourly": ("crps", "mase"),
@@ -35,7 +37,7 @@ def _balanced_std(values: np.ndarray, nfes: np.ndarray) -> np.ndarray:
     return np.sqrt(np.sum((values - mean) ** 2 * weights[:, None], axis=0))
 
 
-def _paired_cells(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _paired_cells(rows: list[dict[str, Any]], *, varying_clocks: bool = False) -> list[dict[str, Any]]:
     """Pair before averaging repeats. Never silently intersect seed panels."""
     if not rows:
         raise ValueError("Reward evidence is empty.")
@@ -60,6 +62,8 @@ def _paired_cells(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             raise ValueError(f"Measurement is missing pairing fields: {sorted(missing)}")
         if row["task"] not in TASK_METRICS:
             raise ValueError(f"Unsupported reward task: {row['task']!r}")
+        if row["solver"] != normalize_solver_key(row["solver"]):
+            raise ValueError("Measurement solver must use its canonical name.")
         if row["split"] not in (*FIT_SPLITS, "validation", "test"):
             raise ValueError("Measurements require an explicit train/calibration/validation/test split.")
         for key in ("nfe", "ensemble_size"):
@@ -114,9 +118,13 @@ def _paired_cells(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cell["seeds"] = sorted(r["seed"] for r in repeats)
         cell["reference_ids"] = {str(r["seed"]): r["reference_id"] for r in repeats}
         cell.pop("seed")
-        # Density and measurement semantics may not change between repeats.
+        # Fixed-reference fitting requires one density. Policy evaluation can
+        # average independent clocks after validating every executed member.
         for r in repeats[1:]:
-            for field in ("density_mass", "time_grid", "measurement_protocol", "ensemble_size"):
+            fields = ("measurement_protocol", "ensemble_size")
+            if not varying_clocks:
+                fields += ("density_mass", "time_grid", "sample_clocks")
+            for field in fields:
                 if r.get(field) != first.get(field):
                     raise ValueError(f"Repeated measurements disagree on {field}.")
         cells.append(cell)
@@ -165,7 +173,7 @@ class RewardCalibration:
             candidate = cell.get("reward_metrics", cell["metrics"])[key]
             anchor = cell.get("anchor_reward_metrics", cell["anchor_metrics"])[key]
             if key in LOG_METRICS:
-                value = np.log((anchor + floor) / (candidate + floor))
+                value = np.log(anchor + floor) - np.log(candidate + floor)
             else:
                 value = ((anchor - candidate) if key == "kid" else (candidate - anchor)) / scale
             values.append(value)
@@ -236,8 +244,10 @@ def calibrate_rewards(rows: list[dict], *, component_calibration_rows: list[dict
     return RewardCalibration(**common, reward_scale=float(_balanced_std(scalar, nfes)[0]))
 
 
-def construct_rewards(rows: list[dict], calibration: RewardCalibration) -> list[dict]:
-    cells = _paired_cells(rows)
+def construct_rewards(rows: list[dict], calibration: RewardCalibration, *, varying_clocks: bool = False) -> list[dict]:
+    if varying_clocks and any(r.get("split") not in ("validation", "test") for r in rows):
+        raise ValueError("Varying clocks are supported only for policy evaluation.")
+    cells = _paired_cells(rows, varying_clocks=varying_clocks)
     for cell in cells:
         vector = calibration.vector(cell)
         cell["reward_vector"] = vector.tolist()

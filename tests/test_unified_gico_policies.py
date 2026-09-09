@@ -186,6 +186,18 @@ def test_unsupported_score_weights_and_invalid_densities_fail():
         materialize(np.full(64, 1 / 64), "heun", 3)
 
 
+def test_teacher_reference_weights_clip_scores_before_temperature_one_softmax():
+    from genode.gico.training import teacher_weights
+
+    class Scores(torch.nn.Module):
+        def forward(self, condition, mass):
+            return torch.tensor([[-100.0], [0.0], [100.0]])
+
+    weights = teacher_weights(Scores(), torch.zeros(3, 1), torch.full((3, 64), 1 / 64))
+    torch.testing.assert_close(weights, torch.tensor([-5.0, 0.0, 5.0]).softmax(0))
+    assert bool((weights > 0).all())
+
+
 @pytest.fixture(scope="module")
 def untrained_artifact(tmp_path_factory):
     rows, contexts = reference_evidence()

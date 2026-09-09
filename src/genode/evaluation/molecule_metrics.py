@@ -246,10 +246,14 @@ def _sample_molecule_ar_rollout(
         context = ds.context_features_from_history_coords(history_coords)
         embedding = _molecule_context_embedding(model=model, ds=ds, item={"context": context}, device=device)
         target_nfe = int(nfe) * solver_eval_multiplier(solver)
-        grid = policy.materialize(embedding, solver, target_nfe, seed=clock_seed, request_id=clock_request_id)
+        from genode.gico.clocks import materialize
+
+        mass = policy.density(embedding, solver, target_nfe, seed=clock_seed, request_id=clock_request_id)
+        grid = materialize(mass, solver, target_nfe)
         if clock_records is not None:
             clock_records.append(
                 {
+                    "density_mass": mass.tolist(),
                     "time_grid": list(grid),
                     "clock_seed": clock_seed,
                     "request_id": clock_request_id,

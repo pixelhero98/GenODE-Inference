@@ -18,6 +18,8 @@ from genode.gico.train_gico import read_rows
 
 
 def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> dict:
+    if split not in ("validation", "test"):
+        raise ValueError("Reports require validation or test data.")
     if not rows or any(r["split"] != split for r in rows):
         raise ValueError(f"Reporting requires {split} measurements exclusively.")
     forbidden = set(policy.metadata["split_contexts"]["train"])
@@ -30,12 +32,35 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
     for row in rows:
         if row["solver"] not in policy.metadata["solvers"]:
             raise ValueError("Report solver is absent from the frozen artifact.")
-        verify_measurement_clock(row)
+        if row["measurement_protocol"] not in policy.metadata["measurement_protocols"]:
+            raise ValueError("Report measurement protocol differs from the frozen calibration.")
+        if row.get("backbone_binding") != policy.metadata.get("backbone_binding"):
+            raise ValueError("Report native backbone binding differs from the frozen artifact.")
+        if (
+            row["task"].startswith("molecule_")
+            and row.get("molecule_feature_map") not in policy.metadata.get("molecular_feature_maps", {}).values()
+        ):
+            raise ValueError("Report molecular feature map differs from the frozen training map.")
+        if "policy_sha256" in row and (
+            row["policy_sha256"] != policy.artifact_sha256 or row.get("student_kind") != policy.student_kind
+        ):
+            raise ValueError("Report policy identity/student kind differs from the selected artifact.")
+        if "sample_clocks" in row:
+            if "density_mass" in row or "time_grid" in row:
+                raise ValueError("Declare either a fixed clock or sample_clocks, not both.")
+            if len(row["sample_clocks"]) != row["ensemble_size"]:
+                raise ValueError("Report requires exactly one clock per ensemble member.")
+            for clock in row["sample_clocks"]:
+                verify_measurement_clock(
+                    {**row, "density_mass": clock["density_mass"], "time_grid": clock["time_grid"]}
+                )
+        else:
+            verify_measurement_clock(row)
     groups = defaultdict(list)
     for solver, calibration in policy.metadata["reward_calibrations"].items():
         subset = [r for r in rows if r["solver"] == solver]
         if subset:
-            for row in construct_rewards(subset, RewardCalibration.from_payload(calibration)):
+            for row in construct_rewards(subset, RewardCalibration.from_payload(calibration), varying_clocks=True):
                 groups[(solver, row["nfe"], row["schedule_key"])].append(row)
     output = []
     for (solver, nfe, schedule), cells in sorted(groups.items()):

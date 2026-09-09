@@ -25,7 +25,7 @@ from genode.schedule_transfer.otflow_paper_registry import (
     paper_schedule_specs,
     paper_solver_specs,
 )
-from genode.schedule_transfer.otflow_signal_traces import NATIVE_INFO_GROWTH_TRACE_KEY, NATIVE_SIGNAL_TRACE_KEYS
+from genode.schedule_transfer.otflow_signal_traces import NATIVE_INFO_GROWTH_TRACE_KEY
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -351,7 +351,6 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
 
     def test_native_hardness_trace_is_info_growth(self) -> None:
         self.assertEqual(NATIVE_INFO_GROWTH_TRACE_KEY, "info_growth_hardness_by_step")
-        self.assertIn("info_growth_hardness_by_step", NATIVE_SIGNAL_TRACE_KEYS)
 
     def test_runner_dry_run_writes_combined_summary(self) -> None:
         manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"

@@ -15,7 +15,6 @@ CANONICAL_SEEN_NFES: tuple[int, ...] = (4, 8, 12, 16)
 CANONICAL_UNSEEN_NFES: tuple[int, ...] = (6, 10, 14, 20)
 CANONICAL_CHECKPOINT_STEPS: tuple[int, ...] = (4000, 8000, 12000, 16000, 20000)
 CANONICAL_CONTEXT_SAMPLE_COUNT = 188
-CANONICAL_UNSEEN_TARGET_WEIGHT = 0.25
 NFE_ROLE_SEEN = "seen"
 NFE_ROLE_UNSEEN = "unseen"
 NFE_ROLES: tuple[str, ...] = (NFE_ROLE_SEEN, NFE_ROLE_UNSEEN)
@@ -26,19 +25,10 @@ MOLECULE_SCENARIO_KEYS: tuple[str, ...] = ("molecule_3d_set1", "molecule_3d_set2
 CANONICAL_SCENARIO_KEYS: tuple[str, ...] = (*FORECAST_SCENARIO_KEYS, *MOLECULE_SCENARIO_KEYS)
 PHYSICAL_SCHEDULE_KEYS: tuple[str, ...] = REFERENCE_CLOCK_BASE_KEYS
 REVERSED_SCHEDULE_KEYS: tuple[str, ...] = REFERENCE_CLOCK_REVERSED_KEYS
-AVERAGED_REVERSED_SCHEDULE_KEYS: tuple[str, ...] = ()
 CANONICAL_SUPERVISION_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
 REVERSED_SCHEDULE_BASE: Mapping[str, str] = {key: key.removesuffix("_reversed") for key in REVERSED_SCHEDULE_KEYS}
-AVERAGED_SCHEDULE_COMPONENTS: Mapping[str, tuple[str, str]] = {}
 SCHEDULE_FAMILY_PHYSICAL = "physical"
 SCHEDULE_FAMILY_REVERSED = "reversed"
-SCHEDULE_FAMILY_AVERAGED_REVERSED = "averaged_reversed"
-STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT = "seen_only_zero_shot"
-STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS = "seen_plus_unseen_targets"
-STUDENT_TRAINING_MODES: tuple[str, ...] = (
-    STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT,
-    STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS,
-)
 
 
 @dataclass(frozen=True)
@@ -84,16 +74,11 @@ def schedule_family_for_key(schedule_key: str) -> str:
         return SCHEDULE_FAMILY_PHYSICAL
     if key in REVERSED_SCHEDULE_KEYS:
         return SCHEDULE_FAMILY_REVERSED
-    if key in AVERAGED_REVERSED_SCHEDULE_KEYS:
-        return SCHEDULE_FAMILY_AVERAGED_REVERSED
     return "generated"
 
 
 def density_source_key_for_schedule(schedule_key: str) -> str:
     key = str(schedule_key).strip()
-    if key in AVERAGED_SCHEDULE_COMPONENTS:
-        left, right = AVERAGED_SCHEDULE_COMPONENTS[key]
-        return f"{left}+{right}"
     if key in REVERSED_SCHEDULE_BASE:
         return REVERSED_SCHEDULE_BASE[key]
     return key
@@ -110,18 +95,14 @@ def canonical_layout_summary() -> dict[str, object]:
         "scenario_keys": list(CANONICAL_SCENARIO_KEYS),
         "physical_schedule_keys": list(PHYSICAL_SCHEDULE_KEYS),
         "reversed_schedule_keys": list(REVERSED_SCHEDULE_KEYS),
-        "averaged_reversed_schedule_keys": list(AVERAGED_REVERSED_SCHEDULE_KEYS),
         "supervision_schedule_keys": list(CANONICAL_SUPERVISION_SCHEDULE_KEYS),
     }
 
 
 __all__ = [
-    "AVERAGED_REVERSED_SCHEDULE_KEYS",
-    "AVERAGED_SCHEDULE_COMPONENTS",
     "CANONICAL_CHECKPOINT_STEPS",
     "CANONICAL_CONTEXT_SAMPLE_COUNT",
     "CANONICAL_LAYOUT_VERSION",
-    "CANONICAL_UNSEEN_TARGET_WEIGHT",
     "CANONICAL_SCENARIO_KEYS",
     "CANONICAL_SEEN_NFES",
     "CANONICAL_SOLVER_KEYS",
@@ -137,12 +118,8 @@ __all__ = [
     "REVERSED_SCHEDULE_KEYS",
     "SCENARIO_FAMILY_FORECAST",
     "SCENARIO_FAMILY_MOLECULE",
-    "SCHEDULE_FAMILY_AVERAGED_REVERSED",
     "SCHEDULE_FAMILY_PHYSICAL",
     "SCHEDULE_FAMILY_REVERSED",
-    "STUDENT_TRAINING_MODE_SEEN_ONLY_ZERO_SHOT",
-    "STUDENT_TRAINING_MODE_SEEN_PLUS_UNSEEN_TARGETS",
-    "STUDENT_TRAINING_MODES",
     "ScenarioSpec",
     "canonical_layout_summary",
     "canonical_nfes_for_role",

@@ -131,6 +131,11 @@ jobs:
                   rb"genode-build-(?:ser-" rb"ptg-reference|ptg-figure)",
                   re.IGNORECASE,
               ),
+              "retired temporal task": re.compile(
+                  rb"top_" rb"book|lob_" rb"conditional_generation|"
+                  rb"otflow_medical_" rb"datasets|otflow_medical_" rb"constants",
+                  re.IGNORECASE,
+              ),
               "credential": re.compile(
                   rb"AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
                   rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"

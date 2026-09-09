@@ -34,11 +34,6 @@ from genode.models.conditioning import FROZEN_BACKBONE_POLICY_CONTEXT_PROTOCOL, 
 from genode.models.otflow_model import OTFlow
 from genode.models.otflow_train_val import save_json, seed_all
 from genode.runtime import ProgressBar
-from genode.schedule_transfer.otflow_signal_traces import (
-    NATIVE_INFO_GROWTH_TRACE_KEY,
-    compute_info_growth_hardness_numpy,
-    resolved_info_growth_scale,
-)
 from genode.solver_protocol import (
     CANONICAL_SOLVER_KEYS,
     CANONICAL_SOLVER_RUNTIME_NAMES,
@@ -373,18 +368,6 @@ def solver_experiment_scope(solver_key: str) -> str:
     return "solver_transfer" if str(solver_key) == "dpmpp2m" else "main"
 
 
-def resolve_reference_macro_steps(
-    requested_macro_steps: int, runtime_nfe: int, *, reference_macro_factor: float = 4.0
-) -> int:
-    requested = int(requested_macro_steps)
-    if requested > 0:
-        return requested
-    factor = float(reference_macro_factor)
-    if factor <= 0.0:
-        raise ValueError(f"reference_macro_factor must be positive, got {reference_macro_factor}")
-    return max(32, int(round(factor * int(runtime_nfe))))
-
-
 def _resolved_backbone_manifest_path(cli_args: argparse.Namespace) -> Path | None:
     raw = str(getattr(cli_args, "backbone_manifest", "") or "").strip()
     if not raw:
@@ -496,35 +479,6 @@ def validate_execution_preflight(cli_args: argparse.Namespace) -> None:
             )
     if errors:
         raise RuntimeError("Execution preflight failed:\n- " + "\n- ".join(errors))
-
-
-def _rankdata_average(values: Sequence[float]) -> np.ndarray:
-    arr = np.asarray(values, dtype=np.float64)
-    order = np.argsort(arr, kind="mergesort")
-    ranks = np.zeros(arr.shape[0], dtype=np.float64)
-    start = 0
-    while start < order.size:
-        end = start
-        while end + 1 < order.size and abs(float(arr[order[end + 1]]) - float(arr[order[start]])) <= 1e-12:
-            end += 1
-        avg_rank = 0.5 * (float(start + 1) + float(end + 1))
-        for idx in range(start, end + 1):
-            ranks[order[idx]] = float(avg_rank)
-        start = end + 1
-    return ranks
-
-
-def safe_spearman(x: Sequence[float], y: Sequence[float]) -> float:
-    x_arr = np.asarray(x, dtype=np.float64)
-    y_arr = np.asarray(y, dtype=np.float64)
-    if x_arr.size < 2 or y_arr.size < 2 or x_arr.size != y_arr.size:
-        return float("nan")
-    if np.allclose(x_arr, x_arr[0]) or np.allclose(y_arr, y_arr[0]):
-        return float("nan")
-    x_rank = _rankdata_average(x_arr)
-    y_rank = _rankdata_average(y_arr)
-    corr = np.corrcoef(x_rank, y_rank)[0, 1]
-    return float(corr)
 
 
 def resolved_eval_horizon(cli_args: argparse.Namespace, dataset: str) -> int:
@@ -851,99 +805,6 @@ def load_forecast_checkpoint_splits(
     }
 
 
-def collect_forecast_calibration(
-    model: OTFlow,
-    ds_val,
-    cfg,
-    *,
-    macro_steps: int,
-    solver_name: str,
-    seed: int,
-    calibration_trace_samples: int = 1,
-    info_growth_scale_multiplier: float = 1.0,
-) -> dict[str, Any]:
-    trace_samples = int(calibration_trace_samples)
-    if trace_samples <= 0:
-        raise ValueError(f"calibration_trace_samples must be positive, got {calibration_trace_samples}")
-    reference_time_grid: np.ndarray | None = None
-    disagreement_rows: list[np.ndarray] = []
-    residual_rows: list[np.ndarray] = []
-    oracle_rows: list[np.ndarray] = []
-    trace_rows: list[dict[str, Any]] = []
-    device = cfg.train.device
-    for example_idx in range(len(ds_val)):
-        hist_t, _, _, _ = _parse_forecast_batch(ds_val[int(example_idx)])
-        hist = hist_t[None].to(device).float()
-        disagreement_samples: list[np.ndarray] = []
-        residual_samples: list[np.ndarray] = []
-        oracle_samples: list[np.ndarray] = []
-        for sample_idx in range(trace_samples):
-            seed_all(int(seed) + int(example_idx) + 1000000 * int(sample_idx))
-            _, trace = model.sample_future_trace(
-                hist, steps=int(macro_steps), solver=str(solver_name), oracle_local_error=True
-            )
-            grid = trace["time_grid"].detach().cpu().numpy().astype(np.float64)
-            if reference_time_grid is None:
-                reference_time_grid = grid
-            elif not np.allclose(reference_time_grid, grid, atol=1e-08, rtol=1e-08):
-                raise ValueError("Forecast calibration trace time grids must match across validation examples.")
-            disagreement_samples.append(trace["disagreement"][0].detach().cpu().numpy().astype(np.float64))
-            residual_samples.append(trace["residual_norm"][0].detach().cpu().numpy().astype(np.float64))
-            oracle_samples.append(trace["oracle_local_error"][0].detach().cpu().numpy().astype(np.float64))
-        disagreement = np.stack(disagreement_samples, axis=0).mean(axis=0)
-        residual = np.stack(residual_samples, axis=0).mean(axis=0)
-        oracle = np.stack(oracle_samples, axis=0).mean(axis=0)
-        disagreement_rows.append(disagreement)
-        residual_rows.append(residual)
-        oracle_rows.append(oracle)
-        for step_idx, (disagreement_value, residual_value, oracle_value) in enumerate(
-            zip(disagreement.tolist(), residual.tolist(), oracle.tolist(), strict=False)
-        ):
-            trace_rows.append(
-                {
-                    "example_index": int(example_idx),
-                    "step_index": int(step_idx),
-                    "disagreement": float(disagreement_value),
-                    "residual_norm": float(residual_value),
-                    "oracle_local_error": float(oracle_value),
-                }
-            )
-    if not disagreement_rows:
-        raise ValueError("Forecast validation split is empty; cannot calibrate native info-growth trace.")
-    disagreement_arr = np.stack(disagreement_rows, axis=0)
-    residual_arr = np.stack(residual_rows, axis=0)
-    oracle_arr = np.stack(oracle_rows, axis=0)
-    base_scale = resolved_info_growth_scale(residual_arr.reshape(-1))
-    effective_scale = float(base_scale) * float(info_growth_scale_multiplier)
-    if effective_scale <= 0.0:
-        raise ValueError(f"info_growth_scale_multiplier must keep scale positive, got {info_growth_scale_multiplier}")
-    info_growth_arr = compute_info_growth_hardness_numpy(residual_arr, disagreement_arr, scale=float(effective_scale))
-    if reference_time_grid is None:
-        reference_time_grid = np.linspace(0.0, 1.0, int(macro_steps) + 1, dtype=np.float64)
-    corr_signal = info_growth_arr[:, 1:].reshape(-1)
-    corr_oracle = oracle_arr[:, 1:].reshape(-1)
-    return {
-        "macro_steps": int(macro_steps),
-        "solver": str(solver_name),
-        "n_windows": int(info_growth_arr.shape[0]),
-        "calibration_trace_samples": int(trace_samples),
-        "reference_time_grid": [float(value) for value in reference_time_grid.tolist()],
-        "reference_time_alignment": "left_endpoint",
-        "base_info_growth_scale": float(base_scale),
-        "info_growth_scale": float(effective_scale),
-        "info_growth_scale_multiplier": float(info_growth_scale_multiplier),
-        "rows": trace_rows,
-        "disagreement_by_step": [float(value) for value in disagreement_arr.mean(axis=0).tolist()],
-        "residual_norm_by_step": [float(value) for value in residual_arr.mean(axis=0).tolist()],
-        "oracle_local_error_by_step": [float(value) for value in oracle_arr.mean(axis=0).tolist()],
-        NATIVE_INFO_GROWTH_TRACE_KEY: [float(value) for value in info_growth_arr.mean(axis=0).tolist()],
-        "signal_correlations_vs_oracle": {
-            NATIVE_INFO_GROWTH_TRACE_KEY: {"spearman": safe_spearman(corr_signal, corr_oracle)}
-        },
-    }
-
-
-@torch.no_grad()
 def evaluate_forecast_schedule(
     model: OTFlow,
     ds,
@@ -1091,21 +952,34 @@ def evaluate_forecast_schedule(
                             ]
                 chunk_draws: list[np.ndarray] = []
                 sample_time_grids = []
+                sample_clocks = []
                 for sample_idx in range(int(num_eval_samples)):
                     seed_all(int(evaluation_seed) + 1000000 * int(chunk_start) + int(sample_idx))
                     if device.type == "cuda" and torch.cuda.is_available():
                         torch.cuda.synchronize(device)
                     start = time.perf_counter()
                     if policy is not None:
-                        grid = policy.materialize(
+                        from genode.gico.clocks import materialize
+
+                        request_id = f"{chunk_context_ids[0]}:{logical_panel_seed}:member:{sample_idx}"
+                        mass = policy.density(
                             chunk_context_embeddings[0],
                             solver_name,
                             resolved_target_nfe,
                             seed=clock_seed,
-                            request_id=f"{chunk_context_ids[0]}:{logical_panel_seed}:member:{sample_idx}",
+                            request_id=request_id,
                         )
+                        grid = materialize(mass, solver_name, resolved_target_nfe)
                         _apply_sample_overrides(model, cfg, time_grid=grid)
                         sample_time_grids.append(list(grid))
+                        sample_clocks.append(
+                            {
+                                "density_mass": mass.tolist(),
+                                "time_grid": list(grid),
+                                "clock_seed": clock_seed,
+                                "request_id": request_id,
+                            }
+                        )
                     pred_norm = model.sample_future(hist, steps=int(runtime_nfe), solver=str(solver_name))
                     if device.type == "cuda" and torch.cuda.is_available():
                         torch.cuda.synchronize(device)
@@ -1177,7 +1051,9 @@ def evaluate_forecast_schedule(
                                 "axis_flags": "",
                                 "schedule_grid_hash": schedule_grid_hash(time_grid) if policy is None else "",
                                 "sample_time_grids": sample_time_grids if policy is not None else None,
+                                "sample_clocks": sample_clocks if policy is not None else None,
                                 "policy_sha256": None if policy is None else policy.artifact_sha256,
+                                "student_kind": None if policy is None else policy.student_kind,
                                 "example_idx": int(metadata["example_idx"]),
                                 "series_id": str(metadata["series_id"]),
                                 "series_idx": int(metadata["series_idx"]),
@@ -1257,7 +1133,6 @@ __all__ = [
     "TRAIN_TUNING_SAMPLING_MODES",
     "UNIFORM_SCHEDULER_KEY",
     "VALIDATION_PHASE",
-    "collect_forecast_calibration",
     "choose_forecast_example_indices",
     "choose_forecast_train_tuning_indices",
     "evaluate_forecast_schedule",
@@ -1270,11 +1145,9 @@ __all__ = [
     "parse_float_csv",
     "parse_forecast_datasets",
     "parse_int_csv",
-    "resolve_reference_macro_steps",
     "resolved_eval_horizon",
     "resolved_future_block_len",
     "resolved_rollout_mode",
-    "safe_spearman",
     "save_json",
     "selection_metric_for_family",
     "solver_eval_multiplier",

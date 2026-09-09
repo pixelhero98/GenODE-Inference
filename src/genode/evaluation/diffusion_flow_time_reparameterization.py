@@ -147,12 +147,7 @@ ROW_RECORD_FIELDS: tuple[str, ...] = (
     "schedule_name",
     "schedule_family",
     "density_source_key",
-    "student_training_mode",
     "row_signature",
-    "signal_trace_key",
-    "signal_validation_spearman",
-    "info_growth_scale",
-    "reference_macro_factor",
     "paper_duplicate_count",
     "experiment_scope",
     "selection_metric",
@@ -343,21 +338,15 @@ def _safe_relative_gain(value: Any, baseline_value: Any) -> float | None:
 
 
 def _write_context_rows_enabled(cli_args: argparse.Namespace) -> bool:
-    if bool(getattr(cli_args, "write_forecast_context_rows", False)):
-        raise ValueError("--write_forecast_context_rows is retired; use --write_context_rows.")
     return bool(getattr(cli_args, "write_context_rows", False))
 
 
 def _context_row_csv_name(cli_args: argparse.Namespace) -> str:
-    if str(getattr(cli_args, "forecast_context_row_csv_name", "") or "").strip():
-        raise ValueError("--forecast_context_row_csv_name is retired; use --context_row_csv_name.")
     value = str(getattr(cli_args, "context_row_csv_name", "") or "context_rows.csv")
     return portable_relative_path(value, label="context row CSV name").as_posix()
 
 
 def _context_embeddings_npz_name(cli_args: argparse.Namespace) -> str:
-    if str(getattr(cli_args, "forecast_context_embeddings_npz_name", "") or "").strip():
-        raise ValueError("--forecast_context_embeddings_npz_name is retired; use --context_embeddings_npz_name.")
     value = str(getattr(cli_args, "context_embeddings_npz_name", "") or "context_embeddings.npz")
     return portable_relative_path(value, label="context embeddings NPZ name").as_posix()
 
@@ -1950,12 +1939,7 @@ def _build_row(
         "schedule_name": schedule_display_name(str(scheduler_key)),
         "schedule_family": schedule_family_for_key(str(scheduler_key)),
         "density_source_key": density_source_key_for_schedule(str(scheduler_key)),
-        "student_training_mode": "",
         "row_signature": str(row_signature),
-        "signal_trace_key": None,
-        "signal_validation_spearman": None,
-        "info_growth_scale": None,
-        "reference_macro_factor": None,
         "paper_duplicate_count": int(details.get("paper_duplicate_count", 0) or 0),
         "experiment_scope": solver_experiment_scope(str(solver_key)),
         "selection_metric": str(selection_metric),
@@ -2817,9 +2801,6 @@ def build_argparser() -> argparse.ArgumentParser:
         default=CANONICAL_CONTEXT_SAMPLE_COUNT,
         help="Train-tuning context budget for GICO supervision rows; validation/locked-test use eval-window options.",
     )
-    ap.add_argument("--write_forecast_context_rows", action="store_true", default=False)
-    ap.add_argument("--forecast_context_row_csv_name", type=str, default="")
-    ap.add_argument("--forecast_context_embeddings_npz_name", type=str, default="")
     ap.add_argument("--eval_horizon", type=int, default=0)
     ap.add_argument("--eval_train_fraction", type=float, default=0.2)
     ap.add_argument("--train_tuning_seed", type=int, default=0)

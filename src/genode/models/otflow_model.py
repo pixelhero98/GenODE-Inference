@@ -20,13 +20,6 @@ OTFLOW_TRACE_FIELDS: tuple[str, ...] = (
     "ema_velocity_norm",
     "residual_norm",
     "hybrid_signal",
-    "u_disagreement",
-    "u_residual_norm",
-    "u_hybrid_signal",
-    "variance_scaled_signal",
-    "top_book_disagreement",
-    "top_book_residual_norm",
-    "top_book_hybrid_signal",
     "oracle_local_error",
     "field_evals_by_step",
     "mean_field_evals_per_step",
@@ -221,45 +214,6 @@ class OTFlow(RectifiedFlow):
                 raise ValueError("sample.time_grid must be strictly increasing.")
         return raw_grid
 
-    def _top_of_book_feature_weights(
-        self,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        base_dim = self._snapshot_dim()
-        weights = torch.ones(base_dim, device=device, dtype=dtype)
-        levels = int(self.cfg.data.levels)
-        if int(weights.numel()) < 2:
-            return weights
-
-        weights[0] = 2.0
-        weights[1] = 2.0
-        ask_gap_start = 2
-        bid_gap_start = ask_gap_start + max(0, levels - 1)
-        size_start = bid_gap_start + max(0, levels - 1)
-
-        for depth in range(max(0, levels - 1)):
-            decay = 1.0 / float(depth + 1)
-            idx = ask_gap_start + depth
-            if idx < weights.numel():
-                weights[idx] = 1.5 * decay
-            idx = bid_gap_start + depth
-            if idx < weights.numel():
-                weights[idx] = 1.5 * decay
-
-        for depth in range(levels):
-            decay = 1.0 / float(depth + 1)
-            idx = size_start + depth
-            if idx < weights.numel():
-                weights[idx] = 2.0 * decay
-            idx = size_start + levels + depth
-            if idx < weights.numel():
-                weights[idx] = 2.0 * decay
-        if self._prediction_horizon() <= 1:
-            return weights
-        return weights.repeat(self._prediction_horizon())
-
     def _oracle_local_error_proxy(
         self,
         x: torch.Tensor,
@@ -304,9 +258,6 @@ class OTFlow(RectifiedFlow):
         prev_dpm_v: torch.Tensor | None = None
         prev_dpm_dt: float | None = None
         ema_v: torch.Tensor | None = None
-        ema_v_sq: torch.Tensor | None = None
-        ema_u: torch.Tensor | None = None
-        top_book_weights = self._top_of_book_feature_weights(device=hist.device, dtype=x.dtype)[None, :]
 
         if record_trace:
             trace_disagreement = []
@@ -314,22 +265,13 @@ class OTFlow(RectifiedFlow):
             trace_ema_velocity_norm = []
             trace_residual_norm = []
             trace_hybrid_signal = []
-            trace_u_disagreement = []
-            trace_u_residual_norm = []
-            trace_u_hybrid_signal = []
-            trace_variance_scaled_signal = []
-            trace_top_book_disagreement = []
-            trace_top_book_residual_norm = []
-            trace_top_book_hybrid_signal = []
             trace_oracle_error = []
             trace_field_evals = []
             trace_time = []
         else:
             trace_disagreement = trace_velocity_norm = None
             trace_ema_velocity_norm = None
-            trace_residual_norm = trace_hybrid_signal = trace_u_disagreement = None
-            trace_u_residual_norm = trace_u_hybrid_signal = trace_variance_scaled_signal = None
-            trace_top_book_disagreement = trace_top_book_residual_norm = trace_top_book_hybrid_signal = None
+            trace_residual_norm = trace_hybrid_signal = None
             trace_oracle_error = trace_field_evals = None
             trace_time = None
 
@@ -339,45 +281,18 @@ class OTFlow(RectifiedFlow):
             dt = float(t_next - t_cur)
             t = torch.full((batch_size, 1), t_cur, device=hist.device, dtype=x.dtype)
             v = self._guided_field(x, t, hist, cond=cond, guidance=guidance)
-            v_flat = v.reshape(batch_size, -1)
-            vel_norm = torch.sqrt(v_flat.square().sum(dim=-1) + 1e-12)
+            if record_trace:
+                v_flat = v.reshape(batch_size, -1)
+                vel_norm = torch.sqrt(v_flat.square().sum(dim=-1) + 1e-12)
 
-            if ema_v is None:
-                ema_v = v_flat.detach().clone()
-            if ema_v_sq is None:
-                ema_v_sq = v_flat.detach().square().clone()
-            ema_vel_norm = torch.sqrt(ema_v.square().sum(dim=-1) + 1e-12)
-            cos = F.cosine_similarity(v_flat, ema_v, dim=-1, eps=1e-8).clamp(-1.0, 1.0)
-            disagreement = 1.0 - cos
-            residual_flat = v_flat - ema_v
-            residual_norm = torch.sqrt(residual_flat.square().sum(dim=-1) + 1e-12)
-            hybrid_signal = residual_norm * disagreement
-            feature_var = torch.clamp(ema_v_sq - ema_v.square(), min=0.0)
-            variance_scale = torch.sqrt(feature_var + 1e-6)
-            scaled_v_flat = v_flat / variance_scale
-            scaled_ema_flat = ema_v / variance_scale
-            scaled_cos = F.cosine_similarity(scaled_v_flat, scaled_ema_flat, dim=-1, eps=1e-8).clamp(-1.0, 1.0)
-            variance_scaled_disagreement = 1.0 - scaled_cos
-            variance_scaled_residual_flat = residual_flat / variance_scale
-            variance_scaled_residual_norm = torch.sqrt(variance_scaled_residual_flat.square().sum(dim=-1) + 1e-12)
-            variance_scaled_signal = variance_scaled_residual_norm * variance_scaled_disagreement
-            weighted_v_flat = v_flat * top_book_weights
-            weighted_ema_flat = ema_v * top_book_weights
-            weighted_cos = F.cosine_similarity(weighted_v_flat, weighted_ema_flat, dim=-1, eps=1e-8).clamp(-1.0, 1.0)
-            top_book_disagreement = 1.0 - weighted_cos
-            top_book_residual_flat = weighted_v_flat - weighted_ema_flat
-            top_book_residual_norm = torch.sqrt(top_book_residual_flat.square().sum(dim=-1) + 1e-12)
-            top_book_hybrid_signal = top_book_residual_norm * top_book_disagreement
-            tail_cur = max(1e-12, 1.0 - t_cur)
-            u_flat = (x + tail_cur * v).reshape(batch_size, -1)
-            if ema_u is None:
-                ema_u = u_flat.detach().clone()
-            u_cos = F.cosine_similarity(u_flat, ema_u, dim=-1, eps=1e-8).clamp(-1.0, 1.0)
-            u_disagreement = 1.0 - u_cos
-            u_residual_flat = u_flat - ema_u
-            u_residual_norm = torch.sqrt(u_residual_flat.square().sum(dim=-1) + 1e-12)
-            u_hybrid_signal = u_residual_norm * u_disagreement
-
+                if ema_v is None:
+                    ema_v = v_flat.detach().clone()
+                ema_vel_norm = torch.sqrt(ema_v.square().sum(dim=-1) + 1e-12)
+                cos = F.cosine_similarity(v_flat, ema_v, dim=-1, eps=1e-8).clamp(-1.0, 1.0)
+                disagreement = 1.0 - cos
+                residual_flat = v_flat - ema_v
+                residual_norm = torch.sqrt(residual_flat.square().sum(dim=-1) + 1e-12)
+                hybrid_signal = residual_norm * disagreement
             oracle_error = torch.zeros(batch_size, device=hist.device, dtype=x.dtype)
             field_evals = torch.ones(batch_size, device=hist.device, dtype=x.dtype)
 
@@ -417,24 +332,14 @@ class OTFlow(RectifiedFlow):
             else:
                 raise ValueError(f"Unhandled sample solver={solver_name}")
 
-            ema_beta = _TRACE_EMA_DECAY
-            ema_v = ema_beta * ema_v + (1.0 - ema_beta) * v_flat.detach()
-            ema_v_sq = ema_beta * ema_v_sq + (1.0 - ema_beta) * v_flat.detach().square()
-            ema_u = ema_beta * ema_u + (1.0 - ema_beta) * u_flat.detach()
-
             if record_trace:
+                ema_beta = _TRACE_EMA_DECAY
+                ema_v = ema_beta * ema_v + (1.0 - ema_beta) * v_flat.detach()
                 trace_disagreement.append(disagreement.detach().cpu())
                 trace_velocity_norm.append(vel_norm.detach().cpu())
                 trace_ema_velocity_norm.append(ema_vel_norm.detach().cpu())
                 trace_residual_norm.append(residual_norm.detach().cpu())
                 trace_hybrid_signal.append(hybrid_signal.detach().cpu())
-                trace_u_disagreement.append(u_disagreement.detach().cpu())
-                trace_u_residual_norm.append(u_residual_norm.detach().cpu())
-                trace_u_hybrid_signal.append(u_hybrid_signal.detach().cpu())
-                trace_variance_scaled_signal.append(variance_scaled_signal.detach().cpu())
-                trace_top_book_disagreement.append(top_book_disagreement.detach().cpu())
-                trace_top_book_residual_norm.append(top_book_residual_norm.detach().cpu())
-                trace_top_book_hybrid_signal.append(top_book_hybrid_signal.detach().cpu())
                 trace_oracle_error.append(oracle_error.detach().cpu())
                 trace_field_evals.append(field_evals.detach().cpu())
                 trace_time.append(float(t_cur))
@@ -446,13 +351,6 @@ class OTFlow(RectifiedFlow):
             ema_velocity_norm_t = torch.stack(trace_ema_velocity_norm, dim=1)
             residual_norm_t = torch.stack(trace_residual_norm, dim=1)
             hybrid_signal_t = torch.stack(trace_hybrid_signal, dim=1)
-            u_disagreement_t = torch.stack(trace_u_disagreement, dim=1)
-            u_residual_norm_t = torch.stack(trace_u_residual_norm, dim=1)
-            u_hybrid_signal_t = torch.stack(trace_u_hybrid_signal, dim=1)
-            variance_scaled_signal_t = torch.stack(trace_variance_scaled_signal, dim=1)
-            top_book_disagreement_t = torch.stack(trace_top_book_disagreement, dim=1)
-            top_book_residual_norm_t = torch.stack(trace_top_book_residual_norm, dim=1)
-            top_book_hybrid_signal_t = torch.stack(trace_top_book_hybrid_signal, dim=1)
             oracle_error_t = torch.stack(trace_oracle_error, dim=1)
             field_evals_t = torch.stack(trace_field_evals, dim=1)
             trace = {
@@ -466,13 +364,6 @@ class OTFlow(RectifiedFlow):
                 "ema_velocity_norm": ema_velocity_norm_t,
                 "residual_norm": residual_norm_t,
                 "hybrid_signal": hybrid_signal_t,
-                "u_disagreement": u_disagreement_t,
-                "u_residual_norm": u_residual_norm_t,
-                "u_hybrid_signal": u_hybrid_signal_t,
-                "variance_scaled_signal": variance_scaled_signal_t,
-                "top_book_disagreement": top_book_disagreement_t,
-                "top_book_residual_norm": top_book_residual_norm_t,
-                "top_book_hybrid_signal": top_book_hybrid_signal_t,
                 "oracle_local_error": oracle_error_t,
                 "field_evals_by_step": field_evals_t,
                 "mean_field_evals_per_step": float(field_evals_t.mean().item()),

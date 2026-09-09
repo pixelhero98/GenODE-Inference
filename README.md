@@ -122,7 +122,9 @@ BO, PG, and LD3 remain separate comparison methods. Completed experiments remain
 
 Protocol `genode-gico-v2` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, and fitting history. Incompatible old artifacts are rejected; there is no legacy architecture loader.
 
-`genode-report-gico-locked-test` applies an artifact's frozen calibration to paired test measurements without selection. `genode-evaluate-schedule-summary` performs the analogous validation report. Both require new output files.
+`genode-report-gico-locked-test` applies an artifact's frozen calibration to paired test measurements without selection. `genode-evaluate-schedule-summary` performs the analogous validation report. Both require new output files and matching frozen measurement protocols, native backbone bindings, and molecular feature maps. Supply `policy_sha256` and `student_kind` for learned-policy measurements.
+
+Evaluation rows can carry a fixed `density_mass`/`time_grid` pair or `sample_clocks`, a list containing one such pair per ensemble member. This supports independently sampled stochastic clocks while averaging repeated terminal measurements before constructing log improvements. Forecast evaluators export `sample_clocks`; molecular evaluators export the same pairs with rollout provenance in `sample_clock_records`. Training reference clocks remain fixed across repeats.
 
 ```bash
 python -m ruff check .

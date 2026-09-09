@@ -165,18 +165,29 @@ def paired_kid_shrinkage(
     sizes = np.bincount(groups)
     for setting in range(len(kids)):
         for schedule in range(kids.shape[1]):
-            values, noise = advantages[setting, schedule], variance[setting, schedule]
+            values = advantages[setting, schedule]
             global_mean = values.mean()
             means = np.asarray([values[groups == g].mean() for g in group_ids])
             group_replicates = np.stack([paired[setting, schedule, groups == g].mean(axis=0) for g in group_ids])
+            global_replicates = paired[setting, schedule].mean(axis=0)
+            class_residuals = paired[setting, schedule] - group_replicates[groups]
+            group_residuals = group_replicates - global_replicates
+            # Shrink contrasts, not absolute measurements: each estimated
+            # target shares uncertainty with the quantity being shrunk.
+            # Common fluctuations cancel and must not erase measured contrasts.
+            class_noise = (
+                (blocks - 1)
+                / blocks
+                * np.square(class_residuals - class_residuals.mean(axis=-1, keepdims=True)).sum(axis=-1)
+            )
             group_noise = (
                 (blocks - 1)
                 / blocks
-                * np.square(group_replicates - group_replicates.mean(axis=-1, keepdims=True)).sum(axis=-1)
+                * np.square(group_residuals - group_residuals.mean(axis=-1, keepdims=True)).sum(axis=-1)
             )
-            within = max(float(np.mean((values - means[groups]) ** 2) - noise.mean()), 0.0)
+            within = max(float(np.mean((values - means[groups]) ** 2) - class_noise.mean()), 0.0)
             between = max(float(np.sum(sizes * ((means - global_mean) ** 2 - group_noise)) / len(values)), 0.0)
-            cw = np.divide(within, within + noise, out=np.zeros_like(noise), where=within + noise > 0)
+            cw = np.divide(within, within + class_noise, out=np.zeros_like(class_noise), where=within + class_noise > 0)
             gw = np.divide(
                 between, between + group_noise, out=np.zeros_like(group_noise), where=between + group_noise > 0
             )[groups]

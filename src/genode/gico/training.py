@@ -68,6 +68,11 @@ def teacher_score(teacher: DensityTeacher, condition: Tensor, mass: Tensor) -> T
     return teacher(condition, mass).mean(-1).clamp(-5, 5).mean()
 
 
+def teacher_weights(teacher: DensityTeacher, condition: Tensor, mass: Tensor) -> Tensor:
+    """Temperature-one weights over unique references, using bounded scores."""
+    return teacher(condition, mass).mean(-1).clamp(-5, 5).softmax(0)
+
+
 def _tensors(evidence: Evidence, group: list[dict], device: str) -> tuple[Tensor, Tensor, Tensor]:
     conditions = np.array(
         [evidence.conditioning.transform(evidence.contexts[r["context_id"]], r["solver"], r["nfe"]) for r in group]
@@ -143,8 +148,8 @@ def fit_models(evidence: Evidence, config: TrainingConfig, *, student_kind: str 
     teacher.zero_grad(set_to_none=True)
     training_groups = [_tensors(evidence, g, device) for g in train_groups]
     with torch.no_grad():
-        targets = [(c[:1], m, teacher(c, m).mean(-1).softmax(0)) for c, m, _ in training_groups]
-        validation_targets = [(c[:1], m, teacher(c, m).mean(-1).softmax(0)) for c, m, _ in validation]
+        targets = [(c[:1], m, teacher_weights(teacher, c, m)) for c, m, _ in training_groups]
+        validation_targets = [(c[:1], m, teacher_weights(teacher, c, m)) for c, m, _ in validation]
     # Fit the ratio transform only on unique training-reference densities.
     unique = {}
     for group in teacher_groups:

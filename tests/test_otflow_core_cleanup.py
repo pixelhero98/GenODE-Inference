@@ -185,6 +185,9 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
                 expected = torch.full_like(trace["field_evals_by_step"], evaluations_per_step)
                 self.assertTrue(torch.equal(trace["field_evals_by_step"], expected))
                 self.assertEqual(trace["mean_total_field_evals_per_rollout"], 4 * evaluations_per_step)
+                torch.manual_seed(4)
+                plain = model.sample(hist, steps=4, solver=requested)
+                torch.testing.assert_close(plain, sample, rtol=0, atol=0)
 
     def test_noncanonical_solvers_are_rejected_at_model_boundary(self) -> None:
         cfg = self._cfg(use_minibatch_ot=False)

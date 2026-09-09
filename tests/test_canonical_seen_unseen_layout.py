@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 
 from genode.canonical_experiment_layout import (
-    AVERAGED_REVERSED_SCHEDULE_KEYS,
     CANONICAL_CHECKPOINT_STEPS,
     CANONICAL_CONTEXT_SAMPLE_COUNT,
     CANONICAL_SCENARIO_KEYS,
@@ -36,7 +35,6 @@ class CanonicalSeenUnseenLayoutTests(unittest.TestCase):
         self.assertEqual(len(CANONICAL_SCENARIO_KEYS), 6)
         self.assertEqual(len(PHYSICAL_SCHEDULE_KEYS), 13)
         self.assertEqual(len(REVERSED_SCHEDULE_KEYS), 12)
-        self.assertEqual(len(AVERAGED_REVERSED_SCHEDULE_KEYS), 0)
         self.assertEqual(len(CANONICAL_SUPERVISION_SCHEDULE_KEYS), 25)
 
     def test_role_and_runner_defaults(self) -> None:

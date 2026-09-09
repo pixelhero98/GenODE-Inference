@@ -122,17 +122,19 @@ def test_renaming_split_context_does_not_hide_panel_leakage():
         prepare_image_rows(manifest)
 
 
-@pytest.mark.parametrize("opposing,expected_group_weight", [(False, 0.75), (True, 1.0)])
-def test_group_shrinkage_uses_covariance_of_paired_class_replicates(opposing, expected_group_weight):
+@pytest.mark.parametrize("pattern,expected_group_weight", [("common", 1.0), ("within", 1.0), ("between", 0.75)])
+def test_group_shrinkage_uses_paired_group_global_contrasts(pattern, expected_group_weight):
     kids = np.array([[[10.0, 10.0, 10.0, 10.0], [9.0, 9.0, 5.0, 5.0]]])
     jackknife = np.repeat(kids[..., None], 2, axis=-1)
     offsets = np.tile([-1.0, 1.0], (4, 1))
-    if opposing:
+    if pattern == "within":
         offsets[[1, 3]] *= -1
+    elif pattern == "between":
+        offsets[[2, 3]] *= -1
     jackknife[0, 1] -= offsets
     result = paired_kid_shrinkage(kids, jackknife, np.array([0, 0, 1, 1]), uniform_index=0, fit_split="train")
-    # Every class has variance1. Correlated group means retain variance1;
-    # opposite deviations cancel in each group mean and give variance0.
+    # Every marginal class variance is 1. Only opposing group shifts create
+    # uncertainty in the group-minus-global contrast; other shifts cancel.
     np.testing.assert_allclose(result["standard_errors"][0, 1], 1.0)
     expected_coefficients = np.tile([0.0, expected_group_weight, 1 - expected_group_weight], (4, 1))
     np.testing.assert_allclose(result["coefficients"][0, 1], expected_coefficients)
@@ -140,6 +142,27 @@ def test_group_shrinkage_uses_covariance_of_paired_class_replicates(opposing, ex
     assert not np.isclose(expected_group_weight, independent_group_weight)
     expected = expected_group_weight * np.array([1, 1, 5, 5]) + (1 - expected_group_weight) * 3
     np.testing.assert_allclose(result["shrunk_improvements"][0, 1], expected)
+
+
+def test_common_jackknife_noise_preserves_exact_class_and_group_contrasts():
+    kids = np.array([[[10.0] * 4, [9.0, 8.0, 6.0, 5.0]]])
+    jackknife = np.repeat(kids[..., None], 2, axis=-1)
+    jackknife[0, 1] += [-10.0, 10.0]
+    result = paired_kid_shrinkage(kids, jackknife, np.array([0, 0, 1, 1]), uniform_index=0, fit_split="train")
+    np.testing.assert_allclose(result["standard_errors"][0, 1], 10.0)
+    np.testing.assert_allclose(result["shrunk_improvements"][0, 1], [1.0, 2.0, 4.0, 5.0])
+    np.testing.assert_allclose(result["coefficients"][0, 1, :, 0], 1.0)
+
+
+def test_noisy_class_contrasts_shrink_to_precise_group_means():
+    kids = np.array([[[10.0] * 4, [9.0, 7.0, 5.0, 3.0]]])
+    jackknife = np.repeat(kids[..., None], 2, axis=-1)
+    offsets = np.tile([-1.0, 1.0], (4, 1))
+    offsets[[1, 3]] *= -1
+    jackknife[0, 1] += offsets
+    result = paired_kid_shrinkage(kids, jackknife, np.array([0, 0, 1, 1]), uniform_index=0, fit_split="train")
+    np.testing.assert_allclose(result["shrunk_improvements"][0, 1], [2.0, 2.0, 6.0, 6.0])
+    np.testing.assert_allclose(result["coefficients"][0, 1], np.tile([0.0, 1.0, 0.0], (4, 1)))
 
 
 @pytest.mark.parametrize("task", ["cifar10", "imagenet64"])

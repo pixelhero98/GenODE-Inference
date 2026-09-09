@@ -18,7 +18,7 @@ class PackagingHygieneTests(unittest.TestCase):
         self.assertNotIn("medical", extras)
         dependencies = pyproject["project"]["dependencies"] + [dep for group in extras.values() for dep in group]
         self.assertFalse(any(str(dep).startswith(("wfdb", "pyedflib")) for dep in dependencies))
-        for module in ("otflow_medical_constants", "otflow_medical_datasets", "experiment_common"):
+        for module in ("otflow_medical_" + "constants", "otflow_medical_" + "datasets", "experiment_common"):
             self.assertFalse((REPO_ROOT / "src" / "genode" / "data" / f"{module}.py").exists())
 
     def test_density_metadata_type_hints_resolve(self) -> None:

@@ -10,6 +10,7 @@ import torch
 
 from genode.evaluation.molecule_metrics import _sample_molecule_ar_rollout
 from genode.evaluation.otflow_evaluation_support import evaluate_forecast_schedule
+from genode.gico.clocks import materialize, verify_measurement_clock
 from genode.models.conditioning import ConditioningCache
 from genode.models.config import OTFlowConfig
 
@@ -56,9 +57,11 @@ class RecordingPolicy:
         self.metadata = {"task": task, "backbone": "fixture-backbone"}
         self.calls = []
 
-    def materialize(self, context, solver, nfe, *, seed, request_id):
+    def density(self, context, solver, nfe, *, seed, request_id):
         self.calls.append((np.asarray(context).copy(), solver, nfe, seed, request_id))
-        return (0.0, 0.25 if request_id.endswith("0") else 0.75, 1.0)
+        mass = np.full(64, 1 / 128)
+        mass[:32] = 3 / 128
+        return mass if request_id.endswith("0") else mass[::-1].copy()
 
 
 class MoleculeFixture:
@@ -103,7 +106,8 @@ def test_molecular_member_clock_sampled_once_reused_and_restored(fail):
         assert not np.array_equal(result[0], result[-1])
     assert clock_records == [
         {
-            "time_grid": [0.0, 0.25, 1.0],
+            "density_mass": np.r_[np.full(32, 3 / 128), np.full(32, 1 / 128)].tolist(),
+            "time_grid": list(materialize(np.r_[np.full(32, 3 / 128), np.full(32, 1 / 128)], "heun", 4)),
             "clock_seed": 5,
             "request_id": "member:0",
             "generation_seed": 77,
@@ -116,7 +120,7 @@ def test_molecular_member_clock_sampled_once_reused_and_restored(fail):
     ]
     assert len(policy.calls) == 1
     assert policy.calls[0][1:] == ("heun", 4, 5, "member:0")
-    assert model.grids == [(0.0, 0.25, 1.0)] * (1 if fail else 3)
+    assert model.grids == [tuple(clock_records[0]["time_grid"])] * (1 if fail else 3)
     assert len(model.backbone.histories) == 1
     np.testing.assert_array_equal(model.backbone.histories[0][0].numpy(), history.reshape(2, 9))
     assert tuple(model.cfg.sample.time_grid) == ()
@@ -170,8 +174,11 @@ def test_forecast_members_share_frozen_observed_context_and_separate_clock_reque
     assert policy.calls[0][-1].endswith(":8:member:0")
     assert policy.calls[1][-1].endswith(":8:member:1")
     assert len(model.backbone.histories) == 1
-    assert model.grids == [(0, 0.25, 1), (0, 0.75, 1)]
-    assert result["per_example_rows"][0]["sample_time_grids"] == [[0, 0.25, 1], [0, 0.75, 1]]
+    row = result["per_example_rows"][0]
+    assert model.grids[0] != model.grids[1]
+    assert row["sample_time_grids"] == [list(grid) for grid in model.grids]
+    for clock in row["sample_clocks"]:
+        verify_measurement_clock({**clock, "solver": "heun", "nfe": 4, "schedule_key": "policy"})
     assert tuple(model.cfg.sample.time_grid) == ()
     candidate_draws = [value.clone() for value in model.draws]
     model.draws.clear()
