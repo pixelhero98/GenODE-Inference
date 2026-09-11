@@ -16,9 +16,9 @@ AUXILIARY_NORMALIZATION = "frozen_context_solver_nfe_reference_mean_std"
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    context_mode: str = "native"
-    width: int = 128
-    teacher_density_normalization: str = "none"
+    teacher_context_mode: str = "native"
+    student_context_mode: str = "native"
+    backbone: str | None = None
     teacher_steps: int = 500
     student_steps: int = 500
     teacher_batch_groups: int = 64
@@ -40,12 +40,10 @@ class TrainingConfig:
     seed: int = 0
 
     def __post_init__(self):
-        if self.context_mode not in ("native", "global"):
-            raise ValueError("context_mode must be native or global.")
-        if self.width not in (64, 128):
-            raise ValueError("Transformer width must be 64 or 128.")
-        if self.teacher_density_normalization not in ("none", "training_reference"):
-            raise ValueError("Unknown teacher density normalization protocol.")
+        if any(mode not in ("native", "global") for mode in (self.teacher_context_mode, self.student_context_mode)):
+            raise ValueError("Teacher/student context modes must be native or global.")
+        if self.backbone is not None and (not isinstance(self.backbone, str) or not self.backbone.strip()):
+            raise ValueError("Profile backbone must be a nonempty identity.")
         integers = (
             "teacher_steps",
             "student_steps",

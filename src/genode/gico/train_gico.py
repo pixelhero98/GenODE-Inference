@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 
 from genode.gico.evidence import prepare_evidence
@@ -54,6 +54,9 @@ def run_config(config: dict, *, dry_run: bool = False) -> dict:
             evidence.task,
             **{key: value for key, value in values.items() if key in {field.name for field in fields(TrainingConfig)}},
         )
+        if training.backbone is not None and training.backbone != evidence.backbone:
+            raise ValueError("Fitting profile backbone differs from measurement evidence.")
+        training = replace(training, backbone=evidence.backbone)
         return {
             "task": evidence.task,
             "backbone": evidence.backbone,

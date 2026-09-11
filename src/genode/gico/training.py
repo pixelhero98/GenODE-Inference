@@ -135,17 +135,18 @@ def _regret(teacher, groups, config, temperature, weights):
 
 
 def student_losses(groups, *, model, kind, teacher, config, weights, coefficient, generator, score_rng):
+    teacher_conditions = torch.cat([g[5] for g in groups])
     conditions = torch.cat([g[0] for g in groups])
     device = conditions.device
     if kind == "deterministic":
         predicted = model(conditions)
         target = torch.stack([(g[2][:, None] * g[1]).sum(0) for g in groups])
         distillation = density_kl(target, predicted)
-        score_condition = conditions
+        score_condition = teacher_conditions
     else:
         count = config.stochastic_likelihood_samples
         samples = []
-        for _, refs, probability, _, _ in groups:
+        for _, refs, probability, _, _, _ in groups:
             choice = torch.multinomial(probability, count, replacement=True, generator=generator)
             samples.append(
                 model.ratios(refs[choice])
@@ -154,8 +155,12 @@ def student_losses(groups, *, model, kind, teacher, config, weights, coefficient
         distillation = (
             model.nll(conditions.repeat_interleave(count, 0), torch.cat(samples)).reshape(len(groups), count).mean(-1)
         )
-        score_condition = conditions.repeat_interleave(config.stochastic_score_samples, 0)
-        predicted = model.sample(score_condition, generator=score_rng) if coefficient else None
+        score_condition = teacher_conditions.repeat_interleave(config.stochastic_score_samples, 0)
+        predicted = (
+            model.sample(conditions.repeat_interleave(config.stochastic_score_samples, 0), generator=score_rng)
+            if coefficient
+            else None
+        )
     if coefficient:
         score = scalarize(teacher(score_condition, predicted), weights).reshape(len(groups), -1)
         mean = torch.stack([g[3] for g in groups])[:, None]
@@ -183,7 +188,7 @@ def fit_models(
 
 
 def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=None):
-    evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.context_mode))
+    evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.teacher_context_mode))
     if student_kind not in (*STUDENT_KINDS, "both"):
         raise ValueError("student_kind must be deterministic, stochastic, or both.")
     train_groups, val_groups = evidence.groups("train"), evidence.groups("validation")
@@ -199,7 +204,7 @@ def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=N
     validation = [_tensors(evidence, g, device) for g in val_groups]
     density_validation = [_tensors(evidence, g, device) for g in density_holdout]
     weights = next(iter(evidence.calibrations.values())).metric_weights
-    architecture = ModelConfig(evidence.conditioning.width, len(weights), width=config.width, dropout=config.dropout)
+    architecture = ModelConfig(evidence.conditioning.width, len(weights), dropout=config.dropout)
     # Fit the ratio transform only on unique training-reference densities.
     unique = {}
     for group in teacher_groups:
@@ -212,15 +217,11 @@ def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=N
     ratios = logmass[:, :-1] - logmass[:, -1:]
     ratio_mean, ratio_scale = ratios.mean(0), ratios.std(0, unbiased=False)
     ratio_scale = torch.where(ratio_scale < 1e-6, 1, ratio_scale)
-    density_mean, density_scale = torch.zeros(64, device=device), torch.ones(64, device=device)
-    if config.teacher_density_normalization == "training_reference":
-        density_mean, density_scale = logmass.mean(0), logmass.std(0, unbiased=False)
-        density_scale = torch.where(density_scale < 1e-6, 1, density_scale)
     # fork_rng isolates initialization from callers' generation RNG state.
     devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(config.seed)
-        teacher = DensityTeacher(architecture, density_mean, density_scale).to(device)
+        teacher = DensityTeacher(architecture).to(device)
     rng = np.random.default_rng(config.seed)
     optimizer = torch.optim.AdamW(
         teacher.parameters(), lr=config.teacher_learning_rate, weight_decay=config.weight_decay
@@ -276,27 +277,36 @@ def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=N
     training_groups = [_tensors(evidence, g, device) for g in train_groups]
     temperature = selected_teacher["temperature"]
 
-    def make_targets(groups):
+    student_conditioning = replace(evidence.conditioning, context_mode=config.student_context_mode)
+
+    def make_targets(groups, rows):
         result = []
         with torch.no_grad():
             for start in range(0, len(groups), config.microbatch_contexts):
                 chunk = groups[start : start + config.microbatch_contexts]
-                for prediction, (c, m, _, scale) in zip(_predict_groups(teacher, chunk), chunk, strict=True):
+                for offset, (prediction, (c, m, _, scale)) in enumerate(
+                    zip(_predict_groups(teacher, chunk), chunk, strict=True)
+                ):
+                    row = rows[start + offset][0]
+                    student_condition = c.new_tensor(
+                        student_conditioning.transform(evidence.contexts[row["context_id"]], row["solver"], row["nfe"])
+                    )[None]
                     score = scalarize(prediction, weights)
                     std = score.std(unbiased=False)
                     std = torch.where(std < 1e-6, torch.ones_like(std), std)
                     result.append(
                         (
-                            c[:1],
+                            student_condition,
                             m,
                             reference_weights(score, temperature=temperature, reward_scale=scale),
                             score.mean(),
                             std,
+                            c[:1],
                         )
                     )
         return result
 
-    targets, validation_targets = make_targets(training_groups), make_targets(validation)
+    targets, validation_targets = make_targets(training_groups, train_groups), make_targets(validation, val_groups)
     students, histories, selections = {}, {}, {}
     kinds = STUDENT_KINDS if student_kind == "both" else (student_kind,)
     for kind in kinds:
@@ -345,7 +355,7 @@ def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=N
                 model.eval()
                 with torch.no_grad():
                     losses = []
-                    for c, m, w, _, _ in validation_targets:
+                    for c, m, w, _, _, _ in validation_targets:
                         if kind == "deterministic":
                             value = density_kl((w[:, None] * m).sum(0, keepdim=True), model(c)).mean()
                         else:
@@ -409,7 +419,10 @@ def fit(
         raise ValueError("Native backbone/context bindings differ between measurements.")
     evidence = prepare_evidence(rows, contexts, calibration_rows=calibration_rows, purpose=purpose)
     config = resolve_profile(evidence.task, **fitting_settings)
-    evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.context_mode))
+    if config.backbone is not None and config.backbone != evidence.backbone:
+        raise ValueError("Fitting profile backbone differs from measurement evidence.")
+    config = replace(config, backbone=evidence.backbone)
+    evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.teacher_context_mode))
     started = time.perf_counter()
     teacher, students, history = fit_models(
         evidence, config, student_kind=student_kind, device=device, checkpoint_callback=checkpoint_callback
@@ -462,5 +475,7 @@ def fit(
     metadata["molecular_feature_maps"] = maps
     from genode.gico.policy import save_artifact
 
-    save_artifact(output, teacher, students, evidence.conditioning, metadata)
+    save_artifact(
+        output, teacher, students, replace(evidence.conditioning, context_mode=config.student_context_mode), metadata
+    )
     return metadata

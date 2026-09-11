@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 import torch
@@ -32,8 +33,8 @@ class ModelConfig:
     dropout: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.width not in (64, 128) or (self.layers, self.heads, self.feedforward) != (2, 4, 256):
-            raise ValueError("Unified GICO requires width64 or width128, layers2/heads4/feedforward256.")
+        if self.width != 128 or (self.layers, self.heads, self.feedforward) != (2, 4, 256):
+            raise ValueError("Unified GICO requires width128, layers2/heads4/feedforward256.")
         if any(isinstance(x, bool) or not isinstance(x, int) or x < 1 for x in (self.condition_dim, self.metric_count)):
             raise ValueError("Condition width and metric count must be positive integers.")
         if not 0 <= self.dropout <= 0.1:
@@ -43,27 +44,53 @@ class ModelConfig:
         return asdict(self)
 
 
+def density_rope(x: Tensor) -> Tensor:
+    """Rotate Q/K using fixed 64-bin centers, independent of prefix length."""
+    centers = (torch.arange(x.shape[-2], device=x.device, dtype=x.dtype) + 0.5) / DENSITY_BINS
+    frequencies = torch.arange(1, x.shape[-1] // 2 + 1, device=x.device, dtype=x.dtype)
+    angles = centers[:, None] * frequencies[None] * math.pi
+    cosine, sine = angles.cos().repeat_interleave(2, -1), angles.sin().repeat_interleave(2, -1)
+    rotated = torch.stack((-x[..., 1::2], x[..., ::2]), -1).flatten(-2)
+    return x * cosine + rotated * sine
+
+
+class _TransformerBlock(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.heads = config.heads
+        self.norm1 = nn.LayerNorm(config.width)
+        self.qkv = nn.Linear(config.width, 3 * config.width)
+        self.attention_output = nn.Linear(config.width, config.width)
+        self.norm2 = nn.LayerNorm(config.width)
+        self.ff = nn.Sequential(
+            nn.Linear(config.width, config.feedforward),
+            nn.SiLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.feedforward, config.width),
+        )
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, tokens: Tensor, *, causal: bool) -> Tensor:
+        batch, length, width = tokens.shape
+        qkv = self.qkv(self.norm1(tokens)).reshape(batch, length, 3, self.heads, width // self.heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        attended = F.scaled_dot_product_attention(
+            density_rope(q), density_rope(k), v, is_causal=causal, dropout_p=self.dropout.p if self.training else 0.0
+        )
+        tokens = tokens + self.dropout(self.attention_output(attended.transpose(1, 2).reshape(batch, length, width)))
+        return tokens + self.dropout(self.ff(self.norm2(tokens)))
+
+
+def _projection(inputs: int, width: int) -> nn.Sequential:
+    return nn.Sequential(nn.Linear(inputs, width), nn.SiLU(), nn.Linear(width, width))
+
+
 class _Transformer(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
-        self.condition = nn.Sequential(
-            nn.Linear(config.condition_dim, config.width), nn.GELU(), nn.Linear(config.width, config.width)
-        )
-        self.blocks = nn.ModuleList(
-            [
-                nn.TransformerEncoderLayer(
-                    config.width,
-                    config.heads,
-                    config.feedforward,
-                    dropout=config.dropout,
-                    activation="gelu",
-                    batch_first=True,
-                    norm_first=True,
-                )
-                for _ in range(config.layers)
-            ]
-        )
+        self.condition = _projection(config.condition_dim, config.width)
+        self.blocks = nn.ModuleList([_TransformerBlock(config) for _ in range(config.layers)])
         self.norm = nn.LayerNorm(config.width)
 
     def encode(self, condition: Tensor, tokens: Tensor, *, causal: bool = False) -> Tensor:
@@ -71,10 +98,9 @@ class _Transformer(nn.Module):
             raise ValueError("Condition tensor has the wrong width.")
         if condition.shape[0] != tokens.shape[0] or not bool(torch.isfinite(condition).all()):
             raise ValueError("Conditions must be finite and match the density batch.")
-        projected = self.condition(condition)[:, None]
-        mask = torch.ones(tokens.shape[1], tokens.shape[1], dtype=torch.bool, device=tokens.device).triu(1)
+        tokens = tokens + self.condition(condition)[:, None]
         for block in self.blocks:
-            tokens = block(tokens + projected, src_mask=mask if causal else None)
+            tokens = block(tokens, causal=causal)
         return self.norm(tokens)
 
 
@@ -85,32 +111,15 @@ def _geometry() -> Tensor:
 
 
 class DensityTeacher(_Transformer):
-    def __init__(self, config: ModelConfig, density_mean=None, density_scale=None) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
-        self.register_buffer(
-            "density_mean", torch.zeros(DENSITY_BINS) if density_mean is None else density_mean.float()
-        )
-        self.register_buffer(
-            "density_scale", torch.ones(DENSITY_BINS) if density_scale is None else density_scale.float()
-        )
-        self.validate_density_normalization()
-
         self.register_buffer("geometry", _geometry(), persistent=False)
-        self.input = nn.Linear(3, config.width)
+        self.input = _projection(3, config.width)
         self.output = nn.Linear(config.width, config.metric_count)
-
-    def validate_density_normalization(self):
-        if self.density_mean.shape != (DENSITY_BINS,) or self.density_scale.shape != (DENSITY_BINS,):
-            raise ValueError("Teacher density normalizers require 64 coordinates.")
-        if not bool(torch.isfinite(self.density_mean).all() and torch.isfinite(self.density_scale).all()) or bool(
-            (self.density_scale <= 0).any()
-        ):
-            raise ValueError("Teacher density normalizers must be finite with positive scales.")
 
     def forward(self, condition: Tensor, mass: Tensor) -> Tensor:
         # Do not use no_grad here: students need the teacher's density gradient.
         log_mass = guarded_mass(mass).log().to(condition.dtype)
-        log_mass = (log_mass - self.density_mean) / self.density_scale
         features = torch.cat((log_mass[..., None], self.geometry[None].expand(len(mass), -1, -1)), dim=-1)
         return self.output(self.encode(condition, self.input(features)).mean(dim=1))
 
@@ -119,7 +128,7 @@ class DeterministicStudent(_Transformer):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
         self.register_buffer("geometry", _geometry(), persistent=False)
-        self.input = nn.Linear(2, config.width)
+        self.input = _projection(2, config.width)
         self.output = nn.Linear(config.width, 1)
 
     def forward(self, condition: Tensor) -> Tensor:
@@ -142,8 +151,7 @@ class StochasticStudent(_Transformer):
             raise ValueError("Log-ratio normalizers must be finite.")
         if bool((self.ratio_scale <= 0).any()):
             raise ValueError("Log-ratio scales must be positive.")
-        self.input = nn.Linear(1, config.width)
-        self.position = nn.Embedding(RATIO_COUNT, config.width)
+        self.input = _projection(1, config.width)
         self.output = nn.Linear(config.width, 2)
         nn.init.zeros_(self.output.weight)
         with torch.no_grad():
@@ -160,8 +168,7 @@ class StochasticStudent(_Transformer):
         return torch.cat((values, torch.zeros_like(values[..., :1])), dim=-1).softmax(-1)
 
     def _distribution_head(self, condition: Tensor, shifted: Tensor) -> tuple[Tensor, Tensor]:
-        positions = torch.arange(shifted.shape[1], device=condition.device)
-        tokens = self.input(shifted.to(condition.dtype)[..., None]) + self.position(positions)[None]
+        tokens = self.input(shifted.to(condition.dtype)[..., None])
         values = self.output(self.encode(condition, tokens, causal=True))
         return values[..., 0], 0.05 + 1.95 * values[..., 1].sigmoid()
 

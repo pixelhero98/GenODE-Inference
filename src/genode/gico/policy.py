@@ -7,6 +7,7 @@ import io
 import json
 import os
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,7 @@ from genode.gico.profiles import AUXILIARY_NORMALIZATION, TEMPERATURE_UNITS, res
 from genode.gico.rewards import TASK_METRICS, RewardCalibration, metric_weights
 from genode.gico.schedule_hash import json_hash
 
-GICO_PROTOCOL = "genode-gico-v4"
+GICO_PROTOCOL = "genode-gico-v5"
 RNG_PROTOCOL = "sha256-request-seeded-torch-normal-v1"
 
 
@@ -104,6 +105,10 @@ def save_artifact(path, teacher, students: dict, conditioning: Conditioning, met
         "protocol": GICO_PROTOCOL,
         "architecture": teacher.config.to_payload(),
         "conditioning": conditioning.to_payload(),
+        "teacher_conditioning": replace(
+            conditioning, context_mode=metadata["fitting_profile"]["teacher_context_mode"]
+        ).to_payload(),
+        "architecture_protocol": "density-rope64-silu-additive-once-v1",
         "metadata": metadata,
         "teacher": {k: v.detach().cpu() for k, v in teacher.state_dict().items()},
         "students": {
@@ -141,7 +146,17 @@ def _read_artifact(path) -> tuple[dict, str]:
         raise ValueError("Policy artifact checksum mismatch.")
     payload = torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
     if (
-        set(payload) != {"protocol", "architecture", "conditioning", "metadata", "teacher", "students"}
+        set(payload)
+        != {
+            "protocol",
+            "architecture",
+            "architecture_protocol",
+            "conditioning",
+            "teacher_conditioning",
+            "metadata",
+            "teacher",
+            "students",
+        }
         or payload["protocol"] != GICO_PROTOCOL
     ):
         raise ValueError("Unsupported policy payload; old architecture loaders have been removed.")
@@ -158,6 +173,9 @@ class GICOPolicy:
         if sorted(payload["students"]) != self.metadata["student_kinds"]:
             raise ValueError("Student manifest and model states disagree.")
         self.conditioning = Conditioning.from_payload(payload["conditioning"])
+        self.teacher_conditioning = Conditioning.from_payload(payload["teacher_conditioning"])
+        if payload["architecture_protocol"] != "density-rope64-silu-additive-once-v1":
+            raise ValueError("Unsupported Transformer positional/conditioning protocol.")
         config = ModelConfig(**payload["architecture"])
         if self.metadata["task"] not in TASK_METRICS or config.metric_count != len(TASK_METRICS[self.metadata["task"]]):
             raise ValueError("Artifact architecture and reward task disagree.")
@@ -184,8 +202,11 @@ class GICOPolicy:
             raise ValueError("Artifact fitting profile is incomplete.")
         training = resolve_profile(self.metadata["task"], **profile)
         if (
-            training.width != config.width
-            or training.context_mode != self.conditioning.context_mode
+            training.student_context_mode != self.conditioning.context_mode
+            or training.teacher_context_mode != self.teacher_conditioning.context_mode
+            or training.backbone != self.metadata["backbone"]
+            or replace(self.teacher_conditioning, context_mode=self.conditioning.context_mode).to_payload()
+            != self.conditioning.to_payload()
             or training.dropout != config.dropout
             or tuple(self.metadata["metric_weights"]) != metric_weights(self.metadata["task"])
             or self.metadata["temperature_units"] != TEMPERATURE_UNITS
@@ -283,13 +304,7 @@ def load_teacher(path) -> tuple[DensityTeacher, Conditioning, dict]:
     with torch.random.fork_rng(devices=[]):
         teacher = DensityTeacher(ModelConfig(**payload["architecture"]))
     teacher.load_state_dict(payload["teacher"], strict=True)
-    teacher.validate_density_normalization()
     if any(not bool(torch.isfinite(v).all()) for v in teacher.state_dict().values()):
         raise ValueError("Artifact contains nonfinite teacher parameters.")
-    profile = payload["metadata"]["fitting_profile"]
-    if profile["teacher_density_normalization"] == "none" and (
-        bool(teacher.density_mean.any()) or not bool((teacher.density_scale == 1).all())
-    ):
-        raise ValueError("Teacher density normalization conflicts with its fitting profile.")
     teacher.eval().requires_grad_(False)
-    return teacher, validated.conditioning, validated.metadata
+    return teacher, validated.teacher_conditioning, validated.metadata

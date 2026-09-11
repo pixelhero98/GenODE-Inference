@@ -147,7 +147,7 @@ BO, PG, and LD3 remain separate comparison methods. Completed experiments remain
 
 ## Artifacts and validation
 
-Protocol `genode-gico-v4` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, resolved fitting profiles, explicit metric weights, dropout, temperature units, normalization/selection protocols, selected steps and realized coefficients, and fitting history. Incompatible old artifacts are rejected; there is no legacy architecture loader.
+Protocol `genode-gico-v5` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, resolved fitting profiles, explicit metric weights, dropout, temperature units, normalization/selection protocols, selected steps and realized coefficients, and fitting history. Incompatible old artifacts are rejected; there is no legacy architecture loader.
 
 `genode-report-gico-locked-test` applies an artifact's frozen calibration to paired test measurements without selection. `genode-evaluate-schedule-summary` performs the analogous validation report. Both require new output files and matching frozen measurement protocols, native backbone bindings, and molecular feature maps. Supply `policy_sha256` and `student_kind` for learned-policy measurements.
 
@@ -168,23 +168,32 @@ Tests cover paired rewards, split isolation, geometric energy scoring, causal st
 
 ### Controlled fitting options
 
-Task profiles also accept `context_mode` (`native`, the default, or `global`),
-`width` (128 by default, or 64), and `teacher_density_normalization` (`none`, the
-default, or `training_reference`). Global mode zeroes the normalized context
-features for both teacher and student while retaining solver and NFE features;
-contexts and comparison groups remain separate for reward construction and losses.
-The optional teacher transform standardizes each log-density coordinate using
-unique teacher-training references only, excluding context and density-family
-holdouts. These frozen buffers are stored in the v4 artifact. Width changes keep
-two layers, four heads, and feed-forward width 256.
+All roles share a two-layer, width-128, four-head pre-normalized Transformer with
+feed-forward width 256, SiLU projections, density-bin RoPE, and additive MLP
+conditioning applied once before the block stack. RoPE positions use fixed 64-bin
+centers even during stochastic prefix decoding. The teacher uses raw log masses;
+deterministic students use bin queries and stochastic students use shifted log-ratio
+prefixes. Solver identity and frozen-normalized continuous log NFE/macro-step
+features use the same encoding for all roles.
 
-These are controlled ablation options, not established performance improvements.
-For example, a SANA profile can set `context_mode: "global"`, `width: 128`,
-`teacher_density_normalization: "training_reference"`, and
-`teacher_score_weight: 0.05` in its JSON fitting configuration. Tune on selection
-contexts and freeze settings before a fresh confirmation panel. Report additional
-selection image costs separately from reference evidence and pilot calibration.
-Historical v3 artifacts require their originating runtime and are not upgraded.
+Profiles accept independent `teacher_context_mode` and `student_context_mode`
+(`native`, the default, or `global`). Global mode zeroes only that role's normalized
+context features. With a native teacher and global student, reference targets and
+auxiliary scores still use each original prompt context; only the student's input
+is global. Groups remain separate and equally weighted. Global inference produces
+one deterministic density per solver/NFE, or a context-independent stochastic
+clock distribution, without invoking the teacher.
+
+The task identifies the dataset; an optional `backbone` identity binds a fitting
+configuration to its measurement evidence and is always resolved in saved artifacts.
+Temperature candidates, preferred temperature, teacher-score weight, dropout,
+learning rates and horizons remain profile-specific, with explicit run overrides.
+For example, a SANA configuration can set `teacher_context_mode: "native"`,
+`student_context_mode: "global"`, `teacher_score_weight: 0.05`,
+`temperatures: [0.025, 0.05, 0.1]`, and `preferred_temperature: 0.05`.
+Select on held-out selection contexts and freeze before confirmation. These
+architectural choices do not themselves establish better utility or generalization.
+Historical v4 artifacts require their originating runtime and are not upgraded.
 
 The Python fitting API has an optional `checkpoint_callback(kind, step, model,
 statistics)` observer for diagnostics. Observers must not mutate the model or RNG

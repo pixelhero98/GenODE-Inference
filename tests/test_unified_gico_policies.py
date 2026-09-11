@@ -52,8 +52,8 @@ def test_fixed_transformer_architecture_and_normalized_density_outputs():
     for model in (teacher, deterministic, stochastic):
         assert len(model.blocks) == 2
         for block in model.blocks:
-            assert block.norm_first and block.self_attn.num_heads == 4
-            assert block.linear1.in_features == 128 and block.linear1.out_features == 256
+            assert isinstance(block.norm1, torch.nn.LayerNorm) and block.heads == 4
+            assert block.ff[0].in_features == 128 and block.ff[0].out_features == 256
             assert block.dropout.p == 0
     with torch.no_grad():
         mass = deterministic(conditions)
@@ -222,7 +222,10 @@ def untrained_artifact(tmp_path_factory):
         },
         "reference_grids": {f"{r['solver']}:{r['nfe']}:{r['schedule_key']}": r["time_grid"] for r in evidence.cells},
         "measurement_protocols": ["paired-terminal-v3"],
-        "fitting_profile": {"task": evidence.task, **asdict(resolve_profile(evidence.task, dropout=0))},
+        "fitting_profile": {
+            "task": evidence.task,
+            **asdict(resolve_profile(evidence.task, backbone=evidence.backbone, dropout=0)),
+        },
         "metric_weights": [0.5, 0.5],
         "temperature_units": TEMPERATURE_UNITS,
         "auxiliary_normalization": AUXILIARY_NORMALIZATION,
@@ -334,9 +337,9 @@ def test_nontrivial_ratio_normalizers_are_inverted_without_changing_density():
     "change",
     [
         lambda p: p["metadata"]["fitting_profile"].update(teacher_density_normalization="running"),
-        lambda p: p["metadata"]["fitting_profile"].update(context_mode="global"),
+        lambda p: p["metadata"]["fitting_profile"].update(teacher_context_mode="global"),
         lambda p: p["metadata"]["fitting_profile"].update(width=64),
-        lambda p: p["teacher"]["density_scale"].zero_(),
+        lambda p: p.update(architecture_protocol="wrong-rope"),
     ],
 )
 def test_teacher_loader_rejects_invalid_profile_or_normalizer(untrained_artifact, tmp_path, change):
@@ -349,27 +352,26 @@ def test_teacher_loader_rejects_invalid_profile_or_normalizer(untrained_artifact
         load_teacher(damaged)
 
 
-def test_global_normalized_width64_artifact_roundtrip(untrained_artifact, tmp_path):
+@pytest.mark.parametrize("kind", ("deterministic", "stochastic"))
+def test_prompt_teacher_global_student_artifact_roundtrip(untrained_artifact, tmp_path, kind):
     from dataclasses import replace
 
     from genode.gico.policy import load_teacher
 
-    root, _, _, evidence = untrained_artifact
+    root, teacher, students, evidence = untrained_artifact
     metadata = torch.load(root / "policy.pt", weights_only=True)["metadata"]
-    config = ModelConfig(evidence.conditioning.width, 2, width=64)
-    teacher = DensityTeacher(config, torch.linspace(-5, -3, 64), torch.linspace(0.1, 1, 64)).eval()
-    student = DeterministicStudent(config).eval()
-    metadata["fitting_profile"].update(
-        width=64, context_mode="global", teacher_density_normalization="training_reference"
-    )
-    metadata["history"]["student_selection"] = {"deterministic": {"step": 500, "coefficient": 0.01}}
+    metadata["fitting_profile"].update(student_context_mode="global")
+    metadata["history"]["student_selection"] = {kind: {"step": 500, "coefficient": 0.01}}
     path = tmp_path / "global"
     save_artifact(
-        path, teacher, {"deterministic": student}, replace(evidence.conditioning, context_mode="global"), metadata
+        path, teacher, {kind: students[kind]}, replace(evidence.conditioning, context_mode="global"), metadata
     )
-    policy = load_policy(path)
-    np.testing.assert_array_equal(policy.density([1, 2], "euler", 4), policy.density([9, -5], "euler", 4))
+    policy = load_policy(path, student_kind=kind)
+    np.testing.assert_array_equal(
+        policy.density([1, 2], "euler", 4, request_id="same"), policy.density([9, -5], "euler", 4, request_id="same")
+    )
     restored, conditioning, _ = load_teacher(path)
-    assert conditioning.context_mode == "global"
+    assert conditioning.context_mode == "native"
+    assert not np.array_equal(conditioning.transform([1, 2], "euler", 4), conditioning.transform([9, -5], "euler", 4))
     for key, value in teacher.state_dict().items():
         torch.testing.assert_close(value, restored.state_dict()[key], atol=0, rtol=0)

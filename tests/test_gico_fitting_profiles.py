@@ -116,7 +116,7 @@ def test_actual_student_objective_score_term_has_gradients_without_teacher_updat
     refs = torch.softmax(torch.stack((torch.linspace(-1, 1, 64), torch.linspace(1, -1, 64))), -1).double()
     with torch.no_grad():
         scores = scalarize(teacher(context.expand(2, -1), refs))
-    groups = [(context, refs, torch.tensor([0.4, 0.6], dtype=torch.float64), scores.mean(), torch.tensor(1.0))]
+    groups = [(context, refs, torch.tensor([0.4, 0.6], dtype=torch.float64), scores.mean(), torch.tensor(1.0), context)]
     original = deepcopy(teacher.state_dict())
     config = resolve_profile("sana", stochastic_likelihood_samples=2, stochastic_score_samples=1)
     values = []
@@ -158,8 +158,7 @@ def test_dropout_is_disabled_for_deterministic_and_replayable_stochastic_inferen
     torch.testing.assert_close(a, b, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("width", (64, 128))
-def test_global_conditioning_preserves_settings_and_zeroes_only_context(width):
+def test_global_conditioning_preserves_settings_and_zeroes_only_context():
     from dataclasses import replace
 
     from genode.gico.conditioning import Conditioning
@@ -179,32 +178,93 @@ def test_global_conditioning_preserves_settings_and_zeroes_only_context(width):
     assert Conditioning.from_payload(global_condition.to_payload()).context_mode == "global"
     with pytest.raises(ValueError, match="width"):
         global_condition.transform([1], "euler", 4)
-    model = DeterministicStudent(ModelConfig(len(a), 2, width=width, dropout=0.05)).eval()
+    model = DeterministicStudent(ModelConfig(len(a), 2, dropout=0.05)).eval()
     torch.testing.assert_close(model(torch.tensor(a[None])), model(torch.tensor(b[None])), atol=0, rtol=0)
 
 
-def test_teacher_density_transform_roundtrip_and_density_gradient():
-    config = ModelConfig(5, 2, width=64)
-    teacher = (
-        DensityTeacher(config, torch.linspace(-8, -2, 64), torch.linspace(0.2, 2, 64)).eval().requires_grad_(False)
-    )
-    clone = DensityTeacher(config).eval().requires_grad_(False)
-    clone.load_state_dict(teacher.state_dict())
-    logits = torch.linspace(-2, 2, 64).requires_grad_()
-    mass = logits.softmax(0)[None]
-    condition = torch.zeros(1, 5)
-    score = teacher(condition, mass)
-    torch.testing.assert_close(score, clone(condition, mass), atol=0, rtol=0)
-    score.sum().backward()
-    assert torch.isfinite(logits.grad).all() and logits.grad.abs().max() > 0
-    assert all(p.grad is None for p in teacher.parameters())
-    with pytest.raises(ValueError, match="positive"):
-        DensityTeacher(config, torch.zeros(64), torch.zeros(64))
-
-
 @pytest.mark.parametrize(
-    "option,value", [("context_mode", "unknown"), ("width", 32), ("teacher_density_normalization", "running")]
+    "option,value",
+    [
+        ("teacher_context_mode", "unknown"),
+        ("student_context_mode", "unknown"),
+        ("width", 64),
+        ("teacher_density_normalization", "training_reference"),
+    ],
 )
 def test_ablation_profiles_reject_unknown_semantics(option, value):
     with pytest.raises(ValueError):
         resolve_profile("sana", **{option: value})
+
+
+def test_rope_and_causal_parameters_match_every_prefix():
+    from genode.gico.networks import density_rope
+
+    torch.manual_seed(19)
+    x = torch.randn(2, 4, 64, 32)
+    for length in (1, 2, 17, 63):
+        torch.testing.assert_close(density_rope(x[..., :length, :]), density_rope(x)[..., :length, :], atol=0, rtol=0)
+    student = StochasticStudent(ModelConfig(5, 2, dropout=0.05)).eval()
+    torch.nn.init.normal_(student.output.weight, std=0.03)
+    condition, ratios = torch.randn(2, 5), torch.randn(2, 63)
+    full_mean, full_std = student.conditional_parameters(condition, ratios)
+    for length in (1, 2, 17, 63):
+        shifted = torch.cat((torch.zeros(2, 1), ratios[:, : length - 1]), 1)
+        mean, std = student._distribution_head(condition, shifted)
+        torch.testing.assert_close(mean, full_mean[:, :length], atol=2e-6, rtol=1e-5)
+        torch.testing.assert_close(std, full_std[:, :length], atol=2e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("kind", ("deterministic", "stochastic"))
+def test_global_student_score_chasing_keeps_original_teacher_contexts(kind):
+    from unittest.mock import patch
+
+    torch.manual_seed(43)
+    config = resolve_profile(
+        "sana",
+        teacher_context_mode="native",
+        student_context_mode="global",
+        stochastic_likelihood_samples=2,
+        stochastic_score_samples=2,
+    )
+    architecture = ModelConfig(5, 2)
+    teacher = DensityTeacher(architecture).eval().requires_grad_(False)
+    model = (DeterministicStudent(architecture) if kind == "deterministic" else StochasticStudent(architecture)).eval()
+    teacher_contexts = torch.tensor([[1.0, 2.0, 0.0, 0.0, 1.0], [3.0, -4.0, 0.0, 0.0, 1.0]])
+    student_context = torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0]])
+    refs = torch.softmax(torch.randn(2, 64), -1).double()
+    groups = [
+        (student_context, refs, torch.tensor([0.4, 0.6]), torch.tensor(0.0), torch.tensor(1.0), c[None])
+        for c in teacher_contexts
+    ]
+    with patch.object(teacher, "forward", wraps=teacher.forward) as observed:
+        losses = student_losses(
+            groups,
+            model=model,
+            kind=kind,
+            teacher=teacher,
+            config=config,
+            weights=(0.5, 0.5),
+            coefficient=0.05,
+            generator=torch.Generator().manual_seed(1),
+            score_rng=torch.Generator().manual_seed(2),
+        )
+    expected = teacher_contexts if kind == "deterministic" else teacher_contexts.repeat_interleave(2, 0)
+    torch.testing.assert_close(observed.call_args.args[0], expected, atol=0, rtol=0)
+    assert losses.shape == (2,)
+    losses.mean().backward()
+    assert any(p.grad is not None and p.grad.abs().max() > 0 for p in model.parameters())
+    assert all(p.grad is None for p in teacher.parameters())
+
+
+def test_backbone_specific_parameters_are_not_shared():
+    a = resolve_profile(
+        "sana", backbone="checkpoint-a", teacher_score_weight=0.05, temperatures=(0.025,), preferred_temperature=0.025
+    )
+    b = resolve_profile(
+        "sana", backbone="checkpoint-b", teacher_score_weight=0.1, temperatures=(0.1,), preferred_temperature=0.1
+    )
+    assert (
+        a.backbone != b.backbone
+        and a.temperatures != b.temperatures
+        and a.teacher_score_weight != b.teacher_score_weight
+    )
