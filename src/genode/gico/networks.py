@@ -32,8 +32,8 @@ class ModelConfig:
     dropout: float = 0.0
 
     def __post_init__(self) -> None:
-        if (self.width, self.layers, self.heads, self.feedforward) != (128, 2, 4, 256):
-            raise ValueError("Unified GICO requires width128/layers2/heads4/feedforward256.")
+        if self.width not in (64, 128) or (self.layers, self.heads, self.feedforward) != (2, 4, 256):
+            raise ValueError("Unified GICO requires width64 or width128, layers2/heads4/feedforward256.")
         if any(isinstance(x, bool) or not isinstance(x, int) or x < 1 for x in (self.condition_dim, self.metric_count)):
             raise ValueError("Condition width and metric count must be positive integers.")
         if not 0 <= self.dropout <= 0.1:
@@ -85,15 +85,32 @@ def _geometry() -> Tensor:
 
 
 class DensityTeacher(_Transformer):
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, density_mean=None, density_scale=None) -> None:
         super().__init__(config)
+        self.register_buffer(
+            "density_mean", torch.zeros(DENSITY_BINS) if density_mean is None else density_mean.float()
+        )
+        self.register_buffer(
+            "density_scale", torch.ones(DENSITY_BINS) if density_scale is None else density_scale.float()
+        )
+        self.validate_density_normalization()
+
         self.register_buffer("geometry", _geometry(), persistent=False)
         self.input = nn.Linear(3, config.width)
         self.output = nn.Linear(config.width, config.metric_count)
 
+    def validate_density_normalization(self):
+        if self.density_mean.shape != (DENSITY_BINS,) or self.density_scale.shape != (DENSITY_BINS,):
+            raise ValueError("Teacher density normalizers require 64 coordinates.")
+        if not bool(torch.isfinite(self.density_mean).all() and torch.isfinite(self.density_scale).all()) or bool(
+            (self.density_scale <= 0).any()
+        ):
+            raise ValueError("Teacher density normalizers must be finite with positive scales.")
+
     def forward(self, condition: Tensor, mass: Tensor) -> Tensor:
         # Do not use no_grad here: students need the teacher's density gradient.
         log_mass = guarded_mass(mass).log().to(condition.dtype)
+        log_mass = (log_mass - self.density_mean) / self.density_scale
         features = torch.cat((log_mass[..., None], self.geometry[None].expand(len(mass), -1, -1)), dim=-1)
         return self.output(self.encode(condition, self.input(features)).mean(dim=1))
 

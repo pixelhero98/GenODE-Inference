@@ -147,7 +147,7 @@ BO, PG, and LD3 remain separate comparison methods. Completed experiments remain
 
 ## Artifacts and validation
 
-Protocol `genode-gico-v3` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, resolved fitting profiles, explicit metric weights, dropout, temperature units, normalization/selection protocols, selected steps and realized coefficients, and fitting history. Incompatible old artifacts are rejected; there is no legacy architecture loader.
+Protocol `genode-gico-v4` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, resolved fitting profiles, explicit metric weights, dropout, temperature units, normalization/selection protocols, selected steps and realized coefficients, and fitting history. Incompatible old artifacts are rejected; there is no legacy architecture loader.
 
 `genode-report-gico-locked-test` applies an artifact's frozen calibration to paired test measurements without selection. `genode-evaluate-schedule-summary` performs the analogous validation report. Both require new output files and matching frozen measurement protocols, native backbone bindings, and molecular feature maps. Supply `policy_sha256` and `student_kind` for learned-policy measurements.
 
@@ -165,3 +165,28 @@ git diff --check
 ```
 
 Tests cover paired rewards, split isolation, geometric energy scoring, causal stochastic sampling, teacher-input gradients, density decoding, solver accounting, artifact integrity, and active task routing. External-asset functional checks and their environment-specific instructions belong outside the public package. Fixture coverage alone does not validate a pretrained generator or establish quality gains.
+
+### Controlled fitting options
+
+Task profiles also accept `context_mode` (`native`, the default, or `global`),
+`width` (128 by default, or 64), and `teacher_density_normalization` (`none`, the
+default, or `training_reference`). Global mode zeroes the normalized context
+features for both teacher and student while retaining solver and NFE features;
+contexts and comparison groups remain separate for reward construction and losses.
+The optional teacher transform standardizes each log-density coordinate using
+unique teacher-training references only, excluding context and density-family
+holdouts. These frozen buffers are stored in the v4 artifact. Width changes keep
+two layers, four heads, and feed-forward width 256.
+
+These are controlled ablation options, not established performance improvements.
+For example, a SANA profile can set `context_mode: "global"`, `width: 128`,
+`teacher_density_normalization: "training_reference"`, and
+`teacher_score_weight: 0.05` in its JSON fitting configuration. Tune on selection
+contexts and freeze settings before a fresh confirmation panel. Report additional
+selection image costs separately from reference evidence and pilot calibration.
+Historical v3 artifacts require their originating runtime and are not upgraded.
+
+The Python fitting API has an optional `checkpoint_callback(kind, step, model,
+statistics)` observer for diagnostics. Observers must not mutate the model or RNG
+state. Diagnostic checkpoints do not change production eligibility: only
+post-ramp validation-selected student states are saved as deployable artifacts.

@@ -328,3 +328,48 @@ def test_nontrivial_ratio_normalizers_are_inverted_without_changing_density():
     torch.testing.assert_close(student.density(expected), guarded_mass(masses), atol=1e-12, rtol=1e-10)
     with pytest.raises(ValueError, match="positive"):
         StochasticStudent(ModelConfig(5, 2), mean, torch.zeros(63))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda p: p["metadata"]["fitting_profile"].update(teacher_density_normalization="running"),
+        lambda p: p["metadata"]["fitting_profile"].update(context_mode="global"),
+        lambda p: p["metadata"]["fitting_profile"].update(width=64),
+        lambda p: p["teacher"]["density_scale"].zero_(),
+    ],
+)
+def test_teacher_loader_rejects_invalid_profile_or_normalizer(untrained_artifact, tmp_path, change):
+    from genode.gico.policy import load_teacher
+
+    root, _, _, _ = untrained_artifact
+    damaged = tmp_path / "teacher-invalid"
+    corrupt_payload(root, damaged, change)
+    with pytest.raises(ValueError):
+        load_teacher(damaged)
+
+
+def test_global_normalized_width64_artifact_roundtrip(untrained_artifact, tmp_path):
+    from dataclasses import replace
+
+    from genode.gico.policy import load_teacher
+
+    root, _, _, evidence = untrained_artifact
+    metadata = torch.load(root / "policy.pt", weights_only=True)["metadata"]
+    config = ModelConfig(evidence.conditioning.width, 2, width=64)
+    teacher = DensityTeacher(config, torch.linspace(-5, -3, 64), torch.linspace(0.1, 1, 64)).eval()
+    student = DeterministicStudent(config).eval()
+    metadata["fitting_profile"].update(
+        width=64, context_mode="global", teacher_density_normalization="training_reference"
+    )
+    metadata["history"]["student_selection"] = {"deterministic": {"step": 500, "coefficient": 0.01}}
+    path = tmp_path / "global"
+    save_artifact(
+        path, teacher, {"deterministic": student}, replace(evidence.conditioning, context_mode="global"), metadata
+    )
+    policy = load_policy(path)
+    np.testing.assert_array_equal(policy.density([1, 2], "euler", 4), policy.density([9, -5], "euler", 4))
+    restored, conditioning, _ = load_teacher(path)
+    assert conditioning.context_mode == "global"
+    for key, value in teacher.state_dict().items():
+        torch.testing.assert_close(value, restored.state_dict()[key], atol=0, rtol=0)

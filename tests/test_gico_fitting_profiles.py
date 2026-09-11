@@ -156,3 +156,55 @@ def test_dropout_is_disabled_for_deterministic_and_replayable_stochastic_inferen
     a = stochastic.sample(context, generator=torch.Generator().manual_seed(12))
     b = stochastic.sample(context, generator=torch.Generator().manual_seed(12))
     torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("width", (64, 128))
+def test_global_conditioning_preserves_settings_and_zeroes_only_context(width):
+    from dataclasses import replace
+
+    from genode.gico.conditioning import Conditioning
+    from genode.gico.evidence import prepare_evidence
+    from tests.test_unified_gico_rewards import reference_evidence
+
+    rows, contexts = reference_evidence()
+    evidence = prepare_evidence(rows, contexts)
+    original = evidence.conditioning
+    global_condition = replace(original, context_mode="global")
+    a = global_condition.transform([1, 2], "euler", 4)
+    b = global_condition.transform([7, -9], "euler", 4)
+    np.testing.assert_array_equal(a, b)
+    assert not a[:2].any()
+    np.testing.assert_array_equal(a[2:], original.transform([1, 2], "euler", 4)[2:])
+    assert not np.array_equal(a, global_condition.transform([1, 2], "euler", 8))
+    assert Conditioning.from_payload(global_condition.to_payload()).context_mode == "global"
+    with pytest.raises(ValueError, match="width"):
+        global_condition.transform([1], "euler", 4)
+    model = DeterministicStudent(ModelConfig(len(a), 2, width=width, dropout=0.05)).eval()
+    torch.testing.assert_close(model(torch.tensor(a[None])), model(torch.tensor(b[None])), atol=0, rtol=0)
+
+
+def test_teacher_density_transform_roundtrip_and_density_gradient():
+    config = ModelConfig(5, 2, width=64)
+    teacher = (
+        DensityTeacher(config, torch.linspace(-8, -2, 64), torch.linspace(0.2, 2, 64)).eval().requires_grad_(False)
+    )
+    clone = DensityTeacher(config).eval().requires_grad_(False)
+    clone.load_state_dict(teacher.state_dict())
+    logits = torch.linspace(-2, 2, 64).requires_grad_()
+    mass = logits.softmax(0)[None]
+    condition = torch.zeros(1, 5)
+    score = teacher(condition, mass)
+    torch.testing.assert_close(score, clone(condition, mass), atol=0, rtol=0)
+    score.sum().backward()
+    assert torch.isfinite(logits.grad).all() and logits.grad.abs().max() > 0
+    assert all(p.grad is None for p in teacher.parameters())
+    with pytest.raises(ValueError, match="positive"):
+        DensityTeacher(config, torch.zeros(64), torch.zeros(64))
+
+
+@pytest.mark.parametrize(
+    "option,value", [("context_mode", "unknown"), ("width", 32), ("teacher_density_normalization", "running")]
+)
+def test_ablation_profiles_reject_unknown_semantics(option, value):
+    with pytest.raises(ValueError):
+        resolve_profile("sana", **{option: value})

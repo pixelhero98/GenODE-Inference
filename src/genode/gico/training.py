@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 
@@ -166,14 +166,24 @@ def student_losses(groups, *, model, kind, teacher, config, weights, coefficient
     return distillation - coefficient * auxiliary
 
 
-def fit_models(evidence: Evidence, config: TrainingConfig, *, student_kind: str = "both", device: str = "cuda"):
+def fit_models(
+    evidence: Evidence,
+    config: TrainingConfig,
+    *,
+    student_kind: str = "both",
+    device: str = "cuda",
+    checkpoint_callback=None,
+):
     devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(config.seed)
-        return _fit_models(evidence, config, student_kind=student_kind, device=device)
+        return _fit_models(
+            evidence, config, student_kind=student_kind, device=device, checkpoint_callback=checkpoint_callback
+        )
 
 
-def _fit_models(evidence, config, *, student_kind, device):
+def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=None):
+    evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.context_mode))
     if student_kind not in (*STUDENT_KINDS, "both"):
         raise ValueError("student_kind must be deterministic, stochastic, or both.")
     train_groups, val_groups = evidence.groups("train"), evidence.groups("validation")
@@ -189,12 +199,28 @@ def _fit_models(evidence, config, *, student_kind, device):
     validation = [_tensors(evidence, g, device) for g in val_groups]
     density_validation = [_tensors(evidence, g, device) for g in density_holdout]
     weights = next(iter(evidence.calibrations.values())).metric_weights
-    architecture = ModelConfig(evidence.conditioning.width, len(weights), dropout=config.dropout)
+    architecture = ModelConfig(evidence.conditioning.width, len(weights), width=config.width, dropout=config.dropout)
+    # Fit the ratio transform only on unique training-reference densities.
+    unique = {}
+    for group in teacher_groups:
+        for row in group:
+            unique[row["density_sha256"]] = row["density_mass"]
+    reference = torch.tensor(list(unique.values()), dtype=torch.float64, device=device)
+    from genode.gico.networks import guarded_mass
+
+    logmass = guarded_mass(reference).log()
+    ratios = logmass[:, :-1] - logmass[:, -1:]
+    ratio_mean, ratio_scale = ratios.mean(0), ratios.std(0, unbiased=False)
+    ratio_scale = torch.where(ratio_scale < 1e-6, 1, ratio_scale)
+    density_mean, density_scale = torch.zeros(64, device=device), torch.ones(64, device=device)
+    if config.teacher_density_normalization == "training_reference":
+        density_mean, density_scale = logmass.mean(0), logmass.std(0, unbiased=False)
+        density_scale = torch.where(density_scale < 1e-6, 1, density_scale)
     # fork_rng isolates initialization from callers' generation RNG state.
     devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(config.seed)
-        teacher = DensityTeacher(architecture).to(device)
+        teacher = DensityTeacher(architecture, density_mean, density_scale).to(device)
     rng = np.random.default_rng(config.seed)
     optimizer = torch.optim.AdamW(
         teacher.parameters(), lr=config.teacher_learning_rate, weight_decay=config.weight_decay
@@ -271,18 +297,6 @@ def _fit_models(evidence, config, *, student_kind, device):
         return result
 
     targets, validation_targets = make_targets(training_groups), make_targets(validation)
-    # Fit the ratio transform only on unique training-reference densities.
-    unique = {}
-    for group in teacher_groups:
-        for row in group:
-            unique[row["density_sha256"]] = row["density_mass"]
-    reference = torch.tensor(list(unique.values()), dtype=torch.float64, device=device)
-    from genode.gico.networks import guarded_mass
-
-    logmass = guarded_mass(reference).log()
-    ratios = logmass[:, :-1] - logmass[:, -1:]
-    ratio_mean, ratio_scale = ratios.mean(0), ratios.std(0, unbiased=False)
-    ratio_scale = torch.where(ratio_scale < 1e-6, 1, ratio_scale)
     students, histories, selections = {}, {}, {}
     kinds = STUDENT_KINDS if student_kind == "both" else (student_kind,)
     for kind in kinds:
@@ -350,6 +364,8 @@ def _fit_models(evidence, config, *, student_kind, device):
                     "contexts": len(indices),
                 }
                 history.append(row)
+                if checkpoint_callback is not None:
+                    checkpoint_callback(kind, step + 1, model, dict(row))
                 if coefficient > 0 and value < best:
                     best, best_state, chosen = value, copy.deepcopy(model.state_dict()), dict(row)
         if best_state is None:
@@ -383,6 +399,7 @@ def fit(
     device: str = "cuda",
     purpose: str = "research",
     calibration_rows: list[dict] | None = None,
+    checkpoint_callback=None,
     **fitting_settings,
 ) -> dict:
     if Path(output).exists():
@@ -392,8 +409,11 @@ def fit(
         raise ValueError("Native backbone/context bindings differ between measurements.")
     evidence = prepare_evidence(rows, contexts, calibration_rows=calibration_rows, purpose=purpose)
     config = resolve_profile(evidence.task, **fitting_settings)
+    evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.context_mode))
     started = time.perf_counter()
-    teacher, students, history = fit_models(evidence, config, student_kind=student_kind, device=device)
+    teacher, students, history = fit_models(
+        evidence, config, student_kind=student_kind, device=device, checkpoint_callback=checkpoint_callback
+    )
     fitting_seconds = time.perf_counter() - started
     metadata = {
         "task": evidence.task,

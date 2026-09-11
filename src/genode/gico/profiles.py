@@ -16,6 +16,9 @@ AUXILIARY_NORMALIZATION = "frozen_context_solver_nfe_reference_mean_std"
 
 @dataclass(frozen=True)
 class TrainingConfig:
+    context_mode: str = "native"
+    width: int = 128
+    teacher_density_normalization: str = "none"
     teacher_steps: int = 500
     student_steps: int = 500
     teacher_batch_groups: int = 64
@@ -37,6 +40,12 @@ class TrainingConfig:
     seed: int = 0
 
     def __post_init__(self):
+        if self.context_mode not in ("native", "global"):
+            raise ValueError("context_mode must be native or global.")
+        if self.width not in (64, 128):
+            raise ValueError("Transformer width must be 64 or 128.")
+        if self.teacher_density_normalization not in ("none", "training_reference"):
+            raise ValueError("Unknown teacher density normalization protocol.")
         integers = (
             "teacher_steps",
             "student_steps",

@@ -19,7 +19,7 @@ from genode.gico.profiles import AUXILIARY_NORMALIZATION, TEMPERATURE_UNITS, res
 from genode.gico.rewards import TASK_METRICS, RewardCalibration, metric_weights
 from genode.gico.schedule_hash import json_hash
 
-GICO_PROTOCOL = "genode-gico-v3"
+GICO_PROTOCOL = "genode-gico-v4"
 RNG_PROTOCOL = "sha256-request-seeded-torch-normal-v1"
 
 
@@ -184,7 +184,9 @@ class GICOPolicy:
             raise ValueError("Artifact fitting profile is incomplete.")
         training = resolve_profile(self.metadata["task"], **profile)
         if (
-            training.dropout != config.dropout
+            training.width != config.width
+            or training.context_mode != self.conditioning.context_mode
+            or training.dropout != config.dropout
             or tuple(self.metadata["metric_weights"]) != metric_weights(self.metadata["task"])
             or self.metadata["temperature_units"] != TEMPERATURE_UNITS
             or self.metadata["auxiliary_normalization"] != AUXILIARY_NORMALIZATION
@@ -275,9 +277,19 @@ def load_policy(path, *, student_kind: str = "deterministic", expected_backbone:
 
 def load_teacher(path) -> tuple[DensityTeacher, Conditioning, dict]:
     """Explicit research control; ordinary policy inference never calls this."""
-    payload, _ = _read_artifact(path)
+    payload, digest = _read_artifact(path)
+    # Apply the same architecture, profile, split and normalization contract as inference.
+    validated = GICOPolicy(payload, digest, payload["metadata"]["student_kinds"][0])
     with torch.random.fork_rng(devices=[]):
         teacher = DensityTeacher(ModelConfig(**payload["architecture"]))
     teacher.load_state_dict(payload["teacher"], strict=True)
+    teacher.validate_density_normalization()
+    if any(not bool(torch.isfinite(v).all()) for v in teacher.state_dict().values()):
+        raise ValueError("Artifact contains nonfinite teacher parameters.")
+    profile = payload["metadata"]["fitting_profile"]
+    if profile["teacher_density_normalization"] == "none" and (
+        bool(teacher.density_mean.any()) or not bool((teacher.density_scale == 1).all())
+    ):
+        raise ValueError("Teacher density normalization conflicts with its fitting profile.")
     teacher.eval().requires_grad_(False)
-    return teacher, Conditioning.from_payload(payload["conditioning"]), payload["metadata"]
+    return teacher, validated.conditioning, validated.metadata

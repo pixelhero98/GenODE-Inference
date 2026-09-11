@@ -54,6 +54,11 @@ class Conditioning:
     settings: EmbeddingNormalizer
     solvers: tuple[str, ...]
     unconditional: bool = False
+    context_mode: str = "native"
+
+    def __post_init__(self):
+        if self.context_mode not in ("native", "global"):
+            raise ValueError("context_mode must be native or global.")
 
     @staticmethod
     def budget(solver: str, nfe: int) -> np.ndarray:
@@ -80,9 +85,12 @@ class Conditioning:
             raise ValueError("Policy was not trained for this solver.")
         if self.unconditional and np.any(np.asarray(context) != 0):
             raise ValueError("Unconditional policies reject labels/nonzero context.")
+        features = self.context.transform_one(context)
+        if self.context_mode == "global":
+            features = np.zeros_like(features)
         return np.concatenate(
             (
-                self.context.transform_one(context),
+                features,
                 np.array([float(s == solver) for s in self.solvers]),
                 self.settings.transform_one(self.budget(solver, nfe)),
             )
@@ -94,6 +102,7 @@ class Conditioning:
             "settings": self.settings.to_payload(),
             "solvers": list(self.solvers),
             "unconditional": self.unconditional,
+            "context_mode": self.context_mode,
         }
 
     @classmethod
@@ -103,4 +112,5 @@ class Conditioning:
             EmbeddingNormalizer.from_payload(p["settings"]),
             tuple(p["solvers"]),
             p["unconditional"],
+            p["context_mode"],
         )
