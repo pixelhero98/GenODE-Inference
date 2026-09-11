@@ -23,6 +23,8 @@ from genode.image_comparators.reflow import (
     load_reflow,
     reflow_grid,
     restore_ema,
+    validate_executed_model_times,
+    validate_learned_grids,
 )
 
 
@@ -105,6 +107,20 @@ def test_reflow_rejects_unverified_pickle_before_upstream_import(tmp_path):
     checkpoint.write_bytes(b"not the official checkpoint")
     with pytest.raises(ValueError, match="verified official"):
         load_reflow(tmp_path, checkpoint, {}, device="cpu")
+
+
+def test_learned_and_transformed_solver_times_reject_zero_width_calls():
+    grid = reflow_grid([0, 0.25, 0.5, 0.75, 1], device="cpu")
+    validate_learned_grids(grid, grid, 4)
+    validate_executed_model_times((grid[:-1] * 1000).tolist(), 4)
+    collapsed = grid.clone()
+    collapsed[2] = collapsed[1]
+    with pytest.raises(ValueError, match="strictly increasing"):
+        validate_learned_grids(grid, collapsed, 4)
+    with pytest.raises(ValueError, match="endpoints"):
+        validate_learned_grids(grid + 0.01, grid, 4)
+    with pytest.raises(ValueError, match="distinct ordered"):
+        validate_executed_model_times([0.1, 200, 200, 999], 4)
 
 
 def test_ema_preserves_buffers_and_rejects_missing_shadows():
