@@ -6,6 +6,7 @@ import hashlib
 import json
 import shutil
 from copy import deepcopy
+from dataclasses import asdict
 from unittest.mock import patch
 
 import numpy as np
@@ -25,6 +26,7 @@ from genode.gico.networks import (
     guarded_mass,
 )
 from genode.gico.policy import GICO_PROTOCOL, load_policy, save_artifact
+from genode.gico.profiles import AUXILIARY_NORMALIZATION, TEMPERATURE_UNITS, resolve_profile
 from genode.gico.training import SCORE_WEIGHTS, TrainingConfig, score_coefficient, teacher_loss, teacher_score
 from tests.test_unified_gico_rewards import reference_evidence
 
@@ -186,16 +188,15 @@ def test_unsupported_score_weights_and_invalid_densities_fail():
         materialize(np.full(64, 1 / 64), "heun", 3)
 
 
-def test_teacher_reference_weights_clip_scores_before_temperature_one_softmax():
-    from genode.gico.training import teacher_weights
+def test_reference_temperature_uses_unclipped_pre_normalization_utilities():
+    from genode.gico.training import reference_weights
 
-    class Scores(torch.nn.Module):
-        def forward(self, condition, mass):
-            return torch.tensor([[-100.0], [0.0], [100.0]])
-
-    weights = teacher_weights(Scores(), torch.zeros(3, 1), torch.full((3, 64), 1 / 64))
-    torch.testing.assert_close(weights, torch.tensor([-5.0, 0.0, 5.0]).softmax(0))
-    assert bool((weights > 0).all())
+    scores = torch.tensor([-100.0, 0.0, 100.0], dtype=torch.float64)
+    expected = (scores * 0.001 / 0.05).softmax(0)
+    actual = reference_weights(scores, temperature=0.05, reward_scale=0.001)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual, reference_weights(scores / 10, temperature=0.05, reward_scale=0.01))
+    assert bool((actual > 0).all())
 
 
 @pytest.fixture(scope="module")
@@ -221,6 +222,14 @@ def untrained_artifact(tmp_path_factory):
         },
         "reference_grids": {f"{r['solver']}:{r['nfe']}:{r['schedule_key']}": r["time_grid"] for r in evidence.cells},
         "measurement_protocols": ["paired-terminal-v3"],
+        "fitting_profile": {"task": evidence.task, **asdict(resolve_profile(evidence.task, dropout=0))},
+        "metric_weights": [0.5, 0.5],
+        "temperature_units": TEMPERATURE_UNITS,
+        "auxiliary_normalization": AUXILIARY_NORMALIZATION,
+        "teacher_selection_criterion": "heldout_reference_utility_regret",
+        "student_selection_criterion": "post_ramp_validation_distillation",
+        "selected_temperature": 0.05,
+        "history": {"student_selection": {k: {"step": 500, "coefficient": 0.01} for k in students}},
     }
     root = tmp_path_factory.mktemp("untrained-artifact") / "policy"
     save_artifact(root, teacher, students, evidence.conditioning, deepcopy(metadata))

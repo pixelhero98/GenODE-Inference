@@ -38,9 +38,11 @@ def build_argparser() -> argparse.ArgumentParser:
     train.add_argument("--evidence", required=True)
     train.add_argument("--output", required=True)
     train.add_argument("--student-kind", choices=("deterministic", "stochastic", "both"), default="both")
-    train.add_argument("--teacher-score-weight", type=float, choices=(0.01, 0.05, 0.1), default=0.01)
-    train.add_argument("--steps", type=int, default=2000)
-    train.add_argument("--seed", type=int, default=0)
+    train.add_argument("--teacher-score-weight", type=float, choices=(0.01, 0.05, 0.1))
+    train.add_argument("--teacher-steps", type=int)
+    train.add_argument("--student-steps", type=int)
+    train.add_argument("--fitting-profile", help="JSON object of common task-profile overrides.")
+    train.add_argument("--seed", type=int)
     train.add_argument("--device", default="cuda")
     train.add_argument("--purpose", choices=("research", "functional"), default="research")
     validate = commands.add_parser("validate", help="Validate a common GICO artifact and its identities.")
@@ -77,14 +79,16 @@ def main(argv=None) -> int:
         rows = [row for row in rows if row["split"] in {"train", "validation"}]
         if any(row["task"] not in {"cifar10", "imagenet64"} for row in rows):
             raise ValueError("The image CLI trains only small-image tasks.")
+        fitting = _read(args.fitting_profile) if args.fitting_profile else {}
+        for key in ("teacher_steps", "student_steps", "seed", "teacher_score_weight"):
+            if getattr(args, key) is not None:
+                fitting[key] = getattr(args, key)
         result = fit(
             rows,
             evidence["contexts"],
             args.output,
             student_kind=args.student_kind,
-            teacher_score_weight=args.teacher_score_weight,
-            steps=args.steps,
-            seed=args.seed,
+            **fitting,
             device=args.device,
             purpose=args.purpose,
             calibration_rows=calibration_rows,

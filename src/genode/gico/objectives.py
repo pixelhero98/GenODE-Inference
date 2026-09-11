@@ -28,7 +28,22 @@ FORECAST_METRIC_SPECS: tuple[MetricObjectiveSpec, ...] = (
 )
 
 MOLECULE_METRIC_SPECS = (
-    MetricObjectiveSpec("molecule_energy_score", "u_energy_score_uniform", METRIC_DIRECTION_LOWER, 1.0),
+    MetricObjectiveSpec("molecule_kabsch_rmsd_3d", "u_kabsch_rmsd_3d_uniform", METRIC_DIRECTION_LOWER, 0.4),
+    MetricObjectiveSpec(
+        "molecule_ensemble_velocity_norm_w1", "u_ensemble_velocity_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15
+    ),
+    MetricObjectiveSpec(
+        "molecule_ensemble_acceleration_norm_w1",
+        "u_ensemble_acceleration_norm_w1_uniform",
+        METRIC_DIRECTION_LOWER,
+        0.15,
+    ),
+    MetricObjectiveSpec(
+        "molecule_rollout_velocity_norm_w1", "u_rollout_velocity_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15
+    ),
+    MetricObjectiveSpec(
+        "molecule_rollout_acceleration_norm_w1", "u_rollout_acceleration_norm_w1_uniform", METRIC_DIRECTION_LOWER, 0.15
+    ),
 )
 OBJECTIVE_SPECS_BY_FAMILY = {
     SCENARIO_FAMILY_FORECAST: FORECAST_METRIC_SPECS,
@@ -48,6 +63,8 @@ def teacher_metric_profile_for_scenario(scenario_key):
         "target_metric_keys": [s.metric_key for s in specs],
         "target_utility_keys": [s.utility_key for s in specs],
         "target_weights": {s.utility_key: s.weight for s in specs},
-        "diagnostic_metric_keys": [],
+        "diagnostic_metric_keys": ["molecule_energy_score"]
+        if scenario_family_for_key(scenario_key) == SCENARIO_FAMILY_MOLECULE
+        else [],
         "diagnostic_utility_keys": [],
     }

@@ -327,7 +327,7 @@ def image_protocol_metadata(
             "primary_target": "teacher_weighted_unique_reference_densities",
             "deterministic_objective": "target_to_policy_kl_minus_teacher_score",
             "stochastic_objective": "smoothed_autoregressive_gaussian_nll_minus_reparameterized_teacher_score",
-            "artifact_protocol": "genode-gico-v2",
+            "artifact_protocol": "genode-gico-v3",
             "teacher_score_weights": [0.01, 0.05, 0.1],
             "teacher_evidence_phase": "reward_train",
             "teacher_score_weight": IMAGE_GICO_TEACHER_SCORE_WEIGHT,

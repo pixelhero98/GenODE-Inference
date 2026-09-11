@@ -205,7 +205,7 @@ def run(config_path, *, phase):
                 if phase == "fit":
                     anchor = anchors[(prompt_id, seed)]
                     row["utility"] = float(
-                        calibration.vector({**anchor, "metrics": scores, "anchor_metrics": anchor["metrics"]}).mean()
+                        calibration.scalar({**anchor, "metrics": scores, "anchor_metrics": anchor["metrics"]})
                     )
                 journal.write(json.dumps(row, allow_nan=False) + "\n")
                 journal.flush()

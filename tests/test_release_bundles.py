@@ -267,6 +267,22 @@ def _write_common_artifact(directory):
         "reference_densities": {f"euler:2:{row['schedule_key']}": row["density_mass"] for row in rows},
         "reference_grids": {f"euler:2:{row['schedule_key']}": row["time_grid"] for row in rows},
     }
+    from dataclasses import asdict
+
+    from genode.gico.profiles import AUXILIARY_NORMALIZATION, TEMPERATURE_UNITS, resolve_profile
+
+    metadata.update(
+        fitting_profile={"task": evidence.task, **asdict(resolve_profile(evidence.task))},
+        metric_weights=[1.0],
+        temperature_units=TEMPERATURE_UNITS,
+        auxiliary_normalization=AUXILIARY_NORMALIZATION,
+        teacher_selection_criterion="heldout_reference_utility_regret",
+        student_selection_criterion="post_ramp_validation_distillation",
+        selected_temperature=1.0,
+        history={
+            "student_selection": {k: {"step": 2000, "coefficient": 0.01} for k in ("deterministic", "stochastic")}
+        },
+    )
     save_artifact(
         directory,
         DensityTeacher(config),

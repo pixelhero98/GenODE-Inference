@@ -74,7 +74,7 @@ from genode.evaluation.otflow_evaluation_support import (
     parse_csv,
     parse_forecast_datasets,
     parse_int_csv,
-    selection_metric_for_family,
+    reporting_metric_for_family,
     solver_eval_multiplier,
     solver_experiment_scope,
     solver_macro_steps,
@@ -150,8 +150,8 @@ ROW_RECORD_FIELDS: tuple[str, ...] = (
     "row_signature",
     "paper_duplicate_count",
     "experiment_scope",
-    "selection_metric",
-    "selection_metric_value",
+    "reporting_metric",
+    "reporting_metric_value",
     "reference_macro_steps",
     "reference_time_alignment",
     "runtime_grid_q25",
@@ -1896,7 +1896,7 @@ def _build_row(
     row_signature: str,
     protocol_hash: str,
 ) -> dict[str, Any]:
-    selection_metric = selection_metric_for_family(str(benchmark_family))
+    reporting_metric = reporting_metric_for_family(str(benchmark_family))
     nfe = normalize_solver_nfe_fields(
         str(solver_key),
         int(target_nfe),
@@ -1942,8 +1942,8 @@ def _build_row(
         "row_signature": str(row_signature),
         "paper_duplicate_count": int(details.get("paper_duplicate_count", 0) or 0),
         "experiment_scope": solver_experiment_scope(str(solver_key)),
-        "selection_metric": str(selection_metric),
-        "selection_metric_value": metrics.get(selection_metric),
+        "reporting_metric": str(reporting_metric),
+        "reporting_metric_value": metrics.get(reporting_metric),
         "reference_macro_steps": int(details.get("reference_macro_steps", nfe.macro_steps)),
         "reference_time_alignment": str(
             details.get("reference_time_alignment", schedule_time_alignment(str(scheduler_key)))
@@ -2505,7 +2505,7 @@ def _run_molecule_phase(
                                     *MOLECULE_DIAGNOSTIC_METRICS,
                                     "molecule_coordinate_w1_mean",
                                     "molecule_pair_distance_w1",
-                                    "selection_metric_value",
+                                    "reporting_metric_value",
                                     "num_eval_samples",
                                     "eval_windows",
                                     "realized_nfe",

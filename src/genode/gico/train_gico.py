@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict, fields
 from pathlib import Path
 
 from genode.gico.evidence import prepare_evidence
 from genode.gico.policy import load_context_embedding_table
-from genode.gico.training import SCORE_WEIGHTS, TrainingConfig, fit
+from genode.gico.profiles import SCORE_WEIGHTS, TrainingConfig, resolve_profile
+from genode.gico.training import fit
 
 
 def read_rows(path) -> list[dict]:
@@ -25,12 +27,9 @@ def load_config(path) -> dict:
         "output",
         "student_kind",
         "teacher_score_weight",
-        "steps",
-        "seed",
         "device",
         "purpose",
-        "batch_size",
-    }
+    } | {field.name for field in fields(TrainingConfig)}
     if set(config) - allowed or not {"rows", "contexts", "output"} <= set(config):
         raise ValueError("Training config requires rows/contexts/output and only documented GICO options.")
     for key in ("rows", "contexts", "calibration_rows", "output"):
@@ -48,14 +47,12 @@ def run_config(config: dict, *, dry_run: bool = False) -> dict:
     contexts = load_context_embedding_table(values.pop("contexts"))
     calibration = read_rows(values.pop("calibration_rows")) if "calibration_rows" in values else None
     if dry_run:
-        training = TrainingConfig(
-            steps=values.get("steps", 2000),
-            seed=values.get("seed", 0),
-            teacher_score_weight=values.get("teacher_score_weight", 0.01),
-            batch_size=values.get("batch_size", 32),
-        )
         evidence = prepare_evidence(
             rows, contexts, calibration_rows=calibration, purpose=values.get("purpose", "research")
+        )
+        training = resolve_profile(
+            evidence.task,
+            **{key: value for key, value in values.items() if key in {field.name for field in fields(TrainingConfig)}},
         )
         return {
             "task": evidence.task,
@@ -65,6 +62,7 @@ def run_config(config: dict, *, dry_run: bool = False) -> dict:
             "condition_width": evidence.conditioning.width,
             "reward_calibrations": {key: c.to_payload() for key, c in evidence.calibrations.items()},
             "teacher_score_weight": training.teacher_score_weight,
+            "fitting_profile": asdict(training),
             "dry_run": True,
         }
     return fit(rows, contexts, calibration_rows=calibration, **values)

@@ -15,10 +15,11 @@ import torch
 from genode.gico.clocks import clock_generator, materialize, validate_mass
 from genode.gico.conditioning import Conditioning
 from genode.gico.networks import DensityTeacher, DeterministicStudent, ModelConfig, StochasticStudent
-from genode.gico.rewards import TASK_METRICS, RewardCalibration
+from genode.gico.profiles import AUXILIARY_NORMALIZATION, TEMPERATURE_UNITS, resolve_profile
+from genode.gico.rewards import TASK_METRICS, RewardCalibration, metric_weights
 from genode.gico.schedule_hash import json_hash
 
-GICO_PROTOCOL = "genode-gico-v2"
+GICO_PROTOCOL = "genode-gico-v3"
 RNG_PROTOCOL = "sha256-request-seeded-torch-normal-v1"
 
 
@@ -160,6 +161,51 @@ class GICOPolicy:
         config = ModelConfig(**payload["architecture"])
         if self.metadata["task"] not in TASK_METRICS or config.metric_count != len(TASK_METRICS[self.metadata["task"]]):
             raise ValueError("Artifact architecture and reward task disagree.")
+        required = {
+            "fitting_profile",
+            "metric_weights",
+            "temperature_units",
+            "auxiliary_normalization",
+            "teacher_selection_criterion",
+            "student_selection_criterion",
+            "selected_temperature",
+            "history",
+        }
+        if not required <= self.metadata.keys():
+            raise ValueError("Artifact lacks the resolved fitting and selection protocols; retrain.")
+        profile = dict(self.metadata["fitting_profile"])
+        if profile.pop("task", None) != self.metadata["task"]:
+            raise ValueError("Artifact fitting profile task mismatch.")
+        from dataclasses import fields
+
+        from genode.gico.profiles import TrainingConfig
+
+        if set(profile) != {field.name for field in fields(TrainingConfig)}:
+            raise ValueError("Artifact fitting profile is incomplete.")
+        training = resolve_profile(self.metadata["task"], **profile)
+        if (
+            training.dropout != config.dropout
+            or tuple(self.metadata["metric_weights"]) != metric_weights(self.metadata["task"])
+            or self.metadata["temperature_units"] != TEMPERATURE_UNITS
+            or self.metadata["auxiliary_normalization"] != AUXILIARY_NORMALIZATION
+            or self.metadata["teacher_selection_criterion"] != "heldout_reference_utility_regret"
+            or self.metadata["student_selection_criterion"] != "post_ramp_validation_distillation"
+            or self.metadata["selected_temperature"] not in training.temperatures
+        ):
+            raise ValueError("Artifact fitting, scalarization or normalization protocols disagree.")
+        from genode.gico.training import score_coefficient
+
+        selection = self.metadata["history"].get("student_selection", {}).get(student_kind, {})
+        step = selection.get("step", 0)
+        if (
+            type(step) is not int
+            or not 0.6 * training.student_steps < step <= training.student_steps
+            or not np.isclose(
+                selection.get("coefficient", -1),
+                score_coefficient(step - 1, training.student_steps, training.teacher_score_weight),
+            )
+        ):
+            raise ValueError("Artifact student checkpoint is not eligible after the score ramp.")
         if (
             config.condition_dim != self.conditioning.width
             or tuple(self.metadata["solvers"]) != self.conditioning.solvers

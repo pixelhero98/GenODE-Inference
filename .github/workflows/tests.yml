@@ -171,6 +171,7 @@ jobs:
                   "genode/gico/networks.py",
                   "genode/gico/rewards.py",
                   "genode/gico/training.py",
+                  "genode/gico/profiles.py",
               }
               if not required_wheel <= wheel_names:
                   raise SystemExit("Wheel omitted an active image GICO module.")

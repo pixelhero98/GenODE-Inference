@@ -356,7 +356,7 @@ def _forecast_example_detail_metadata(
     }
 
 
-def selection_metric_for_family(benchmark_family: str) -> str:
+def reporting_metric_for_family(benchmark_family: str) -> str:
     if str(benchmark_family) == FORECAST_FAMILY:
         return "forecast_crps"
     if str(benchmark_family) == SCENARIO_FAMILY_MOLECULE:
@@ -1149,7 +1149,7 @@ __all__ = [
     "resolved_future_block_len",
     "resolved_rollout_mode",
     "save_json",
-    "selection_metric_for_family",
+    "reporting_metric_for_family",
     "solver_eval_multiplier",
     "solver_experiment_scope",
     "solver_macro_steps",

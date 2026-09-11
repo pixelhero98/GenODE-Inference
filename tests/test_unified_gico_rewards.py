@@ -10,7 +10,7 @@ import pytest
 from genode.gico.clocks import REFERENCE_KEYS, materialize, reference_densities, verify_measurement_clock
 from genode.gico.conditioning import Conditioning
 from genode.gico.evidence import prepare_evidence
-from genode.gico.rewards import RewardCalibration, calibrate_rewards, construct_rewards
+from genode.gico.rewards import MOLECULE_METRICS, RewardCalibration, calibrate_rewards, construct_rewards
 from genode.schedule_transfer.reference_clocks import build_reference_clock_grid
 
 
@@ -60,7 +60,7 @@ def test_solver_alias_rejected_before_fitting():
 
 def test_log_improvement_does_not_overflow_for_finite_extreme_metrics():
     calibration = calibrate_rewards(paired_rows())
-    calibration = RewardCalibration(**{**calibration.to_payload(), "floors": (1e-300, 1e-300)})
+    calibration = RewardCalibration.from_payload({**calibration.to_payload(), "floors": (1e-300, 1e-300)})
     rows = paired_rows()
     for row in rows:
         row["metrics"] = dict.fromkeys(("crps", "mase"), 1e300 if row["schedule_key"] == "uniform" else 1e-300)
@@ -232,7 +232,7 @@ def test_degenerate_reward_calibrations_are_rejected(case):
         rows = kid_panel([1, 1])
     else:
         for row in rows:
-            row.update(task="molecule_3d_set1", ensemble_size=1, metrics={"energy_score": 1})
+            row.update(task="molecule_3d_set1", ensemble_size=1, metrics=dict.fromkeys(MOLECULE_METRICS, 1))
     with pytest.raises(ValueError, match="Degenerate|at least two"):
         calibrate_rewards(rows)
 
@@ -407,7 +407,7 @@ def test_research_molecular_evidence_requires_valid_frozen_feature_map(invalid):
     for row in rows:
         row.update(
             task="molecule_3d_set1",
-            metrics={"energy_score": row["metrics"]["crps"]},
+            metrics=dict.fromkeys(MOLECULE_METRICS, row["metrics"]["crps"]),
             molecule_feature_map=deepcopy(feature_map),
         )
     assert prepare_evidence(rows, contexts).task == "molecule_3d_set1"
@@ -434,7 +434,7 @@ def test_molecular_feature_maps_are_context_stable_and_validation_maps_come_from
     for row in rows:
         row.update(
             task="molecule_3d_set1",
-            metrics={"energy_score": row["metrics"]["crps"]},
+            metrics=dict.fromkeys(MOLECULE_METRICS, row["metrics"]["crps"]),
             molecule_feature_map=deepcopy(first_map),
         )
     # Distinct members may use distinct geometries when both are present in fitting.

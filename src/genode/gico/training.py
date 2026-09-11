@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import copy
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -14,34 +15,15 @@ from torch.nn import functional as F
 
 from genode.gico.evidence import Evidence, prepare_evidence
 from genode.gico.networks import DensityTeacher, DeterministicStudent, ModelConfig, StochasticStudent, density_kl
+from genode.gico.profiles import (
+    AUXILIARY_NORMALIZATION,
+    SCORE_WEIGHTS,
+    TEMPERATURE_UNITS,
+    TrainingConfig,
+    resolve_profile,
+)
 
-SCORE_WEIGHTS = (0.01, 0.05, 0.1)
 STUDENT_KINDS = ("deterministic", "stochastic")
-
-
-@dataclass(frozen=True)
-class TrainingConfig:
-    steps: int = 2000
-    batch_size: int = 32
-    learning_rate: float = 1e-3
-    weight_decay: float = 1e-4
-    teacher_score_weight: float = 0.01
-    seed: int = 0
-    target_smoothing: float = 0.1
-
-    def __post_init__(self):
-        if self.teacher_score_weight not in SCORE_WEIGHTS:
-            raise ValueError(f"teacher_score_weight must be one of {SCORE_WEIGHTS}.")
-        if any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in (self.steps, self.batch_size)):
-            raise ValueError("steps and batch_size must be positive integers.")
-        if self.target_smoothing != 0.1:
-            raise ValueError("Unified stochastic target smoothing is fixed at 0.1.")
-        if (
-            not np.isfinite([self.learning_rate, self.weight_decay]).all()
-            or self.learning_rate <= 0
-            or self.weight_decay < 0
-        ):
-            raise ValueError("Invalid optimizer parameters.")
 
 
 def score_coefficient(step: int, steps: int, weight: float) -> float:
@@ -50,9 +32,18 @@ def score_coefficient(step: int, steps: int, weight: float) -> float:
     return weight * max(0.0, min(1.0, ((step + 1) / steps - 0.6) / 0.4))
 
 
-def teacher_loss(predicted: Tensor, target: Tensor) -> Tensor:
-    regression = F.huber_loss(predicted, target, reduction="mean")
-    score, truth = predicted.mean(-1), target.mean(-1)
+def scalarize(vector: Tensor, metric_weights=None) -> Tensor:
+    weights = (
+        vector.new_full((vector.shape[-1],), 1 / vector.shape[-1])
+        if metric_weights is None
+        else vector.new_tensor(metric_weights)
+    )
+    return (vector * weights).sum(-1)
+
+
+def teacher_loss(predicted: Tensor, target: Tensor, metric_weights=None) -> Tensor:
+    regression = scalarize(F.huber_loss(predicted, target, reduction="none"), metric_weights).mean()
+    score, truth = scalarize(predicted, metric_weights), scalarize(target, metric_weights)
     left, right = torch.triu_indices(len(score), len(score), offset=1, device=score.device)
     differences = truth[left] - truth[right]
     non_ties = differences != 0
@@ -64,16 +55,53 @@ def teacher_loss(predicted: Tensor, target: Tensor) -> Tensor:
     return ranking + 0.25 * regression
 
 
-def teacher_score(teacher: DensityTeacher, condition: Tensor, mass: Tensor) -> Tensor:
-    return teacher(condition, mass).mean(-1).clamp(-5, 5).mean()
+def teacher_score(teacher, condition, mass, *, reference_mean=0.0, reference_std=1.0, metric_weights=None):
+    return ((scalarize(teacher(condition, mass), metric_weights) - reference_mean) / reference_std).clamp(-5, 5).mean()
 
 
-def teacher_weights(teacher: DensityTeacher, condition: Tensor, mass: Tensor) -> Tensor:
-    """Temperature-one weights over unique references, using bounded scores."""
-    return teacher(condition, mass).mean(-1).clamp(-5, 5).softmax(0)
+def reference_weights(scores, *, temperature, reward_scale):
+    if not np.isfinite([temperature, reward_scale]).all() or min(temperature, reward_scale) <= 0:
+        raise ValueError("Temperature and frozen reward scale must be positive and finite.")
+    return (scores.double() * reward_scale / temperature).softmax(-1)
 
 
-def _tensors(evidence: Evidence, group: list[dict], device: str) -> tuple[Tensor, Tensor, Tensor]:
+def teacher_weights(teacher, condition, mass, *, temperature=0.05, reward_scale=1.0, metric_weights=None):
+    return reference_weights(
+        scalarize(teacher(condition, mass), metric_weights), temperature=temperature, reward_scale=reward_scale
+    )
+
+
+def utility_regret(predicted, truth, *, temperature, reward_scale):
+    weights = reference_weights(predicted, temperature=temperature, reward_scale=reward_scale)
+    return (truth.max() - (weights * truth).sum()).clamp_min(0) * reward_scale
+
+
+def selection_key(regret, temperature, step, preferred):
+    return regret, temperature != preferred, step, temperature
+
+
+def sample_groups(rng, count, batch_size):
+    return rng.choice(count, size=min(count, batch_size), replace=False).tolist()
+
+
+def accumulated_step(model, optimizer, groups, loss_fn, *, microbatch_contexts):
+    """One optimizer update with equal weight for each distinct group."""
+    optimizer.zero_grad(set_to_none=True)
+    total = 0.0
+    for start in range(0, len(groups), microbatch_contexts):
+        chunk = groups[start : start + microbatch_contexts]
+        losses = loss_fn(chunk)
+        if losses.shape != (len(chunk),) or not bool(torch.isfinite(losses).all()):
+            raise ValueError("Nonfinite or malformed per-group loss.")
+        loss = losses.sum() / len(groups)
+        loss.backward()
+        total += float(loss.detach())
+    nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+    optimizer.step()
+    return total
+
+
+def _tensors(evidence: Evidence, group: list[dict], device: str) -> tuple[Tensor, Tensor, Tensor, float]:
     conditions = np.array(
         [evidence.conditioning.transform(evidence.contexts[r["context_id"]], r["solver"], r["nfe"]) for r in group]
     )
@@ -81,75 +109,168 @@ def _tensors(evidence: Evidence, group: list[dict], device: str) -> tuple[Tensor
         torch.tensor(conditions, dtype=torch.float32, device=device),
         torch.tensor([r["density_mass"] for r in group], dtype=torch.float64, device=device),
         torch.tensor([r["reward_vector"] for r in group], dtype=torch.float32, device=device),
+        evidence.calibrations[group[0]["solver"]].reward_scale,
     )
 
 
-def _finite_step(model: nn.Module, optimizer, loss: Tensor) -> None:
-    if not bool(torch.isfinite(loss)):
-        raise ValueError("Nonfinite training objective.")
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
-    optimizer.step()
+def _predict_groups(teacher, groups):
+    sizes = [len(g[0]) for g in groups]
+    return teacher(torch.cat([g[0] for g in groups]), torch.cat([g[1] for g in groups])).split(sizes)
 
 
-def _optimizer(model, config):
-    return torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+def _regret(teacher, groups, config, temperature, weights):
+    values = []
+    for start in range(0, len(groups), config.microbatch_contexts):
+        chunk = groups[start : start + config.microbatch_contexts]
+        for prediction, (_, _, truth, scale) in zip(_predict_groups(teacher, chunk), chunk, strict=True):
+            values.append(
+                utility_regret(
+                    scalarize(prediction, weights),
+                    scalarize(truth, weights),
+                    temperature=temperature,
+                    reward_scale=scale,
+                )
+            )
+    return float(torch.stack(values).mean())
+
+
+def student_losses(groups, *, model, kind, teacher, config, weights, coefficient, generator, score_rng):
+    conditions = torch.cat([g[0] for g in groups])
+    device = conditions.device
+    if kind == "deterministic":
+        predicted = model(conditions)
+        target = torch.stack([(g[2][:, None] * g[1]).sum(0) for g in groups])
+        distillation = density_kl(target, predicted)
+        score_condition = conditions
+    else:
+        count = config.stochastic_likelihood_samples
+        samples = []
+        for _, refs, probability, _, _ in groups:
+            choice = torch.multinomial(probability, count, replacement=True, generator=generator)
+            samples.append(
+                model.ratios(refs[choice])
+                + config.target_smoothing * torch.randn(count, 63, generator=generator, device=device)
+            )
+        distillation = (
+            model.nll(conditions.repeat_interleave(count, 0), torch.cat(samples)).reshape(len(groups), count).mean(-1)
+        )
+        score_condition = conditions.repeat_interleave(config.stochastic_score_samples, 0)
+        predicted = model.sample(score_condition, generator=score_rng) if coefficient else None
+    if coefficient:
+        score = scalarize(teacher(score_condition, predicted), weights).reshape(len(groups), -1)
+        mean = torch.stack([g[3] for g in groups])[:, None]
+        std = torch.stack([g[4] for g in groups])[:, None]
+        auxiliary = ((score - mean) / std).clamp(-5, 5).mean(-1)
+    else:
+        auxiliary = distillation * 0
+    return distillation - coefficient * auxiliary
 
 
 def fit_models(evidence: Evidence, config: TrainingConfig, *, student_kind: str = "both", device: str = "cuda"):
+    devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(config.seed)
+        return _fit_models(evidence, config, student_kind=student_kind, device=device)
+
+
+def _fit_models(evidence, config, *, student_kind, device):
     if student_kind not in (*STUDENT_KINDS, "both"):
         raise ValueError("student_kind must be deterministic, stochastic, or both.")
     train_groups, val_groups = evidence.groups("train"), evidence.groups("validation")
     # Leave an entire density family out of teacher fitting; its observations
     # remain available for validation, never for reference-ratio normalization.
-    family_holdout = {"late_p_3", "late_p_3_reversed"}
+    family_holdout = set(config.density_family_holdout)
     teacher_groups = [[r for r in g if not set(r["aliases"]) <= family_holdout] for g in train_groups]
     density_holdout = [[r for r in g if set(r["aliases"]) <= family_holdout] for g in train_groups]
     density_holdout = [g for g in density_holdout if g]
-    if evidence.purpose == "research" and not density_holdout:
+    if family_holdout and evidence.purpose == "research" and not density_holdout:
         raise ValueError("Research teacher fitting requires its density-family holdout.")
     train = [_tensors(evidence, g, device) for g in teacher_groups if g]
     validation = [_tensors(evidence, g, device) for g in val_groups]
     density_validation = [_tensors(evidence, g, device) for g in density_holdout]
-    architecture = ModelConfig(evidence.conditioning.width, len(next(iter(evidence.calibrations.values())).metric_keys))
+    weights = next(iter(evidence.calibrations.values())).metric_weights
+    architecture = ModelConfig(evidence.conditioning.width, len(weights), dropout=config.dropout)
     # fork_rng isolates initialization from callers' generation RNG state.
     devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(config.seed)
         teacher = DensityTeacher(architecture).to(device)
     rng = np.random.default_rng(config.seed)
-    optimizer = _optimizer(teacher, config)
-    best, best_state, teacher_history = float("inf"), None, []
-    interval = max(1, config.steps // 10)
-    for step in range(config.steps):
+    optimizer = torch.optim.AdamW(
+        teacher.parameters(), lr=config.teacher_learning_rate, weight_decay=config.weight_decay
+    )
+    best, best_state, teacher_history, selected_teacher = None, None, [], None
+
+    def teacher_losses(groups):
+        return torch.stack(
+            [teacher_loss(p, g[2], weights) for p, g in zip(_predict_groups(teacher, groups), groups, strict=True)]
+        )
+
+    for step in range(config.teacher_steps):
         teacher.train()
-        condition, mass, target = train[int(rng.integers(len(train)))]
-        _finite_step(teacher, optimizer, teacher_loss(teacher(condition, mass), target))
-        if (step + 1) % interval == 0 or step + 1 == config.steps:
+        indices = sample_groups(rng, len(train), config.teacher_batch_groups)
+        loss = accumulated_step(
+            teacher,
+            optimizer,
+            [train[i] for i in indices],
+            teacher_losses,
+            microbatch_contexts=config.microbatch_contexts,
+        )
+        if (step + 1) % config.teacher_checkpoint_every == 0 or step + 1 == config.teacher_steps:
             teacher.eval()
             with torch.no_grad():
-                context_loss = torch.stack([F.huber_loss(teacher(c, m), y) for c, m, y in validation]).mean()
-                family_loss = (
-                    torch.stack([F.huber_loss(teacher(c, m), y) for c, m, y in density_validation]).mean()
-                    if density_validation
-                    else context_loss
-                )
-                value = float((context_loss + family_loss) / 2)
-            teacher_history.append(
-                {"step": step + 1, "context_huber": float(context_loss), "density_huber": float(family_loss)}
-            )
-            if value < best:
-                best, best_state = value, copy.deepcopy(teacher.state_dict())
+                for temperature in config.temperatures:
+                    context = _regret(teacher, validation, config, temperature, weights)
+                    family = (
+                        _regret(teacher, density_validation, config, temperature, weights)
+                        if density_validation
+                        else None
+                    )
+                    regret = context if family is None else (context + family) / 2
+                    row = {
+                        "step": step + 1,
+                        "temperature": temperature,
+                        "regret": regret,
+                        "context_regret": context,
+                        "density_regret": family,
+                        "training_loss": loss,
+                        "groups": len(indices),
+                    }
+                    teacher_history.append(row)
+                    if not np.isfinite(regret):
+                        raise ValueError("Nonfinite held-out teacher utility regret.")
+                    key = selection_key(regret, temperature, step + 1, config.preferred_temperature)
+                    if best is None or key < best:
+                        best, best_state, selected_teacher = key, copy.deepcopy(teacher.state_dict()), dict(row)
     if best_state is None:
         raise ValueError("Teacher validation did not produce a finite checkpoint.")
     teacher.load_state_dict(best_state)
     teacher.eval().requires_grad_(False)
     teacher.zero_grad(set_to_none=True)
     training_groups = [_tensors(evidence, g, device) for g in train_groups]
-    with torch.no_grad():
-        targets = [(c[:1], m, teacher_weights(teacher, c, m)) for c, m, _ in training_groups]
-        validation_targets = [(c[:1], m, teacher_weights(teacher, c, m)) for c, m, _ in validation]
+    temperature = selected_teacher["temperature"]
+
+    def make_targets(groups):
+        result = []
+        with torch.no_grad():
+            for start in range(0, len(groups), config.microbatch_contexts):
+                chunk = groups[start : start + config.microbatch_contexts]
+                for prediction, (c, m, _, scale) in zip(_predict_groups(teacher, chunk), chunk, strict=True):
+                    score = scalarize(prediction, weights)
+                    std = score.std(unbiased=False)
+                    std = torch.where(std < 1e-6, torch.ones_like(std), std)
+                    result.append(
+                        (
+                            c[:1],
+                            m,
+                            reference_weights(score, temperature=temperature, reward_scale=scale),
+                            score.mean(),
+                            std,
+                        )
+                    )
+        return result
+
+    targets, validation_targets = make_targets(training_groups), make_targets(validation)
     # Fit the ratio transform only on unique training-reference densities.
     unique = {}
     for group in teacher_groups:
@@ -162,7 +283,7 @@ def fit_models(evidence: Evidence, config: TrainingConfig, *, student_kind: str 
     ratios = logmass[:, :-1] - logmass[:, -1:]
     ratio_mean, ratio_scale = ratios.mean(0), ratios.std(0, unbiased=False)
     ratio_scale = torch.where(ratio_scale < 1e-6, 1, ratio_scale)
-    students, histories = {}, {}
+    students, histories, selections = {}, {}, {}
     kinds = STUDENT_KINDS if student_kind == "both" else (student_kind,)
     for kind in kinds:
         with torch.random.fork_rng(devices=devices):
@@ -172,75 +293,71 @@ def fit_models(evidence: Evidence, config: TrainingConfig, *, student_kind: str 
                 if kind == "deterministic"
                 else StochasticStudent(architecture, ratio_mean, ratio_scale)
             ).to(device)
-        optimizer = _optimizer(model, config)
+        torch.manual_seed(config.seed + 419)  # Independent dropout stream for each student kind.
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=config.student_learning_rate, weight_decay=config.weight_decay
+        )
+        group_rng = np.random.default_rng(config.seed + 113)
         generator = torch.Generator(device=device).manual_seed(config.seed + 173)
         score_rng = torch.Generator(device=device).manual_seed(config.seed + 271)
         val_rng = torch.Generator(device=device).manual_seed(config.seed + 379)
-        # Fixed validation noise gives comparable checkpoints without touching
-        # generation or training streams.
-        val_noise = torch.randn(config.batch_size, 63, generator=val_rng, device=device)
-        history, best, best_state = [], float("inf"), None
-        for step in range(config.steps):
+        val_noise = torch.randn(config.stochastic_likelihood_samples, 63, generator=val_rng, device=device)
+        history, best, best_state, chosen = [], float("inf"), None, None
+
+        for step in range(config.student_steps):
             model.train()
-            condition, mass, weights = targets[int(rng.integers(len(targets)))]
-            coefficient = score_coefficient(step, config.steps, config.teacher_score_weight)
-            if kind == "deterministic":
-                target = (weights[:, None] * mass).sum(0, keepdim=True)
-                predicted = model(condition)
-                distillation = density_kl(target, predicted).mean()
-                score = teacher_score(teacher, condition, predicted)
-            else:
-                choice = torch.multinomial(weights, config.batch_size, replacement=True, generator=generator)
-                repeated_condition = condition.expand(config.batch_size, -1)
-                target = model.ratios(mass[choice]) + config.target_smoothing * torch.randn(
-                    config.batch_size, 63, generator=generator, device=device
-                )
-                distillation = model.nll(repeated_condition, target).mean()
-                # Bound score Monte Carlo memory independently of parallel NLL.
-                score_condition = condition.expand(min(4, config.batch_size), -1)
-                score = (
-                    teacher_score(teacher, score_condition, model.sample(score_condition, generator=score_rng))
-                    if coefficient
-                    else distillation * 0
-                )
-            loss = distillation - coefficient * score
-            _finite_step(model, optimizer, loss)
+            coefficient = score_coefficient(step, config.student_steps, config.teacher_score_weight)
+            indices = sample_groups(group_rng, len(targets), config.student_batch_contexts)
+            loss = accumulated_step(
+                model,
+                optimizer,
+                [targets[i] for i in indices],
+                partial(
+                    student_losses,
+                    model=model,
+                    kind=kind,
+                    teacher=teacher,
+                    config=config,
+                    weights=weights,
+                    coefficient=coefficient,
+                    generator=generator,
+                    score_rng=score_rng,
+                ),
+                microbatch_contexts=config.microbatch_contexts,
+            )
             if any(p.grad is not None for p in teacher.parameters()):
                 raise RuntimeError("Frozen teacher unexpectedly accumulated parameter gradients.")
-            if (step + 1) % interval == 0 or step + 1 == config.steps:
+            if (step + 1) % config.student_checkpoint_every == 0 or step + 1 == config.student_steps:
                 model.eval()
                 with torch.no_grad():
                     losses = []
-                    for c, m, w in validation_targets:
+                    for c, m, w, _, _ in validation_targets:
                         if kind == "deterministic":
                             value = density_kl((w[:, None] * m).sum(0, keepdim=True), model(c)).mean()
                         else:
-                            # Weighted expectation over all reference paths,
-                            # with fixed perturbations for checkpoint selection.
                             perturbed = model.ratios(m)[:, None] + config.target_smoothing * val_noise[None]
-                            condition_batch = c.expand(len(m) * config.batch_size, -1)
+                            condition_batch = c.expand(len(m) * config.stochastic_likelihood_samples, -1)
                             value = (
                                 model.nll(condition_batch, perturbed.reshape(-1, 63)).reshape(len(m), -1).mean(1) * w
                             ).sum()
                         losses.append(value)
                     value = float(torch.stack(losses).mean())
-                history.append(
-                    {
-                        "step": step + 1,
-                        "distillation": float(distillation.detach()),
-                        "teacher_score": float(score.detach()),
-                        "coefficient": coefficient,
-                        "validation_distillation": value,
-                    }
-                )
-                # Select only after score optimization has begun.
+                row = {
+                    "step": step + 1,
+                    "objective": loss,
+                    "coefficient": coefficient,
+                    "validation_distillation": value,
+                    "contexts": len(indices),
+                }
+                history.append(row)
                 if coefficient > 0 and value < best:
-                    best, best_state = value, copy.deepcopy(model.state_dict())
+                    best, best_state, chosen = value, copy.deepcopy(model.state_dict()), dict(row)
         if best_state is None:
             raise ValueError("Student validation did not produce a finite checkpoint after the score ramp.")
         model.load_state_dict(best_state)
         students[kind] = model.eval().requires_grad_(False).cpu()
         histories[kind] = history
+        selections[kind] = chosen
     return (
         teacher.cpu(),
         students,
@@ -249,6 +366,10 @@ def fit_models(evidence: Evidence, config: TrainingConfig, *, student_kind: str 
             "teacher": teacher_history,
             "students": histories,
             "density_holdout": sorted(family_holdout),
+            "teacher_selection": selected_teacher,
+            "student_selection": selections,
+            "temperature_units": TEMPERATURE_UNITS,
+            "auxiliary_normalization": AUXILIARY_NORMALIZATION,
         },
     )
 
@@ -259,13 +380,10 @@ def fit(
     output,
     *,
     student_kind: str = "both",
-    teacher_score_weight: float = 0.01,
-    steps: int = 2000,
-    seed: int = 0,
     device: str = "cuda",
     purpose: str = "research",
     calibration_rows: list[dict] | None = None,
-    batch_size: int = 32,
+    **fitting_settings,
 ) -> dict:
     if Path(output).exists():
         raise FileExistsError(f"Artifact destination already exists: {output}")
@@ -273,7 +391,7 @@ def fit(
     if bindings and (len(bindings) != len(rows) or any(value != bindings[0] for value in bindings)):
         raise ValueError("Native backbone/context bindings differ between measurements.")
     evidence = prepare_evidence(rows, contexts, calibration_rows=calibration_rows, purpose=purpose)
-    config = TrainingConfig(steps=steps, seed=seed, teacher_score_weight=teacher_score_weight, batch_size=batch_size)
+    config = resolve_profile(evidence.task, **fitting_settings)
     started = time.perf_counter()
     teacher, students, history = fit_models(evidence, config, student_kind=student_kind, device=device)
     fitting_seconds = time.perf_counter() - started
@@ -285,6 +403,13 @@ def fit(
         "reward_calibrations": {k: v.to_payload() for k, v in evidence.calibrations.items()},
         "evidence_sha256": evidence.evidence_sha256,
         "history": history,
+        "fitting_profile": {"task": evidence.task, **asdict(config)},
+        "metric_weights": list(next(iter(evidence.calibrations.values())).metric_weights),
+        "temperature_units": TEMPERATURE_UNITS,
+        "auxiliary_normalization": AUXILIARY_NORMALIZATION,
+        "teacher_selection_criterion": "heldout_reference_utility_regret",
+        "student_selection_criterion": "post_ramp_validation_distillation",
+        "selected_temperature": history["teacher_selection"]["temperature"],
         "split_contexts": {
             s: sorted({r["context_id"] for r in evidence.cells if r["split"] == s}) for s in ("train", "validation")
         },

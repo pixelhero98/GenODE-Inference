@@ -20,7 +20,7 @@ The optional `latent-clock` extra supplies Bayesian-optimization dependencies. I
 | Task | Frozen native context | Terminal training reward |
 | --- | --- | --- |
 | `solar_energy_10m`, `traffic_hourly`, `weather_daily` | Pooled backbone summary, including native auxiliary conditioning | Equal-weight CRPS and MASE log improvements |
-| `molecule_3d_set1`, `molecule_3d_set2`, `molecule_3d_set3` | Pooled backbone summary of observed history | Joint-trajectory ensemble energy-score log improvement |
+| `molecule_3d_set1`, `molecule_3d_set2`, `molecule_3d_set3` | Pooled backbone summary of observed history | 40% Kabsch RMSD + 15% each of four motion-discrepancy log improvements |
 | `cifar10` | Explicit zero vector | Uniform KID minus candidate KID |
 | `imagenet64` | Native class embedding | Equally weighted class-conditional paired KID improvement |
 | `sana`, `sd15` | Pooled native text embedding | Equal-weight ImageReward and VQAScore differences, divided by frozen pilot component scales |
@@ -31,26 +31,38 @@ Positive errors use `log((anchor + epsilon) / (candidate + epsilon))`, where eac
 
 ImageNet retains paired-jackknife, class-to-feature-group-to-global shrinkage estimated only from training/calibration evidence. Report unshrunk class-conditional KID separately from measured global KID/FID. Global metrics cannot be reconstructed from class KID alone.
 
-The molecular primary score is the fair finite-ensemble energy estimator:
+The molecular primary reward is 40% Kabsch RMSD log improvement and 15% each for ensemble velocity, ensemble acceleration, rollout velocity and rollout acceleration norm-Wasserstein discrepancies. Metric weights apply to teacher ranking, regression, reference weighting, auxiliary scoring and reports. The fair finite-ensemble energy estimator remains a diagnostic:
 
 ```text
 mean_m ||phi(X_m) - phi(y)||
   - sum_{m != n} ||phi(X_m) - phi(X_n)|| / (2 M (M - 1))
 ```
 
-It requires at least two independently generated complete trajectories. The frozen feature map preserves atom indices and horizon order, includes indexed pair distances and signed volumes relative to a non-collinear reference triangle, and uses deterministic atom-index tie breaking. Lengths and volumes use the training reference RMS pair distance and its cube; feature blocks use dimension normalization. The observed future is one observation, never a fabricated reference ensemble. Kabsch RMSD, motion discrepancies, clashes, and bond violations remain diagnostics.
+It requires at least two independently generated complete trajectories. The frozen feature map preserves atom indices and horizon order, includes indexed pair distances and signed volumes relative to a non-collinear reference triangle, and uses deterministic atom-index tie breaking. Lengths and volumes use the training reference RMS pair distance and its cube; feature blocks use dimension normalization. The observed future is one observation, never a fabricated reference ensemble. Clashes and bond violations also remain diagnostics. The schedule report identifies energy score as a reporting diagnostic; teacher selection uses paired utility regret.
 
 These are optimization objectives. Log transformations, mixtures of components, and teacher approximations do not establish proper scoring or benchmark improvement for the learned policy.
 
 ## Shared architecture and optimization
 
-All roles use a two-layer, width-128, four-head, pre-normalized Transformer with a 256-wide feed-forward block and zero dropout. Conditioning combines native context, solver identity, and continuous NFE/macro-step features. Feature normalization is fitted on training data and frozen. Initial generation noise is never a policy input.
+All roles use a two-layer, width-128, four-head, pre-normalized Transformer with a 256-wide feed-forward block and task-configured dropout. Conditioning combines native context, solver identity, and continuous NFE/macro-step features. Feature normalization is fitted on training data and frozen. Initial generation noise is never a policy input.
 
 * The teacher consumes conditioning and a candidate density and predicts the normalized metric-improvement vector. Its objective combines within-context/settings pairwise ranking (temperature 0.5) with weighted Huber regression (weight 0.25).
 * The deterministic student uses 64 density-bin queries. It minimizes KL from the teacher-weighted reference-density barycenter, plus a teacher-score term.
 * The stochastic student predicts 63 Gaussian log-density ratios autoregressively. Training-reference ratios are standardized; likelihood targets receive Gaussian noise with standard deviation 0.1. Predicted standard deviations are bounded to [0.05, 2]. The likelihood averages over all 63 coordinates. A reparameterized teacher-score term also trains this student.
 
-Both students use a uniform prior over unique realized reference densities and teacher softmax temperature 1. Stochastic target smoothing is an additional modeling choice. Teacher-score weights are **0.01, 0.05, 0.1**, default 0.01. The weight ramps linearly from zero after 60% of training; normalized teacher scores are clipped to [-5, 5]. Teacher parameters remain frozen while gradients pass through density inputs.
+Both students use a uniform prior over unique realized reference densities. Reference softmax temperature is expressed in paired utility units **before** scalar reward normalization: multiply predicted scalar scores by the frozen reward scale before dividing by temperature. Reference logits are never clipped. Stochastic target smoothing is an additional modeling choice.
+
+Teacher-score weights are **0.01, 0.05, 0.1**. Auxiliary scores use each context/solver/NFE group's frozen predicted-reference mean and population standard deviation (standard deviations below 1e-6 use 1), then clip to [-5, 5]. This normalization does not change terminal rewards or reference weights. Teacher parameters remain frozen while gradients pass through density inputs. The coefficient ramps linearly from zero after 60% of the configured student horizon; only checkpoints with a positive realized coefficient are eligible.
+
+Teacher updates average up to 64 distinct comparison groups; student updates average up to 512 distinct context/settings targets. Smaller microbatches accumulate the same equally weighted objective. Ranking pairs never cross group boundaries. Teacher checkpoint/temperature selection minimizes measured held-out reference-mixture utility regret. Context and density-family regret receive equal weight when the profile uses both; text-to-image uses context selection only. Ties prefer the configured preferred temperature, then the earlier checkpoint. Student selection minimizes held-out distillation loss among post-ramp checkpoints, with earlier-step ties.
+
+| Profile | Teacher/student steps | Dropout | Score coefficient | Initial reference temperature |
+|---|---:|---:|---:|---:|
+| Forecasting, molecules | 500 / 500 | 0.05 | 0.01 | 0.05 |
+| SANA, SD1.5 | 500 / 500 | 0.05 | 0.05 | 0.05 |
+| CIFAR-10, ImageNet-64 | 2,000 / 2,000 | 0 | 0.01 | 1 |
+
+Transformer AdamW defaults to learning rate 0.001 and weight decay 0.0001. Teacher and student learning rates, step limits, batch sizes and checkpoint intervals are independently configurable. Task identity comes from the evidence. All resolved settings are recorded; architecture sharing does not imply one validated temperature for every task.
 
 The shared pool has 25 reference clocks, including late-p=3 and its reversal. Every reference is materialized through the same 64-bin representation as student outputs. Identical densities are deduplicated before mixture weighting. Historical evidence is reusable only if executed grids and measurement protocols match exactly; changed grids require new measurements.
 
@@ -66,15 +78,24 @@ The common interface accepts JSON configuration:
   "output": "policy",
   "student_kind": "both",
   "teacher_score_weight": 0.01,
-  "steps": 2000,
-  "batch_size": 32,
+  "teacher_steps": 500,
+  "student_steps": 500,
+  "teacher_batch_groups": 64,
+  "student_batch_contexts": 512,
+  "microbatch_contexts": 8,
+  "teacher_learning_rate": 0.001,
+  "student_learning_rate": 0.001,
+  "teacher_checkpoint_every": 100,
+  "student_checkpoint_every": 100,
+  "temperatures": [0.025, 0.05, 0.1],
+  "preferred_temperature": 0.05,
   "seed": 0,
   "device": "cuda",
   "purpose": "research"
 }
 ```
 
-Paths are relative to the configuration file. Each measurement row contains `task`, `backbone`, `solver`, integer `nfe`, `context_id`, explicit `split`, integer `seed`, `ensemble_size`, `reference_id`, `measurement_protocol`, `schedule_key`, `metrics`, 64 `density_mass` entries, and the executed `time_grid`. Metric keys are `crps/mase`, `energy_score`, `kid`, or `preference/alignment`. Training input contains disjoint `train` and `validation` contexts; calibration contains only `train` or `calibration`. Locked-test rows are forbidden during fitting. Store native contexts with `save_context_embedding_table`.
+Paths are relative to the configuration file. Each measurement row contains `task`, `backbone`, `solver`, integer `nfe`, `context_id`, explicit `split`, integer `seed`, `ensemble_size`, `reference_id`, `measurement_protocol`, `schedule_key`, `metrics`, 64 `density_mass` entries, and the executed `time_grid`. Metric keys are `crps/mase`, `kid`, or `preference/alignment`; molecular keys are `kabsch_rmsd_3d`, `ensemble_velocity_norm_w1`, `ensemble_acceleration_norm_w1`, `rollout_velocity_norm_w1`, and `rollout_acceleration_norm_w1`. Training input contains disjoint `train` and `validation` contexts; calibration contains only `train` or `calibration`. Locked-test rows are forbidden during fitting. Store native contexts with `save_context_embedding_table`.
 
 Research molecular rows also carry the frozen `molecule_feature_map` dictionary from `MoleculeFeatureMap.to_dict()`. It is recorded in the policy artifact and checked against runtime reference geometry.
 
@@ -83,7 +104,7 @@ genode-train-gico --config train.json --dry-run
 genode-train-gico --config train.json --student-kind both --teacher-score-weight 0.01
 ```
 
-Research evidence requires all 25 references in every cell. Explicit `purpose: functional` permits a reduced reference set for integration checks; it does not produce benchmark evidence. Checkpoints are selected using validation evidence, including a teacher density-family holdout. Output directories must be new.
+Research evidence requires all 25 references in every cell. Explicit `purpose: functional` permits a reduced reference set for integration checks; it does not produce benchmark evidence. Checkpoints are selected using validation evidence and the profile-specific teacher density-family holdout. Output directories must be new.
 
 ```python
 from genode.gico.policy import load_policy
@@ -126,7 +147,7 @@ BO, PG, and LD3 remain separate comparison methods. Completed experiments remain
 
 ## Artifacts and validation
 
-Protocol `genode-gico-v2` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, and fitting history. Incompatible old artifacts are rejected; there is no legacy architecture loader.
+Protocol `genode-gico-v3` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, resolved fitting profiles, explicit metric weights, dropout, temperature units, normalization/selection protocols, selected steps and realized coefficients, and fitting history. Incompatible old artifacts are rejected; there is no legacy architecture loader.
 
 `genode-report-gico-locked-test` applies an artifact's frozen calibration to paired test measurements without selection. `genode-evaluate-schedule-summary` performs the analogous validation report. Both require new output files and matching frozen measurement protocols, native backbone bindings, and molecular feature maps. Supply `policy_sha256` and `student_kind` for learned-policy measurements.
 

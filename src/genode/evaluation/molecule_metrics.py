@@ -43,8 +43,8 @@ from genode.solver_protocol import (
 )
 
 MOLECULE_CONTEXT_SCHEMA = "molecule_3d_window"
-MOLECULE_PRIMARY_METRICS: tuple[str, ...] = ("molecule_energy_score",)
-MOLECULE_DIAGNOSTIC_METRICS: tuple[str, ...] = (
+MOLECULE_DIAGNOSTIC_METRICS: tuple[str, ...] = ("molecule_energy_score",)
+MOLECULE_PRIMARY_METRICS: tuple[str, ...] = (
     "molecule_kabsch_rmsd_3d",
     "molecule_ensemble_velocity_norm_w1",
     "molecule_ensemble_acceleration_norm_w1",
@@ -700,7 +700,7 @@ def evaluate_molecule_rollout_schedule(
     }
     for metric in (*MOLECULE_PRIMARY_METRICS, *MOLECULE_DIAGNOSTIC_METRICS):
         summary[metric] = _safe_mean([row.get(metric) for row in per_context])
-    summary["selection_metric_value"] = summary["molecule_energy_score"]
+    summary["reporting_metric_value"] = summary["molecule_energy_score"]
     return summary
 
 

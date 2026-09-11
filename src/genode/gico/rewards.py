@@ -10,20 +10,35 @@ import numpy as np
 
 from genode.solver_protocol import normalize_solver_key
 
+MOLECULE_METRICS = (
+    "kabsch_rmsd_3d",
+    "ensemble_velocity_norm_w1",
+    "ensemble_acceleration_norm_w1",
+    "rollout_velocity_norm_w1",
+    "rollout_acceleration_norm_w1",
+)
 TASK_METRICS = {
     "solar_energy_10m": ("crps", "mase"),
     "traffic_hourly": ("crps", "mase"),
     "weather_daily": ("crps", "mase"),
-    "molecule_3d_set1": ("energy_score",),
-    "molecule_3d_set2": ("energy_score",),
-    "molecule_3d_set3": ("energy_score",),
+    "molecule_3d_set1": MOLECULE_METRICS,
+    "molecule_3d_set2": MOLECULE_METRICS,
+    "molecule_3d_set3": MOLECULE_METRICS,
     "cifar10": ("kid",),
     "imagenet64": ("kid",),
     "sana": ("preference", "alignment"),
     "sd15": ("preference", "alignment"),
 }
-LOG_METRICS = frozenset(("crps", "mase", "energy_score"))
+LOG_METRICS = frozenset(("crps", "mase", *MOLECULE_METRICS))
 FIT_SPLITS = frozenset(("train", "calibration"))
+
+
+def metric_weights(task: str) -> tuple[float, ...]:
+    return (
+        (0.4, 0.15, 0.15, 0.15, 0.15)
+        if task.startswith("molecule_")
+        else tuple(1 / len(TASK_METRICS[task]) for _ in TASK_METRICS[task])
+    )
 
 
 def _balanced_std(values: np.ndarray, nfes: np.ndarray) -> np.ndarray:
@@ -84,7 +99,7 @@ def _paired_cells(rows: list[dict[str, Any]], *, varying_clocks: bool = False) -
                 raise ValueError("Invalid shrunk KID evidence.")
         if any(row["metrics"][key] < 0 for key in TASK_METRICS[row["task"]] if key in LOG_METRICS):
             raise ValueError("Error metrics must be nonnegative.")
-        if "energy_score" in TASK_METRICS[row["task"]] and row["ensemble_size"] < 2:
+        if row["task"].startswith("molecule_") and row["ensemble_size"] < 2:
             raise ValueError("Fair molecular energy score requires at least two ensemble members.")
         key = tuple(row[k] for k in ("task", "backbone", "solver", "nfe", "context_id", "split", "seed"))
         if row["schedule_key"] in panel[key]:
@@ -152,6 +167,13 @@ class RewardCalibration:
     calibration_contexts: tuple[str, ...]
     calibration_nfes: tuple[int, ...]
 
+    @property
+    def metric_weights(self) -> tuple[float, ...]:
+        return metric_weights(self.task)
+
+    def scalar(self, cell: dict, *, normalize: bool = True) -> float:
+        return float(self.vector(cell, normalize=normalize) @ np.asarray(self.metric_weights))
+
     def __post_init__(self) -> None:
         if self.task not in TASK_METRICS or tuple(self.metric_keys) != TASK_METRICS[self.task]:
             raise ValueError("Calibration metric profile does not match its task.")
@@ -183,11 +205,13 @@ class RewardCalibration:
         return result / self.reward_scale if normalize else result
 
     def to_payload(self) -> dict:
-        return asdict(self)
+        return {**asdict(self), "metric_weights": self.metric_weights}
 
     @classmethod
     def from_payload(cls, payload: dict) -> RewardCalibration:
         values = dict(payload)
+        if tuple(values.pop("metric_weights", ())) != metric_weights(values["task"]):
+            raise ValueError("Reward metric weights are absent or incompatible; recalibrate with the current protocol.")
         for name in ("metric_keys", "floors", "component_scales", "calibration_contexts", "calibration_nfes"):
             values[name] = tuple(values[name])
         return cls(**values)
@@ -240,7 +264,7 @@ def calibrate_rewards(rows: list[dict], *, component_calibration_rows: list[dict
         "calibration_nfes": tuple(int(x) for x in np.unique(nfes)),
     }
     provisional = RewardCalibration(**common, reward_scale=1.0)
-    scalar = np.array([[provisional.vector(r, normalize=False).mean()] for r in candidates])
+    scalar = np.array([[provisional.scalar(r, normalize=False)] for r in candidates])
     return RewardCalibration(**common, reward_scale=float(_balanced_std(scalar, nfes)[0]))
 
 
@@ -251,5 +275,5 @@ def construct_rewards(rows: list[dict], calibration: RewardCalibration, *, varyi
     for cell in cells:
         vector = calibration.vector(cell)
         cell["reward_vector"] = vector.tolist()
-        cell["reward"] = float(vector.mean())
+        cell["reward"] = calibration.scalar(cell)
     return cells

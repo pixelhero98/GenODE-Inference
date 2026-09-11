@@ -29,12 +29,15 @@ class ModelConfig:
     layers: int = 2
     heads: int = 4
     feedforward: int = 256
+    dropout: float = 0.0
 
     def __post_init__(self) -> None:
         if (self.width, self.layers, self.heads, self.feedforward) != (128, 2, 4, 256):
             raise ValueError("Unified GICO requires width128/layers2/heads4/feedforward256.")
         if any(isinstance(x, bool) or not isinstance(x, int) or x < 1 for x in (self.condition_dim, self.metric_count)):
             raise ValueError("Condition width and metric count must be positive integers.")
+        if not 0 <= self.dropout <= 0.1:
+            raise ValueError("Dropout must be between zero and 0.1.")
 
     def to_payload(self) -> dict:
         return asdict(self)
@@ -53,7 +56,7 @@ class _Transformer(nn.Module):
                     config.width,
                     config.heads,
                     config.feedforward,
-                    dropout=0,
+                    dropout=config.dropout,
                     activation="gelu",
                     batch_first=True,
                     norm_first=True,

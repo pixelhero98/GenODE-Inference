@@ -31,10 +31,18 @@ def test_prepare_and_train_delegate_to_common_fit(tmp_path):
         )
     assert fit.call_args.kwargs["student_kind"] == "both"
     assert fit.call_args.kwargs["teacher_score_weight"] == 0.05
+    from genode.gico.profiles import resolve_profile
+
+    settings = {
+        k: v
+        for k, v in fit.call_args.kwargs.items()
+        if k not in {"student_kind", "device", "purpose", "calibration_rows"}
+    }
+    assert resolve_profile("cifar10", **settings).student_steps == 2000
     assert len(fit.call_args.args[0]) == 4
     assert all("kid" in row["metrics"] for row in fit.call_args.args[0])
 
 
 def test_shared_image_training_flags():
     args = build_argparser().parse_args(["train", "--evidence", "input.json", "--output", "out"])
-    assert args.student_kind == "both" and args.teacher_score_weight == 0.01
+    assert args.student_kind == "both" and args.teacher_score_weight is None
