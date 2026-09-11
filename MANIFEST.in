@@ -4,3 +4,4 @@ include SECURITY.md
 include THIRD_PARTY_NOTICES.md
 include tests/__init__.py
 recursive-include LICENSES *.txt
+recursive-include docs *.md

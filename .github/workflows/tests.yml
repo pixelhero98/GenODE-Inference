@@ -164,6 +164,9 @@ jobs:
                   validate_name(name)
                   validate_content(name, archive.read(name))
               required_wheel = {
+                  "genode/latent_clock/js_experiment.py",
+                  "genode/latent_clock/js_reinforce.py",
+                  "genode/image_comparators/reflow.py",
                   "genode/gico/image_cli.py",
                   "genode/gico/networks.py",
                   "genode/gico/rewards.py",
@@ -206,6 +209,7 @@ jobs:
                   raise SystemExit("Source distribution omitted publication or test metadata.")
           PY
       - run: python -m pip install --force-reinstall dist/*.whl
+      - run: python -m genode.latent_clock.js_experiment --help
       - run: |
           for command in \
             genode-run-schedules \

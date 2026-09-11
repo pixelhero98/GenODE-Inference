@@ -30,10 +30,10 @@ def serve_scores() -> None:
     for line in sys.stdin:
         request = json.loads(line)
         with contextlib.redirect_stdout(sys.stderr):
-            if request.get("close"):
+            if request.get("close") or request.get("identity"):
                 scorer.verify_frozen()
                 result = {
-                    "closed": True,
+                    "closed": bool(request.get("close")),
                     "fingerprints": scorer._fingerprints,
                     "versions": scorer.versions,
                     "asset_manifest_sha256": scorer.asset_manifest_sha256,

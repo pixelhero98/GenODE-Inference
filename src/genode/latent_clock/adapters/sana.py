@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from genode.latent_clock.clocks import Clock
 from genode.latent_clock.contracts import ExecutionTrace, FrozenContext
+
+if TYPE_CHECKING:
+    from genode.latent_clock.js_reinforce import JSSchedule
 
 
 def invert_flow_shift(target_sigma: np.ndarray, shift: float) -> np.ndarray:
@@ -18,7 +21,7 @@ def invert_flow_shift(target_sigma: np.ndarray, shift: float) -> np.ndarray:
     return target / (value - (value - 1.0) * target)
 
 
-def _prepare_scheduler(scheduler: Any, clock: Clock, device: Any) -> Any:
+def _prepare_scheduler(scheduler: Any, clock: Clock | JSSchedule, device: Any) -> Any:
     import torch
 
     target = 1.0 - np.asarray(clock.nodes, dtype=np.float64)
@@ -69,7 +72,24 @@ class SanaFlowEulerAdapter:
         self._opaque_contexts[context.context_id] = (condition, uncondition, dict(model_kwargs))
         return context
 
-    def sample(self, *, noise_seed: int, context: FrozenContext, clock: Clock) -> tuple[Any, ExecutionTrace]:
+    def policy_inputs(self, *, noise_seed: int, context: FrozenContext) -> dict:
+        """Expose frozen native inputs for the separate noise-conditioned JS baseline."""
+        import torch
+
+        if context.backbone_revision != self.backbone_revision or context.context_id not in self._opaque_contexts:
+            raise ValueError("SANA context does not belong to this frozen adapter.")
+        condition, _, kwargs = self._opaque_contexts[context.context_id]
+        mask = kwargs.get("mask")
+        return {
+            "noise": self.latent_factory(int(noise_seed), context).detach(),
+            "text": condition[:, 0].detach(),
+            "pooled": torch.tensor(context.embedding.copy(), device=condition.device)[None],
+            "padding_mask": None if mask is None else ~mask.bool(),
+        }
+
+    def sample(
+        self, *, noise_seed: int, context: FrozenContext, clock: Clock | JSSchedule
+    ) -> tuple[Any, ExecutionTrace]:
         if context.backbone_revision != self.backbone_revision or context.context_id not in self._opaque_contexts:
             raise ValueError("SANA context does not belong to this frozen adapter.")
         if clock.target_nfe <= 0:

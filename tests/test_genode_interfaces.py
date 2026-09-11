@@ -136,6 +136,8 @@ class GenODEInterfaceTests(unittest.TestCase):
                 "README.md",
                 "SECURITY.md",
                 "THIRD_PARTY_NOTICES.md",
+                "docs/image-comparators.md",
+                "docs/js-reinforce.md",
             ],
         )
         text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
@@ -206,9 +208,12 @@ class GenODEInterfaceTests(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, manifest)
 
-    def test_no_tracked_scripts_or_legacy_docs_tree(self) -> None:
+    def test_no_tracked_scripts_or_unregistered_docs(self) -> None:
         self.assertFalse((PROJECT_ROOT / "scripts").exists())
-        self.assertFalse((PROJECT_ROOT / "docs").exists())
+        self.assertEqual(
+            {path.name for path in (PROJECT_ROOT / "docs").iterdir()},
+            {"image-comparators.md", "js-reinforce.md"},
+        )
 
     def test_gico_trainer_public_contract_is_canonical(self) -> None:
         from genode.gico.train_gico import build_argparser

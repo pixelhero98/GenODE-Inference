@@ -98,6 +98,12 @@ Forecast and molecular Python evaluators accept `policy` and `clock_seed`. Forec
 
 ## Image and latent-image workflows
 
+The separate [JS-REINFORCE comparator](docs/js-reinforce.md) provides a documented
+paper-based Dirichlet scheduler with native noise/text conditioning, budgeted
+SANA fitting and versioned inference artifacts. It is distinct from both GICO
+students. The [ReFlow comparison bridge](docs/image-comparators.md) loads the
+original frozen EMA network and supplies a shared exact-count EDM FID evaluator.
+
 CIFAR/ImageNet preparation validates paired feature-block evidence and native backbone/context bindings:
 
 ```bash
