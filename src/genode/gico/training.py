@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import time
 from dataclasses import asdict, replace
 from functools import partial
@@ -13,7 +14,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from genode.gico.evidence import Evidence, prepare_evidence
+from genode.gico.evidence import Evidence, content_hash, prepare_evidence
 from genode.gico.networks import DensityTeacher, DeterministicStudent, ModelConfig, StochasticStudent, density_kl
 from genode.gico.profiles import (
     AUXILIARY_NORMALIZATION,
@@ -24,6 +25,55 @@ from genode.gico.profiles import (
 )
 
 STUDENT_KINDS = ("deterministic", "stochastic")
+
+
+def reuse_teacher(path, evidence: Evidence, config: TrainingConfig):
+    """Load a frozen teacher only for the exact evidence and teacher fitting profile."""
+    from genode.gico.policy import load_teacher
+
+    location = Path(path)
+    weight_path = location / "policy.pt" if location.is_dir() else location
+    digest = hashlib.sha256(weight_path.read_bytes()).hexdigest()
+    teacher, conditioning, metadata = load_teacher(path)
+    if hashlib.sha256(weight_path.read_bytes()).hexdigest() != digest:
+        raise ValueError("Teacher artifact changed while loading.")
+    expected = {
+        "task": evidence.task,
+        "backbone": evidence.backbone,
+        "purpose": evidence.purpose,
+        "evidence_sha256": evidence.evidence_sha256,
+        "reward_calibrations": {k: v.to_payload() for k, v in evidence.calibrations.items()},
+    }
+    for key, value in expected.items():
+        if content_hash(metadata[key]) != content_hash(value):
+            raise ValueError(f"Reused teacher {key} differs from fitting evidence.")
+    expected_conditioning = replace(evidence.conditioning, context_mode=config.teacher_context_mode)
+    if content_hash(conditioning.to_payload()) != content_hash(expected_conditioning.to_payload()):
+        raise ValueError("Reused teacher conditioning differs from fitting evidence.")
+    teacher_fields = {
+        "teacher_context_mode",
+        "teacher_steps",
+        "teacher_batch_groups",
+        "teacher_learning_rate",
+        "teacher_checkpoint_every",
+        "weight_decay",
+        "dropout",
+        "temperatures",
+        "preferred_temperature",
+        "density_family_holdout",
+        "seed",
+    }
+    for key in teacher_fields:
+        if content_hash(metadata["fitting_profile"][key]) != content_hash(getattr(config, key)):
+            raise ValueError(f"Reused teacher fitting setting {key} differs from its source profile.")
+    selection = metadata["history"].get("teacher_selection")
+    if not selection or selection not in metadata["history"].get("teacher", []):
+        raise ValueError("Reused teacher requires recorded teacher selection history.")
+    if selection["temperature"] != metadata["selected_temperature"]:
+        raise ValueError("Reused teacher selected temperature disagrees with its history.")
+    metadata = copy.deepcopy(metadata)
+    metadata["reused_artifact_sha256"] = digest
+    return teacher, metadata
 
 
 def score_coefficient(step: int, steps: int, weight: float) -> float:
@@ -171,52 +221,7 @@ def student_losses(groups, *, model, kind, teacher, config, weights, coefficient
     return distillation - coefficient * auxiliary
 
 
-def fit_models(
-    evidence: Evidence,
-    config: TrainingConfig,
-    *,
-    student_kind: str = "both",
-    device: str = "cuda",
-    checkpoint_callback=None,
-):
-    devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
-    with torch.random.fork_rng(devices=devices):
-        torch.manual_seed(config.seed)
-        return _fit_models(
-            evidence, config, student_kind=student_kind, device=device, checkpoint_callback=checkpoint_callback
-        )
-
-
-def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=None):
-    evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.teacher_context_mode))
-    if student_kind not in (*STUDENT_KINDS, "both"):
-        raise ValueError("student_kind must be deterministic, stochastic, or both.")
-    train_groups, val_groups = evidence.groups("train"), evidence.groups("validation")
-    # Leave an entire density family out of teacher fitting; its observations
-    # remain available for validation, never for reference-ratio normalization.
-    family_holdout = set(config.density_family_holdout)
-    teacher_groups = [[r for r in g if not set(r["aliases"]) <= family_holdout] for g in train_groups]
-    density_holdout = [[r for r in g if set(r["aliases"]) <= family_holdout] for g in train_groups]
-    density_holdout = [g for g in density_holdout if g]
-    if family_holdout and evidence.purpose == "research" and not density_holdout:
-        raise ValueError("Research teacher fitting requires its density-family holdout.")
-    train = [_tensors(evidence, g, device) for g in teacher_groups if g]
-    validation = [_tensors(evidence, g, device) for g in val_groups]
-    density_validation = [_tensors(evidence, g, device) for g in density_holdout]
-    weights = next(iter(evidence.calibrations.values())).metric_weights
-    architecture = ModelConfig(evidence.conditioning.width, len(weights), dropout=config.dropout)
-    # Fit the ratio transform only on unique training-reference densities.
-    unique = {}
-    for group in teacher_groups:
-        for row in group:
-            unique[row["density_sha256"]] = row["density_mass"]
-    reference = torch.tensor(list(unique.values()), dtype=torch.float64, device=device)
-    from genode.gico.networks import guarded_mass
-
-    logmass = guarded_mass(reference).log()
-    ratios = logmass[:, :-1] - logmass[:, -1:]
-    ratio_mean, ratio_scale = ratios.mean(0), ratios.std(0, unbiased=False)
-    ratio_scale = torch.where(ratio_scale < 1e-6, 1, ratio_scale)
+def _fit_teacher(architecture, train, validation, density_validation, weights, config, device):
     # fork_rng isolates initialization from callers' generation RNG state.
     devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
     with torch.random.fork_rng(devices=devices):
@@ -272,6 +277,73 @@ def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=N
     if best_state is None:
         raise ValueError("Teacher validation did not produce a finite checkpoint.")
     teacher.load_state_dict(best_state)
+    return teacher, teacher_history, selected_teacher
+
+
+def fit_models(
+    evidence: Evidence,
+    config: TrainingConfig,
+    *,
+    student_kind: str = "both",
+    device: str = "cuda",
+    checkpoint_callback=None,
+    teacher_artifact=None,
+):
+    devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(config.seed)
+        return _fit_models(
+            evidence,
+            config,
+            student_kind=student_kind,
+            device=device,
+            checkpoint_callback=checkpoint_callback,
+            teacher_artifact=teacher_artifact,
+        )
+
+
+def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=None, teacher_artifact=None):
+    evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.teacher_context_mode))
+    if student_kind not in (*STUDENT_KINDS, "both"):
+        raise ValueError("student_kind must be deterministic, stochastic, or both.")
+    train_groups, val_groups = evidence.groups("train"), evidence.groups("validation")
+    # Leave an entire density family out of teacher fitting; its observations
+    # remain available for validation, never for reference-ratio normalization.
+    family_holdout = set(config.density_family_holdout)
+    teacher_groups = [[r for r in g if not set(r["aliases"]) <= family_holdout] for g in train_groups]
+    density_holdout = [[r for r in g if set(r["aliases"]) <= family_holdout] for g in train_groups]
+    density_holdout = [g for g in density_holdout if g]
+    if family_holdout and evidence.purpose == "research" and not density_holdout:
+        raise ValueError("Research teacher fitting requires its density-family holdout.")
+    train = [_tensors(evidence, g, device) for g in teacher_groups if g]
+    validation = [_tensors(evidence, g, device) for g in val_groups]
+    density_validation = [_tensors(evidence, g, device) for g in density_holdout]
+    weights = next(iter(evidence.calibrations.values())).metric_weights
+    architecture = ModelConfig(evidence.conditioning.width, len(weights), dropout=config.dropout)
+    # Fit the ratio transform only on unique training-reference densities.
+    unique = {}
+    for group in teacher_groups:
+        for row in group:
+            unique[row["density_sha256"]] = row["density_mass"]
+    reference = torch.tensor(list(unique.values()), dtype=torch.float64, device=device)
+    from genode.gico.networks import guarded_mass
+
+    logmass = guarded_mass(reference).log()
+    ratios = logmass[:, :-1] - logmass[:, -1:]
+    ratio_mean, ratio_scale = ratios.mean(0), ratios.std(0, unbiased=False)
+    ratio_scale = torch.where(ratio_scale < 1e-6, 1, ratio_scale)
+    devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
+    if teacher_artifact is None:
+        teacher, teacher_history, selected_teacher = _fit_teacher(
+            architecture, train, validation, density_validation, weights, config, device
+        )
+        teacher_source = None
+    else:
+        teacher, source = reuse_teacher(teacher_artifact, evidence, config)
+        teacher = teacher.to(device)
+        teacher_history = copy.deepcopy(source["history"]["teacher"])
+        selected_teacher = copy.deepcopy(source["history"]["teacher_selection"])
+        teacher_source = source["reused_artifact_sha256"]
     teacher.eval().requires_grad_(False)
     teacher.zero_grad(set_to_none=True)
     training_groups = [_tensors(evidence, g, device) for g in train_groups]
@@ -389,6 +461,7 @@ def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=N
         students,
         {
             "training": asdict(config),
+            "teacher_source_artifact_sha256": teacher_source,
             "teacher": teacher_history,
             "students": histories,
             "density_holdout": sorted(family_holdout),
@@ -410,6 +483,7 @@ def fit(
     purpose: str = "research",
     calibration_rows: list[dict] | None = None,
     checkpoint_callback=None,
+    teacher_artifact=None,
     **fitting_settings,
 ) -> dict:
     if Path(output).exists():
@@ -425,7 +499,12 @@ def fit(
     evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.teacher_context_mode))
     started = time.perf_counter()
     teacher, students, history = fit_models(
-        evidence, config, student_kind=student_kind, device=device, checkpoint_callback=checkpoint_callback
+        evidence,
+        config,
+        student_kind=student_kind,
+        device=device,
+        checkpoint_callback=checkpoint_callback,
+        teacher_artifact=teacher_artifact,
     )
     fitting_seconds = time.perf_counter() - started
     metadata = {

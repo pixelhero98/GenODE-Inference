@@ -10,7 +10,7 @@ from pathlib import Path
 from genode.gico.evidence import prepare_evidence
 from genode.gico.policy import load_context_embedding_table
 from genode.gico.profiles import SCORE_WEIGHTS, TrainingConfig, resolve_profile
-from genode.gico.training import fit
+from genode.gico.training import fit, reuse_teacher
 
 
 def read_rows(path) -> list[dict]:
@@ -29,10 +29,11 @@ def load_config(path) -> dict:
         "teacher_score_weight",
         "device",
         "purpose",
+        "teacher_artifact",
     } | {field.name for field in fields(TrainingConfig)}
     if set(config) - allowed or not {"rows", "contexts", "output"} <= set(config):
         raise ValueError("Training config requires rows/contexts/output and only documented GICO options.")
-    for key in ("rows", "contexts", "calibration_rows", "output"):
+    for key in ("rows", "contexts", "calibration_rows", "output", "teacher_artifact"):
         if key in config:
             value = Path(config[key])
             config[key] = str(value if value.is_absolute() else location.parent / value)
@@ -57,6 +58,8 @@ def run_config(config: dict, *, dry_run: bool = False) -> dict:
         if training.backbone is not None and training.backbone != evidence.backbone:
             raise ValueError("Fitting profile backbone differs from measurement evidence.")
         training = replace(training, backbone=evidence.backbone)
+        if "teacher_artifact" in values:
+            reuse_teacher(values["teacher_artifact"], evidence, training)
         return {
             "task": evidence.task,
             "backbone": evidence.backbone,

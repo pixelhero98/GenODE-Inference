@@ -106,6 +106,14 @@ genode-train-gico --config train.json --student-kind both --teacher-score-weight
 
 Research evidence requires all 25 references in every cell. Explicit `purpose: functional` permits a reduced reference set for integration checks; it does not produce benchmark evidence. Checkpoints are selected using validation evidence and the profile-specific teacher density-family holdout. Output directories must be new.
 
+To compare students using an existing frozen teacher, add `"teacher_artifact": "previous-policy"`
+to the common training configuration (or pass `teacher_artifact` to `fit`). This skips teacher
+fitting and reuses its selected weights and temperature. Evidence, reward calibration, teacher
+conditioning and teacher fitting settings must match the source artifact; student conditioning
+and fitting settings can differ. The output records the source artifact checksum and inherited
+teacher selection history. `--dry-run` also checks this binding. Microbatch size can change for
+student memory requirements without changing the effective batch or inherited teacher.
+
 ```python
 from genode.gico.policy import load_policy
 

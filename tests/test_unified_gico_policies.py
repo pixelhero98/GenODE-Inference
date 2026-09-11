@@ -6,7 +6,7 @@ import hashlib
 import json
 import shutil
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from unittest.mock import patch
 
 import numpy as np
@@ -232,11 +232,71 @@ def untrained_artifact(tmp_path_factory):
         "teacher_selection_criterion": "heldout_reference_utility_regret",
         "student_selection_criterion": "post_ramp_validation_distillation",
         "selected_temperature": 0.05,
-        "history": {"student_selection": {k: {"step": 500, "coefficient": 0.01} for k in students}},
+        "history": {
+            "student_selection": {k: {"step": 500, "coefficient": 0.01} for k in students},
+            "teacher": [{"step": 100, "temperature": 0.05, "regret": 0.1}],
+            "teacher_selection": {"step": 100, "temperature": 0.05, "regret": 0.1},
+        },
     }
     root = tmp_path_factory.mktemp("untrained-artifact") / "policy"
     save_artifact(root, teacher, students, evidence.conditioning, deepcopy(metadata))
     return root, teacher, students, evidence
+
+
+def test_teacher_reuse_requires_identical_evidence_and_teacher_settings(untrained_artifact):
+    from genode.gico.training import reuse_teacher
+
+    root, original, _, evidence = untrained_artifact
+    config = resolve_profile(evidence.task, backbone=evidence.backbone, dropout=0)
+    teacher, metadata = reuse_teacher(root, evidence, replace(config, student_context_mode="global"))
+    assert all(not p.requires_grad for p in teacher.parameters()) and not teacher.training
+    for key, value in original.state_dict().items():
+        torch.testing.assert_close(value, teacher.state_dict()[key], atol=0, rtol=0)
+    assert metadata["reused_artifact_sha256"] == hashlib.sha256((root / "policy.pt").read_bytes()).hexdigest()
+    for altered in (replace(evidence, evidence_sha256="changed"), replace(evidence, purpose="functional")):
+        with pytest.raises(ValueError, match="differs from fitting evidence"):
+            reuse_teacher(root, altered, config)
+    for setting in ({"teacher_context_mode": "global"}, {"seed": 1}, {"temperatures": (0.05, 0.1)}):
+        with pytest.raises(ValueError, match="differs"):
+            reuse_teacher(root, evidence, replace(config, **setting))
+
+
+@pytest.mark.parametrize("mode", ["native", "global"])
+def test_reuse_bypasses_teacher_fitting_and_records_source(untrained_artifact, monkeypatch, mode):
+    from genode.gico import training
+
+    root, original, _, evidence = untrained_artifact
+    before = (root / "policy.pt").read_bytes()
+    config = resolve_profile(
+        evidence.task,
+        backbone=evidence.backbone,
+        dropout=0,
+        student_context_mode=mode,
+        student_steps=2,
+        student_checkpoint_every=1,
+        stochastic_likelihood_samples=1,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Reusing an artifact must skip teacher training")
+
+    monkeypatch.setattr(training, "_fit_teacher", forbidden)
+    # No local fitting: exercise target construction/selection with optimizer steps mocked.
+    monkeypatch.setattr(training, "accumulated_step", lambda *args, **kwargs: 0.0)
+    teacher, students, history = training.fit_models(
+        evidence,
+        config,
+        student_kind="stochastic",
+        device="cpu",
+        teacher_artifact=root,
+    )
+    assert set(students) == {"stochastic"}
+    assert history["teacher_selection"]["temperature"] == 0.05
+    assert history["student_selection"]["stochastic"]["step"] == 2
+    assert history["teacher_source_artifact_sha256"] == hashlib.sha256(before).hexdigest()
+    for key, value in original.state_dict().items():
+        torch.testing.assert_close(value, teacher.state_dict()[key], atol=0, rtol=0)
+    assert before == (root / "policy.pt").read_bytes()
 
 
 @pytest.mark.parametrize("kind", ["deterministic", "stochastic"])
