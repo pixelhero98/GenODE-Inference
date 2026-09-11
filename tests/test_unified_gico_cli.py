@@ -40,6 +40,9 @@ def test_config_relative_paths_and_dry_run_validate_without_fitting(tmp_path, mo
     assert result["dry_run"] is True
     assert result["paired_cells"] > 0
     assert result["teacher_score_weight"] == weight
+    assert result["fitting_profile"]["backbone"] == rows[0]["backbone"]
+    with pytest.raises(ValueError, match="backbone differs"):
+        train_gico.run_config({**config, "backbone": "different-checkpoint"}, dry_run=True)
     assert not (tmp_path / "artifact").exists()
 
 

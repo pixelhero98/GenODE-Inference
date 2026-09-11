@@ -272,7 +272,7 @@ def _write_common_artifact(directory):
     from genode.gico.profiles import AUXILIARY_NORMALIZATION, TEMPERATURE_UNITS, resolve_profile
 
     metadata.update(
-        fitting_profile={"task": evidence.task, **asdict(resolve_profile(evidence.task))},
+        fitting_profile={"task": evidence.task, **asdict(resolve_profile(evidence.task, backbone=evidence.backbone))},
         metric_weights=[1.0],
         temperature_units=TEMPERATURE_UNITS,
         auxiliary_normalization=AUXILIARY_NORMALIZATION,
