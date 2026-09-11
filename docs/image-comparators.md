@@ -1,5 +1,11 @@
 # ReFlow image comparison bridge
 
+The loader accepts only the SHA-256-verified official `reflow_1.pth` checkpoint
+(`27d1463f573556765d380b1983664d24e00a194853e0778f5af18fcdf34500de`).
+Its original training payload contains NumPy optimizer scalars, so it needs the
+original pickle reader after this exact-file check. Parameters and EMA tensors
+are still restored with strict name, shape and tensor-count validation.
+
 `genode.image_comparators` provides common checkpoint loading, a counted Euler
 sampler and EDM Inception FID accumulation. It does not implement or rename
 LD3 or BézierFlow training. Their schedules and transformations must come from

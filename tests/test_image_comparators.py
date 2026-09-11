@@ -20,6 +20,7 @@ from genode.image_comparators.reflow import (
     ReflowVelocity,
     _upstream_imports,
     euler_sample,
+    load_reflow,
     reflow_grid,
     restore_ema,
 )
@@ -94,6 +95,16 @@ def test_reflow_euler_exact_nfe_and_model_time_convention(nfe):
 def test_grid_rejects_float32_collapse():
     with pytest.raises(ValueError, match="collapses"):
         reflow_grid([0, 0.5, 0.5 + 1e-12, 1], device="cpu")
+
+
+def test_reflow_rejects_unverified_pickle_before_upstream_import(tmp_path):
+    model = tmp_path / "ImageGeneration/models/ncsnpp.py"
+    model.parent.mkdir(parents=True)
+    model.write_text("raise RuntimeError('must not import')")
+    checkpoint = tmp_path / "reflow_1.pth"
+    checkpoint.write_bytes(b"not the official checkpoint")
+    with pytest.raises(ValueError, match="verified official"):
+        load_reflow(tmp_path, checkpoint, {}, device="cpu")
 
 
 def test_ema_preserves_buffers_and_rejects_missing_shadows():

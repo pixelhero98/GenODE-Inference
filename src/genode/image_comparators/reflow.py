@@ -13,9 +13,12 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from genode.latent_clock.artifacts import sha256_file
+
 _IMPORT_LOCK = threading.RLock()
 RF_START = 1e-4
 RF_END = 0.9999
+REFLOW_CHECKPOINT_SHA256 = "27d1463f573556765d380b1983664d24e00a194853e0778f5af18fcdf34500de"
 
 
 @contextmanager
@@ -77,6 +80,8 @@ def load_reflow(source: str | Path, checkpoint: str | Path, config: Mapping, *, 
     root = Path(source).resolve() / "ImageGeneration"
     if not (root / "models" / "ncsnpp.py").is_file():
         raise ValueError(f"Not a RectifiedFlow source checkout: {source}")
+    if sha256_file(checkpoint) != REFLOW_CHECKPOINT_SHA256:
+        raise ValueError("ReFlow bridge requires the verified official reflow_1 checkpoint.")
     configuration = _namespace(config)
     if configuration.model.name != "ncsnpp":
         raise ValueError("This bridge supports only the original CIFAR NCSN++ network")
@@ -85,7 +90,10 @@ def load_reflow(source: str | Path, checkpoint: str | Path, config: Mapping, *, 
         importlib.import_module("models.ncsnpp")
         utilities = importlib.import_module("models.utils")
         net = utilities.create_model(configuration)
-    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    # The original training checkpoint includes NumPy optimizer scalars that the
+    # weights-only reader rejects. Permit its original reader only after checking
+    # the exact official file digest above; arbitrary pickle inputs are rejected.
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     restore_ema(net, state)
     net.eval().requires_grad_(False)
     return net
