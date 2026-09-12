@@ -32,13 +32,13 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
     for row in rows:
         if row["task"] in ("cifar10", "imagenet64"):
             if row.get("image_objective") != policy.metadata.get("image_objective"):
-                raise ValueError("Report LPIPS/target-generator identity differs from the frozen artifact.")
+                raise ValueError("Report image-objective identity differs from the frozen artifact.")
             for phase in ("train", "calibration", "validation") if split == "test" else ("train", "calibration"):
                 provenance = policy.metadata["image_split_identities"][phase]
-                if (
-                    row.get("panel_id") in provenance.get("panels", [])
-                    or row.get("reference_id") in provenance.get("targets", [])
-                    or row.get("target", {}).get("noise_sha256") in provenance.get("noises", [])
+                from genode.gico.image_objective import image_split_fields
+
+                if any(
+                    set(values).intersection(provenance.get(key, [])) for key, values in image_split_fields(row).items()
                 ):
                     raise ValueError("Report image targets/noise overlap fitting/calibration data.")
         if row["solver"] not in policy.metadata["solvers"]:

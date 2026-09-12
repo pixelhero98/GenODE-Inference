@@ -34,6 +34,14 @@ LOG_METRICS = frozenset(("crps", "mase", *MOLECULE_METRICS))
 FIT_SPLITS = frozenset(("train", "calibration"))
 
 
+def measurement_metrics(row: dict) -> tuple[str, ...]:
+    from genode.gico.kid_objective import KID_OBJECTIVE
+
+    if row["task"] == "cifar10" and row.get("image_objective", {}).get("protocol") == KID_OBJECTIVE:
+        return ("kid",)
+    return TASK_METRICS[row["task"]]
+
+
 def metric_weights(task: str) -> tuple[float, ...]:
     return (
         (0.4, 0.15, 0.15, 0.15, 0.15)
@@ -97,12 +105,12 @@ def _paired_cells(rows: list[dict[str, Any]], *, varying_clocks: bool = False) -
         for key in ("backbone", "context_id", "reference_id", "measurement_protocol", "schedule_key"):
             if not isinstance(row[key], str) or not row[key]:
                 raise ValueError(f"{key} must be a nonempty identity.")
-        values = np.array([row["metrics"][key] for key in TASK_METRICS[row["task"]]], dtype=float)
+        values = np.array([row["metrics"][key] for key in measurement_metrics(row)], dtype=float)
         if not np.isfinite(values).all():
             raise ValueError("Terminal metrics must be finite and complete.")
         if any(key in row for key in ("reward_metrics", "reward_estimator")):
             raise ValueError("Obsolete reward overrides are unsupported; supply raw paired terminal measurements.")
-        if any(row["metrics"][key] < 0 for key in TASK_METRICS[row["task"]] if key in LOG_METRICS or key == "lpips"):
+        if any(row["metrics"][key] < 0 for key in measurement_metrics(row) if key in LOG_METRICS or key == "lpips"):
             raise ValueError("Error metrics must be nonnegative.")
         if row["task"].startswith("molecule_") and row["ensemble_size"] < 2:
             raise ValueError("Fair molecular energy score requires at least two ensemble members.")
@@ -129,10 +137,12 @@ def _paired_cells(rows: list[dict[str, Any]], *, varying_clocks: bool = False) -
     cells = []
     for repeats in groups.values():
         first = repeats[0]
-        keys = TASK_METRICS[first["task"]]
+        keys = measurement_metrics(first)
         cell = {**first, "metrics": {k: float(np.mean([r["metrics"][k] for r in repeats])) for k in keys}}
         cell["seeds"] = sorted(r["seed"] for r in repeats)
         cell["reference_ids"] = {str(r["seed"]): r["reference_id"] for r in repeats}
+        if "sample_block" in first:
+            cell["sample_blocks"] = {str(r["seed"]): r["sample_block"] for r in repeats}
         cell.pop("seed")
         # Fixed-reference fitting requires one density. Policy evaluation can
         # average independent clocks after validating every executed member.
@@ -175,7 +185,10 @@ class RewardCalibration:
         return float(self.vector(cell, normalize=normalize) @ np.asarray(self.metric_weights))
 
     def __post_init__(self) -> None:
-        if self.task not in TASK_METRICS or tuple(self.metric_keys) != TASK_METRICS[self.task]:
+        if self.task not in TASK_METRICS or (
+            tuple(self.metric_keys) != TASK_METRICS[self.task]
+            and not (self.task == "cifar10" and tuple(self.metric_keys) == ("kid",))
+        ):
             raise ValueError("Calibration metric profile does not match its task.")
         count = len(self.metric_keys)
         if len(self.floors) != count or len(self.component_scales) != count:
@@ -197,7 +210,7 @@ class RewardCalibration:
             if key in LOG_METRICS:
                 value = np.log(anchor + floor) - np.log(candidate + floor)
             else:
-                value = ((anchor - candidate) if key == "lpips" else (candidate - anchor)) / scale
+                value = ((anchor - candidate) if key in ("lpips", "kid") else (candidate - anchor)) / scale
             values.append(value)
         result = np.asarray(values, dtype=np.float64)
         if not np.isfinite(result).all():
@@ -225,7 +238,7 @@ def calibrate_rewards(rows: list[dict], *, component_calibration_rows: list[dict
     if len(scopes) != 1:
         raise ValueError("Calibrate one task/backbone/solver at a time.")
     task, backbone, solver = scopes.pop()
-    metrics = TASK_METRICS[task]
+    metrics = measurement_metrics(cells[0])
     anchors = [r for r in cells if r["schedule_key"] == "uniform"]
     candidates = [r for r in cells if r["schedule_key"] != "uniform"]
     if not candidates:
@@ -274,6 +287,8 @@ def construct_rewards(rows: list[dict], calibration: RewardCalibration, *, varyi
         raise ValueError("Varying clocks are supported only for policy evaluation.")
     cells = _paired_cells(rows, varying_clocks=varying_clocks)
     for cell in cells:
+        if measurement_metrics(cell) != calibration.metric_keys:
+            raise ValueError("Measurement objective differs from its frozen reward calibration.")
         vector = calibration.vector(cell)
         cell["reward_vector"] = vector.tolist()
         cell["reward"] = calibration.scalar(cell)

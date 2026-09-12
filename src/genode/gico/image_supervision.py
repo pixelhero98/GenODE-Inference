@@ -28,6 +28,10 @@ def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float
     contexts, rows = {}, []
     for original in manifest["rows"]:
         row = dict(original)
+        if row.get("image_objective", {}).get("protocol") != IMAGE_OBJECTIVE:
+            raise ValueError(
+                "The image-fidelity interface requires paired LPIPS; use common fit for explicit KID evidence."
+            )
         if row.get("task", task) != task or row.get("backbone", backbone.model_key) != backbone.model_key:
             raise ValueError("Measured image task/backbone does not match its native context binding.")
         if row.get("solver") != "euler":

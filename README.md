@@ -207,3 +207,5 @@ The Python fitting API has an optional `checkpoint_callback(kind, step, model,
 statistics)` observer for diagnostics. Observers must not mutate the model or RNG
 state. Diagnostic checkpoints do not change production eligibility: only
 post-ramp validation-selected student states are saved as deployable artifacts.
+
+For explicit CIFAR distributional supervision on a frozen transformed sampler, see [GICO on frozen BézierFlow](docs/frozen-bezier-kid.md). The paired LPIPS image workflow remains available.

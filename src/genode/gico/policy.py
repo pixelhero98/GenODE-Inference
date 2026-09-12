@@ -186,13 +186,21 @@ class GICOPolicy:
             from genode.gico.image_objective import validate_image_objective, validate_image_split_identities
 
             validate_image_objective(self.metadata.get("image_objective"))
-            target = self.metadata["image_objective"]["target_generator"]
+            objective = self.metadata["image_objective"]
+            target = objective.get("target_generator", objective.get("generator"))
+            if "generator" in objective and self.metadata.get("backbone_binding") != target:
+                raise ValueError("KID artifact frozen generator binding differs from its objective.")
             if target["backbone"] != self.metadata["backbone"] or (
                 "backbone_binding" in self.metadata
                 and self.metadata["backbone_binding"].get("checkpoint_sha256") != target["checkpoint_sha256"]
             ):
                 raise ValueError("Image artifact target and candidate backbone identities disagree.")
-            validate_image_split_identities(self.metadata.get("image_split_identities"))
+            validate_image_split_identities(self.metadata.get("image_split_identities"), protocol=objective["protocol"])
+            expected_metric = "lpips" if "target_generator" in objective else "kid"
+            if any(
+                tuple(c["metric_keys"]) != (expected_metric,) for c in self.metadata["reward_calibrations"].values()
+            ):
+                raise ValueError("Image objective and reward calibration disagree.")
         self.artifact_sha256 = digest
         self.student_kind = student_kind
         if student_kind not in ("deterministic", "stochastic") or student_kind not in payload["students"]:

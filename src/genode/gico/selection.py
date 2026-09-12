@@ -145,6 +145,8 @@ def measured_utility(
                 raise ValueError(f"Selection {field} differs from frozen reference evidence.")
         if row["seed"] not in anchor["seeds"] or row["reference_id"] != anchor["reference_ids"][str(row["seed"])]:
             raise ValueError("Selection generation-noise/reference identities differ from the registered panel.")
+        if "sample_blocks" in anchor and row.get("sample_block") != anchor["sample_blocks"][str(row["seed"])]:
+            raise ValueError("Selection KID sample block differs from frozen evidence.")
         if row.get("molecule_feature_map") != anchor.get("molecule_feature_map"):
             raise ValueError("Selection molecular geometry differs from the frozen feature map.")
         replicate = row.get("clock_replicate", 0)

@@ -15,6 +15,11 @@ def _digest(value) -> bool:
 
 
 def validate_image_objective(objective: dict) -> None:
+    from genode.gico.kid_objective import KID_OBJECTIVE, validate_kid_objective
+
+    if isinstance(objective, dict) and objective.get("protocol") == KID_OBJECTIVE:
+        validate_kid_objective(objective)
+        return
     if not isinstance(objective, dict) or objective.get("protocol") != IMAGE_OBJECTIVE:
         raise ValueError(
             "Image policies require paired-lpips-v1; historical KID evidence/artifacts need their original runtime."
@@ -53,6 +58,11 @@ def validate_image_rows(rows: list[dict]) -> None:
         return
     objective = image_rows[0].get("image_objective")
     validate_image_objective(objective)
+    from genode.gico.kid_objective import KID_OBJECTIVE, validate_kid_rows
+
+    if objective["protocol"] == KID_OBJECTIVE:
+        validate_kid_rows(image_rows, objective)
+        return
     splits, targets, contexts = {}, {}, {}
     for row in image_rows:
         if row.get("image_objective") != objective or row.get("measurement_protocol") != IMAGE_OBJECTIVE:
@@ -119,10 +129,12 @@ def lpips_values(scorer, candidate, target):
     return values
 
 
-def validate_image_split_identities(provenance: dict) -> None:
+def validate_image_split_identities(provenance: dict, *, protocol=IMAGE_OBJECTIVE) -> None:
     if not isinstance(provenance, dict) or set(provenance) != {"train", "calibration", "validation"}:
         raise ValueError("Image artifact lacks target/noise split provenance.")
     seen = {key: set() for key in ("panels", "targets", "noises")}
+    if protocol != IMAGE_OBJECTIVE:
+        seen.update(real_samples=set(), generated_seeds=set())
     for phase, fields in provenance.items():
         if not isinstance(fields, dict) or set(fields) != set(seen):
             raise ValueError("Incomplete image split provenance.")
@@ -137,9 +149,24 @@ def validate_image_split_identities(provenance: dict) -> None:
             if key == "noises" and not all(_digest(value) for value in values):
                 raise ValueError("Image split noise identities must be SHA-256 hashes.")
             if key == "targets" and not all(
-                value.startswith("lpips-target:") and _digest(value[13:]) for value in values
+                value.startswith("lpips-target:" if protocol == IMAGE_OBJECTIVE else "kid-reference:")
+                and _digest(value.split(":", 1)[-1])
+                for value in values
             ):
                 raise ValueError("Image split targets require versioned target identities.")
             if seen[key].intersection(values):
                 raise ValueError("Image split identities overlap.")
             seen[key].update(values)
+
+
+def image_split_fields(row):
+    """Individual identities, so renamed or partially overlapping blocks cannot hide reuse."""
+    fields = {"panels": [row["panel_id"]], "targets": [row["reference_id"]]}
+    if "target" in row:
+        fields["noises"] = [row["target"]["noise_sha256"]]
+    else:
+        fields["noises"] = row["sample_block"]["noise_sha256"]
+        fields["generated_seeds"] = [str(s) for s in row["sample_block"]["seeds"]]
+        ref = row["reference_block"]
+        fields["real_samples"] = [f"{ref['dataset_sha256']}:{i}" for i in ref["indices"]]
+    return fields
