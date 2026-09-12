@@ -246,7 +246,7 @@ def _write_common_artifact(directory):
                     "schedule_key": "late_p_3_reversed",
                     "density_mass": list(mass),
                     "time_grid": list(materialize(mass, "euler", 2)),
-                    "metrics": {"kid": 0.08},
+                    "metrics": {"lpips": 0.08},
                 }
             )
     evidence = prepare_evidence(rows, contexts, purpose="functional")
@@ -256,6 +256,15 @@ def _write_common_artifact(directory):
         "backbone": evidence.backbone,
         "solvers": ["euler"],
         "backbone_binding": image_metadata["backbone_binding"],
+        "image_objective": image_metadata["image_objective"],
+        "image_split_identities": {
+            phase: {
+                "panels": sorted({r["panel_id"] for r in rows if r["split"] == phase}),
+                "targets": sorted({r["reference_id"] for r in rows if r["split"] == phase}),
+                "noises": sorted({r["target"]["noise_sha256"] for r in rows if r["split"] == phase}),
+            }
+            for phase in ("train", "calibration", "validation")
+        },
         "locked_test_used": False,
         "split_contexts": {
             split: sorted({row["context_id"] for row in rows if row["split"] == split})

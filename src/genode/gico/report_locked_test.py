@@ -30,6 +30,17 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
     if forbidden & {r["context_id"] for r in rows}:
         raise ValueError("Report contexts overlap fitting/calibration data.")
     for row in rows:
+        if row["task"] in ("cifar10", "imagenet64"):
+            if row.get("image_objective") != policy.metadata.get("image_objective"):
+                raise ValueError("Report LPIPS/target-generator identity differs from the frozen artifact.")
+            for phase in ("train", "calibration", "validation") if split == "test" else ("train", "calibration"):
+                provenance = policy.metadata["image_split_identities"][phase]
+                if (
+                    row.get("panel_id") in provenance.get("panels", [])
+                    or row.get("reference_id") in provenance.get("targets", [])
+                    or row.get("target", {}).get("noise_sha256") in provenance.get("noises", [])
+                ):
+                    raise ValueError("Report image targets/noise overlap fitting/calibration data.")
         if row["solver"] not in policy.metadata["solvers"]:
             raise ValueError("Report solver is absent from the frozen artifact.")
         if row["measurement_protocol"] not in policy.metadata["measurement_protocols"]:
@@ -70,7 +81,7 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
             # Average all classes equally first; uncertainty is across blocks.
             panels = defaultdict(list)
             for cell in cells:
-                panels[content_hash(cell["reference_ids"])].append(cell)
+                panels[cell["panel_id"]].append(cell)
             units = []
             for panel in panels.values():
                 if len(panel) != 1000 or {r.get("class_id") for r in panel} != set(range(1000)):
@@ -78,7 +89,7 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
                 units.append(
                     {
                         "reward": float(np.mean([r["reward"] for r in panel])),
-                        "metrics": {"kid": float(np.mean([r["metrics"]["kid"] for r in panel]))},
+                        "metrics": {"lpips": float(np.mean([r["metrics"]["lpips"] for r in panel]))},
                     }
                 )
         rewards = np.array([r["reward"] for r in units])

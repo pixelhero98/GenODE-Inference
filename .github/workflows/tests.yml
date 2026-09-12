@@ -101,6 +101,7 @@ jobs:
           }
           retired_member_fragments = (
               "genode/" + "distillation/",
+              "genode/gico/image_conditional.py",
               "genode/gico/" + "ser_" + "ptg_reference.py",
               "genode/visualization/" + "build_ptg_" + "observed_gain_figure.py",
               "tests/test_" + "distillation",

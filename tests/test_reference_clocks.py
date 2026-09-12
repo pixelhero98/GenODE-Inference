@@ -88,14 +88,14 @@ class ReferenceClockTests(unittest.TestCase):
 
     def test_image_protocol_uses_dynamic_canonical_clock_count_and_provenance(self) -> None:
         metadata = image_protocol_metadata()
-        self.assertEqual(metadata["protocol_key"], "image_euler_248_v7")
+        self.assertEqual(metadata["protocol_key"], "image_euler_lpips_v8")
         self.assertEqual(metadata["schedule_count"], 25)
         self.assertEqual(tuple(metadata["schedule_keys"]), EXPECTED_DEFAULT_KEYS)
         self.assertEqual(len(metadata["reference_clock_provenance"]), 25)
-        self.assertEqual(euler_image_workload().evidence_images, 2_250_000)
+        self.assertEqual(euler_image_workload().evidence_images, 30_000)
         self.assertEqual(
             euler_image_workload().backbone_image_evaluations,
-            10_500_000,
+            140_000,
         )
         for dataset in metadata["datasets"].values():
             self.assertEqual(

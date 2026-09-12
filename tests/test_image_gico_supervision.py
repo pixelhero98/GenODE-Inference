@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import copy
+from copy import deepcopy
 
-import numpy as np
 import pytest
 
-from genode.artifacts.identity import semantic_sha256
 from genode.gico.clocks import materialize, reference_densities
-from genode.gico.image_conditional import fit_feature_groups, paired_kid_shrinkage
+from genode.gico.image_objective import target_identity, validate_image_rows
 from genode.gico.image_supervision import prepare_image_rows
+from genode.gico.rewards import calibrate_rewards, construct_rewards
+from tests.image_fixtures import image_fields
 from tests.test_image_primary_runtime import _frozen_cifar_backbone, _frozen_imagenet_backbone
 
 
@@ -21,44 +21,40 @@ def image_manifest(task="cifar10"):
     result = {"backbone_manifest": backbone.manifest.to_manifest_dict(), "rows": []}
     if task == "imagenet64":
         result["native_context_table"] = backbone.canonical_conditioning_table().tolist()
-        groups = {
-            "assignments": (np.arange(1000) % 32).tolist(),
-            "fit_split": "train",
-            "source_reference_id": "train-real",
-        }
-        result["feature_groups"] = {**groups, "sha256": semantic_sha256(groups, namespace="image-feature-groups")}
     for split in ("train", "validation"):
         for schedule in ("uniform", "late_p_3"):
-            mass = np.asarray(reference_densities("euler", 2)[schedule])
+            mass = reference_densities("euler", 2)[schedule]
             for label in range(1000 if task == "imagenet64" else 1):
-                kid = 0.1 if schedule == "uniform" else 0.09 - (label % 7) * 0.001
                 row = {
+                    "task": task,
+                    "backbone": backbone.manifest.model_key,
                     "solver": "euler",
                     "nfe": 2,
                     "split": split,
                     "seed": 3,
-                    "ensemble_size": 8,
-                    "reference_id": f"{split}-real",
-                    "measurement_protocol": "kid-paired-block-v1",
+                    "panel_id": split + "-panel",
+                    "context_id": f"{split}:{split}-panel:"
+                    + (f"class:{label}" if task == "imagenet64" else "unconditional"),
                     "schedule_key": schedule,
-                    "density_mass": mass.tolist(),
+                    "density_mass": list(mass),
                     "time_grid": list(materialize(mass, "euler", 2)),
-                    "metrics": {"kid": kid},
+                    "metrics": {"lpips": 0.1 if schedule == "uniform" else 0.09 - (label % 7) * 0.001},
                 }
                 if task == "imagenet64":
-                    row.update(class_id=label, jackknife_kid=[kid - 0.001, kid + 0.001])
+                    row["class_id"] = label
+                row = image_fields(row)
+                row["image_objective"]["target_generator"]["checkpoint_sha256"] = backbone.manifest.checkpoint.sha256
+                row["reference_id"] = target_identity(row["image_objective"], row["target"])
                 result["rows"].append(row)
     return result
 
 
-def test_cifar_uses_zero_context_and_preserves_raw_paired_measurements():
-    manifest = image_manifest()
-    rows, contexts, metadata = prepare_image_rows(manifest)
+def test_cifar_uses_zero_context_and_preserves_per_sample_measurements():
+    rows, contexts, metadata = prepare_image_rows(image_manifest())
     assert len(rows) == 4 and set(map(tuple, contexts.values())) == {(0.0,)}
-    assert rows[0]["metrics"] == {"kid": 0.1}
-    assert all("reward_metrics" not in row for row in rows)
+    assert rows[0]["metrics"] == {"lpips": 0.1}
     assert metadata["backbone_binding"]["context_source"] == "zero"
-    assert metadata["raw_metric_report"][0]["global_kid"] == 0.1
+    assert metadata["raw_metric_report"][0]["lpips"] == 0.1
     assert rows[0]["context_id"] != rows[2]["context_id"]
     assert rows[0]["context_id"] == rows[1]["context_id"]
 
@@ -70,107 +66,218 @@ def test_old_executed_clock_is_rejected():
         prepare_image_rows(manifest)
 
 
-def test_imagenet_preserves_raw_kid_and_only_fits_training_evidence():
+def test_imagenet_preserves_native_classes_and_equal_class_reports():
     manifest = image_manifest("imagenet64")
-    original = copy.deepcopy(manifest["rows"])
     rows, contexts, metadata = prepare_image_rows(manifest)
     assert len(contexts) == 2000
     assert metadata["backbone_binding"]["context_source"] == "native_class_embedding"
-    assert metadata["raw_metric_report"][0]["unshrunk_class_conditional_kid"] == pytest.approx(0.1)
-    assert metadata["global_metric_report"] == []
-    assert all(row["metrics"] == before["metrics"] for row, before in zip(rows, original, strict=True))
-    assert all("reward_metrics" in row for row in rows if row["split"] == "train")
-    assert all("reward_metrics" not in row for row in rows if row["split"] == "validation")
-    train = [row for row in rows if row["split"] == "train"]
-    assert train[0]["reward_metrics"] == train[0]["metrics"]
-    assert sum(train[1000]["reward_estimator"]["coefficients"]) == pytest.approx(1)
-    manifest["feature_groups"]["fit_split"] = "validation"
-    with pytest.raises(ValueError, match="provenance"):
+    assert metadata["raw_metric_report"][0]["lpips"] == pytest.approx(0.1)
+    assert all("reward_metrics" not in row for row in rows)
+    assert rows[0]["reference_id"] != rows[1]["reference_id"]
+    manifest["rows"].pop()
+    with pytest.raises(ValueError, match="complete equally weighted class"):
         prepare_image_rows(manifest)
 
 
-def test_paired_jackknife_cancels_shared_noise_and_shrinkage_preserves_equal_class_weight():
-    kids = np.asarray([[[1.0, 1.0, 1.0, 1.0], [0.8, 0.7, 0.4, 0.3]]])
-    jackknife = kids[..., None] + np.asarray([-0.1, 0.1])
-    result = paired_kid_shrinkage(kids, jackknife, np.asarray([0, 0, 1, 1]), uniform_index=0, fit_split="train")
-    np.testing.assert_allclose(result["standard_errors"], 0, atol=1e-15)
-    np.testing.assert_allclose(result["shrunk_improvements"], kids[:, :1] - kids)
-    np.testing.assert_allclose(result["unshrunk_class_conditional_kid"], kids.mean(axis=-1))
-    assert np.allclose(result["coefficients"].sum(axis=-1), 1)
-    with pytest.raises(ValueError, match="training/calibration"):
-        paired_kid_shrinkage(kids, jackknife, np.asarray([0, 0, 1, 1]), uniform_index=0, fit_split="test")
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("metrics", {"kid": 0.1}),
+        ("ensemble_size", 2),
+        ("reference_id", "changed"),
+        ("image_objective", {"protocol": "kid"}),
+        ("panel_id", ""),
+    ],
+)
+def test_incompatible_image_evidence_is_rejected(field, value):
+    rows = image_manifest()["rows"]
+    rows[0][field] = value
+    with pytest.raises(ValueError):
+        validate_image_rows(rows)
 
 
-def test_training_feature_groups_are_reproducible_and_split_bound():
-    values = np.random.default_rng(1).normal(size=(20, 8))
-    first = fit_feature_groups(
-        values, fit_split="train", source_reference_id="real-train", group_count=3, component_count=4
+@pytest.mark.parametrize("change", ["noise", "class", "target", "scorer"])
+def test_target_pairing_and_scorer_changes_are_rejected(change):
+    rows = image_manifest()["rows"]
+    row = rows[1]
+    if change == "scorer":
+        row["image_objective"]["lpips"]["weights_sha256"] = "d" * 64
+    else:
+        field = {"noise": "noise_sha256", "class": "class_id", "target": "image_sha256"}[change]
+        row["target"][field] = 1 if change == "class" else "d" * 64
+        row["reference_id"] = target_identity(row["image_objective"], row["target"])
+    with pytest.raises(ValueError):
+        validate_image_rows(rows)
+
+
+def test_renamed_panel_cannot_hide_cross_split_target_reuse():
+    rows = image_manifest()["rows"]
+    for row in rows[2:]:
+        row.update(seed=rows[0]["seed"], target=deepcopy(rows[0]["target"]), reference_id=rows[0]["reference_id"])
+    with pytest.raises(ValueError, match="disjoint"):
+        validate_image_rows(rows)
+
+
+def test_repeats_average_lpips_without_noise_conditioning_or_log_reweighting():
+    rows, contexts, _ = prepare_image_rows(image_manifest())
+    training = rows[:2]
+    for index, value in enumerate((0.8, 0.4)):
+        repeated = deepcopy(training[index])
+        repeated["seed"] += 1
+        repeated["target"]["seed"] = repeated["seed"]
+        repeated["target"]["noise_sha256"] = "e" * 64
+        repeated["target"]["image_sha256"] = "f" * 64
+        repeated["reference_id"] = target_identity(repeated["image_objective"], repeated["target"])
+        repeated["metrics"]["lpips"] = value
+        training.append(repeated)
+    # Add a distinct reference utility so scalar calibration is nondegenerate.
+    for row in deepcopy(training):
+        if row["schedule_key"] != "uniform":
+            row["schedule_key"] = "late_p_3_reversed"
+            row["metrics"]["lpips"] *= 1.5
+            training.append(row)
+    calibration = calibrate_rewards(training)
+    cells = construct_rewards(training, calibration)
+    assert len(cells) == 3 and len(contexts) == 2
+    candidate = next(row for row in cells if row["schedule_key"] == "late_p_3")
+    assert candidate["reward"] * calibration.reward_scale == pytest.approx((0.1 + 0.8 - 0.09 - 0.4) / 2)
+    assert next(row for row in cells if row["schedule_key"] == "uniform")["reward"] == 0
+    assert calibration.floors == (0.0,) and calibration.component_scales == (1.0,)
+    assert len(candidate["reference_ids"]) == 2
+
+
+def test_lpips_evaluation_preserves_unclamped_float_inputs_and_frozen_scorer():
+    import torch
+
+    from genode.gico.image_objective import lpips_values
+
+    class Scorer(torch.nn.Module):
+        def forward(self, target, candidate):
+            assert candidate.dtype == target.dtype == torch.float32
+            assert candidate.max() > 1
+            return ((candidate - target) ** 2).mean((1, 2, 3))
+
+    scorer = Scorer().eval()
+    candidate = torch.full((2, 3, 32, 32), 2.0, requires_grad=True)
+    values = lpips_values(scorer, candidate, torch.zeros_like(candidate))
+    values.mean().backward()
+    assert torch.isfinite(candidate.grad).all() and candidate.grad.abs().sum() > 0
+    scorer.train()
+    with pytest.raises(ValueError, match="evaluation mode"):
+        lpips_values(scorer, candidate, torch.zeros_like(candidate))
+
+
+def test_shared_image_calibration_covers_all_nfes_without_validation_access():
+    from genode.gico.evidence import prepare_evidence
+    from tests.test_unified_gico_rewards import reference_evidence
+
+    rows, contexts = reference_evidence(task="cifar10")
+    calibration = deepcopy([row for row in rows if row["split"] == "train"])
+    extra = deepcopy(calibration)
+    for row in extra:
+        row["nfe"] = 8
+        row["density_mass"] = list(reference_densities("euler", 8)[row["schedule_key"]])
+        row["time_grid"] = list(materialize(row["density_mass"], "euler", 8))
+    evidence = prepare_evidence(rows, contexts, calibration_rows=calibration + extra)
+    assert evidence.calibrations["euler"].calibration_nfes == (4, 8)
+    for row in extra:
+        row["split"] = "validation"
+    with pytest.raises(ValueError):
+        prepare_evidence(rows, contexts, calibration_rows=calibration + extra)
+
+
+def test_imagenet_scale_balances_classes_with_unequal_panel_counts():
+    from tests.test_unified_gico_rewards import measurement
+
+    rows = []
+    for label, delta in ((0, 1.0), (1, 5.0)):
+        for key, value in (("uniform", 10.0), ("late_p_3", 10.0 - delta)):
+            row = measurement(task="imagenet64", context=f"class{label}", schedule=key, metrics={"lpips": value})
+            row["class_id"] = label
+            row["target"]["class_id"] = label
+            row["reference_id"] = target_identity(row["image_objective"], row["target"])
+            rows.append(row)
+    baseline = calibrate_rewards(rows)
+    repeated = deepcopy(rows[:2])
+    for row in repeated:
+        row["context_id"] += "-extra"
+        row["panel_id"] += "-extra"
+    assert calibrate_rewards(rows + repeated).reward_scale == pytest.approx(baseline.reward_scale)
+    assert baseline.reward_scale == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("kind", ["deterministic", "stochastic"])
+def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind):
+    import hashlib
+    import json
+
+    import torch
+
+    from genode.gico.policy import load_policy
+    from genode.gico.training import fit
+    from tests.test_unified_gico_rewards import reference_evidence
+
+    rows, contexts = reference_evidence(task="cifar10")
+    destination = tmp_path / kind
+    metadata = fit(
+        rows,
+        contexts,
+        destination,
+        student_kind=kind,
+        device="cpu",
+        teacher_steps=2,
+        student_steps=2,
+        teacher_checkpoint_every=1,
+        student_checkpoint_every=1,
+        teacher_score_weight=0.05,
+        stochastic_likelihood_samples=1,
+        stochastic_score_samples=1,
     )
-    assert first == fit_feature_groups(
-        values, fit_split="train", source_reference_id="real-train", group_count=3, component_count=4
-    )
-    assert set(first["assignments"]) == {0, 1, 2}
-    with pytest.raises(ValueError, match="training/calibration"):
-        fit_feature_groups(values, fit_split="validation", source_reference_id="real-val")
+    assert metadata["image_objective"]["protocol"] == "paired-lpips-v1"
+    policy = load_policy(destination, student_kind=kind)
+    first = policy.materialize([0.0, 0.0], "euler", 4, seed=2, request_id="sample")
+    assert first == policy.materialize([0.0, 0.0], "euler", 4, seed=2, request_id="sample")
+    assert len(first) == 5 and all(a < b for a, b in zip(first[:-1], first[1:], strict=True))
+    payload = torch.load(destination / "policy.pt", weights_only=True)
+    del payload["metadata"]["image_objective"]
+    torch.save(payload, destination / "policy.pt")
+    manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+    manifest["policy_sha256"] = hashlib.sha256((destination / "policy.pt").read_bytes()).hexdigest()
+    (destination / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="historical KID"):
+        load_policy(destination, student_kind=kind)
 
 
-def test_renaming_split_context_does_not_hide_panel_leakage():
+def test_target_checkpoint_must_match_bound_candidate_checkpoint():
     manifest = image_manifest()
     for row in manifest["rows"]:
-        row["reference_id"] = "same-panel"
-    with pytest.raises(ValueError, match="disjoint paired measurement panels"):
+        row["image_objective"]["target_generator"]["checkpoint_sha256"] = "f" * 64
+        row["reference_id"] = target_identity(row["image_objective"], row["target"])
+    with pytest.raises(ValueError, match="checkpoint SHA-256"):
         prepare_image_rows(manifest)
 
 
-@pytest.mark.parametrize("pattern,expected_group_weight", [("common", 1.0), ("within", 1.0), ("between", 0.75)])
-def test_group_shrinkage_uses_paired_group_global_contrasts(pattern, expected_group_weight):
-    kids = np.array([[[10.0, 10.0, 10.0, 10.0], [9.0, 9.0, 5.0, 5.0]]])
-    jackknife = np.repeat(kids[..., None], 2, axis=-1)
-    offsets = np.tile([-1.0, 1.0], (4, 1))
-    if pattern == "within":
-        offsets[[1, 3]] *= -1
-    elif pattern == "between":
-        offsets[[2, 3]] *= -1
-    jackknife[0, 1] -= offsets
-    result = paired_kid_shrinkage(kids, jackknife, np.array([0, 0, 1, 1]), uniform_index=0, fit_split="train")
-    # Every marginal class variance is 1. Only opposing group shifts create
-    # uncertainty in the group-minus-global contrast; other shifts cancel.
-    np.testing.assert_allclose(result["standard_errors"][0, 1], 1.0)
-    expected_coefficients = np.tile([0.0, expected_group_weight, 1 - expected_group_weight], (4, 1))
-    np.testing.assert_allclose(result["coefficients"][0, 1], expected_coefficients)
-    independent_group_weight = 3.5 / (3.5 + 0.5)
-    assert not np.isclose(expected_group_weight, independent_group_weight)
-    expected = expected_group_weight * np.array([1, 1, 5, 5]) + (1 - expected_group_weight) * 3
-    np.testing.assert_allclose(result["shrunk_improvements"][0, 1], expected)
+@pytest.mark.parametrize("mutation", ["missing-phase", "missing-list", "bad-hash", "overlap"])
+def test_image_artifact_requires_complete_disjoint_split_provenance(mutation):
+    from genode.gico.image_objective import validate_image_split_identities
 
-
-def test_common_jackknife_noise_preserves_exact_class_and_group_contrasts():
-    kids = np.array([[[10.0] * 4, [9.0, 8.0, 6.0, 5.0]]])
-    jackknife = np.repeat(kids[..., None], 2, axis=-1)
-    jackknife[0, 1] += [-10.0, 10.0]
-    result = paired_kid_shrinkage(kids, jackknife, np.array([0, 0, 1, 1]), uniform_index=0, fit_split="train")
-    np.testing.assert_allclose(result["standard_errors"][0, 1], 10.0)
-    np.testing.assert_allclose(result["shrunk_improvements"][0, 1], [1.0, 2.0, 4.0, 5.0])
-    np.testing.assert_allclose(result["coefficients"][0, 1, :, 0], 1.0)
-
-
-def test_noisy_class_contrasts_shrink_to_precise_group_means():
-    kids = np.array([[[10.0] * 4, [9.0, 7.0, 5.0, 3.0]]])
-    jackknife = np.repeat(kids[..., None], 2, axis=-1)
-    offsets = np.tile([-1.0, 1.0], (4, 1))
-    offsets[[1, 3]] *= -1
-    jackknife[0, 1] += offsets
-    result = paired_kid_shrinkage(kids, jackknife, np.array([0, 0, 1, 1]), uniform_index=0, fit_split="train")
-    np.testing.assert_allclose(result["shrunk_improvements"][0, 1], [2.0, 2.0, 6.0, 6.0])
-    np.testing.assert_allclose(result["coefficients"][0, 1], np.tile([0.0, 1.0, 0.0], (4, 1)))
-
-
-@pytest.mark.parametrize("task", ["cifar10", "imagenet64"])
-def test_image_split_panel_reuse_is_rejected_even_when_generation_seed_changes(task):
-    manifest = image_manifest(task)
-    for row in manifest["rows"]:
-        row["reference_id"] = "reused-reference-panel"
-        if row["split"] == "validation":
-            row["seed"] = 999
-    with pytest.raises(ValueError, match="disjoint paired measurement panels"):
-        prepare_image_rows(manifest)
+    rows = image_manifest()["rows"]
+    provenance = {
+        phase: {
+            "panels": sorted({r["panel_id"] for r in rows if r["split"] == phase}),
+            "targets": sorted({r["reference_id"] for r in rows if r["split"] == phase}),
+            "noises": sorted({r["target"]["noise_sha256"] for r in rows if r["split"] == phase}),
+        }
+        for phase in ("train", "calibration", "validation")
+    }
+    validate_image_split_identities(provenance)
+    if mutation == "missing-phase":
+        del provenance["validation"]
+    elif mutation == "missing-list":
+        del provenance["train"]["targets"]
+    elif mutation == "bad-hash":
+        provenance["train"]["noises"] = ["not-a-sha"]
+    else:
+        provenance["validation"]["noises"] = provenance["train"]["noises"]
+    with pytest.raises(ValueError):
+        validate_image_split_identities(provenance)

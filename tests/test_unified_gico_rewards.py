@@ -18,7 +18,7 @@ def measurement(
     *, task="traffic_hourly", context="train-a", split="train", nfe=4, seed=0, schedule="uniform", metrics=None
 ):
     mass = reference_densities("euler", nfe)[schedule]
-    return {
+    row = {
         "task": task,
         "backbone": "frozen-checkpoint-sha",
         "solver": "euler",
@@ -34,12 +34,17 @@ def measurement(
         "density_mass": list(mass),
         "time_grid": list(materialize(mass, "euler", nfe)),
     }
+    if task in ("cifar10", "imagenet64"):
+        from tests.image_fixtures import image_fields
+
+        row = image_fields(row)
+    return row
 
 
 def paired_rows(*, task="traffic_hourly"):
     rows = []
     for context, factor in (("train-a", 0.5), ("train-b", 0.8)):
-        anchor = {"crps": 4.0, "mase": 2.0} if task == "traffic_hourly" else {"kid": 0.2}
+        anchor = {"crps": 4.0, "mase": 2.0} if task == "traffic_hourly" else {"lpips": 0.2}
         candidate = {key: value * factor for key, value in anchor.items()}
         rows.extend(
             (
@@ -75,7 +80,7 @@ def reference_evidence(*, task="traffic_hourly", complete=True):
         for key in keys:
             mass = np.asarray(reference_densities("euler", 4)[key])
             moment = float(mass @ np.linspace(1, 3, 64))
-            metrics = {"kid": moment} if task == "cifar10" else {"crps": 3 + moment, "mase": 2 + moment**2}
+            metrics = {"lpips": moment} if task == "cifar10" else {"crps": 3 + moment, "mase": 2 + moment**2}
             rows.append(measurement(task=task, context=context, split=split, schedule=key, metrics=metrics))
     return rows, contexts
 
@@ -172,23 +177,23 @@ def test_calibration_scope_is_frozen_and_errors_have_equal_relative_weight():
     assert RewardCalibration.from_payload(calibration.to_payload()) == calibration
 
 
-def kid_panel(differences, *, nfe=4, context_prefix="cell"):
+def lpips_panel(differences, *, nfe=4, context_prefix="cell"):
     rows = []
     for i, delta in enumerate(differences):
         context = f"{context_prefix}-{i}"
         rows += [
-            measurement(task="cifar10", context=context, nfe=nfe, metrics={"kid": 20}),
-            measurement(task="cifar10", context=context, nfe=nfe, schedule="late_p_3", metrics={"kid": 20 - delta}),
+            measurement(task="cifar10", context=context, nfe=nfe, metrics={"lpips": 20}),
+            measurement(task="cifar10", context=context, nfe=nfe, schedule="late_p_3", metrics={"lpips": 20 - delta}),
         ]
     return rows
 
 
 def test_scalar_scale_balances_nfes_and_does_not_center_final_reward():
-    rows = kid_panel([1, 3], nfe=4, context_prefix="four") + kid_panel([10, 14], nfe=8, context_prefix="eight")
+    rows = lpips_panel([1, 3], nfe=4, context_prefix="four") + lpips_panel([10, 14], nfe=8, context_prefix="eight")
     reference_scale = np.std([1, 3, 10, 14])
     calibration = calibrate_rewards(rows)
     assert calibration.reward_scale == pytest.approx(reference_scale)
-    replicated = rows + sum((kid_panel([1, 3], nfe=4, context_prefix=f"replica-{i}") for i in range(4)), [])
+    replicated = rows + sum((lpips_panel([1, 3], nfe=4, context_prefix=f"replica-{i}") for i in range(4)), [])
     assert calibrate_rewards(replicated).reward_scale == pytest.approx(reference_scale)
     candidates = [r for r in construct_rewards(rows, calibration) if r["schedule_key"] != "uniform"]
     assert [r["reward"] for r in candidates] == pytest.approx(np.array([1, 3, 10, 14]) / reference_scale)
@@ -229,7 +234,7 @@ def test_degenerate_reward_calibrations_are_rejected(case):
             if row["schedule_key"] == "uniform":
                 row["metrics"] = {"crps": 0, "mase": 0}
     elif case == "constant-improvement":
-        rows = kid_panel([1, 1])
+        rows = lpips_panel([1, 1])
     else:
         for row in rows:
             row.update(task="molecule_3d_set1", ensemble_size=1, metrics=dict.fromkeys(MOLECULE_METRICS, 1))

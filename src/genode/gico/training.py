@@ -541,9 +541,18 @@ def fit(
     }
     if bindings:
         metadata["backbone_binding"] = bindings[0]
-    metadata["reward_estimators"] = [
-        r["reward_estimator"] for r in (rows + (calibration_rows or [])) if "reward_estimator" in r
-    ]
+    if evidence.task in ("cifar10", "imagenet64"):
+        metadata["image_objective"] = rows[0]["image_objective"]
+        metadata["image_split_identities"] = {
+            phase: {
+                "panels": sorted({r["panel_id"] for r in rows + (calibration_rows or []) if r["split"] == phase}),
+                "targets": sorted({r["reference_id"] for r in rows + (calibration_rows or []) if r["split"] == phase}),
+                "noises": sorted(
+                    {r["target"]["noise_sha256"] for r in rows + (calibration_rows or []) if r["split"] == phase}
+                ),
+            }
+            for phase in ("train", "calibration", "validation")
+        }
     from genode.gico.evidence import content_hash
 
     maps = {

@@ -166,6 +166,17 @@ def _read_artifact(path) -> tuple[dict, str]:
 class GICOPolicy:
     def __init__(self, payload: dict, digest: str, student_kind: str):
         self.metadata = payload["metadata"]
+        if self.metadata["task"] in ("cifar10", "imagenet64"):
+            from genode.gico.image_objective import validate_image_objective, validate_image_split_identities
+
+            validate_image_objective(self.metadata.get("image_objective"))
+            target = self.metadata["image_objective"]["target_generator"]
+            if target["backbone"] != self.metadata["backbone"] or (
+                "backbone_binding" in self.metadata
+                and self.metadata["backbone_binding"].get("checkpoint_sha256") != target["checkpoint_sha256"]
+            ):
+                raise ValueError("Image artifact target and candidate backbone identities disagree.")
+            validate_image_split_identities(self.metadata.get("image_split_identities"))
         self.artifact_sha256 = digest
         self.student_kind = student_kind
         if student_kind not in ("deterministic", "stochastic") or student_kind not in payload["students"]:

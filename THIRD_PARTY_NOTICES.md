@@ -156,3 +156,15 @@ before downloading or redistributing that external file.
 - External weight source: [torch-fidelity v0.2.0 release](https://github.com/toshas/torch-fidelity/releases/tag/v0.2.0)
 - Referenced implementation: [pytorch-fid](https://github.com/mseitzer/pytorch-fid)
 - Package license: Apache License 2.0
+
+
+## Paired perceptual supervision
+
+The optional `image-supervision` extra uses the external `lpips` package and
+TorchVision VGG network weights. No perceptual-network weights are distributed
+with GenODE. Image evidence records the complete frozen scorer state and source
+hashes, version, and preprocessing. The fitting convention follows the pinned
+[BezierFlow trainer](https://github.com/KAIST-Visual-AI-Group/BezierFlow/blob/63ccd10454919a61804536a2c59609256910cf02/trainer.py).
+
+- LPIPS source: [PerceptualSimilarity](https://github.com/richzhang/PerceptualSimilarity)
+- Network implementation: [TorchVision](https://github.com/pytorch/vision)

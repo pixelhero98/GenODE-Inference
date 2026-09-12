@@ -66,6 +66,9 @@ def prepare_evidence(
             raise ValueError("Reference name does not match its realized density.")
     calibration_rows = calibration_rows if calibration_rows is not None else [r for r in rows if r["split"] == "train"]
     all_rows = rows + calibration_rows
+    from genode.gico.image_objective import IMAGE_TASKS, validate_image_rows
+
+    validate_image_rows(all_rows)
     if task.startswith("molecule_"):
         from genode.evaluation.molecule_energy import MoleculeFeatureMap
 
@@ -109,8 +112,12 @@ def prepare_evidence(
         if task in ("sana", "sd15"):
             calibrated = calibrate_rewards(training, component_calibration_rows=calibration)
         else:
-            if {r["nfe"] for r in calibration} != {r["nfe"] for r in training}:
-                raise ValueError("Reward calibration must cover exactly the training NFEs for each solver.")
+            calibration_nfes = {r["nfe"] for r in calibration}
+            training_nfes = {r["nfe"] for r in training}
+            if not training_nfes <= calibration_nfes or (task not in IMAGE_TASKS and training_nfes != calibration_nfes):
+                raise ValueError(
+                    "Reward calibration must cover training NFEs; only image fitting permits a shared calibration NFE superset."
+                )
             calibrated = calibrate_rewards(calibration)
         calibrations[solver] = calibrated
         cells.extend(construct_rewards([r for r in rows if r["solver"] == solver], calibrated))

@@ -31,7 +31,9 @@ def _write(path: str, payload: dict) -> None:
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    prepare = commands.add_parser("prepare", help="Validate raw paired KID measurements and bind native contexts.")
+    prepare = commands.add_parser(
+        "prepare", help="Validate raw paired LPIPS target measurements and bind native contexts."
+    )
     prepare.add_argument("--manifest", required=True)
     prepare.add_argument("--output", required=True)
     train = commands.add_parser("train", help="Fit the common teacher and requested student architectures.")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "genode"
-version = "0.10.1"
+version = "0.11.0"
 description = "GICO inference-clock optimization for frozen flow-matching backbones."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -38,6 +38,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10", "ruff>=0.12"]
+image-supervision = ["lpips==0.1.4", "torchvision>=0.17"]
 latent-clock = ["botorch>=0.16,<0.17"]
 
 [project.urls]

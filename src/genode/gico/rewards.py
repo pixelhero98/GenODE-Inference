@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 
+from genode.gico.image_objective import validate_image_rows
 from genode.solver_protocol import normalize_solver_key
 
 MOLECULE_METRICS = (
@@ -24,8 +25,8 @@ TASK_METRICS = {
     "molecule_3d_set1": MOLECULE_METRICS,
     "molecule_3d_set2": MOLECULE_METRICS,
     "molecule_3d_set3": MOLECULE_METRICS,
-    "cifar10": ("kid",),
-    "imagenet64": ("kid",),
+    "cifar10": ("lpips",),
+    "imagenet64": ("lpips",),
     "sana": ("preference", "alignment"),
     "sd15": ("preference", "alignment"),
 }
@@ -41,13 +42,19 @@ def metric_weights(task: str) -> tuple[float, ...]:
     )
 
 
-def _balanced_std(values: np.ndarray, nfes: np.ndarray) -> np.ndarray:
+def _balanced_std(values: np.ndarray, nfes: np.ndarray, classes: np.ndarray | None = None) -> np.ndarray:
     """Population standard deviation with equal total weight per observed NFE."""
     weights = np.zeros(len(nfes), dtype=np.float64)
     unique = np.unique(nfes)
     for nfe in unique:
         mask = nfes == nfe
-        weights[mask] = 1 / (len(unique) * mask.sum())
+        if classes is None:
+            weights[mask] = 1 / (len(unique) * mask.sum())
+        else:
+            labels = np.unique(classes[mask])
+            for label in labels:
+                cell = mask & (classes == label)
+                weights[cell] = 1 / (len(unique) * len(labels) * cell.sum())
     mean = np.sum(values * weights[:, None], axis=0)
     return np.sqrt(np.sum((values - mean) ** 2 * weights[:, None], axis=0))
 
@@ -56,6 +63,7 @@ def _paired_cells(rows: list[dict[str, Any]], *, varying_clocks: bool = False) -
     """Pair before averaging repeats. Never silently intersect seed panels."""
     if not rows:
         raise ValueError("Reward evidence is empty.")
+    validate_image_rows(rows)
     panel: dict[tuple, dict[str, dict]] = defaultdict(dict)
     required = (
         "task",
@@ -92,12 +100,9 @@ def _paired_cells(rows: list[dict[str, Any]], *, varying_clocks: bool = False) -
         values = np.array([row["metrics"][key] for key in TASK_METRICS[row["task"]]], dtype=float)
         if not np.isfinite(values).all():
             raise ValueError("Terminal metrics must be finite and complete.")
-        if "reward_metrics" in row:
-            if row["task"] != "imagenet64" or row["split"] not in FIT_SPLITS or "reward_estimator" not in row:
-                raise ValueError("Only calibrated ImageNet training evidence may carry shrunk reward metrics.")
-            if set(row["reward_metrics"]) != {"kid"} or not np.isfinite(row["reward_metrics"]["kid"]):
-                raise ValueError("Invalid shrunk KID evidence.")
-        if any(row["metrics"][key] < 0 for key in TASK_METRICS[row["task"]] if key in LOG_METRICS):
+        if any(key in row for key in ("reward_metrics", "reward_estimator")):
+            raise ValueError("Obsolete reward overrides are unsupported; supply raw paired terminal measurements.")
+        if any(row["metrics"][key] < 0 for key in TASK_METRICS[row["task"]] if key in LOG_METRICS or key == "lpips"):
             raise ValueError("Error metrics must be nonnegative.")
         if row["task"].startswith("molecule_") and row["ensemble_size"] < 2:
             raise ValueError("Fair molecular energy score requires at least two ensemble members.")
@@ -126,10 +131,6 @@ def _paired_cells(rows: list[dict[str, Any]], *, varying_clocks: bool = False) -
         first = repeats[0]
         keys = TASK_METRICS[first["task"]]
         cell = {**first, "metrics": {k: float(np.mean([r["metrics"][k] for r in repeats])) for k in keys}}
-        if any("reward_metrics" in r for r in repeats):
-            if not all("reward_metrics" in r for r in repeats):
-                raise ValueError("Repeated KID measurements have inconsistent shrinkage protocols.")
-            cell["reward_metrics"] = {k: float(np.mean([r["reward_metrics"][k] for r in repeats])) for k in keys}
         cell["seeds"] = sorted(r["seed"] for r in repeats)
         cell["reference_ids"] = {str(r["seed"]): r["reference_id"] for r in repeats}
         cell.pop("seed")
@@ -151,7 +152,6 @@ def _paired_cells(rows: list[dict[str, Any]], *, varying_clocks: bool = False) -
     for cell in cells:
         anchor = lookup[tuple(cell[k] for k in ("task", "backbone", "solver", "nfe", "context_id", "split"))]
         cell["anchor_metrics"] = anchor["metrics"]
-        cell["anchor_reward_metrics"] = anchor.get("reward_metrics", anchor["metrics"])
     return cells
 
 
@@ -192,12 +192,12 @@ class RewardCalibration:
             raise ValueError("Reward calibration task/backbone/solver mismatch.")
         values = []
         for key, floor, scale in zip(self.metric_keys, self.floors, self.component_scales, strict=True):
-            candidate = cell.get("reward_metrics", cell["metrics"])[key]
-            anchor = cell.get("anchor_reward_metrics", cell["anchor_metrics"])[key]
+            candidate = cell["metrics"][key]
+            anchor = cell["anchor_metrics"][key]
             if key in LOG_METRICS:
                 value = np.log(anchor + floor) - np.log(candidate + floor)
             else:
-                value = ((anchor - candidate) if key == "kid" else (candidate - anchor)) / scale
+                value = ((anchor - candidate) if key == "lpips" else (candidate - anchor)) / scale
             values.append(value)
         result = np.asarray(values, dtype=np.float64)
         if not np.isfinite(result).all():
@@ -265,7 +265,8 @@ def calibrate_rewards(rows: list[dict], *, component_calibration_rows: list[dict
     }
     provisional = RewardCalibration(**common, reward_scale=1.0)
     scalar = np.array([[provisional.scalar(r, normalize=False)] for r in candidates])
-    return RewardCalibration(**common, reward_scale=float(_balanced_std(scalar, nfes)[0]))
+    classes = np.array([r["class_id"] for r in candidates]) if task == "imagenet64" else None
+    return RewardCalibration(**common, reward_scale=float(_balanced_std(scalar, nfes, classes)[0]))
 
 
 def construct_rewards(rows: list[dict], calibration: RewardCalibration, *, varying_clocks: bool = False) -> list[dict]:

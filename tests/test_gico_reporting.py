@@ -97,23 +97,30 @@ def test_report_rejects_incompatible_or_leaked_evidence(field, value, match):
 
 
 def test_imagenet_report_uses_complete_equally_weighted_class_panels_as_uncertainty_units():
+    from genode.gico.image_supervision import prepare_image_rows
+    from tests.test_image_gico_supervision import image_manifest
+
     policy, _, _ = report_fixture()
-    calibration = calibrate_rewards(paired_rows(task="imagenet64"))
+    prepared, _, _ = prepare_image_rows(image_manifest("imagenet64"))
+    calibration = calibrate_rewards([r for r in prepared if r["split"] == "train"])
     policy.metadata["reward_calibrations"] = {"euler": calibration.to_payload()}
-    templates = [
-        measurement(task="imagenet64", split="test", metrics={"kid": 2.0}),
-        measurement(task="imagenet64", split="test", schedule="late_p_3", metrics={"kid": 1.0}),
-    ]
-    rows = [
-        {**row, "class_id": label, "context_id": f"test-class:{label}"} for row in templates for label in range(1000)
-    ]
+    rows = [r for r in prepared if r["split"] == "validation"]
+    for row in rows:
+        row["split"] = "test"
+    policy.metadata["image_objective"] = rows[0]["image_objective"]
+    policy.metadata["image_split_identities"] = {
+        phase: {"panels": [], "targets": [], "noises": []} for phase in ("train", "validation", "calibration")
+    }
+    policy.metadata["backbone_binding"] = rows[0]["backbone_binding"]
+    policy.metadata["measurement_protocols"] = [rows[0]["measurement_protocol"]]
     report = summarize_measurements(rows, policy)
     result = next(r for r in report["results"] if r["schedule"] == "late_p_3")
     assert result["paired_contexts"] == 1000
     assert result["independent_units"] == 1
     assert result["reward_standard_error"] is None
-    assert result["reward_mean"] == pytest.approx(1 / calibration.reward_scale)
-    assert result["raw_metrics"] == {"kid": 1.0}
+    expected = np.mean([r["metrics"]["lpips"] for r in rows if r["schedule_key"] == "late_p_3"])
+    assert result["reward_mean"] == pytest.approx((0.1 - expected) / calibration.reward_scale)
+    assert result["raw_metrics"] == {"lpips": pytest.approx(expected)}
     assert report["uncertainty_unit"] == "paired_panel_mean_over_classes_and_replicates"
     rows = [r for r in rows if r["class_id"] != 999]
     with pytest.raises(ValueError, match="all 1000 classes"):

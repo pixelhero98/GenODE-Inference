@@ -23,8 +23,8 @@ from genode.schedule_transfer.reference_clocks import (
 from genode.schedules.fixed import FIXED_SCHEDULE_TARGET_NFES
 from genode.schedules.specification import ScheduleSpecification
 
-IMAGE_PROTOCOL_VERSION = 7
-IMAGE_PROTOCOL_KEY = "image_euler_248_v7"
+IMAGE_PROTOCOL_VERSION = 8
+IMAGE_PROTOCOL_KEY = "image_euler_lpips_v8"
 IMAGE_GICO_TEACHER_SCORE_WEIGHT = 0.01
 IMAGE_GICO_TEACHER_SCORE_WARMUP_FRACTION = 0.60
 IMAGE_GICO_TEACHER_SCORE_CLIP = 5.0
@@ -40,16 +40,9 @@ IMAGE_SOLVER_KEY = "euler"
 IMAGE_TARGET_NFES: tuple[int, ...] = FIXED_SCHEDULE_TARGET_NFES
 IMAGE_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
 
-KID_BLOCK_SIZE = 1_000
-KID_REWARD_TRAIN_BLOCKS = 20
-KID_SELECTION_SCREENING_BLOCKS = 10
-KID_SURVIVOR_CONFIRMATION_BLOCKS = 10
-KID_SCREENING_SURVIVORS_PER_NFE = 3
-KID_SELECTION_RULE_KEY = "top3_unique_grid_then_unique_confirmation_minimum"
-
-CONDITIONAL_KID_REWARD_TRAIN_BLOCKS = 64
-CONDITIONAL_KID_SELECTION_SCREENING_BLOCKS = 32
-CONDITIONAL_KID_SURVIVOR_CONFIRMATION_BLOCKS = 64
+IMAGE_PANEL_BLOCK_SIZE = 1_000
+LPIPS_TRAIN_PAIRS = 200
+LPIPS_SELECTION_PAIRS = 200
 
 LOCKED_SAMPLE_COUNT = 50_000
 LOCKED_INCEPTION_SPLITS = 10
@@ -101,28 +94,13 @@ PANEL_PHASES: tuple[str, ...] = (
 )
 
 _PANEL_SHAPES: Mapping[str, tuple[int, int]] = {
-    PANEL_PHASE_REWARD_TRAIN: (KID_REWARD_TRAIN_BLOCKS, KID_BLOCK_SIZE),
-    PANEL_PHASE_SELECTION_SCREENING: (
-        KID_SELECTION_SCREENING_BLOCKS,
-        KID_BLOCK_SIZE,
-    ),
-    PANEL_PHASE_SURVIVOR_CONFIRMATION: (
-        KID_SURVIVOR_CONFIRMATION_BLOCKS,
-        KID_BLOCK_SIZE,
-    ),
-    PANEL_PHASE_LOCKED_MAIN: (LOCKED_SAMPLE_COUNT // KID_BLOCK_SIZE, KID_BLOCK_SIZE),
-    PANEL_PHASE_CONDITIONAL_REWARD_TRAIN: (
-        CONDITIONAL_KID_REWARD_TRAIN_BLOCKS,
-        KID_BLOCK_SIZE,
-    ),
-    PANEL_PHASE_CONDITIONAL_SELECTION_SCREENING: (
-        CONDITIONAL_KID_SELECTION_SCREENING_BLOCKS,
-        KID_BLOCK_SIZE,
-    ),
-    PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION: (
-        CONDITIONAL_KID_SURVIVOR_CONFIRMATION_BLOCKS,
-        KID_BLOCK_SIZE,
-    ),
+    PANEL_PHASE_REWARD_TRAIN: (1, LPIPS_TRAIN_PAIRS),
+    PANEL_PHASE_SELECTION_SCREENING: (1, LPIPS_SELECTION_PAIRS),
+    PANEL_PHASE_SURVIVOR_CONFIRMATION: (1, LPIPS_SELECTION_PAIRS),
+    PANEL_PHASE_LOCKED_MAIN: (LOCKED_SAMPLE_COUNT // IMAGE_PANEL_BLOCK_SIZE, IMAGE_PANEL_BLOCK_SIZE),
+    PANEL_PHASE_CONDITIONAL_REWARD_TRAIN: (1, LPIPS_TRAIN_PAIRS),
+    PANEL_PHASE_CONDITIONAL_SELECTION_SCREENING: (1, LPIPS_SELECTION_PAIRS),
+    PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION: (1, LPIPS_SELECTION_PAIRS),
 }
 
 
@@ -233,7 +211,7 @@ def euler_image_workload(
     if pairs <= 0:
         raise ValueError("pair_count must be a positive integer.")
     schedule_count = len(image_schedule_keys(extra_late_p_values))
-    images_per_density_cell = (KID_REWARD_TRAIN_BLOCKS + KID_SELECTION_SCREENING_BLOCKS) * KID_BLOCK_SIZE
+    images_per_density_cell = LPIPS_TRAIN_PAIRS + LPIPS_SELECTION_PAIRS
     per_pair_images = schedule_count * len(IMAGE_TARGET_NFES) * images_per_density_cell
     per_pair_evaluations = schedule_count * images_per_density_cell * sum(IMAGE_TARGET_NFES)
     return EulerImageWorkload(
@@ -262,7 +240,7 @@ def survivor_confirmation_workload(
         if count < 0:
             raise ValueError("Survivor counts must be nonnegative integers.")
         normalized[nfe] += count
-    samples_per_survivor = KID_SURVIVOR_CONFIRMATION_BLOCKS * KID_BLOCK_SIZE
+    samples_per_survivor = LPIPS_SELECTION_PAIRS
     confirmation_images = samples_per_survivor * sum(normalized.values())
     confirmation_evaluations = samples_per_survivor * sum(nfe * count for nfe, count in normalized.items())
     return EulerImageWorkload(
@@ -292,16 +270,14 @@ def image_protocol_metadata(
         "schedule_count": len(schedule_keys),
         "schedule_specifications": [ScheduleSpecification(key).as_payload() for key in schedule_keys],
         "reference_clock_provenance": [reference_clock_provenance(key) for key in schedule_keys],
-        "kid": {
-            "reward_metric": "kernel_inception_distance",
-            "estimator": "unbiased_mmd2",
-            "kernel": "polynomial_degree_3",
-            "block_size": KID_BLOCK_SIZE,
-            "reward_train_blocks": KID_REWARD_TRAIN_BLOCKS,
-            "selection_screening_blocks": KID_SELECTION_SCREENING_BLOCKS,
-            "survivor_confirmation_blocks": KID_SURVIVOR_CONFIRMATION_BLOCKS,
+        "supervision": {
+            "protocol": "paired-lpips-v1",
+            "metric": "lpips_vgg",
+            "target": "same_backbone_high_accuracy_same_noise_and_class",
+            "train_pairs_per_panel": LPIPS_TRAIN_PAIRS,
+            "selection_pairs_per_panel": LPIPS_SELECTION_PAIRS,
             "reward_direction": "lower_is_better",
-            "reward_transform": "paired_uniform_minus_candidate_kid_frozen_scalar_std",
+            "reward_transform": "paired_uniform_minus_candidate_lpips_frozen_scalar_std",
         },
         "locked_metrics": {
             "sample_count": LOCKED_SAMPLE_COUNT,
@@ -313,14 +289,10 @@ def image_protocol_metadata(
             "execution": locked_metric_execution_spec(),
         },
         "selection": {
-            "rule_key": KID_SELECTION_RULE_KEY,
-            "screening_survivors_per_nfe": (KID_SCREENING_SURVIVORS_PER_NFE),
-            "duplicate_handling": "group_by_exact_time_grid_sha256",
-            "screening_statistic": "mean_unbiased_block_kid",
-            "screening_direction": "lower_is_better",
-            "confirmation_statistic": "mean_unbiased_block_kid",
-            "confirmation_direction": "lower_is_better",
-            "tie_policy": "abort",
+            "teacher": "heldout_reference_mixture_lpips_regret",
+            "student_checkpoint": "post_ramp_heldout_distillation",
+            "student_coefficient": "heldout_mean_lpips_then_lower_coefficient",
+            "duplicate_handling": "unique_realized_density",
             "locked_tuning": False,
         },
         "gico_student": {
@@ -393,9 +365,6 @@ def finite_temperature(value: object) -> float:
 
 __all__ = [
     "CIFAR10_DATASET_KEY",
-    "CONDITIONAL_KID_REWARD_TRAIN_BLOCKS",
-    "CONDITIONAL_KID_SELECTION_SCREENING_BLOCKS",
-    "CONDITIONAL_KID_SURVIVOR_CONFIRMATION_BLOCKS",
     "EulerImageWorkload",
     "FID_COMPLEX_IMAGINARY_TOLERANCE",
     "FID_COVARIANCE_EPSILON",
@@ -411,12 +380,6 @@ __all__ = [
     "IMAGE_TARGET_NFES",
     "IMAGENET64_DATASET_KEY",
     "ImageBenchmarkSpec",
-    "KID_BLOCK_SIZE",
-    "KID_REWARD_TRAIN_BLOCKS",
-    "KID_SCREENING_SURVIVORS_PER_NFE",
-    "KID_SELECTION_RULE_KEY",
-    "KID_SELECTION_SCREENING_BLOCKS",
-    "KID_SURVIVOR_CONFIRMATION_BLOCKS",
     "LOCKED_INCEPTION_SPLITS",
     "LOCKED_METRIC_EXECUTION_PROTOCOL",
     "LOCKED_PRECISION_RECALL_NEIGHBORHOOD",
