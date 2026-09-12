@@ -206,6 +206,7 @@ jobs:
                   f"{root}/SECURITY.md",
                   f"{root}/THIRD_PARTY_NOTICES.md",
                   f"{root}/tests/__init__.py",
+                  f"{root}/tests/image_fixtures.py",
                   f"{root}/tests/test_image_gico_cli.py",
               }
               if not required_sdist <= sdist_names:
