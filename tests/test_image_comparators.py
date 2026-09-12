@@ -136,6 +136,38 @@ def test_ema_preserves_buffers_and_rejects_missing_shadows():
         restore_ema(net, state)
 
 
+def test_two_time_baselines_allow_tied_model_times_but_not_integration_steps():
+    grid = reflow_grid([0, 0.25, 0.5, 0.75, 1], device="cpu")
+    times = grid.clone()
+    times[2] = times[1]
+    validate_learned_grids(grid, times, 4, allow_repeated_model_times=True)
+    validate_executed_model_times(times[:-1] * 1000, 4, allow_repeated_model_times=True)
+
+    class StateField(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.states = []
+
+        def forward(self, state, time):
+            self.states.append(state.clone())
+            return state + 1
+
+    network = StateField()
+    velocity = ReflowVelocity(network)
+    state = torch.zeros(1, 3, 2, 2)
+    for left, right, time in zip(grid[:-1], grid[1:], times[:-1], strict=True):
+        state = state + (right - left) * velocity(state, time)
+    assert velocity.calls == 4 and torch.isfinite(state).all()
+    assert not torch.equal(network.states[1], network.states[2])
+    with pytest.raises(ValueError, match="strictly increasing"):
+        validate_learned_grids(times, grid, 4, allow_repeated_model_times=True)
+    times[2] = times[1] - 0.01
+    with pytest.raises(ValueError, match="nondecreasing"):
+        validate_learned_grids(grid, times, 4, allow_repeated_model_times=True)
+    with pytest.raises(ValueError, match="nondecreasing"):
+        validate_executed_model_times(times[:-1] * 1000, 4, allow_repeated_model_times=True)
+
+
 def test_upstream_import_scope_restores_other_methods_after_failure(tmp_path, monkeypatch):
     existing = ModuleType("models")
     monkeypatch.setitem(sys.modules, "models", existing)

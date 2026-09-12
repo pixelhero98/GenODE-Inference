@@ -146,25 +146,32 @@ def euler_sample(velocity: ReflowVelocity, noise: torch.Tensor, progress) -> tor
     return x
 
 
-def validate_learned_grids(integration_times, model_times, nfe: int) -> None:
-    """Validate the two learned upstream grids without projecting or repairing them."""
-    for times in (integration_times, model_times):
+def validate_learned_grids(
+    integration_times, model_times, nfe: int, *, allow_repeated_model_times: bool = False
+) -> None:
+    """Keep integration strict; two-time baselines may evaluate new states at tied times."""
+    for index, times in enumerate((integration_times, model_times)):
         values = torch.as_tensor(times).detach().float()
-        if values.shape != (nfe + 1,) or not torch.isfinite(values).all() or not (values.diff() > 0).all():
-            raise ValueError("Learned ReFlow grids need L+1 finite, strictly increasing float32 nodes.")
+        repeated = index == 1 and allow_repeated_model_times
+        ordered = values.ndim == 1 and (values.diff() >= 0 if repeated else values.diff() > 0).all()
+        if values.shape != (nfe + 1,) or not torch.isfinite(values).all() or not ordered:
+            order = "nondecreasing" if repeated else "strictly increasing"
+            raise ValueError(f"Learned ReFlow grids need L+1 finite, {order} float32 nodes.")
         if abs(float(values[0]) - RF_START) > 1e-7 or abs(float(values[-1]) - RF_END) > 1e-7:
             raise ValueError("Learned ReFlow grids changed the common solver endpoints.")
-        if not ((values * 1000).diff() > 0).all():
+        native_diff = (values * 1000).diff()
+        if not (native_diff >= 0 if repeated else native_diff > 0).all():
             raise ValueError("Learned ReFlow model times collapse after native time scaling.")
 
 
-def validate_executed_model_times(times, nfe: int) -> None:
+def validate_executed_model_times(times, nfe: int, *, allow_repeated_model_times: bool = False) -> None:
     """Check actual native network times, including a Bézier field transformation."""
     values = torch.as_tensor(times, dtype=torch.float32)
     if (
         values.shape != (nfe,)
         or not torch.isfinite(values).all()
         or not ((values > 0) & (values < 1000)).all()
-        or not (values.diff() > 0).all()
+        or not (values.diff() >= 0 if allow_repeated_model_times else values.diff() > 0).all()
     ):
-        raise ValueError("Executed ReFlow model times must be L distinct ordered native times in (0,1000).")
+        order = "nondecreasing" if allow_repeated_model_times else "distinct ordered"
+        raise ValueError(f"Executed ReFlow model times must be L {order} native times in (0,1000).")

@@ -36,6 +36,16 @@ Euler makes precisely one network call per interval and validates the executed
 float32 grid. `ReflowVelocity.bezier` exposes the upstream solver signature;
 its call counter also counts evaluations inside a transformed velocity field.
 
+Two-time BézierFlow and LD3 schedules keep integration nodes strictly increasing,
+but their published offset clipping can produce equal adjacent model times.
+These still evaluate distinct evolving states and each call counts toward NFE.
+Use `allow_repeated_model_times=True` in both learned-grid and executed-time
+validation for those adapters; Base Euler and GICO retain the strict default.
+Do not jitter or project a learned schedule to pass validation. When constructing
+upstream training configurations directly, preserve the authors' hyperparameter
+adjustments, including dividing the model-time learning rate by NFE. Record the
+resolved values, fitting allowance and checkpoint-selection rule for each method.
+
 FID uses only the official EDM `inception-2015-12-05.pkl` detector with its
 matching `cifar10-32x32.npz` reference moments. Verify and record both asset
 hashes before loading the trusted pickle. The pinned BézierFlow checkout
