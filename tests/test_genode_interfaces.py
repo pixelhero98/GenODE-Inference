@@ -204,7 +204,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         for required in (
             "include CONTRIBUTING.md",
             "include SECURITY.md",
-            "include tests/__init__.py",
+            "recursive-include tests *.py",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, manifest)
