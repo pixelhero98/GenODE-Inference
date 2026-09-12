@@ -92,7 +92,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         project = data["project"]
 
-        self.assertEqual(project["version"], "0.12.0")
+        self.assertEqual(project["version"], "0.12.1")
         self.assertEqual(
             project["description"], "GICO inference-clock optimization for frozen flow-matching backbones."
         )
@@ -136,6 +136,7 @@ class GenODEInterfaceTests(unittest.TestCase):
                 "README.md",
                 "SECURITY.md",
                 "THIRD_PARTY_NOTICES.md",
+                "docs/frozen-bezier-kid.md",
                 "docs/image-comparators.md",
                 "docs/image-supervision.md",
                 "docs/js-reinforce.md",
@@ -214,7 +215,13 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertFalse((PROJECT_ROOT / "scripts").exists())
         self.assertEqual(
             {path.name for path in (PROJECT_ROOT / "docs").iterdir()},
-            {"image-comparators.md", "image-supervision.md", "js-reinforce.md", "student-selection.md"},
+            {
+                "frozen-bezier-kid.md",
+                "image-comparators.md",
+                "image-supervision.md",
+                "js-reinforce.md",
+                "student-selection.md",
+            },
         )
 
     def test_gico_trainer_public_contract_is_canonical(self) -> None:

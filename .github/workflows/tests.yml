@@ -173,6 +173,8 @@ jobs:
                   "genode/gico/rewards.py",
                   "genode/gico/training.py",
                   "genode/gico/selection.py",
+                  "genode/gico/kid_objective.py",
+                  "genode/image_comparators/frozen_clock.py",
                   "genode/gico/profiles.py",
                   "genode/gico/conditioning.py",
               }
