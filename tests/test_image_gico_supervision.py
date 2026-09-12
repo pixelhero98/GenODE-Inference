@@ -207,7 +207,7 @@ def test_imagenet_scale_balances_classes_with_unequal_panel_counts():
 
 
 @pytest.mark.parametrize("kind", ["deterministic", "stochastic"])
-def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind):
+def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind, monkeypatch):
     import hashlib
     import json
 
@@ -218,6 +218,10 @@ def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind
     from tests.test_unified_gico_rewards import reference_evidence
 
     rows, contexts = reference_evidence(task="cifar10")
+    from tests.selection_fixtures import evaluator_for
+
+    # Exercise interfaces, not optimizer fitting on the local development host.
+    monkeypatch.setattr("genode.gico.training.accumulated_step", lambda *args, **kwargs: 0.0)
     destination = tmp_path / kind
     metadata = fit(
         rows,
@@ -232,6 +236,7 @@ def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind
         teacher_score_weight=0.05,
         stochastic_likelihood_samples=1,
         stochastic_score_samples=1,
+        selection_evaluator=evaluator_for(rows, contexts),
     )
     assert metadata["image_objective"]["protocol"] == "paired-lpips-v1"
     policy = load_policy(destination, student_kind=kind)

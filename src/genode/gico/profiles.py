@@ -10,6 +10,7 @@ from genode.gico.clocks import REFERENCE_KEYS
 from genode.gico.rewards import TASK_METRICS
 
 SCORE_WEIGHTS = (0.01, 0.05, 0.1)
+SCORE_SCHEDULES = ("linear_60_40", "ramp_plateau_60_20_20", "constant_60_40")
 TEMPERATURE_UNITS = "paired_utility_before_scalar_reward_normalization"
 AUXILIARY_NORMALIZATION = "frozen_context_solver_nfe_reference_mean_std"
 
@@ -31,6 +32,8 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     dropout: float = 0.05
     teacher_score_weight: float = 0.01
+    score_schedule: str = "linear_60_40"
+    selection_clock_replicates: int = 4
     temperatures: tuple[float, ...] = (0.05,)
     preferred_temperature: float = 0.05
     density_family_holdout: tuple[str, ...] = ("late_p_3", "late_p_3_reversed")
@@ -54,6 +57,7 @@ class TrainingConfig:
             "student_checkpoint_every",
             "stochastic_likelihood_samples",
             "stochastic_score_samples",
+            "selection_clock_replicates",
         )
         if any(type(getattr(self, key)) is not int or getattr(self, key) < 1 for key in integers):
             raise ValueError("Step, batch, sampling and checkpoint counts must be positive integers.")
@@ -61,6 +65,8 @@ class TrainingConfig:
             raise ValueError("Seed must be a nonnegative integer.")
         if self.teacher_score_weight not in SCORE_WEIGHTS:
             raise ValueError(f"teacher_score_weight must be one of {SCORE_WEIGHTS}.")
+        if self.score_schedule not in SCORE_SCHEDULES:
+            raise ValueError(f"score_schedule must be one of {SCORE_SCHEDULES}.")
         if self.target_smoothing != 0.1:
             raise ValueError("Stochastic target smoothing is fixed at 0.1.")
         if not np.isfinite(

@@ -52,9 +52,9 @@ All roles use a two-layer, width-128, four-head, pre-normalized Transformer with
 
 Both students use a uniform prior over unique realized reference densities. Reference softmax temperature is expressed in paired utility units **before** scalar reward normalization: multiply predicted scalar scores by the frozen reward scale before dividing by temperature. Reference logits are never clipped. Stochastic target smoothing is an additional modeling choice.
 
-Teacher-score weights are **0.01, 0.05, 0.1**. Auxiliary scores use each context/solver/NFE group's frozen predicted-reference mean and population standard deviation (standard deviations below 1e-6 use 1), then clip to [-5, 5]. This normalization does not change terminal rewards or reference weights. Teacher parameters remain frozen while gradients pass through density inputs. The coefficient ramps linearly from zero after 60% of the configured student horizon; only checkpoints with a positive realized coefficient are eligible.
+Teacher-score weights are **0.01, 0.05, 0.1**. Auxiliary scores use each context/solver/NFE group's frozen predicted-reference mean and population standard deviation (standard deviations below 1e-6 use 1), then clip to [-5, 5]. This normalization does not change terminal rewards or reference weights. Teacher parameters remain frozen while gradients pass through density inputs. The configurable coefficient schedule begins chasing after 60% of the student horizon; only checkpoints with a positive realized coefficient are eligible. The default remains the historical linear ramp; alternatives include a ramp with a full-weight plateau and an immediate full-weight switch.
 
-Teacher updates average up to 64 distinct comparison groups; student updates average up to 512 distinct context/settings targets. Smaller microbatches accumulate the same equally weighted objective. Ranking pairs never cross group boundaries. Teacher checkpoint/temperature selection minimizes measured held-out reference-mixture utility regret. Context and density-family regret receive equal weight when the profile uses both; text-to-image uses context selection only. Ties prefer the configured preferred temperature, then the earlier checkpoint. Student selection minimizes held-out distillation loss among post-ramp checkpoints, with earlier-step ties.
+Teacher updates average up to 64 distinct comparison groups; student updates average up to 512 distinct context/settings targets. Smaller microbatches accumulate the same equally weighted objective. Ranking pairs never cross group boundaries. Teacher checkpoint/temperature selection minimizes measured held-out reference-mixture utility regret. Context and density-family regret receive equal weight when the profile uses both; text-to-image uses context selection only. Ties prefer the configured preferred temperature, then the earlier checkpoint. Student selection maximizes measured held-out terminal utility among eligible checkpoints, with earlier-step ties. Distillation remains diagnostic. See [selection and score schedules](docs/student-selection.md).
 
 | Profile | Teacher/student steps | Dropout | Score coefficient | Initial reference temperature |
 |---|---:|---:|---:|---:|
@@ -95,7 +95,7 @@ The common interface accepts JSON configuration:
 }
 ```
 
-Paths are relative to the configuration file. Each measurement row contains `task`, `backbone`, `solver`, integer `nfe`, `context_id`, explicit `split`, integer `seed`, `ensemble_size`, `reference_id`, `measurement_protocol`, `schedule_key`, `metrics`, 64 `density_mass` entries, and the executed `time_grid`. Metric keys are `crps/mase`, `lpips`, or `preference/alignment`; molecular keys are `kabsch_rmsd_3d`, `ensemble_velocity_norm_w1`, `ensemble_acceleration_norm_w1`, `rollout_velocity_norm_w1`, and `rollout_acceleration_norm_w1`. Training input contains disjoint `train` and `validation` contexts; calibration contains only `train` or `calibration`. Locked-test rows are forbidden during fitting. Store native contexts with `save_context_embedding_table`.
+Before fitting, add the task-specific [held-out utility evaluator](docs/student-selection.md#evaluator-contract) to this configuration. Top-level paths are relative to the configuration file. Each measurement row contains `task`, `backbone`, `solver`, integer `nfe`, `context_id`, explicit `split`, integer `seed`, `ensemble_size`, `reference_id`, `measurement_protocol`, `schedule_key`, `metrics`, 64 `density_mass` entries, and the executed `time_grid`. Metric keys are `crps/mase`, `lpips`, or `preference/alignment`; molecular keys are `kabsch_rmsd_3d`, `ensemble_velocity_norm_w1`, `ensemble_acceleration_norm_w1`, `rollout_velocity_norm_w1`, and `rollout_acceleration_norm_w1`. Training input contains disjoint `train` and `validation` contexts; calibration contains only `train` or `calibration`. Locked-test rows are forbidden during fitting. Store native contexts with `save_context_embedding_table`.
 
 Research molecular rows also carry the frozen `molecule_feature_map` dictionary from `MoleculeFeatureMap.to_dict()`. It is recorded in the policy artifact and checked against runtime reference geometry.
 
@@ -137,7 +137,7 @@ CIFAR/ImageNet preparation validates paired feature-block evidence and native ba
 
 ```bash
 genode-image-gico prepare --manifest raw.json --output evidence.json
-genode-image-gico train --evidence evidence.json --output policy --student-kind both --teacher-score-weight 0.01
+genode-image-gico train --evidence evidence.json --output policy --student-kind both --teacher-score-weight 0.01 --selection-evaluator evaluator.json
 genode-image-gico validate --help
 genode-image-gico materialize --help
 ```
@@ -155,7 +155,7 @@ BO, PG, and LD3 remain separate comparison methods. Completed experiments remain
 
 ## Artifacts and validation
 
-Protocol `genode-gico-v5` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, resolved fitting profiles, explicit metric weights, dropout, temperature units, normalization/selection protocols, selected steps and realized coefficients, and fitting history. Incompatible old artifacts are rejected; there is no legacy architecture loader.
+Protocol `genode-gico-v6` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, resolved fitting profiles, explicit metric weights, dropout, temperature units, normalization/selection protocols, selected steps and realized coefficients, and fitting history. Incompatible old artifacts are rejected; there is no legacy architecture loader.
 
 `genode-report-gico-locked-test` applies an artifact's frozen calibration to paired test measurements without selection. `genode-evaluate-schedule-summary` performs the analogous validation report. Both require new output files and matching frozen measurement protocols, native backbone bindings, and molecular feature maps. Supply `policy_sha256` and `student_kind` for learned-policy measurements.
 

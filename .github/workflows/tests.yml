@@ -172,6 +172,7 @@ jobs:
                   "genode/gico/networks.py",
                   "genode/gico/rewards.py",
                   "genode/gico/training.py",
+                  "genode/gico/selection.py",
                   "genode/gico/profiles.py",
                   "genode/gico/conditioning.py",
               }
@@ -207,6 +208,7 @@ jobs:
                   f"{root}/THIRD_PARTY_NOTICES.md",
                   f"{root}/tests/__init__.py",
                   f"{root}/tests/image_fixtures.py",
+                  f"{root}/tests/selection_fixtures.py",
                   f"{root}/tests/test_image_gico_cli.py",
               }
               if not required_sdist <= sdist_names:
@@ -258,5 +260,6 @@ jobs:
           cd "$SDIST_ROOT"
           "$SDIST_PYTHON" -m pytest -q \
             tests/test_image_gico_cli.py \
-            tests/test_image_gico_supervision.py
+            tests/test_image_gico_supervision.py \
+            tests/test_student_utility_selection.py
           "$RUNNER_TEMP/genode-sdist-venv/bin/genode-image-gico" --help

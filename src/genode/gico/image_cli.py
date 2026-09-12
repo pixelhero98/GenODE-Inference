@@ -44,6 +44,11 @@ def build_argparser() -> argparse.ArgumentParser:
     train.add_argument("--teacher-steps", type=int)
     train.add_argument("--student-steps", type=int)
     train.add_argument("--fitting-profile", help="JSON object of common task-profile overrides.")
+    train.add_argument(
+        "--selection-evaluator",
+        required=True,
+        help="JSON object with trusted module:factory and config for held-out terminal measurements.",
+    )
     train.add_argument("--seed", type=int)
     train.add_argument("--device", default="cuda")
     train.add_argument("--purpose", choices=("research", "functional"), default="research")
@@ -71,6 +76,7 @@ def main(argv=None) -> int:
         _write(args.output, {"rows": rows, "contexts": contexts, "metadata": metadata})
         result = {"row_count": len(rows), "context_count": len(contexts), "task": metadata["task"]}
     elif args.command == "train":
+        from genode.gico.train_gico import load_selection_evaluator
         from genode.gico.training import fit
 
         evidence = _read(args.evidence)
@@ -94,6 +100,7 @@ def main(argv=None) -> int:
             device=args.device,
             purpose=args.purpose,
             calibration_rows=calibration_rows,
+            selection_evaluator=load_selection_evaluator(_read(args.selection_evaluator)),
         )
     else:
         from genode.gico.policy import load_policy

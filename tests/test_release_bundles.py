@@ -286,16 +286,20 @@ def _write_common_artifact(directory):
         temperature_units=TEMPERATURE_UNITS,
         auxiliary_normalization=AUXILIARY_NORMALIZATION,
         teacher_selection_criterion="heldout_reference_utility_regret",
-        student_selection_criterion="post_ramp_validation_distillation",
+        student_selection_criterion="heldout_paired_terminal_utility_v1",
         selected_temperature=1.0,
         history={
             "student_selection": {k: {"step": 2000, "coefficient": 0.01} for k in ("deterministic", "stochastic")}
         },
     )
+    from tests.selection_fixtures import fixture_history
+
+    students = {"deterministic": DeterministicStudent(config), "stochastic": StochasticStudent(config)}
+    metadata["history"] = fixture_history(students, evidence, rows, contexts, step=2000)
     save_artifact(
         directory,
         DensityTeacher(config),
-        {"deterministic": DeterministicStudent(config), "stochastic": StochasticStudent(config)},
+        students,
         evidence.conditioning,
         metadata,
     )

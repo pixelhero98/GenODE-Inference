@@ -20,7 +20,7 @@ from genode.gico.profiles import AUXILIARY_NORMALIZATION, TEMPERATURE_UNITS, res
 from genode.gico.rewards import TASK_METRICS, RewardCalibration, metric_weights
 from genode.gico.schedule_hash import json_hash
 
-GICO_PROTOCOL = "genode-gico-v5"
+GICO_PROTOCOL = "genode-gico-v6"
 RNG_PROTOCOL = "sha256-request-seeded-torch-normal-v1"
 
 
@@ -129,7 +129,7 @@ def save_artifact(path, teacher, students: dict, conditioning: Conditioning, met
         os.rename(stage, destination)
 
 
-def _read_artifact(path) -> tuple[dict, str]:
+def _read_artifact(path, *, teacher_only=False) -> tuple[dict, str]:
     path = Path(path)
     directory = path.parent if path.name == "policy.pt" else path
     manifest_path, weight_path = directory / "manifest.json", directory / "policy.pt"
@@ -138,7 +138,8 @@ def _read_artifact(path) -> tuple[dict, str]:
             "Unified artifact requires regular manifest.json and policy.pt files; old formats are unsupported."
         )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if set(manifest) != {"protocol", "policy_sha256"} or manifest["protocol"] != GICO_PROTOCOL:
+    protocols = {GICO_PROTOCOL, "genode-gico-v5"} if teacher_only else {GICO_PROTOCOL}
+    if set(manifest) != {"protocol", "policy_sha256"} or manifest["protocol"] not in protocols:
         raise ValueError("Unsupported artifact version; retrain with the unified GICO protocol.")
     data = weight_path.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
@@ -157,14 +158,29 @@ def _read_artifact(path) -> tuple[dict, str]:
             "teacher",
             "students",
         }
-        or payload["protocol"] != GICO_PROTOCOL
+        or payload["protocol"] != manifest["protocol"]
     ):
         raise ValueError("Unsupported policy payload; old architecture loaders have been removed.")
     return payload, digest
 
 
+def sample_density(model, conditioning, kind, context, solver, nfe, seed=0, request_id=""):
+    features = torch.tensor(conditioning.transform(context, solver, nfe)[None])
+    with torch.inference_mode():
+        mass = (
+            model.sample(features, generator=clock_generator(seed, request_id))
+            if kind == "stochastic"
+            else model(features)
+        )
+    values = mass[0].numpy().astype(np.float64, copy=True)
+    return values / values.sum()
+
+
 class GICOPolicy:
-    def __init__(self, payload: dict, digest: str, student_kind: str):
+    def __init__(self, payload: dict, digest: str, student_kind: str, *, teacher_only=False):
+        historical_teacher = teacher_only and payload["protocol"] == "genode-gico-v5"
+        if payload["protocol"] != GICO_PROTOCOL and not historical_teacher:
+            raise ValueError("Old student selection artifacts require their originating runtime.")
         self.metadata = payload["metadata"]
         if self.metadata["task"] in ("cifar10", "imagenet64"):
             from genode.gico.image_objective import validate_image_objective, validate_image_split_identities
@@ -209,6 +225,12 @@ class GICOPolicy:
 
         from genode.gico.profiles import TrainingConfig
 
+        if historical_teacher:
+            # The teacher architecture/objective is unchanged. This path only
+            # validates teacher reuse; old students are never exposed for inference.
+            if {"score_schedule", "selection_clock_replicates"} & profile.keys():
+                raise ValueError("Historical teacher profile contains incompatible selection settings.")
+            profile.update(score_schedule="linear_60_40", selection_clock_replicates=4)
         if set(profile) != {field.name for field in fields(TrainingConfig)}:
             raise ValueError("Artifact fitting profile is incomplete.")
         training = resolve_profile(self.metadata["task"], **profile)
@@ -223,7 +245,8 @@ class GICOPolicy:
             or self.metadata["temperature_units"] != TEMPERATURE_UNITS
             or self.metadata["auxiliary_normalization"] != AUXILIARY_NORMALIZATION
             or self.metadata["teacher_selection_criterion"] != "heldout_reference_utility_regret"
-            or self.metadata["student_selection_criterion"] != "post_ramp_validation_distillation"
+            or self.metadata["student_selection_criterion"]
+            != ("post_ramp_validation_distillation" if historical_teacher else "heldout_paired_terminal_utility_v1")
             or self.metadata["selected_temperature"] not in training.temperatures
         ):
             raise ValueError("Artifact fitting, scalarization or normalization protocols disagree.")
@@ -236,10 +259,52 @@ class GICOPolicy:
             or not 0.6 * training.student_steps < step <= training.student_steps
             or not np.isclose(
                 selection.get("coefficient", -1),
-                score_coefficient(step - 1, training.student_steps, training.teacher_score_weight),
+                score_coefficient(
+                    step - 1, training.student_steps, training.teacher_score_weight, training.score_schedule
+                ),
             )
         ):
             raise ValueError("Artifact student checkpoint is not eligible after the score ramp.")
+        if not historical_teacher:
+            from genode.gico.selection import SELECTION_PROTOCOL
+
+            records = self.metadata["history"].get("students", {}).get(student_kind, [])
+            if (
+                not records
+                or any(
+                    type(row.get("step")) is not int
+                    or not 1 <= row["step"] <= training.student_steps
+                    or not np.isclose(
+                        row.get("coefficient", -1),
+                        score_coefficient(
+                            row["step"] - 1,
+                            training.student_steps,
+                            training.teacher_score_weight,
+                            training.score_schedule,
+                        ),
+                        rtol=0,
+                        atol=1e-12,
+                    )
+                    for row in records
+                )
+                or [row["step"] for row in records] != sorted({row["step"] for row in records})
+            ):
+                raise ValueError("Artifact checkpoint history does not follow its configured score schedule.")
+            eligible = [row for row in records if row.get("coefficient", 0) > 0]
+            if (
+                not eligible
+                or any(
+                    row.get("selection_protocol") != SELECTION_PROTOCOL
+                    or not np.isfinite(row.get("utility", float("nan")))
+                    or not row.get("measurements_sha256")
+                    or row.get("clock_replicates")
+                    != (training.selection_clock_replicates if student_kind == "stochastic" else 1)
+                    or row.get("selection_contexts") != sorted(self.metadata["split_contexts"]["validation"])
+                    for row in eligible
+                )
+                or selection != min(eligible, key=lambda row: (-row["utility"], row["step"]))
+            ):
+                raise ValueError("Artifact student was not selected by held-out measured utility.")
         if (
             config.condition_dim != self.conditioning.width
             or tuple(self.metadata["solvers"]) != self.conditioning.solvers
@@ -285,16 +350,16 @@ class GICOPolicy:
         if student_kind == "stochastic" and bool((self.model.ratio_scale <= 0).any()):
             raise ValueError("Artifact log-ratio scales must be positive.")
         self.model.eval().requires_grad_(False)
+        if not historical_teacher:
+            from genode.gico.selection import candidate_fingerprint
+
+            if selection.get("selection_checkpoint_id") != candidate_fingerprint(
+                self.model, self.conditioning, student_kind, step
+            ):
+                raise ValueError("Selected utility evidence does not match the stored student state/conditioning.")
 
     def density(self, context, solver: str, nfe: int, *, seed: int = 0, request_id: str = "") -> np.ndarray:
-        features = torch.tensor(self.conditioning.transform(context, solver, nfe)[None])
-        with torch.inference_mode():
-            if self.student_kind == "stochastic":
-                mass = self.model.sample(features, generator=clock_generator(seed, request_id))
-            else:
-                mass = self.model(features)
-        values = mass[0].numpy().astype(np.float64, copy=True)
-        return values / values.sum()
+        return sample_density(self.model, self.conditioning, self.student_kind, context, solver, nfe, seed, request_id)
 
     def materialize(self, context, solver: str, nfe: int, *, seed: int = 0, request_id: str = "") -> tuple[float, ...]:
         return materialize(self.density(context, solver, nfe, seed=seed, request_id=request_id), solver, nfe)
@@ -309,9 +374,9 @@ def load_policy(path, *, student_kind: str = "deterministic", expected_backbone:
 
 def load_teacher(path) -> tuple[DensityTeacher, Conditioning, dict]:
     """Explicit research control; ordinary policy inference never calls this."""
-    payload, digest = _read_artifact(path)
+    payload, digest = _read_artifact(path, teacher_only=True)
     # Apply the same architecture, profile, split and normalization contract as inference.
-    validated = GICOPolicy(payload, digest, payload["metadata"]["student_kinds"][0])
+    validated = GICOPolicy(payload, digest, payload["metadata"]["student_kinds"][0], teacher_only=True)
     with torch.random.fork_rng(devices=[]):
         teacher = DensityTeacher(ModelConfig(**payload["architecture"]))
     teacher.load_state_dict(payload["teacher"], strict=True)

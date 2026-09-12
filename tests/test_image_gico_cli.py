@@ -11,6 +11,8 @@ def test_prepare_and_train_delegate_to_common_fit(tmp_path):
     manifest = tmp_path / "measurements.json"
     manifest.write_text(json.dumps(image_manifest()), encoding="utf-8")
     evidence = tmp_path / "evidence.json"
+    evaluator = tmp_path / "evaluator.json"
+    evaluator.write_text(json.dumps({"factory": "tests.selection_fixtures:cli_factory", "config": {}}))
     assert main(["prepare", "--manifest", str(manifest), "--output", str(evidence)]) == 0
     with patch("genode.gico.training.fit", return_value={"task": "cifar10"}) as fit:
         assert (
@@ -23,6 +25,8 @@ def test_prepare_and_train_delegate_to_common_fit(tmp_path):
                     str(tmp_path / "artifact"),
                     "--student-kind",
                     "both",
+                    "--selection-evaluator",
+                    str(evaluator),
                     "--teacher-score-weight",
                     "0.05",
                 ]
@@ -36,7 +40,7 @@ def test_prepare_and_train_delegate_to_common_fit(tmp_path):
     settings = {
         k: v
         for k, v in fit.call_args.kwargs.items()
-        if k not in {"student_kind", "device", "purpose", "calibration_rows"}
+        if k not in {"student_kind", "device", "purpose", "calibration_rows", "selection_evaluator"}
     }
     assert resolve_profile("cifar10", **settings).student_steps == 2000
     assert len(fit.call_args.args[0]) == 4
@@ -44,5 +48,7 @@ def test_prepare_and_train_delegate_to_common_fit(tmp_path):
 
 
 def test_shared_image_training_flags():
-    args = build_argparser().parse_args(["train", "--evidence", "input.json", "--output", "out"])
+    args = build_argparser().parse_args(
+        ["train", "--evidence", "input.json", "--output", "out", "--selection-evaluator", "evaluator.json"]
+    )
     assert args.student_kind == "both" and args.teacher_score_weight is None

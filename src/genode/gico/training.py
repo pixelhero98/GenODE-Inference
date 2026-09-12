@@ -76,10 +76,20 @@ def reuse_teacher(path, evidence: Evidence, config: TrainingConfig):
     return teacher, metadata
 
 
-def score_coefficient(step: int, steps: int, weight: float) -> float:
+def score_coefficient(step: int, steps: int, weight: float, schedule: str = "linear_60_40") -> float:
+    from genode.gico.profiles import SCORE_SCHEDULES
+
     if weight not in SCORE_WEIGHTS:
         raise ValueError("Unsupported teacher-score weight.")
-    return weight * max(0.0, min(1.0, ((step + 1) / steps - 0.6) / 0.4))
+    if schedule not in SCORE_SCHEDULES:
+        raise ValueError("Unsupported teacher-score schedule.")
+    progress = (step + 1) / steps
+    if progress <= 0.6:
+        return 0.0
+    if schedule == "constant_60_40":
+        return weight
+    ramp = 0.2 if schedule == "ramp_plateau_60_20_20" else 0.4
+    return weight * min(1.0, (progress - 0.6) / ramp)
 
 
 def scalarize(vector: Tensor, metric_weights=None) -> Tensor:
@@ -288,6 +298,7 @@ def fit_models(
     device: str = "cuda",
     checkpoint_callback=None,
     teacher_artifact=None,
+    selection_evaluator=None,
 ):
     devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
     with torch.random.fork_rng(devices=devices):
@@ -299,10 +310,19 @@ def fit_models(
             device=device,
             checkpoint_callback=checkpoint_callback,
             teacher_artifact=teacher_artifact,
+            selection_evaluator=selection_evaluator,
         )
 
 
-def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=None, teacher_artifact=None):
+def _fit_models(
+    evidence, config, *, student_kind, device, checkpoint_callback=None, teacher_artifact=None, selection_evaluator=None
+):
+    from genode.gico.selection import evaluate_candidate
+
+    if not callable(selection_evaluator):
+        raise ValueError(
+            "Student fitting requires a held-out terminal-utility selection_evaluator; distillation is diagnostic only."
+        )
     evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.teacher_context_mode))
     if student_kind not in (*STUDENT_KINDS, "both"):
         raise ValueError("student_kind must be deterministic, stochastic, or both.")
@@ -398,11 +418,13 @@ def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=N
         score_rng = torch.Generator(device=device).manual_seed(config.seed + 271)
         val_rng = torch.Generator(device=device).manual_seed(config.seed + 379)
         val_noise = torch.randn(config.stochastic_likelihood_samples, 63, generator=val_rng, device=device)
-        history, best, best_state, chosen = [], float("inf"), None, None
+        history, best, best_state, chosen = [], -float("inf"), None, None
 
         for step in range(config.student_steps):
             model.train()
-            coefficient = score_coefficient(step, config.student_steps, config.teacher_score_weight)
+            coefficient = score_coefficient(
+                step, config.student_steps, config.teacher_score_weight, config.score_schedule
+            )
             indices = sample_groups(group_rng, len(targets), config.student_batch_contexts)
             loss = accumulated_step(
                 model,
@@ -445,11 +467,24 @@ def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=N
                     "validation_distillation": value,
                     "contexts": len(indices),
                 }
+                if coefficient > 0:
+                    row.update(
+                        evaluate_candidate(
+                            model,
+                            student_conditioning,
+                            kind,
+                            step + 1,
+                            coefficient,
+                            selection_evaluator,
+                            evidence,
+                            config.selection_clock_replicates,
+                        )
+                    )
                 history.append(row)
                 if checkpoint_callback is not None:
                     checkpoint_callback(kind, step + 1, model, dict(row))
-                if coefficient > 0 and value < best:
-                    best, best_state, chosen = value, copy.deepcopy(model.state_dict()), dict(row)
+                if coefficient > 0 and row["utility"] > best:
+                    best, best_state, chosen = row["utility"], copy.deepcopy(model.state_dict()), dict(row)
         if best_state is None:
             raise ValueError("Student validation did not produce a finite checkpoint after the score ramp.")
         model.load_state_dict(best_state)
@@ -484,6 +519,7 @@ def fit(
     calibration_rows: list[dict] | None = None,
     checkpoint_callback=None,
     teacher_artifact=None,
+    selection_evaluator=None,
     **fitting_settings,
 ) -> dict:
     if Path(output).exists():
@@ -505,6 +541,7 @@ def fit(
         device=device,
         checkpoint_callback=checkpoint_callback,
         teacher_artifact=teacher_artifact,
+        selection_evaluator=selection_evaluator,
     )
     fitting_seconds = time.perf_counter() - started
     metadata = {
@@ -520,7 +557,7 @@ def fit(
         "temperature_units": TEMPERATURE_UNITS,
         "auxiliary_normalization": AUXILIARY_NORMALIZATION,
         "teacher_selection_criterion": "heldout_reference_utility_regret",
-        "student_selection_criterion": "post_ramp_validation_distillation",
+        "student_selection_criterion": "heldout_paired_terminal_utility_v1",
         "selected_temperature": history["teacher_selection"]["temperature"],
         "split_contexts": {
             s: sorted({r["context_id"] for r in evidence.cells if r["split"] == s}) for s in ("train", "validation")

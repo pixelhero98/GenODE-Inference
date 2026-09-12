@@ -290,7 +290,7 @@ def image_protocol_metadata(
         },
         "selection": {
             "teacher": "heldout_reference_mixture_lpips_regret",
-            "student_checkpoint": "post_ramp_heldout_distillation",
+            "student_checkpoint": "heldout_paired_terminal_utility_v1",
             "student_coefficient": "heldout_mean_lpips_then_lower_coefficient",
             "duplicate_handling": "unique_realized_density",
             "locked_tuning": False,
@@ -299,7 +299,7 @@ def image_protocol_metadata(
             "primary_target": "teacher_weighted_unique_reference_densities",
             "deterministic_objective": "target_to_policy_kl_minus_teacher_score",
             "stochastic_objective": "smoothed_autoregressive_gaussian_nll_minus_reparameterized_teacher_score",
-            "artifact_protocol": "genode-gico-v5",
+            "artifact_protocol": "genode-gico-v6",
             "teacher_score_weights": [0.01, 0.05, 0.1],
             "teacher_evidence_phase": "reward_train",
             "teacher_score_weight": IMAGE_GICO_TEACHER_SCORE_WEIGHT,

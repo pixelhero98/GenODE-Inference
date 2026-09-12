@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 from dataclasses import asdict, fields, replace
 from pathlib import Path
@@ -30,6 +31,7 @@ def load_config(path) -> dict:
         "device",
         "purpose",
         "teacher_artifact",
+        "selection_evaluator",
     } | {field.name for field in fields(TrainingConfig)}
     if set(config) - allowed or not {"rows", "contexts", "output"} <= set(config):
         raise ValueError("Training config requires rows/contexts/output and only documented GICO options.")
@@ -40,8 +42,31 @@ def load_config(path) -> dict:
     return config
 
 
+def load_selection_evaluator(evaluator, *, dry_run=False):
+    if evaluator is not None and (
+        not isinstance(evaluator, dict)
+        or set(evaluator) != {"factory", "config"}
+        or not isinstance(evaluator["factory"], str)
+        or len(evaluator["factory"].split(":")) != 2
+        or not all(part.isidentifier() for part in evaluator["factory"].replace(":", ".").split("."))
+        or not isinstance(evaluator["config"], dict)
+    ):
+        raise ValueError("selection_evaluator requires a trusted module:factory and a config object.")
+    if dry_run:
+        return None
+    if evaluator is None:
+        raise ValueError("Training requires a held-out terminal-utility selection_evaluator factory.")
+    module, name = evaluator["factory"].split(":")
+    callback = getattr(importlib.import_module(module), name)(evaluator["config"])
+    if not callable(callback):
+        raise ValueError("Selection evaluator factory must return a callable.")
+    return callback
+
+
 def run_config(config: dict, *, dry_run: bool = False) -> dict:
     values = dict(config)
+    evaluator = values.pop("selection_evaluator", None)
+    callback = load_selection_evaluator(evaluator, dry_run=dry_run)
     if values.get("student_kind", "both") not in ("deterministic", "stochastic", "both"):
         raise ValueError("student_kind must be deterministic, stochastic, or both.")
     rows = read_rows(values.pop("rows"))
@@ -70,8 +95,9 @@ def run_config(config: dict, *, dry_run: bool = False) -> dict:
             "teacher_score_weight": training.teacher_score_weight,
             "fitting_profile": asdict(training),
             "dry_run": True,
+            "selection_evaluator": evaluator,
         }
-    return fit(rows, contexts, calibration_rows=calibration, **values)
+    return fit(rows, contexts, calibration_rows=calibration, selection_evaluator=callback, **values)
 
 
 def build_argparser() -> argparse.ArgumentParser:

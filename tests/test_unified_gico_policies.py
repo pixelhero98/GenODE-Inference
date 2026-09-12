@@ -28,6 +28,7 @@ from genode.gico.networks import (
 from genode.gico.policy import GICO_PROTOCOL, load_policy, save_artifact
 from genode.gico.profiles import AUXILIARY_NORMALIZATION, TEMPERATURE_UNITS, resolve_profile
 from genode.gico.training import SCORE_WEIGHTS, TrainingConfig, score_coefficient, teacher_loss, teacher_score
+from tests.selection_fixtures import evaluator_for, fixture_history
 from tests.test_unified_gico_rewards import reference_evidence
 
 
@@ -230,10 +231,10 @@ def untrained_artifact(tmp_path_factory):
         "temperature_units": TEMPERATURE_UNITS,
         "auxiliary_normalization": AUXILIARY_NORMALIZATION,
         "teacher_selection_criterion": "heldout_reference_utility_regret",
-        "student_selection_criterion": "post_ramp_validation_distillation",
+        "student_selection_criterion": "heldout_paired_terminal_utility_v1",
         "selected_temperature": 0.05,
         "history": {
-            "student_selection": {k: {"step": 500, "coefficient": 0.01} for k in students},
+            **fixture_history(students, evidence, rows, contexts),
             "teacher": [{"step": 100, "temperature": 0.05, "regret": 0.1}],
             "teacher_selection": {"step": 100, "temperature": 0.05, "regret": 0.1},
         },
@@ -289,6 +290,7 @@ def test_reuse_bypasses_teacher_fitting_and_records_source(untrained_artifact, m
         student_kind="stochastic",
         device="cpu",
         teacher_artifact=root,
+        selection_evaluator=evaluator_for(*reference_evidence()),
     )
     assert set(students) == {"stochastic"}
     assert history["teacher_selection"]["temperature"] == 0.05
@@ -412,6 +414,44 @@ def test_teacher_loader_rejects_invalid_profile_or_normalizer(untrained_artifact
         load_teacher(damaged)
 
 
+def test_v5_allows_teacher_only_reuse_without_relabelling_students(untrained_artifact, tmp_path):
+    from genode.gico.policy import load_teacher
+
+    root, teacher, _, _ = untrained_artifact
+    old = tmp_path / "v5"
+
+    def change(payload):
+        payload["protocol"] = "genode-gico-v5"
+        profile = payload["metadata"]["fitting_profile"]
+        profile.pop("score_schedule")
+        profile.pop("selection_clock_replicates")
+        payload["metadata"]["student_selection_criterion"] = "post_ramp_validation_distillation"
+
+    corrupt_payload(root, old, change)
+    manifest = json.loads((old / "manifest.json").read_text())
+    manifest["protocol"] = "genode-gico-v5"
+    (old / "manifest.json").write_text(json.dumps(manifest))
+    before = (old / "policy.pt").read_bytes()
+    restored, _, _ = load_teacher(old)
+    for key, value in teacher.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[key], value)
+    assert (old / "policy.pt").read_bytes() == before
+    with pytest.raises(ValueError, match="Unsupported artifact version"):
+        load_policy(old)
+
+
+def test_selected_measurements_bind_actual_student_parameters(untrained_artifact, tmp_path):
+    root, _, _, _ = untrained_artifact
+    damaged = tmp_path / "state-mismatch"
+
+    def change(payload):
+        next(iter(payload["students"]["deterministic"].values())).add_(0.01)
+
+    corrupt_payload(root, damaged, change)
+    with pytest.raises(ValueError, match="stored student"):
+        load_policy(damaged)
+
+
 @pytest.mark.parametrize("kind", ("deterministic", "stochastic"))
 def test_prompt_teacher_global_student_artifact_roundtrip(untrained_artifact, tmp_path, kind):
     from dataclasses import replace
@@ -421,7 +461,14 @@ def test_prompt_teacher_global_student_artifact_roundtrip(untrained_artifact, tm
     root, teacher, students, evidence = untrained_artifact
     metadata = torch.load(root / "policy.pt", weights_only=True)["metadata"]
     metadata["fitting_profile"].update(student_context_mode="global")
-    metadata["history"]["student_selection"] = {kind: {"step": 500, "coefficient": 0.01}}
+    metadata["history"].update(
+        fixture_history(
+            {kind: students[kind]},
+            evidence,
+            *reference_evidence(),
+            conditioning=replace(evidence.conditioning, context_mode="global"),
+        )
+    )
     path = tmp_path / "global"
     save_artifact(
         path, teacher, {kind: students[kind]}, replace(evidence.conditioning, context_mode="global"), metadata
