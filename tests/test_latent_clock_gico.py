@@ -95,7 +95,8 @@ def test_native_fit_delegates_to_common_config(tmp_path):
     assert run.call_args.kwargs["dry_run"] is True
 
 
-def test_collection_samples_one_clock_per_image_and_reuses_complete_solver_grid(tmp_path):
+@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
+def test_collection_samples_one_clock_per_image_and_reuses_complete_solver_grid(tmp_path, kind):
     from genode.latent_clock.collection import collect
 
     calls = []
@@ -141,7 +142,7 @@ def test_collection_samples_one_clock_per_image_and_reuses_complete_solver_grid(
         "method": "gico",
         "checkpoint": "policy",
         "checkpoint_sha256": "a" * 64,
-        "student_kind": "GICO-sto-policy",
+        "student_kind": kind,
         "clock_seed": 23,
         "requests": [request],
     }
@@ -158,4 +159,5 @@ def test_collection_samples_one_clock_per_image_and_reuses_complete_solver_grid(
     assert sampled[0][3:] == (23, "image-one") and calls[0][0] == 17011
     row = json.loads((tmp_path / "images" / "image-one.json").read_text())
     assert row["density_mass"] == list(calls[0][1].density_mass)
-    assert row["clock_student_kind"] == "GICO-sto-policy" and row["clock_seed"] == 23
+    assert row["clock_student_kind"] == kind and row["clock_seed"] == 23
+    assert row["clock_key"] == kind and calls[0][1].key == kind

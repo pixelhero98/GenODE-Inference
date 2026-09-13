@@ -55,7 +55,7 @@ def test_stochastic_report_averages_repeated_metrics_before_log_with_each_clock_
         construct_rewards(rows, calibration)
     report = summarize_measurements(rows, policy, contexts={"test-a": [0.0]})
     uniform = next(r for r in report["results"] if r["schedule"] == "uniform")
-    candidate = next(r for r in report["results"] if r["schedule"] == "policy")
+    candidate = next(r for r in report["results"] if r["schedule"] == "GICO-sto-policy")
     expected = (
         np.mean(
             [
@@ -69,6 +69,27 @@ def test_stochastic_report_averages_repeated_metrics_before_log_with_each_clock_
     assert candidate["reward_mean"] == pytest.approx(expected)
     assert candidate["paired_contexts"] == 1
     assert not report["selection_performed"]
+
+
+@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
+@pytest.mark.parametrize("label", ["policy", "student", "gico_GICO-sto-policy"])
+def test_report_renders_verified_student_names_and_preserves_reference_names(kind, label):
+    policy, _, rows = report_fixture()
+    policy.student_kind = kind
+    for row in rows:
+        if "policy_sha256" in row:
+            row.update(student_kind=kind, schedule_key=label)
+    report = summarize_measurements(rows, policy, contexts={"test-a": [0.0]})
+    assert report["student_kind"] == kind
+    assert {r["schedule"] for r in report["results"]} == {"uniform", kind}
+
+
+def test_report_preserves_explicit_baseline_names_with_policy_provenance():
+    policy, _, rows = report_fixture()
+    for row in rows:
+        row.update(measurement_role="baseline", policy_sha256=policy.artifact_sha256, student_kind=policy.student_kind)
+    report = summarize_measurements(rows, policy)
+    assert {r["schedule"] for r in report["results"]} == {"uniform", "policy"}
 
 
 def test_report_collapses_paired_clock_replicates_before_log():

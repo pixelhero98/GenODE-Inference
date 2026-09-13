@@ -275,7 +275,7 @@ def collect(*, runtime_config: str, plan_path: str, output: str) -> None:
                 request_id=request_id,
             )
             clock = Clock(
-                f"gico_{plan['student_kind']}",
+                plan["student_kind"],
                 request["nfe"],
                 materialize(mass, runtime.adapter.solver_key, request["nfe"]),
                 "unified_gico",

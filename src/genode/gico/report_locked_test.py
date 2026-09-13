@@ -146,7 +146,9 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test", con
         subset = [r for r in rows if r["solver"] == solver]
         if subset:
             for row in construct_rewards(subset, RewardCalibration.from_payload(calibration), varying_clocks=True):
-                groups[(solver, row["nfe"], row["schedule_key"])].append(row)
+                learned = row["schedule_key"] not in REFERENCE_KEYS and row.get("measurement_role") != "baseline"
+                schedule = policy.student_kind if learned else row["schedule_key"]
+                groups[(solver, row["nfe"], schedule)].append(row)
     output = []
     for (solver, nfe, schedule), cells in sorted(groups.items()):
         units = cells
@@ -186,6 +188,7 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test", con
         )
     return {
         "artifact_sha256": policy.artifact_sha256,
+        "student_kind": policy.student_kind,
         "measurements_sha256": measurements_sha256,
         "split": split,
         "results": output,
