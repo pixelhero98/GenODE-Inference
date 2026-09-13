@@ -202,6 +202,8 @@ def test_all_task_selection_uses_its_current_calibrated_objective(task):
         row["task"] = task
         row["metrics"] = {key: value ** (1 + i / 10) for i, key in enumerate(TASK_METRICS[task])}
         if task == "imagenet64":
+            # This fixture exercises the explicit GICO-TF objective.
+            row["metrics"] = {"lpips": value}
             row.update(image_fields(row))
     evidence = prepare_evidence(rows, contexts, purpose="functional")
     model = DeterministicStudent(ModelConfig(evidence.conditioning.width, len(TASK_METRICS[task]))).eval()

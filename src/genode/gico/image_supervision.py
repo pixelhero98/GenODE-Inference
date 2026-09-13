@@ -1,4 +1,4 @@
-"""Bind paired LPIPS measurements to zero or native class conditioning."""
+"""Bind GICO KID or explicit GICO-TF LPIPS evidence to native conditioning."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from genode.gico.kid_objective import IMAGE_KID_OBJECTIVE
 
 
 def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float]], dict]:
-    """Validate per-image target fidelity evidence and retain native class identities.
+    """Validate paired KID blocks or GICO-TF target pairs and native class identities.
 
     Rows carry panel_id independently of per-sample target/reference_id. A panel's
     seeds are averaged together, and never supplied as model conditioning.
@@ -32,7 +32,6 @@ def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float
         protocol = row.get("image_objective", {}).get("protocol")
         if protocol not in (IMAGE_OBJECTIVE, IMAGE_KID_OBJECTIVE):
             raise ValueError("Native image preparation requires paired LPIPS or paired image KID.")
-        metric = "lpips" if protocol == IMAGE_OBJECTIVE else "kid"
         if row.get("task", task) != task or row.get("backbone", backbone.model_key) != backbone.model_key:
             raise ValueError("Measured image task/backbone does not match its native context binding.")
         if row.get("solver") != "euler":

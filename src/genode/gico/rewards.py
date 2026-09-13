@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from genode.gico.image_objective import validate_image_rows
+from genode.gico.image_objective import IMAGE_OBJECTIVE, IMAGE_TASKS, validate_image_rows
 from genode.solver_protocol import normalize_solver_key
 
 MOLECULE_METRICS = (
@@ -25,8 +25,8 @@ TASK_METRICS = {
     "molecule_3d_set1": MOLECULE_METRICS,
     "molecule_3d_set2": MOLECULE_METRICS,
     "molecule_3d_set3": MOLECULE_METRICS,
-    "cifar10": ("lpips",),
-    "imagenet64": ("lpips",),
+    "cifar10": ("kid",),
+    "imagenet64": ("kid",),
     "sana": ("preference", "alignment"),
     "sd15": ("preference", "alignment"),
 }
@@ -37,8 +37,13 @@ FIT_SPLITS = frozenset(("train", "calibration"))
 def measurement_metrics(row: dict) -> tuple[str, ...]:
     from genode.gico.kid_objective import KID_PROTOCOLS
 
-    if row["task"] in ("cifar10", "imagenet64") and row.get("image_objective", {}).get("protocol") in KID_PROTOCOLS:
-        return ("kid",)
+    if row["task"] in IMAGE_TASKS:
+        protocol = row.get("image_objective", {}).get("protocol")
+        if protocol in KID_PROTOCOLS:
+            return ("kid",)
+        if protocol == IMAGE_OBJECTIVE:
+            return ("lpips",)
+        raise ValueError("Image rewards require an explicit GICO KID or GICO-TF paired LPIPS objective.")
     return TASK_METRICS[row["task"]]
 
 
@@ -193,7 +198,7 @@ class RewardCalibration:
     def __post_init__(self) -> None:
         if self.task not in TASK_METRICS or (
             tuple(self.metric_keys) != TASK_METRICS[self.task]
-            and not (self.task in ("cifar10", "imagenet64") and tuple(self.metric_keys) == ("kid",))
+            and not (self.task in IMAGE_TASKS and tuple(self.metric_keys) == ("lpips",))
         ):
             raise ValueError("Calibration metric profile does not match its task.")
         count = len(self.metric_keys)

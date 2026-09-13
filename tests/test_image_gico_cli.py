@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
+from genode.backbones.registry import IMAGE_BACKBONE_REGISTRY
 from genode.gico.image_cli import build_argparser, main
 from tests.test_image_gico_supervision import image_manifest
 
@@ -52,3 +55,36 @@ def test_shared_image_training_flags():
         ["train", "--evidence", "input.json", "--output", "out", "--selection-evaluator", "evaluator.json"]
     )
     assert args.student_kind == "both" and args.teacher_score_weight is None
+
+
+@pytest.mark.parametrize("model_key", list(IMAGE_BACKBONE_REGISTRY))
+def test_registered_native_backbones_prepare_and_train_with_kid(tmp_path, model_key):
+    from genode.gico.rewards import calibrate_rewards, construct_rewards
+    from tests.test_native_image_kid import native_manifest
+
+    manifest, evidence, evaluator = (tmp_path / name for name in ("manifest.json", "evidence.json", "evaluator.json"))
+    manifest.write_text(json.dumps(native_manifest(model_key)), encoding="utf-8")
+    evaluator.write_text(json.dumps({"factory": "tests.selection_fixtures:cli_factory", "config": {}}))
+    main(["prepare", "--manifest", str(manifest), "--output", str(evidence)])
+    prepared = json.loads(evidence.read_text(encoding="utf-8"))
+    assert prepared["metadata"]["protocol"] == "paired-image-kid-v1"
+    assert prepared["metadata"]["raw_metric"] == "kid"
+    assert all(set(r["metrics"]) == {"kid"} for r in prepared["rows"])
+    calibration = calibrate_rewards([r for r in prepared["rows"] if r["split"] == "train"])
+    assert calibration.metric_keys == ("kid",)
+    cells = construct_rewards(prepared["rows"], calibration)
+    assert any(c["metrics"]["kid"] < 0 and c["reward"] > 0 for c in cells)
+    with patch("genode.gico.training.fit", return_value={"task": prepared["metadata"]["task"]}) as fit:
+        main(
+            [
+                "train",
+                "--evidence",
+                str(evidence),
+                "--output",
+                str(tmp_path / "policy"),
+                "--selection-evaluator",
+                str(evaluator),
+            ]
+        )
+    assert fit.call_args.kwargs["student_kind"] == "both"
+    assert fit.call_args.args[0] == prepared["rows"]

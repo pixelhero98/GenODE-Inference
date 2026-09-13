@@ -88,7 +88,23 @@ class ReferenceClockTests(unittest.TestCase):
 
     def test_image_protocol_uses_dynamic_canonical_clock_count_and_provenance(self) -> None:
         metadata = image_protocol_metadata()
-        self.assertEqual(metadata["protocol_key"], "image_euler_lpips_v8")
+        self.assertEqual(metadata["protocol_key"], "image_euler_kid_v9")
+        self.assertEqual(metadata["method"], "GICO")
+        self.assertEqual(metadata["supervision"]["protocol"], "paired-image-kid-v1")
+        self.assertEqual(metadata["selection"]["teacher"], "heldout_reference_mixture_kid_regret")
+        self.assertNotIn("target", metadata["supervision"])
+        self.assertEqual(metadata["selection"]["student_coefficient"], "explicit_fitting_profile")
+        workloads = metadata["workload_per_dataset_checkpoint_pair"]
+        self.assertEqual(workloads["cifar10"]["evidence_images"], 30_000)
+        self.assertEqual(workloads["imagenet64"]["conditioning_groups"], 1000)
+        self.assertEqual(workloads["imagenet64"]["evidence_images"], 30_000_000)
+        self.assertEqual(workloads["imagenet64"]["backbone_image_evaluations"], 140_000_000)
+        fidelity = image_protocol_metadata(method="GICO-TF")
+        self.assertEqual(fidelity["supervision"]["protocol"], "paired-lpips-v1")
+        self.assertEqual(fidelity["selection"]["teacher"], "heldout_reference_mixture_lpips_regret")
+        self.assertNotEqual(fidelity["protocol_sha256"], metadata["protocol_sha256"])
+        with self.assertRaises(ValueError):
+            image_protocol_metadata(method="unlabelled-lpips")
         self.assertEqual(metadata["schedule_count"], 25)
         self.assertEqual(tuple(metadata["schedule_keys"]), EXPECTED_DEFAULT_KEYS)
         self.assertEqual(len(metadata["reference_clock_provenance"]), 25)

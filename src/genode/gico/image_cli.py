@@ -32,7 +32,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser(
-        "prepare", help="Validate raw paired LPIPS target measurements and bind native contexts."
+        "prepare", help="Validate GICO KID blocks or explicit GICO-TF LPIPS pairs and bind native contexts."
     )
     prepare.add_argument("--manifest", required=True)
     prepare.add_argument("--output", required=True)

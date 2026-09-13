@@ -23,8 +23,8 @@ from genode.schedule_transfer.reference_clocks import (
 from genode.schedules.fixed import FIXED_SCHEDULE_TARGET_NFES
 from genode.schedules.specification import ScheduleSpecification
 
-IMAGE_PROTOCOL_VERSION = 8
-IMAGE_PROTOCOL_KEY = "image_euler_lpips_v8"
+IMAGE_PROTOCOL_VERSION = 9
+IMAGE_PROTOCOL_KEY = "image_euler_kid_v9"
 IMAGE_GICO_TEACHER_SCORE_WEIGHT = 0.01
 IMAGE_GICO_TEACHER_SCORE_WARMUP_FRACTION = 0.60
 IMAGE_GICO_TEACHER_SCORE_CLIP = 5.0
@@ -41,8 +41,8 @@ IMAGE_TARGET_NFES: tuple[int, ...] = FIXED_SCHEDULE_TARGET_NFES
 IMAGE_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
 
 IMAGE_PANEL_BLOCK_SIZE = 1_000
-LPIPS_TRAIN_PAIRS = 200
-LPIPS_SELECTION_PAIRS = 200
+IMAGE_TRAIN_SAMPLES = 200
+IMAGE_SELECTION_SAMPLES = 200
 
 LOCKED_SAMPLE_COUNT = 50_000
 LOCKED_INCEPTION_SPLITS = 10
@@ -94,13 +94,13 @@ PANEL_PHASES: tuple[str, ...] = (
 )
 
 _PANEL_SHAPES: Mapping[str, tuple[int, int]] = {
-    PANEL_PHASE_REWARD_TRAIN: (1, LPIPS_TRAIN_PAIRS),
-    PANEL_PHASE_SELECTION_SCREENING: (1, LPIPS_SELECTION_PAIRS),
-    PANEL_PHASE_SURVIVOR_CONFIRMATION: (1, LPIPS_SELECTION_PAIRS),
+    PANEL_PHASE_REWARD_TRAIN: (1, IMAGE_TRAIN_SAMPLES),
+    PANEL_PHASE_SELECTION_SCREENING: (1, IMAGE_SELECTION_SAMPLES),
+    PANEL_PHASE_SURVIVOR_CONFIRMATION: (1, IMAGE_SELECTION_SAMPLES),
     PANEL_PHASE_LOCKED_MAIN: (LOCKED_SAMPLE_COUNT // IMAGE_PANEL_BLOCK_SIZE, IMAGE_PANEL_BLOCK_SIZE),
-    PANEL_PHASE_CONDITIONAL_REWARD_TRAIN: (1, LPIPS_TRAIN_PAIRS),
-    PANEL_PHASE_CONDITIONAL_SELECTION_SCREENING: (1, LPIPS_SELECTION_PAIRS),
-    PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION: (1, LPIPS_SELECTION_PAIRS),
+    PANEL_PHASE_CONDITIONAL_REWARD_TRAIN: (1, IMAGE_TRAIN_SAMPLES),
+    PANEL_PHASE_CONDITIONAL_SELECTION_SCREENING: (1, IMAGE_SELECTION_SAMPLES),
+    PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION: (1, IMAGE_SELECTION_SAMPLES),
 }
 
 
@@ -168,6 +168,7 @@ def normalize_image_nfe(value: object) -> int:
 
 
 def panel_shape(phase: str) -> tuple[int, int]:
+    """Return a conditioning-group panel shape; locked-main is dataset-wide."""
     key = str(phase).strip().lower()
     try:
         return _PANEL_SHAPES[key]
@@ -211,7 +212,7 @@ def euler_image_workload(
     if pairs <= 0:
         raise ValueError("pair_count must be a positive integer.")
     schedule_count = len(image_schedule_keys(extra_late_p_values))
-    images_per_density_cell = LPIPS_TRAIN_PAIRS + LPIPS_SELECTION_PAIRS
+    images_per_density_cell = IMAGE_TRAIN_SAMPLES + IMAGE_SELECTION_SAMPLES
     per_pair_images = schedule_count * len(IMAGE_TARGET_NFES) * images_per_density_cell
     per_pair_evaluations = schedule_count * images_per_density_cell * sum(IMAGE_TARGET_NFES)
     return EulerImageWorkload(
@@ -240,7 +241,7 @@ def survivor_confirmation_workload(
         if count < 0:
             raise ValueError("Survivor counts must be nonnegative integers.")
         normalized[nfe] += count
-    samples_per_survivor = LPIPS_SELECTION_PAIRS
+    samples_per_survivor = IMAGE_SELECTION_SAMPLES
     confirmation_images = samples_per_survivor * sum(normalized.values())
     confirmation_evaluations = samples_per_survivor * sum(nfe * count for nfe, count in normalized.items())
     return EulerImageWorkload(
@@ -254,14 +255,45 @@ def survivor_confirmation_workload(
 
 def image_protocol_metadata(
     *,
+    method: str = "GICO",
     extra_late_p_values: str | Sequence[Decimal | float | int | str] = (),
 ) -> dict[str, Any]:
+    """Describe native-image GICO (KID) or the explicit GICO-TF LPIPS comparison.
+
+    These benchmark identities are separate from frozen backbone identities and
+    artifact wire versions. Recorded older experiment metadata is never relabelled.
+    """
+    if method not in ("GICO", "GICO-TF"):
+        raise ValueError("Native image method must be GICO (KID) or GICO-TF (paired LPIPS).")
+    metric = "kid" if method == "GICO" else "lpips"
+    supervision = {
+        "protocol": "paired-image-kid-v1" if method == "GICO" else "paired-lpips-v1",
+        "metric": "kid_unbiased_cubic" if method == "GICO" else "lpips_vgg",
+        "reward_direction": "lower_is_better",
+        "reward_transform": f"paired_uniform_minus_candidate_{metric}_frozen_scalar_std",
+    }
+    if method == "GICO":
+        supervision.update(
+            reference="real_dataset_class_matched_disjoint_splits",
+            train_samples_per_conditioning_group=IMAGE_TRAIN_SAMPLES,
+            selection_samples_per_conditioning_group=IMAGE_SELECTION_SAMPLES,
+            complete_generated_reference_blocks=True,
+            class_weighting="equal",
+            negative_estimates="preserve",
+        )
+    else:
+        supervision.update(
+            target="same_backbone_high_accuracy_same_noise_and_class",
+            train_pairs_per_conditioning_group=IMAGE_TRAIN_SAMPLES,
+            selection_pairs_per_conditioning_group=IMAGE_SELECTION_SAMPLES,
+        )
     schedule_keys = image_schedule_keys(extra_late_p_values)
     workload = euler_image_workload(
         extra_late_p_values=extra_late_p_values,
     )
     metadata: dict[str, Any] = {
-        "protocol_key": IMAGE_PROTOCOL_KEY,
+        "protocol_key": IMAGE_PROTOCOL_KEY if method == "GICO" else "image_euler_lpips_v9",
+        "method": method,
         "protocol_version": IMAGE_PROTOCOL_VERSION,
         "solver_key": IMAGE_SOLVER_KEY,
         "target_nfes": list(IMAGE_TARGET_NFES),
@@ -270,15 +302,7 @@ def image_protocol_metadata(
         "schedule_count": len(schedule_keys),
         "schedule_specifications": [ScheduleSpecification(key).as_payload() for key in schedule_keys],
         "reference_clock_provenance": [reference_clock_provenance(key) for key in schedule_keys],
-        "supervision": {
-            "protocol": "paired-lpips-v1",
-            "metric": "lpips_vgg",
-            "target": "same_backbone_high_accuracy_same_noise_and_class",
-            "train_pairs_per_panel": LPIPS_TRAIN_PAIRS,
-            "selection_pairs_per_panel": LPIPS_SELECTION_PAIRS,
-            "reward_direction": "lower_is_better",
-            "reward_transform": "paired_uniform_minus_candidate_lpips_frozen_scalar_std",
-        },
+        "supervision": supervision,
         "locked_metrics": {
             "sample_count": LOCKED_SAMPLE_COUNT,
             "fid": "fid50k",
@@ -289,9 +313,9 @@ def image_protocol_metadata(
             "execution": locked_metric_execution_spec(),
         },
         "selection": {
-            "teacher": "heldout_reference_mixture_lpips_regret",
+            "teacher": f"heldout_reference_mixture_{metric}_regret",
             "student_checkpoint": "heldout_paired_terminal_utility_v1",
-            "student_coefficient": "heldout_mean_lpips_then_lower_coefficient",
+            "student_coefficient": "explicit_fitting_profile",
             "duplicate_handling": "unique_realized_density",
             "locked_tuning": False,
         },
@@ -301,6 +325,7 @@ def image_protocol_metadata(
             "stochastic_objective": "smoothed_autoregressive_gaussian_nll_minus_reparameterized_teacher_score",
             "artifact_protocol": "genode-gico-v6",
             "teacher_score_weights": [0.01, 0.05, 0.1],
+            "teacher_score_weights_role": "allowed_explicit_overrides",
             "teacher_evidence_phase": "reward_train",
             "teacher_score_weight": IMAGE_GICO_TEACHER_SCORE_WEIGHT,
             "teacher_score_schedule": "zero_then_linear_late_ramp",
@@ -309,7 +334,17 @@ def image_protocol_metadata(
             "unseen_nfe_distillation": False,
         },
         "datasets": {key: image_benchmark_spec(key).as_dict() for key in IMAGE_DATASET_KEYS},
-        "workload_per_dataset_checkpoint_pair": workload.as_dict(),
+        "conditioning_group": "native_class_or_unconditional",
+        "workload_scope": "generated_image_evaluations_excluding_reference_target_preparation_and_scoring",
+        "workload_per_conditioning_group": workload.as_dict(),
+        "workload_per_dataset_checkpoint_pair": {
+            key: {
+                "conditioning_groups": max(1, spec.class_count),
+                "evidence_images": max(1, spec.class_count) * workload.evidence_images,
+                "backbone_image_evaluations": max(1, spec.class_count) * workload.backbone_image_evaluations,
+            }
+            for key, spec in _BENCHMARK_SPECS.items()
+        },
     }
     metadata["protocol_sha256"] = semantic_sha256(
         metadata,

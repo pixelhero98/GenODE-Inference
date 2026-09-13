@@ -1,6 +1,6 @@
 # Built-in measured selection
 
-Use `genode.gico.evaluators:build_evaluator` in the existing factory/config interface. It supports every retained task, native image LPIPS/KID and frozen BézierFlow KID. Custom factories remain an extension point.
+Use `genode.gico.evaluators:build_evaluator` in the existing factory/config interface. It supports every retained task, native image GICO KID, explicit GICO-TF LPIPS and frozen BézierFlow KID. Custom factories remain an extension point.
 
 ```json
 {
@@ -36,8 +36,8 @@ Runtime configuration contains `task`, `device`, and a `backbones` map. Each ent
 
 Runtime keys are `task`, `device`, `objective` (the exact row `image_objective`), `backbone_manifest`, `checkpoint` and pinned upstream `source_root`.
 
-- LPIPS adds `lpips_checkpoint`, a complete VGG-LPIPS state dictionary, preventing implicit downloads. Pin its file SHA-256, installed package version and `lpips_implementation_identity()` from `genode.gico.image_evaluator`. Each case's `target` points to a decoded float32 NPY tensor matching `target.image_sha256` and the generated batch shape.
-- KID adds `feature_checkpoint`. Each case supplies `reference_features`, its file `reference_features_sha256`, and the exact `reference_block` from the row. The NPY feature matrix must preserve all declared indices, their order and class. Pin the detector and `feature_implementation_identity()` from the same module.
+- GICO-TF only: LPIPS adds `lpips_checkpoint`, a complete VGG-LPIPS state dictionary, preventing implicit downloads. Pin its file SHA-256, installed package version and `lpips_implementation_identity()` from `genode.gico.image_evaluator`. Each case's `target` points to a decoded float32 NPY tensor matching `target.image_sha256` and the generated batch shape.
+- Standard image GICO: KID adds `feature_checkpoint`. Each case supplies `reference_features`, its file `reference_features_sha256`, and the exact `reference_block` from the row. The NPY feature matrix must preserve all declared indices, their order and class. Pin the detector and `feature_implementation_identity()` from the same module.
 
 The evaluator regenerates the declared noise, validates its raw tensor digests, uses the native class embeddings, executes Euler with exact NFE, and retains decoded images. See [image supervision](image-supervision.md) for objective and split rules. Supplied reference features must have been extracted with that pinned detector and input protocol.
 

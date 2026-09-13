@@ -1,7 +1,6 @@
 # Distributional GICO on frozen BézierFlow
 
-The common GICO trainer accepts explicit `paired-cifar-kid-v1` CIFAR evidence
-in addition to paired LPIPS fidelity evidence. The native-image CLI accepts LPIPS and its distinct native KID protocol.
+GICO over frozen BézierFlow uses `paired-cifar-kid-v1` CIFAR evidence. Like standard GICO on RF++ and EDM-as-1RF, it optimizes KID. Its protocol separately binds the frozen two-grid transform; native image GICO uses `paired-image-kid-v1`. Only GICO-TF uses the paired LPIPS target-fidelity objective.
 Frozen BézierFlow KID evidence goes through the common `genode.gico.training.fit`
 interface with global teacher and student conditioning. The [built-in evaluator](evaluators.md) executes the pinned generator and paired KID measurements.
 
