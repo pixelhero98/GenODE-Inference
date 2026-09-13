@@ -25,7 +25,7 @@ def runtime_binding(runtime) -> dict:
     }
 
 
-def checkpoint_identity(path: str | None, method: str, *, student_kind: str = "deterministic") -> str | None:
+def checkpoint_identity(path: str | None, method: str, *, student_kind: str = "GICO-det-policy") -> str | None:
     if path is None:
         return None
     if method == "gico":
@@ -187,9 +187,6 @@ def prepare_gico(
         "calibration_rows": "calibration_rows.jsonl",
         "output": "policy",
         "student_kind": "both",
-        "teacher_score_weight": 0.05,
-        "teacher_steps": 500,
-        "student_steps": 500,
         "seed": 0,
         "device": "cuda",
         "purpose": "research",

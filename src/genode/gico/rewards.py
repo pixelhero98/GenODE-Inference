@@ -35,9 +35,9 @@ FIT_SPLITS = frozenset(("train", "calibration"))
 
 
 def measurement_metrics(row: dict) -> tuple[str, ...]:
-    from genode.gico.kid_objective import KID_OBJECTIVE
+    from genode.gico.kid_objective import KID_PROTOCOLS
 
-    if row["task"] == "cifar10" and row.get("image_objective", {}).get("protocol") == KID_OBJECTIVE:
+    if row["task"] in ("cifar10", "imagenet64") and row.get("image_objective", {}).get("protocol") in KID_PROTOCOLS:
         return ("kid",)
     return TASK_METRICS[row["task"]]
 
@@ -187,7 +187,7 @@ class RewardCalibration:
     def __post_init__(self) -> None:
         if self.task not in TASK_METRICS or (
             tuple(self.metric_keys) != TASK_METRICS[self.task]
-            and not (self.task == "cifar10" and tuple(self.metric_keys) == ("kid",))
+            and not (self.task in ("cifar10", "imagenet64") and tuple(self.metric_keys) == ("kid",))
         ):
             raise ValueError("Calibration metric profile does not match its task.")
         count = len(self.metric_keys)

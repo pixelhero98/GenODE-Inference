@@ -39,14 +39,14 @@ def _safe_series_id(metadata: Mapping[str, str], line_number: int) -> str:
 
 
 def _fill_missing_values(values: np.ndarray) -> np.ndarray:
+    if np.isinf(values).any() or not np.isfinite(values).any():
+        raise ValueError("Series must contain finite observations and no infinity.")
     if not np.isnan(values).any():
         return values.astype(np.float32, copy=False)
-    idx = np.arange(values.shape[0], dtype=np.float64)
-    mask = np.isfinite(values)
-    if not np.any(mask):
-        raise ValueError("Series contains only missing values.")
-    filled = np.interp(idx, idx[mask], values[mask]).astype(np.float32)
-    return filled
+    # Causal carry-forward: future observations never repair an earlier origin.
+    # Leading missing observations have no measured past; use a fixed zero.
+    indices = np.maximum.accumulate(np.where(np.isfinite(values), np.arange(len(values)), -1))
+    return np.where(indices >= 0, values[np.maximum(indices, 0)], 0).astype(np.float32)
 
 
 def _frequency_seconds(label: str) -> int:

@@ -20,8 +20,8 @@ class TrainingConfig:
     teacher_context_mode: str = "native"
     student_context_mode: str = "native"
     backbone: str | None = None
-    teacher_steps: int = 500
-    student_steps: int = 500
+    teacher_steps: int = 2000
+    student_steps: int = 2000
     teacher_batch_groups: int = 64
     student_batch_contexts: int = 512
     microbatch_contexts: int = 8
@@ -30,11 +30,11 @@ class TrainingConfig:
     teacher_checkpoint_every: int = 100
     student_checkpoint_every: int = 100
     weight_decay: float = 1e-4
-    dropout: float = 0.05
+    dropout: float = 0.01
     teacher_score_weight: float = 0.01
     score_schedule: str = "linear_60_40"
     selection_clock_replicates: int = 4
-    temperatures: tuple[float, ...] = (0.05,)
+    temperatures: tuple[float, ...] = (0.05, 0.1, 0.5)
     preferred_temperature: float = 0.05
     density_family_holdout: tuple[str, ...] = ("late_p_3", "late_p_3_reversed")
     stochastic_likelihood_samples: int = 32
@@ -105,9 +105,7 @@ def resolve_profile(task: str, **overrides) -> TrainingConfig:
     if task in ("sana", "sd15"):
         values.update(teacher_score_weight=0.05, density_family_holdout=())
     elif task in ("cifar10", "imagenet64"):
-        values.update(
-            teacher_steps=2000, student_steps=2000, dropout=0.0, temperatures=(1.0,), preferred_temperature=1.0
-        )
+        values.update(dropout=0.0)
     unknown = set(overrides) - {field.name for field in fields(TrainingConfig)}
     if unknown:
         raise ValueError(f"Unknown fitting settings: {sorted(unknown)}")

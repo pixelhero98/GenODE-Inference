@@ -24,7 +24,7 @@ from genode.gico.profiles import (
     resolve_profile,
 )
 
-STUDENT_KINDS = ("deterministic", "stochastic")
+STUDENT_KINDS = ("GICO-det-policy", "GICO-sto-policy")
 
 
 def reuse_teacher(path, evidence: Evidence, config: TrainingConfig):
@@ -198,7 +198,7 @@ def student_losses(groups, *, model, kind, teacher, config, weights, coefficient
     teacher_conditions = torch.cat([g[5] for g in groups])
     conditions = torch.cat([g[0] for g in groups])
     device = conditions.device
-    if kind == "deterministic":
+    if kind == "GICO-det-policy":
         predicted = model(conditions)
         target = torch.stack([(g[2][:, None] * g[1]).sum(0) for g in groups])
         distillation = density_kl(target, predicted)
@@ -325,7 +325,7 @@ def _fit_models(
         )
     evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.teacher_context_mode))
     if student_kind not in (*STUDENT_KINDS, "both"):
-        raise ValueError("student_kind must be deterministic, stochastic, or both.")
+        raise ValueError("student_kind must be GICO-det-policy, GICO-sto-policy, or both.")
     train_groups, val_groups = evidence.groups("train"), evidence.groups("validation")
     # Leave an entire density family out of teacher fitting; its observations
     # remain available for validation, never for reference-ratio normalization.
@@ -369,6 +369,11 @@ def _fit_models(
     training_groups = [_tensors(evidence, g, device) for g in train_groups]
     temperature = selected_teacher["temperature"]
 
+    from genode.gico.selection import teacher_fingerprint
+
+    teacher_selection_fingerprint = teacher_fingerprint(
+        teacher, evidence.conditioning, selected_teacher["step"], selected_teacher["temperature"]
+    )
     student_conditioning = replace(evidence.conditioning, context_mode=config.student_context_mode)
 
     def make_targets(groups, rows):
@@ -406,7 +411,7 @@ def _fit_models(
             torch.manual_seed(config.seed)
             model = (
                 DeterministicStudent(architecture)
-                if kind == "deterministic"
+                if kind == "GICO-det-policy"
                 else StochasticStudent(architecture, ratio_mean, ratio_scale)
             ).to(device)
         torch.manual_seed(config.seed + 419)  # Independent dropout stream for each student kind.
@@ -450,7 +455,7 @@ def _fit_models(
                 with torch.no_grad():
                     losses = []
                     for c, m, w, _, _, _ in validation_targets:
-                        if kind == "deterministic":
+                        if kind == "GICO-det-policy":
                             value = density_kl((w[:, None] * m).sum(0, keepdim=True), model(c)).mean()
                         else:
                             perturbed = model.ratios(m)[:, None] + config.target_smoothing * val_noise[None]
@@ -501,6 +506,7 @@ def _fit_models(
             "students": histories,
             "density_holdout": sorted(family_holdout),
             "teacher_selection": selected_teacher,
+            "teacher_selection_fingerprint": teacher_selection_fingerprint,
             "student_selection": selections,
             "temperature_units": TEMPERATURE_UNITS,
             "auxiliary_normalization": AUXILIARY_NORMALIZATION,

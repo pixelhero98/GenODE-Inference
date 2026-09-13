@@ -206,7 +206,7 @@ def test_imagenet_scale_balances_classes_with_unequal_panel_counts():
     assert baseline.reward_scale == pytest.approx(2.0)
 
 
-@pytest.mark.parametrize("kind", ["deterministic", "stochastic"])
+@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
 def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind, monkeypatch):
     import hashlib
     import json
@@ -249,7 +249,7 @@ def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind
     manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
     manifest["policy_sha256"] = hashlib.sha256((destination / "policy.pt").read_bytes()).hexdigest()
     (destination / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(ValueError, match="historical KID"):
+    with pytest.raises(ValueError, match="supported KID"):
         load_policy(destination, student_kind=kind)
 
 

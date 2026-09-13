@@ -122,10 +122,10 @@ def test_selection_cannot_replace_members_of_frozen_noise_block():
     candidate = StudentCandidate(
         model,
         evidence.conditioning,
-        "deterministic",
+        "GICO-det-policy",
         2000,
         0.1,
-        candidate_fingerprint(model, evidence.conditioning, "deterministic", 2000),
+        candidate_fingerprint(model, evidence.conditioning, "GICO-det-policy", 2000),
     )
     measured = evaluator_for(rows, contexts)(candidate)
     assert measured_utility(measured, evidence, candidate, clock_replicates=4)["utility"] > 0
@@ -151,7 +151,7 @@ def test_kid_artifact_roundtrip_and_transform_identity(tmp_path, monkeypatch):
         contexts,
         destination,
         purpose="functional",
-        student_kind="deterministic",
+        student_kind="GICO-det-policy",
         device="cpu",
         teacher_steps=2,
         student_steps=2,
@@ -174,4 +174,4 @@ def test_kid_artifact_roundtrip_and_transform_identity(tmp_path, monkeypatch):
     payload = torch.load(destination / "policy.pt", weights_only=True)
     payload["metadata"]["backbone_binding"] = dict(payload["metadata"]["backbone_binding"], transform_sha256="f" * 64)
     with pytest.raises(ValueError, match="binding differs"):
-        GICOPolicy(payload, "fixture", "deterministic")
+        GICOPolicy(payload, "fixture", "GICO-det-policy")

@@ -2,69 +2,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
 from typing import Any
 
 from genode.data.otflow_experiment_plan import FORECAST_FAMILY
-
-
-@dataclass(frozen=True)
-class TableMetricBlock:
-    nfe: int
-    metrics: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class TableLayout:
-    benchmark_family: str
-    title: str
-    row_group_label: str
-    schedule_label: str
-    metric_blocks: tuple[TableMetricBlock, ...]
-
-
-def build_forecast_table_layout(nfe_values: Sequence[int]) -> TableLayout:
-    return TableLayout(
-        benchmark_family=FORECAST_FAMILY,
-        title="OTFlow extrapolation under matched NFE",
-        row_group_label="Sampling method",
-        schedule_label="Schedule",
-        metric_blocks=tuple(
-            TableMetricBlock(nfe=int(nfe), metrics=("forecast_relative_crps_gain_vs_uniform", "forecast_mase"))
-            for nfe in nfe_values
-        ),
-    )
-
-
-def build_forecast_appendix_table_layout(nfe_values: Sequence[int]) -> TableLayout:
-    return TableLayout(
-        benchmark_family=FORECAST_FAMILY,
-        title="OTFlow extrapolation appendix metrics",
-        row_group_label="Sampling method",
-        schedule_label="Schedule",
-        metric_blocks=tuple(
-            TableMetricBlock(nfe=int(nfe), metrics=("forecast_crps", "forecast_mse")) for nfe in nfe_values
-        ),
-    )
-
-
-def table_layout_to_dict(layout: TableLayout) -> dict[str, Any]:
-    return asdict(layout)
-
-
-def markdown_header_stub(layout: TableLayout) -> list[str]:
-    first_row = [layout.row_group_label, layout.schedule_label]
-    second_row = ["", ""]
-    divider = ["---", "---"]
-    for block in layout.metric_blocks:
-        first_row.extend([f"NFE={int(block.nfe)}"] + [""] * (len(block.metrics) - 1))
-        second_row.extend(list(block.metrics))
-        divider.extend(["---:"] * len(block.metrics))
-    return [
-        "| " + " | ".join(first_row) + " |",
-        "| " + " | ".join(second_row) + " |",
-        "| " + " | ".join(divider) + " |",
-    ]
 
 
 def _row_value(row: Mapping[str, Any], *keys: str) -> Any:
@@ -72,13 +12,6 @@ def _row_value(row: Mapping[str, Any], *keys: str) -> Any:
         if key in row and row.get(key) is not None:
             return row.get(key)
     return None
-
-
-def _schedule_key(row: Mapping[str, Any]) -> str:
-    raw = _row_value(row, "scheduler_key", "schedule_name", "grid_name", "schedule_display_name")
-    text = str(raw).strip().lower() if raw is not None else ""
-    aliases = {"uniform": "uniform", "time-uniform": "uniform", "time uniform": "uniform"}
-    return aliases.get(text, text)
 
 
 def _relative_match_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -126,7 +59,7 @@ def _metric_value(row: Mapping[str, Any], metric_key: str) -> Any:
 def augment_rows_with_relative_metrics(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     baseline_rows: dict[tuple[Any, ...], Mapping[str, Any]] = {}
     for row in rows:
-        if _schedule_key(row) == "uniform":
+        if row.get("scheduler_key") == "uniform":
             baseline_rows[_relative_match_key(row)] = row
     enriched: list[dict[str, Any]] = []
     for row in rows:
@@ -150,14 +83,3 @@ def augment_rows_with_relative_metrics(rows: Sequence[Mapping[str, Any]]) -> lis
                 )
         enriched.append(payload)
     return enriched
-
-
-__all__ = [
-    "TableLayout",
-    "TableMetricBlock",
-    "augment_rows_with_relative_metrics",
-    "build_forecast_appendix_table_layout",
-    "build_forecast_table_layout",
-    "markdown_header_stub",
-    "table_layout_to_dict",
-]

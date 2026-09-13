@@ -961,7 +961,7 @@ def evaluate_forecast_schedule(
                     if policy is not None:
                         from genode.gico.clocks import materialize
 
-                        request_id = f"{chunk_context_ids[0]}:{logical_panel_seed}:member:{sample_idx}"
+                        request_id = f"{chunk_context_ids[0]}:{solver_name}:{resolved_target_nfe}:{logical_panel_seed}:member:{sample_idx}"
                         mass = policy.density(
                             chunk_context_embeddings[0],
                             solver_name,
@@ -977,7 +977,7 @@ def evaluate_forecast_schedule(
                                 "density_mass": mass.tolist(),
                                 "time_grid": list(grid),
                                 "clock_seed": clock_seed,
-                                "request_id": request_id,
+                                "clock_request_id": request_id,
                             }
                         )
                     pred_norm = model.sample_future(hist, steps=int(runtime_nfe), solver=str(solver_name))

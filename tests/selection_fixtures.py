@@ -16,7 +16,7 @@ def evaluator_for(rows, contexts, *, factor=0.9, replicates=4):
         for anchor in rows:
             if anchor["split"] != "validation" or anchor["schedule_key"] != "uniform":
                 continue
-            count = replicates if candidate.student_kind == "stochastic" else 1
+            count = replicates if candidate.student_kind == "GICO-sto-policy" else 1
             for rep in range(count):
                 uniform = deepcopy(anchor)
                 uniform["clock_replicate"] = rep
@@ -39,7 +39,7 @@ def evaluator_for(rows, contexts, *, factor=0.9, replicates=4):
                             "clock_request_id": request,
                         }
                     )
-                if candidate.student_kind == "stochastic" and anchor["ensemble_size"] > 1:
+                if candidate.student_kind == "GICO-sto-policy" and anchor["ensemble_size"] > 1:
                     student.pop("density_mass")
                     student.pop("time_grid")
                     student["sample_clocks"] = clocks
@@ -51,7 +51,7 @@ def evaluator_for(rows, contexts, *, factor=0.9, replicates=4):
     return evaluate
 
 
-def fixture_history(students, evidence, rows, contexts, *, conditioning=None, step=500, coefficient=0.01):
+def fixture_history(students, evidence, rows, contexts, *, conditioning=None, step=2000, coefficient=0.01):
     selected = {}
     for kind, model in students.items():
         selected[kind] = {

@@ -1,22 +1,7 @@
 import json
 
 from genode.latent_clock.artifacts import write_new_jsonl
-from genode.latent_clock.experiment import report_specification
 from genode.latent_clock.protocol import NOISE_SEEDS
-
-
-def test_generated_spec_excludes_cancelled_audits(tmp_path):
-    path = tmp_path / "spec.json"
-    report_specification(tmp_path, path)
-    spec = json.loads(path.read_text())
-    assert spec["include_external_audits"] is False
-    assert spec["evaluation_scope"]["excluded_audits"] == ["GenEval", "VisionReward"]
-    assert all(
-        source["path"].endswith("locked_test-scores.jsonl")
-        for comparison in spec["comparisons"]
-        for role in ("candidate", "anchor")
-        for source in comparison[role]
-    )
 
 
 def test_report_completes_without_external_audit_files(tmp_path, monkeypatch):

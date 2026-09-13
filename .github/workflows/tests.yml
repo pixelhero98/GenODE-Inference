@@ -111,9 +111,9 @@ jobs:
               "tests/test_ptg_" + "observed_gain_figure.py",
           )
           content_patterns = {
-              "cluster path": re.compile(
-                  rb"isam" rb"bard|b3" rb"5z|ma" rb"cs3|/scr" rb"atch/|/pro" rb"jects/|"
-                  rb"sl" rb"urm|sba" rb"tch|pixelhero\.b3" rb"5z",
+              "private filesystem path": re.compile(
+                  rb"/(?:scr" rb"atch|pro" rb"jects|ho" rb"me)/[^\s\"']+|"
+                  rb"[A-Z]:[/\\]Us" rb"ers[/\\][^\s\"']+",
                   re.IGNORECASE,
               ),
               "retired image policy": re.compile(
@@ -177,6 +177,11 @@ jobs:
                   "genode/image_comparators/frozen_clock.py",
                   "genode/gico/profiles.py",
                   "genode/gico/conditioning.py",
+                  "genode/gico/codec.py",
+                  "genode/gico/evaluators.py",
+                  "genode/gico/task_evaluators.py",
+                  "genode/gico/image_evaluator.py",
+                  "genode/image_comparators/bezier.py",
               }
               if not required_wheel <= wheel_names:
                   raise SystemExit("Wheel omitted an active image GICO module.")
@@ -212,12 +217,15 @@ jobs:
                   f"{root}/tests/image_fixtures.py",
                   f"{root}/tests/selection_fixtures.py",
                   f"{root}/tests/test_image_gico_cli.py",
+                  f"{root}/examples/decode_clock.py",
+                  f"{root}/docs/evaluators.md",
               }
               if not required_sdist <= sdist_names:
                   raise SystemExit("Source distribution omitted publication or test metadata.")
           PY
       - run: python -m pip install --force-reinstall dist/*.whl
       - run: python -m genode.latent_clock.js_experiment --help
+      - run: python examples/decode_clock.py
       - run: |
           for command in \
             genode-run-schedules \
@@ -230,10 +238,6 @@ jobs:
             genode-preflight-gico-rows \
             genode-report-gico-locked-test \
             genode-evaluate-schedule-summary \
-            genode-build-hardness-figure \
-            genode-package-backbone-family \
-            genode-validate-backbone-package \
-            genode-build-release-archive \
             genode-image-gico \
             genode-latent-clock
           do

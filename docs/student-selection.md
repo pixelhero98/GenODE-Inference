@@ -40,7 +40,7 @@ draws (default 4), with `clock_replicate` indexed from zero. Repeat the matching
 uniform row for each draw. Supply `clock_seed` and `clock_request_id`, separate from
 generation noise. Ensembles require `sample_clocks`, one per member; retain each
 member's clock throughout the rollout. Innovations must be distinct across members
-and replicates within a comparison cell. Pair their identities across checkpoints.
+and replicates across all distinct generated members and replicates. Pair their identities across checkpoints.
 Deterministic selection uses one replicate, with the prescribed task ensemble size.
 
 Raw metrics are averaged across clock and generation replicates before nonlinear
@@ -56,16 +56,20 @@ For the common configuration CLI, add a trusted adapter factory:
 ```json
 {
   "selection_evaluator": {
-    "factory": "my_task.selection:build_evaluator",
-    "config": {"panel": "/absolute/path/to/selection-panel.json"}
+    "factory": "genode.gico.evaluators:build_evaluator",
+    "config": {
+      "rows": "selection.jsonl", "contexts": "contexts.npz",
+      "runtime": "runtime.json", "cases": "cases.json",
+      "output": "selection-measurements", "clock_seed": 412
+    }
   },
   "score_schedule": "ramp_plateau_60_20_20",
   "selection_clock_replicates": 4
 }
 ```
 
-The factory receives its `config` dictionary and returns the callback. Factory
-configuration paths are adapter-owned; use absolute paths. Dry-run validates the
+The factory receives its `config` dictionary and returns the callback. The built-in runtime schemas are documented in [evaluators](evaluators.md). Factory
+configuration paths are adapter-owned; the built-in factory resolves them from the working directory. Use absolute paths when invoking from another directory. Custom factories remain supported. Dry-run validates the
 factory specification without importing the generator runtime. Evidence preparation
 may produce a draft configuration without an evaluator; actual fitting requires it.
 The image CLI accepts the same factory/config object through `--selection-evaluator`.
@@ -75,8 +79,11 @@ The image CLI accepts the same factory/config object through `--selection-evalua
 Protocol v6 records the schedule, selected utility, measurement hash, panel identities,
 replicate allowance and a fingerprint binding the selected parameters and conditioning.
 It verifies that the saved student is the highest-utility eligible history entry.
-Teacher-only reuse of v5 is supported with its original profile validation; v5
-students remain accessible only through their originating runtime and are not relabelled.
+The v6 codec preserves serialized role keys and fingerprint inputs while public selectors use
+`GICO-det-policy` and `GICO-sto-policy`. Public teacher reuse requires a fingerprint binding
+selected weights, conditioning, step and temperature, plus the minimum-regret history entry.
+Existing valid v6 student inference remains supported without that teacher proof.
+All v5 loading and older teacher replay require an archived runtime.
 
 Every eligible checkpoint incurs held-out generation/scoring access. Report these
 trajectories, their backbone evaluations and wall time separately from reference

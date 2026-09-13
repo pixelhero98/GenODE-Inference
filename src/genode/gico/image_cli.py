@@ -39,7 +39,7 @@ def build_argparser() -> argparse.ArgumentParser:
     train = commands.add_parser("train", help="Fit the common teacher and requested student architectures.")
     train.add_argument("--evidence", required=True)
     train.add_argument("--output", required=True)
-    train.add_argument("--student-kind", choices=("deterministic", "stochastic", "both"), default="both")
+    train.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy", "both"), default="both")
     train.add_argument("--teacher-score-weight", type=float, choices=(0.01, 0.05, 0.1))
     train.add_argument("--teacher-steps", type=int)
     train.add_argument("--student-steps", type=int)
@@ -54,7 +54,7 @@ def build_argparser() -> argparse.ArgumentParser:
     train.add_argument("--purpose", choices=("research", "functional"), default="research")
     validate = commands.add_parser("validate", help="Validate a common GICO artifact and its identities.")
     validate.add_argument("--policy", required=True)
-    validate.add_argument("--student-kind", choices=("deterministic", "stochastic"), default="deterministic")
+    validate.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy"), default="GICO-det-policy")
     materialize = commands.add_parser("materialize", help="Decode a complete clock using the common policy.")
     materialize.add_argument("--policy", required=True)
     materialize.add_argument("--evidence", required=True)
@@ -62,7 +62,9 @@ def build_argparser() -> argparse.ArgumentParser:
     materialize.add_argument(
         "--sample-keys", required=True, help="Comma-separated independent clock request identities."
     )
-    materialize.add_argument("--student-kind", choices=("deterministic", "stochastic"), default="deterministic")
+    materialize.add_argument(
+        "--student-kind", choices=("GICO-det-policy", "GICO-sto-policy"), default="GICO-det-policy"
+    )
     materialize.add_argument("--nfe", type=int, required=True)
     materialize.add_argument("--clock-seed", type=int, default=0)
     materialize.add_argument("--output", required=True)

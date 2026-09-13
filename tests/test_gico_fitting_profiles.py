@@ -31,7 +31,7 @@ def cpu_threads():
 def test_profiles_preserve_task_settings_and_reject_obsolete_options():
     for task in ("sana", "sd15", "weather_daily", "molecule_3d_set1"):
         p = resolve_profile(task)
-        assert p.teacher_steps == p.student_steps == 500 and p.dropout == 0.05
+        assert p.teacher_steps == p.student_steps == 2000 and p.dropout == 0.01
         assert p.teacher_batch_groups == 64 and p.student_batch_contexts == 512
         assert p.teacher_learning_rate == p.student_learning_rate == 0.001
         assert p.teacher_score_weight == (0.05 if task in ("sana", "sd15") else 0.01)
@@ -102,7 +102,7 @@ def test_molecular_scalarization_is_weighted_log_improvement():
     assert RewardCalibration.from_payload(calibration.to_payload()) == calibration
 
 
-@pytest.mark.parametrize("kind", ("deterministic", "stochastic"))
+@pytest.mark.parametrize("kind", ("GICO-det-policy", "GICO-sto-policy"))
 @pytest.mark.parametrize("coefficient", (0.01, 0.05, 0.1))
 def test_actual_student_objective_score_term_has_gradients_without_teacher_updates(kind, coefficient):
     with torch.random.fork_rng(devices=[]):
@@ -110,7 +110,7 @@ def test_actual_student_objective_score_term_has_gradients_without_teacher_updat
         architecture = ModelConfig(5, 2, dropout=0.05)
         teacher = DensityTeacher(architecture).eval().requires_grad_(False)
         model = (
-            DeterministicStudent(architecture) if kind == "deterministic" else StochasticStudent(architecture)
+            DeterministicStudent(architecture) if kind == "GICO-det-policy" else StochasticStudent(architecture)
         ).eval()
     context = torch.zeros(1, 5)
     refs = torch.softmax(torch.stack((torch.linspace(-1, 1, 64), torch.linspace(1, -1, 64))), -1).double()
@@ -214,7 +214,7 @@ def test_rope_and_causal_parameters_match_every_prefix():
         torch.testing.assert_close(std, full_std[:, :length], atol=2e-6, rtol=1e-5)
 
 
-@pytest.mark.parametrize("kind", ("deterministic", "stochastic"))
+@pytest.mark.parametrize("kind", ("GICO-det-policy", "GICO-sto-policy"))
 def test_global_student_score_chasing_keeps_original_teacher_contexts(kind):
     from unittest.mock import patch
 
@@ -228,7 +228,9 @@ def test_global_student_score_chasing_keeps_original_teacher_contexts(kind):
     )
     architecture = ModelConfig(5, 2)
     teacher = DensityTeacher(architecture).eval().requires_grad_(False)
-    model = (DeterministicStudent(architecture) if kind == "deterministic" else StochasticStudent(architecture)).eval()
+    model = (
+        DeterministicStudent(architecture) if kind == "GICO-det-policy" else StochasticStudent(architecture)
+    ).eval()
     teacher_contexts = torch.tensor([[1.0, 2.0, 0.0, 0.0, 1.0], [3.0, -4.0, 0.0, 0.0, 1.0]])
     student_context = torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0]])
     refs = torch.softmax(torch.randn(2, 64), -1).double()
@@ -248,7 +250,7 @@ def test_global_student_score_chasing_keeps_original_teacher_contexts(kind):
             generator=torch.Generator().manual_seed(1),
             score_rng=torch.Generator().manual_seed(2),
         )
-    expected = teacher_contexts if kind == "deterministic" else teacher_contexts.repeat_interleave(2, 0)
+    expected = teacher_contexts if kind == "GICO-det-policy" else teacher_contexts.repeat_interleave(2, 0)
     torch.testing.assert_close(observed.call_args.args[0], expected, atol=0, rtol=0)
     assert losses.shape == (2,)
     losses.mean().backward()

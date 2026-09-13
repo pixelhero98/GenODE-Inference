@@ -13,14 +13,6 @@ if TYPE_CHECKING:
     from genode.latent_clock.js_reinforce import JSSchedule
 
 
-def invert_flow_shift(target_sigma: np.ndarray, shift: float) -> np.ndarray:
-    target = np.asarray(target_sigma, dtype=np.float64)
-    value = float(shift)
-    if not np.all(np.isfinite(target)) or np.any(target < 0) or np.any(target > 1) or value <= 0:
-        raise ValueError("Flow sigmas must be finite in [0,1] and shift must be positive.")
-    return target / (value - (value - 1.0) * target)
-
-
 def _prepare_scheduler(scheduler: Any, clock: Clock | JSSchedule, device: Any) -> Any:
     import torch
 

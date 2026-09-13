@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from genode.evaluation.relative_metrics import augment_rows_with_relative_metrics
 from genode.gico.density_representation import average_density_masses, grid_to_density_mass, uniform_reference_grid
 from genode.schedule_transfer.diffusion_flow_schedules import (
     BASELINE_SCHEDULE_KEYS,
@@ -12,7 +13,6 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
     schedule_display_name,
     schedule_time_alignment,
 )
-from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
 
 
 class DiffusionFlowScheduleReviewFixTests(unittest.TestCase):

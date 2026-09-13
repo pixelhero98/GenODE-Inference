@@ -82,6 +82,7 @@ from genode.evaluation.otflow_evaluation_support import (
     train_tuning_target_example_count,
     validate_execution_preflight,
 )
+from genode.evaluation.relative_metrics import augment_rows_with_relative_metrics
 from genode.gico.models import validate_time_grid
 from genode.gico.policy import load_context_embedding_table, save_context_embedding_table
 from genode.gico.schedule_hash import schedule_grid_hash
@@ -98,10 +99,10 @@ from genode.schedule_transfer.diffusion_flow_schedules import (
     schedule_display_name,
     schedule_time_alignment,
 )
-from genode.schedule_transfer.otflow_paper_registry import METHOD_KEY
-from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
 from genode.schedule_transfer.reference_clocks import reference_clock_provenance
 from genode.solver_protocol import normalize_solver_keys, normalize_solver_nfe_fields
+
+METHOD_KEY = "diffusion_flow_time_reparameterization"
 
 RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_density64_energy_v6"
 CONTEXT_REWARD_PROTOCOL_VERSION = "paired_terminal_metric_evidence_v3"

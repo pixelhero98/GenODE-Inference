@@ -12,12 +12,66 @@ from scipy.stats import t
 
 from genode.gico.clocks import verify_measurement_clock
 from genode.gico.evidence import content_hash
-from genode.gico.policy import load_policy
+from genode.gico.policy import load_context_embedding_table, load_policy
 from genode.gico.rewards import RewardCalibration, construct_rewards
 from genode.gico.train_gico import read_rows
 
 
-def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> dict:
+def collapse_clock_replicates(rows):
+    """Average complete paired clock draws before nonlinear terminal rewards."""
+    if not any("clock_replicate" in row for row in rows):
+        return rows
+    from genode.gico.rewards import measurement_metrics
+
+    panels = defaultdict(lambda: defaultdict(dict))
+    for row in rows:
+        replicate = row.get("clock_replicate")
+        if type(replicate) is not int or replicate < 0:
+            raise ValueError("Every replicated report row requires a nonnegative clock_replicate.")
+        key = tuple(row[k] for k in ("task", "backbone", "split", "context_id", "solver", "nfe", "seed"))
+        members = panels[key][row["schedule_key"]]
+        if replicate in members:
+            raise ValueError("Duplicate report clock replicate.")
+        members[replicate] = row
+    collapsed = []
+    for schedules in panels.values():
+        if "uniform" not in schedules:
+            raise ValueError("Replicated reports require paired uniform anchors.")
+        uniform = schedules["uniform"]
+        expected = set(range(len(uniform)))
+        if any(set(draws) != expected for draws in schedules.values()):
+            raise ValueError("Report clock replicate panels are incomplete or unpaired.")
+        metric_keys = measurement_metrics(uniform[0])
+        for row in uniform.values():
+            if any(row["metrics"][key] != uniform[0]["metrics"][key] for key in metric_keys):
+                raise ValueError("Repeated uniform measurements changed across clock replicates.")
+        for draws in schedules.values():
+            first = draws[0]
+            for row in draws.values():
+                if any(
+                    row.get(k) != first.get(k)
+                    for k in (
+                        "ensemble_size",
+                        "reference_id",
+                        "measurement_protocol",
+                        "sample_block",
+                        "reference_block",
+                        "target",
+                    )
+                ):
+                    raise ValueError("Report clock replicates changed their paired measurement assets.")
+            collapsed.append(
+                {
+                    **first,
+                    "metrics": {
+                        key: float(np.mean([row["metrics"][key] for row in draws.values()])) for key in metric_keys
+                    },
+                }
+            )
+    return collapsed
+
+
+def summarize_measurements(rows: list[dict], policy, *, split: str = "test", contexts: dict | None = None) -> dict:
     if split not in ("validation", "test"):
         raise ValueError("Reports require validation or test data.")
     if not rows or any(r["split"] != split for r in rows):
@@ -29,6 +83,7 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
         forbidden.update(calibration["calibration_contexts"])
     if forbidden & {r["context_id"] for r in rows}:
         raise ValueError("Report contexts overlap fitting/calibration data.")
+    clock_identities = set()
     for row in rows:
         if row["task"] in ("cifar10", "imagenet64"):
             if row.get("image_objective") != policy.metadata.get("image_objective"):
@@ -52,6 +107,14 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
             and row.get("molecule_feature_map") not in policy.metadata.get("molecular_feature_maps", {}).values()
         ):
             raise ValueError("Report molecular feature map differs from the frozen training map.")
+        from genode.gico.clocks import REFERENCE_KEYS
+        from genode.gico.selection import _check_clock
+
+        learned = row["schedule_key"] not in REFERENCE_KEYS and row.get("measurement_role") != "baseline"
+        if learned and (
+            row.get("policy_sha256") != policy.artifact_sha256 or row.get("student_kind") != policy.student_kind
+        ):
+            raise ValueError("Report policy identity/student kind is required for learned-policy measurements.")
         if "policy_sha256" in row and (
             row["policy_sha256"] != policy.artifact_sha256 or row.get("student_kind") != policy.student_kind
         ):
@@ -67,6 +130,12 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
                 )
         else:
             verify_measurement_clock(row)
+        if learned:
+            if contexts is None or row["context_id"] not in contexts:
+                raise ValueError("Learned-policy reports require native contexts for executed clock replay.")
+            _check_clock({**row, "schedule_key": "student"}, policy, contexts[row["context_id"]], clock_identities)
+    measurements_sha256 = content_hash(rows)
+    rows = collapse_clock_replicates(rows)
     groups = defaultdict(list)
     for solver, calibration in policy.metadata["reward_calibrations"].items():
         subset = [r for r in rows if r["solver"] == solver]
@@ -89,7 +158,7 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
                 units.append(
                     {
                         "reward": float(np.mean([r["reward"] for r in panel])),
-                        "metrics": {"lpips": float(np.mean([r["metrics"]["lpips"] for r in panel]))},
+                        "metrics": {k: float(np.mean([r["metrics"][k] for r in panel])) for k in panel[0]["metrics"]},
                     }
                 )
         rewards = np.array([r["reward"] for r in units])
@@ -112,7 +181,7 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
         )
     return {
         "artifact_sha256": policy.artifact_sha256,
-        "measurements_sha256": content_hash(rows),
+        "measurements_sha256": measurements_sha256,
         "split": split,
         "results": output,
         "selection_performed": False,
@@ -125,12 +194,16 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test") -> 
 def report_main(*, default_split: str) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", required=True)
-    parser.add_argument("--student-kind", choices=("deterministic", "stochastic"), required=True)
+    parser.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy"), required=True)
     parser.add_argument("--rows", required=True, help="Paired JSONL terminal measurements, including uniform anchors.")
+    parser.add_argument("--contexts", help="Native context NPZ required for learned-policy clock replay.")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     report = summarize_measurements(
-        read_rows(args.rows), load_policy(args.artifact, student_kind=args.student_kind), split=default_split
+        read_rows(args.rows),
+        load_policy(args.artifact, student_kind=args.student_kind),
+        split=default_split,
+        contexts=load_context_embedding_table(args.contexts) if args.contexts else None,
     )
     destination = Path(args.output)
     destination.parent.mkdir(parents=True, exist_ok=True)

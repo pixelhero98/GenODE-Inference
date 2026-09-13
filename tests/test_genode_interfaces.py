@@ -76,10 +76,6 @@ class GenODEInterfaceTests(unittest.TestCase):
             "genode-preflight-gico-rows",
             "genode-report-gico-locked-test",
             "genode-evaluate-schedule-summary",
-            "genode-build-hardness-figure",
-            "genode-package-backbone-family",
-            "genode-validate-backbone-package",
-            "genode-build-release-archive",
             "genode-image-gico",
             "genode-latent-clock",
         }
@@ -92,7 +88,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         project = data["project"]
 
-        self.assertEqual(project["version"], "0.13.0")
+        self.assertEqual(project["version"], "0.14.0")
         self.assertEqual(
             project["description"], "GICO inference-clock optimization for frozen flow-matching backbones."
         )
@@ -101,7 +97,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         retired_modules = (
             "genode." + "distillation",
             "genode.gico." + "ser_" + "ptg_reference",
-            "genode.visualization." + "build_ptg_" + "observed_gain_figure",
+            "genode.visualization",
         )
         for module_name in retired_modules:
             with self.subTest(module_name=module_name):
@@ -136,6 +132,8 @@ class GenODEInterfaceTests(unittest.TestCase):
                 "README.md",
                 "SECURITY.md",
                 "THIRD_PARTY_NOTICES.md",
+                "docs/evaluators.md",
+                "docs/examples.md",
                 "docs/frozen-bezier-kid.md",
                 "docs/image-comparators.md",
                 "docs/image-supervision.md",
@@ -216,6 +214,8 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in (PROJECT_ROOT / "docs").iterdir()},
             {
+                "evaluators.md",
+                "examples.md",
                 "frozen-bezier-kid.md",
                 "image-comparators.md",
                 "image-supervision.md",

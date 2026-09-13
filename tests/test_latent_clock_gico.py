@@ -87,10 +87,10 @@ def test_native_fit_delegates_to_common_config(tmp_path):
     config = tmp_path / "train.json"
     config.write_text(json.dumps({"rows": "rows.jsonl", "contexts": "contexts.npz", "output": "policy"}))
     with patch("genode.latent_clock.gico.run_config", return_value={"task": "sana"}) as run:
-        assert fit_gico(config_path=str(config), student_kind="stochastic", teacher_score_weight=0.1, dry_run=True) == {
-            "task": "sana"
-        }
-    assert run.call_args.args[0]["student_kind"] == "stochastic"
+        assert fit_gico(
+            config_path=str(config), student_kind="GICO-sto-policy", teacher_score_weight=0.1, dry_run=True
+        ) == {"task": "sana"}
+    assert run.call_args.args[0]["student_kind"] == "GICO-sto-policy"
     assert run.call_args.args[0]["teacher_score_weight"] == 0.1
     assert run.call_args.kwargs["dry_run"] is True
 
@@ -141,7 +141,7 @@ def test_collection_samples_one_clock_per_image_and_reuses_complete_solver_grid(
         "method": "gico",
         "checkpoint": "policy",
         "checkpoint_sha256": "a" * 64,
-        "student_kind": "stochastic",
+        "student_kind": "GICO-sto-policy",
         "clock_seed": 23,
         "requests": [request],
     }
@@ -158,4 +158,4 @@ def test_collection_samples_one_clock_per_image_and_reuses_complete_solver_grid(
     assert sampled[0][3:] == (23, "image-one") and calls[0][0] == 17011
     row = json.loads((tmp_path / "images" / "image-one.json").read_text())
     assert row["density_mass"] == list(calls[0][1].density_mass)
-    assert row["clock_student_kind"] == "stochastic" and row["clock_seed"] == 23
+    assert row["clock_student_kind"] == "GICO-sto-policy" and row["clock_seed"] == 23

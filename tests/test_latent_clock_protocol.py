@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 
 from genode.latent_clock.adapters.ipndm import compile_ipndm_times
-from genode.latent_clock.adapters.sana import invert_flow_shift
 from genode.latent_clock.clocks import (
     REFERENCE_CLOCK_KEYS,
     bo_bounds,
@@ -88,13 +87,6 @@ def test_pg_evaluation_uses_same_precision_map_as_training():
     actual = sample_policy_clock(policy, context, seed=123)
     assert actual.nodes == expected.nodes
     assert actual.source_kind == "pg_precision_corrected"
-
-
-def test_sana_shift_is_inverted_exactly_enough_for_float32_runtime():
-    target = 1 - np.asarray(next(c for c in reference_clocks(8) if c.key == "late_p_3").nodes[:-1])
-    raw = invert_flow_shift(target, 3.0)
-    realized = 3.0 * raw / (1.0 + 2.0 * raw)
-    assert np.allclose(realized, target, atol=1e-14)
 
 
 def test_ipndm_compiler_uses_complete_descending_time_grid():

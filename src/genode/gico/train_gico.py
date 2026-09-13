@@ -67,8 +67,8 @@ def run_config(config: dict, *, dry_run: bool = False) -> dict:
     values = dict(config)
     evaluator = values.pop("selection_evaluator", None)
     callback = load_selection_evaluator(evaluator, dry_run=dry_run)
-    if values.get("student_kind", "both") not in ("deterministic", "stochastic", "both"):
-        raise ValueError("student_kind must be deterministic, stochastic, or both.")
+    if values.get("student_kind", "both") not in ("GICO-det-policy", "GICO-sto-policy", "both"):
+        raise ValueError("student_kind must be GICO-det-policy, GICO-sto-policy, or both.")
     rows = read_rows(values.pop("rows"))
     contexts = load_context_embedding_table(values.pop("contexts"))
     calibration = read_rows(values.pop("calibration_rows")) if "calibration_rows" in values else None
@@ -103,7 +103,7 @@ def run_config(config: dict, *, dry_run: bool = False) -> dict:
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="JSON configuration; paths are relative to this file.")
-    parser.add_argument("--student-kind", choices=("deterministic", "stochastic", "both"))
+    parser.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy", "both"))
     parser.add_argument("--teacher-score-weight", type=float, choices=SCORE_WEIGHTS)
     parser.add_argument("--dry-run", action="store_true")
     return parser

@@ -11,7 +11,6 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from genode.backbone_packages import _contains_local_marker, _validate_file_record
 from genode.benchmarks.image import artifact_paths as image_artifact_paths
 from genode.data import molecule_xyz, otflow_datasets, otflow_monash_datasets
 from genode.evaluation import diffusion_flow_time_reparameterization as evaluation_runner
@@ -262,29 +261,6 @@ class SafeZipExtractionTests(unittest.TestCase):
                         otflow_monash_datasets._extract_zip(archive_path, destination)
                     self.assertFalse((root / "outside.tsf").exists())
                     self.assertFalse((destination / "safe" / "data.tsf").exists())
-
-
-class PackageAttestationTests(unittest.TestCase):
-    def test_file_records_require_size_and_sha256_attestations(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            payload = root / "payload.bin"
-            payload.write_bytes(b"payload")
-            errors = _validate_file_record(root, {"path": "payload.bin"})
-        self.assertIn("Missing or invalid size_bytes for payload.bin", errors)
-        self.assertIn("Missing or invalid SHA256 for payload.bin", errors)
-
-    def test_embedded_local_paths_are_detected_in_free_text(self) -> None:
-        local_text = (
-            "loaded checkpoint C:\\Users\\person\\model.pt successfully",
-            "loaded checkpoint \\\\server\\share\\model.pt successfully",
-            "loaded checkpoint /srv/private/model.pt successfully",
-        )
-        for value in local_text:
-            with self.subTest(value=value):
-                self.assertTrue(_contains_local_marker(value))
-        self.assertFalse(_contains_local_marker("loaded packaged checkpoint successfully"))
-        self.assertFalse(_contains_local_marker("source https://github.com/example/project/blob/main/model.py"))
 
 
 class RunnerOutputPathTests(unittest.TestCase):

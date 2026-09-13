@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from genode.backbone_packages import FAMILY_SPECS
 from genode.canonical_experiment_layout import CANONICAL_SCENARIO_KEYS, FORECAST_SCENARIO_KEYS, MOLECULE_SCENARIO_KEYS
 from genode.data.otflow_experiment_plan import experiment_plan_by_key
 from genode.pipeline import full_pipeline
@@ -19,7 +18,6 @@ def test_active_tasks_and_backbone_packages_are_exact():
     assert MOLECULE_SCENARIO_KEYS == ("molecule_3d_set1", "molecule_3d_set2", "molecule_3d_set3")
     assert (*FORECAST_SCENARIO_KEYS, *MOLECULE_SCENARIO_KEYS) == CANONICAL_SCENARIO_KEYS
     assert tuple(experiment_plan_by_key()) == FORECAST_SCENARIO_KEYS
-    assert set(FAMILY_SPECS) == {"temporal-extrapolation", "molecule-coord-generation"}
 
 
 def test_pipeline_routes_explicit_gico_config_to_common_cli(tmp_path: Path):
@@ -34,7 +32,7 @@ def test_pipeline_routes_explicit_gico_config_to_common_cli(tmp_path: Path):
             "--gico-config",
             str(config),
             "--student-kind",
-            "stochastic",
+            "GICO-sto-policy",
             "--teacher-score-weight",
             "0.05",
         ]
@@ -43,7 +41,14 @@ def test_pipeline_routes_explicit_gico_config_to_common_cli(tmp_path: Path):
     assert len(stages) == 1
     command = stages[0].commands[0]
     assert command[2] == "genode.gico.train_gico"
-    assert command[3:] == ["--config", str(config), "--student-kind", "stochastic", "--teacher-score-weight", "0.05"]
+    assert command[3:] == [
+        "--config",
+        str(config),
+        "--student-kind",
+        "GICO-sto-policy",
+        "--teacher-score-weight",
+        "0.05",
+    ]
 
 
 def test_pipeline_requires_explicit_gico_config(tmp_path: Path):

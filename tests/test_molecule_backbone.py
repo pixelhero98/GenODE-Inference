@@ -14,7 +14,6 @@ import torch
 from genode.data import molecule_xyz
 from genode.evaluation import molecule_metrics
 from genode.models.config import OTFlowConfig
-from genode.models.otflow_train_val import generate_continuation
 from genode.solver_protocol import CANONICAL_SOLVER_KEYS
 from genode.training import train_molecule_backbone as train_molecule_module
 
@@ -301,19 +300,6 @@ class MoleculeBackboneTests(unittest.TestCase):
         cfg.apply_overrides(context_feature_dim=616)
         self.assertEqual(cfg.context_dim, 616)
 
-    def test_generic_rollout_rejects_augmented_non_temporal_context_without_future_features(self) -> None:
-        cfg = molecule_xyz.configure_molecule_otflow(
-            OTFlowConfig(),
-            history_len=2,
-            future_horizon=1,
-            rollout_mode="autoregressive",
-            atom_count=2,
-        )
-        model = SimpleNamespace(cfg=cfg)
-        hist = torch.zeros(1, 2, 2 * molecule_xyz.MOLECULE_CONTEXT_ATOM_FEATURE_DIM)
-        with self.assertRaisesRegex(ValueError, "domain-specific rollout"):
-            generate_continuation(model, hist, None, steps=1, nfe=1)
-
     def test_molecule_training_exports_validation_selected_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -436,6 +422,15 @@ class MoleculeBackboneTests(unittest.TestCase):
                 ),
             ):
                 summary = train_molecule_module.train_molecule_backbone(args)
+                for index, invalid in enumerate((float("nan"), float("inf"))):
+                    invalid_args = SimpleNamespace(**vars(args))
+                    invalid_args.out_dir = str(root / f"invalid-{index}")
+                    with (
+                        patch.object(train_molecule_module, "evaluate_average_loss", return_value={"loss": invalid}),
+                        self.assertRaisesRegex(ValueError, "must be finite"),
+                    ):
+                        train_molecule_module.train_molecule_backbone(invalid_args)
+                    self.assertFalse(list(Path(invalid_args.out_dir).rglob("*.pt")))
 
             self.assertEqual(summary["selected_step"], 2)
             self.assertEqual(summary["budget_artifacts"]["1"]["selected_step"], 1)

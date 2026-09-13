@@ -25,7 +25,7 @@ def prepare_geneval(
     nfe: int,
     checkpoint: str | None,
     freeze_path: str,
-    student_kind: str = "deterministic",
+    student_kind: str = "GICO-det-policy",
     clock_seed: int = 0,
 ) -> None:
     frozen = json.loads(Path(freeze_path).read_text())
@@ -116,7 +116,7 @@ def prepare_collection(
     method: str = "support",
     checkpoint: str | None = None,
     freeze_path: str | None = None,
-    student_kind: str = "deterministic",
+    student_kind: str = "GICO-det-policy",
     clock_seed: int = 0,
 ) -> None:
     manifest = json.loads(Path(manifest_path).read_text())

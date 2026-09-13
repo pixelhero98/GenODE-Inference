@@ -256,7 +256,7 @@ def _sample_molecule_ar_rollout(
                     "density_mass": mass.tolist(),
                     "time_grid": list(grid),
                     "clock_seed": clock_seed,
-                    "request_id": clock_request_id,
+                    "clock_request_id": clock_request_id,
                     "generation_seed": seed,
                     "policy_sha256": policy.artifact_sha256,
                     "student_kind": policy.student_kind,
@@ -626,7 +626,7 @@ def evaluate_molecule_rollout_schedule(
                 seed=int(seed) + 10_000 * int(example_idx),
                 policy=policy,
                 clock_seed=clock_seed,
-                clock_request_id=f"{dataset_key}:{member_key}:{split_phase}:{example_idx}:{seed}",
+                clock_request_id=f"{dataset_key}:{member_key}:{split_phase}:{example_idx}:{solver_key}:{target_nfe}:{seed}",
             )
             target_idx = int(item.get("target_idx", example_idx))
             flags = {

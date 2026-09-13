@@ -116,8 +116,8 @@ def build_molecule_cfg(args: argparse.Namespace, *, atom_count: int, context_fea
         solver=normalize_solver_key(str(args.solver)),
         use_amp=bool(args.use_amp),
         grad_accum_steps=int(args.grad_accum_steps),
-        ema_decay=float(args.ema_decay),
-        use_swa=bool(args.use_swa),
+        ema_decay=0.0,
+        use_swa=False,
     )
     return cfg
 
@@ -314,6 +314,8 @@ def train_molecule_backbone(args: argparse.Namespace) -> dict[str, Any]:
         validation: Mapping[str, Any],
     ) -> None:
         score = float(validation["loss"])
+        if not np.isfinite(score):
+            raise ValueError("Molecular validation loss must be finite before checkpoint selection.")
         if best["score"] is None or score < float(best["score"]):
             best.update(
                 {
@@ -544,8 +546,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--solver", choices=CANONICAL_SOLVER_KEYS, default="euler")
-    parser.add_argument("--ema_decay", type=float, default=0.999)
-    parser.add_argument("--use_swa", action="store_true", default=False)
     parser.add_argument("--use_minibatch_ot", action="store_true", default=True)
     parser.add_argument("--no_minibatch_ot", dest="use_minibatch_ot", action="store_false")
     parser.add_argument("--prepare_data", action="store_true", default=True)

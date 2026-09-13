@@ -11,64 +11,11 @@ from unittest import mock
 import genode.evaluation.diffusion_flow_time_reparameterization as runner
 from genode.evaluation.fm_backbone_registry import materialize_backbone_manifest
 from genode.evaluation.molecule_energy import MoleculeFeatureMap
-from genode.schedule_transfer.diffusion_flow_schedules import (
-    EXPERIMENTAL_FIXED_SCHEDULE_KEYS,
-    EXPERIMENTAL_REVERSED_SCHEDULE_KEYS,
-    build_schedule_grid,
-)
-from genode.schedule_transfer.otflow_paper_registry import (
-    BASELINE_SCHEDULE_KEYS,
-    MAIN_NFE_VALUES,
-    METHOD_KEY,
-    TRANSFER_SCHEDULE_KEYS,
-    paper_registry_snapshot,
-    paper_schedule_specs,
-    paper_solver_specs,
-)
-from genode.schedule_transfer.otflow_signal_traces import NATIVE_INFO_GROWTH_TRACE_KEY
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class DiffusionFlowPaperPrepTests(unittest.TestCase):
-    def test_registry_exposes_diffusion_flow_method_not_tvd(self) -> None:
-        snapshot = paper_registry_snapshot()
-        self.assertEqual(METHOD_KEY, "diffusion_flow_time_reparameterization")
-        self.assertEqual(snapshot["paper_method"], "diffusion_flow_time_reparameterization")
-        self.assertFalse(
-            any(spec.comparison_role == "paper_method" and spec.key == "tvd" for spec in paper_schedule_specs())
-        )
-        self.assertIn("flowts_power_0p03", {spec.key for spec in paper_schedule_specs()})
-        self.assertNotIn("atss", {spec.key for spec in paper_schedule_specs()})
-
-    def test_schedule_sets_are_exact(self) -> None:
-        self.assertEqual(len(BASELINE_SCHEDULE_KEYS), 13)
-        self.assertEqual(
-            TRANSFER_SCHEDULE_KEYS,
-            (
-                "ays_sd15_native",
-                "ays_sd15_log_sigma",
-                "gits_cifar10_native",
-                "gits_cifar10_log_sigma",
-                "ots_vp_linear_native",
-                "ots_vp_linear_log_sigma",
-            ),
-        )
-        self.assertNotIn("uniform_reversed", EXPERIMENTAL_REVERSED_SCHEDULE_KEYS)
-        self.assertEqual(EXPERIMENTAL_FIXED_SCHEDULE_KEYS[: len(BASELINE_SCHEDULE_KEYS)], BASELINE_SCHEDULE_KEYS)
-
-    def test_registry_exposes_active_baseline_matrix(self) -> None:
-        snapshot = paper_registry_snapshot()
-        self.assertEqual(MAIN_NFE_VALUES, (4, 8, 12, 16))
-        self.assertEqual(snapshot["main_nfe_values"], [4, 8, 12, 16])
-        self.assertEqual(runner.DEFAULT_TARGET_NFE_VALUES, (4, 8, 12, 16))
-        self.assertEqual(snapshot["baseline_schedule_keys"], list(BASELINE_SCHEDULE_KEYS))
-        solver_names = {spec.display_name for spec in paper_solver_specs()}
-        self.assertIn("Euler", solver_names)
-        self.assertIn("Heun / RK2", solver_names)
-        self.assertIn("Midpoint RK2", solver_names)
-        self.assertIn("DPM++2M", solver_names)
-
     def test_gico_docs_describe_active_density_path(self) -> None:
         text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
         lower = text.lower()
@@ -95,21 +42,6 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
             "flowts_power_sampling",
         ):
             self.assertNotIn(retired, lower)
-
-    def test_active_schedule_grids_have_endpoints(self) -> None:
-        for key in BASELINE_SCHEDULE_KEYS:
-            grid = build_schedule_grid(key, 4)
-            self.assertIsNotNone(grid, key)
-            self.assertEqual(len(grid), 5)
-            self.assertAlmostEqual(grid[0], 0.0)
-            self.assertAlmostEqual(grid[-1], 1.0)
-            self.assertTrue(all((right > left for left, right in zip(grid, grid[1:], strict=False))), key)
-
-    def test_active_schedule_grids_reject_non_positive_steps(self) -> None:
-        for key in BASELINE_SCHEDULE_KEYS:
-            for n_steps in (0, -1):
-                with self.assertRaisesRegex(ValueError, "n_steps must be positive"):
-                    build_schedule_grid(key, n_steps)
 
     def test_scheduler_cases_evaluate_uniform_first(self) -> None:
         args = runner.build_argparser().parse_args(["--baseline_scheduler_names", "ays_sd15_native,uniform"])
@@ -348,24 +280,6 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertAlmostEqual(runner._safe_relative_gain(3.0, 4.0), 0.25)
         self.assertAlmostEqual(by_schedule["ays"]["forecast_relative_crps_gain_vs_uniform"], 0.25)
         self.assertAlmostEqual(by_schedule["uniform"]["forecast_relative_crps_gain_vs_uniform"], 0.0)
-
-    def test_native_hardness_trace_is_info_growth(self) -> None:
-        self.assertEqual(NATIVE_INFO_GROWTH_TRACE_KEY, "info_growth_hardness_by_step")
-
-    def test_runner_dry_run_writes_combined_summary(self) -> None:
-        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
-        with tempfile.TemporaryDirectory() as tmpdir:
-            args = runner.build_argparser().parse_args(
-                ["--out_root", tmpdir, "--forecast_datasets", "", "--backbone_manifest", str(manifest)]
-            )
-            payload = runner.run_diffusion_flow_time_reparameterization(args)
-            summary = json.loads((Path(tmpdir) / "combined_summary.json").read_text(encoding="utf-8"))
-        self.assertEqual(payload["runner_mode"], "diffusion_flow_time_reparameterization")
-        self.assertEqual(summary["method_key"], "diffusion_flow_time_reparameterization")
-        retired_dataset_key = "lo" + "b_datasets"
-        self.assertNotIn(retired_dataset_key, summary)
-        self.assertIn("flowts_power_0p03", summary["baseline_schedule_keys"])
-        self.assertEqual(summary["transfer_schedule_keys"], list(TRANSFER_SCHEDULE_KEYS))
 
     def test_row_recorder_drops_stale_protocol_rows(self) -> None:
         manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"

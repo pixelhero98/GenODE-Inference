@@ -19,7 +19,7 @@ from genode.evaluation.fm_backbone_registry import (
     load_backbone_manifest,
     materialize_backbone_manifest,
 )
-from genode.schedule_transfer.otflow_paper_tables import augment_rows_with_relative_metrics
+from genode.evaluation.relative_metrics import augment_rows_with_relative_metrics
 
 FORECAST_KEYS = ("solar_energy_10m", "traffic_hourly", "weather_daily")
 

@@ -11,6 +11,7 @@ from genode.backbones.registry import get_image_backbone_spec
 from genode.gico.clocks import verify_measurement_clock
 from genode.gico.image_conditional_context import context_binding
 from genode.gico.image_objective import IMAGE_OBJECTIVE, IMAGE_TASKS, validate_image_rows
+from genode.gico.kid_objective import IMAGE_KID_OBJECTIVE
 
 
 def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float]], dict]:
@@ -28,10 +29,10 @@ def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float
     contexts, rows = {}, []
     for original in manifest["rows"]:
         row = dict(original)
-        if row.get("image_objective", {}).get("protocol") != IMAGE_OBJECTIVE:
-            raise ValueError(
-                "The image-fidelity interface requires paired LPIPS; use common fit for explicit KID evidence."
-            )
+        protocol = row.get("image_objective", {}).get("protocol")
+        if protocol not in (IMAGE_OBJECTIVE, IMAGE_KID_OBJECTIVE):
+            raise ValueError("Native image preparation requires paired LPIPS or paired image KID.")
+        metric = "lpips" if protocol == IMAGE_OBJECTIVE else "kid"
         if row.get("task", task) != task or row.get("backbone", backbone.model_key) != backbone.model_key:
             raise ValueError("Measured image task/backbone does not match its native context binding.")
         if row.get("solver") != "euler":
@@ -51,7 +52,11 @@ def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float
             backbone=backbone.model_key,
             context_id=context_id,
             source_context_id=source_context,
-            backbone_binding=binding,
+            backbone_binding=(
+                binding
+                if protocol == IMAGE_OBJECTIVE
+                else {**binding, "backbone": backbone.model_key, "clock_protocol": "density64-euler"}
+            ),
             context_protocol="native_context_paired_target_panel_v1",
         )
         if row.get("split") not in {"train", "calibration", "validation", "test"}:
@@ -61,10 +66,12 @@ def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float
     if not rows:
         raise ValueError("Image preparation requires nonempty measured rows.")
     validate_image_rows(rows)
+    protocol = rows[0]["image_objective"]["protocol"]
+    metric = "lpips" if protocol == IMAGE_OBJECTIVE else "kid"
     report_cells = defaultdict(lambda: defaultdict(list))
     for row in rows:
         key = tuple(row[key] for key in ("split", "solver", "nfe", "schedule_key"))
-        report_cells[key][row["source_context_id"]].append(float(row["metrics"]["lpips"]))
+        report_cells[key][row["source_context_id"]].append(float(row["metrics"][metric]))
     reports = []
     for key, classes in report_cells.items():
         if len(classes) != (1000 if task == "imagenet64" else 1):
@@ -72,7 +79,7 @@ def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float
         reports.append(
             {
                 **dict(zip(("split", "solver", "nfe", "schedule_key"), key, strict=True)),
-                "lpips": float(np.mean([np.mean(values) for values in classes.values()])),
+                metric: float(np.mean([np.mean(values) for values in classes.values()])),
             }
         )
     return (
@@ -80,9 +87,9 @@ def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float
         contexts,
         {
             "task": task,
-            "backbone_binding": binding,
-            "raw_metric": "lpips",
-            "protocol": IMAGE_OBJECTIVE,
+            "backbone_binding": rows[0]["backbone_binding"],
+            "raw_metric": metric,
+            "protocol": protocol,
             "image_objective": rows[0]["image_objective"],
             "context_protocol": "native_context_paired_target_panel_v1",
             "raw_metric_report": reports,

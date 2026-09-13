@@ -16,7 +16,7 @@ def report_fixture():
     calibration = calibrate_rewards(paired_rows())
     policy = SimpleNamespace(
         artifact_sha256="fixture-policy",
-        student_kind="stochastic",
+        student_kind="GICO-sto-policy",
         metadata={
             "split_contexts": {"train": ["train-a", "train-b"], "validation": ["validation-a"]},
             "solvers": ["euler"],
@@ -34,8 +34,18 @@ def report_fixture():
             schedule="late_p_3" if seed == 1 else "late_p_3_reversed",
             metrics={"crps": 1.0 if seed == 1 else 3.0, "mase": 1.0},
         )
-        candidate.update(schedule_key="policy", policy_sha256=policy.artifact_sha256, student_kind="stochastic")
+        candidate.update(
+            clock_seed=12,
+            clock_request_id=f"seed:{seed}:member:0",
+            schedule_key="policy",
+            policy_sha256=policy.artifact_sha256,
+            student_kind="GICO-sto-policy",
+        )
+        anchor["ensemble_size"] = candidate["ensemble_size"] = 1
         rows.extend([anchor, candidate])
+    policy.density = lambda context, solver, nfe, seed=0, request_id="": reference_densities(solver, nfe)[
+        "late_p_3" if request_id.startswith("seed:1") else "late_p_3_reversed"
+    ]
     return policy, calibration, rows
 
 
@@ -43,7 +53,7 @@ def test_stochastic_report_averages_repeated_metrics_before_log_with_each_clock_
     policy, calibration, rows = report_fixture()
     with pytest.raises(ValueError, match="density_mass"):
         construct_rewards(rows, calibration)
-    report = summarize_measurements(rows, policy)
+    report = summarize_measurements(rows, policy, contexts={"test-a": [0.0]})
     uniform = next(r for r in report["results"] if r["schedule"] == "uniform")
     candidate = next(r for r in report["results"] if r["schedule"] == "policy")
     expected = (
@@ -61,22 +71,65 @@ def test_stochastic_report_averages_repeated_metrics_before_log_with_each_clock_
     assert not report["selection_performed"]
 
 
+def test_report_collapses_paired_clock_replicates_before_log():
+    policy, _, rows = report_fixture()
+    repeated = []
+    for row in rows:
+        for replicate in range(2):
+            value = deepcopy(row)
+            value["clock_replicate"] = replicate
+            if row["schedule_key"] == "policy":
+                value["clock_request_id"] += f":replicate:{replicate}"
+                value["metrics"]["crps"] += 0.5 * (-1 if replicate == 0 else 1)
+            repeated.append(value)
+    expected = summarize_measurements(rows, policy, contexts={"test-a": [0.0]})
+    actual = summarize_measurements(repeated, policy, contexts={"test-a": [0.0]})
+    assert actual["results"] == expected["results"]
+    with pytest.raises(ValueError, match="incomplete or unpaired"):
+        summarize_measurements(repeated[:-1], policy, contexts={"test-a": [0.0]})
+    repeated[1]["metrics"]["crps"] += 0.1
+    with pytest.raises(ValueError, match="Repeated uniform"):
+        summarize_measurements(repeated, policy, contexts={"test-a": [0.0]})
+
+
 def test_ensemble_report_validates_every_member_clock_and_count():
     policy, _, rows = report_fixture()
     for row in rows:
-        clocks = [{"density_mass": row.pop("density_mass"), "time_grid": row.pop("time_grid")}]
+        row["ensemble_size"] = 3
+        clocks = [
+            {
+                "density_mass": row.pop("density_mass"),
+                "time_grid": row.pop("time_grid"),
+                "clock_seed": 12,
+                "clock_request_id": f"seed:{row['seed']}:member:0",
+            }
+        ]
         for key in ("late_p_2", "late_p_2_reversed"):
             mass = reference_densities("euler", 4)[key if row["schedule_key"] != "uniform" else "uniform"]
-            clocks.append({"density_mass": list(mass), "time_grid": list(materialize(mass, "euler", 4))})
+            clocks.append(
+                {
+                    "density_mass": list(mass),
+                    "time_grid": list(materialize(mass, "euler", 4)),
+                    "clock_seed": 12,
+                    "clock_request_id": f"seed:{row['seed']}:member:{len(clocks)}",
+                }
+            )
         row["sample_clocks"] = clocks
-    assert summarize_measurements(rows, policy)["results"]
+    lookup = {
+        c["clock_request_id"]: c["density_mass"]
+        for r in rows
+        if r["schedule_key"] == "policy"
+        for c in r["sample_clocks"]
+    }
+    policy.density = lambda context, solver, nfe, seed=0, request_id="": lookup[request_id]
+    assert summarize_measurements(rows, policy, contexts={"test-a": [0.0]})["results"]
     broken = deepcopy(rows)
     broken[1]["sample_clocks"].pop()
     with pytest.raises(ValueError, match="one clock per ensemble"):
-        summarize_measurements(broken, policy)
+        summarize_measurements(broken, policy, contexts={"test-a": [0.0]})
     rows[1]["sample_clocks"][2]["time_grid"][1] += 0.001
     with pytest.raises(ValueError, match="Measured clock differs"):
-        summarize_measurements(rows, policy)
+        summarize_measurements(rows, policy, contexts={"test-a": [0.0]})
 
 
 @pytest.mark.parametrize(
@@ -85,7 +138,7 @@ def test_ensemble_report_validates_every_member_clock_and_count():
         ("measurement_protocol", "changed-scorer", "measurement protocol"),
         ("backbone_binding", {"weights": "changed"}, "backbone binding"),
         ("policy_sha256", "other-policy", "policy identity"),
-        ("student_kind", "deterministic", "student kind"),
+        ("student_kind", "GICO-det-policy", "student kind"),
         ("context_id", "train-a", "overlap"),
     ],
 )
@@ -93,7 +146,7 @@ def test_report_rejects_incompatible_or_leaked_evidence(field, value, match):
     policy, _, rows = report_fixture()
     rows[1][field] = value
     with pytest.raises(ValueError, match=match):
-        summarize_measurements(rows, policy)
+        summarize_measurements(rows, policy, contexts={"test-a": [0.0]})
 
 
 def test_imagenet_report_uses_complete_equally_weighted_class_panels_as_uncertainty_units():
@@ -113,7 +166,7 @@ def test_imagenet_report_uses_complete_equally_weighted_class_panels_as_uncertai
     }
     policy.metadata["backbone_binding"] = rows[0]["backbone_binding"]
     policy.metadata["measurement_protocols"] = [rows[0]["measurement_protocol"]]
-    report = summarize_measurements(rows, policy)
+    report = summarize_measurements(rows, policy, contexts={"test-a": [0.0]})
     result = next(r for r in report["results"] if r["schedule"] == "late_p_3")
     assert result["paired_contexts"] == 1000
     assert result["independent_units"] == 1
@@ -124,4 +177,4 @@ def test_imagenet_report_uses_complete_equally_weighted_class_panels_as_uncertai
     assert report["uncertainty_unit"] == "paired_panel_mean_over_classes_and_replicates"
     rows = [r for r in rows if r["class_id"] != 999]
     with pytest.raises(ValueError, match="all 1000 classes"):
-        summarize_measurements(rows, policy)
+        summarize_measurements(rows, policy, contexts={"test-a": [0.0]})

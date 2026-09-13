@@ -27,6 +27,7 @@ from genode.gico.networks import (
 )
 from genode.gico.policy import GICO_PROTOCOL, load_policy, save_artifact
 from genode.gico.profiles import AUXILIARY_NORMALIZATION, TEMPERATURE_UNITS, resolve_profile
+from genode.gico.selection import teacher_fingerprint
 from genode.gico.training import SCORE_WEIGHTS, TrainingConfig, score_coefficient, teacher_loss, teacher_score
 from tests.selection_fixtures import evaluator_for, fixture_history
 from tests.test_unified_gico_rewards import reference_evidence
@@ -117,16 +118,16 @@ def test_sampling_is_replayable_and_independent_of_generation_rng():
         clock_generator(9, "")
 
 
-@pytest.mark.parametrize("kind", ["deterministic", "stochastic"])
+@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
 def test_teacher_score_has_finite_density_gradients_to_both_students_with_teacher_frozen(kind):
     teacher, deterministic, stochastic = models()
-    student = deterministic if kind == "deterministic" else stochastic
+    student = deterministic if kind == "GICO-det-policy" else stochastic
     teacher.eval().requires_grad_(False)
     teacher_before = {key: value.clone() for key, value in teacher.state_dict().items()}
     condition = torch.tensor([[0.1, 0.2, -0.3, 0.4, 0.5]])
     mass = (
         student(condition)
-        if kind == "deterministic"
+        if kind == "GICO-det-policy"
         else student.sample(condition, innovations=torch.linspace(-1, 1, 63)[None])
     )
     mass.retain_grad()
@@ -208,7 +209,7 @@ def untrained_artifact(tmp_path_factory):
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(23)
         teacher = DensityTeacher(config)
-        students = {"deterministic": DeterministicStudent(config), "stochastic": StochasticStudent(config)}
+        students = {"GICO-det-policy": DeterministicStudent(config), "GICO-sto-policy": StochasticStudent(config)}
     metadata = {
         "task": evidence.task,
         "backbone": evidence.backbone,
@@ -237,6 +238,7 @@ def untrained_artifact(tmp_path_factory):
             **fixture_history(students, evidence, rows, contexts),
             "teacher": [{"step": 100, "temperature": 0.05, "regret": 0.1}],
             "teacher_selection": {"step": 100, "temperature": 0.05, "regret": 0.1},
+            "teacher_selection_fingerprint": teacher_fingerprint(teacher, evidence.conditioning, 100, 0.05),
         },
     }
     root = tmp_path_factory.mktemp("untrained-artifact") / "policy"
@@ -287,21 +289,21 @@ def test_reuse_bypasses_teacher_fitting_and_records_source(untrained_artifact, m
     teacher, students, history = training.fit_models(
         evidence,
         config,
-        student_kind="stochastic",
+        student_kind="GICO-sto-policy",
         device="cpu",
         teacher_artifact=root,
         selection_evaluator=evaluator_for(*reference_evidence()),
     )
-    assert set(students) == {"stochastic"}
+    assert set(students) == {"GICO-sto-policy"}
     assert history["teacher_selection"]["temperature"] == 0.05
-    assert history["student_selection"]["stochastic"]["step"] == 2
+    assert history["student_selection"]["GICO-sto-policy"]["step"] == 2
     assert history["teacher_source_artifact_sha256"] == hashlib.sha256(before).hexdigest()
     for key, value in original.state_dict().items():
         torch.testing.assert_close(value, teacher.state_dict()[key], atol=0, rtol=0)
     assert before == (root / "policy.pt").read_bytes()
 
 
-@pytest.mark.parametrize("kind", ["deterministic", "stochastic"])
+@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
 def test_standalone_artifact_roundtrip_without_loading_teacher(untrained_artifact, kind):
     root, _, students, evidence = untrained_artifact
     condition = torch.tensor(evidence.conditioning.transform([1, 2], "euler", 4)[None])
@@ -309,7 +311,7 @@ def test_standalone_artifact_roundtrip_without_loading_teacher(untrained_artifac
     with torch.inference_mode():
         expected = (
             students[kind](condition)
-            if kind == "deterministic"
+            if kind == "GICO-det-policy"
             else students[kind].sample(condition, generator=clock_generator(31, "trajectory-6"))
         )
     with patch(
@@ -338,6 +340,46 @@ def corrupt_payload(source, destination, change):
         "policy_sha256": hashlib.sha256((destination / "policy.pt").read_bytes()).hexdigest(),
     }
     (destination / "manifest.json").write_text(json.dumps(manifest))
+
+
+@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
+def test_existing_v6_student_replay_does_not_require_new_teacher_proof(untrained_artifact, tmp_path, kind):
+    from genode.gico.policy import load_teacher
+
+    root, *_ = untrained_artifact
+    path = tmp_path / "old-teacher"
+    corrupt_payload(root, path, lambda p: p["metadata"]["history"].pop("teacher_selection_fingerprint"))
+    assert load_policy(path, student_kind=kind).student_kind == kind
+    with pytest.raises(ValueError, match="selected-weight fingerprint"):
+        load_teacher(path)
+
+
+@pytest.mark.parametrize("mutation", ["weights", "history", "clock_scope"])
+def test_teacher_proof_and_clock_scope_reject_tampering(untrained_artifact, tmp_path, mutation):
+    from genode.gico.policy import load_teacher
+
+    root, *_ = untrained_artifact
+    path = tmp_path / "tampered-teacher"
+
+    def change(payload):
+        if mutation == "weights":
+            key = next(iter(payload["teacher"]))
+            payload["teacher"][key].add_(0.1)
+        elif mutation == "history":
+            payload["metadata"]["history"]["teacher"].append({"step": 1, "temperature": 0.05, "regret": -1.0})
+        else:
+            payload["metadata"]["clock_scope"] = "per_horizon"
+
+    corrupt_payload(root, path, change)
+    with pytest.raises(ValueError):
+        load_teacher(path)
+
+
+@pytest.mark.parametrize("kind", ["deterministic", "stochastic", "gico-deterministic"])
+def test_old_public_selector_aliases_are_rejected(untrained_artifact, kind):
+    root, *_ = untrained_artifact
+    with pytest.raises(ValueError):
+        load_policy(root, student_kind=kind)
 
 
 def test_artifact_checksum_and_old_versions_are_rejected(untrained_artifact, tmp_path):
@@ -414,30 +456,19 @@ def test_teacher_loader_rejects_invalid_profile_or_normalizer(untrained_artifact
         load_teacher(damaged)
 
 
-def test_v5_allows_teacher_only_reuse_without_relabelling_students(untrained_artifact, tmp_path):
+def test_v5_requires_archived_runtime(untrained_artifact, tmp_path):
     from genode.gico.policy import load_teacher
 
-    root, teacher, _, _ = untrained_artifact
+    root, *_ = untrained_artifact
     old = tmp_path / "v5"
-
-    def change(payload):
-        payload["protocol"] = "genode-gico-v5"
-        profile = payload["metadata"]["fitting_profile"]
-        profile.pop("score_schedule")
-        profile.pop("selection_clock_replicates")
-        payload["metadata"]["student_selection_criterion"] = "post_ramp_validation_distillation"
-
-    corrupt_payload(root, old, change)
-    manifest = json.loads((old / "manifest.json").read_text())
+    shutil.copytree(root, old)
+    manifest_path = old / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
     manifest["protocol"] = "genode-gico-v5"
-    (old / "manifest.json").write_text(json.dumps(manifest))
-    before = (old / "policy.pt").read_bytes()
-    restored, _, _ = load_teacher(old)
-    for key, value in teacher.state_dict().items():
-        torch.testing.assert_close(restored.state_dict()[key], value)
-    assert (old / "policy.pt").read_bytes() == before
-    with pytest.raises(ValueError, match="Unsupported artifact version"):
-        load_policy(old)
+    manifest_path.write_text(json.dumps(manifest))
+    for loader in (load_teacher, load_policy):
+        with pytest.raises(ValueError, match="Unsupported artifact version"):
+            loader(old)
 
 
 def test_selected_measurements_bind_actual_student_parameters(untrained_artifact, tmp_path):
@@ -452,7 +483,7 @@ def test_selected_measurements_bind_actual_student_parameters(untrained_artifact
         load_policy(damaged)
 
 
-@pytest.mark.parametrize("kind", ("deterministic", "stochastic"))
+@pytest.mark.parametrize("kind", ("GICO-det-policy", "GICO-sto-policy"))
 def test_prompt_teacher_global_student_artifact_roundtrip(untrained_artifact, tmp_path, kind):
     from dataclasses import replace
 

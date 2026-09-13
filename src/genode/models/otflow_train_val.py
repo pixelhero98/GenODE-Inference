@@ -1,4 +1,4 @@
-"""Shared training, deterministic seeding and continuation for OTFlow backbones."""
+"""Shared training and deterministic seeding for OTFlow backbones."""
 
 from __future__ import annotations
 
@@ -250,13 +250,6 @@ def _model_prediction_horizon(model: torch.nn.Module) -> int:
     if model_cfg is None:
         return 1
     return int(max(1, int(getattr(model_cfg, "prediction_horizon", 1))))
-
-
-def _model_snapshot_dim(model: torch.nn.Module, context_dim: int) -> int:
-    model_cfg = getattr(model, "cfg", None)
-    if model_cfg is None:
-        return int(context_dim)
-    return int(getattr(model_cfg, "snapshot_dim", int(context_dim)))
 
 
 def _build_scheduler(opt: torch.optim.Optimizer, cfg: OTFlowConfig, total_steps: int):
@@ -532,90 +525,6 @@ def train_loop(
     return model.eval()
 
 
-@torch.no_grad()
-def generate_continuation(
-    model: torch.nn.Module,
-    hist: torch.Tensor,
-    cond_seq: torch.Tensor | None,
-    steps: int,
-    nfe: int,
-    future_context_seq: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Continuation in normalized param space.
-
-    Autoregressive models sample one next state per solve. Non-autoregressive
-    OTFlow models sample a future block and advance the rollout by that block.
-    """
-    B, H, D = hist.shape
-    model_cfg = getattr(model, "cfg", None)
-    context_len = resolve_context_length(H, horizon=steps, cfg=model_cfg)
-    x_hist = crop_history_window(hist, context_len).clone()
-    out = []
-    snapshot_dim = _model_snapshot_dim(model, context_dim=D)
-    extra_dim = max(0, int(D) - int(snapshot_dim))
-    if extra_dim > 0 and future_context_seq is None:
-        uses_time_context = bool(
-            getattr(model_cfg, "use_time_features", False) or getattr(model_cfg, "use_time_gaps", False)
-        )
-        if not uses_time_context:
-            raise ValueError(
-                "Continuation with context_dim > snapshot_dim requires explicit future_context_seq. Use a domain-specific rollout path for non-temporal augmented contexts."
-            )
-    if (
-        extra_dim > 0
-        and future_context_seq is not None
-        and (
-            future_context_seq.shape[0] != B
-            or future_context_seq.shape[1] < int(steps)
-            or future_context_seq.shape[2] != extra_dim
-        )
-    ):
-        raise ValueError(
-            f"future_context_seq must have shape [B, steps, context_extra_dim] with B={B}, steps>={int(steps)}, context_extra_dim={extra_dim}; got {tuple(future_context_seq.shape)}."
-        )
-
-    def _append_context_features(block: torch.Tensor, cursor: int, take: int) -> torch.Tensor:
-        if extra_dim <= 0:
-            return block
-        if future_context_seq is None:
-            raise ValueError("future_context_seq is required when context_dim exceeds snapshot_dim.")
-        extra = future_context_seq[:, int(cursor) : int(cursor) + int(take), :].to(
-            device=block.device, dtype=block.dtype
-        )
-        return torch.cat([block, extra], dim=-1)
-
-    prediction_horizon = _model_prediction_horizon(model)
-    if prediction_horizon > 1:
-        cursor = 0
-        while cursor < int(steps):
-            cond_t = cond_seq[:, cursor, :] if cond_seq is not None else None
-            if isinstance(model, OTFlow):
-                if not hasattr(model, "sample_future"):
-                    raise RuntimeError("Non-autoregressive OTFlow requires sample_future(...).")
-                x_block = model.sample_future(x_hist, cond=cond_t, steps=nfe)
-            else:
-                raise RuntimeError("Non-autoregressive continuation is currently implemented for OTFlow only.")
-            take = min(int(prediction_horizon), int(steps) - int(cursor))
-            block_slice = x_block[:, :take, :]
-            out.append(block_slice)
-            hist_block = _append_context_features(block_slice, cursor=cursor, take=take)
-            x_hist = torch.cat([x_hist, hist_block], dim=1)
-            x_hist = crop_history_window(x_hist, context_len)
-            cursor += int(take)
-        return torch.cat(out, dim=1)
-    for k in range(steps):
-        cond_t = cond_seq[:, k, :] if cond_seq is not None else None
-        if isinstance(model, OTFlow):
-            x_next = model.sample(x_hist, cond=cond_t, steps=nfe)
-        else:
-            raise RuntimeError("Generation is implemented for OTFlow only.")
-        out.append(x_next[:, None, :])
-        hist_step = _append_context_features(x_next[:, None, :], cursor=k, take=1)
-        x_hist = torch.cat([x_hist, hist_step], dim=1)
-        x_hist = crop_history_window(x_hist, context_len)
-    return torch.cat(out, dim=1)
-
-
 def save_json(obj: dict[str, Any], path: str):
 
     def _conv(x):
@@ -640,7 +549,6 @@ __all__ = [
     "capture_rng_state",
     "crop_history_window",
     "evaluate_average_loss",
-    "generate_continuation",
     "make_loader",
     "resolve_context_length",
     "restore_rng_state",

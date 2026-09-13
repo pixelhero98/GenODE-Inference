@@ -15,15 +15,13 @@ def _digest(value) -> bool:
 
 
 def validate_image_objective(objective: dict) -> None:
-    from genode.gico.kid_objective import KID_OBJECTIVE, validate_kid_objective
+    from genode.gico.kid_objective import KID_PROTOCOLS, validate_kid_objective
 
-    if isinstance(objective, dict) and objective.get("protocol") == KID_OBJECTIVE:
+    if isinstance(objective, dict) and objective.get("protocol") in KID_PROTOCOLS:
         validate_kid_objective(objective)
         return
     if not isinstance(objective, dict) or objective.get("protocol") != IMAGE_OBJECTIVE:
-        raise ValueError(
-            "Image policies require paired-lpips-v1; historical KID evidence/artifacts need their original runtime."
-        )
+        raise ValueError("Image policies require an explicit paired-lpips-v1 or supported KID objective.")
     target, scorer = objective.get("target_generator", {}), objective.get("lpips", {})
     if (
         not target.get("backbone")
@@ -58,9 +56,9 @@ def validate_image_rows(rows: list[dict]) -> None:
         return
     objective = image_rows[0].get("image_objective")
     validate_image_objective(objective)
-    from genode.gico.kid_objective import KID_OBJECTIVE, validate_kid_rows
+    from genode.gico.kid_objective import KID_PROTOCOLS, validate_kid_rows
 
-    if objective["protocol"] == KID_OBJECTIVE:
+    if objective["protocol"] in KID_PROTOCOLS:
         validate_kid_rows(image_rows, objective)
         return
     splits, targets, contexts = {}, {}, {}
@@ -75,7 +73,10 @@ def validate_image_rows(rows: list[dict]) -> None:
             and binding.get("checkpoint_sha256") != objective["target_generator"]["checkpoint_sha256"]
         ):
             raise ValueError("Candidate and target generator checkpoint SHA-256 identities differ.")
-        if any(key in row for key in ("reward_metrics", "reward_estimator", "jackknife_kid")):
+        if "kid" in row.get("metrics", {}) or any(
+            key in row
+            for key in ("sample_block", "reference_block", "reward_metrics", "reward_estimator", "jackknife_kid")
+        ):
             raise ValueError("KID reward overrides are incompatible with paired LPIPS.")
         metric = row.get("metrics", {}).get("lpips", np.nan)
         if not np.isfinite(metric) or metric < 0:

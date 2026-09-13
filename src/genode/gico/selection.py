@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from genode.gico.clocks import materialize, verify_measurement_clock
+from genode.gico.codec import wire_role
 from genode.gico.conditioning import Conditioning
 from genode.gico.evidence import Evidence, content_hash
 from genode.gico.image_objective import validate_image_rows
@@ -28,6 +29,44 @@ def state_fingerprint(model) -> str:
             for key, value in model.state_dict().items()
         }
     )
+
+
+def teacher_fingerprint(model, conditioning, step, temperature):
+    return content_hash(
+        {
+            "state": state_fingerprint(model),
+            "conditioning": conditioning.to_payload(),
+            "step": step,
+            "temperature": temperature,
+        }
+    )
+
+
+def validate_teacher_selection(model, conditioning, metadata):
+    """Require measured selection and a binding to the actual selected teacher."""
+    from genode.gico.training import selection_key
+
+    history, profile = metadata["history"], metadata["fitting_profile"]
+    records = history.get("teacher", [])
+    selected = history.get("teacher_selection", {})
+    if not records or any(
+        type(r.get("step")) is not int
+        or not 1 <= r["step"] <= profile["teacher_steps"]
+        or r.get("temperature") not in profile["temperatures"]
+        or not np.isfinite(r.get("regret", np.nan))
+        for r in records
+    ):
+        raise ValueError("Teacher requires finite measured checkpoint/temperature selection history.")
+    best = min(
+        records, key=lambda r: selection_key(r["regret"], r["temperature"], r["step"], profile["preferred_temperature"])
+    )
+    if selected != best or selected["temperature"] != metadata["selected_temperature"]:
+        raise ValueError("Teacher was not selected by minimum held-out reference regret.")
+    expected = teacher_fingerprint(model, conditioning, selected["step"], selected["temperature"])
+    if history.get("teacher_selection_fingerprint") != expected:
+        raise ValueError(
+            "Teacher reuse requires a selected-weight fingerprint; use the original runtime for older teachers."
+        )
 
 
 @dataclass(frozen=True)
@@ -52,14 +91,19 @@ class StudentCandidate:
 
 def candidate_fingerprint(model, conditioning, kind, step):
     return content_hash(
-        {"state": state_fingerprint(model), "conditioning": conditioning.to_payload(), "kind": kind, "step": step}
+        {
+            "state": state_fingerprint(model),
+            "conditioning": conditioning.to_payload(),
+            "kind": wire_role(kind),
+            "step": step,
+        }
     )
 
 
 def _check_clock(row, candidate, context, identities):
     if (
         row["schedule_key"] == "student"
-        and candidate.student_kind == "stochastic"
+        and candidate.student_kind == "GICO-sto-policy"
         and row["ensemble_size"] > 1
         and "sample_clocks" not in row
     ):
@@ -72,16 +116,12 @@ def _check_clock(row, candidate, context, identities):
         if row["schedule_key"] == "uniform":
             expected = np.full(64, 1 / 64)
         else:
-            if candidate.student_kind == "stochastic" and (
+            if candidate.student_kind == "GICO-sto-policy" and (
                 type(clock.get("clock_seed")) is not int or not clock.get("clock_request_id")
             ):
                 raise ValueError("Stochastic selection requires replayable, independent clock RNG identities.")
-            if candidate.student_kind == "stochastic":
+            if candidate.student_kind == "GICO-sto-policy":
                 identity = (
-                    row["context_id"],
-                    row["solver"],
-                    row["nfe"],
-                    row["seed"],
                     clock["clock_seed"],
                     clock["clock_request_id"],
                 )
@@ -114,7 +154,7 @@ def measured_utility(
         )
         for group in evidence.groups("validation")
     }
-    count = clock_replicates if candidate.student_kind == "stochastic" else 1
+    count = clock_replicates if candidate.student_kind == "GICO-sto-policy" else 1
     measurements = defaultdict(dict)
     identities = set()
     for row in rows:

@@ -69,6 +69,12 @@ def prepare_evidence(
     from genode.gico.image_objective import IMAGE_TASKS, validate_image_rows
 
     validate_image_rows(all_rows)
+    if task == "imagenet64" and purpose == "research":
+        panels = defaultdict(set)
+        for row in all_rows:
+            panels[(row["split"], row["panel_id"], row["solver"], row["nfe"], row["schedule_key"])].add(row["class_id"])
+        if any(classes != set(range(1000)) for classes in panels.values()):
+            raise ValueError("Research ImageNet evidence requires complete 1000-class panels.")
     if task.startswith("molecule_"):
         from genode.evaluation.molecule_energy import MoleculeFeatureMap
 

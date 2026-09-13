@@ -10,7 +10,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from genode.backbone_packages import apply_backbone_package_to_args, validate_provided_backbone_manifest
+from genode.backbone_manifest import validate_provided_backbone_manifest
 from genode.canonical_experiment_layout import (
     CANONICAL_CHECKPOINT_STEPS,
     CANONICAL_CONTEXT_SAMPLE_COUNT,
@@ -215,9 +215,6 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[Stag
 
 def run_full_pipeline(args: argparse.Namespace) -> dict[str, object]:
     scenario_family_for_key(args.scenario_key)
-    if args.backbone_package_root:
-        apply_backbone_package_to_args(args)
-        args.use_provided_backbones = True
     stages = _effective_stage_names(args)
     if args.use_provided_backbones and not args.dry_run:
         validation = validate_provided_backbone_manifest(
@@ -293,10 +290,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--backbone_manifest", default=str(default_backbone_manifest_path()))
     parser.add_argument("--molecule_group_root", default=str(default_molecule_group_root()))
     parser.add_argument("--molecule_backbone_root", default=str(project_outputs_root() / "molecule_3d_backbones"))
-    parser.add_argument("--backbone_package_root", default="")
     parser.add_argument("--use_provided_backbones", action="store_true")
     parser.add_argument("--gico-config", default="")
-    parser.add_argument("--student-kind", choices=("deterministic", "stochastic", "both"), default="both")
+    parser.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy", "both"), default="both")
     parser.add_argument("--teacher-score-weight", type=float, choices=(0.01, 0.05, 0.1), default=0.01)
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--resume", action="store_true")

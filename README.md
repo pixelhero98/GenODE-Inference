@@ -29,7 +29,7 @@ Pair each candidate and uniform anchor on context, backbone, solver, NFE, genera
 
 Positive errors use `log((anchor + epsilon) / (candidate + epsilon))`, where each frozen numerical floor is `1e-6 * median(positive uniform calibration values)`. Reject degenerate calibration. After component scalarization, divide by a single frozen reward standard deviation for each task/backbone/solver, balancing calibration contributions across training NFEs. Do not subtract a mean or use per-context or running normalization. Uniform rewards remain exactly zero. Text-to-image component scales use pilot measurements; its scalar scale uses training measurements.
 
-Small-image GICO-TF uses raw LPIPS differences, not log ratios. The reward scale is frozen on training evidence with equal NFE/class weight. VGG-LPIPS matches the pinned comparator preprocessing; FID50k evaluates the resulting distribution independently. KID remains an optional distributional diagnostic, outside policy fitting. Lower LPIPS does not establish better FID. See [paired image supervision](docs/image-supervision.md) for identities, selection and compatibility.
+Small-image GICO-TF uses raw LPIPS differences, not log ratios. The reward scale is frozen on training evidence with equal NFE/class weight. VGG-LPIPS matches the pinned comparator preprocessing; FID50k evaluates the resulting distribution independently. The distinct `paired-image-kid-v1` objective supports native CIFAR/ImageNet distributional fitting with raw unbiased KID, including negative estimates. The frozen BézierFlow `paired-cifar-kid-v1` objective remains separate. Complete generated/reference blocks and split isolation are required; LPIPS and KID evidence cannot be mixed. Lower LPIPS does not establish better FID. See [paired image supervision](docs/image-supervision.md) for identities, selection and compatibility.
 
 The molecular primary reward is 40% Kabsch RMSD log improvement and 15% each for ensemble velocity, ensemble acceleration, rollout velocity and rollout acceleration norm-Wasserstein discrepancies. Metric weights apply to teacher ranking, regression, reference weighting, auxiliary scoring and reports. The fair finite-ensemble energy estimator remains a diagnostic:
 
@@ -58,9 +58,9 @@ Teacher updates average up to 64 distinct comparison groups; student updates ave
 
 | Profile | Teacher/student steps | Dropout | Score coefficient | Initial reference temperature |
 |---|---:|---:|---:|---:|
-| Forecasting, molecules | 500 / 500 | 0.05 | 0.01 | 0.05 |
-| SANA, SD1.5 | 500 / 500 | 0.05 | 0.05 | 0.05 |
-| CIFAR-10, ImageNet-64 | 2,000 / 2,000 | 0 | 0.01 | 1 |
+| Forecasting, molecules | 2,000 / 2,000 | 0.01 | 0.01 | 0.05 |
+| SANA, SD1.5 | 2,000 / 2,000 | 0.01 | 0.05 | 0.05 |
+| CIFAR-10, ImageNet-64 | 2,000 / 2,000 | 0 | 0.01 | 0.05 |
 
 Transformer AdamW defaults to learning rate 0.001 and weight decay 0.0001. Teacher and student learning rates, step limits, batch sizes and checkpoint intervals are independently configurable. Task identity comes from the evidence. All resolved settings are recorded; architecture sharing does not imply one validated temperature for every task.
 
@@ -78,8 +78,8 @@ The common interface accepts JSON configuration:
   "output": "policy",
   "student_kind": "both",
   "teacher_score_weight": 0.01,
-  "teacher_steps": 500,
-  "student_steps": 500,
+  "teacher_steps": 2000,
+  "student_steps": 2000,
   "teacher_batch_groups": 64,
   "student_batch_contexts": 512,
   "microbatch_contexts": 8,
@@ -87,7 +87,7 @@ The common interface accepts JSON configuration:
   "student_learning_rate": 0.001,
   "teacher_checkpoint_every": 100,
   "student_checkpoint_every": 100,
-  "temperatures": [0.025, 0.05, 0.1],
+  "temperatures": [0.05, 0.1, 0.5],
   "preferred_temperature": 0.05,
   "seed": 0,
   "device": "cuda",
@@ -95,7 +95,7 @@ The common interface accepts JSON configuration:
 }
 ```
 
-Before fitting, add the task-specific [held-out utility evaluator](docs/student-selection.md#evaluator-contract) to this configuration. Top-level paths are relative to the configuration file. Each measurement row contains `task`, `backbone`, `solver`, integer `nfe`, `context_id`, explicit `split`, integer `seed`, `ensemble_size`, `reference_id`, `measurement_protocol`, `schedule_key`, `metrics`, 64 `density_mass` entries, and the executed `time_grid`. Metric keys are `crps/mase`, `lpips`, or `preference/alignment`; molecular keys are `kabsch_rmsd_3d`, `ensemble_velocity_norm_w1`, `ensemble_acceleration_norm_w1`, `rollout_velocity_norm_w1`, and `rollout_acceleration_norm_w1`. Training input contains disjoint `train` and `validation` contexts; calibration contains only `train` or `calibration`. Locked-test rows are forbidden during fitting. Store native contexts with `save_context_embedding_table`.
+Before fitting, add a [built-in held-out utility evaluator](docs/evaluators.md) to this configuration. Top-level paths are relative to the configuration file. Each measurement row contains `task`, `backbone`, `solver`, integer `nfe`, `context_id`, explicit `split`, integer `seed`, `ensemble_size`, `reference_id`, `measurement_protocol`, `schedule_key`, `metrics`, 64 `density_mass` entries, and the executed `time_grid`. Metric keys are `crps/mase`, `lpips` or `kid` under the declared image objective, or `preference/alignment`; molecular keys are `kabsch_rmsd_3d`, `ensemble_velocity_norm_w1`, `ensemble_acceleration_norm_w1`, `rollout_velocity_norm_w1`, and `rollout_acceleration_norm_w1`. Training input contains disjoint `train` and `validation` contexts; calibration contains only `train` or `calibration`. Locked-test rows are forbidden during fitting. Store native contexts with `save_context_embedding_table`.
 
 Research molecular rows also carry the frozen `molecule_feature_map` dictionary from `MoleculeFeatureMap.to_dict()`. It is recorded in the policy artifact and checked against runtime reference geometry.
 
@@ -107,7 +107,7 @@ genode-train-gico --config train.json --student-kind both --teacher-score-weight
 Research evidence requires all 25 references in every cell. Explicit `purpose: functional` permits a reduced reference set for integration checks; it does not produce benchmark evidence. Checkpoints are selected using validation evidence and the profile-specific teacher density-family holdout. Output directories must be new.
 
 To compare students using an existing frozen teacher, add `"teacher_artifact": "previous-policy"`
-to the common training configuration (or pass `teacher_artifact` to `fit`). This skips teacher
+to the common training configuration (or pass `teacher_artifact` to `fit`). Public reuse requires selected-teacher weight/conditioning/step/temperature proof and a matching minimum-regret history entry. This skips teacher
 fitting and reuses its selected weights and temperature. Evidence, reward calibration, teacher
 conditioning and teacher fitting settings must match the source artifact; student conditioning
 and fitting settings can differ. The output records the source artifact checksum and inherited
@@ -117,7 +117,7 @@ student memory requirements without changing the effective batch or inherited te
 ```python
 from genode.gico.policy import load_policy
 
-policy = load_policy("policy", student_kind="stochastic", expected_backbone="checkpoint-sha")
+policy = load_policy("policy", student_kind="GICO-sto-policy", expected_backbone="checkpoint-sha")
 grid = policy.materialize(native_context, "euler", 8, seed=412, request_id="example:member:0")
 ```
 
@@ -155,9 +155,9 @@ BO, PG, and LD3 remain separate comparison methods. Completed experiments remain
 
 ## Artifacts and validation
 
-Protocol `genode-gico-v6` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, resolved fitting profiles, explicit metric weights, dropout, temperature units, normalization/selection protocols, selected steps and realized coefficients, and fitting history. Incompatible old artifacts are rejected; there is no legacy architecture loader.
+Protocol `genode-gico-v6` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, resolved fitting profiles, explicit metric weights, dropout, temperature units, normalization/selection protocols, selected steps and realized coefficients, and fitting history. Existing valid v6 student artifacts remain loadable through the explicit role codec. Public selectors are `GICO-det-policy` and `GICO-sto-policy`; `both` fits both. Old selector aliases are rejected. Serialized v6 role keys and fingerprint inputs remain stable. All v5 loading and older teachers lacking selection proof require their archived runtimes. Recorded clock scope must describe one complete clock per generated trajectory.
 
-`genode-report-gico-locked-test` applies an artifact's frozen calibration to paired test measurements without selection. `genode-evaluate-schedule-summary` performs the analogous validation report. Both require new output files and matching frozen measurement protocols, native backbone bindings, and molecular feature maps. Supply `policy_sha256` and `student_kind` for learned-policy measurements.
+`genode-report-gico-locked-test` applies an artifact's frozen calibration to paired test measurements without selection. `genode-evaluate-schedule-summary` performs the analogous validation report. Both require new output files and matching frozen measurement protocols, native backbone bindings, and molecular feature maps. Supply `policy_sha256` and `student_kind` for learned-policy measurements and `--contexts contexts.npz` for exact selected-policy clock replay. Stochastic rows require distinct `clock_seed`/`clock_request_id` pairs for each generated member and replicate. Explicit non-GICO comparisons use `measurement_role: "baseline"`.
 
 Evaluation rows can carry a fixed `density_mass`/`time_grid` pair or `sample_clocks`, a list containing one such pair per ensemble member. This supports independently sampled stochastic clocks while averaging repeated terminal measurements before constructing log improvements. Forecast evaluators export `sample_clocks`; molecular evaluators export the same pairs with rollout provenance in `sample_clock_records`. Training reference clocks remain fixed across repeats.
 
@@ -172,7 +172,7 @@ python -m build
 git diff --check
 ```
 
-Tests cover paired rewards, split isolation, geometric energy scoring, causal stochastic sampling, teacher-input gradients, density decoding, solver accounting, artifact integrity, and active task routing. External-asset functional checks and their environment-specific instructions belong outside the public package. Fixture coverage alone does not validate a pretrained generator or establish quality gains.
+Tests cover paired rewards, split isolation, geometric energy scoring, causal stochastic sampling, teacher-input gradients, density decoding, solver accounting, artifact integrity, and active task routing. Portable functional examples are in [examples](docs/examples.md); actual assets and environment-specific operators remain external. Fixture coverage alone does not validate a pretrained generator or establish quality gains.
 
 ### Controlled fitting options
 
@@ -198,7 +198,7 @@ Temperature candidates, preferred temperature, teacher-score weight, dropout,
 learning rates and horizons remain profile-specific, with explicit run overrides.
 For example, a SANA configuration can set `teacher_context_mode: "native"`,
 `student_context_mode: "global"`, `teacher_score_weight: 0.05`,
-`temperatures: [0.025, 0.05, 0.1]`, and `preferred_temperature: 0.05`.
+`temperatures: [0.05, 0.1, 0.5]`, and `preferred_temperature: 0.05`.
 Select on held-out selection contexts and freeze before confirmation. These
 architectural choices do not themselves establish better utility or generalization.
 Historical v4 artifacts require their originating runtime and are not upgraded.
@@ -215,9 +215,9 @@ times must match; interval ratios use `r`, not diffusion time or log-SNR.
 {
   "backbone": "sd15",
   "solver": "ipndm_v",
-  "source": "/path/to/pinned/LD3",
+  "source": "assets/LD3",
   "source_revision": "ec1bf603fb19696966ca30198ed209ae6488a3e5",
-  "asset_manifest": "/path/to/asset-manifest.json"
+  "asset_manifest": "assets/asset-manifest.json"
 }
 ```
 

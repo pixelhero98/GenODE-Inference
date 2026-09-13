@@ -51,7 +51,7 @@ class StubSampler(torch.nn.Module):
 
 class RecordingPolicy:
     artifact_sha256 = "fixture-policy"
-    student_kind = "stochastic"
+    student_kind = "GICO-sto-policy"
 
     def __init__(self, task):
         self.metadata = {"task": task, "backbone": "fixture-backbone"}
@@ -109,10 +109,10 @@ def test_molecular_member_clock_sampled_once_reused_and_restored(fail):
             "density_mass": np.r_[np.full(32, 3 / 128), np.full(32, 1 / 128)].tolist(),
             "time_grid": list(materialize(np.r_[np.full(32, 3 / 128), np.full(32, 1 / 128)], "heun", 4)),
             "clock_seed": 5,
-            "request_id": "member:0",
+            "clock_request_id": "member:0",
             "generation_seed": 77,
             "policy_sha256": "fixture-policy",
-            "student_kind": "stochastic",
+            "student_kind": "GICO-sto-policy",
             "solver": "heun",
             "nfe_per_horizon": 4,
             "trajectory_nfe": 12,
