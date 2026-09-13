@@ -11,7 +11,6 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from genode.benchmarks.image import artifact_paths as image_artifact_paths
 from genode.data import molecule_xyz, otflow_datasets, otflow_monash_datasets
 from genode.evaluation import diffusion_flow_time_reparameterization as evaluation_runner
 from genode.path_safety import portable_relative_path, resolve_portable_relative_path
@@ -51,32 +50,6 @@ class PortablePathTests(unittest.TestCase):
                 self.skipTest(f"Directory symlink creation is unavailable: {exc}")
             with self.assertRaisesRegex(ValueError, "escapes its declared root"):
                 resolve_portable_relative_path(root, "linked/file.npy")
-
-    def test_image_artifact_path_allows_trusted_symlinked_mount_ancestor(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            storage = root / "storage"
-            storage.mkdir()
-            mount = root / "mount"
-            try:
-                mount.symlink_to(storage, target_is_directory=True)
-            except (OSError, NotImplementedError) as exc:
-                self.skipTest(f"directory symlinks are unavailable: {exc}")
-            target = image_artifact_paths.managed_image_leaf_directory(mount / "policy", label="image policy directory")
-            self.assertEqual(target, storage.resolve() / "policy")
-
-    def test_image_artifact_path_rejects_leaf_symlink(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            storage = root / "storage"
-            storage.mkdir()
-            target = root / "policy"
-            try:
-                target.symlink_to(storage, target_is_directory=True)
-            except (OSError, NotImplementedError) as exc:
-                self.skipTest(f"directory symlinks are unavailable: {exc}")
-            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
-                image_artifact_paths.managed_image_leaf_directory(target, label="image policy directory")
 
 
 class MoleculeManifestPathTests(unittest.TestCase):

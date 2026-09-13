@@ -389,7 +389,7 @@ class BackboneMatrixTests(unittest.TestCase):
                 "train_budget_label": "20k",
                 "target_nfe": 10,
                 "solver_key": "euler",
-                "schedule_name": "uniform",
+                "scheduler_key": "uniform",
                 "forecast_crps": 5.0,
                 "experiment_scope": "main",
             },
@@ -403,7 +403,7 @@ class BackboneMatrixTests(unittest.TestCase):
                 "train_budget_label": "4k",
                 "target_nfe": 10,
                 "solver_key": "euler",
-                "schedule_name": "flowts_power_sampling",
+                "scheduler_key": "GICO-det-policy",
                 "forecast_crps": 3.0,
                 "experiment_scope": "main",
             },
@@ -417,16 +417,14 @@ class BackboneMatrixTests(unittest.TestCase):
                 "train_budget_label": "4k",
                 "target_nfe": 10,
                 "solver_key": "euler",
-                "schedule_name": "uniform",
+                "scheduler_key": "uniform",
                 "forecast_crps": 4.0,
                 "experiment_scope": "main",
             },
         ]
         enriched = augment_rows_with_relative_metrics(rows)
-        by_schedule = {(row["train_steps"], row["schedule_name"]): row for row in enriched}
-        self.assertAlmostEqual(
-            by_schedule[4000, "flowts_power_sampling"]["forecast_relative_crps_gain_vs_uniform"], 0.25
-        )
+        by_schedule = {(row["train_steps"], row["scheduler_key"]): row for row in enriched}
+        self.assertAlmostEqual(by_schedule[4000, "GICO-det-policy"]["forecast_relative_crps_gain_vs_uniform"], 0.25)
 
 
 if __name__ == "__main__":

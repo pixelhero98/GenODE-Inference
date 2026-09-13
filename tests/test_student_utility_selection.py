@@ -45,7 +45,13 @@ def fixture(kind="GICO-det-policy", task="traffic_hourly"):
 
 def test_distinct_generation_seeds_cannot_reuse_the_same_clock_rng_inputs():
     rows, contexts, evidence, candidate = fixture("GICO-sto-policy")
+    extra = deepcopy([row for row in rows if row["split"] == "validation"])
+    for row in extra:
+        row["seed"] += 1
+    rows.extend(extra)
+    evidence = prepare_evidence(rows, contexts)
     measured = evaluator_for(rows, contexts)(candidate)
+    assert measured_utility(measured, evidence, candidate, clock_replicates=4)["utility"] > 0
     students = [r for r in measured if r["schedule_key"] == "student"]
     first = students[0]
     other = next(r for r in students if r["seed"] != first["seed"])

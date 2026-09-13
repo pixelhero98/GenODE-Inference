@@ -138,8 +138,9 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test", con
             if contexts is None or row["context_id"] not in contexts:
                 raise ValueError("Learned-policy reports require native contexts for executed clock replay.")
             _check_clock({**row, "schedule_key": "student"}, policy, contexts[row["context_id"]], clock_identities)
-    measurements_sha256 = content_hash(rows)
-    rows = collapse_clock_replicates(rows)
+    raw_rows = rows
+    rows = collapse_clock_replicates(raw_rows)
+    measurements_sha256 = content_hash(raw_rows)
     groups = defaultdict(list)
     for solver, calibration in policy.metadata["reward_calibrations"].items():
         subset = [r for r in rows if r["solver"] == solver]
