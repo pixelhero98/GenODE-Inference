@@ -50,6 +50,18 @@ def metric_weights(task: str) -> tuple[float, ...]:
     )
 
 
+def validate_terminal_metrics(row: dict) -> None:
+    """Validate raw measurements before any averaging can hide invalid draws."""
+    keys = measurement_metrics(row)
+    values = np.array([row["metrics"][key] for key in keys], dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError("Terminal metrics must be finite and complete.")
+    if any(key in row for key in ("reward_metrics", "reward_estimator")):
+        raise ValueError("Obsolete reward overrides are unsupported; supply raw paired terminal measurements.")
+    if any(row["metrics"][key] < 0 for key in keys if key in LOG_METRICS or key == "lpips"):
+        raise ValueError("Error metrics must be nonnegative.")
+
+
 def _balanced_std(values: np.ndarray, nfes: np.ndarray, classes: np.ndarray | None = None) -> np.ndarray:
     """Population standard deviation with equal total weight per observed NFE."""
     weights = np.zeros(len(nfes), dtype=np.float64)
@@ -105,13 +117,7 @@ def _paired_cells(rows: list[dict[str, Any]], *, varying_clocks: bool = False) -
         for key in ("backbone", "context_id", "reference_id", "measurement_protocol", "schedule_key"):
             if not isinstance(row[key], str) or not row[key]:
                 raise ValueError(f"{key} must be a nonempty identity.")
-        values = np.array([row["metrics"][key] for key in measurement_metrics(row)], dtype=float)
-        if not np.isfinite(values).all():
-            raise ValueError("Terminal metrics must be finite and complete.")
-        if any(key in row for key in ("reward_metrics", "reward_estimator")):
-            raise ValueError("Obsolete reward overrides are unsupported; supply raw paired terminal measurements.")
-        if any(row["metrics"][key] < 0 for key in measurement_metrics(row) if key in LOG_METRICS or key == "lpips"):
-            raise ValueError("Error metrics must be nonnegative.")
+        validate_terminal_metrics(row)
         if row["task"].startswith("molecule_") and row["ensemble_size"] < 2:
             raise ValueError("Fair molecular energy score requires at least two ensemble members.")
         key = tuple(row[k] for k in ("task", "backbone", "solver", "nfe", "context_id", "split", "seed"))

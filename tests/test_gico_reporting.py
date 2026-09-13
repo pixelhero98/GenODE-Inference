@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from genode.gico.clocks import materialize, reference_densities
-from genode.gico.report_locked_test import summarize_measurements
+from genode.gico.report_locked_test import collapse_clock_replicates, summarize_measurements
 from genode.gico.rewards import calibrate_rewards, construct_rewards
 from tests.test_unified_gico_rewards import measurement, paired_rows
 
@@ -90,6 +90,39 @@ def test_report_collapses_paired_clock_replicates_before_log():
     repeated[1]["metrics"]["crps"] += 0.1
     with pytest.raises(ValueError, match="Repeated uniform"):
         summarize_measurements(repeated, policy, contexts={"test-a": [0.0]})
+
+
+@pytest.mark.parametrize("invalid", [-1.0, float("nan"), float("inf")])
+def test_report_rejects_invalid_raw_replicate_before_averaging(invalid):
+    policy, _, rows = report_fixture()
+    repeated = []
+    for row in rows:
+        for replicate in range(2):
+            value = deepcopy(row)
+            value["clock_replicate"] = replicate
+            if row["schedule_key"] == "policy":
+                value["clock_request_id"] += f":replicate:{replicate}"
+                value["metrics"]["crps"] = invalid if replicate == 0 else 3.0
+            repeated.append(value)
+    with pytest.raises(ValueError, match="finite|nonnegative"):
+        summarize_measurements(repeated, policy, contexts={"test-a": [0.0]})
+
+
+@pytest.mark.parametrize("field,value", [("class_id", 1), ("panel_id", "changed-panel")])
+def test_report_validates_every_raw_image_replicate_identity(field, value):
+    from genode.gico.image_supervision import prepare_image_rows
+    from tests.test_image_gico_supervision import image_manifest
+
+    rows, _, _ = prepare_image_rows(image_manifest())
+    repeated = []
+    for row in rows:
+        for replicate in range(2):
+            value_row = deepcopy(row)
+            value_row["clock_replicate"] = replicate
+            repeated.append(value_row)
+    repeated[1][field] = value
+    with pytest.raises(ValueError, match="class identity|panels or classes"):
+        collapse_clock_replicates(repeated)
 
 
 def test_ensemble_report_validates_every_member_clock_and_count():

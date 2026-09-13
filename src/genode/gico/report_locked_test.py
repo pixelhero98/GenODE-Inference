@@ -12,13 +12,17 @@ from scipy.stats import t
 
 from genode.gico.clocks import verify_measurement_clock
 from genode.gico.evidence import content_hash
+from genode.gico.image_objective import validate_image_rows
 from genode.gico.policy import load_context_embedding_table, load_policy
-from genode.gico.rewards import RewardCalibration, construct_rewards
+from genode.gico.rewards import RewardCalibration, construct_rewards, validate_terminal_metrics
 from genode.gico.train_gico import read_rows
 
 
 def collapse_clock_replicates(rows):
     """Average complete paired clock draws before nonlinear terminal rewards."""
+    validate_image_rows(rows)
+    for row in rows:
+        validate_terminal_metrics(row)
     if not any("clock_replicate" in row for row in rows):
         return rows
     from genode.gico.rewards import measurement_metrics
