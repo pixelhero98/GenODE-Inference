@@ -163,13 +163,17 @@ def test_forecast_imputation_is_causal():
         _fill_missing_values(np.array([1, np.inf]))
 
 
-def test_text_solver_identity_is_checked_before_prompt_execution(tmp_path, monkeypatch):
+def test_text_solver_identity_is_checked_before_prompt_execution(tmp_path):
     from genode.gico.task_evaluators import TextEvaluator
+    from genode.latent_clock.gico import runtime_binding
 
     evaluator = TextEvaluator.__new__(TextEvaluator)
-    evaluator.runtime = SimpleNamespace(adapter=SimpleNamespace(solver_key="ipndm"))
-    binding = {"solver": "ipndm"}
-    monkeypatch.setattr("genode.latent_clock.gico.runtime_binding", lambda runtime: binding)
+    evaluator.runtime = SimpleNamespace(
+        adapter=SimpleNamespace(solver_key="ipndm", backbone_revision="fixture"),
+        metadata={"backbone": "sd15"},
+        fingerprints={"generator": "fixture"},
+    )
+    binding = runtime_binding(evaluator.runtime)
     with pytest.raises(ValueError, match="exact single-image frozen runtime"):
         evaluator.measure({"ensemble_size": 1, "backbone_binding": binding, "solver": "ipndm_v"}, [], [], {}, tmp_path)
 
