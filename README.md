@@ -203,6 +203,32 @@ Select on held-out selection contexts and freeze before confirmation. These
 architectural choices do not themselves establish better utility or generalization.
 Historical v4 artifacts require their originating runtime and are not upgraded.
 
+### SD1.5 variable-step integration
+
+SD1.5 runtime configurations default to `"solver": "ipndm_v"`, the order-2
+variable-step Adams–Bashforth solver in `r = sigma / alpha`, with Euler startup
+and exactly one denoiser evaluation per update. The runtime records
+`solver_protocol="sigma_over_alpha_ab2_v1"`. Integration and model-evaluation
+times must match; interval ratios use `r`, not diffusion time or log-SNR.
+
+```json
+{
+  "backbone": "sd15",
+  "solver": "ipndm_v",
+  "source": "/path/to/pinned/LD3",
+  "source_revision": "ec1bf603fb19696966ca30198ed209ae6488a3e5",
+  "asset_manifest": "/path/to/asset-manifest.json"
+}
+```
+
+The historical fixed-coefficient solver remains explicitly available as
+`"solver": "ipndm"` for the official LD3 baseline. These are distinct solver
+identities, not interchangeable artifact versions. Changing solvers requires
+fresh paired reference measurements, anchors and reward calibration before
+refitting GICO. Historical policies and results retain their original runtime;
+do not relabel their evidence as variable-step measurements. The shared teacher,
+student, utility selection and task-specific fitting parameters are unchanged.
+
 The Python fitting API has an optional `checkpoint_callback(kind, step, model,
 statistics)` observer for diagnostics. Observers must not mutate the model or RNG
 state. Diagnostic checkpoints do not change production eligibility: only

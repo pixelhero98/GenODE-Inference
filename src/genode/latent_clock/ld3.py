@@ -59,6 +59,8 @@ def fit_ld3(*, runtime_config: str, manifest_path: str, nfe: int, seed: int, out
     runtime = load_runtime(runtime_config)
     if runtime.metadata["backbone"] != "sd15":
         raise ValueError("This LD3 protocol requires the frozen SD1.5 EMA backbone.")
+    if runtime.adapter.solver_key != "ipndm":
+        raise ValueError("The official LD3 baseline requires explicit runtime solver='ipndm', not 'ipndm_v'.")
     from dataset import LD3Dataset
     from trainer import LD3Trainer, ModelConfig, TrainingConfig
     from utils import PRIOR_TIMESTEPS, set_seed_everything

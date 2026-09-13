@@ -232,6 +232,8 @@ def collect(*, runtime_config: str, plan_path: str, output: str) -> None:
     elif plan["method"] == "ld3":
         from genode.latent_clock.ld3 import LD3Schedule
 
+        if runtime.adapter.solver_key != "ipndm":
+            raise ValueError("The official LD3 baseline requires explicit runtime solver='ipndm', not 'ipndm_v'.")
         model = LD3Schedule(**json.loads(Path(plan["checkpoint"]).read_text()))
         if (
             runtime.metadata["backbone"] != "sd15"

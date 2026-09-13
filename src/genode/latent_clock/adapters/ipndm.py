@@ -10,6 +10,60 @@ from genode.latent_clock.clocks import Clock
 from genode.latent_clock.contracts import ExecutionTrace, FrozenContext
 
 
+class VariableStepIPNDM:
+    """Second-order AB integration in y=x/alpha, r=sigma/alpha.
+
+    Unlike fixed-coefficient iPNDM, extrapolation uses the actual consecutive
+    r intervals. The first update is Euler; every update makes one model call.
+    """
+
+    solver_key = "ipndm_v"
+    protocol = "sigma_over_alpha_ab2_v1"
+
+    def __init__(self, noise_schedule: Any) -> None:
+        self.noise_schedule = noise_schedule
+
+    def sample_simple(
+        self,
+        model_fn: Any,
+        x: Any,
+        timesteps: Any,
+        evaluation_times: Any,
+        *,
+        order: int = 2,
+        condition: Any = None,
+        unconditional_condition: Any = None,
+    ) -> Any:
+        import torch
+
+        if order != 2:
+            raise ValueError("Variable-step iPNDM supports order 2 only.")
+        if timesteps.ndim != 1 or timesteps.numel() < 2 or not torch.equal(timesteps, evaluation_times):
+            raise ValueError("Variable-step iPNDM requires identical one-dimensional integration/evaluation grids.")
+        if not torch.isfinite(timesteps).all() or not (timesteps[1:] < timesteps[:-1]).all():
+            raise ValueError("Variable-step iPNDM requires finite, strictly decreasing times.")
+        schedule = self.noise_schedule
+        if timesteps[0] > schedule.T or timesteps[-1] < schedule.eps:
+            raise ValueError("Variable-step iPNDM times lie outside the noise schedule.")
+        # Compute interval ratios accurately, but preserve the latent/model dtype.
+        times = timesteps.double()
+        alpha = schedule.marginal_alpha(times)
+        rho = schedule.marginal_std(times) / alpha
+        intervals = rho[1:] - rho[:-1]
+        if not torch.isfinite(rho).all() or not (alpha > 0).all() or not (intervals < 0).all():
+            raise ValueError("Variable-step iPNDM requires finite, strictly decreasing sigma/alpha.")
+        previous = None
+        for step in range(len(intervals)):
+            current = model_fn(x, timesteps[step].expand(x.shape[0]), condition, unconditional_condition)
+            estimate = current
+            if previous is not None:
+                ratio = (intervals[step] / intervals[step - 1]).to(x)
+                estimate = (1 + ratio / 2) * current - (ratio / 2) * previous
+            x = (alpha[step + 1] / alpha[step]).to(x) * x + (alpha[step + 1] * intervals[step]).to(x) * estimate
+            previous = current
+        return x
+
+
 def compile_ipndm_times(clock: Clock, *, epsilon: float = 0.001) -> np.ndarray:
     eps = float(epsilon)
     if not 0 < eps < 1:
@@ -34,12 +88,18 @@ class IPNDMAdapter:
         latent_factory: Callable[[int, FrozenContext], Any],
         backbone_revision: str,
         order: int = 2,
+        solver_key: str | None = None,
     ) -> None:
         self.model_fn, self.decoder, self.solver, self.noise_schedule = model_fn, decoder, solver, noise_schedule
         self.context_encoder, self.latent_factory = context_encoder, latent_factory
         self.backbone_revision, self.order = str(backbone_revision), int(order)
+        declared_solver = getattr(solver, "solver_key", "ipndm")
+        solver_key = declared_solver if solver_key is None else solver_key
+        if solver_key not in {"ipndm", "ipndm_v"} or solver_key != declared_solver:
+            raise ValueError("SD1.5 solver identity differs from its implementation.")
+        self.solver_key = solver_key
         if self.order != 2:
-            raise ValueError("The preregistered official LD3 comparison uses iPNDM order 2.")
+            raise ValueError("SD1.5 iPNDM adapters support order 2 only.")
         self._opaque_contexts: dict[str, tuple[Any, Any]] = {}
 
     def encode_context(self, prompt_id: str, prompt: str) -> FrozenContext:
@@ -98,7 +158,7 @@ class IPNDMAdapter:
         trace = ExecutionTrace(
             "runtime",
             clock_key,
-            "ipndm",
+            self.solver_key,
             nfe,
             field_calls,
             field_calls,

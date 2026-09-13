@@ -8,13 +8,14 @@ from numbers import Integral
 CANONICAL_SOLVER_KEYS: tuple[str, ...] = ("euler", "dpmpp2m", "heun", "midpoint_rk2")
 # External latent-T2I solvers are valid metadata, but are not added to the
 # canonical flow-matching experiment matrix or its built-in runtime dispatch.
-EXTERNAL_SOLVER_ORDERS: dict[str, int] = {"ipndm": 2}
+EXTERNAL_SOLVER_ORDERS: dict[str, int] = {"ipndm": 2, "ipndm_v": 2}
 CANONICAL_SOLVER_DISPLAY_NAMES: dict[str, str] = {
     "euler": "Euler",
     "dpmpp2m": "DPM++2M",
     "heun": "Heun / RK2",
     "midpoint_rk2": "Midpoint RK2",
     "ipndm": "LD3 iPNDM (order 2)",
+    "ipndm_v": "Variable-step iPNDM (order 2)",
 }
 CANONICAL_SOLVER_RUNTIME_NAMES: dict[str, str] = {
     "euler": "euler",
@@ -38,6 +39,7 @@ SOLVER_ALIASES: dict[str, str] = {
     "rk2_midpoint": "midpoint_rk2",
     "midpoint rk2": "midpoint_rk2",
     "ipndm": "ipndm",
+    "ipndm_v": "ipndm_v",
 }
 _INTEGER_TEXT = re.compile(r"[+-]?\d+")
 

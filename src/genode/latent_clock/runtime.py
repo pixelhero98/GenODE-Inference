@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from genode.latent_clock.adapters.ipndm import IPNDMAdapter
+from genode.latent_clock.adapters.ipndm import IPNDMAdapter, VariableStepIPNDM
 from genode.latent_clock.adapters.sana import SanaFlowEulerAdapter
 from genode.latent_clock.artifacts import implementation_sha256
 from genode.latent_clock.clocks import Clock
@@ -63,7 +63,7 @@ def load_runtime(config_path: str | Path) -> FrozenRuntime:
     if config["backbone"] == "sana":
         runtime = _load_sana(source, revision, assets)
     elif config["backbone"] == "sd15":
-        runtime = _load_sd15(source, revision, assets)
+        runtime = _load_sd15(source, revision, assets, solver_key=config.get("solver", "ipndm_v"))
     else:
         raise ValueError(f"Unknown backbone {config['backbone']!r}")
     runtime.metadata["implementation_sha256"] = implementation_sha256()
@@ -196,7 +196,9 @@ def _load_sana(source: Path, revision: str, assets: dict) -> FrozenRuntime:
     )
 
 
-def _load_sd15(source: Path, revision: str, assets: dict) -> FrozenRuntime:
+def _load_sd15(source: Path, revision: str, assets: dict, *, solver_key: str = "ipndm_v") -> FrozenRuntime:
+    if solver_key not in {"ipndm", "ipndm_v"}:
+        raise ValueError("SD1.5 solver must be 'ipndm_v' or the historical 'ipndm'.")
     from types import SimpleNamespace
 
     # The pinned LD3 vendored tree omits package __init__ files; its legacy
@@ -229,7 +231,7 @@ def _load_sd15(source: Path, revision: str, assets: dict) -> FrozenRuntime:
     def latent(seed: int, context: Any) -> Any:
         return torch.randn(1, 4, 64, 64, generator=torch.Generator(device="cuda").manual_seed(seed), device="cuda")
 
-    solver = iPNDM(schedule)
+    solver = VariableStepIPNDM(schedule) if solver_key == "ipndm_v" else iPNDM(schedule)
     adapter = IPNDMAdapter(
         model_fn=model_fn,
         decoder=decoder,
@@ -238,17 +240,18 @@ def _load_sd15(source: Path, revision: str, assets: dict) -> FrozenRuntime:
         context_encoder=encode,
         latent_factory=latent,
         backbone_revision=assets["sd15"]["revision"],
+        solver_key=solver_key,
     )
 
     def native_clock(nfe: int) -> Clock:
-        times = solver.get_time_steps("time_uniform", schedule.T, schedule.eps, nfe, "cuda").double().cpu().numpy()
+        times = torch.linspace(schedule.T, schedule.eps, nfe + 1, device="cuda").double().cpu().numpy()
         nodes = (times[0] - times) / (times[0] - times[-1])
         return Clock("native", nfe, tuple(nodes), "ld3_time_uniform")
 
     @torch.inference_mode()
     def native_sample(context: Any, seed: int, nfe: int) -> Any:
         condition, uncondition = adapter._opaque_contexts[context.context_id]
-        times = solver.get_time_steps("time_uniform", schedule.T, schedule.eps, nfe, "cuda")
+        times = torch.linspace(schedule.T, schedule.eps, nfe + 1, device="cuda")
         value = solver.sample_simple(
             model_fn,
             schedule.prior_transformation(latent(seed, context)),
@@ -273,5 +276,6 @@ def _load_sd15(source: Path, revision: str, assets: dict) -> FrozenRuntime:
             "order": 2,
             "resolution": 512,
             "assets": assets["sd15"]["revision"],
+            "solver_protocol": VariableStepIPNDM.protocol if solver_key == "ipndm_v" else "ld3_fixed_ab2_v1",
         },
     )
