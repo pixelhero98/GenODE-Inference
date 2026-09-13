@@ -233,7 +233,7 @@ def student_losses(groups, *, model, kind, teacher, config, weights, coefficient
 
 def _fit_teacher(architecture, train, validation, density_validation, weights, config, device):
     # fork_rng isolates initialization from callers' generation RNG state.
-    devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(config.seed)
         teacher = DensityTeacher(architecture).to(device)
@@ -300,7 +300,8 @@ def fit_models(
     teacher_artifact=None,
     selection_evaluator=None,
 ):
-    devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
+    # manual_seed seeds every visible GPU, including when fitting on the CPU.
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(config.seed)
         return _fit_models(
@@ -352,7 +353,7 @@ def _fit_models(
     ratios = logmass[:, :-1] - logmass[:, -1:]
     ratio_mean, ratio_scale = ratios.mean(0), ratios.std(0, unbiased=False)
     ratio_scale = torch.where(ratio_scale < 1e-6, 1, ratio_scale)
-    devices = [torch.device(device).index or 0] if str(device).startswith("cuda") else []
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
     if teacher_artifact is None:
         teacher, teacher_history, selected_teacher = _fit_teacher(
             architecture, train, validation, density_validation, weights, config, device

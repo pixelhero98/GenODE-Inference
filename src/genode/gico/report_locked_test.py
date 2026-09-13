@@ -58,6 +58,7 @@ def collapse_clock_replicates(rows):
                         "ensemble_size",
                         "reference_id",
                         "measurement_protocol",
+                        "molecule_feature_map",
                         "sample_block",
                         "reference_block",
                         "target",

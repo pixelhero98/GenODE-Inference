@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from genode.gico.clocks import REFERENCE_KEYS, density_identity, reference_densities, verify_measurement_clock
+from genode.gico.clocks import REFERENCE_KEYS, density_identity, verify_measurement_clock
 from genode.gico.conditioning import Conditioning
 from genode.gico.rewards import RewardCalibration, calibrate_rewards, construct_rewards
 
@@ -61,9 +61,6 @@ def prepare_evidence(
             raise ValueError(f"Missing native context {row['context_id']!r}.")
         if row["schedule_key"] not in REFERENCE_KEYS:
             raise ValueError("Teacher evidence must use the declared reference-clock pool.")
-        expected = reference_densities(row["solver"], row["nfe"])[row["schedule_key"]]
-        if not np.allclose(row["density_mass"], expected, atol=1e-12, rtol=0):
-            raise ValueError("Reference name does not match its realized density.")
     calibration_rows = calibration_rows if calibration_rows is not None else [r for r in rows if r["split"] == "train"]
     all_rows = rows + calibration_rows
     from genode.gico.image_objective import IMAGE_TASKS, validate_image_rows

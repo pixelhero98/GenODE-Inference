@@ -51,6 +51,13 @@ def verify_measurement_clock(row: dict) -> None:
         raise ValueError("Measured clock differs from its 64-bin realization; recollect terminal evidence.")
     if row["schedule_key"] == "uniform" and not np.allclose(mass, 1 / DENSITY_BINS, atol=1e-12, rtol=0):
         raise ValueError("Uniform anchor must use the uniform density.")
+    if row["schedule_key"] in REFERENCE_KEYS:
+        steps = solver_macro_steps(row["solver"], row["nfe"])
+        reference = grid_to_density_mass(
+            build_reference_clock_grid(row["schedule_key"], steps), macro_steps=steps, eps=0
+        )
+        if not np.allclose(mass, reference, atol=1e-12, rtol=0):
+            raise ValueError("Reference name does not match its realized density.")
 
 
 def density_identity(mass) -> str:

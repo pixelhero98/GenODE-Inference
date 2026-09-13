@@ -51,6 +51,42 @@ def test_distinct_group_sampling_caps_effective_batch():
         assert len(sampled) == len(set(sampled)) == min(count, batch)
 
 
+@pytest.mark.parametrize("device", ("cpu", "cuda", "cuda:1"))
+@pytest.mark.parametrize("fails", (False, True))
+def test_fitting_restores_all_visible_gpu_rng_streams(monkeypatch, device, fails):
+    from genode.gico import training
+
+    # Exercise the real fork_rng context without requiring GPUs or fitting a model.
+    streams = {0: 123, 1: 456}
+    original = dict(streams)
+    cpu_state = torch.random.get_rng_state().clone()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "get_rng_state", lambda index: streams[index])
+    monkeypatch.setattr(torch.cuda, "set_rng_state", lambda state, index: streams.__setitem__(index, state))
+
+    def seed_all(seed):
+        torch.random.default_generator.manual_seed(seed)
+        streams.update(dict.fromkeys(streams, seed))
+
+    def fake_fit(*args, **kwargs):
+        torch.rand(1)
+        streams[1] += 1  # Also cover an unindexed 'cuda' using the second GPU.
+        if fails:
+            raise RuntimeError("fitting failed")
+        return "completed"
+
+    monkeypatch.setattr(torch, "manual_seed", seed_all)
+    monkeypatch.setattr(training, "_fit_models", fake_fit)
+    if fails:
+        with pytest.raises(RuntimeError, match="fitting failed"):
+            training.fit_models(None, resolve_profile("sana"), device=device)
+    else:
+        assert training.fit_models(None, resolve_profile("sana"), device=device) == "completed"
+    assert streams == original
+    assert torch.equal(torch.random.get_rng_state(), cpu_state)
+
+
 def test_accumulation_matches_equal_group_loss_with_unequal_group_sizes():
     first = torch.nn.Linear(1, 1, bias=False).double()
     first.weight.data.fill_(0.03)

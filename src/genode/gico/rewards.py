@@ -141,8 +141,8 @@ def _paired_cells(rows: list[dict[str, Any]], *, varying_clocks: bool = False) -
         supports[group] = support
         anchor = schedules["uniform"]
         for row in schedules.values():
-            for field in ("ensemble_size", "reference_id", "measurement_protocol"):
-                if row[field] != anchor[field]:
+            for field in ("ensemble_size", "reference_id", "measurement_protocol", "molecule_feature_map"):
+                if row.get(field) != anchor.get(field):
                     raise ValueError(f"Candidate and uniform have different {field}.")
             groups[(*group, row["schedule_key"])].append(row)
     cells = []
@@ -158,7 +158,7 @@ def _paired_cells(rows: list[dict[str, Any]], *, varying_clocks: bool = False) -
         # Fixed-reference fitting requires one density. Policy evaluation can
         # average independent clocks after validating every executed member.
         for r in repeats[1:]:
-            fields = ("measurement_protocol", "ensemble_size")
+            fields = ("measurement_protocol", "ensemble_size", "molecule_feature_map")
             if not varying_clocks:
                 fields += ("density_mass", "time_grid", "sample_clocks")
             for field in fields:

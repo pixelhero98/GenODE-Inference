@@ -92,6 +92,61 @@ def test_report_preserves_explicit_baseline_names_with_policy_provenance():
     assert {r["schedule"] for r in report["results"]} == {"uniform", "policy"}
 
 
+@pytest.mark.parametrize("member_clocks", [False, True])
+def test_report_rejects_reference_label_with_another_executed_clock(member_clocks):
+    policy, _, _ = report_fixture()
+    rows = [measurement(context="test-a", split="test", schedule=name) for name in ("uniform", "late_p_3")]
+    # Density and grid agree with each other but contradict the named reference.
+    rows[1]["density_mass"] = list(reference_densities("euler", 4)["late_p_3_reversed"])
+    rows[1]["time_grid"] = list(materialize(rows[1]["density_mass"], "euler", 4))
+    if member_clocks:
+        for row in rows:
+            clock = {key: row.pop(key) for key in ("density_mass", "time_grid")}
+            row["sample_clocks"] = [deepcopy(clock) for _ in range(row["ensemble_size"])]
+    with pytest.raises(ValueError, match="Reference name"):
+        summarize_measurements(rows, policy)
+
+
+@pytest.mark.parametrize("change", ["candidate", "seed", "replicate"])
+def test_molecular_report_rejects_geometry_changes_inside_a_comparison(change):
+    from genode.gico.rewards import MOLECULE_METRICS
+
+    geometry = {"atom_count": 3, "anchor_triangle": [0, 1, 2], "length_scale": 1.0, "reference_sha256": "a" * 64}
+    other_geometry = {**geometry, "length_scale": 2.0}
+    training = paired_rows()
+    for row in training:
+        row.update(
+            task="molecule_3d_set1",
+            molecule_feature_map=geometry,
+            metrics=dict.fromkeys(MOLECULE_METRICS, row["metrics"]["crps"]),
+        )
+    calibration = calibrate_rewards(training)
+    policy, _, _ = report_fixture()
+    policy.metadata.update(
+        reward_calibrations={"euler": calibration.to_payload()},
+        molecular_feature_maps={"first": geometry, "second": other_geometry},
+    )
+    rows = deepcopy(training[:2])
+    for row in rows:
+        row.update(context_id="test-molecule", split="test")
+    if change == "candidate":
+        rows[1]["molecule_feature_map"] = other_geometry
+    else:
+        repeated = deepcopy(rows)
+        for row in repeated:
+            row["molecule_feature_map"] = other_geometry
+            if change == "seed":
+                row["seed"] = 1
+            else:
+                row["clock_replicate"] = 1
+        if change == "replicate":
+            for row in rows:
+                row["clock_replicate"] = 0
+        rows.extend(repeated)
+    with pytest.raises(ValueError, match="molecule_feature_map|paired measurement assets"):
+        summarize_measurements(rows, policy)
+
+
 def test_report_collapses_paired_clock_replicates_before_log():
     policy, _, rows = report_fixture()
     repeated = []
