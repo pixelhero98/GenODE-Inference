@@ -56,7 +56,7 @@ Both students use a uniform prior over unique realized reference densities. Refe
 
 Teacher-score weights are **0.01, 0.05, 0.1**. Auxiliary scores use each context/solver/NFE group's frozen predicted-reference mean and population standard deviation (standard deviations below 1e-6 use 1), then clip to [-5, 5]. This normalization does not change terminal rewards or reference weights. Teacher parameters remain frozen while gradients pass through density inputs. The configurable coefficient schedule begins chasing after 60% of the student horizon; only checkpoints with a positive realized coefficient are eligible. The default remains the historical linear ramp; alternatives include a ramp with a full-weight plateau and an immediate full-weight switch.
 
-Teacher updates average up to 64 distinct comparison groups; student updates average up to 512 distinct context/settings targets. Smaller microbatches accumulate the same equally weighted objective. Ranking pairs never cross group boundaries. Teacher checkpoint/temperature selection minimizes measured held-out reference-mixture utility regret. Context and density-family regret receive equal weight when the profile uses both; text-to-image uses context selection only. Ties prefer the configured preferred temperature, then the earlier checkpoint. Student selection maximizes measured held-out terminal utility among eligible checkpoints, with earlier-step ties. Distillation remains diagnostic. See [selection and score schedules](docs/student-selection.md).
+Teacher updates average up to 64 distinct comparison groups; student updates average up to 512 distinct context/settings targets. Smaller microbatches accumulate the same equally weighted objective. Ranking pairs never cross group boundaries. Teacher checkpoint/temperature selection minimizes measured held-out reference-mixture utility regret. Context and density-family regret receive equal weight when the profile uses both; text-to-image uses context selection only. Ties prefer the configured preferred temperature, then the earlier checkpoint. Deterministic student selection maximizes frozen-teacher calibrated utility among eligible checkpoints whose held-out KL is within 15% of its eligible minimum; one density and one teacher evaluation are used per context/NFE. Stochastic selection retains measured held-out terminal utility. Both prefer earlier checkpoints on ties. Teacher checkpoints default to every 20 steps, deterministic student checkpoints to every 10, and stochastic checkpoints to every 100. See [selection and score schedules](docs/student-selection.md).
 
 | Profile | Teacher/student steps | Dropout | Score coefficient | Initial reference temperature |
 |---|---:|---:|---:|---:|
@@ -87,8 +87,10 @@ The common interface accepts JSON configuration:
   "microbatch_contexts": 8,
   "teacher_learning_rate": 0.001,
   "student_learning_rate": 0.001,
-  "teacher_checkpoint_every": 100,
+  "teacher_checkpoint_every": 20,
   "student_checkpoint_every": 100,
+  "deterministic_checkpoint_every": 10,
+  "deterministic_kl_allowance": 0.15,
   "temperatures": [0.05, 0.1, 0.5],
   "preferred_temperature": 0.05,
   "seed": 0,
@@ -229,11 +231,11 @@ identities, not interchangeable artifact versions. Changing solvers requires
 fresh paired reference measurements, anchors and reward calibration before
 refitting GICO. Historical policies and results retain their original runtime;
 do not relabel their evidence as variable-step measurements. The shared teacher,
-student, utility selection and task-specific fitting parameters are unchanged.
+student objectives and task-specific fitting parameters are unchanged by this solver correction.
 
 The Python fitting API has an optional `checkpoint_callback(kind, step, model,
 statistics)` observer for diagnostics. Observers must not mutate the model or RNG
 state. Diagnostic checkpoints do not change production eligibility: only
-post-ramp validation-selected student states are saved as deployable artifacts.
+validation-selected student states with a positive chasing coefficient are saved as deployable artifacts.
 
 For the KID-supervised composition with a frozen transformed sampler, see [GICO on frozen BézierFlow](docs/frozen-bezier-kid.md). The separate [GICO-TF comparison](docs/image-supervision.md#gico-tf-only-paired-lpips) uses paired LPIPS target fidelity.

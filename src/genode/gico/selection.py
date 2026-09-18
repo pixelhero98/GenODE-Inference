@@ -23,10 +23,11 @@ SELECTION_PROTOCOL = "heldout_paired_terminal_utility_v1"
 
 
 def state_fingerprint(model) -> str:
+    state = model if isinstance(model, dict) else model.state_dict()
     return content_hash(
         {
             key: hashlib.sha256(value.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
-            for key, value in model.state_dict().items()
+            for key, value in state.items()
         }
     )
 

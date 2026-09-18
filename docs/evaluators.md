@@ -1,5 +1,7 @@
 # Built-in measured selection
 
+Stochastic student fitting requires measured selection. Deterministic fitting uses the generator-free teacher-score/KL rule described in [student selection](student-selection.md) and does not invoke this evaluator.
+
 Use `genode.gico.evaluators:build_evaluator` in the existing factory/config interface. It supports every retained task, native image GICO KID, explicit GICO-TF LPIPS and frozen BézierFlow KID. Custom factories remain an extension point.
 
 ```json

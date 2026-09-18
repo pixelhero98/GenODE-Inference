@@ -320,10 +320,8 @@ def _fit_models(
 ):
     from genode.gico.selection import evaluate_candidate
 
-    if not callable(selection_evaluator):
-        raise ValueError(
-            "Student fitting requires a held-out terminal-utility selection_evaluator; distillation is diagnostic only."
-        )
+    if student_kind != "GICO-det-policy" and not callable(selection_evaluator):
+        raise ValueError("Stochastic student fitting requires a held-out terminal-utility selection_evaluator.")
     evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.teacher_context_mode))
     if student_kind not in (*STUDENT_KINDS, "both"):
         raise ValueError("student_kind must be GICO-det-policy, GICO-sto-policy, or both.")
@@ -408,6 +406,9 @@ def _fit_models(
     students, histories, selections = {}, {}, {}
     kinds = STUDENT_KINDS if student_kind == "both" else (student_kind,)
     for kind in kinds:
+        deterministic = kind == "GICO-det-policy"
+        checkpoint_every = config.deterministic_checkpoint_every if deterministic else config.student_checkpoint_every
+        candidate_states = {}
         with torch.random.fork_rng(devices=devices):
             torch.manual_seed(config.seed)
             model = (
@@ -451,13 +452,16 @@ def _fit_models(
             )
             if any(p.grad is not None for p in teacher.parameters()):
                 raise RuntimeError("Frozen teacher unexpectedly accumulated parameter gradients.")
-            if (step + 1) % config.student_checkpoint_every == 0 or step + 1 == config.student_steps:
+            if (step + 1) % checkpoint_every == 0 or step + 1 == config.student_steps:
                 model.eval()
                 with torch.no_grad():
                     losses = []
+                    validation_masses = []
                     for c, m, w, _, _, _ in validation_targets:
                         if kind == "GICO-det-policy":
-                            value = density_kl((w[:, None] * m).sum(0, keepdim=True), model(c)).mean()
+                            mass = model(c)
+                            validation_masses.append(mass)
+                            value = density_kl((w[:, None] * m).sum(0, keepdim=True), mass).mean()
                         else:
                             perturbed = model.ratios(m)[:, None] + config.target_smoothing * val_noise[None]
                             condition_batch = c.expand(len(m) * config.stochastic_likelihood_samples, -1)
@@ -466,6 +470,10 @@ def _fit_models(
                             ).sum()
                         losses.append(value)
                     value = float(torch.stack(losses).mean())
+                    if deterministic:
+                        from genode.gico.deterministic_selection import balanced_mean
+
+                        value = balanced_mean([float(loss) for loss in losses], val_groups, evidence.task)
                 row = {
                     "step": step + 1,
                     "objective": loss,
@@ -474,23 +482,59 @@ def _fit_models(
                     "contexts": len(indices),
                 }
                 if coefficient > 0:
-                    row.update(
-                        evaluate_candidate(
-                            model,
-                            student_conditioning,
-                            kind,
-                            step + 1,
-                            coefficient,
-                            selection_evaluator,
-                            evidence,
-                            config.selection_clock_replicates,
+                    if deterministic:
+                        from genode.gico.deterministic_selection import score_deterministic
+
+                        row.update(
+                            score_deterministic(
+                                model,
+                                teacher,
+                                student_conditioning,
+                                validation_targets,
+                                validation_masses,
+                                val_groups,
+                                evidence,
+                                weights,
+                                step + 1,
+                                teacher_selection_fingerprint,
+                            )
                         )
-                    )
+                    else:
+                        row.update(
+                            evaluate_candidate(
+                                model,
+                                student_conditioning,
+                                kind,
+                                step + 1,
+                                coefficient,
+                                selection_evaluator,
+                                evidence,
+                                config.selection_clock_replicates,
+                            )
+                        )
                 history.append(row)
                 if checkpoint_callback is not None:
                     checkpoint_callback(kind, step + 1, model, dict(row))
-                if coefficient > 0 and row["utility"] > best:
-                    best, best_state, chosen = row["utility"], copy.deepcopy(model.state_dict()), dict(row)
+                if coefficient > 0:
+                    if deterministic:
+                        from genode.gico.deterministic_selection import select_deterministic
+
+                        candidate_states[row["step"]] = {
+                            key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+                        }
+                        chosen = dict(select_deterministic(history, config.deterministic_kl_allowance))
+                        best_state = candidate_states[chosen["step"]]
+                        minimum = min(max(0.0, r["validation_distillation"]) for r in history if r["coefficient"] > 0)
+                        threshold = minimum + config.deterministic_kl_allowance * minimum
+                        # The minimum KL can only decrease: rejected snapshots can never requalify.
+                        retained = {
+                            r["step"]
+                            for r in history
+                            if r["coefficient"] > 0 and r["validation_distillation"] <= threshold
+                        }
+                        candidate_states = {key: state for key, state in candidate_states.items() if key in retained}
+                    elif row["utility"] > best:
+                        best, best_state, chosen = row["utility"], copy.deepcopy(model.state_dict()), dict(row)
         if best_state is None:
             raise ValueError("Student validation did not produce a finite checkpoint after the score ramp.")
         model.load_state_dict(best_state)
@@ -564,7 +608,7 @@ def fit(
         "temperature_units": TEMPERATURE_UNITS,
         "auxiliary_normalization": AUXILIARY_NORMALIZATION,
         "teacher_selection_criterion": "heldout_reference_utility_regret",
-        "student_selection_criterion": "heldout_paired_terminal_utility_v1",
+        "student_selection_criterion": "det_teacher_kl_gate_sto_measured_utility_v1",
         "selected_temperature": history["teacher_selection"]["temperature"],
         "split_contexts": {
             s: sorted({r["context_id"] for r in evidence.cells if r["split"] == s}) for s in ("train", "validation")

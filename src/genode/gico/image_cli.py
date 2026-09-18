@@ -46,8 +46,7 @@ def build_argparser() -> argparse.ArgumentParser:
     train.add_argument("--fitting-profile", help="JSON object of common task-profile overrides.")
     train.add_argument(
         "--selection-evaluator",
-        required=True,
-        help="JSON object with trusted module:factory and config for held-out terminal measurements.",
+        help="Required for stochastic students: JSON module:factory/config for held-out terminal measurements.",
     )
     train.add_argument("--seed", type=int)
     train.add_argument("--device", default="cuda")
@@ -102,7 +101,11 @@ def main(argv=None) -> int:
             device=args.device,
             purpose=args.purpose,
             calibration_rows=calibration_rows,
-            selection_evaluator=load_selection_evaluator(_read(args.selection_evaluator)),
+            selection_evaluator=load_selection_evaluator(
+                _read(args.selection_evaluator) if args.selection_evaluator else None,
+                dry_run=args.student_kind == "GICO-det-policy",
+                required=args.student_kind != "GICO-det-policy",
+            ),
         )
     else:
         from genode.gico.policy import load_policy

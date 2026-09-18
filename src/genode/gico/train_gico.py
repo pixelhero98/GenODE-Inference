@@ -42,7 +42,7 @@ def load_config(path) -> dict:
     return config
 
 
-def load_selection_evaluator(evaluator, *, dry_run=False):
+def load_selection_evaluator(evaluator, *, dry_run=False, required=True):
     if evaluator is not None and (
         not isinstance(evaluator, dict)
         or set(evaluator) != {"factory", "config"}
@@ -55,6 +55,8 @@ def load_selection_evaluator(evaluator, *, dry_run=False):
     if dry_run:
         return None
     if evaluator is None:
+        if not required:
+            return None
         raise ValueError("Training requires a held-out terminal-utility selection_evaluator factory.")
     module, name = evaluator["factory"].split(":")
     callback = getattr(importlib.import_module(module), name)(evaluator["config"])
@@ -66,7 +68,8 @@ def load_selection_evaluator(evaluator, *, dry_run=False):
 def run_config(config: dict, *, dry_run: bool = False) -> dict:
     values = dict(config)
     evaluator = values.pop("selection_evaluator", None)
-    callback = load_selection_evaluator(evaluator, dry_run=dry_run)
+    deterministic = values.get("student_kind", "both") == "GICO-det-policy"
+    callback = load_selection_evaluator(evaluator, dry_run=dry_run or deterministic, required=not deterministic)
     if values.get("student_kind", "both") not in ("GICO-det-policy", "GICO-sto-policy", "both"):
         raise ValueError("student_kind must be GICO-det-policy, GICO-sto-policy, or both.")
     rows = read_rows(values.pop("rows"))

@@ -27,8 +27,10 @@ class TrainingConfig:
     microbatch_contexts: int = 8
     teacher_learning_rate: float = 1e-3
     student_learning_rate: float = 1e-3
-    teacher_checkpoint_every: int = 100
+    teacher_checkpoint_every: int = 20
     student_checkpoint_every: int = 100
+    deterministic_checkpoint_every: int = 10
+    deterministic_kl_allowance: float = 0.15
     weight_decay: float = 1e-4
     dropout: float = 0.01
     teacher_score_weight: float = 0.01
@@ -55,6 +57,7 @@ class TrainingConfig:
             "microbatch_contexts",
             "teacher_checkpoint_every",
             "student_checkpoint_every",
+            "deterministic_checkpoint_every",
             "stochastic_likelihood_samples",
             "stochastic_score_samples",
             "selection_clock_replicates",
@@ -63,6 +66,12 @@ class TrainingConfig:
             raise ValueError("Step, batch, sampling and checkpoint counts must be positive integers.")
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("Seed must be a nonnegative integer.")
+        if (
+            isinstance(self.deterministic_kl_allowance, bool)
+            or not np.isfinite(self.deterministic_kl_allowance)
+            or self.deterministic_kl_allowance < 0
+        ):
+            raise ValueError("Deterministic KL allowance must be finite and nonnegative.")
         if self.teacher_score_weight not in SCORE_WEIGHTS:
             raise ValueError(f"teacher_score_weight must be one of {SCORE_WEIGHTS}.")
         if self.score_schedule not in SCORE_SCHEDULES:

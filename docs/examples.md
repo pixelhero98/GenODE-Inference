@@ -28,7 +28,7 @@ print(grid)
 
 Use `GICO-det-policy` to load the deterministic student. Reuse the sampled grid through a complete generated trajectory; change request identity for each new member or replicate. The native generator and its exact solver must consume this grid.
 
-For actual fitting, combine the README's common configuration with a [built-in selection evaluator](evaluators.md), then run:
+For fitting `both` or `GICO-sto-policy`, combine the README's common configuration with a [built-in selection evaluator](evaluators.md). Deterministic-only fitting uses the frozen-teacher/KL rule and needs no evaluator. Then run:
 
 ```bash
 genode-train-gico --config train.json --dry-run

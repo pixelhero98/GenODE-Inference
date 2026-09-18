@@ -26,7 +26,7 @@ uniform image parity, finite outputs, realized grids and actual backbone calls
 in the native runtime before collecting evidence.
 
 Teacher ranking/regression, regret-based teacher selection, student distillation
-plus teacher-score chasing, and held-out measured-utility student selection use
+plus teacher-score chasing, and held-out student selection use
 the shared implementations. Held-out utility is paired KID improvement for this
 objective. Inference uses only the frozen student and the composed clock.
 
@@ -34,3 +34,5 @@ KID and LPIPS objectives have separate versioned identities and calibrations.
 Neither historical evidence from another generator nor a fidelity policy may
 be relabeled as distributional evidence. Improved KID during selection does not
 establish improved FID or generalization; evaluate frozen choices separately.
+
+Deterministic checkpoint selection uses frozen-teacher utility subject to the 15% validation-KL allowance; stochastic selection retains measured paired KID utility. See [student selection](student-selection.md).

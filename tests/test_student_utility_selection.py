@@ -173,10 +173,10 @@ def test_history_selects_utility_when_distillation_is_unchanged(monkeypatch):
         return evaluator_for(rows, contexts, factor=1 - candidate.step * 0.01)(candidate)
 
     _, _, history = training.fit_models(
-        evidence, config, student_kind="GICO-det-policy", device="cpu", selection_evaluator=evaluator
+        evidence, config, student_kind="GICO-sto-policy", device="cpu", selection_evaluator=evaluator
     )
     assert seen == [4, 5]
-    assert history["student_selection"]["GICO-det-policy"]["step"] == 5
+    assert history["student_selection"]["GICO-sto-policy"]["step"] == 5
 
 
 @pytest.mark.parametrize(

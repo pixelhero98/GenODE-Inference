@@ -233,9 +233,23 @@ class GICOPolicy:
             raise ValueError("Artifact fitting profile task mismatch.")
         from dataclasses import fields
 
+        from genode.gico.deterministic_selection import (
+            DETERMINISTIC_SELECTION_PROTOCOL,
+            STUDENT_SELECTION_PROTOCOL,
+            select_deterministic,
+        )
         from genode.gico.profiles import TrainingConfig
+        from genode.gico.selection import SELECTION_PROTOCOL
 
-        if set(profile) != {field.name for field in fields(TrainingConfig)}:
+        profile_fields = {field.name for field in fields(TrainingConfig)}
+        added_fields = {"deterministic_checkpoint_every", "deterministic_kl_allowance"}
+        criterion = self.metadata["student_selection_criterion"]
+        # Only the exact historical measured-v6 profile can omit the new fields.
+        if criterion == SELECTION_PROTOCOL and set(profile) == profile_fields - added_fields:
+            profile.update(
+                deterministic_checkpoint_every=profile["student_checkpoint_every"], deterministic_kl_allowance=0.15
+            )
+        if set(profile) != profile_fields:
             raise ValueError("Artifact fitting profile is incomplete.")
         training = resolve_profile(self.metadata["task"], **profile)
         if (
@@ -249,7 +263,7 @@ class GICOPolicy:
             or self.metadata["temperature_units"] != TEMPERATURE_UNITS
             or self.metadata["auxiliary_normalization"] != AUXILIARY_NORMALIZATION
             or self.metadata["teacher_selection_criterion"] != "heldout_reference_utility_regret"
-            or self.metadata["student_selection_criterion"] != "heldout_paired_terminal_utility_v1"
+            or criterion not in (SELECTION_PROTOCOL, STUDENT_SELECTION_PROTOCOL)
             or self.metadata["selected_temperature"] not in training.temperatures
         ):
             raise ValueError("Artifact fitting, scalarization or normalization protocols disagree.")
@@ -268,8 +282,6 @@ class GICOPolicy:
             )
         ):
             raise ValueError("Artifact student checkpoint is not eligible after the score ramp.")
-        from genode.gico.selection import SELECTION_PROTOCOL
-
         records = self.metadata["history"].get("students", {}).get(student_kind, [])
         if (
             not records
@@ -293,7 +305,37 @@ class GICOPolicy:
         ):
             raise ValueError("Artifact checkpoint history does not follow its configured score schedule.")
         eligible = [row for row in records if row.get("coefficient", 0) > 0]
-        if (
+        if criterion == STUDENT_SELECTION_PROTOCOL and student_kind == "GICO-det-policy":
+            from genode.gico.selection import validate_teacher_selection
+
+            validate_teacher_selection(payload["teacher"], self.teacher_conditioning, self.metadata)
+            expected_steps = list(
+                range(
+                    training.deterministic_checkpoint_every,
+                    training.student_steps + 1,
+                    training.deterministic_checkpoint_every,
+                )
+            )
+            if not expected_steps or expected_steps[-1] != training.student_steps:
+                expected_steps.append(training.student_steps)
+            if (
+                [row["step"] for row in records] != expected_steps
+                or not eligible
+                or any(
+                    row.get("selection_protocol") != DETERMINISTIC_SELECTION_PROTOCOL
+                    or row.get("selection_teacher_fingerprint")
+                    != self.metadata["history"]["teacher_selection_fingerprint"]
+                    or row.get("selection_contexts") != sorted(self.metadata["split_contexts"]["validation"])
+                    or not isinstance(row.get("predictions_sha256"), str)
+                    or len(row["predictions_sha256"]) != 64
+                    or type(row.get("selection_groups")) is not int
+                    or row["selection_groups"] < 1
+                    for row in eligible
+                )
+                or selection != select_deterministic(records, training.deterministic_kl_allowance)
+            ):
+                raise ValueError("Artifact deterministic student violates teacher-score/KL selection.")
+        elif (
             not eligible
             or any(
                 row.get("selection_protocol") != SELECTION_PROTOCOL
@@ -350,6 +392,26 @@ class GICOPolicy:
                 DeterministicStudent(config) if student_kind == "GICO-det-policy" else StochasticStudent(config)
             )
         self.model.load_state_dict(payload["students"][student_kind], strict=True)
+        if criterion == STUDENT_SELECTION_PROTOCOL and student_kind == "GICO-det-policy":
+            # Both roles share the Transformer; only input/output projection sizes differ.
+            # Check structure without constructing a teacher or changing v6 byte fingerprints.
+            shapes = {key: tuple(value.shape) for key, value in self.model.state_dict().items()}
+            shapes.update(
+                {
+                    "input.0.weight": (config.width, 3),
+                    "output.weight": (config.metric_count, config.width),
+                    "output.bias": (config.metric_count,),
+                }
+            )
+            state = payload["teacher"]
+            if set(state) != set(shapes) or any(
+                not isinstance(value, torch.Tensor)
+                or tuple(value.shape) != shapes[key]
+                or value.dtype != torch.float32
+                or not bool(torch.isfinite(value).all())
+                for key, value in state.items()
+            ):
+                raise ValueError("Selected teacher state does not match its Transformer architecture.")
         if any(not bool(torch.isfinite(v).all()) for v in self.model.state_dict().values()):
             raise ValueError("Artifact contains nonfinite model parameters.")
         if student_kind == "GICO-sto-policy" and bool((self.model.ratio_scale <= 0).any()):
@@ -360,7 +422,7 @@ class GICOPolicy:
         if selection.get("selection_checkpoint_id") != candidate_fingerprint(
             self.model, self.conditioning, student_kind, step
         ):
-            raise ValueError("Selected utility evidence does not match the stored student state/conditioning.")
+            raise ValueError("Selected checkpoint evidence does not match the stored student state/conditioning.")
 
     def density(self, context, solver: str, nfe: int, *, seed: int = 0, request_id: str = "") -> np.ndarray:
         return sample_density(self.model, self.conditioning, self.student_kind, context, solver, nfe, seed, request_id)

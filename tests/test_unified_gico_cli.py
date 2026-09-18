@@ -64,3 +64,24 @@ def test_config_rejects_missing_or_retired_options(tmp_path, config):
 def test_cli_rejects_unsupported_choices(option, value):
     with pytest.raises(SystemExit):
         train_gico.build_argparser().parse_args(["--config", "training.json", option, value])
+
+
+@pytest.mark.parametrize("factory", [None, {"factory": "unavailable_runtime:factory", "config": {}}])
+def test_deterministic_fit_does_not_import_or_require_generator_factory(tmp_path, monkeypatch, factory):
+    rows, contexts = reference_evidence()
+    monkeypatch.setattr(train_gico, "read_rows", lambda _: rows)
+    monkeypatch.setattr(train_gico, "load_context_embedding_table", lambda _: contexts)
+    calls = []
+    monkeypatch.setattr(train_gico, "fit", lambda *args, **kwargs: calls.append(kwargs))
+    config = {
+        "rows": "observations.jsonl",
+        "contexts": "contexts.npz",
+        "output": str(tmp_path / "policy"),
+        "student_kind": "GICO-det-policy",
+        "selection_evaluator": factory,
+    }
+    train_gico.run_config(config)
+    assert calls[0]["selection_evaluator"] is None
+    for kind in ("both", "GICO-sto-policy"):
+        with pytest.raises(ValueError, match="requires"):
+            train_gico.run_config({**config, "student_kind": kind, "selection_evaluator": None})

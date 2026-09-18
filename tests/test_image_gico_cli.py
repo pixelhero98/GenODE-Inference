@@ -57,6 +57,25 @@ def test_shared_image_training_flags():
     assert args.student_kind == "both" and args.teacher_score_weight is None
 
 
+def test_deterministic_image_fit_needs_no_generator_factory(tmp_path):
+    manifest, evidence = tmp_path / "measurements.json", tmp_path / "evidence.json"
+    manifest.write_text(json.dumps(image_manifest()), encoding="utf-8")
+    main(["prepare", "--manifest", str(manifest), "--output", str(evidence)])
+    with patch("genode.gico.training.fit", return_value={}) as fit:
+        main(
+            [
+                "train",
+                "--evidence",
+                str(evidence),
+                "--output",
+                str(tmp_path / "policy"),
+                "--student-kind",
+                "GICO-det-policy",
+            ]
+        )
+    assert fit.call_args.kwargs["selection_evaluator"] is None
+
+
 @pytest.mark.parametrize("model_key", list(IMAGE_BACKBONE_REGISTRY))
 def test_registered_native_backbones_prepare_and_train_with_kid(tmp_path, model_key):
     from genode.gico.rewards import calibrate_rewards, construct_rewards
