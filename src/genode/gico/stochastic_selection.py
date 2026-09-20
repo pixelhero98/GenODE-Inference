@@ -21,6 +21,10 @@ def distribution_kl(model, condition, references, weights, noise, smoothing):
     component samples reduce comparison noise. Joint log probabilities are
     summed over all 63 coordinates before evaluating the nonnegative estimator.
     """
+    # Softmax can underflow to exact zero. Such components contribute no mass
+    # to p, so evaluating their samples can only introduce spurious overflow.
+    active = weights != 0
+    references, weights = references[active], weights[active]
     centers = model.ratios(references)
     samples = (centers[:, None] + smoothing * noise[None]).reshape(-1, 63)
     values = []

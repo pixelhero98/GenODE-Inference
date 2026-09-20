@@ -18,6 +18,8 @@ KID observations are complete paired blocks: the candidate and uniform use ident
 
 The manifest records configuration, selected inventory, assignments, full reference support, held-out density identities, split membership, every solve request and its seed/block, source revision, completed solve count and measurement checksum. Settings are resolved before measurements are observed. A completed manifest is mandatory for research fitting. `purpose: functional` exists only for small, explicitly labelled software fixtures; it cannot be relabelled as research evidence.
 
+Validation independently checks split counts and each density's fitting allocation, even when manifest checksums have been recomputed. Fitting counts use the configured fraction with largest-remainder allocation and the recorded density order for ties. If source groups contain multiple selected contexts, keep each group intact and choose the nearest feasible held-out count; equal-distance ties prefer the larger holdout. CIFAR panel identities and exact image-budget divisibility are also checked.
+
 ## Plan and collect
 
 A collection JSON config contains `task`, frozen `backbone`, `source_revision`, `settings` (for example `[["euler", 4], ["euler", 6]]`), `inventory` and `output`. Inventory entries contain `context_id` and optional `stratum`; ImageNet requires `class_id` and all 1,000 classes. Native embeddings stay in a separate NPZ table. Optional `collection` fields match `CollectionConfig` in `genode.gico.collection`.

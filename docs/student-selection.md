@@ -44,6 +44,8 @@ KL estimate = sum_j w_j * mean_{z from component j}(l + exp(-l) - 1)
 
 The likelihood-ratio estimator is nonnegative for every sample. `log p` uses the complete weighted mixture; `log q` uses autoregressive conditional parameters. Training's coordinate-averaged NLL and deterministic barycenter KL are different quantities and are not stochastic selection criteria.
 
+Components whose weights underflow to exactly zero contribute neither probability nor samples to the estimate. Every positive-weight component is retained, however small its weight; no probability threshold or extra smoothing is applied.
+
 Rank admitted checkpoints by expected calibrated frozen-teacher utility from four fixed full-policy draws per context/setting. Prefer earlier ties. Target samples and policy draws use independent explicit RNG streams, repeat identically at each checkpoint, and do not consume training or generation RNG state. Restore each solver's scalar reward scale before aggregation. Auxiliary standardization and clipping are training-only.
 
 ## Shared training and artifact contract

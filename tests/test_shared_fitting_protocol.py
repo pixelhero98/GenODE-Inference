@@ -160,6 +160,41 @@ def test_distribution_kl_uses_full_mixture_joint_likelihoods():
     )
 
 
+@pytest.mark.parametrize("tail_score", [-50.0, -30.0])
+def test_distribution_kl_handles_underflow_without_dropping_positive_components(tail_score):
+    from genode.gico.training import reference_weights
+
+    class Gaussian:
+        def __init__(self):
+            self.samples = 0
+
+        def ratios(self, refs):
+            return refs
+
+        def conditional_parameters(self, condition, ratios):
+            self.samples += len(ratios)
+            return torch.zeros_like(ratios), torch.ones_like(ratios)
+
+    refs = torch.zeros(2, 63, dtype=torch.double)
+    refs[1, 0] = 10
+    weights = reference_weights(torch.tensor([0.0, tail_score]), temperature=0.05, reward_scale=1.0)
+    noise = torch.randn(32, 63, generator=torch.Generator().manual_seed(2), dtype=torch.double)
+    condition = torch.zeros(1, 2)
+    model = Gaussian()
+    actual = distribution_kl(model, condition, refs, weights, noise, 0.1)
+    assert torch.isfinite(actual) and actual >= 0
+    if tail_score == -50:
+        assert weights[1] == 0
+        expected = distribution_kl(Gaussian(), condition, refs[:1], weights[:1], noise, 0.1)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert model.samples == 32
+        reversed_value = distribution_kl(Gaussian(), condition, refs.flip(0), weights.flip(0), noise, 0.1)
+        torch.testing.assert_close(actual, reversed_value, atol=0, rtol=0)
+    else:
+        assert 0 < weights[1] < 1e-250
+        assert model.samples == 64
+
+
 def test_stochastic_selection_is_replayable_and_rng_isolated():
     from tests.test_unified_gico_rewards import reference_evidence
 

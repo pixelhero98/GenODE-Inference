@@ -5,7 +5,7 @@ from copy import deepcopy
 
 import pytest
 
-from genode.gico.collection import CollectionConfig, plan_collection, validate_collection
+from genode.gico.collection import CollectionConfig, digest, plan_collection, validate_collection
 
 
 def plan(task, inventory, **options):
@@ -92,3 +92,107 @@ def test_sequence_repeats_have_disjoint_complete_member_seeds_and_exact_solve_co
         previous = by_context.setdefault(row["context_id"], set())
         assert not previous.intersection(row["sample_seeds"])
         previous.update(row["sample_seeds"])
+
+
+def rebind_plan(manifest):
+    """Recompute identities so semantic checks, rather than checksums, reject changes."""
+    fitting = set(manifest["split_contexts"]["train"])
+    for request in manifest["requests"]:
+        request["split"] = "train" if request["context_id"] in fitting else "validation"
+        request["request_id"] = digest({k: v for k, v in request.items() if k != "request_id"})
+    manifest["plan_sha256"] = digest({k: v for k, v in manifest.items() if k != "plan_sha256"})
+
+
+@pytest.mark.parametrize("task", ["traffic_hourly", "sana", "imagenet64"])
+@pytest.mark.parametrize("mutation", ["size", "density", "duplicate"])
+def test_rehashed_context_splits_must_match_configured_allocation(task, mutation):
+    count = 1000 if task == "imagenet64" else 256
+    inventory = [{"context_id": str(i), **({"class_id": i} if task == "imagenet64" else {})} for i in range(count)]
+    result = plan(task, inventory)
+    validate_collection(result)
+    splits = result["split_contexts"]
+    if mutation == "size":
+        splits["train"] += splits["validation"][:-1]
+        splits["validation"] = splits["validation"][-1:]
+        error = "split size"
+    elif mutation == "density":
+        fitting = splits["train"][0]
+        held = next(c for c in splits["validation"] if result["assignments"][c] != result["assignments"][fitting])
+        splits["train"].remove(fitting)
+        splits["train"].append(held)
+        splits["validation"].remove(held)
+        splits["validation"].append(fitting)
+        error = "density split"
+    else:
+        splits["train"].append(splits["train"][0])
+        error = "duplicate"
+    rebind_plan(result)
+    with pytest.raises(ValueError, match=error):
+        validate_collection(result)
+
+
+@pytest.mark.parametrize(
+    "sizes,fraction,held", [([12, 18, 30], 0.8, 12), ([20, 20, 20], 0.8, 20), ([10, 20, 30], 0.75, 20)]
+)
+def test_grouped_split_keeps_nearest_feasible_size_and_larger_holdout_ties(sizes, fraction, held):
+    inventory = [{"context_id": f"{g}:{i}", "group_id": str(g)} for g, size in enumerate(sizes) for i in range(size)]
+    result = plan("traffic_hourly", inventory, fitting_fraction=fraction)
+    validate_collection(result)
+    assert len(result["split_contexts"]["validation"]) == held
+    splits = result["split_contexts"]
+    group = splits["train"][0].split(":")[0]
+    moved = [c for c in splits["train"] if c.split(":")[0] == group]
+    splits["train"] = [c for c in splits["train"] if c not in moved]
+    splits["validation"] += moved
+    rebind_plan(result)
+    with pytest.raises(ValueError, match="nearest feasible"):
+        validate_collection(result)
+
+
+@pytest.mark.parametrize("task", ["traffic_hourly", "sana", "cifar10", "imagenet64"])
+def test_custom_budget_repeat_and_split_settings_remain_valid(task):
+    if task == "imagenet64":
+        inventory = [{"context_id": str(i), "class_id": i} for i in range(1000)]
+        options = {"imagenet_images_per_class": 32, "generation_seeds": (2, 3, 4, 5), "fitting_fraction": 0.75}
+        expected_contexts, expected_solves = (750, 250), 62720
+    elif task == "cifar10":
+        inventory = [{"context_id": "unconditional"}]
+        options = {"cifar_images": 12500, "generation_seeds": (2, 3, 4, 5, 6), "fitting_fraction": 0.75}
+        expected_contexts, expected_solves = (1, 1), 12500
+    else:
+        inventory = [{"context_id": str(i)} for i in range(123)]
+        options = {"context_budget": 111, "generation_seeds": (2, 3, 4), "fitting_fraction": 0.65}
+        expected_contexts, expected_solves = (72, 39), None
+    result = plan(task, inventory, **options)
+    validate_collection(result)
+    assert tuple(len(result["split_contexts"][s]) for s in ("train", "validation")) == expected_contexts
+    if expected_solves is not None:
+        assert sum(r["sample_count"] for r in result["requests"] if r["nfe"] == 4) == expected_solves
+    if task == "imagenet64":
+        counts = Counter(result["assignments"][c][0] for c in result["split_contexts"]["train"])
+        assert set(counts.values()) == {30}
+    if task == "cifar10":
+        assert sum(r["sample_count"] for r in result["requests"] if r["nfe"] == 4 and r["split"] == "train") == 9375
+
+
+@pytest.mark.parametrize("task,field", [("cifar10", "cifar_images"), ("imagenet64", "imagenet_images_per_class")])
+def test_rehashed_image_budgets_cannot_silently_drop_remainders(task, field):
+    inventory = (
+        [{"context_id": "unconditional"}]
+        if task == "cifar10"
+        else [{"context_id": str(i), "class_id": i} for i in range(1000)]
+    )
+    result = plan(task, inventory)
+    result["config"][field] += 1
+    rebind_plan(result)
+    with pytest.raises(ValueError, match="divide exactly"):
+        validate_collection(result)
+
+
+def test_cifar_panel_split_identities_cannot_be_swapped_after_rehashing():
+    result = plan("cifar10", [{"context_id": "unconditional"}])
+    splits = result["split_contexts"]
+    splits["train"], splits["validation"] = splits["validation"], splits["train"]
+    rebind_plan(result)
+    with pytest.raises(ValueError, match="panel identities"):
+        validate_collection(result)

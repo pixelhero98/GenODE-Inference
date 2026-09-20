@@ -112,15 +112,36 @@ def _stratified(records, count, rng):
     return selected
 
 
+def _fitting_counts(counts, fraction):
+    sizes = [math.floor(count * fraction) for count in counts]
+    remaining = math.floor(sum(counts) * fraction) - sum(sizes)
+    order = sorted(range(len(counts)), key=lambda i: -(counts[i] * fraction - sizes[i]))
+    for index in order[:remaining]:
+        sizes[index] += 1
+    return sizes
+
+
+def _grouped_holdout(counts, fraction):
+    # Exact subset sum where possible; nearest feasible size otherwise. Ties
+    # prefer the larger holdout, keeping each source group intact.
+    reachable = {0: ()}
+    for name, count in counts.items():
+        for size, chosen in list(reachable.items()):
+            reachable.setdefault(size + count, (*chosen, name))
+    total = sum(counts.values())
+    target = total - math.floor(total * fraction)
+    feasible = [size for size in reachable if 0 < size < total]
+    if not feasible:
+        raise ValueError("A grouped holdout requires at least two independent source groups.")
+    size = min(feasible, key=lambda value: (abs(value - target), value < target, value))
+    return reachable[size]
+
+
 def _assign(records, fraction, rng):
     keys = list(rng.permutation(REFERENCE_KEYS))
     assigned = {r["context_id"]: keys[i % len(keys)] for i, r in enumerate(records)}
     groups = [[r for r in records if assigned[r["context_id"]] == key] for key in keys]
-    sizes = [math.floor(len(group) * fraction) for group in groups]
-    remaining = math.floor(len(records) * fraction) - sum(sizes)
-    order = sorted(range(len(groups)), key=lambda i: -(len(groups[i]) * fraction - sizes[i]))
-    for index in order[:remaining]:
-        sizes[index] += 1
+    sizes = _fitting_counts([len(group) for group in groups], fraction)
     splits = {}
     for group, count in zip(groups, sizes, strict=True):
         for index, row in enumerate(group):
@@ -131,19 +152,8 @@ def _assign(records, fraction, rng):
         grouped = defaultdict(list)
         for row in records:
             grouped[row["group_id"]].append(row["context_id"])
-        # Exact subset sum where possible; closest feasible integer otherwise.
-        # Group membership always takes precedence over rounding 80/20.
-        reachable = {0: ()}
         names = list(rng.permutation(sorted(grouped)))
-        for name in names:
-            for size, chosen in list(reachable.items()):
-                reachable.setdefault(size + len(grouped[name]), (*chosen, name))
-        target = len(records) - math.floor(len(records) * fraction)
-        feasible = [size for size in reachable if 0 < size < len(records)]
-        if not feasible:
-            raise ValueError("A grouped holdout requires at least two independent source groups.")
-        size = min(feasible, key=lambda value: (abs(value - target), value < target, value))
-        heldout = set(reachable[size])
+        heldout = set(_grouped_holdout({name: len(grouped[name]) for name in names}, fraction))
         splits = {row["context_id"]: "validation" if row["group_id"] in heldout else "train" for row in records}
     return assigned, splits
 
@@ -299,8 +309,12 @@ def validate_collection(manifest, rows=None):
         if manifest.get("complete_solves") != sum(r["sample_count"] for r in manifest["requests"]):
             raise ValueError("Collection solve accounting differs from its requests.")
     splits = manifest["split_contexts"]
-    if not all(splits.values()) or set(splits["train"]) & set(splits["validation"]):
-        raise ValueError("Collection contexts must have nonempty disjoint splits.")
+    if (
+        set(splits) != {"train", "validation"}
+        or any(not values or len(values) != len(set(values)) for values in splits.values())
+        or set(splits["train"]) & set(splits["validation"])
+    ):
+        raise ValueError("Collection contexts must have nonempty disjoint splits without duplicate entries.")
     support = manifest["reference_support"]
     settings = [(s.rsplit(":", 1)[0], int(s.rsplit(":", 1)[1])) for s in support]
     if support != reference_support(settings):
@@ -378,6 +392,10 @@ def _validate_requests(manifest, config):
     if task == "cifar10":
         if len(ids) != 2 or any(set(keys) != set(REFERENCE_KEYS) for keys in assigned.values()):
             raise ValueError("CIFAR needs two disjoint panels covering every reference density.")
+        if config.cifar_images % (len(REFERENCE_KEYS) * len(config.generation_seeds)):
+            raise ValueError("CIFAR image budget must divide exactly across densities and collection repeats.")
+        if splits != {phase: [f"{phase}:unconditional"] for phase in ("train", "validation")}:
+            raise ValueError("CIFAR fitting and held-out panel identities differ from their planned splits.")
     else:
         if any(len(keys) != 1 or keys[0] not in REFERENCE_KEYS for keys in assigned.values()):
             raise ValueError("Each context must have exactly one assigned candidate density.")
@@ -387,12 +405,40 @@ def _validate_requests(manifest, config):
         if task == "imagenet64":
             if len(ids) != 1000 or {r.get("class_id") for r in records} != set(range(1000)):
                 raise ValueError("ImageNet needs all 1000 distinct class contexts.")
+            if config.imagenet_images_per_class % len(config.generation_seeds):
+                raise ValueError("ImageNet image budget must divide exactly across collection repeats.")
         elif len(ids) > config.context_budget:
             raise ValueError("Collection exceeded its context budget.")
+        _validate_split_allocation(records, assigned, splits, config.fitting_fraction)
     phases = {context: phase for phase, contexts in splits.items() for context in contexts}
     expected = _requests(task, manifest["backbone"], records, manifest["reference_support"], assigned, phases, config)
     if expected != manifest["requests"]:
         raise ValueError("Collection requests differ from resolved budgets, assignments or seeds.")
+
+
+def _validate_split_allocation(records, assigned, splits, fraction):
+    source_groups = defaultdict(list)
+    for row in records:
+        source_groups[row.get("group_id", row["context_id"])].append(row["context_id"])
+    if len(source_groups) < len(records):
+        if not all(isinstance(row.get("group_id"), str) and row["group_id"] for row in records):
+            raise ValueError("Grouped contexts require a source group_id for every entry.")
+        counts = {name: len(group) for name, group in source_groups.items()}
+        expected = sum(counts[name] for name in _grouped_holdout(counts, fraction))
+        if len(splits["validation"]) != expected:
+            raise ValueError("Grouped collection split differs from its nearest feasible held-out allocation.")
+    else:
+        if len(splits["train"]) != math.floor(len(records) * fraction):
+            raise ValueError("Collection fitting split size differs from its configured fraction.")
+        # First appearances preserve the planner's seeded density order, which
+        # breaks equal-remainder ties without introducing a second RNG stream.
+        density_groups = defaultdict(list)
+        for row in records:
+            density_groups[assigned[row["context_id"]][0]].append(row["context_id"])
+        expected = _fitting_counts([len(group) for group in density_groups.values()], fraction)
+        fitting = set(splits["train"])
+        if [sum(context in fitting for context in group) for group in density_groups.values()] != expected:
+            raise ValueError("Collection density split differs from its stratified fitting allocation.")
 
 
 def complete_collection(manifest, rows):
