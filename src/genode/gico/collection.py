@@ -33,10 +33,15 @@ class CollectionConfig:
     cifar_images: int = 10000
     imagenet_images_per_class: int = 64
     image_objective: str = "kid"
+    forecast_ensemble_size: int = 5
+    molecule_ensemble_size: int = 16
 
     def __post_init__(self):
         if self.image_objective not in ("kid", "lpips"):
             raise ValueError("Image collection objective must be kid or explicit lpips.")
+        for size in (self.forecast_ensemble_size, self.molecule_ensemble_size):
+            if type(size) is not int or size < 2:
+                raise ValueError("Sequence collection requires complete ensembles with at least two members.")
         for name in ("context_budget", "cifar_images", "imagenet_images_per_class"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError("Collection budgets must be positive integers.")
@@ -150,6 +155,10 @@ def plan_collection(task, backbone, inventory, settings, *, source_revision, con
     embeddings and runtime-specific cases stay in separate input files.
     """
     config = config or CollectionConfig()
+    from genode.gico.rewards import TASK_METRICS
+
+    if task not in TASK_METRICS:
+        raise ValueError("Collection requires a registered task.")
     if not source_revision or not backbone or not settings:
         raise ValueError("Collection requires source, frozen backbone and solver/NFE settings.")
     records = copy.deepcopy(inventory)
@@ -227,13 +236,21 @@ def _requests(task, backbone, records, support, assigned, splits, config):
                     samples = train if phase == "train" else total - train
                 elif task == "imagenet64":
                     samples = config.imagenet_images_per_class // repeats
+                elif task.startswith("molecule_"):
+                    samples = config.molecule_ensemble_size
+                elif task not in ("sana", "sd15"):
+                    samples = config.forecast_ensemble_size
                 if task in ("cifar10", "imagenet64") and samples < 2:
                     raise ValueError("Each complete KID block needs at least two samples.")
-                seeds = (
-                    [int(digest([config.seed, seed, context, i])[:15], 16) for i in range(samples)]
-                    if task in ("cifar10", "imagenet64")
-                    else [seed]
-                )
+                if task in ("cifar10", "imagenet64"):
+                    seeds = [int(digest([config.seed, seed, context, i])[:15], 16) for i in range(samples)]
+                elif task in ("sana", "sd15"):
+                    seeds = [seed]
+                else:
+                    # Native sequence runtimes use consecutive physical member seeds.
+                    # Hash the repeat/context first so adjacent repeat labels never share members.
+                    first = int(digest([config.seed, seed, context])[:15], 16)
+                    seeds = list(range(first, first + samples))
                 for key in dict.fromkeys(["uniform", *assigned[context]]):
                     request = {
                         "task": task,
@@ -243,7 +260,8 @@ def _requests(task, backbone, records, support, assigned, splits, config):
                         "context_id": context,
                         "split": phase,
                         "schedule_key": key,
-                        "seed": seeds[0] if task in ("cifar10", "imagenet64") else seed,
+                        "seed": seeds[0],
+                        "collection_seed": seed,
                         "collection_repeat": repeat,
                         "sample_seeds": seeds,
                         "sample_count": samples,
@@ -311,6 +329,12 @@ def validate_collection(manifest, rows=None):
                 raise ValueError("Duplicate or unplanned collection observation.")
             observed.add(identity)
             request = requests[identity]
+            if manifest.get("purpose") != "functional" and row.get("ensemble_size") != request["sample_count"]:
+                raise ValueError("Collected ensemble size differs from its planned physical solve allowance.")
+            if manifest.get("purpose") != "functional" and any(
+                row.get(key) != request[key] for key in ("sample_seeds", "collection_seed", "collection_repeat")
+            ):
+                raise ValueError("Collected physical member seeds or repeat identity differs from the plan.")
             for key in (
                 "task",
                 "backbone",

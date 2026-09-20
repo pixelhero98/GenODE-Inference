@@ -106,7 +106,8 @@ def test_builtin_factory_executes_paired_blocks_and_seed_specific_assets(tmp_pat
     runtime.verify_frozen()
 
 
-def test_forecast_replays_recorded_nonfirst_physical_seed(tmp_path):
+@pytest.mark.parametrize("collected", [False, True])
+def test_forecast_replays_recorded_nonfirst_physical_seed(tmp_path, collected):
     model = StubSampler(1)
     runtime = SequenceEvaluator.__new__(SequenceEvaluator)
     runtime.device, runtime.molecule = torch.device("cpu"), False
@@ -133,6 +134,8 @@ def test_forecast_replays_recorded_nonfirst_physical_seed(tmp_path):
         "collection_batch_size": 1,
         "sample_seed_values": [1000031, 1000032],
     }
+    if collected:
+        row.update(seed=1000031, collection_seed=0, sample_seeds=case["sample_seed_values"])
     runtime.measure(row, clocks, [4.0] * 4, case, tmp_path / "first")
     with torch.random.fork_rng(devices=[]):
         for seed, observed in zip(case["sample_seed_values"], model.draws, strict=True):
@@ -204,3 +207,43 @@ def test_lpips_implementation_mismatch_fails_before_scorer_construction(tmp_path
                 "lpips_checkpoint": "fixture-lpips.pt",
             }
         )
+
+
+def test_molecular_collection_corrects_native_example_offset(tmp_path, monkeypatch):
+    from genode.gico.rewards import MOLECULE_METRICS
+
+    target = torch.zeros(2, 3, 3)
+    runtime = SequenceEvaluator.__new__(SequenceEvaluator)
+    runtime.device, runtime.molecule = torch.device("cpu"), True
+    source = {"backbone_id": "frozen", "rollout_steps": 2, "stratum": "fixture"}
+    runtime.config = {"backbones": {"fixture": source}}
+    runtime.loaded = {
+        "fixture": {
+            "model": None,
+            "cfg": None,
+            "splits": {"val": SimpleNamespace(eval_item=lambda i: {"future_coords": target})},
+        }
+    }
+    row = {
+        "task": "molecule_3d_set1",
+        "backbone": "frozen",
+        "reference_id": "target",
+        "seed": 100000,
+        "collection_seed": 0,
+        "sample_seeds": [100000, 100001],
+        "solver": "euler",
+        "nfe": 4,
+        "ensemble_size": 2,
+        "schedule_key": "uniform",
+    }
+    case = {"backbone": "fixture", "reference_id": "target", "example_idx": 7, "target_sha256": tensor_digest(target)}
+
+    def evaluate(**kwargs):
+        assert kwargs["seed"] + 10000 * kwargs["example_indices"][0] == row["sample_seeds"][0]
+        kwargs["policy"].cursor = 2
+        return {"molecule_" + key: 1.0 for key in MOLECULE_METRICS}
+
+    monkeypatch.setattr("genode.evaluation.molecule_metrics.evaluate_molecule_rollout_schedule", evaluate)
+    clock = {"density_mass": [1 / 64] * 64, "time_grid": [0, 0.25, 0.5, 0.75, 1]}
+    metrics = runtime.measure(row, [clock] * 2, [0.0], case, tmp_path / "measured")
+    assert set(metrics) == set(MOLECULE_METRICS)

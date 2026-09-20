@@ -39,7 +39,7 @@ def sparse_evidence():
         moment = float(np.asarray(request["density_mass"]) @ np.linspace(1, 3, 64))
         return {
             **{k: v for k, v in request.items() if k != "request_id"},
-            "ensemble_size": 3,
+            "ensemble_size": request["sample_count"],
             "reference_id": "reference:" + request["context_id"],
             "measurement_protocol": "fixture-complete-forecast",
             "metrics": {"crps": 3 + moment, "mase": 2 + moment**2},

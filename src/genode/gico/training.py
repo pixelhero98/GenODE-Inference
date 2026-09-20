@@ -371,9 +371,16 @@ def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=N
             first = group[0]
             pool = evidence.reference_support[f"{first['solver']}:{first['nfe']}"]
             unique = {}
-            for name, value in pool.items():
-                unique.setdefault(value["density_identity"], {**first, **value, "schedule_key": name})
-            result.append(_tensors(evidence, list(unique.values()), device))
+            for value in pool.values():
+                unique.setdefault(value["density_identity"], value["density_mass"])
+            condition = torch.tensor(
+                evidence.conditioning.transform(evidence.contexts[first["context_id"]], first["solver"], first["nfe"]),
+                dtype=torch.float32,
+                device=device,
+            )[None].expand(len(unique), -1)
+            masses = torch.tensor(list(unique.values()), dtype=torch.float64, device=device)
+            # Unmeasured support has no truth tensor: these are teacher queries only.
+            result.append((condition, masses, None, evidence.calibrations[first["solver"]].reward_scale))
         return result
 
     training_groups = support_groups(train_groups)

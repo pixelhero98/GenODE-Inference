@@ -22,9 +22,7 @@ def read_rows(path) -> list[dict]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
-def load_config(path) -> dict:
-    location = Path(path).resolve()
-    config = json.loads(location.read_text(encoding="utf-8"))
+def validate_config(config):
     allowed = {
         "rows",
         "contexts",
@@ -39,6 +37,12 @@ def load_config(path) -> dict:
     } | {field.name for field in fields(TrainingConfig)}
     if set(config) - allowed or not {"rows", "contexts", "output"} <= set(config):
         raise ValueError("Training config requires rows/contexts/output and only documented GICO options.")
+
+
+def load_config(path) -> dict:
+    location = Path(path).resolve()
+    config = json.loads(location.read_text(encoding="utf-8"))
+    validate_config(config)
     for key in ("rows", "contexts", "calibration_rows", "output", "teacher_artifact", "collection_manifest"):
         if key in config:
             value = Path(config[key])
@@ -47,6 +51,7 @@ def load_config(path) -> dict:
 
 
 def run_config(config: dict, *, dry_run: bool = False) -> dict:
+    validate_config(config)
     values = dict(config)
     if values.get("student_kind", "GICO-det-policy") not in ("GICO-det-policy", "GICO-sto-policy", "both"):
         raise ValueError("student_kind must be GICO-det-policy, GICO-sto-policy, or both.")

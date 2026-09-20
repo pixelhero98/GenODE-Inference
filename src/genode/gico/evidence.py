@@ -105,8 +105,8 @@ def prepare_evidence(
         if any(content_hash(r) not in {content_hash(x) for x in rows} for r in calibration_rows):
             raise ValueError("Calibration observations must belong to the completed collection.")
     calibration_rows = calibration_rows if calibration_rows is not None else [r for r in rows if eligible(r)]
-    all_rows = rows + calibration_rows
-    from genode.gico.image_objective import IMAGE_TASKS, validate_image_rows
+    all_rows = rows
+    from genode.gico.image_objective import validate_image_rows
 
     validate_image_rows(all_rows)
     if task == "imagenet64" and purpose == "research":
@@ -158,10 +158,8 @@ def prepare_evidence(
         else:
             calibration_nfes = {r["nfe"] for r in calibration}
             training_nfes = {r["nfe"] for r in training}
-            if not training_nfes <= calibration_nfes or (task not in IMAGE_TASKS and training_nfes != calibration_nfes):
-                raise ValueError(
-                    "Reward calibration must cover training NFEs; only image fitting permits a shared calibration NFE superset."
-                )
+            if training_nfes != calibration_nfes:
+                raise ValueError("Reward calibration must cover the collected eligible fitting NFEs exactly.")
             calibrated = calibrate_rewards(calibration)
         calibrations[solver] = calibrated
         cells.extend(construct_rewards([r for r in rows if r["solver"] == solver], calibrated))

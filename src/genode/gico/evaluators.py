@@ -65,11 +65,17 @@ def build_collector(config):
             "density_mass",
             "time_grid",
             "class_id",
+            "sample_count",
+            "sample_seeds",
+            "collection_seed",
+            "collection_repeat",
         ):
             if key in request:
                 if key in row and row[key] != request[key]:
                     raise ValueError(f"Collection template conflicts with planned {key}.")
                 row[key] = request[key]
+        if row.get("ensemble_size") != request["sample_count"]:
+            raise ValueError("Collection ensemble size must match the planned physical solve allowance.")
         if "sample_block" in row and row["sample_block"]["seeds"] != request["sample_seeds"]:
             raise ValueError("Collection template sample block differs from the plan.")
         if instance is None:

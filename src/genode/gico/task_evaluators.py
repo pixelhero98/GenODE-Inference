@@ -124,6 +124,13 @@ class SequenceEvaluator(FrozenModules):
             target = ds.eval_item(index)["future_coords"]
             if tensor_digest(target) != case["target_sha256"]:
                 raise ValueError("Molecular held-out target changed.")
+            seed = row["seed"]
+            if "collection_seed" in row:
+                seeds = row["sample_seeds"]
+                if seeds != list(range(seed, seed + row["ensemble_size"])):
+                    raise ValueError("Molecular collection member seeds differ from the planned complete ensemble.")
+                # The native evaluator adds this example offset internally.
+                seed -= 10000 * index
             result = evaluate_molecule_rollout_schedule(
                 model=loaded["model"],
                 ds=ds,
@@ -135,7 +142,7 @@ class SequenceEvaluator(FrozenModules):
                 rollout_steps=source["rollout_steps"],
                 sample_count=row["ensemble_size"],
                 example_indices=[index],
-                seed=row["seed"],
+                seed=seed,
                 scheduler_key=row["schedule_key"],
                 split_phase="validation_tuning",
                 checkpoint_id=row["backbone"],
@@ -154,6 +161,8 @@ class SequenceEvaluator(FrozenModules):
             if tensor_digest(complete) != case["target_sha256"]:
                 raise ValueError("Forecast held-out target changed.")
             seeds = case["sample_seed_values"]
+            if "collection_seed" in row and seeds != row["sample_seeds"]:
+                raise ValueError("Forecast case seeds differ from the planned complete ensemble.")
             if seeds != list(range(seeds[0], seeds[0] + row["ensemble_size"])):
                 raise ValueError("Forecast physical member seeds must be complete and consecutive.")
             if case["collection_batch_size"] != 1:
