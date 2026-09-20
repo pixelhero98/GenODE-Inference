@@ -75,8 +75,8 @@ def test_imagenet_preserves_native_classes_and_equal_class_reports():
     assert all("reward_metrics" not in row for row in rows)
     assert rows[0]["reference_id"] != rows[1]["reference_id"]
     manifest["rows"].pop()
-    with pytest.raises(ValueError, match="complete equally weighted class"):
-        prepare_image_rows(manifest)
+    _, _, partial = prepare_image_rows(manifest)
+    assert partial["raw_metric_report"][-1]["observed_contexts"] == 999
 
 
 @pytest.mark.parametrize(
@@ -178,12 +178,12 @@ def test_shared_image_calibration_covers_all_nfes_without_validation_access():
         row["nfe"] = 8
         row["density_mass"] = list(reference_densities("euler", 8)[row["schedule_key"]])
         row["time_grid"] = list(materialize(row["density_mass"], "euler", 8))
-    evidence = prepare_evidence(rows, contexts, calibration_rows=calibration + extra)
+    combined = rows + extra
+    evidence = prepare_evidence(combined, contexts, purpose="functional")
     assert evidence.calibrations["euler"].calibration_nfes == (4, 8)
-    for row in extra:
-        row["split"] = "validation"
+    # Independent pilot rows cannot expand the collected budget.
     with pytest.raises(ValueError):
-        prepare_evidence(rows, contexts, calibration_rows=calibration + extra)
+        prepare_evidence(rows, contexts, calibration_rows=calibration + extra, purpose="functional")
 
 
 def test_imagenet_scale_balances_classes_with_unequal_panel_counts():
@@ -218,7 +218,6 @@ def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind
     from tests.test_unified_gico_rewards import reference_evidence
 
     rows, contexts = reference_evidence(task="cifar10")
-    from tests.selection_fixtures import evaluator_for
 
     # Exercise interfaces, not optimizer fitting on the local development host.
     monkeypatch.setattr("genode.gico.training.accumulated_step", lambda *args, **kwargs: 0.0)
@@ -236,7 +235,7 @@ def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind
         teacher_score_weight=0.05,
         stochastic_likelihood_samples=1,
         stochastic_score_samples=1,
-        selection_evaluator=evaluator_for(rows, contexts),
+        purpose="functional",
     )
     assert metadata["image_objective"]["protocol"] == "paired-lpips-v1"
     policy = load_policy(destination, student_kind=kind)

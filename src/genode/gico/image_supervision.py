@@ -9,6 +9,7 @@ import numpy as np
 from genode.backbones.protocol import ImageBackboneManifest
 from genode.backbones.registry import get_image_backbone_spec
 from genode.gico.clocks import verify_measurement_clock
+from genode.gico.collection import validate_collection
 from genode.gico.image_conditional_context import context_binding
 from genode.gico.image_objective import IMAGE_OBJECTIVE, IMAGE_TASKS, validate_image_rows
 from genode.gico.kid_objective import IMAGE_KID_OBJECTIVE
@@ -20,6 +21,9 @@ def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float
     Rows carry panel_id independently of per-sample target/reference_id. A panel's
     seeds are averaged together, and never supplied as model conditioning.
     """
+    collection = manifest.get("collection_manifest")
+    if collection is not None:
+        validate_collection(collection, manifest["rows"])
     backbone = ImageBackboneManifest.from_manifest_dict(manifest["backbone_manifest"])
     task = get_image_backbone_spec(backbone.model_key).dataset_key
     if task not in IMAGE_TASKS:
@@ -42,9 +46,11 @@ def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float
         if task == "cifar10" and label is not None:
             raise ValueError("Unconditional CIFAR-10 evidence cannot carry class labels.")
         source_context = f"class:{label}" if task == "imagenet64" else "unconditional"
-        context_id = f"{row['split']}:{row.get('panel_id', '')}:{source_context}"
-        if row.get("context_id", context_id) != context_id:
-            raise ValueError("Measured class/panel and context ID disagree.")
+        context_id = row["context_id"]
+        if not isinstance(context_id, str) or not context_id:
+            raise ValueError("Measured image evidence requires its planned context identity.")
+        if context_id in contexts and contexts[context_id] != table[label if label is not None else 0].tolist():
+            raise ValueError("A collected context cannot refer to different native classes.")
         contexts[context_id] = table[label if label is not None else 0].tolist()
         row.update(
             task=task,
@@ -73,14 +79,18 @@ def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float
         report_cells[key][row["source_context_id"]].append(float(row["metrics"][metric]))
     reports = []
     for key, classes in report_cells.items():
-        if len(classes) != (1000 if task == "imagenet64" else 1):
-            raise ValueError("Image metric reports require complete equally weighted class coverage.")
         reports.append(
             {
                 **dict(zip(("split", "solver", "nfe", "schedule_key"), key, strict=True)),
                 metric: float(np.mean([np.mean(values) for values in classes.values()])),
+                "observed_contexts": len(classes),
             }
         )
+    if collection is not None:
+        # Native binding is a preparation transform; preserve the plan and bind its output.
+        from genode.gico.collection import complete_collection
+
+        collection = complete_collection(collection, rows)
     return (
         rows,
         contexts,
@@ -92,5 +102,6 @@ def prepare_image_rows(manifest: dict) -> tuple[list[dict], dict[str, list[float
             "image_objective": rows[0]["image_objective"],
             "context_protocol": "native_context_paired_target_panel_v1",
             "raw_metric_report": reports,
+            "collection_manifest": collection,
         },
     )

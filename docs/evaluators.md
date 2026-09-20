@@ -1,8 +1,8 @@
-# Built-in measured selection
+# Collection and explicit measurement reports
 
-Stochastic student fitting requires measured selection. Deterministic fitting uses the generator-free teacher-score/KL rule described in [student selection](student-selection.md) and does not invoke this evaluator.
+Neither student fitting nor checkpoint selection calls a generator or terminal scorer. For collection use `genode.gico.evaluators:build_collector`, with request-keyed templates/cases described in [collection](collection.md). The task runtime configurations below apply to collection and reporting.
 
-Use `genode.gico.evaluators:build_evaluator` in the existing factory/config interface. It supports every retained task, native image GICO KID, explicit GICO-TF LPIPS and frozen BézierFlow KID. Custom factories remain an extension point.
+For an explicit post-fit paired measurement report, `build_evaluator` returns a callback usable by `genode.gico.reporting.evaluate_policy_report`. Its configuration is shown below. It is not accepted by training configuration. These adapters support every retained task, native image KID, explicit GICO-TF LPIPS and frozen BézierFlow KID.
 
 ```json
 {
@@ -19,11 +19,11 @@ Use `genode.gico.evaluators:build_evaluator` in the existing factory/config inte
 }
 ```
 
-Paths in this factory and its runtime/case files resolve from the working directory. Absolute paths can make invocation independent of that directory. The output directory must be new. `rows` contains validation evidence with measured uniform anchors; the shared fitter checks complete held-out coverage. `contexts` uses the shared NPZ context table. Missing assets, changed uniform measurements or incomplete panels fail rather than substituting predictions.
+Paths in this factory and its runtime/case files resolve from the working directory. Absolute paths can make invocation independent of that directory. The output directory must be new. `rows` contains validation evidence with measured uniform anchors; the explicit reporting helper checks complete panel coverage. `contexts` uses the shared NPZ context table. Missing assets, changed uniform measurements or incomplete panels fail rather than substituting predictions.
 
 `cases.json` maps `measurement_identity(row)` from `genode.gico.evaluators` to each measurement's asset description. This hashes context, generation seed and reference identity. Multiple seeds in one context therefore resolve different targets or reference blocks. Cases are shared across candidate checkpoints and solver/NFE settings only when their measurement identity agrees.
 
-An optional factory `python` points to an interpreter with GenODE installed and the task's external dependencies. It runs the frozen generator in that environment; fit-time policy snapshots stay detached on CPU. Each candidate directory retains its request, generated images or sequence metrics, and actual paired measurements. Clock identities derive from context, solver/NFE, generation seed, member and replicate and are reused across candidates. Stochastic identities cannot be shared by distinct generated members or replicates.
+An optional factory `python` points to an interpreter with GenODE installed and the task's external dependencies. It runs the frozen generator in that environment; report-time policy snapshots stay detached on CPU. Each candidate directory retains its request, generated images or sequence metrics, and actual paired measurements. Clock identities derive from context, solver/NFE, generation seed, member and replicate and are reused across candidates. Stochastic identities cannot be shared by distinct generated members or replicates.
 
 ## Forecasting and molecules
 

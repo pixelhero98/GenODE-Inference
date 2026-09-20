@@ -88,7 +88,7 @@ class ReferenceClockTests(unittest.TestCase):
 
     def test_image_protocol_uses_dynamic_canonical_clock_count_and_provenance(self) -> None:
         metadata = image_protocol_metadata()
-        self.assertEqual(metadata["protocol_key"], "image_euler_kid_v9")
+        self.assertEqual(metadata["protocol_key"], "image_euler_kid_collection")
         self.assertEqual(metadata["method"], "GICO")
         self.assertEqual(metadata["supervision"]["protocol"], "paired-image-kid-v1")
         self.assertEqual(metadata["selection"]["teacher"], "heldout_reference_mixture_kid_regret")
@@ -97,8 +97,8 @@ class ReferenceClockTests(unittest.TestCase):
         workloads = metadata["workload_per_dataset_checkpoint_pair"]
         self.assertEqual(workloads["cifar10"]["evidence_images"], 30_000)
         self.assertEqual(workloads["imagenet64"]["conditioning_groups"], 1000)
-        self.assertEqual(workloads["imagenet64"]["evidence_images"], 30_000_000)
-        self.assertEqual(workloads["imagenet64"]["backbone_image_evaluations"], 140_000_000)
+        self.assertEqual(workloads["imagenet64"]["evidence_images"], 376_320)
+        self.assertEqual(workloads["imagenet64"]["backbone_image_evaluations"], 1_756_160)
         fidelity = image_protocol_metadata(method="GICO-TF")
         self.assertEqual(fidelity["supervision"]["protocol"], "paired-lpips-v1")
         self.assertEqual(fidelity["selection"]["teacher"], "heldout_reference_mixture_lpips_regret")
@@ -118,10 +118,9 @@ class ReferenceClockTests(unittest.TestCase):
                 set(dataset),
                 {"key", "resolution", "class_count", "conditioning"},
             )
-        augmented = image_protocol_metadata(extra_late_p_values="2.25")
-        self.assertEqual(augmented["schedule_count"], 27)
-        self.assertIn("late_p_2p25", augmented["schedule_keys"])
-        self.assertIn("late_p_2p25_reversed", augmented["schedule_keys"])
+        self.assertEqual(metadata["selection"]["generator_evaluations"], 0)
+        self.assertEqual(metadata["collection"]["cifar10"]["train_images"], 8000)
+        self.assertEqual(euler_image_workload(dataset_key="imagenet64").evidence_images, 376320)
 
     def test_published_source_node_goldens(self) -> None:
         self.assertEqual(AYS_SD15_TIMESTEPS, (999, 850, 736, 645, 545, 455, 343, 233, 124, 24))

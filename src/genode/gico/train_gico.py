@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 from dataclasses import asdict, fields, replace
 from pathlib import Path
@@ -15,7 +14,12 @@ from genode.gico.training import fit, reuse_teacher
 
 
 def read_rows(path) -> list[dict]:
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    source = Path(path)
+    text = source.read_text(encoding="utf-8")
+    if source.suffix == ".json":
+        value = json.loads(text)
+        return value["rows"] if isinstance(value, dict) else value
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def load_config(path) -> dict:
@@ -31,53 +35,35 @@ def load_config(path) -> dict:
         "device",
         "purpose",
         "teacher_artifact",
-        "selection_evaluator",
+        "collection_manifest",
     } | {field.name for field in fields(TrainingConfig)}
     if set(config) - allowed or not {"rows", "contexts", "output"} <= set(config):
         raise ValueError("Training config requires rows/contexts/output and only documented GICO options.")
-    for key in ("rows", "contexts", "calibration_rows", "output", "teacher_artifact"):
+    for key in ("rows", "contexts", "calibration_rows", "output", "teacher_artifact", "collection_manifest"):
         if key in config:
             value = Path(config[key])
             config[key] = str(value if value.is_absolute() else location.parent / value)
     return config
 
 
-def load_selection_evaluator(evaluator, *, dry_run=False, required=True):
-    if evaluator is not None and (
-        not isinstance(evaluator, dict)
-        or set(evaluator) != {"factory", "config"}
-        or not isinstance(evaluator["factory"], str)
-        or len(evaluator["factory"].split(":")) != 2
-        or not all(part.isidentifier() for part in evaluator["factory"].replace(":", ".").split("."))
-        or not isinstance(evaluator["config"], dict)
-    ):
-        raise ValueError("selection_evaluator requires a trusted module:factory and a config object.")
-    if dry_run:
-        return None
-    if evaluator is None:
-        if not required:
-            return None
-        raise ValueError("Training requires a held-out terminal-utility selection_evaluator factory.")
-    module, name = evaluator["factory"].split(":")
-    callback = getattr(importlib.import_module(module), name)(evaluator["config"])
-    if not callable(callback):
-        raise ValueError("Selection evaluator factory must return a callable.")
-    return callback
-
-
 def run_config(config: dict, *, dry_run: bool = False) -> dict:
     values = dict(config)
-    evaluator = values.pop("selection_evaluator", None)
-    deterministic = values.get("student_kind", "both") == "GICO-det-policy"
-    callback = load_selection_evaluator(evaluator, dry_run=dry_run or deterministic, required=not deterministic)
-    if values.get("student_kind", "both") not in ("GICO-det-policy", "GICO-sto-policy", "both"):
+    if values.get("student_kind", "GICO-det-policy") not in ("GICO-det-policy", "GICO-sto-policy", "both"):
         raise ValueError("student_kind must be GICO-det-policy, GICO-sto-policy, or both.")
     rows = read_rows(values.pop("rows"))
     contexts = load_context_embedding_table(values.pop("contexts"))
     calibration = read_rows(values.pop("calibration_rows")) if "calibration_rows" in values else None
+    manifest = values.pop("collection_manifest", None)
+    manifest = json.loads(Path(manifest).read_text(encoding="utf-8")) if manifest is not None else None
+    if manifest is not None and "collection_manifest" in manifest:
+        manifest = manifest["collection_manifest"]
     if dry_run:
         evidence = prepare_evidence(
-            rows, contexts, calibration_rows=calibration, purpose=values.get("purpose", "research")
+            rows,
+            contexts,
+            calibration_rows=calibration,
+            purpose=values.get("purpose", "research"),
+            collection_manifest=manifest,
         )
         training = resolve_profile(
             evidence.task,
@@ -98,9 +84,9 @@ def run_config(config: dict, *, dry_run: bool = False) -> dict:
             "teacher_score_weight": training.teacher_score_weight,
             "fitting_profile": asdict(training),
             "dry_run": True,
-            "selection_evaluator": evaluator,
+            "collection_manifest": evidence.collection_manifest,
         }
-    return fit(rows, contexts, calibration_rows=calibration, selection_evaluator=callback, **values)
+    return fit(rows, contexts, calibration_rows=calibration, collection_manifest=manifest, **values)
 
 
 def build_argparser() -> argparse.ArgumentParser:

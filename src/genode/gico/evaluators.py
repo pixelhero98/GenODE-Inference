@@ -27,6 +27,68 @@ def measurement_identity(row):
     return content_hash([row["context_id"], row["seed"], row["reference_id"]])
 
 
+def build_collector(config):
+    """Execute planned reference solves using frozen native task runtimes.
+
+    ``templates`` and ``cases`` are JSON objects keyed by collection request ID.
+    Templates hold task-specific reference/asset identities, never measured
+    metrics. Paths are explicit and belong in private runtime configuration.
+    """
+    required = {"runtime", "contexts", "templates", "cases", "output"}
+    if set(config) != required:
+        raise ValueError(f"Native collection requires exactly {sorted(required)}.")
+    contexts = load_context_embedding_table(config["contexts"])
+    templates = json.loads(Path(config["templates"]).read_text(encoding="utf-8"))
+    cases = json.loads(Path(config["cases"]).read_text(encoding="utf-8"))
+    runtime_config = json.loads(Path(config["runtime"]).read_text(encoding="utf-8"))
+    output = Path(config["output"])
+    output.mkdir(parents=True, exist_ok=False)
+    instance = None
+
+    def measure(request):
+        nonlocal instance
+        identity = request["request_id"]
+        if identity not in templates or identity not in cases or request["context_id"] not in contexts:
+            raise ValueError("Collection templates, cases and native contexts must cover every request.")
+        row = copy.deepcopy(templates[identity])
+        if "metrics" in row:
+            raise ValueError("Collection templates cannot contain prefilled measurements.")
+        for key in (
+            "task",
+            "backbone",
+            "solver",
+            "nfe",
+            "context_id",
+            "split",
+            "schedule_key",
+            "seed",
+            "density_mass",
+            "time_grid",
+            "class_id",
+        ):
+            if key in request:
+                if key in row and row[key] != request[key]:
+                    raise ValueError(f"Collection template conflicts with planned {key}.")
+                row[key] = request[key]
+        if "sample_block" in row and row["sample_block"]["seeds"] != request["sample_seeds"]:
+            raise ValueError("Collection template sample block differs from the plan.")
+        if instance is None:
+            from genode.gico.task_evaluators import load_task_evaluator
+
+            instance = load_task_evaluator(runtime_config)
+        instance.verify_frozen()
+        clock = {"density_mass": row["density_mass"], "time_grid": row["time_grid"]}
+        row["metrics"] = instance.measure(
+            row, [clock] * row["ensemble_size"], contexts[row["context_id"]], cases[identity], output / identity
+        )
+        instance.verify_frozen()
+        if row["task"] in ("sana", "sd15"):
+            row["context_embedding_sha256"] = content_hash(contexts[row["context_id"]].tolist())
+        return row
+
+    return measure
+
+
 def build_evaluator(config):
     """Build a callback from rows, contexts, runtime, cases, output and clock_seed.
 

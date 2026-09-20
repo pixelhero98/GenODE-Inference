@@ -113,13 +113,13 @@ def test_frozen_grid_warp_preserves_uniform_and_changes_both_grids():
 def test_selection_cannot_replace_members_of_frozen_noise_block():
     from genode.gico.evidence import prepare_evidence
     from genode.gico.networks import DeterministicStudent, ModelConfig
-    from genode.gico.selection import StudentCandidate, candidate_fingerprint, measured_utility
+    from genode.gico.reporting import PolicyCandidate, candidate_fingerprint, measured_utility
     from tests.selection_fixtures import evaluator_for
 
     rows, contexts = evidence_rows(), {"train": [0.0], "validation": [0.0]}
     evidence = prepare_evidence(rows, contexts, purpose="functional")
     model = DeterministicStudent(ModelConfig(evidence.conditioning.width, 1)).eval()
-    candidate = StudentCandidate(
+    candidate = PolicyCandidate(
         model,
         evidence.conditioning,
         "GICO-det-policy",
@@ -141,7 +141,6 @@ def test_kid_artifact_roundtrip_and_transform_identity(tmp_path, monkeypatch):
 
     from genode.gico.policy import GICOPolicy, load_policy
     from genode.gico.training import fit
-    from tests.selection_fixtures import evaluator_for
 
     rows, contexts = evidence_rows(), {"train": [0.0], "validation": [0.0]}
     monkeypatch.setattr("genode.gico.training.accumulated_step", lambda *a, **kw: 0.0)
@@ -157,8 +156,6 @@ def test_kid_artifact_roundtrip_and_transform_identity(tmp_path, monkeypatch):
         student_steps=2,
         teacher_checkpoint_every=1,
         student_checkpoint_every=1,
-        density_family_holdout=(),
-        selection_evaluator=evaluator_for(rows, contexts),
     )
     policy = load_policy(destination)
     assert len(policy.materialize([0.0], "euler", 4)) == 5

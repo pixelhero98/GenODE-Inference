@@ -177,7 +177,9 @@ jobs:
                   "genode/image_comparators/frozen_clock.py",
                   "genode/gico/profiles.py",
                   "genode/gico/conditioning.py",
-                  "genode/gico/codec.py",
+                  "genode/gico/collection.py",
+                  "genode/gico/stochastic_selection.py",
+                  "genode/gico/student_selection.py",
                   "genode/gico/evaluators.py",
                   "genode/gico/task_evaluators.py",
                   "genode/gico/image_evaluator.py",
@@ -234,6 +236,7 @@ jobs:
             genode-prepare-molecule-xyz \
             genode-train-molecule-backbone \
             genode-evaluate-molecule-backbone \
+            genode-collect-gico \
             genode-train-gico \
             genode-preflight-gico-rows \
             genode-report-gico-locked-test \

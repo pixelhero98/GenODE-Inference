@@ -39,15 +39,13 @@ def build_argparser() -> argparse.ArgumentParser:
     train = commands.add_parser("train", help="Fit the common teacher and requested student architectures.")
     train.add_argument("--evidence", required=True)
     train.add_argument("--output", required=True)
-    train.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy", "both"), default="both")
+    train.add_argument(
+        "--student-kind", choices=("GICO-det-policy", "GICO-sto-policy", "both"), default="GICO-det-policy"
+    )
     train.add_argument("--teacher-score-weight", type=float, choices=(0.01, 0.05, 0.1))
     train.add_argument("--teacher-steps", type=int)
     train.add_argument("--student-steps", type=int)
     train.add_argument("--fitting-profile", help="JSON object of common task-profile overrides.")
-    train.add_argument(
-        "--selection-evaluator",
-        help="Required for stochastic students: JSON module:factory/config for held-out terminal measurements.",
-    )
     train.add_argument("--seed", type=int)
     train.add_argument("--device", default="cuda")
     train.add_argument("--purpose", choices=("research", "functional"), default="research")
@@ -74,10 +72,17 @@ def main(argv=None) -> int:
     args = build_argparser().parse_args(argv)
     if args.command == "prepare":
         rows, contexts, metadata = prepare_image_rows(_read(args.manifest))
-        _write(args.output, {"rows": rows, "contexts": contexts, "metadata": metadata})
+        _write(
+            args.output,
+            {
+                "rows": rows,
+                "contexts": contexts,
+                "metadata": metadata,
+                "collection_manifest": metadata.get("collection_manifest"),
+            },
+        )
         result = {"row_count": len(rows), "context_count": len(contexts), "task": metadata["task"]}
     elif args.command == "train":
-        from genode.gico.train_gico import load_selection_evaluator
         from genode.gico.training import fit
 
         evidence = _read(args.evidence)
@@ -101,11 +106,7 @@ def main(argv=None) -> int:
             device=args.device,
             purpose=args.purpose,
             calibration_rows=calibration_rows,
-            selection_evaluator=load_selection_evaluator(
-                _read(args.selection_evaluator) if args.selection_evaluator else None,
-                dry_run=args.student_kind == "GICO-det-policy",
-                required=args.student_kind != "GICO-det-policy",
-            ),
+            collection_manifest=evidence.get("collection_manifest"),
         )
     else:
         from genode.gico.policy import load_policy

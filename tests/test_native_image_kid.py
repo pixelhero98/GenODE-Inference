@@ -74,8 +74,8 @@ def test_imagenet_research_requires_all_classes_before_fitting():
     rows = native_rows("imagenet64")
     contexts = {r["context_id"]: [float(r["class_id"])] for r in rows}
     assert prepare_evidence(rows, contexts, purpose="functional").task == "imagenet64"
-    with pytest.raises(ValueError, match="1000-class"):
-        prepare_evidence(rows, contexts)
+    with pytest.raises(ValueError, match="completed collection manifest"):
+        prepare_evidence(rows, contexts, purpose="research")
 
 
 def test_imagenet_calibration_does_not_overweight_a_repeated_class():
@@ -122,7 +122,6 @@ def native_manifest(model_key):
     for row in rows:
         row.update(backbone=model_key, backbone_binding=binding)
         row["image_objective"]["generator"] = binding
-        del row["context_id"]  # Let preparation derive the canonical native panel/class ID.
     return {"backbone_manifest": backbone.to_manifest_dict(), "native_context_table": table.tolist(), "rows": rows}
 
 
@@ -131,7 +130,6 @@ def native_manifest(model_key):
 def test_native_kid_both_students_retain_objective_through_fit_and_replay(tmp_path, monkeypatch, task, kind):
     from genode.gico.policy import load_policy
     from genode.gico.training import fit
-    from tests.selection_fixtures import evaluator_for
 
     rows = native_rows(task)
     contexts = {r["context_id"]: [float(r["class_id"] or 0)] for r in rows}
@@ -147,8 +145,6 @@ def test_native_kid_both_students_retain_objective_through_fit_and_replay(tmp_pa
         student_steps=2,
         teacher_checkpoint_every=1,
         student_checkpoint_every=1,
-        density_family_holdout=(),
-        selection_evaluator=evaluator_for(rows, contexts),
     )
     assert metadata["image_objective"]["protocol"] == IMAGE_KID_OBJECTIVE
     assert all(c["metric_keys"] == ("kid",) for c in metadata["reward_calibrations"].values())

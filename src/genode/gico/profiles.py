@@ -6,7 +6,6 @@ from dataclasses import dataclass, fields
 
 import numpy as np
 
-from genode.gico.clocks import REFERENCE_KEYS
 from genode.gico.rewards import TASK_METRICS
 
 SCORE_WEIGHTS = (0.01, 0.05, 0.1)
@@ -31,6 +30,7 @@ class TrainingConfig:
     student_checkpoint_every: int = 100
     deterministic_checkpoint_every: int = 10
     deterministic_kl_allowance: float = 0.15
+    stochastic_kl_allowance: float = 0.20
     weight_decay: float = 1e-4
     dropout: float = 0.01
     teacher_score_weight: float = 0.01
@@ -38,7 +38,6 @@ class TrainingConfig:
     selection_clock_replicates: int = 4
     temperatures: tuple[float, ...] = (0.05, 0.1, 0.5)
     preferred_temperature: float = 0.05
-    density_family_holdout: tuple[str, ...] = ("late_p_3", "late_p_3_reversed")
     stochastic_likelihood_samples: int = 32
     stochastic_score_samples: int = 4
     target_smoothing: float = 0.1
@@ -66,12 +65,9 @@ class TrainingConfig:
             raise ValueError("Step, batch, sampling and checkpoint counts must be positive integers.")
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("Seed must be a nonnegative integer.")
-        if (
-            isinstance(self.deterministic_kl_allowance, bool)
-            or not np.isfinite(self.deterministic_kl_allowance)
-            or self.deterministic_kl_allowance < 0
-        ):
-            raise ValueError("Deterministic KL allowance must be finite and nonnegative.")
+        for allowance in (self.deterministic_kl_allowance, self.stochastic_kl_allowance):
+            if isinstance(allowance, bool) or not np.isfinite(allowance) or allowance < 0:
+                raise ValueError("Student KL allowances must be finite and nonnegative.")
         if self.teacher_score_weight not in SCORE_WEIGHTS:
             raise ValueError(f"teacher_score_weight must be one of {SCORE_WEIGHTS}.")
         if self.score_schedule not in SCORE_SCHEDULES:
@@ -101,10 +97,6 @@ class TrainingConfig:
             raise ValueError("Temperatures must be distinct positive values.")
         if self.preferred_temperature not in self.temperatures:
             raise ValueError("Preferred temperature must be included in the candidate temperatures.")
-        if set(self.density_family_holdout) - set(REFERENCE_KEYS):
-            raise ValueError("Unknown density-family holdout names.")
-        if len(set(self.density_family_holdout)) != len(self.density_family_holdout):
-            raise ValueError("Density-family holdout names must be distinct.")
 
 
 def resolve_profile(task: str, **overrides) -> TrainingConfig:
@@ -112,14 +104,13 @@ def resolve_profile(task: str, **overrides) -> TrainingConfig:
         raise ValueError(f"Unknown task profile: {task}")
     values = {}
     if task in ("sana", "sd15"):
-        values.update(teacher_score_weight=0.05, density_family_holdout=())
+        values.update(teacher_score_weight=0.05)
     elif task in ("cifar10", "imagenet64"):
         values.update(dropout=0.0)
     unknown = set(overrides) - {field.name for field in fields(TrainingConfig)}
     if unknown:
         raise ValueError(f"Unknown fitting settings: {sorted(unknown)}")
     values.update(overrides)
-    for key in ("temperatures", "density_family_holdout"):
-        if key in values:
-            values[key] = tuple(values[key])
+    if "temperatures" in values:
+        values["temperatures"] = tuple(values["temperatures"])
     return TrainingConfig(**values)

@@ -202,7 +202,7 @@ def test_global_conditioning_preserves_settings_and_zeroes_only_context():
     from tests.test_unified_gico_rewards import reference_evidence
 
     rows, contexts = reference_evidence()
-    evidence = prepare_evidence(rows, contexts)
+    evidence = prepare_evidence(rows, contexts, purpose="functional")
     original = evidence.conditioning
     global_condition = replace(original, context_mode="global")
     a = global_condition.transform([1, 2], "euler", 4)

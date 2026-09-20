@@ -24,6 +24,14 @@ from genode.gico.profiles import (
     resolve_profile,
 )
 
+
+def source_fingerprint():
+    root = Path(__file__).parents[1]
+    return content_hash(
+        {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(root.rglob("*.py"))}
+    )
+
+
 STUDENT_KINDS = ("GICO-det-policy", "GICO-sto-policy")
 
 
@@ -60,7 +68,6 @@ def reuse_teacher(path, evidence: Evidence, config: TrainingConfig):
         "dropout",
         "temperatures",
         "preferred_temperature",
-        "density_family_holdout",
         "seed",
     }
     for key in teacher_fields:
@@ -294,11 +301,10 @@ def fit_models(
     evidence: Evidence,
     config: TrainingConfig,
     *,
-    student_kind: str = "both",
+    student_kind: str = "GICO-det-policy",
     device: str = "cuda",
     checkpoint_callback=None,
     teacher_artifact=None,
-    selection_evaluator=None,
 ):
     # manual_seed seeds every visible GPU, including when fitting on the CPU.
     devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
@@ -311,29 +317,22 @@ def fit_models(
             device=device,
             checkpoint_callback=checkpoint_callback,
             teacher_artifact=teacher_artifact,
-            selection_evaluator=selection_evaluator,
         )
 
 
-def _fit_models(
-    evidence, config, *, student_kind, device, checkpoint_callback=None, teacher_artifact=None, selection_evaluator=None
-):
-    from genode.gico.selection import evaluate_candidate
-
-    if student_kind != "GICO-det-policy" and not callable(selection_evaluator):
-        raise ValueError("Stochastic student fitting requires a held-out terminal-utility selection_evaluator.")
+def _fit_models(evidence, config, *, student_kind, device, checkpoint_callback=None, teacher_artifact=None):
     evidence = replace(evidence, conditioning=replace(evidence.conditioning, context_mode=config.teacher_context_mode))
     if student_kind not in (*STUDENT_KINDS, "both"):
         raise ValueError("student_kind must be GICO-det-policy, GICO-sto-policy, or both.")
     train_groups, val_groups = evidence.groups("train"), evidence.groups("validation")
-    # Leave an entire density family out of teacher fitting; its observations
-    # remain available for validation, never for reference-ratio normalization.
-    family_holdout = set(config.density_family_holdout)
-    teacher_groups = [[r for r in g if not set(r["aliases"]) <= family_holdout] for g in train_groups]
-    density_holdout = [[r for r in g if set(r["aliases"]) <= family_holdout] for g in train_groups]
-    density_holdout = [g for g in density_holdout if g]
-    if family_holdout and evidence.purpose == "research" and not density_holdout:
-        raise ValueError("Research teacher fitting requires its density-family holdout.")
+    teacher_groups = [[r for r in group if not evidence.is_density_holdout(r)] for group in train_groups]
+    density_holdout = []
+    for group in train_groups:
+        held = [r for r in group if evidence.is_density_holdout(r)]
+        if held:
+            density_holdout.append([r for r in group if r["schedule_key"] == "uniform"] + held)
+    if evidence.purpose == "research" and not density_holdout:
+        raise ValueError("Research teacher fitting requires measured density holdout pairs.")
     train = [_tensors(evidence, g, device) for g in teacher_groups if g]
     validation = [_tensors(evidence, g, device) for g in val_groups]
     density_validation = [_tensors(evidence, g, device) for g in density_holdout]
@@ -365,7 +364,20 @@ def _fit_models(
         teacher_source = source["reused_artifact_sha256"]
     teacher.eval().requires_grad_(False)
     teacher.zero_grad(set_to_none=True)
-    training_groups = [_tensors(evidence, g, device) for g in train_groups]
+
+    def support_groups(groups):
+        result = []
+        for group in groups:
+            first = group[0]
+            pool = evidence.reference_support[f"{first['solver']}:{first['nfe']}"]
+            unique = {}
+            for name, value in pool.items():
+                unique.setdefault(value["density_identity"], {**first, **value, "schedule_key": name})
+            result.append(_tensors(evidence, list(unique.values()), device))
+        return result
+
+    training_groups = support_groups(train_groups)
+    student_validation = support_groups(val_groups)
     temperature = selected_teacher["temperature"]
 
     from genode.gico.selection import teacher_fingerprint
@@ -402,7 +414,10 @@ def _fit_models(
                     )
         return result
 
-    targets, validation_targets = make_targets(training_groups, train_groups), make_targets(validation, val_groups)
+    targets, validation_targets = (
+        make_targets(training_groups, train_groups),
+        make_targets(student_validation, val_groups),
+    )
     students, histories, selections = {}, {}, {}
     kinds = STUDENT_KINDS if student_kind == "both" else (student_kind,)
     for kind in kinds:
@@ -423,9 +438,7 @@ def _fit_models(
         group_rng = np.random.default_rng(config.seed + 113)
         generator = torch.Generator(device=device).manual_seed(config.seed + 173)
         score_rng = torch.Generator(device=device).manual_seed(config.seed + 271)
-        val_rng = torch.Generator(device=device).manual_seed(config.seed + 379)
-        val_noise = torch.randn(config.stochastic_likelihood_samples, 63, generator=val_rng, device=device)
-        history, best, best_state, chosen = [], -float("inf"), None, None
+        history, best_state, chosen = [], None, None
 
         for step in range(config.student_steps):
             model.train()
@@ -454,26 +467,18 @@ def _fit_models(
                 raise RuntimeError("Frozen teacher unexpectedly accumulated parameter gradients.")
             if (step + 1) % checkpoint_every == 0 or step + 1 == config.student_steps:
                 model.eval()
-                with torch.no_grad():
-                    losses = []
-                    validation_masses = []
-                    for c, m, w, _, _, _ in validation_targets:
-                        if kind == "GICO-det-policy":
+                validation_masses = []
+                value = None
+                if deterministic:
+                    from genode.gico.student_selection import balanced_mean
+
+                    with torch.no_grad():
+                        losses = []
+                        for c, m, w, _, _, _ in validation_targets:
                             mass = model(c)
                             validation_masses.append(mass)
-                            value = density_kl((w[:, None] * m).sum(0, keepdim=True), mass).mean()
-                        else:
-                            perturbed = model.ratios(m)[:, None] + config.target_smoothing * val_noise[None]
-                            condition_batch = c.expand(len(m) * config.stochastic_likelihood_samples, -1)
-                            value = (
-                                model.nll(condition_batch, perturbed.reshape(-1, 63)).reshape(len(m), -1).mean(1) * w
-                            ).sum()
-                        losses.append(value)
-                    value = float(torch.stack(losses).mean())
-                    if deterministic:
-                        from genode.gico.deterministic_selection import balanced_mean
-
-                        value = balanced_mean([float(loss) for loss in losses], val_groups, evidence.task)
+                            losses.append(float(density_kl((w[:, None] * m).sum(0, keepdim=True), mass).mean()))
+                        value = balanced_mean(losses, val_groups, evidence.task)
                 row = {
                     "step": step + 1,
                     "objective": loss,
@@ -500,41 +505,39 @@ def _fit_models(
                             )
                         )
                     else:
+                        from genode.gico.stochastic_selection import score_stochastic
+
                         row.update(
-                            evaluate_candidate(
+                            score_stochastic(
                                 model,
+                                teacher,
                                 student_conditioning,
-                                kind,
-                                step + 1,
-                                coefficient,
-                                selection_evaluator,
+                                validation_targets,
+                                val_groups,
                                 evidence,
-                                config.selection_clock_replicates,
+                                weights,
+                                step + 1,
+                                teacher_selection_fingerprint,
+                                config,
                             )
                         )
                 history.append(row)
                 if checkpoint_callback is not None:
                     checkpoint_callback(kind, step + 1, model, dict(row))
                 if coefficient > 0:
-                    if deterministic:
-                        from genode.gico.deterministic_selection import select_deterministic
+                    from genode.gico.deterministic_selection import select_deterministic
+                    from genode.gico.stochastic_selection import select_stochastic
+                    from genode.gico.student_selection import admissible_checkpoints
 
-                        candidate_states[row["step"]] = {
-                            key: value.detach().cpu().clone() for key, value in model.state_dict().items()
-                        }
-                        chosen = dict(select_deterministic(history, config.deterministic_kl_allowance))
-                        best_state = candidate_states[chosen["step"]]
-                        minimum = min(max(0.0, r["validation_distillation"]) for r in history if r["coefficient"] > 0)
-                        threshold = minimum + config.deterministic_kl_allowance * minimum
-                        # The minimum KL can only decrease: rejected snapshots can never requalify.
-                        retained = {
-                            r["step"]
-                            for r in history
-                            if r["coefficient"] > 0 and r["validation_distillation"] <= threshold
-                        }
-                        candidate_states = {key: state for key, state in candidate_states.items() if key in retained}
-                    elif row["utility"] > best:
-                        best, best_state, chosen = row["utility"], copy.deepcopy(model.state_dict()), dict(row)
+                    allowance = config.deterministic_kl_allowance if deterministic else config.stochastic_kl_allowance
+                    selector = select_deterministic if deterministic else select_stochastic
+                    candidate_states[row["step"]] = {
+                        key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+                    }
+                    chosen = dict(selector(history, allowance))
+                    best_state = candidate_states[chosen["step"]]
+                    retained = {r["step"] for r in admissible_checkpoints(history, allowance)}
+                    candidate_states = {key: state for key, state in candidate_states.items() if key in retained}
         if best_state is None:
             raise ValueError("Student validation did not produce a finite checkpoint after the score ramp.")
         model.load_state_dict(best_state)
@@ -546,10 +549,15 @@ def _fit_models(
         students,
         {
             "training": asdict(config),
+            "evidence_fingerprint": evidence.evidence_sha256,
+            "calibration_fingerprint": content_hash({k: v.to_payload() for k, v in evidence.calibrations.items()}),
+            "collection_fingerprint": content_hash(evidence.collection_manifest),
+            "support_fingerprint": content_hash(evidence.reference_support),
+            "source_fingerprint": source_fingerprint(),
             "teacher_source_artifact_sha256": teacher_source,
             "teacher": teacher_history,
             "students": histories,
-            "density_holdout": sorted(family_holdout),
+            "density_holdout": evidence.density_holdout,
             "teacher_selection": selected_teacher,
             "teacher_selection_fingerprint": teacher_selection_fingerprint,
             "student_selection": selections,
@@ -564,13 +572,13 @@ def fit(
     contexts: dict,
     output,
     *,
-    student_kind: str = "both",
+    student_kind: str = "GICO-det-policy",
     device: str = "cuda",
     purpose: str = "research",
     calibration_rows: list[dict] | None = None,
+    collection_manifest: dict | None = None,
     checkpoint_callback=None,
     teacher_artifact=None,
-    selection_evaluator=None,
     **fitting_settings,
 ) -> dict:
     if Path(output).exists():
@@ -578,7 +586,9 @@ def fit(
     bindings = [r["backbone_binding"] for r in rows if "backbone_binding" in r]
     if bindings and (len(bindings) != len(rows) or any(value != bindings[0] for value in bindings)):
         raise ValueError("Native backbone/context bindings differ between measurements.")
-    evidence = prepare_evidence(rows, contexts, calibration_rows=calibration_rows, purpose=purpose)
+    evidence = prepare_evidence(
+        rows, contexts, calibration_rows=calibration_rows, purpose=purpose, collection_manifest=collection_manifest
+    )
     config = resolve_profile(evidence.task, **fitting_settings)
     if config.backbone is not None and config.backbone != evidence.backbone:
         raise ValueError("Fitting profile backbone differs from measurement evidence.")
@@ -592,7 +602,6 @@ def fit(
         device=device,
         checkpoint_callback=checkpoint_callback,
         teacher_artifact=teacher_artifact,
-        selection_evaluator=selection_evaluator,
     )
     fitting_seconds = time.perf_counter() - started
     metadata = {
@@ -608,15 +617,24 @@ def fit(
         "temperature_units": TEMPERATURE_UNITS,
         "auxiliary_normalization": AUXILIARY_NORMALIZATION,
         "teacher_selection_criterion": "heldout_reference_utility_regret",
-        "student_selection_criterion": "det_teacher_kl_gate_sto_measured_utility_v1",
+        "student_selection_criterion": "heldout_calibrated_teacher_utility_with_policy_kl",
+        "collection_manifest": evidence.collection_manifest,
+        "collection_sha256": content_hash(evidence.collection_manifest),
+        "source_code_sha256": source_fingerprint(),
         "selected_temperature": history["teacher_selection"]["temperature"],
         "split_contexts": {
             s: sorted({r["context_id"] for r in evidence.cells if r["split"] == s}) for s in ("train", "validation")
         },
         "reference_densities": {
-            f"{r['solver']}:{r['nfe']}:{r['schedule_key']}": r["density_mass"] for r in evidence.cells
+            f"{setting}:{name}": value["density_mass"]
+            for setting, pool in evidence.reference_support.items()
+            for name, value in pool.items()
         },
-        "reference_grids": {f"{r['solver']}:{r['nfe']}:{r['schedule_key']}": r["time_grid"] for r in evidence.cells},
+        "reference_grids": {
+            f"{setting}:{name}": value["time_grid"]
+            for setting, pool in evidence.reference_support.items()
+            for name, value in pool.items()
+        },
         "measurement_protocols": sorted({r["measurement_protocol"] for r in evidence.cells}),
         "teacher_score_is_surrogate": True,
         "locked_test_used": False,
@@ -647,8 +665,6 @@ def fit(
             }
             for phase in ("train", "calibration", "validation")
         }
-    from genode.gico.evidence import content_hash
-
     maps = {
         content_hash(r["molecule_feature_map"]): r["molecule_feature_map"]
         for r in rows + (calibration_rows or [])

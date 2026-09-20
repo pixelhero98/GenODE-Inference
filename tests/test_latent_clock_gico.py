@@ -12,65 +12,30 @@ from genode.gico.clocks import materialize, reference_densities
 from genode.latent_clock.clocks import Clock, reference_clocks
 from genode.latent_clock.contracts import ExecutionTrace, FrozenContext
 from genode.latent_clock.gico import fit_gico, prepare_gico_rows, runtime_binding
-from genode.latent_clock.protocol import NOISE_SEEDS, PILOT_CLOCKS
 
 
 def raw_fixture():
-    manifest = {
-        "records": [
-            {"prompt_id": phase, "split": phase, "image_id": i, "caption_id": i, "prompt": f"A distinct image {i}."}
-            for i, phase in enumerate(("pilot", "calibration", "validation"))
-        ]
-    }
-    rows = []
-    binding = {"task": "sana", "backbone_revision": "weights", "solver": "euler"}
-    for prompt in manifest["records"]:
-        for nfe in (4, 6, 8):
-            for clock in reference_clocks(nfe):
-                if prompt["split"] == "pilot" and (nfe == 6 or clock.key not in PILOT_CLOCKS):
-                    continue
-                for seed in NOISE_SEEDS:
-                    rows.append(
-                        {
-                            **prompt,
-                            "nfe": nfe,
-                            "clock_key": clock.key,
-                            "noise_seed": seed,
-                            "completed": True,
-                            "realized_nfe": nfe,
-                            "checkpoint_id": "weights",
-                            "solver_key": "euler",
-                            "density_mass": list(clock.density_mass),
-                            "nodes": list(clock.nodes),
-                            "backbone_binding": binding,
-                            "measurement_protocol": "frozen-text-scorers-v1",
-                            "context_embedding_sha256": "a" * 64,
-                            "preference": float("nan") if nfe == 6 else float(nfe),
-                            "alignment": 0.5,
-                        }
-                    )
-    return rows, manifest
+    from genode.gico.collection import functional_manifest
+    from tests.test_unified_gico_rewards import reference_evidence
+
+    rows, _ = reference_evidence(task="sana")
+    return functional_manifest(rows)
 
 
-def test_native_transfer_excludes_nfe6_before_metric_handling_and_keeps_pilot_separate():
+def test_native_preparation_keeps_the_complete_collected_scope_and_split():
     raw, manifest = raw_fixture()
-    rows, pilot = prepare_gico_rows(raw, manifest=manifest, task="sana", nfes=(4, 8), budget="25")
-    assert len(rows) == 2 * 2 * 25 * 2 and len(pilot) == 2 * 3 * 2
-    assert {row["split"] for row in rows} == {"train", "validation"}
-    assert {row["split"] for row in pilot} == {"calibration"}
-    assert all(np.isfinite(row["metrics"]["preference"]) for row in rows)
-    with pytest.raises(ValueError, match="incomplete or duplicated"):
-        prepare_gico_rows(raw + [raw[0]], manifest=manifest, task="sana", nfes=(4, 8))
-
-
-def test_historical_direct_grid_evidence_and_locked_rows_are_rejected():
-    raw, manifest = raw_fixture()
-    raw[0].pop("density_mass")
-    with pytest.raises(ValueError, match="recollect"):
+    assert prepare_gico_rows(raw, manifest=manifest, task="sana", nfes=(4,)) == raw
+    with pytest.raises(ValueError, match="scope"):
         prepare_gico_rows(raw, manifest=manifest, task="sana", nfes=(4, 8))
+    with pytest.raises(ValueError, match="measurements changed"):
+        prepare_gico_rows(raw + [raw[0]], manifest=manifest, task="sana", nfes=(4,))
+
+
+def test_changed_clock_or_locked_rows_invalidate_the_collection():
+    raw, manifest = raw_fixture()
     raw[0]["split"] = "locked_test"
-    with pytest.raises(ValueError, match="Locked-test"):
-        prepare_gico_rows(raw, manifest=manifest, task="sana", nfes=(4, 8))
+    with pytest.raises(ValueError, match="measurements changed"):
+        prepare_gico_rows(raw, manifest=manifest, task="sana", nfes=(4,))
 
 
 def test_every_latent_reference_executes_common_density_realization():
@@ -161,3 +126,33 @@ def test_collection_samples_one_clock_per_image_and_reuses_complete_solver_grid(
     assert row["density_mass"] == list(calls[0][1].density_mass)
     assert row["clock_student_kind"] == kind and row["clock_seed"] == 23
     assert row["clock_key"] == kind and calls[0][1].key == kind
+
+
+def test_preparation_uses_canonical_native_table_and_preserves_manifest(tmp_path):
+    from genode.gico.collection import functional_manifest
+    from genode.gico.evidence import content_hash
+    from genode.gico.policy import load_context_embedding_table, save_context_embedding_table
+    from genode.latent_clock.gico import prepare_gico
+    from tests.test_unified_gico_rewards import reference_evidence
+
+    rows, contexts = reference_evidence(task="sana")
+    for row in rows:
+        row["context_embedding_sha256"] = content_hash(contexts[row["context_id"]])
+    rows, manifest = functional_manifest(rows)
+    source = tmp_path / "collected.json"
+    source.write_text(json.dumps({"rows": rows, "collection_manifest": manifest}))
+    table = tmp_path / "native.npz"
+    save_context_embedding_table(table, contexts)
+    destination = tmp_path / "prepared"
+    prepare_gico(
+        rows_paths=[str(source)],
+        embeddings_paths=[str(table)],
+        manifest_path=str(source),
+        task="sana",
+        nfes=(4,),
+        output=str(destination),
+    )
+    config = json.loads((destination / "train_config.json").read_text())
+    assert config["student_kind"] == "GICO-det-policy"
+    assert json.loads((destination / "collection.json").read_text()) == manifest
+    assert set(load_context_embedding_table(destination / "contexts.npz")) == set(contexts)

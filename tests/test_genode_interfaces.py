@@ -72,6 +72,7 @@ class GenODEInterfaceTests(unittest.TestCase):
             "genode-prepare-molecule-xyz",
             "genode-train-molecule-backbone",
             "genode-evaluate-molecule-backbone",
+            "genode-collect-gico",
             "genode-train-gico",
             "genode-preflight-gico-rows",
             "genode-report-gico-locked-test",
@@ -88,7 +89,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         project = data["project"]
 
-        self.assertEqual(project["version"], "0.14.0")
+        self.assertEqual(project["version"], "0.15.0")
         self.assertEqual(
             project["description"], "GICO inference-clock optimization for frozen flow-matching backbones."
         )
@@ -132,6 +133,7 @@ class GenODEInterfaceTests(unittest.TestCase):
                 "README.md",
                 "SECURITY.md",
                 "THIRD_PARTY_NOTICES.md",
+                "docs/collection.md",
                 "docs/evaluators.md",
                 "docs/examples.md",
                 "docs/frozen-bezier-kid.md",
@@ -188,6 +190,7 @@ class GenODEInterfaceTests(unittest.TestCase):
             "genode-image-gico",
             "prepare",
             "train",
+            "genode-collect-gico",
             "genode-train-gico",
             "genode-latent-clock",
             "validate",
@@ -214,6 +217,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in (PROJECT_ROOT / "docs").iterdir()},
             {
+                "collection.md",
                 "evaluators.md",
                 "examples.md",
                 "frozen-bezier-kid.md",

@@ -23,8 +23,7 @@ from genode.schedule_transfer.reference_clocks import (
 from genode.schedules.fixed import FIXED_SCHEDULE_TARGET_NFES
 from genode.schedules.specification import ScheduleSpecification
 
-IMAGE_PROTOCOL_VERSION = 9
-IMAGE_PROTOCOL_KEY = "image_euler_kid_v9"
+IMAGE_PROTOCOL_KEY = "image_euler_kid_collection"
 IMAGE_GICO_TEACHER_SCORE_WEIGHT = 0.01
 IMAGE_GICO_TEACHER_SCORE_WARMUP_FRACTION = 0.60
 IMAGE_GICO_TEACHER_SCORE_CLIP = 5.0
@@ -41,8 +40,6 @@ IMAGE_TARGET_NFES: tuple[int, ...] = FIXED_SCHEDULE_TARGET_NFES
 IMAGE_SCHEDULE_KEYS: tuple[str, ...] = DEFAULT_REFERENCE_CLOCK_KEYS
 
 IMAGE_PANEL_BLOCK_SIZE = 1_000
-IMAGE_TRAIN_SAMPLES = 200
-IMAGE_SELECTION_SAMPLES = 200
 
 LOCKED_SAMPLE_COUNT = 50_000
 LOCKED_INCEPTION_SPLITS = 10
@@ -75,33 +72,6 @@ LOCKED_TORCH_FIDELITY_FIXED_OPTIONS: Mapping[str, object] = MappingProxyType(
         "verbose": False,
     }
 )
-
-PANEL_PHASE_REWARD_TRAIN = "reward_train"
-PANEL_PHASE_SELECTION_SCREENING = "selection_screening"
-PANEL_PHASE_SURVIVOR_CONFIRMATION = "survivor_confirmation"
-PANEL_PHASE_LOCKED_MAIN = "locked_main"
-PANEL_PHASE_CONDITIONAL_REWARD_TRAIN = "conditional_reward_train"
-PANEL_PHASE_CONDITIONAL_SELECTION_SCREENING = "conditional_selection_screening"
-PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION = "conditional_survivor_confirmation"
-PANEL_PHASES: tuple[str, ...] = (
-    PANEL_PHASE_REWARD_TRAIN,
-    PANEL_PHASE_SELECTION_SCREENING,
-    PANEL_PHASE_SURVIVOR_CONFIRMATION,
-    PANEL_PHASE_LOCKED_MAIN,
-    PANEL_PHASE_CONDITIONAL_REWARD_TRAIN,
-    PANEL_PHASE_CONDITIONAL_SELECTION_SCREENING,
-    PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION,
-)
-
-_PANEL_SHAPES: Mapping[str, tuple[int, int]] = {
-    PANEL_PHASE_REWARD_TRAIN: (1, IMAGE_TRAIN_SAMPLES),
-    PANEL_PHASE_SELECTION_SCREENING: (1, IMAGE_SELECTION_SAMPLES),
-    PANEL_PHASE_SURVIVOR_CONFIRMATION: (1, IMAGE_SELECTION_SAMPLES),
-    PANEL_PHASE_LOCKED_MAIN: (LOCKED_SAMPLE_COUNT // IMAGE_PANEL_BLOCK_SIZE, IMAGE_PANEL_BLOCK_SIZE),
-    PANEL_PHASE_CONDITIONAL_REWARD_TRAIN: (1, IMAGE_TRAIN_SAMPLES),
-    PANEL_PHASE_CONDITIONAL_SELECTION_SCREENING: (1, IMAGE_SELECTION_SAMPLES),
-    PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION: (1, IMAGE_SELECTION_SAMPLES),
-}
 
 
 @dataclass(frozen=True)
@@ -167,22 +137,11 @@ def normalize_image_nfe(value: object) -> int:
     return parsed
 
 
-def panel_shape(phase: str) -> tuple[int, int]:
-    """Return a conditioning-group panel shape; locked-main is dataset-wide."""
-    key = str(phase).strip().lower()
-    try:
-        return _PANEL_SHAPES[key]
-    except KeyError as exc:
-        raise ValueError(f"Unknown image sample-panel phase {phase!r}; expected one of {PANEL_PHASES}.") from exc
-
-
 @dataclass(frozen=True)
 class EulerImageWorkload:
     pair_count: int
     evidence_images: int
     backbone_image_evaluations: int
-    survivor_confirmation_images: int = 0
-    survivor_confirmation_backbone_evaluations: int = 0
 
     def as_dict(self) -> dict[str, int | str]:
         return {
@@ -190,8 +149,6 @@ class EulerImageWorkload:
             "pair_count": int(self.pair_count),
             "evidence_images": int(self.evidence_images),
             "backbone_image_evaluations": int(self.backbone_image_evaluations),
-            "survivor_confirmation_images": int(self.survivor_confirmation_images),
-            "survivor_confirmation_backbone_evaluations": int(self.survivor_confirmation_backbone_evaluations),
         }
 
 
@@ -201,62 +158,22 @@ def image_schedule_keys(
     return reference_clock_keys(extra_late_p_values)
 
 
-def euler_image_workload(
-    *,
-    pair_count: int = 1,
-    extra_late_p_values: str | Sequence[Decimal | float | int | str] = (),
-) -> EulerImageWorkload:
-    if isinstance(pair_count, bool) or not isinstance(pair_count, Integral):
+def euler_image_workload(*, dataset_key: str = "cifar10", pair_count: int = 1) -> EulerImageWorkload:
+    """Complete solves for all registered NFEs; repeats are included, selection is free."""
+    spec = image_benchmark_spec(dataset_key)
+    if isinstance(pair_count, bool) or not isinstance(pair_count, Integral) or pair_count < 1:
         raise ValueError("pair_count must be a positive integer.")
-    pairs = int(pair_count)
-    if pairs <= 0:
-        raise ValueError("pair_count must be a positive integer.")
-    schedule_count = len(image_schedule_keys(extra_late_p_values))
-    images_per_density_cell = IMAGE_TRAIN_SAMPLES + IMAGE_SELECTION_SAMPLES
-    per_pair_images = schedule_count * len(IMAGE_TARGET_NFES) * images_per_density_cell
-    per_pair_evaluations = schedule_count * images_per_density_cell * sum(IMAGE_TARGET_NFES)
+    per_nfe = 10000 if spec.key == "cifar10" else 1000 * 64 + 960 * 64
     return EulerImageWorkload(
-        pair_count=pairs,
-        evidence_images=pairs * per_pair_images,
-        backbone_image_evaluations=pairs * per_pair_evaluations,
-    )
-
-
-def survivor_confirmation_workload(
-    survivors_by_nfe: Mapping[int, int],
-    *,
-    pair_count: int = 1,
-    extra_late_p_values: str | Sequence[Decimal | float | int | str] = (),
-) -> EulerImageWorkload:
-    base = euler_image_workload(
-        pair_count=pair_count,
-        extra_late_p_values=extra_late_p_values,
-    )
-    normalized: dict[int, int] = dict.fromkeys(IMAGE_TARGET_NFES, 0)
-    for raw_nfe, raw_count in survivors_by_nfe.items():
-        nfe = normalize_image_nfe(raw_nfe)
-        if isinstance(raw_count, bool) or not isinstance(raw_count, Integral):
-            raise ValueError("Survivor counts must be nonnegative integers.")
-        count = int(raw_count)
-        if count < 0:
-            raise ValueError("Survivor counts must be nonnegative integers.")
-        normalized[nfe] += count
-    samples_per_survivor = IMAGE_SELECTION_SAMPLES
-    confirmation_images = samples_per_survivor * sum(normalized.values())
-    confirmation_evaluations = samples_per_survivor * sum(nfe * count for nfe, count in normalized.items())
-    return EulerImageWorkload(
-        pair_count=base.pair_count,
-        evidence_images=base.evidence_images,
-        backbone_image_evaluations=base.backbone_image_evaluations,
-        survivor_confirmation_images=base.pair_count * confirmation_images,
-        survivor_confirmation_backbone_evaluations=(base.pair_count * confirmation_evaluations),
+        pair_count=int(pair_count),
+        evidence_images=int(pair_count) * per_nfe * len(IMAGE_TARGET_NFES),
+        backbone_image_evaluations=int(pair_count) * per_nfe * sum(IMAGE_TARGET_NFES),
     )
 
 
 def image_protocol_metadata(
     *,
     method: str = "GICO",
-    extra_late_p_values: str | Sequence[Decimal | float | int | str] = (),
 ) -> dict[str, Any]:
     """Describe native-image GICO (KID) or the explicit GICO-TF LPIPS comparison.
 
@@ -275,8 +192,7 @@ def image_protocol_metadata(
     if method == "GICO":
         supervision.update(
             reference="real_dataset_class_matched_disjoint_splits",
-            train_samples_per_conditioning_group=IMAGE_TRAIN_SAMPLES,
-            selection_samples_per_conditioning_group=IMAGE_SELECTION_SAMPLES,
+            collection_protocol="complete-solve-collection",
             complete_generated_reference_blocks=True,
             class_weighting="equal",
             negative_estimates="preserve",
@@ -284,17 +200,12 @@ def image_protocol_metadata(
     else:
         supervision.update(
             target="same_backbone_high_accuracy_same_noise_and_class",
-            train_pairs_per_conditioning_group=IMAGE_TRAIN_SAMPLES,
-            selection_pairs_per_conditioning_group=IMAGE_SELECTION_SAMPLES,
+            collection_protocol="complete-solve-collection",
         )
-    schedule_keys = image_schedule_keys(extra_late_p_values)
-    workload = euler_image_workload(
-        extra_late_p_values=extra_late_p_values,
-    )
+    schedule_keys = IMAGE_SCHEDULE_KEYS
     metadata: dict[str, Any] = {
-        "protocol_key": IMAGE_PROTOCOL_KEY if method == "GICO" else "image_euler_lpips_v9",
+        "protocol_key": IMAGE_PROTOCOL_KEY if method == "GICO" else "image_euler_lpips_collection",
         "method": method,
-        "protocol_version": IMAGE_PROTOCOL_VERSION,
         "solver_key": IMAGE_SOLVER_KEY,
         "target_nfes": list(IMAGE_TARGET_NFES),
         "unseen_nfe_evaluation": False,
@@ -314,7 +225,9 @@ def image_protocol_metadata(
         },
         "selection": {
             "teacher": f"heldout_reference_mixture_{metric}_regret",
-            "student_checkpoint": "heldout_paired_terminal_utility_v1",
+            "deterministic_checkpoint": "heldout_teacher_utility_density_kl",
+            "stochastic_checkpoint": "heldout_expected_teacher_utility_distribution_kl",
+            "generator_evaluations": 0,
             "student_coefficient": "explicit_fitting_profile",
             "duplicate_handling": "unique_realized_density",
             "locked_tuning": False,
@@ -323,7 +236,7 @@ def image_protocol_metadata(
             "primary_target": "teacher_weighted_unique_reference_densities",
             "deterministic_objective": "target_to_policy_kl_minus_teacher_score",
             "stochastic_objective": "smoothed_autoregressive_gaussian_nll_minus_reparameterized_teacher_score",
-            "artifact_protocol": "genode-gico-v6",
+            "artifact_protocol": "genode-gico",
             "teacher_score_weights": [0.01, 0.05, 0.1],
             "teacher_score_weights_role": "allowed_explicit_overrides",
             "teacher_evidence_phase": "reward_train",
@@ -335,13 +248,23 @@ def image_protocol_metadata(
         },
         "datasets": {key: image_benchmark_spec(key).as_dict() for key in IMAGE_DATASET_KEYS},
         "conditioning_group": "native_class_or_unconditional",
+        "collection": {
+            "repeats": 2,
+            "fitting_fraction": 0.8,
+            "cifar10": {"images_per_nfe": 10000, "train_images": 8000, "heldout_images": 2000},
+            "imagenet64": {
+                "candidate_images_per_class": 64,
+                "images_per_nfe": 125440,
+                "train_classes": 800,
+                "heldout_classes": 200,
+            },
+        },
         "workload_scope": "generated_image_evaluations_excluding_reference_target_preparation_and_scoring",
-        "workload_per_conditioning_group": workload.as_dict(),
         "workload_per_dataset_checkpoint_pair": {
             key: {
                 "conditioning_groups": max(1, spec.class_count),
-                "evidence_images": max(1, spec.class_count) * workload.evidence_images,
-                "backbone_image_evaluations": max(1, spec.class_count) * workload.backbone_image_evaluations,
+                "evidence_images": euler_image_workload(dataset_key=key).evidence_images,
+                "backbone_image_evaluations": euler_image_workload(dataset_key=key).backbone_image_evaluations,
             }
             for key, spec in _BENCHMARK_SPECS.items()
         },
@@ -406,7 +329,6 @@ __all__ = [
     "FID_NEGATIVE_RELATIVE_TOLERANCE",
     "IMAGE_DATASET_KEYS",
     "IMAGE_PROTOCOL_KEY",
-    "IMAGE_PROTOCOL_VERSION",
     "IMAGE_GICO_TEACHER_SCORE_WEIGHT",
     "IMAGE_GICO_TEACHER_SCORE_WARMUP_FRACTION",
     "IMAGE_GICO_TEACHER_SCORE_CLIP",
@@ -421,14 +343,6 @@ __all__ = [
     "LOCKED_PRECISION_RECALL_BATCH_SIZE",
     "LOCKED_SAMPLE_COUNT",
     "LOCKED_TORCH_FIDELITY_FIXED_OPTIONS",
-    "PANEL_PHASE_LOCKED_MAIN",
-    "PANEL_PHASE_CONDITIONAL_REWARD_TRAIN",
-    "PANEL_PHASE_CONDITIONAL_SELECTION_SCREENING",
-    "PANEL_PHASE_CONDITIONAL_SURVIVOR_CONFIRMATION",
-    "PANEL_PHASE_REWARD_TRAIN",
-    "PANEL_PHASE_SELECTION_SCREENING",
-    "PANEL_PHASE_SURVIVOR_CONFIRMATION",
-    "PANEL_PHASES",
     "euler_image_workload",
     "finite_temperature",
     "image_benchmark_spec",
@@ -437,6 +351,4 @@ __all__ = [
     "locked_metric_execution_spec",
     "normalize_image_nfe",
     "normalize_image_solver",
-    "panel_shape",
-    "survivor_confirmation_workload",
 ]

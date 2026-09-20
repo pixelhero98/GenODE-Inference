@@ -23,11 +23,11 @@ The optional `latent-clock` extra supplies Bayesian-optimization dependencies. I
 | `molecule_3d_set1`, `molecule_3d_set2`, `molecule_3d_set3` | Pooled backbone summary of observed history | 40% Kabsch RMSD + 15% each of four motion-discrepancy log improvements |
 | `cifar10` | Explicit zero vector | Uniform KID minus candidate KID on paired generated/real-reference blocks |
 | `imagenet64` | Native class embedding | Equally weighted class-conditional paired KID improvement |
-| `sana`, `sd15` | Pooled native text embedding | Equal-weight ImageReward and VQAScore differences, divided by frozen pilot component scales |
+| `sana`, `sd15` | Pooled native text embedding | Equal-weight ImageReward and VQAScore differences, divided by frozen fitting-evidence component scales |
 
 Pair each candidate and uniform anchor on context, backbone, solver, NFE, generation seed, ensemble size, reference data, and measurement protocol. Standard image GICO uses complete generated/real-reference feature blocks, paired across candidate and uniform clocks. ImageNet blocks are class conditional. Average repeated terminal measurements within each comparison cell **before** computing improvements; log ratios apply only to the positive-error tasks below.
 
-Positive errors use `log((anchor + epsilon) / (candidate + epsilon))`, where each frozen numerical floor is `1e-6 * median(positive uniform calibration values)`. Reject degenerate calibration. After component scalarization, divide by a single frozen reward standard deviation for each task/backbone/solver, balancing calibration contributions across training NFEs. Do not subtract a mean or use per-context or running normalization. Uniform rewards remain exactly zero. Text-to-image component scales use pilot measurements; its scalar scale uses training measurements.
+Positive errors use `log((anchor + epsilon) / (candidate + epsilon))`, where each frozen numerical floor is `1e-6 * median(positive uniform calibration values)`. Reject degenerate calibration. After component scalarization, divide by a single frozen reward standard deviation for each task/backbone/solver, balancing calibration contributions across training NFEs. Do not subtract a mean or use per-context or running normalization. Uniform rewards remain exactly zero. Text-to-image component and scalar scales use eligible fitting evidence only, excluding both holdout axes.
 
 **Image GICO uses KID supervision** on RF++ and the other native image backbones (EDM VE interpreted as 1-RF), as does GICO over frozen BézierFlow. Native CIFAR/ImageNet use `paired-image-kid-v1`; GICO + BézierFlow uses `paired-cifar-kid-v1` to bind the frozen two-grid transform separately. Both optimize raw uniform-minus-candidate unbiased KID differences, preserving negative estimates. Reward scaling is frozen on training evidence, balancing NFEs and classes. Complete generated/reference blocks and split isolation are required.
 
@@ -56,7 +56,7 @@ Both students use a uniform prior over unique realized reference densities. Refe
 
 Teacher-score weights are **0.01, 0.05, 0.1**. Auxiliary scores use each context/solver/NFE group's frozen predicted-reference mean and population standard deviation (standard deviations below 1e-6 use 1), then clip to [-5, 5]. This normalization does not change terminal rewards or reference weights. Teacher parameters remain frozen while gradients pass through density inputs. The configurable coefficient schedule begins chasing after 60% of the student horizon; only checkpoints with a positive realized coefficient are eligible. The default remains the historical linear ramp; alternatives include a ramp with a full-weight plateau and an immediate full-weight switch.
 
-Teacher updates average up to 64 distinct comparison groups; student updates average up to 512 distinct context/settings targets. Smaller microbatches accumulate the same equally weighted objective. Ranking pairs never cross group boundaries. Teacher checkpoint/temperature selection minimizes measured held-out reference-mixture utility regret. Context and density-family regret receive equal weight when the profile uses both; text-to-image uses context selection only. Ties prefer the configured preferred temperature, then the earlier checkpoint. Deterministic student selection maximizes frozen-teacher calibrated utility among eligible checkpoints whose held-out KL is within 15% of its eligible minimum; one density and one teacher evaluation are used per context/NFE. Stochastic selection retains measured held-out terminal utility. Both prefer earlier checkpoints on ties. Teacher checkpoints default to every 20 steps, deterministic student checkpoints to every 10, and stochastic checkpoints to every 100. See [selection and score schedules](docs/student-selection.md).
+Teacher updates average up to 64 distinct comparison groups; student updates average up to 512 context/settings targets, using microbatches of eight. Teacher selection minimizes the equally weighted context-holdout and density-holdout measured reference-mixture regrets for every task. Temperatures are 0.05/0.1/0.5; ties prefer the configured preferred temperature, then the earlier checkpoint. Deterministic selection maximizes raw calibrated frozen-teacher utility within 15% of the final minimum eligible density KL. Stochastic selection independently maximizes expected calibrated teacher utility within 20% of the final minimum eligible full-distribution KL, using 32 fixed samples per reference component and four fixed policy draws. Neither student selector invokes generators or terminal scorers. Cadences are 20/10/100 steps for teacher/deterministic/stochastic. See [selection equations and score schedules](docs/student-selection.md).
 
 | Profile | Teacher/student steps | Dropout | Score coefficient | Initial reference temperature |
 |---|---:|---:|---:|---:|
@@ -66,7 +66,13 @@ Teacher updates average up to 64 distinct comparison groups; student updates ave
 
 Transformer AdamW defaults to learning rate 0.001 and weight decay 0.0001. Teacher and student learning rates, step limits, batch sizes and checkpoint intervals are independently configurable. Task identity comes from the evidence. All resolved settings are recorded; architecture sharing does not imply one validated temperature for every task.
 
-The shared pool has 25 reference clocks, including late-p=3 and its reversal. Every reference is materialized through the same 64-bin representation as student outputs. Identical densities are deduplicated before mixture weighting. Historical evidence is reusable only if executed grids and measurement protocols match exactly; changed grids require new measurements.
+The shared pool has 25 reference clocks, including late-p=3 and its reversal. Every reference is materialized through the same 64-bin representation as student outputs. Identical densities are deduplicated before mixture weighting. Research evidence requires a completed collection manifest with exact executed grids, splits and measurement identities. Historical artifacts are not automatically upgraded.
+
+## Collect before fitting
+
+Use one [shared complete-solve collection manifest](docs/collection.md). Contextual tasks default to 256 distinct contexts per NFE, two generation seeds per assignment, and additional paired uniform anchors: ten contexts per density plus six reproducibly random extras, split 204/52. For COCO, choose one caption per source image before sampling and retain image IDs for split isolation. CIFAR collects 10,000 images including uniform (8,000/2,000); ImageNet assigns all 1,000 classes across densities and collects 64 candidate images per class plus reused/additional uniform anchors, totaling 125,440 images per NFE, with 800/200 class holdout. Two repeats divide the image allowances.
+
+Reserve 20% of unique nonuniform densities, rounding upward, for teacher density validation; equivalent aliases stay together. Teacher fitting and calibration exclude both holdouts. Both students share the teacher's context split and predict over the complete unique reference pool. Collection ends before fitting; fitting and selection add zero generator solves.
 
 ## Train and decode
 
@@ -76,9 +82,9 @@ The common interface accepts JSON configuration:
 {
   "rows": "measurements.jsonl",
   "contexts": "contexts.npz",
-  "calibration_rows": "calibration.jsonl",
+  "collection_manifest": "collection.json",
   "output": "policy",
-  "student_kind": "both",
+  "student_kind": "GICO-det-policy",
   "teacher_score_weight": 0.01,
   "teacher_steps": 2000,
   "student_steps": 2000,
@@ -91,6 +97,7 @@ The common interface accepts JSON configuration:
   "student_checkpoint_every": 100,
   "deterministic_checkpoint_every": 10,
   "deterministic_kl_allowance": 0.15,
+  "stochastic_kl_allowance": 0.20,
   "temperatures": [0.05, 0.1, 0.5],
   "preferred_temperature": 0.05,
   "seed": 0,
@@ -99,7 +106,7 @@ The common interface accepts JSON configuration:
 }
 ```
 
-Before fitting, add a [built-in held-out utility evaluator](docs/evaluators.md) to this configuration. Top-level paths are relative to the configuration file. Each measurement row contains `task`, `backbone`, `solver`, integer `nfe`, `context_id`, explicit `split`, integer `seed`, `ensemble_size`, `reference_id`, `measurement_protocol`, `schedule_key`, `metrics`, 64 `density_mass` entries, and the executed `time_grid`. Metric keys are `crps/mase`, `kid` for image GICO (`lpips` only for GICO-TF), or `preference/alignment`; molecular keys are `kabsch_rmsd_3d`, `ensemble_velocity_norm_w1`, `ensemble_acceleration_norm_w1`, `rollout_velocity_norm_w1`, and `rollout_acceleration_norm_w1`. Training input contains disjoint `train` and `validation` contexts; calibration contains only `train` or `calibration`. Locked-test rows are forbidden during fitting. Store native contexts with `save_context_embedding_table`.
+Before fitting, finish [collection](docs/collection.md) and supply its completed manifest. Top-level paths are relative to the configuration file. Each measurement row contains `task`, `backbone`, `solver`, integer `nfe`, `context_id`, explicit `split`, integer `seed`, `ensemble_size`, `reference_id`, `measurement_protocol`, `schedule_key`, `metrics`, 64 `density_mass` entries, and the executed `time_grid`. Metric keys are `crps/mase`, `kid` for image GICO (`lpips` only for GICO-TF), or `preference/alignment`; molecular keys are `kabsch_rmsd_3d`, `ensemble_velocity_norm_w1`, `ensemble_acceleration_norm_w1`, `rollout_velocity_norm_w1`, and `rollout_acceleration_norm_w1`. Training input contains disjoint `train` and `validation` contexts; any explicit calibration subset must come from eligible fitting observations in this collection. Locked-test rows are forbidden during fitting. Store native contexts with `save_context_embedding_table`.
 
 Research molecular rows also carry the frozen `molecule_feature_map` dictionary from `MoleculeFeatureMap.to_dict()`. It is recorded in the policy artifact and checked against runtime reference geometry.
 
@@ -108,7 +115,7 @@ genode-train-gico --config train.json --dry-run
 genode-train-gico --config train.json --student-kind both --teacher-score-weight 0.01
 ```
 
-Research evidence requires all 25 references in every cell. Explicit `purpose: functional` permits a reduced reference set for integration checks; it does not produce benchmark evidence. Checkpoints are selected using validation evidence and the profile-specific teacher density-family holdout. Output directories must be new.
+Research evidence is sparse: each contextual assignment measures its candidate and uniform anchor; the manifest records all 25 references for frozen-teacher predictions. Explicit `purpose: functional` permits small software fixtures and does not produce benchmark evidence. Output directories must be new. Stochastic fitting stays inactive unless `GICO-sto-policy` or `both` is explicitly requested.
 
 To compare students using an existing frozen teacher, add `"teacher_artifact": "previous-policy"`
 to the common training configuration (or pass `teacher_artifact` to `fit`). Public reuse requires selected-teacher weight/conditioning/step/temperature proof and a matching minimum-regret history entry. This skips teacher
@@ -141,14 +148,14 @@ For GICO on RF++ or EDM-as-1RF, supply `paired-image-kid-v1` rows with `metrics:
 
 ```bash
 genode-image-gico prepare --manifest raw.json --output evidence.json
-genode-image-gico train --evidence evidence.json --output policy --student-kind both --teacher-score-weight 0.01 --selection-evaluator evaluator.json
+genode-image-gico train --evidence evidence.json --output policy --student-kind both --teacher-score-weight 0.01
 genode-image-gico validate --help
 genode-image-gico materialize --help
 ```
 
 The input schema is documented by `prepare_image_rows` in `genode.gico.image_supervision` and [image supervision](docs/image-supervision.md). The same commands fit GICO-TF only when rows explicitly declare `paired-lpips-v1` with LPIPS target pairs. `GICO-det-policy` and `GICO-sto-policy` select the student architecture; the recorded image objective determines whether the run is GICO or GICO-TF. Supply global metric measurements separately when reporting them.
 
-SANA/SD1.5 collection records executed grids, density masses, native contexts, generation seeds, and scorer identities. Use `genode-latent-clock prepare-gico --help` to convert paired collection evidence and independent pilot rows into the common configuration, then:
+SANA/SD1.5 collection records executed grids, density masses, native contexts, generation seeds, and scorer identities. Use `genode-latent-clock prepare-gico --help` to prepare completed shared collection evidence and native embeddings into the common configuration, then:
 
 ```bash
 genode-latent-clock fit-gico --config evidence/train_config.json --student-kind both
@@ -159,7 +166,7 @@ BO, PG, and LD3 remain separate comparison methods. Completed experiments remain
 
 ## Artifacts and validation
 
-Protocol `genode-gico-v6` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts record architecture, reward calibration, context normalization, reference densities and executed grids, split identities, solver semantics, RNG configuration, resolved fitting profiles, explicit metric weights, dropout, temperature units, normalization/selection protocols, selected steps and realized coefficients, and fitting history. Existing valid v6 student artifacts remain loadable through the explicit role codec. Public selectors are `GICO-det-policy` and `GICO-sto-policy`; `both` fits both. Old selector aliases are rejected. Serialized v6 role keys and fingerprint inputs remain stable. All v5 loading and older teachers lacking selection proof require their archived runtimes. Recorded clock scope must describe one complete clock per generated trajectory.
+Protocol `genode-gico` stores `policy.pt` plus a checksummed `manifest.json`. Artifacts bind source fingerprints, the collection manifest, complete-solve identities, context/density splits, calibration, native conditioning, complete reference support, solver/RNG semantics, resolved profiles, selected teacher, full selection history and selected weights. Public selectors and serialized role names are `GICO-det-policy` and `GICO-sto-policy`; `both` fits both. Historical artifacts and missing selection proof are rejected; use their archived runtimes. Existing experiment files are not rewritten.
 
 `genode-report-gico-locked-test` applies an artifact's frozen calibration to paired test measurements without selection. `genode-evaluate-schedule-summary` performs the analogous validation report. Both require new output files and matching frozen measurement protocols, native backbone bindings, and molecular feature maps. Supply `policy_sha256` and `student_kind` for learned-policy measurements and `--contexts contexts.npz` for exact selected-policy clock replay. Stochastic rows require distinct `clock_seed`/`clock_request_id` pairs for each generated member and replicate. Explicit non-GICO comparisons use `measurement_role: "baseline"`.
 

@@ -1,4 +1,4 @@
-"""Versioned unified policies; inference never loads or invokes the teacher."""
+"""Canonical policies; inference never loads or invokes the teacher."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ from genode.gico.profiles import AUXILIARY_NORMALIZATION, TEMPERATURE_UNITS, res
 from genode.gico.rewards import TASK_METRICS, RewardCalibration, metric_weights
 from genode.gico.schedule_hash import json_hash
 
-GICO_PROTOCOL = "genode-gico-v6"
-RNG_PROTOCOL = "sha256-request-seeded-torch-normal-v1"
+GICO_PROTOCOL = "genode-gico"
+RNG_PROTOCOL = "sha256-request-seeded-torch-normal"
 
 
 def stable_context_id(
@@ -108,7 +108,7 @@ def save_artifact(path, teacher, students: dict, conditioning: Conditioning, met
         "teacher_conditioning": replace(
             conditioning, context_mode=metadata["fitting_profile"]["teacher_context_mode"]
         ).to_payload(),
-        "architecture_protocol": "density-rope64-silu-additive-once-v1",
+        "architecture_protocol": "density-rope64-silu-additive-once",
         "metadata": metadata,
         "teacher": {k: v.detach().cpu() for k, v in teacher.state_dict().items()},
         "students": {
@@ -119,9 +119,7 @@ def save_artifact(path, teacher, students: dict, conditioning: Conditioning, met
     with tempfile.TemporaryDirectory(prefix=".gico-", dir=destination.parent) as temporary:
         stage = Path(temporary) / "artifact"
         stage.mkdir()
-        from genode.gico.codec import encode_payload
-
-        torch.save(encode_payload(payload), stage / "policy.pt")
+        torch.save(payload, stage / "policy.pt")
         digest = hashlib.sha256((stage / "policy.pt").read_bytes()).hexdigest()
         (stage / "manifest.json").write_text(
             json.dumps({"protocol": GICO_PROTOCOL, "policy_sha256": digest}, indent=2), encoding="utf-8"
@@ -162,9 +160,7 @@ def _read_artifact(path) -> tuple[dict, str]:
         or payload["protocol"] != manifest["protocol"]
     ):
         raise ValueError("Unsupported policy payload; old architecture loaders have been removed.")
-    from genode.gico.codec import decode_payload
-
-    return decode_payload(payload), digest
+    return payload, digest
 
 
 def sample_density(model, conditioning, kind, context, solver, nfe, seed=0, request_id=""):
@@ -211,7 +207,7 @@ class GICOPolicy:
             raise ValueError("Student manifest and model states disagree.")
         self.conditioning = Conditioning.from_payload(payload["conditioning"])
         self.teacher_conditioning = Conditioning.from_payload(payload["teacher_conditioning"])
-        if payload["architecture_protocol"] != "density-rope64-silu-additive-once-v1":
+        if payload["architecture_protocol"] != "density-rope64-silu-additive-once":
             raise ValueError("Unsupported Transformer positional/conditioning protocol.")
         config = ModelConfig(**payload["architecture"])
         if self.metadata["task"] not in TASK_METRICS or config.metric_count != len(TASK_METRICS[self.metadata["task"]]):
@@ -233,22 +229,13 @@ class GICOPolicy:
             raise ValueError("Artifact fitting profile task mismatch.")
         from dataclasses import fields
 
-        from genode.gico.deterministic_selection import (
-            DETERMINISTIC_SELECTION_PROTOCOL,
-            STUDENT_SELECTION_PROTOCOL,
-            select_deterministic,
-        )
+        from genode.gico.deterministic_selection import DETERMINISTIC_SELECTION_PROTOCOL, select_deterministic
         from genode.gico.profiles import TrainingConfig
-        from genode.gico.selection import SELECTION_PROTOCOL
+        from genode.gico.stochastic_selection import STOCHASTIC_SELECTION_PROTOCOL, select_stochastic
+        from genode.gico.student_selection import STUDENT_SELECTION_PROTOCOL
 
         profile_fields = {field.name for field in fields(TrainingConfig)}
-        added_fields = {"deterministic_checkpoint_every", "deterministic_kl_allowance"}
         criterion = self.metadata["student_selection_criterion"]
-        # Only the exact historical measured-v6 profile can omit the new fields.
-        if criterion == SELECTION_PROTOCOL and set(profile) == profile_fields - added_fields:
-            profile.update(
-                deterministic_checkpoint_every=profile["student_checkpoint_every"], deterministic_kl_allowance=0.15
-            )
         if set(profile) != profile_fields:
             raise ValueError("Artifact fitting profile is incomplete.")
         training = resolve_profile(self.metadata["task"], **profile)
@@ -263,7 +250,7 @@ class GICOPolicy:
             or self.metadata["temperature_units"] != TEMPERATURE_UNITS
             or self.metadata["auxiliary_normalization"] != AUXILIARY_NORMALIZATION
             or self.metadata["teacher_selection_criterion"] != "heldout_reference_utility_regret"
-            or criterion not in (SELECTION_PROTOCOL, STUDENT_SELECTION_PROTOCOL)
+            or criterion != STUDENT_SELECTION_PROTOCOL
             or self.metadata["selected_temperature"] not in training.temperatures
         ):
             raise ValueError("Artifact fitting, scalarization or normalization protocols disagree.")
@@ -305,50 +292,63 @@ class GICOPolicy:
         ):
             raise ValueError("Artifact checkpoint history does not follow its configured score schedule.")
         eligible = [row for row in records if row.get("coefficient", 0) > 0]
-        if criterion == STUDENT_SELECTION_PROTOCOL and student_kind == "GICO-det-policy":
-            from genode.gico.selection import validate_teacher_selection
+        from genode.gico.collection import validate_collection
+        from genode.gico.evidence import content_hash
+        from genode.gico.selection import validate_teacher_selection
 
-            validate_teacher_selection(payload["teacher"], self.teacher_conditioning, self.metadata)
-            expected_steps = list(
-                range(
-                    training.deterministic_checkpoint_every,
-                    training.student_steps + 1,
-                    training.deterministic_checkpoint_every,
-                )
-            )
-            if not expected_steps or expected_steps[-1] != training.student_steps:
-                expected_steps.append(training.student_steps)
-            if (
-                [row["step"] for row in records] != expected_steps
-                or not eligible
-                or any(
-                    row.get("selection_protocol") != DETERMINISTIC_SELECTION_PROTOCOL
-                    or row.get("selection_teacher_fingerprint")
-                    != self.metadata["history"]["teacher_selection_fingerprint"]
-                    or row.get("selection_contexts") != sorted(self.metadata["split_contexts"]["validation"])
-                    or not isinstance(row.get("predictions_sha256"), str)
-                    or len(row["predictions_sha256"]) != 64
-                    or type(row.get("selection_groups")) is not int
-                    or row["selection_groups"] < 1
-                    for row in eligible
-                )
-                or selection != select_deterministic(records, training.deterministic_kl_allowance)
-            ):
-                raise ValueError("Artifact deterministic student violates teacher-score/KL selection.")
-        elif (
-            not eligible
+        validate_teacher_selection(payload["teacher"], self.teacher_conditioning, self.metadata)
+        manifest = self.metadata.get("collection_manifest")
+        validate_collection(manifest)
+        expected_binding = {
+            "evidence_fingerprint": self.metadata["evidence_sha256"],
+            "calibration_fingerprint": content_hash(self.metadata["reward_calibrations"]),
+            "collection_fingerprint": content_hash(manifest),
+            "support_fingerprint": content_hash(manifest["reference_support"]),
+            "source_fingerprint": self.metadata.get("source_code_sha256"),
+        }
+        if any(self.metadata["history"].get(key) != value for key, value in expected_binding.items()):
+            raise ValueError("Artifact fitting evidence, calibration, support or source fingerprint differs.")
+        if (
+            manifest.get("state") != "complete"
+            or self.metadata.get("collection_sha256") != content_hash(manifest)
+            or manifest["split_contexts"] != self.metadata["split_contexts"]
+            or manifest["density_holdout"] != self.metadata["history"]["density_holdout"]
+            or manifest["task"] != self.metadata["task"]
+            or manifest["backbone"] != self.metadata["backbone"]
+            or not isinstance(self.metadata.get("source_code_sha256"), str)
+            or len(self.metadata["source_code_sha256"]) != 64
+        ):
+            raise ValueError("Artifact collection, source or split binding differs.")
+        deterministic = student_kind == "GICO-det-policy"
+        cadence = training.deterministic_checkpoint_every if deterministic else training.student_checkpoint_every
+        expected_steps = list(range(cadence, training.student_steps + 1, cadence))
+        if not expected_steps or expected_steps[-1] != training.student_steps:
+            expected_steps.append(training.student_steps)
+        protocol = DETERMINISTIC_SELECTION_PROTOCOL if deterministic else STOCHASTIC_SELECTION_PROTOCOL
+        selector = select_deterministic if deterministic else select_stochastic
+        allowance = training.deterministic_kl_allowance if deterministic else training.stochastic_kl_allowance
+        if (
+            [row["step"] for row in records] != expected_steps
+            or not eligible
             or any(
-                row.get("selection_protocol") != SELECTION_PROTOCOL
-                or not np.isfinite(row.get("utility", float("nan")))
-                or not row.get("measurements_sha256")
-                or row.get("clock_replicates")
-                != (training.selection_clock_replicates if student_kind == "GICO-sto-policy" else 1)
+                row.get("selection_protocol") != protocol
+                or row.get("selection_teacher_fingerprint") != self.metadata["history"]["teacher_selection_fingerprint"]
                 or row.get("selection_contexts") != sorted(self.metadata["split_contexts"]["validation"])
+                or not isinstance(row.get("predictions_sha256"), str)
+                or len(row["predictions_sha256"]) != 64
+                or type(row.get("selection_groups")) is not int
+                or row["selection_groups"] < 1
                 for row in eligible
             )
-            or selection != min(eligible, key=lambda row: (-row["utility"], row["step"]))
+            or selection != selector(records, allowance)
         ):
-            raise ValueError("Artifact student was not selected by held-out measured utility.")
+            raise ValueError("Artifact student violates calibrated teacher-utility/KL selection.")
+        if not deterministic and any(
+            row.get("clock_replicates") != training.selection_clock_replicates
+            or row.get("kl_samples_per_reference") != training.stochastic_likelihood_samples
+            for row in eligible
+        ):
+            raise ValueError("Stochastic selection sampling disagrees with the fitting profile.")
         if (
             config.condition_dim != self.conditioning.width
             or tuple(self.metadata["solvers"]) != self.conditioning.solvers
@@ -375,13 +375,15 @@ class GICOPolicy:
                 raise ValueError("Artifact reward calibration scope mismatch.")
             if set(value.calibration_contexts) & set(splits["validation"]):
                 raise ValueError("Artifact calibration includes validation contexts.")
-        if (
-            set(self.metadata["reference_densities"]) != set(self.metadata["reference_grids"])
-            or not self.metadata["reference_grids"]
-        ):
+        if set(self.metadata["reference_densities"]) != set(self.metadata["reference_grids"]) or set(
+            self.metadata["reference_grids"]
+        ) != {f"{setting}:{name}" for setting, pool in manifest["reference_support"].items() for name in pool}:
             raise ValueError("Artifact reference densities/grids are incomplete.")
         for key, mass in self.metadata["reference_densities"].items():
-            solver, nfe, _ = key.split(":", 2)
+            solver, nfe, name = key.split(":", 2)
+            planned = manifest["reference_support"].get(f"{solver}:{nfe}", {}).get(name)
+            if planned is None or planned["density_mass"] != mass:
+                raise ValueError("Artifact reference density differs from the collected support.")
             if solver not in self.conditioning.solvers:
                 raise ValueError("Artifact reference solver is outside its conditioning scope.")
             expected = materialize(validate_mass(mass), solver, int(nfe))
@@ -392,26 +394,28 @@ class GICOPolicy:
                 DeterministicStudent(config) if student_kind == "GICO-det-policy" else StochasticStudent(config)
             )
         self.model.load_state_dict(payload["students"][student_kind], strict=True)
-        if criterion == STUDENT_SELECTION_PROTOCOL and student_kind == "GICO-det-policy":
-            # Both roles share the Transformer; only input/output projection sizes differ.
-            # Check structure without constructing a teacher or changing v6 byte fingerprints.
-            shapes = {key: tuple(value.shape) for key, value in self.model.state_dict().items()}
-            shapes.update(
-                {
-                    "input.0.weight": (config.width, 3),
-                    "output.weight": (config.metric_count, config.width),
-                    "output.bias": (config.metric_count,),
-                }
-            )
-            state = payload["teacher"]
-            if set(state) != set(shapes) or any(
-                not isinstance(value, torch.Tensor)
-                or tuple(value.shape) != shapes[key]
-                or value.dtype != torch.float32
-                or not bool(torch.isfinite(value).all())
-                for key, value in state.items()
-            ):
-                raise ValueError("Selected teacher state does not match its Transformer architecture.")
+        # Validate teacher structure without constructing it during inference.
+        shapes = {
+            key: tuple(value.shape)
+            for key, value in self.model.state_dict().items()
+            if key not in ("ratio_mean", "ratio_scale")
+        }
+        shapes.update(
+            {
+                "input.0.weight": (config.width, 3),
+                "output.weight": (config.metric_count, config.width),
+                "output.bias": (config.metric_count,),
+            }
+        )
+        state = payload["teacher"]
+        if set(state) != set(shapes) or any(
+            not isinstance(value, torch.Tensor)
+            or tuple(value.shape) != shapes[key]
+            or value.dtype != torch.float32
+            or not bool(torch.isfinite(value).all())
+            for key, value in state.items()
+        ):
+            raise ValueError("Selected teacher state does not match its Transformer architecture.")
         if any(not bool(torch.isfinite(v).all()) for v in self.model.state_dict().values()):
             raise ValueError("Artifact contains nonfinite model parameters.")
         if student_kind == "GICO-sto-policy" and bool((self.model.ratio_scale <= 0).any()):

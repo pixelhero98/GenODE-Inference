@@ -14,8 +14,6 @@ def test_prepare_and_train_delegate_to_common_fit(tmp_path):
     manifest = tmp_path / "measurements.json"
     manifest.write_text(json.dumps(image_manifest()), encoding="utf-8")
     evidence = tmp_path / "evidence.json"
-    evaluator = tmp_path / "evaluator.json"
-    evaluator.write_text(json.dumps({"factory": "tests.selection_fixtures:cli_factory", "config": {}}))
     assert main(["prepare", "--manifest", str(manifest), "--output", str(evidence)]) == 0
     with patch("genode.gico.training.fit", return_value={"task": "cifar10"}) as fit:
         assert (
@@ -28,8 +26,6 @@ def test_prepare_and_train_delegate_to_common_fit(tmp_path):
                     str(tmp_path / "artifact"),
                     "--student-kind",
                     "both",
-                    "--selection-evaluator",
-                    str(evaluator),
                     "--teacher-score-weight",
                     "0.05",
                 ]
@@ -43,7 +39,7 @@ def test_prepare_and_train_delegate_to_common_fit(tmp_path):
     settings = {
         k: v
         for k, v in fit.call_args.kwargs.items()
-        if k not in {"student_kind", "device", "purpose", "calibration_rows", "selection_evaluator"}
+        if k not in {"student_kind", "device", "purpose", "calibration_rows", "collection_manifest"}
     }
     assert resolve_profile("cifar10", **settings).student_steps == 2000
     assert len(fit.call_args.args[0]) == 4
@@ -51,10 +47,8 @@ def test_prepare_and_train_delegate_to_common_fit(tmp_path):
 
 
 def test_shared_image_training_flags():
-    args = build_argparser().parse_args(
-        ["train", "--evidence", "input.json", "--output", "out", "--selection-evaluator", "evaluator.json"]
-    )
-    assert args.student_kind == "both" and args.teacher_score_weight is None
+    args = build_argparser().parse_args(["train", "--evidence", "input.json", "--output", "out"])
+    assert args.student_kind == "GICO-det-policy" and args.teacher_score_weight is None
 
 
 def test_deterministic_image_fit_needs_no_generator_factory(tmp_path):
@@ -73,7 +67,7 @@ def test_deterministic_image_fit_needs_no_generator_factory(tmp_path):
                 "GICO-det-policy",
             ]
         )
-    assert fit.call_args.kwargs["selection_evaluator"] is None
+    assert "selection_evaluator" not in fit.call_args.kwargs
 
 
 @pytest.mark.parametrize("model_key", list(IMAGE_BACKBONE_REGISTRY))
@@ -81,9 +75,8 @@ def test_registered_native_backbones_prepare_and_train_with_kid(tmp_path, model_
     from genode.gico.rewards import calibrate_rewards, construct_rewards
     from tests.test_native_image_kid import native_manifest
 
-    manifest, evidence, evaluator = (tmp_path / name for name in ("manifest.json", "evidence.json", "evaluator.json"))
+    manifest, evidence = (tmp_path / name for name in ("manifest.json", "evidence.json"))
     manifest.write_text(json.dumps(native_manifest(model_key)), encoding="utf-8")
-    evaluator.write_text(json.dumps({"factory": "tests.selection_fixtures:cli_factory", "config": {}}))
     main(["prepare", "--manifest", str(manifest), "--output", str(evidence)])
     prepared = json.loads(evidence.read_text(encoding="utf-8"))
     assert prepared["metadata"]["protocol"] == "paired-image-kid-v1"
@@ -101,9 +94,7 @@ def test_registered_native_backbones_prepare_and_train_with_kid(tmp_path, model_
                 str(evidence),
                 "--output",
                 str(tmp_path / "policy"),
-                "--selection-evaluator",
-                str(evaluator),
             ]
         )
-    assert fit.call_args.kwargs["student_kind"] == "both"
+    assert fit.call_args.kwargs["student_kind"] == "GICO-det-policy"
     assert fit.call_args.args[0] == prepared["rows"]

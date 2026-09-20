@@ -23,6 +23,7 @@ def test_config_relative_paths_and_dry_run_validate_without_fitting(tmp_path, mo
                 "contexts": "contexts.npz",
                 "output": "artifact",
                 "student_kind": "both",
+                "purpose": "functional",
                 "teacher_score_weight": weight,
             }
         )
@@ -66,8 +67,8 @@ def test_cli_rejects_unsupported_choices(option, value):
         train_gico.build_argparser().parse_args(["--config", "training.json", option, value])
 
 
-@pytest.mark.parametrize("factory", [None, {"factory": "unavailable_runtime:factory", "config": {}}])
-def test_deterministic_fit_does_not_import_or_require_generator_factory(tmp_path, monkeypatch, factory):
+@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy", "both"])
+def test_fit_never_requires_or_imports_generator_factory(tmp_path, monkeypatch, kind):
     rows, contexts = reference_evidence()
     monkeypatch.setattr(train_gico, "read_rows", lambda _: rows)
     monkeypatch.setattr(train_gico, "load_context_embedding_table", lambda _: contexts)
@@ -77,11 +78,12 @@ def test_deterministic_fit_does_not_import_or_require_generator_factory(tmp_path
         "rows": "observations.jsonl",
         "contexts": "contexts.npz",
         "output": str(tmp_path / "policy"),
-        "student_kind": "GICO-det-policy",
-        "selection_evaluator": factory,
+        "student_kind": kind,
+        "purpose": "functional",
     }
     train_gico.run_config(config)
-    assert calls[0]["selection_evaluator"] is None
-    for kind in ("both", "GICO-sto-policy"):
-        with pytest.raises(ValueError, match="requires"):
-            train_gico.run_config({**config, "student_kind": kind, "selection_evaluator": None})
+    assert "selection_evaluator" not in calls[0]
+    location = tmp_path / "obsolete.json"
+    location.write_text(json.dumps({**config, "selection_evaluator": {"factory": "unavailable:factory", "config": {}}}))
+    with pytest.raises(ValueError, match="documented GICO options"):
+        train_gico.load_config(location)

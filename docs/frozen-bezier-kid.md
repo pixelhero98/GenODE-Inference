@@ -35,4 +35,4 @@ Neither historical evidence from another generator nor a fidelity policy may
 be relabeled as distributional evidence. Improved KID during selection does not
 establish improved FID or generalization; evaluate frozen choices separately.
 
-Deterministic checkpoint selection uses frozen-teacher utility subject to the 15% validation-KL allowance; stochastic selection retains measured paired KID utility. See [student selection](student-selection.md).
+Deterministic checkpoint selection uses frozen-teacher utility subject to the 15% validation-KL allowance; stochastic selection uses expected calibrated frozen-teacher utility subject to its separate 20% full-distribution-KL allowance. See [student selection](student-selection.md).

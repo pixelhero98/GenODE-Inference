@@ -72,7 +72,7 @@ def test_equal_setting_and_class_weighting():
 
 
 def test_raw_native_teacher_score_reuses_one_global_student_density():
-    evidence = prepare_evidence(*reference_evidence())
+    evidence = prepare_evidence(*reference_evidence(), purpose="functional")
     conditioning = replace(evidence.conditioning, context_mode="global")
     architecture = ModelConfig(conditioning.width, 2, dropout=0.1)
     model = DeterministicStudent(architecture).eval()
@@ -98,7 +98,7 @@ def test_raw_native_teacher_score_reuses_one_global_student_density():
         )
     assert forward.call_count == len(groups)
     assert all(call.args[0] is native and call.args[1] is mass for call in forward.call_args_list)
-    assert result["predicted_utility"] == 25
+    assert result["predicted_utility"] == pytest.approx(25 * evidence.calibrations["euler"].reward_scale)
     assert "utility" not in result and "measurements_sha256" not in result
     assert state_fingerprint(teacher) == before
     assert torch.equal(rng, torch.random.get_rng_state())
@@ -117,6 +117,7 @@ def fitted(tmp_path):
         student_steps=5,
         deterministic_checkpoint_every=1,
         student_context_mode="global",
+        purpose="functional",
     )
     return destination, metadata
 
@@ -146,13 +147,13 @@ def test_new_artifact_rejects_tampering(fitted, tmp_path, field):
         elif field == "teacher_shape":
             payload["teacher"]["output.weight"] = payload["teacher"]["output.weight"].flatten()
         elif field == "teacher_identity":
-            metadata["history"]["students"]["deterministic"][-1]["selection_teacher_fingerprint"] = "bad"
+            metadata["history"]["students"]["GICO-det-policy"][-1]["selection_teacher_fingerprint"] = "bad"
         elif field == "missing_checkpoint":
-            metadata["history"]["students"]["deterministic"].pop(0)
+            metadata["history"]["students"]["GICO-det-policy"].pop(0)
         elif field == "missing_profile":
             metadata["fitting_profile"].pop("deterministic_kl_allowance")
         else:
-            metadata["history"]["students"]["deterministic"][-1]["predicted_utility"] = float("nan")
+            metadata["history"]["students"]["GICO-det-policy"][-1]["predicted_utility"] = float("nan")
 
     corrupt_payload(destination, tmp_path / "bad", change)
     with pytest.raises(ValueError):
@@ -160,7 +161,7 @@ def test_new_artifact_rejects_tampering(fitted, tmp_path, field):
 
 
 def test_validation_cadence_does_not_change_optimization_or_rng():
-    evidence = prepare_evidence(*reference_evidence())
+    evidence = prepare_evidence(*reference_evidence(), purpose="functional")
     config = resolve_profile(
         evidence.task,
         teacher_steps=2,
@@ -190,7 +191,6 @@ def test_validation_cadence_does_not_change_optimization_or_rng():
             student_kind="GICO-det-policy",
             device="cpu",
             checkpoint_callback=capture,
-            selection_evaluator=forbidden,
         )
         captures.append(checkpoints[5])
     first, second = captures
@@ -200,7 +200,7 @@ def test_validation_cadence_does_not_change_optimization_or_rng():
 
 
 @pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
-def test_historical_v6_profile_without_new_fields(untrained_artifact, tmp_path, kind):  # noqa: F811
+def test_incomplete_profile_is_rejected(untrained_artifact, tmp_path, kind):  # noqa: F811
     source, *_ = untrained_artifact
 
     def old_profile(payload):
@@ -210,4 +210,5 @@ def test_historical_v6_profile_without_new_fields(untrained_artifact, tmp_path, 
         profile["teacher_checkpoint_every"] = 100
 
     corrupt_payload(source, tmp_path / "legacy", old_profile)
-    assert load_policy(tmp_path / "legacy", student_kind=kind).student_kind == kind
+    with pytest.raises(ValueError, match="incomplete"):
+        load_policy(tmp_path / "legacy", student_kind=kind)

@@ -30,6 +30,18 @@ class Evidence:
     backbone: str
     purpose: str
     evidence_sha256: str
+    collection_manifest: dict
+
+    @property
+    def reference_support(self):
+        return self.collection_manifest["reference_support"]
+
+    @property
+    def density_holdout(self):
+        return self.collection_manifest["density_holdout"]
+
+    def is_density_holdout(self, row):
+        return density_identity(row["density_mass"]) in self.density_holdout[f"{row['solver']}:{row['nfe']}"]
 
     def groups(self, split: str) -> list[list[dict]]:
         result = defaultdict(list)
@@ -40,7 +52,12 @@ class Evidence:
 
 
 def prepare_evidence(
-    rows: list[dict], contexts: dict, *, calibration_rows: list[dict] | None = None, purpose: str = "research"
+    rows: list[dict],
+    contexts: dict,
+    *,
+    calibration_rows: list[dict] | None = None,
+    purpose: str = "research",
+    collection_manifest: dict | None = None,
 ) -> Evidence:
     if purpose not in ("research", "functional"):
         raise ValueError("Evidence purpose must be research or functional.")
@@ -55,23 +72,47 @@ def prepare_evidence(
     }
     if not all(phase_contexts.values()) or phase_contexts["train"] & phase_contexts["validation"]:
         raise ValueError("Training and validation contexts must be nonempty and disjoint.")
+    from genode.gico.collection import functional_manifest, validate_collection
+
+    if collection_manifest is None:
+        if purpose != "functional":
+            raise ValueError("Research fitting requires a completed collection manifest.")
+        rows, collection_manifest = functional_manifest(rows)
+    validate_collection(collection_manifest, rows)
+    if purpose == "research" and collection_manifest.get("purpose") == "functional":
+        raise ValueError("Functional observations cannot be relabelled as research evidence.")
+    if collection_manifest["split_contexts"] != {s: sorted(v) for s, v in phase_contexts.items()}:
+        raise ValueError("Collection context membership differs from the fitting observations.")
+
+    def eligible(row):
+        setting = f"{row['solver']}:{row['nfe']}"
+        return (
+            row["split"] == "train"
+            and density_identity(row["density_mass"]) not in collection_manifest["density_holdout"][setting]
+        )
+
     for row in rows:
         verify_measurement_clock(row)
         if row["context_id"] not in contexts:
             raise ValueError(f"Missing native context {row['context_id']!r}.")
         if row["schedule_key"] not in REFERENCE_KEYS:
             raise ValueError("Teacher evidence must use the declared reference-clock pool.")
-    calibration_rows = calibration_rows if calibration_rows is not None else [r for r in rows if r["split"] == "train"]
+    if calibration_rows is not None:
+        if any(r["context_id"] in phase_contexts["validation"] for r in calibration_rows):
+            raise ValueError("Validation contexts cannot be used to calibrate rewards.")
+        if any(not eligible(r) for r in calibration_rows):
+            raise ValueError("Calibration must contain eligible fitting observations only, excluding both holdouts.")
+        if any(content_hash(r) not in {content_hash(x) for x in rows} for r in calibration_rows):
+            raise ValueError("Calibration observations must belong to the completed collection.")
+    calibration_rows = calibration_rows if calibration_rows is not None else [r for r in rows if eligible(r)]
     all_rows = rows + calibration_rows
     from genode.gico.image_objective import IMAGE_TASKS, validate_image_rows
 
     validate_image_rows(all_rows)
     if task == "imagenet64" and purpose == "research":
-        panels = defaultdict(set)
-        for row in all_rows:
-            panels[(row["split"], row["panel_id"], row["solver"], row["nfe"], row["schedule_key"])].add(row["class_id"])
-        if any(classes != set(range(1000)) for classes in panels.values()):
-            raise ValueError("Research ImageNet evidence requires complete 1000-class panels.")
+        classes = {phase: {r["class_id"] for r in rows if r["split"] == phase} for phase in phase_contexts}
+        if classes["train"] & classes["validation"] or classes["train"] | classes["validation"] != set(range(1000)):
+            raise ValueError("Research ImageNet requires all 1000 classes with disjoint fitting/held-out classes.")
     if task.startswith("molecule_"):
         from genode.evaluation.molecule_energy import MoleculeFeatureMap
 
@@ -83,7 +124,7 @@ def prepare_evidence(
         }
         for row in all_rows:
             if "molecule_feature_map" not in row:
-                if purpose == "research":
+                if purpose == "research" or any("molecule_feature_map" in value for value in all_rows):
                     raise ValueError("Research molecular evidence requires its frozen molecule_feature_map.")
                 continue
             MoleculeFeatureMap.from_dict(row["molecule_feature_map"])
@@ -111,7 +152,7 @@ def prepare_evidence(
     cells = []
     for solver in sorted({r["solver"] for r in rows}):
         calibration = [r for r in calibration_rows if r["solver"] == solver]
-        training = [r for r in rows if r["solver"] == solver and r["split"] == "train"]
+        training = [r for r in rows if r["solver"] == solver and eligible(r)]
         if task in ("sana", "sd15"):
             calibrated = calibrate_rewards(training, component_calibration_rows=calibration)
         else:
@@ -129,8 +170,6 @@ def prepare_evidence(
         groups[(cell["split"], cell["solver"], cell["nfe"], cell["context_id"])].append(cell)
     deduplicated = []
     for group in groups.values():
-        if purpose == "research" and {r["schedule_key"] for r in group} != set(REFERENCE_KEYS):
-            raise ValueError("Research fitting requires the complete 25-reference-clock pool in every cell.")
         unique = {}
         for cell in group:
             identity = density_identity(cell["density_mass"])
@@ -142,9 +181,7 @@ def prepare_evidence(
             else:
                 unique[identity] = {**cell, "density_sha256": identity, "aliases": [cell["schedule_key"]]}
         deduplicated.extend(unique.values())
-    conditioner = Conditioning.fit(
-        [r for r in cells if r["split"] == "train"], contexts, unconditional=task == "cifar10"
-    )
+    conditioner = Conditioning.fit([r for r in cells if eligible(r)], contexts, unconditional=task == "cifar10")
     return Evidence(
         deduplicated,
         contexts,
@@ -158,6 +195,8 @@ def prepare_evidence(
                 "measurements": rows,
                 "calibration": calibration_rows,
                 "contexts": {k: np.asarray(v).tolist() for k, v in sorted(contexts.items())},
+                "collection_manifest": collection_manifest,
             }
         ),
+        collection_manifest,
     )

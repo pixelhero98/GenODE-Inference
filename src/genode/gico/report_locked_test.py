@@ -113,7 +113,7 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test", con
         ):
             raise ValueError("Report molecular feature map differs from the frozen training map.")
         from genode.gico.clocks import REFERENCE_KEYS
-        from genode.gico.selection import _check_clock
+        from genode.gico.reporting import _check_clock
 
         learned = row["schedule_key"] not in REFERENCE_KEYS and row.get("measurement_role") != "baseline"
         if learned and (

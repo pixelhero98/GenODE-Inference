@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from genode.gico.clocks import clock_generator, materialize, reference_densities
-from genode.gico.evidence import prepare_evidence
+from genode.gico.evidence import content_hash, prepare_evidence
 from genode.gico.networks import (
     DENSITY_BINS,
     DENSITY_MIXTURE,
@@ -29,7 +29,7 @@ from genode.gico.policy import GICO_PROTOCOL, load_policy, save_artifact
 from genode.gico.profiles import AUXILIARY_NORMALIZATION, TEMPERATURE_UNITS, resolve_profile
 from genode.gico.selection import teacher_fingerprint
 from genode.gico.training import SCORE_WEIGHTS, TrainingConfig, score_coefficient, teacher_loss, teacher_score
-from tests.selection_fixtures import evaluator_for, fixture_history
+from tests.selection_fixtures import fixture_history
 from tests.test_unified_gico_rewards import reference_evidence
 
 
@@ -138,6 +138,9 @@ def test_teacher_score_has_finite_density_gradients_to_both_students_with_teache
     assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
     assert sum(float(gradient.abs().sum()) for gradient in gradients) > 0
     assert all(parameter.grad is None for parameter in teacher.parameters())
+    if kind == "GICO-sto-policy":
+        assert (student.output.weight.grad.abs().sum(1) > 0).all()
+        assert (student.output.bias.grad.abs() > 0).all()
     for key, value in teacher.state_dict().items():
         torch.testing.assert_close(value, teacher_before[key], atol=0, rtol=0)
 
@@ -204,7 +207,7 @@ def test_reference_temperature_uses_unclipped_pre_normalization_utilities():
 @pytest.fixture(scope="module")
 def untrained_artifact(tmp_path_factory):
     rows, contexts = reference_evidence()
-    evidence = prepare_evidence(rows, contexts)
+    evidence = prepare_evidence(rows, contexts, purpose="functional")
     config = ModelConfig(evidence.conditioning.width, 2)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(23)
@@ -213,7 +216,10 @@ def untrained_artifact(tmp_path_factory):
     metadata = {
         "task": evidence.task,
         "backbone": evidence.backbone,
-        "purpose": "research",
+        "purpose": "functional",
+        "collection_manifest": evidence.collection_manifest,
+        "collection_sha256": content_hash(evidence.collection_manifest),
+        "source_code_sha256": "a" * 64,
         "solvers": list(evidence.calibrations),
         "reward_calibrations": {k: v.to_payload() for k, v in evidence.calibrations.items()},
         "evidence_sha256": evidence.evidence_sha256,
@@ -232,13 +238,35 @@ def untrained_artifact(tmp_path_factory):
         "temperature_units": TEMPERATURE_UNITS,
         "auxiliary_normalization": AUXILIARY_NORMALIZATION,
         "teacher_selection_criterion": "heldout_reference_utility_regret",
-        "student_selection_criterion": "heldout_paired_terminal_utility_v1",
+        "student_selection_criterion": "heldout_calibrated_teacher_utility_with_policy_kl",
         "selected_temperature": 0.05,
         "history": {
-            **fixture_history(students, evidence, rows, contexts),
-            "teacher": [{"step": 100, "temperature": 0.05, "regret": 0.1}],
-            "teacher_selection": {"step": 100, "temperature": 0.05, "regret": 0.1},
-            "teacher_selection_fingerprint": teacher_fingerprint(teacher, evidence.conditioning, 100, 0.05),
+            "evidence_fingerprint": evidence.evidence_sha256,
+            "calibration_fingerprint": content_hash({k: v.to_payload() for k, v in evidence.calibrations.items()}),
+            "collection_fingerprint": content_hash(evidence.collection_manifest),
+            "support_fingerprint": content_hash(evidence.reference_support),
+            "source_fingerprint": "a" * 64,
+            **fixture_history(students, evidence, rows, contexts, teacher=teacher),
+            "density_holdout": evidence.density_holdout,
+            "teacher": [
+                {
+                    "step": n,
+                    "temperature": t,
+                    "regret": 0.1 + (t != 0.05) + (n != 20),
+                    "context_regret": 0.1 + (t != 0.05) + (n != 20),
+                    "density_regret": 0.1 + (t != 0.05) + (n != 20),
+                }
+                for n in range(20, 2001, 20)
+                for t in (0.05, 0.1, 0.5)
+            ],
+            "teacher_selection": {
+                "step": 20,
+                "temperature": 0.05,
+                "regret": 0.1,
+                "context_regret": 0.1,
+                "density_regret": 0.1,
+            },
+            "teacher_selection_fingerprint": teacher_fingerprint(teacher, evidence.conditioning, 20, 0.05),
         },
     }
     root = tmp_path_factory.mktemp("untrained-artifact") / "policy"
@@ -256,7 +284,7 @@ def test_teacher_reuse_requires_identical_evidence_and_teacher_settings(untraine
     for key, value in original.state_dict().items():
         torch.testing.assert_close(value, teacher.state_dict()[key], atol=0, rtol=0)
     assert metadata["reused_artifact_sha256"] == hashlib.sha256((root / "policy.pt").read_bytes()).hexdigest()
-    for altered in (replace(evidence, evidence_sha256="changed"), replace(evidence, purpose="functional")):
+    for altered in (replace(evidence, evidence_sha256="changed"), replace(evidence, purpose="research")):
         with pytest.raises(ValueError, match="differs from fitting evidence"):
             reuse_teacher(root, altered, config)
     for setting in ({"teacher_context_mode": "global"}, {"seed": 1}, {"temperatures": (0.05, 0.1)}):
@@ -292,7 +320,6 @@ def test_reuse_bypasses_teacher_fitting_and_records_source(untrained_artifact, m
         student_kind="GICO-sto-policy",
         device="cpu",
         teacher_artifact=root,
-        selection_evaluator=evaluator_for(*reference_evidence()),
     )
     assert set(students) == {"GICO-sto-policy"}
     assert history["teacher_selection"]["temperature"] == 0.05
@@ -343,13 +370,14 @@ def corrupt_payload(source, destination, change):
 
 
 @pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
-def test_existing_v6_student_replay_does_not_require_new_teacher_proof(untrained_artifact, tmp_path, kind):
+def test_all_policy_loading_requires_selected_teacher_proof(untrained_artifact, tmp_path, kind):
     from genode.gico.policy import load_teacher
 
     root, *_ = untrained_artifact
     path = tmp_path / "old-teacher"
     corrupt_payload(root, path, lambda p: p["metadata"]["history"].pop("teacher_selection_fingerprint"))
-    assert load_policy(path, student_kind=kind).student_kind == kind
+    with pytest.raises(ValueError, match="selected-weight fingerprint"):
+        load_policy(path, student_kind=kind)
     with pytest.raises(ValueError, match="selected-weight fingerprint"):
         load_teacher(path)
 
@@ -415,7 +443,7 @@ def test_semantically_corrupt_artifacts_are_rejected_even_with_valid_checksum(un
         elif mutation == "split-overlap":
             metadata["split_contexts"]["validation"] = ["train-a"]
         else:
-            parameter = next(iter(payload["students"]["deterministic"].values()))
+            parameter = next(iter(payload["students"]["GICO-det-policy"].values()))
             parameter.view(-1)[0] = float("nan")
 
     destination = tmp_path / mutation
@@ -476,7 +504,7 @@ def test_selected_measurements_bind_actual_student_parameters(untrained_artifact
     damaged = tmp_path / "state-mismatch"
 
     def change(payload):
-        next(iter(payload["students"]["deterministic"].values())).add_(0.01)
+        next(iter(payload["students"]["GICO-det-policy"].values())).add_(0.01)
 
     corrupt_payload(root, damaged, change)
     with pytest.raises(ValueError, match="stored student"):
@@ -498,6 +526,7 @@ def test_prompt_teacher_global_student_artifact_roundtrip(untrained_artifact, tm
             evidence,
             *reference_evidence(),
             conditioning=replace(evidence.conditioning, context_mode="global"),
+            teacher=teacher,
         )
     )
     path = tmp_path / "global"

@@ -265,16 +265,16 @@ def calibrate_rewards(rows: list[dict], *, component_calibration_rows: list[dict
     component_cells = cells
     if component_calibration_rows is not None:
         if task not in ("sana", "sd15") or any(r.get("split") not in FIT_SPLITS for r in component_calibration_rows):
-            raise ValueError("Separate component calibration requires text-to-image pilot evidence.")
+            raise ValueError("Separate component calibration requires text-to-image fitting evidence.")
         component_cells = _paired_cells(component_calibration_rows)
         if any((r["task"], r["backbone"], r["solver"]) != (task, backbone, solver) for r in component_cells):
-            raise ValueError("Pilot component calibration scope differs from training evidence.")
+            raise ValueError("Component calibration scope differs from training evidence.")
     if task in ("sana", "sd15"):
-        pilot = [r for r in component_cells if r["schedule_key"] != "uniform"]
-        if not pilot:
-            raise ValueError("Component calibration requires non-uniform pilot candidates.")
-        differences = np.array([[r["metrics"][k] - r["anchor_metrics"][k] for k in metrics] for r in pilot])
-        scales = _balanced_std(differences, np.array([r["nfe"] for r in pilot]))
+        fitting = [r for r in component_cells if r["schedule_key"] != "uniform"]
+        if not fitting:
+            raise ValueError("Component calibration requires non-uniform fitting candidates.")
+        differences = np.array([[r["metrics"][k] - r["anchor_metrics"][k] for k in metrics] for r in fitting])
+        scales = _balanced_std(differences, np.array([r["nfe"] for r in fitting]))
         if np.any(scales <= 1e-12):
             raise ValueError("Degenerate text-to-image component calibration.")
     common = {

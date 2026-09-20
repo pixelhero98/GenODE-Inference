@@ -98,7 +98,6 @@ def _prepare_gico(args: argparse.Namespace) -> None:
                 manifest_path=args.manifest,
                 task=args.task,
                 nfes=tuple(args.nfes),
-                budget=args.budget,
                 output=args.output,
             )
         )
@@ -241,7 +240,6 @@ def build_parser() -> argparse.ArgumentParser:
     evidence.add_argument("--manifest", required=True)
     evidence.add_argument("--task", choices=("sana", "sd15"), required=True)
     evidence.add_argument("--nfes", nargs="+", type=int, required=True)
-    evidence.add_argument("--budget", choices=("25", "50", "100"), default="100")
     evidence.add_argument("--output", required=True)
     evidence.set_defaults(run=_prepare_gico)
     fit = commands.add_parser("fit-gico")

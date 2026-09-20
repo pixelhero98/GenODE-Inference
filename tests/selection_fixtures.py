@@ -3,11 +3,6 @@
 from copy import deepcopy
 
 from genode.gico.clocks import materialize
-from genode.gico.selection import evaluate_candidate
-
-
-def cli_factory(config):
-    return lambda candidate: []
 
 
 def evaluator_for(rows, contexts, *, factor=0.9, replicates=4):
@@ -51,21 +46,40 @@ def evaluator_for(rows, contexts, *, factor=0.9, replicates=4):
     return evaluate
 
 
-def fixture_history(students, evidence, rows, contexts, *, conditioning=None, step=2000, coefficient=0.01):
-    selected = {}
+def fixture_history(students, evidence, rows, contexts, *, teacher, conditioning=None, step=2000, coefficient=0.01):
+    """Synthetic complete checkpoint records for artifact-only tests."""
+    from genode.gico.deterministic_selection import DETERMINISTIC_SELECTION_PROTOCOL
+    from genode.gico.evidence import content_hash
+    from genode.gico.selection import candidate_fingerprint, teacher_fingerprint
+    from genode.gico.stochastic_selection import STOCHASTIC_SELECTION_PROTOCOL
+    from genode.gico.training import score_coefficient
+
+    selected, histories = {}, {}
     for kind, model in students.items():
-        selected[kind] = {
-            "step": step,
-            "coefficient": coefficient,
-            **evaluate_candidate(
-                model,
-                conditioning or evidence.conditioning,
-                kind,
-                step,
-                coefficient,
-                evaluator_for(rows, contexts),
-                evidence,
-                4,
-            ),
-        }
-    return {"students": {k: [r] for k, r in selected.items()}, "student_selection": selected}
+        cadence = 10 if kind == "GICO-det-policy" else 100
+        history = []
+        for checkpoint in range(cadence, step + 1, cadence):
+            record = {
+                "step": checkpoint,
+                "coefficient": score_coefficient(checkpoint - 1, step, coefficient),
+                "validation_distillation": 1.0,
+            }
+            if record["coefficient"] > 0:
+                record.update(
+                    selection_protocol=DETERMINISTIC_SELECTION_PROTOCOL
+                    if kind == "GICO-det-policy"
+                    else STOCHASTIC_SELECTION_PROTOCOL,
+                    predicted_utility=checkpoint / step,
+                    selection_checkpoint_id=candidate_fingerprint(
+                        model, conditioning or evidence.conditioning, kind, checkpoint
+                    ),
+                    selection_teacher_fingerprint=teacher_fingerprint(teacher, evidence.conditioning, 20, 0.05),
+                    selection_contexts=sorted({r["context_id"] for r in rows if r["split"] == "validation"}),
+                    selection_groups=len(evidence.groups("validation")),
+                    predictions_sha256=content_hash([kind, checkpoint]),
+                    clock_replicates=4,
+                    kl_samples_per_reference=32,
+                )
+            history.append(record)
+        histories[kind], selected[kind] = history, history[-1]
+    return {"students": histories, "student_selection": selected}

@@ -60,7 +60,7 @@ def test_solver_alias_rejected_before_fitting():
     for row in rows:
         row["solver"] = "Euler"
     with pytest.raises(ValueError, match="canonical name"):
-        prepare_evidence(rows, contexts)
+        prepare_evidence(rows, contexts, purpose="functional")
 
 
 def test_log_improvement_does_not_overflow_for_finite_extreme_metrics():
@@ -244,13 +244,13 @@ def test_degenerate_reward_calibrations_are_rejected(case):
 
 def test_full_reference_evidence_is_split_isolated_and_deduplicated():
     rows, contexts = reference_evidence()
-    evidence = prepare_evidence(rows, contexts)
+    evidence = prepare_evidence(rows, contexts, purpose="functional")
     assert len(REFERENCE_KEYS) == 25
     assert {alias for cell in evidence.groups("train")[0] for alias in cell["aliases"]} == set(REFERENCE_KEYS)
     assert len({r["density_sha256"] for r in evidence.groups("train")[0]}) == len(evidence.groups("train")[0])
     np.testing.assert_array_equal(evidence.conditioning.context.mean, [1, 2])
     assert evidence.calibrations["euler"].calibration_contexts == ("train-a",)
-    assert evidence.evidence_sha256 == prepare_evidence(rows, contexts).evidence_sha256
+    assert evidence.evidence_sha256 == prepare_evidence(rows, contexts, purpose="functional").evidence_sha256
 
 
 def test_evidence_refuses_calibration_alias_of_validation_context():
@@ -259,13 +259,13 @@ def test_evidence_refuses_calibration_alias_of_validation_context():
     for row in calibration:
         row["split"] = "calibration"
     with pytest.raises(ValueError, match="Validation contexts"):
-        prepare_evidence(rows, contexts, calibration_rows=calibration)
+        prepare_evidence(rows, contexts, calibration_rows=calibration, purpose="functional")
 
 
-def test_evidence_requires_disjoint_fit_splits_and_complete_research_pool():
+def test_evidence_requires_disjoint_fit_splits_and_research_collection_manifest():
     rows, contexts = reference_evidence(complete=False)
-    with pytest.raises(ValueError, match="complete 25"):
-        prepare_evidence(rows, contexts)
+    with pytest.raises(ValueError, match="collection manifest"):
+        prepare_evidence(rows, contexts, purpose="research")
     assert prepare_evidence(rows, contexts, purpose="functional").purpose == "functional"
     for row in rows:
         row["context_id"] = "train-a"
@@ -275,7 +275,7 @@ def test_evidence_requires_disjoint_fit_splits_and_complete_research_pool():
 
 def test_cifar_contexts_are_explicit_zero_and_normalizers_are_frozen():
     rows, contexts = reference_evidence(task="cifar10")
-    evidence = prepare_evidence(rows, contexts)
+    evidence = prepare_evidence(rows, contexts, purpose="functional")
     encoded = evidence.conditioning.transform([0, 0], "euler", 6)
     assert np.isfinite(encoded).all()
     np.testing.assert_array_equal(encoded[:2], [0, 0])
@@ -284,7 +284,7 @@ def test_cifar_contexts_are_explicit_zero_and_normalizers_are_frozen():
     changed = deepcopy(contexts)
     changed["train-a"] = [1, 0]
     with pytest.raises(ValueError, match="zero contexts"):
-        prepare_evidence(rows, changed)
+        prepare_evidence(rows, changed, purpose="functional")
     with pytest.raises(ValueError, match="training rows only"):
         Conditioning.fit(rows, contexts)
 
@@ -320,7 +320,7 @@ def test_historical_exact_grid_must_be_recollected_when_64_bin_realization_chang
 
 def test_conditioning_roundtrip_extrapolates_budget_without_refitting_statistics():
     rows, contexts = reference_evidence()
-    conditioning = prepare_evidence(rows, contexts).conditioning
+    conditioning = prepare_evidence(rows, contexts, purpose="functional").conditioning
     before = deepcopy(conditioning.to_payload())
     encoded = conditioning.transform(contexts["validation-a"], "euler", 20)
     restored = Conditioning.from_payload(before)
@@ -339,16 +339,13 @@ def test_conditioning_roundtrip_extrapolates_budget_without_refitting_statistics
         ("measurement_protocol", "Measurement protocols must match"),
     ],
 )
-@pytest.mark.parametrize("changed_split", ["calibration", "train", "validation"])
+@pytest.mark.parametrize("changed_split", ["train", "validation"])
 def test_evidence_provenance_matches_across_pilot_training_and_validation(field, error, changed_split):
     rows, contexts = reference_evidence()
-    pilot = deepcopy([row for row in rows if row["split"] == "train"])
-    for row in pilot:
-        row.update(split="calibration", context_id="pilot-only")
-    for row in rows + pilot:
+    for row in rows:
         row["backbone_binding"] = {"context_source": "native", "weights_sha256": "a" * 64}
-    assert prepare_evidence(rows, contexts, calibration_rows=pilot).calibrations["euler"]
-    for row in rows + pilot:
+    assert prepare_evidence(rows, contexts, purpose="functional").calibrations["euler"]
+    for row in rows:
         if row["split"] == changed_split:
             row[field] = (
                 {"context_source": "changed", "weights_sha256": "b" * 64}
@@ -356,7 +353,7 @@ def test_evidence_provenance_matches_across_pilot_training_and_validation(field,
                 else "different-measurement-protocol"
             )
     with pytest.raises(ValueError, match=error):
-        prepare_evidence(rows, contexts, calibration_rows=pilot)
+        prepare_evidence(rows, contexts, purpose="functional")
 
 
 def text_image_panel(deltas, *, nfe, prefix, task="sana", split="train"):
@@ -396,8 +393,10 @@ def test_pilot_component_scales_are_frozen_and_training_nfes_set_scalar_scale(ta
     assert rebalanced.reward_scale == pytest.approx(calibration.reward_scale)
     validation = text_image_panel(train_deltas[:2], nfe=6, prefix="validation", task=task, split="validation")
     contexts = {row["context_id"]: [1.0, 2.0] for row in train + validation}
-    evidence = prepare_evidence(train + validation, contexts, calibration_rows=pilot, purpose="functional")
-    assert evidence.calibrations["euler"] == calibration
+    with pytest.raises(ValueError, match="eligible fitting observations"):
+        prepare_evidence(train + validation, contexts, calibration_rows=pilot, purpose="functional")
+    evidence = prepare_evidence(train + validation, contexts, purpose="functional")
+    assert evidence.calibrations["euler"].component_scales == pytest.approx(train_deltas.std(axis=0))
     heldout = construct_rewards(validation, calibration)
     assert all(row["reward"] == 0 for row in heldout if row["schedule_key"] == "uniform")
     assert calibration.component_scales == pytest.approx(expected_components)
@@ -415,7 +414,7 @@ def test_research_molecular_evidence_requires_valid_frozen_feature_map(invalid):
             metrics=dict.fromkeys(MOLECULE_METRICS, row["metrics"]["crps"]),
             molecule_feature_map=deepcopy(feature_map),
         )
-    assert prepare_evidence(rows, contexts).task == "molecule_3d_set1"
+    assert prepare_evidence(rows, contexts, purpose="functional").task == "molecule_3d_set1"
     altered = next(row for row in rows if row["split"] == "validation")
     if invalid == "missing":
         del altered["molecule_feature_map"]
@@ -426,7 +425,7 @@ def test_research_molecular_evidence_requires_valid_frozen_feature_map(invalid):
     else:
         altered["molecule_feature_map"]["version"] = "obsolete_geometry"
     with pytest.raises(ValueError, match="feature_map|length scale|triangle|feature map version"):
-        prepare_evidence(rows, contexts)
+        prepare_evidence(rows, contexts, purpose="functional")
 
 
 @pytest.mark.parametrize("mismatch", ["within-context", "unseen-validation-map"])
@@ -448,7 +447,7 @@ def test_molecular_feature_maps_are_context_stable_and_validation_maps_come_from
         row["context_id"] += "-second-member"
         contexts[row["context_id"]] = [3.0, 4.0]
         row["molecule_feature_map"] = deepcopy(second_map)
-    assert prepare_evidence(rows + other_member, contexts).task == "molecule_3d_set1"
+    assert prepare_evidence(rows + other_member, contexts, purpose="functional").task == "molecule_3d_set1"
     if mismatch == "within-context":
         rows[0]["molecule_feature_map"] = second_map
     else:
@@ -456,4 +455,4 @@ def test_molecular_feature_maps_are_context_stable_and_validation_maps_come_from
             if row["split"] == "validation":
                 row["molecule_feature_map"] = deepcopy(second_map)
     with pytest.raises(ValueError, match="[Ff]eature map|[Ff]eature-map|molecule_feature_map"):
-        prepare_evidence(rows, contexts)
+        prepare_evidence(rows, contexts, purpose="functional")
