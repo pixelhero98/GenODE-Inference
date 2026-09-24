@@ -126,8 +126,8 @@ def native_manifest(model_key):
 
 
 @pytest.mark.parametrize("task", ["cifar10", "imagenet64"])
-@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
-def test_native_kid_both_students_retain_objective_through_fit_and_replay(tmp_path, monkeypatch, task, kind):
+@pytest.mark.parametrize("kind", ["deterministic", "stochastic"])
+def test_native_kid_both_policies_retain_objective_through_fit_and_replay(tmp_path, monkeypatch, task, kind):
     from genode.gico.policy import load_policy
     from genode.gico.training import fit
 
@@ -139,16 +139,16 @@ def test_native_kid_both_students_retain_objective_through_fit_and_replay(tmp_pa
         contexts,
         tmp_path / "policy",
         purpose="functional",
-        student_kind=kind,
+        policy_kind=kind,
         device="cpu",
-        teacher_steps=2,
-        student_steps=2,
-        teacher_checkpoint_every=1,
-        student_checkpoint_every=1,
+        utility_surrogate_steps=2,
+        policy_steps=2,
+        utility_surrogate_checkpoint_every=1,
+        policy_checkpoint_every=1,
     )
     assert metadata["image_objective"]["protocol"] == IMAGE_KID_OBJECTIVE
     assert all(c["metric_keys"] == ("kid",) for c in metadata["reward_calibrations"].values())
-    policy = load_policy(tmp_path / "policy", student_kind=kind)
+    policy = load_policy(tmp_path / "policy", policy_kind=kind)
     first = policy.materialize([0.0], "euler", 4, seed=11, request_id="heldout-member")
     assert first == policy.materialize([0.0], "euler", 4, seed=11, request_id="heldout-member")
     assert len(first) == 5

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from numbers import Integral
 from typing import Protocol, TypeVar, runtime_checkable
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -67,7 +68,29 @@ class ScheduleBatch:
             target_nfe=target,
             reference_time_grid=reference,
         )
-        if not torch.allclose(
+        if self.specification is not None and not isinstance(
+            self.specification,
+            ScheduleSpecification,
+        ):
+            raise TypeError("specification must be a ScheduleSpecification or None.")
+        if self.gico_density_mass is not None:
+            from genode.gico.clocks import guarded_density_mass, materialize
+            from genode.gico.networks import DENSITY_BINS
+
+            raw = self.gico_density_mass
+            if not isinstance(raw, Tensor) or raw.shape != mass.shape or raw.shape[-1] != DENSITY_BINS:
+                raise ValueError("GICO raw density must have shape [batch, 64].")
+            if raw.device != mass.device or raw.dtype != torch.float64 or mass.dtype != torch.float64:
+                raise ValueError("GICO schedule provenance requires float64 tensors on the same device.")
+            expected_grid = grid.new_tensor([materialize(row, "euler", target) for row in raw.detach().cpu().numpy()])
+            guarded = mass.new_tensor(np.stack([guarded_density_mass(row) for row in raw.detach().cpu().numpy()]))
+            if not torch.allclose(mass, guarded, rtol=0, atol=_EXECUTABLE_BINDING_ATOL):
+                raise ValueError("GICO density_mass must be its raw density with the uniform mixture applied once.")
+            if not torch.equal(grid, expected_grid):
+                raise ValueError("GICO time_grid must exactly match the shared density decoder.")
+            # Preserve the common decoder's exact nodes for measurement replay.
+            executable_grid = grid
+        elif not torch.allclose(
             grid.to(dtype=torch.float64),
             executable_grid.to(dtype=torch.float64),
             rtol=0.0,
@@ -77,29 +100,6 @@ class ScheduleBatch:
                 "ScheduleBatch time_grid is not the executable quantile grid "
                 "of its density_mass and reference_time_grid."
             )
-        if self.specification is not None and not isinstance(
-            self.specification,
-            ScheduleSpecification,
-        ):
-            raise TypeError("specification must be a ScheduleSpecification or None.")
-        if self.gico_density_mass is not None:
-            from genode.gico.clocks import materialize
-            from genode.gico.networks import DENSITY_BINS, DENSITY_MIXTURE
-
-            raw = self.gico_density_mass
-            if not isinstance(raw, Tensor) or raw.shape != mass.shape or raw.shape[-1] != DENSITY_BINS:
-                raise ValueError("GICO raw density must have shape [batch, 64].")
-            if raw.device != mass.device or raw.dtype != torch.float64 or mass.dtype != torch.float64:
-                raise ValueError("GICO schedule provenance requires float64 tensors on the same device.")
-            expected_grid = grid.new_tensor([materialize(row, "euler", target) for row in raw.detach().cpu().numpy()])
-            guarded = (1 - DENSITY_MIXTURE) * raw + DENSITY_MIXTURE / DENSITY_BINS
-            guarded = guarded / guarded.sum(dim=-1, keepdim=True)
-            if not torch.allclose(mass, guarded, rtol=0, atol=_EXECUTABLE_BINDING_ATOL):
-                raise ValueError("GICO density_mass must be its raw density with the uniform mixture applied once.")
-            if not torch.equal(grid, expected_grid):
-                raise ValueError("GICO time_grid must exactly match the shared density decoder.")
-            # Preserve the common decoder's exact nodes for measurement replay.
-            executable_grid = grid
         object.__setattr__(self, "target_nfe", target)
         object.__setattr__(self, "time_grid", executable_grid)
 

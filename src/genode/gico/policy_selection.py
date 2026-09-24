@@ -4,7 +4,7 @@ from collections import defaultdict
 
 import numpy as np
 
-STUDENT_SELECTION_PROTOCOL = "heldout_calibrated_teacher_utility_with_policy_kl"
+POLICY_SELECTION_PROTOCOL = "heldout_calibrated_utility_surrogate_utility_with_policy_kl"
 
 
 def balanced_mean(values, groups, task):
@@ -26,7 +26,7 @@ def admissible_checkpoints(records, allowance):
         or not np.isfinite(row.get("predicted_utility", np.nan))
         for row in eligible
     ):
-        raise ValueError("Student selection requires finite teacher scores and nonnegative KL.")
+        raise ValueError("Policy selection requires finite utility_surrogate scores and nonnegative KL.")
     if isinstance(allowance, bool) or not np.isfinite(allowance) or allowance < 0:
         raise ValueError("KL allowance must be finite and nonnegative.")
     minimum = min(max(0.0, row["validation_distillation"]) for row in eligible)

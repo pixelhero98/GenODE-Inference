@@ -50,7 +50,7 @@ class ReplayPolicy:
     def __init__(self, row, clocks, context):
         self.row, self.clocks, self.context, self.cursor = row, clocks, context, 0
         self.artifact_sha256 = row.get("selection_checkpoint_id", "uniform")
-        self.student_kind = row.get("student_kind", "GICO-det-policy")
+        self.policy_kind = row.get("policy_kind", "deterministic")
         self.metadata = {
             "task": row["task"],
             "backbone": row["backbone"],
@@ -244,7 +244,7 @@ class TextEvaluator:
             raise ValueError("Native prompt embedding differs from the selection panel.")
         if case["reference_id"] != row["reference_id"]:
             raise ValueError("Prompt reference identity differs from its panel.")
-        clock = Clock("student", row["nfe"], tuple(clocks[0]["time_grid"]), "gico", tuple(clocks[0]["density_mass"]))
+        clock = Clock("policy", row["nfe"], tuple(clocks[0]["time_grid"]), "gico", tuple(clocks[0]["density_mass"]))
         image, trace = runtime.adapter.sample(noise_seed=row["seed"], context=native, clock=clock)
         if trace.realized_nfe != row["nfe"]:
             raise ValueError("Text runtime exceeded the declared NFE.")

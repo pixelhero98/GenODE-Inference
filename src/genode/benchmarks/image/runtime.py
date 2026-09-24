@@ -1156,9 +1156,9 @@ class ImageEulerSampler:
         """
         import numpy as np
 
-        from genode.gico.clocks import materialize
+        from genode.gico.clocks import guarded_density_mass, materialize
         from genode.gico.image_conditional_context import native_contexts
-        from genode.gico.networks import DENSITY_BINS, DENSITY_MIXTURE
+        from genode.gico.networks import DENSITY_BINS
 
         keys = tuple(sample_keys)
         if not keys or any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) != len(keys):
@@ -1180,8 +1180,7 @@ class ImageEulerSampler:
             )
             grids.append(materialize(mass, "euler", target_nfe))
             raw_masses.append(mass)
-            guarded = (1 - DENSITY_MIXTURE) * mass + DENSITY_MIXTURE / DENSITY_BINS
-            masses.append(guarded / guarded.sum())
+            masses.append(guarded_density_mass(mass))
         return ScheduleBatch(
             density_mass=torch.tensor(np.asarray(masses), dtype=torch.float64),
             reference_time_grid=torch.linspace(0, 1, DENSITY_BINS + 1, dtype=torch.float64),

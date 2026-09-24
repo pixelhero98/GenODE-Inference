@@ -25,11 +25,11 @@ def prepare_geneval(
     nfe: int,
     checkpoint: str | None,
     freeze_path: str,
-    student_kind: str = "GICO-det-policy",
+    policy_kind: str = "deterministic",
     clock_seed: int = 0,
 ) -> None:
     frozen = json.loads(Path(freeze_path).read_text())
-    identity = checkpoint_identity(checkpoint, method, student_kind=student_kind) if checkpoint else method
+    identity = checkpoint_identity(checkpoint, method, policy_kind=policy_kind) if checkpoint else method
     if identity not in frozen["method_identities"]:
         raise ValueError("GenEval method was not frozen before audit generation.")
     prompts = []
@@ -73,8 +73,8 @@ def prepare_geneval(
             "phase": "geneval",
             "method": method,
             "checkpoint": checkpoint,
-            "checkpoint_sha256": checkpoint_identity(checkpoint, method, student_kind=student_kind),
-            "student_kind": student_kind,
+            "checkpoint_sha256": checkpoint_identity(checkpoint, method, policy_kind=policy_kind),
+            "policy_kind": policy_kind,
             "clock_seed": clock_seed,
             "freeze_sha256": sha256_file(freeze_path),
             "geneval_source_sha256": sha256_file(source),
@@ -116,7 +116,7 @@ def prepare_collection(
     method: str = "support",
     checkpoint: str | None = None,
     freeze_path: str | None = None,
-    student_kind: str = "GICO-det-policy",
+    policy_kind: str = "deterministic",
     clock_seed: int = 0,
 ) -> None:
     manifest = json.loads(Path(manifest_path).read_text())
@@ -130,7 +130,7 @@ def prepare_collection(
         frozen = json.loads(Path(freeze_path).read_text())
         if frozen["prompt_manifest_sha256"] != sha256_file(manifest_path):
             raise ValueError("Method freeze and prompt manifest disagree.")
-        identity = checkpoint_identity(checkpoint, method, student_kind=student_kind) if checkpoint else method
+        identity = checkpoint_identity(checkpoint, method, policy_kind=policy_kind) if checkpoint else method
         if identity not in frozen["method_identities"]:
             raise ValueError("Requested method was not included in the method freeze.")
     prompts = [row for row in manifest["records"] if row["split"] == phase]
@@ -172,8 +172,8 @@ def prepare_collection(
             "budget": budget,
             "method": method,
             "checkpoint": checkpoint,
-            "checkpoint_sha256": checkpoint_identity(checkpoint, method, student_kind=student_kind),
-            "student_kind": student_kind,
+            "checkpoint_sha256": checkpoint_identity(checkpoint, method, policy_kind=policy_kind),
+            "policy_kind": policy_kind,
             "clock_seed": clock_seed,
             "freeze_sha256": sha256_file(freeze_path) if freeze_path else None,
             "requests": requests,
@@ -210,7 +210,7 @@ def collect(*, runtime_config: str, plan_path: str, output: str) -> None:
         write_new_json(identity_path, identity)
     if (
         plan["checkpoint"]
-        and checkpoint_identity(plan["checkpoint"], plan["method"], student_kind=plan["student_kind"])
+        and checkpoint_identity(plan["checkpoint"], plan["method"], policy_kind=plan["policy_kind"])
         != plan["checkpoint_sha256"]
     ):
         raise ValueError("Method checkpoint changed after collection planning.")
@@ -220,7 +220,7 @@ def collect(*, runtime_config: str, plan_path: str, output: str) -> None:
         from genode.gico.policy import load_policy
 
         model = load_policy(
-            plan["checkpoint"], student_kind=plan["student_kind"], expected_backbone=runtime.adapter.backbone_revision
+            plan["checkpoint"], policy_kind=plan["policy_kind"], expected_backbone=runtime.adapter.backbone_revision
         )
     elif plan["method"] == "pg":
         from genode.latent_clock.pg import ClockPolicy
@@ -275,7 +275,7 @@ def collect(*, runtime_config: str, plan_path: str, output: str) -> None:
                 request_id=request_id,
             )
             clock = Clock(
-                plan["student_kind"],
+                plan["policy_kind"],
                 request["nfe"],
                 materialize(mass, runtime.adapter.solver_key, request["nfe"]),
                 "unified_gico",
@@ -319,7 +319,7 @@ def collect(*, runtime_config: str, plan_path: str, output: str) -> None:
                 "clock_key": clock.key,
                 "nodes": list(clock.nodes),
                 "density_mass": None if clock.density_mass is None else list(clock.density_mass),
-                "clock_student_kind": plan["student_kind"] if plan["method"] == "gico" else None,
+                "clock_policy_kind": plan["policy_kind"] if plan["method"] == "gico" else None,
                 "clock_seed": plan["clock_seed"] if plan["method"] == "gico" else None,
                 "backbone_binding": runtime_binding(runtime),
                 "context_embedding_sha256": canonical_sha256(context.embedding.tolist()),

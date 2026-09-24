@@ -2,7 +2,7 @@
 
 This baseline is a documented reconstruction of Yu et al.,
 [Designing Instance-Level Sampling Schedules via REINFORCE with James--Stein Shrinkage](https://arxiv.org/abs/2511.22177),
-version 2. It is not author-provided code, a GICO student, or an exact reproduction
+version 2. It is not author-provided code, a GICO policy, or an exact reproduction
 of the paper's backbone and reward experiments.
 
 The policy follows Table 4: image-shaped initial noise, native text tokens,
@@ -84,7 +84,7 @@ trajectories must fill complete B-by-K batches. Rewards use the same frozen pair
 ImageReward/VQAScore calibration as GICO, including its scalar reward scale.
 For example, 128 anchors plus 48 batches of 32 contexts and two rollouts equals
 3,200 trajectories. Calibration costs are additional and reported separately.
-There is no running reward normalization or teacher-based JS objective.
+There is no running reward normalization or utility surrogate-based JS objective.
 
 The `genode_js_reinforce_v1` artifact stores native architecture dimensions,
 solver interpretation, numerical interval guard, immutable experiment identity,

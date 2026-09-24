@@ -24,9 +24,14 @@ def validate_mass(mass) -> np.ndarray:
     return values
 
 
-def materialize(mass, solver: str, nfe: int) -> tuple[float, ...]:
+def guarded_density_mass(mass) -> np.ndarray:
+    """Apply the canonical uniform guard exactly once to a raw 64-bin mass."""
     values = validate_mass(mass)
-    guarded = (1 - DENSITY_MIXTURE) * values + DENSITY_MIXTURE / DENSITY_BINS
+    return (1 - DENSITY_MIXTURE) * values + DENSITY_MIXTURE / DENSITY_BINS
+
+
+def materialize(mass, solver: str, nfe: int) -> tuple[float, ...]:
+    guarded = guarded_density_mass(mass)
     steps = solver_macro_steps(solver, nfe)
     grid = density_mass_to_time_grid(guarded, macro_steps=steps, eps=0)
     normalize_solver_nfe_fields(solver, nfe, macro_steps=steps, realized_nfe=nfe, source="GICO density")

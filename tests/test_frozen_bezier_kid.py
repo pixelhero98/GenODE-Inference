@@ -112,20 +112,20 @@ def test_frozen_grid_warp_preserves_uniform_and_changes_both_grids():
 
 def test_selection_cannot_replace_members_of_frozen_noise_block():
     from genode.gico.evidence import prepare_evidence
-    from genode.gico.networks import DeterministicStudent, ModelConfig
+    from genode.gico.networks import DeterministicPolicy, ModelConfig
     from genode.gico.reporting import PolicyCandidate, candidate_fingerprint, measured_utility
     from tests.selection_fixtures import evaluator_for
 
     rows, contexts = evidence_rows(), {"train": [0.0], "validation": [0.0]}
     evidence = prepare_evidence(rows, contexts, purpose="functional")
-    model = DeterministicStudent(ModelConfig(evidence.conditioning.width, 1)).eval()
+    model = DeterministicPolicy(ModelConfig(evidence.conditioning.width, 1)).eval()
     candidate = PolicyCandidate(
         model,
         evidence.conditioning,
-        "GICO-det-policy",
+        "deterministic",
         2000,
         0.1,
-        candidate_fingerprint(model, evidence.conditioning, "GICO-det-policy", 2000),
+        candidate_fingerprint(model, evidence.conditioning, "deterministic", 2000),
     )
     measured = evaluator_for(rows, contexts)(candidate)
     assert measured_utility(measured, evidence, candidate, clock_replicates=4)["utility"] > 0
@@ -150,12 +150,12 @@ def test_kid_artifact_roundtrip_and_transform_identity(tmp_path, monkeypatch):
         contexts,
         destination,
         purpose="functional",
-        student_kind="GICO-det-policy",
+        policy_kind="deterministic",
         device="cpu",
-        teacher_steps=2,
-        student_steps=2,
-        teacher_checkpoint_every=1,
-        student_checkpoint_every=1,
+        utility_surrogate_steps=2,
+        policy_steps=2,
+        utility_surrogate_checkpoint_every=1,
+        policy_checkpoint_every=1,
     )
     policy = load_policy(destination)
     assert len(policy.materialize([0.0], "euler", 4)) == 5
@@ -171,4 +171,4 @@ def test_kid_artifact_roundtrip_and_transform_identity(tmp_path, monkeypatch):
     payload = torch.load(destination / "policy.pt", weights_only=True)
     payload["metadata"]["backbone_binding"] = dict(payload["metadata"]["backbone_binding"], transform_sha256="f" * 64)
     with pytest.raises(ValueError, match="binding differs"):
-        GICOPolicy(payload, "fixture", "GICO-det-policy")
+        GICOPolicy(payload, "fixture", "deterministic")

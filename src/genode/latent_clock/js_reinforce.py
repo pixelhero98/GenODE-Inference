@@ -1,6 +1,6 @@
 """Paper-based Dirichlet/James--Stein comparator (Yu et al., arXiv:2511.22177).
 
-This is a distinct baseline, not a GICO student. See docs/js-reinforce.md for
+This is a distinct baseline, not a GICO policy. See docs/js-reinforce.md for
 the reconstruction choices, including the skipped interval and empirical baseline.
 """
 

@@ -45,7 +45,7 @@ def image_runtime():
     return runtime
 
 
-@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
+@pytest.mark.parametrize("kind", ["deterministic", "stochastic"])
 def test_builtin_factory_executes_paired_blocks_and_seed_specific_assets(tmp_path, monkeypatch, kind):
     from genode.benchmarks.image.noise import generate_seeded_image_noise
     from genode.latent_clock.artifacts import sha256_file
@@ -93,14 +93,14 @@ def test_builtin_factory_executes_paired_blocks_and_seed_specific_assets(tmp_pat
         return mass / mass.sum()
 
     evaluator = build_evaluator(config)
-    candidate = SimpleNamespace(checkpoint_id="fixture-first", student_kind=kind, density=density)
+    candidate = SimpleNamespace(checkpoint_id="fixture-first", policy_kind=kind, density=density)
     rows = evaluator(candidate)
     first = requests[:]
     requests.clear()
     candidate.checkpoint_id = "fixture-second"
     evaluator(candidate)
     assert requests == first and len(first) == len(set(first))
-    assert len(rows) == (8 if kind == "GICO-sto-policy" else 4)
+    assert len(rows) == (8 if kind == "stochastic" else 4)
     assert list((tmp_path / "selection").glob("*/measurements.json"))
     assert all(np.isfinite(r["metrics"]["kid"]) for r in rows)
     runtime.verify_frozen()
@@ -123,7 +123,7 @@ def test_forecast_replays_recorded_nonfirst_physical_seed(tmp_path, collected):
         "solver": "euler",
         "nfe": 2,
         "ensemble_size": 2,
-        "schedule_key": "student",
+        "schedule_key": "policy",
     }
     clocks = [{"density_mass": mass.tolist(), "time_grid": list(materialize(mass, "euler", 2))}] * 2
     case = {

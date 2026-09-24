@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "genode"
-version = "0.15.1"
+version = "1.0.0"
 description = "GICO inference-clock optimization for frozen flow-matching backbones."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,7 +19,7 @@ keywords = [
   "schedule-optimization",
 ]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
@@ -40,11 +40,6 @@ dependencies = [
 test = ["pytest>=8,<10", "ruff>=0.12"]
 image-supervision = ["lpips==0.1.4", "torchvision>=0.17"]
 latent-clock = ["botorch>=0.16,<0.17"]
-
-[project.urls]
-Homepage = "https://github.com/pixelhero98/GenODE-Inference"
-Repository = "https://github.com/pixelhero98/GenODE-Inference"
-Issues = "https://github.com/pixelhero98/GenODE-Inference/issues"
 
 [project.scripts]
 genode-run-schedules = "genode.evaluation.diffusion_flow_time_reparameterization:main"

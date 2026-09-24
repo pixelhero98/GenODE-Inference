@@ -24,31 +24,29 @@ def test_prepare_and_train_delegate_to_common_fit(tmp_path):
                     str(evidence),
                     "--output",
                     str(tmp_path / "artifact"),
-                    "--student-kind",
+                    "--policy-kind",
                     "both",
-                    "--teacher-score-weight",
-                    "0.05",
                 ]
             )
             == 0
         )
-    assert fit.call_args.kwargs["student_kind"] == "both"
-    assert fit.call_args.kwargs["teacher_score_weight"] == 0.05
+    assert fit.call_args.kwargs["policy_kind"] == "both"
+    assert "refinement_weight" not in fit.call_args.kwargs
     from genode.gico.profiles import resolve_profile
 
     settings = {
         k: v
         for k, v in fit.call_args.kwargs.items()
-        if k not in {"student_kind", "device", "purpose", "calibration_rows", "collection_manifest"}
+        if k not in {"policy_kind", "device", "purpose", "calibration_rows", "collection_manifest"}
     }
-    assert resolve_profile("cifar10", **settings).student_steps == 2000
+    assert resolve_profile("cifar10", **settings).policy_steps == 2000
     assert len(fit.call_args.args[0]) == 4
     assert all("lpips" in row["metrics"] for row in fit.call_args.args[0])
 
 
 def test_shared_image_training_flags():
     args = build_argparser().parse_args(["train", "--evidence", "input.json", "--output", "out"])
-    assert args.student_kind == "GICO-det-policy" and args.teacher_score_weight is None
+    assert args.policy_kind is None and not args.utility_surrogate_only
 
 
 def test_deterministic_image_fit_needs_no_generator_factory(tmp_path):
@@ -63,8 +61,8 @@ def test_deterministic_image_fit_needs_no_generator_factory(tmp_path):
                 str(evidence),
                 "--output",
                 str(tmp_path / "policy"),
-                "--student-kind",
-                "GICO-det-policy",
+                "--policy-kind",
+                "deterministic",
             ]
         )
     assert "selection_evaluator" not in fit.call_args.kwargs
@@ -96,5 +94,5 @@ def test_registered_native_backbones_prepare_and_train_with_kid(tmp_path, model_
                 str(tmp_path / "policy"),
             ]
         )
-    assert fit.call_args.kwargs["student_kind"] == "GICO-det-policy"
+    assert fit.call_args.kwargs["policy_kind"] == "deterministic"
     assert fit.call_args.args[0] == prepared["rows"]

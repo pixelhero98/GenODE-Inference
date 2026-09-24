@@ -63,7 +63,7 @@ def fit_js(policy, *, context_count, inputs, evaluate, config: JSFit, on_update=
 
     Each batch contains distinct contexts and K independent clocks per context.
     Context batches cycle through shuffled training contexts; no validation data
-    or teacher scores enter optimization. The final fixed-budget state is used.
+    or utility_surrogate scores enter optimization. The final fixed-budget state is used.
     """
     updates = config.updates(context_count)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=config.learning_rate, weight_decay=1e-4)

@@ -10,8 +10,8 @@ from genode.gico.policy import save_context_embedding_table
 from tests.test_unified_gico_rewards import reference_evidence
 
 
-@pytest.mark.parametrize("weight", [0.01, 0.05, 0.1])
-def test_config_relative_paths_and_dry_run_validate_without_fitting(tmp_path, monkeypatch, weight):
+def test_config_relative_paths_and_dry_run_validate_without_fitting(tmp_path, monkeypatch):
+    weight = 0.05
     rows, contexts = reference_evidence()
     (tmp_path / "rows.jsonl").write_text("\n".join(json.dumps(row) for row in rows))
     save_context_embedding_table(tmp_path / "contexts.npz", contexts)
@@ -22,9 +22,9 @@ def test_config_relative_paths_and_dry_run_validate_without_fitting(tmp_path, mo
                 "rows": "rows.jsonl",
                 "contexts": "contexts.npz",
                 "output": "artifact",
-                "student_kind": "both",
+                "policy_kind": "both",
                 "purpose": "functional",
-                "teacher_score_weight": weight,
+                "refinement_weight": weight,
             }
         )
     )
@@ -40,7 +40,7 @@ def test_config_relative_paths_and_dry_run_validate_without_fitting(tmp_path, mo
     result = train_gico.run_config(config, dry_run=True)
     assert result["dry_run"] is True
     assert result["paired_cells"] > 0
-    assert result["teacher_score_weight"] == weight
+    assert result["refinement_weight"] == weight
     assert result["fitting_profile"]["backbone"] == rows[0]["backbone"]
     with pytest.raises(ValueError, match="backbone differs"):
         train_gico.run_config({**config, "backbone": "different-checkpoint"}, dry_run=True)
@@ -51,7 +51,7 @@ def test_config_relative_paths_and_dry_run_validate_without_fitting(tmp_path, mo
     "config",
     [
         {},
-        {"rows": "r", "contexts": "c", "output": "o", "obsolete_teacher_architecture": "mlp"},
+        {"rows": "r", "contexts": "c", "output": "o", "obsolete_utility_surrogate_architecture": "mlp"},
     ],
 )
 def test_config_rejects_missing_or_retired_options(tmp_path, config):
@@ -61,13 +61,13 @@ def test_config_rejects_missing_or_retired_options(tmp_path, config):
         train_gico.load_config(path)
 
 
-@pytest.mark.parametrize("option,value", [("--student-kind", "discrete"), ("--teacher-score-weight", "0.2")])
+@pytest.mark.parametrize("option,value", [("--policy-kind", "discrete"), ("--refinement-weight", "0.2")])
 def test_cli_rejects_unsupported_choices(option, value):
     with pytest.raises(SystemExit):
         train_gico.build_argparser().parse_args(["--config", "training.json", option, value])
 
 
-@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy", "both"])
+@pytest.mark.parametrize("kind", ["deterministic", "stochastic", "both"])
 def test_fit_never_requires_or_imports_generator_factory(tmp_path, monkeypatch, kind):
     rows, contexts = reference_evidence()
     monkeypatch.setattr(train_gico, "read_rows", lambda _: rows)
@@ -78,7 +78,7 @@ def test_fit_never_requires_or_imports_generator_factory(tmp_path, monkeypatch, 
         "rows": "observations.jsonl",
         "contexts": "contexts.npz",
         "output": str(tmp_path / "policy"),
-        "student_kind": kind,
+        "policy_kind": kind,
         "purpose": "functional",
     }
     train_gico.run_config(config)

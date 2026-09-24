@@ -25,13 +25,13 @@ def runtime_binding(runtime) -> dict:
     }
 
 
-def checkpoint_identity(path: str | None, method: str, *, student_kind: str = "GICO-det-policy") -> str | None:
+def checkpoint_identity(path: str | None, method: str, *, policy_kind: str = "deterministic") -> str | None:
     if path is None:
         return None
     if method == "gico":
         from genode.gico.policy import load_policy
 
-        return load_policy(path, student_kind=student_kind).artifact_sha256
+        return load_policy(path, policy_kind=policy_kind).artifact_sha256
     from genode.latent_clock.artifacts import sha256_file
 
     return sha256_file(path)
@@ -88,7 +88,7 @@ def prepare_gico(
         "contexts": "contexts.npz",
         "collection_manifest": "collection.json",
         "output": "policy",
-        "student_kind": "GICO-det-policy",
+        "policy_kind": "deterministic",
         "seed": 0,
         "device": "cuda",
         "purpose": "research",
@@ -100,13 +100,10 @@ def prepare_gico(
 def fit_gico(
     *,
     config_path: str,
-    student_kind: str | None = None,
-    teacher_score_weight: float | None = None,
+    policy_kind: str | None = None,
     dry_run: bool = False,
 ) -> dict:
     config = load_config(config_path)
-    if student_kind is not None:
-        config["student_kind"] = student_kind
-    if teacher_score_weight is not None:
-        config["teacher_score_weight"] = teacher_score_weight
+    if policy_kind is not None:
+        config["policy_kind"] = policy_kind
     return run_config(config, dry_run=dry_run)

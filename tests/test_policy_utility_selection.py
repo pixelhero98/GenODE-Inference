@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from genode.gico.evidence import prepare_evidence
-from genode.gico.networks import DeterministicStudent, ModelConfig, StochasticStudent
-from genode.gico.profiles import SCORE_SCHEDULES, SCORE_WEIGHTS
+from genode.gico.networks import DeterministicPolicy, ModelConfig, StochasticPolicy
+from genode.gico.profiles import REFINEMENT_WEIGHT, SCORE_SCHEDULES
 from genode.gico.reporting import PolicyCandidate, candidate_fingerprint, evaluate_policy_report, measured_utility
 from genode.gico.training import score_coefficient
 from tests.selection_fixtures import evaluator_for
@@ -18,7 +18,7 @@ from tests.test_unified_gico_rewards import reference_evidence
 
 
 @pytest.mark.parametrize("schedule", SCORE_SCHEDULES)
-@pytest.mark.parametrize("beta", SCORE_WEIGHTS)
+@pytest.mark.parametrize("beta", (REFINEMENT_WEIGHT,))
 @pytest.mark.parametrize("horizon", [500, 2000])
 def test_schedule_boundaries(schedule, beta, horizon):
     def coefficient(step):
@@ -32,19 +32,19 @@ def test_schedule_boundaries(schedule, beta, horizon):
         assert coefficient(int(horizon * 0.6) + 1) == beta
 
 
-def fixture(kind="GICO-det-policy", task="traffic_hourly"):
+def fixture(kind="deterministic", task="traffic_hourly"):
     rows, contexts = reference_evidence(task=task)
     evidence = prepare_evidence(rows, contexts, purpose="functional")
     config = ModelConfig(evidence.conditioning.width, len(evidence.calibrations["euler"].metric_keys), dropout=0.05)
-    model = (DeterministicStudent if kind == "GICO-det-policy" else StochasticStudent)(config).eval()
+    model = (DeterministicPolicy if kind == "deterministic" else StochasticPolicy)(config).eval()
     candidate = PolicyCandidate(
-        model, evidence.conditioning, kind, 500, 0.01, candidate_fingerprint(model, evidence.conditioning, kind, 500)
+        model, evidence.conditioning, kind, 500, 0.05, candidate_fingerprint(model, evidence.conditioning, kind, 500)
     )
     return rows, contexts, evidence, candidate
 
 
 def test_distinct_generation_seeds_cannot_reuse_the_same_clock_rng_inputs():
-    rows, contexts, evidence, candidate = fixture("GICO-sto-policy")
+    rows, contexts, evidence, candidate = fixture("stochastic")
     extra = deepcopy([row for row in rows if row["split"] == "validation"])
     for row in extra:
         row["seed"] += 1
@@ -52,9 +52,9 @@ def test_distinct_generation_seeds_cannot_reuse_the_same_clock_rng_inputs():
     evidence = prepare_evidence(rows, contexts, purpose="functional")
     measured = evaluator_for(rows, contexts)(candidate)
     assert measured_utility(measured, evidence, candidate, clock_replicates=4)["utility"] > 0
-    students = [r for r in measured if r["schedule_key"] == "student"]
-    first = students[0]
-    other = next(r for r in students if r["seed"] != first["seed"])
+    policies = [r for r in measured if r["schedule_key"] == "policy"]
+    first = policies[0]
+    other = next(r for r in policies if r["seed"] != first["seed"])
     other["sample_clocks"][0] = deepcopy(first["sample_clocks"][0])
     with pytest.raises(ValueError, match="independent clocks"):
         measured_utility(measured, evidence, candidate, clock_replicates=4)
@@ -63,7 +63,7 @@ def test_distinct_generation_seeds_cannot_reuse_the_same_clock_rng_inputs():
 def test_evaluation_restores_all_rngs_and_does_not_mutate_live_model():
     rows, contexts, evidence, candidate = fixture()
     candidate.model.train()
-    original = candidate_fingerprint(candidate.model, candidate.conditioning, candidate.student_kind, 500)
+    original = candidate_fingerprint(candidate.model, candidate.conditioning, candidate.policy_kind, 500)
     torch_state, numpy_state, random_state = torch.random.get_rng_state(), np.random.get_state(), random.getstate()
 
     def evaluator(snapshot):
@@ -74,10 +74,10 @@ def test_evaluation_restores_all_rngs_and_does_not_mutate_live_model():
         return evaluator_for(rows, contexts)(snapshot)
 
     result = evaluate_policy_report(
-        candidate.model, candidate.conditioning, "GICO-det-policy", 500, 0.01, evaluator, evidence, 4
+        candidate.model, candidate.conditioning, "deterministic", 500, 0.05, evaluator, evidence, 4
     )
     assert result["utility"] > 0 and candidate.model.training
-    assert candidate_fingerprint(candidate.model, candidate.conditioning, candidate.student_kind, 500) == original
+    assert candidate_fingerprint(candidate.model, candidate.conditioning, candidate.policy_kind, 500) == original
     assert torch.equal(torch_state, torch.random.get_rng_state())
     np.testing.assert_array_equal(numpy_state[1], np.random.get_state()[1])
     assert random_state == random.getstate()
@@ -113,7 +113,7 @@ def test_utility_uses_frozen_calibration_and_correct_direction():
 
 
 def test_duplicate_stochastic_innovations_and_incomplete_ensemble_rejected():
-    rows, contexts, evidence, candidate = fixture("GICO-sto-policy")
+    rows, contexts, evidence, candidate = fixture("stochastic")
     measurements = evaluator_for(rows, contexts, replicates=2)(candidate)
     bad = deepcopy(measurements)
     bad[1]["sample_clocks"][1] = deepcopy(bad[1]["sample_clocks"][0])
@@ -140,11 +140,11 @@ def test_snapshot_conditioning_mutation_fails():
 
     with pytest.raises(ValueError, match="mutated"):
         evaluate_policy_report(
-            candidate.model, candidate.conditioning, "GICO-det-policy", 500, 0.01, evaluator, evidence, 4
+            candidate.model, candidate.conditioning, "deterministic", 500, 0.05, evaluator, evidence, 4
         )
 
 
-def test_stochastic_history_uses_fixed_teacher_selection_without_generator(monkeypatch):
+def test_stochastic_history_uses_fixed_utility_surrogate_selection_without_generator(monkeypatch):
     import genode.gico.evaluators as evaluators
     from genode.gico import training
     from genode.gico.stochastic_selection import select_stochastic
@@ -152,10 +152,10 @@ def test_stochastic_history_uses_fixed_teacher_selection_without_generator(monke
     _, _, evidence, _ = fixture()
     config = replace(
         training.TrainingConfig(),
-        teacher_steps=2,
-        student_steps=5,
-        teacher_checkpoint_every=1,
-        student_checkpoint_every=1,
+        utility_surrogate_steps=2,
+        policy_steps=5,
+        utility_surrogate_checkpoint_every=1,
+        policy_checkpoint_every=1,
         stochastic_likelihood_samples=2,
     )
     monkeypatch.setattr(training, "accumulated_step", lambda *a, **kw: 0.0)
@@ -164,10 +164,10 @@ def test_stochastic_history_uses_fixed_teacher_selection_without_generator(monke
         raise AssertionError("Fitting cannot invoke a generator or scorer")
 
     monkeypatch.setattr(evaluators, "execute_request", forbidden)
-    _, _, history = training.fit_models(evidence, config, student_kind="GICO-sto-policy", device="cpu")
-    records = history["students"]["GICO-sto-policy"]
+    _, _, history = training.fit_models(evidence, config, policy_kind="stochastic", device="cpu")
+    records = history["policies"]["stochastic"]
     assert [r["step"] for r in records if "predicted_utility" in r] == [4, 5]
-    assert history["student_selection"]["GICO-sto-policy"] == select_stochastic(records)
+    assert history["policy_selection"]["stochastic"] == select_stochastic(records)
 
 
 @pytest.mark.parametrize(
@@ -197,14 +197,14 @@ def test_all_task_selection_uses_its_current_calibrated_objective(task):
             row["metrics"] = {"lpips": value}
             row.update(image_fields(row))
     evidence = prepare_evidence(rows, contexts, purpose="functional")
-    model = DeterministicStudent(ModelConfig(evidence.conditioning.width, len(TASK_METRICS[task]))).eval()
+    model = DeterministicPolicy(ModelConfig(evidence.conditioning.width, len(TASK_METRICS[task]))).eval()
     candidate = PolicyCandidate(
         model,
         evidence.conditioning,
-        "GICO-det-policy",
+        "deterministic",
         500,
-        0.01,
-        candidate_fingerprint(model, evidence.conditioning, "GICO-det-policy", 500),
+        0.05,
+        candidate_fingerprint(model, evidence.conditioning, "deterministic", 500),
     )
     measurements = evaluator_for(rows, contexts)(candidate)
     expected = evidence.calibrations["euler"].scalar({**measurements[1], "anchor_metrics": measurements[0]["metrics"]})
@@ -212,7 +212,7 @@ def test_all_task_selection_uses_its_current_calibrated_objective(task):
 
 
 def test_replicate_metrics_are_averaged_before_log_improvement():
-    rows, contexts, evidence, candidate = fixture("GICO-sto-policy")
+    rows, contexts, evidence, candidate = fixture("stochastic")
     measured = evaluator_for(rows, contexts, replicates=2)(candidate)
     for i, factor in ((1, 0.25), (3, 0.75)):
         measured[i]["metrics"] = {k: v * factor for k, v in measured[0]["metrics"].items()}

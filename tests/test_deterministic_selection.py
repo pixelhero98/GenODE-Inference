@@ -11,10 +11,10 @@ import torch
 from genode.gico import training
 from genode.gico.deterministic_selection import balanced_mean, score_deterministic, select_deterministic
 from genode.gico.evidence import prepare_evidence
-from genode.gico.networks import DensityTeacher, DeterministicStudent, ModelConfig
+from genode.gico.networks import DeterministicPolicy, ModelConfig, UtilitySurrogate
 from genode.gico.policy import load_policy
 from genode.gico.profiles import resolve_profile
-from genode.gico.selection import state_fingerprint, teacher_fingerprint
+from genode.gico.selection import state_fingerprint, utility_surrogate_fingerprint
 from tests.test_unified_gico_policies import corrupt_payload, untrained_artifact  # noqa: F401
 from tests.test_unified_gico_rewards import reference_evidence
 
@@ -33,11 +33,11 @@ def row(step, kl, score):
 
 def test_defaults_and_invalid_allowances():
     config = resolve_profile("imagenet64")
-    assert config.teacher_checkpoint_every == 20
+    assert config.utility_surrogate_checkpoint_every == 20
     assert config.deterministic_checkpoint_every == 10
-    assert config.student_checkpoint_every == 100
+    assert config.policy_checkpoint_every == 100
     assert config.deterministic_kl_allowance == 0.15
-    assert config.teacher_steps == config.student_steps == 2000
+    assert config.utility_surrogate_steps == config.policy_steps == 2000
     for bad in (-1, float("nan"), float("inf"), True):
         with pytest.raises(ValueError):
             replace(config, deterministic_kl_allowance=bad)
@@ -71,14 +71,14 @@ def test_equal_setting_and_class_weighting():
         balanced_mean([0], groups, "imagenet64")
 
 
-def test_raw_native_teacher_score_reuses_one_global_student_density():
+def test_raw_native_utility_surrogate_score_reuses_one_global_policy_density():
     evidence = prepare_evidence(*reference_evidence(), purpose="functional")
     conditioning = replace(evidence.conditioning, context_mode="global")
     architecture = ModelConfig(conditioning.width, 2, dropout=0.1)
-    model = DeterministicStudent(architecture).eval()
-    teacher = DensityTeacher(architecture).eval().requires_grad_(False)
-    teacher.output.bias.data.copy_(torch.tensor([10.0, 30.0]))
-    teacher.output.weight.data.zero_()
+    model = DeterministicPolicy(architecture).eval()
+    utility_surrogate = UtilitySurrogate(architecture).eval().requires_grad_(False)
+    utility_surrogate.output.bias.data.copy_(torch.tensor([10.0, 30.0]))
+    utility_surrogate.output.weight.data.zero_()
     groups = evidence.groups("validation")
     native = torch.tensor(evidence.conditioning.transform([3, 7], "euler", 4))[None]
     global_c = torch.tensor(conditioning.transform([3, 7], "euler", 4))[None]
@@ -86,21 +86,30 @@ def test_raw_native_teacher_score_reuses_one_global_student_density():
     with torch.no_grad():
         mass = model(global_c)
     targets = [(global_c, None, None, None, None, native)] * len(groups)
-    identity = teacher_fingerprint(teacher, evidence.conditioning, 20, 0.05)
-    before = state_fingerprint(teacher)
+    identity = utility_surrogate_fingerprint(utility_surrogate, evidence.conditioning, 20, 0.05)
+    before = state_fingerprint(utility_surrogate)
     rng = torch.random.get_rng_state().clone()
     with (
         patch.object(model, "forward", side_effect=AssertionError("Density already computed")),
-        patch.object(teacher, "forward", wraps=teacher.forward) as forward,
+        patch.object(utility_surrogate, "forward", wraps=utility_surrogate.forward) as forward,
     ):
         result = score_deterministic(
-            model, teacher, conditioning, targets, [mass] * len(groups), groups, evidence, (0.25, 0.75), 10, identity
+            model,
+            utility_surrogate,
+            conditioning,
+            targets,
+            [mass] * len(groups),
+            groups,
+            evidence,
+            (0.25, 0.75),
+            10,
+            identity,
         )
     assert forward.call_count == len(groups)
     assert all(call.args[0] is native and call.args[1] is mass for call in forward.call_args_list)
     assert result["predicted_utility"] == pytest.approx(25 * evidence.calibrations["euler"].reward_scale)
     assert "utility" not in result and "measurements_sha256" not in result
-    assert state_fingerprint(teacher) == before
+    assert state_fingerprint(utility_surrogate) == before
     assert torch.equal(rng, torch.random.get_rng_state())
 
 
@@ -110,13 +119,13 @@ def fitted(tmp_path):
     metadata = training.fit(
         *reference_evidence(),
         destination,
-        student_kind="GICO-det-policy",
+        policy_kind="deterministic",
         device="cpu",
-        teacher_steps=2,
-        teacher_checkpoint_every=1,
-        student_steps=5,
+        utility_surrogate_steps=2,
+        utility_surrogate_checkpoint_every=1,
+        policy_steps=5,
         deterministic_checkpoint_every=1,
-        student_context_mode="global",
+        policy_context_mode="global",
         purpose="functional",
     )
     return destination, metadata
@@ -124,36 +133,43 @@ def fitted(tmp_path):
 
 def test_new_artifact_roundtrip_and_checkpoint_history(fitted):
     destination, metadata = fitted
-    records = metadata["history"]["students"]["GICO-det-policy"]
+    records = metadata["history"]["policies"]["deterministic"]
     assert [r["step"] for r in records] == [1, 2, 3, 4, 5]
     assert [r["step"] for r in records if "predicted_utility" in r] == [4, 5]
-    assert metadata["history"]["student_selection"]["GICO-det-policy"] == select_deterministic(records, 0.15)
-    with patch("genode.gico.policy.DensityTeacher", side_effect=AssertionError("Inference is student only")):
+    assert metadata["history"]["policy_selection"]["deterministic"] == select_deterministic(records, 0.15)
+    with patch("genode.gico.policy.UtilitySurrogate", side_effect=AssertionError("Inference is policy only")):
         policy = load_policy(destination)
     assert np.isclose(policy.density([1, 2], "euler", 4).sum(), 1)
 
 
 @pytest.mark.parametrize(
     "field",
-    ["teacher_weights", "teacher_shape", "teacher_identity", "missing_checkpoint", "missing_profile", "bad_score"],
+    [
+        "utility_surrogate_weights",
+        "utility_surrogate_shape",
+        "utility_surrogate_identity",
+        "missing_checkpoint",
+        "missing_profile",
+        "bad_score",
+    ],
 )
 def test_new_artifact_rejects_tampering(fitted, tmp_path, field):
     destination, _ = fitted
 
     def change(payload):
         metadata = payload["metadata"]
-        if field == "teacher_weights":
-            next(iter(payload["teacher"].values())).add_(1)
-        elif field == "teacher_shape":
-            payload["teacher"]["output.weight"] = payload["teacher"]["output.weight"].flatten()
-        elif field == "teacher_identity":
-            metadata["history"]["students"]["GICO-det-policy"][-1]["selection_teacher_fingerprint"] = "bad"
+        if field == "utility_surrogate_weights":
+            next(iter(payload["utility_surrogate"].values())).add_(1)
+        elif field == "utility_surrogate_shape":
+            payload["utility_surrogate"]["output.weight"] = payload["utility_surrogate"]["output.weight"].flatten()
+        elif field == "utility_surrogate_identity":
+            metadata["history"]["policies"]["deterministic"][-1]["selection_utility_surrogate_fingerprint"] = "bad"
         elif field == "missing_checkpoint":
-            metadata["history"]["students"]["GICO-det-policy"].pop(0)
+            metadata["history"]["policies"]["deterministic"].pop(0)
         elif field == "missing_profile":
             metadata["fitting_profile"].pop("deterministic_kl_allowance")
         else:
-            metadata["history"]["students"]["GICO-det-policy"][-1]["predicted_utility"] = float("nan")
+            metadata["history"]["policies"]["deterministic"][-1]["predicted_utility"] = float("nan")
 
     corrupt_payload(destination, tmp_path / "bad", change)
     with pytest.raises(ValueError):
@@ -164,10 +180,10 @@ def test_validation_cadence_does_not_change_optimization_or_rng():
     evidence = prepare_evidence(*reference_evidence(), purpose="functional")
     config = resolve_profile(
         evidence.task,
-        teacher_steps=2,
-        teacher_checkpoint_every=1,
-        student_steps=5,
-        student_context_mode="global",
+        utility_surrogate_steps=2,
+        utility_surrogate_checkpoint_every=1,
+        policy_steps=5,
+        policy_context_mode="global",
         dropout=0.1,
     )
     captures = []
@@ -188,7 +204,7 @@ def test_validation_cadence_does_not_change_optimization_or_rng():
         training.fit_models(
             evidence,
             replace(config, deterministic_checkpoint_every=cadence),
-            student_kind="GICO-det-policy",
+            policy_kind="deterministic",
             device="cpu",
             checkpoint_callback=capture,
         )
@@ -199,7 +215,7 @@ def test_validation_cadence_does_not_change_optimization_or_rng():
         assert torch.equal(first[0][key], second[0][key])
 
 
-@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
+@pytest.mark.parametrize("kind", ["deterministic", "stochastic"])
 def test_incomplete_profile_is_rejected(untrained_artifact, tmp_path, kind):  # noqa: F811
     source, *_ = untrained_artifact
 
@@ -207,8 +223,8 @@ def test_incomplete_profile_is_rejected(untrained_artifact, tmp_path, kind):  # 
         profile = payload["metadata"]["fitting_profile"]
         profile.pop("deterministic_checkpoint_every")
         profile.pop("deterministic_kl_allowance")
-        profile["teacher_checkpoint_every"] = 100
+        profile["utility_surrogate_checkpoint_every"] = 100
 
     corrupt_payload(source, tmp_path / "legacy", old_profile)
     with pytest.raises(ValueError, match="incomplete"):
-        load_policy(tmp_path / "legacy", student_kind=kind)
+        load_policy(tmp_path / "legacy", policy_kind=kind)

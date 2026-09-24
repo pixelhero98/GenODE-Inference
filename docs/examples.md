@@ -8,13 +8,13 @@ python examples/decode_clock.py
 
 It materializes one reference density for Euler and Heun at the same denoiser-call budget. It verifies endpoints and macro-step counts without loading a generator or making a quality claim.
 
-With an canonical `genode-gico` student artifact and its frozen native context:
+With an canonical `genode-gico` policy artifact and its frozen native context:
 
 ```python
 from genode.gico.policy import load_context_embedding_table, load_policy
 
 contexts = load_context_embedding_table("contexts.npz")
-policy = load_policy("policy", student_kind="GICO-sto-policy")
+policy = load_policy("policy", policy_kind="stochastic")
 context_id = next(iter(contexts))
 grid = policy.materialize(
     contexts[context_id],
@@ -26,14 +26,14 @@ grid = policy.materialize(
 print(grid)
 ```
 
-Use `GICO-det-policy` to load the deterministic student. Reuse the sampled grid through a complete generated trajectory; change request identity for each new member or replicate. The native generator and its exact solver must consume this grid.
+Use `deterministic` to load the deterministic policy. Reuse the sampled grid through a complete generated trajectory; change request identity for each new member or replicate. The native generator and its exact solver must consume this grid.
 
-Use the README's fitting configuration with a [completed collection manifest](collection.md). Fitting defaults to deterministic; request `both` or `GICO-sto-policy` explicitly. Neither policy needs a generator/scorer during fitting or selection. Then run:
+Use the README's fitting configuration with a [completed collection manifest](collection.md). Fitting defaults to deterministic; request `both` or `stochastic` explicitly. Neither policy needs a generator/scorer during fitting or selection. Then run:
 
 ```bash
 genode-train-gico --config train.json --dry-run
-genode-train-gico --config train.json --student-kind both
-genode-report-gico-locked-test --artifact policy --student-kind GICO-sto-policy --rows test.jsonl --contexts test-contexts.npz --output test-report.json
+genode-train-gico --config train.json --policy-kind both
+genode-report-gico-locked-test --artifact policy --policy-kind stochastic --rows test.jsonl --contexts test-contexts.npz --output test-report.json
 ```
 
 These commands require independently collected assets and complete paired evidence. Reduced `purpose: functional` panels are integration fixtures; they cannot substantiate benchmark results.

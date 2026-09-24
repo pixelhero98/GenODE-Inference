@@ -24,9 +24,9 @@ from genode.schedules.fixed import FIXED_SCHEDULE_TARGET_NFES
 from genode.schedules.specification import ScheduleSpecification
 
 IMAGE_PROTOCOL_KEY = "image_euler_kid_collection"
-IMAGE_GICO_TEACHER_SCORE_WEIGHT = 0.01
-IMAGE_GICO_TEACHER_SCORE_WARMUP_FRACTION = 0.60
-IMAGE_GICO_TEACHER_SCORE_CLIP = 5.0
+IMAGE_GICO_REFINEMENT_WEIGHT = 0.05
+IMAGE_GICO_UTILITY_SURROGATE_SCORE_WARMUP_FRACTION = 0.60
+IMAGE_GICO_UTILITY_SURROGATE_SCORE_CLIP = 5.0
 
 CIFAR10_DATASET_KEY = "cifar10"
 IMAGENET64_DATASET_KEY = "imagenet64"
@@ -224,26 +224,25 @@ def image_protocol_metadata(
             "execution": locked_metric_execution_spec(),
         },
         "selection": {
-            "teacher": f"heldout_reference_mixture_{metric}_regret",
-            "deterministic_checkpoint": "heldout_teacher_utility_density_kl",
-            "stochastic_checkpoint": "heldout_expected_teacher_utility_distribution_kl",
+            "utility_surrogate": "heldout_component_mse_then_reference_regret",
+            "deterministic_checkpoint": "heldout_utility_surrogate_utility_density_kl",
+            "stochastic_checkpoint": "heldout_expected_utility_surrogate_utility_distribution_kl",
             "generator_evaluations": 0,
-            "student_coefficient": "explicit_fitting_profile",
+            "policy_refinement_weight": IMAGE_GICO_REFINEMENT_WEIGHT,
             "duplicate_handling": "unique_realized_density",
             "locked_tuning": False,
         },
-        "gico_student": {
-            "primary_target": "teacher_weighted_unique_reference_densities",
-            "deterministic_objective": "target_to_policy_kl_minus_teacher_score",
-            "stochastic_objective": "smoothed_autoregressive_gaussian_nll_minus_reparameterized_teacher_score",
+        "gico_policy": {
+            "primary_target": "utility_surrogate_weighted_unique_reference_densities",
+            "deterministic_objective": "target_to_policy_kl_minus_utility_surrogate_score",
+            "stochastic_objective": "smoothed_autoregressive_gaussian_nll_minus_reparameterized_utility_surrogate_score",
             "artifact_protocol": "genode-gico",
-            "teacher_score_weights": [0.01, 0.05, 0.1],
-            "teacher_score_weights_role": "allowed_explicit_overrides",
-            "teacher_evidence_phase": "reward_train",
-            "teacher_score_weight": IMAGE_GICO_TEACHER_SCORE_WEIGHT,
-            "teacher_score_schedule": "zero_then_linear_late_ramp",
-            "teacher_score_warmup_fraction": (IMAGE_GICO_TEACHER_SCORE_WARMUP_FRACTION),
-            "teacher_score_clip": IMAGE_GICO_TEACHER_SCORE_CLIP,
+            "artifact_schema_version": 1,
+            "refinement_weight": IMAGE_GICO_REFINEMENT_WEIGHT,
+            "utility_surrogate_evidence_phase": "reward_train",
+            "utility_surrogate_score_schedule": "zero_then_linear_late_ramp",
+            "utility_surrogate_score_warmup_fraction": (IMAGE_GICO_UTILITY_SURROGATE_SCORE_WARMUP_FRACTION),
+            "utility_surrogate_score_clip": IMAGE_GICO_UTILITY_SURROGATE_SCORE_CLIP,
             "unseen_nfe_distillation": False,
         },
         "datasets": {key: image_benchmark_spec(key).as_dict() for key in IMAGE_DATASET_KEYS},
@@ -329,9 +328,9 @@ __all__ = [
     "FID_NEGATIVE_RELATIVE_TOLERANCE",
     "IMAGE_DATASET_KEYS",
     "IMAGE_PROTOCOL_KEY",
-    "IMAGE_GICO_TEACHER_SCORE_WEIGHT",
-    "IMAGE_GICO_TEACHER_SCORE_WARMUP_FRACTION",
-    "IMAGE_GICO_TEACHER_SCORE_CLIP",
+    "IMAGE_GICO_REFINEMENT_WEIGHT",
+    "IMAGE_GICO_UTILITY_SURROGATE_SCORE_WARMUP_FRACTION",
+    "IMAGE_GICO_UTILITY_SURROGATE_SCORE_CLIP",
     "IMAGE_SCHEDULE_KEYS",
     "IMAGE_SOLVER_KEY",
     "IMAGE_TARGET_NFES",

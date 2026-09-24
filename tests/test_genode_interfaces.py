@@ -89,7 +89,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         project = data["project"]
 
-        self.assertEqual(project["version"], "0.15.1")
+        self.assertEqual(project["version"], "1.0.0")
         self.assertEqual(
             project["description"], "GICO inference-clock optimization for frozen flow-matching backbones."
         )
@@ -140,7 +140,7 @@ class GenODEInterfaceTests(unittest.TestCase):
                 "docs/image-comparators.md",
                 "docs/image-supervision.md",
                 "docs/js-reinforce.md",
-                "docs/student-selection.md",
+                "docs/policy-selection.md",
             ],
         )
         text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
@@ -163,7 +163,7 @@ class GenODEInterfaceTests(unittest.TestCase):
         self.assertNotIn("## 30-second entry point", text)
         self.assertNotIn("## Guarantees", text)
         self.assertNotIn("allow_noncanonical", text)
-        self.assertNotIn("teacher-oracle", text.lower())
+        self.assertNotIn("utility_surrogate-oracle", text.lower())
         for retired_term in (
             "Consistency " + "distillation",
             "endpoint " + "flow-map",
@@ -224,7 +224,7 @@ class GenODEInterfaceTests(unittest.TestCase):
                 "image-comparators.md",
                 "image-supervision.md",
                 "js-reinforce.md",
-                "student-selection.md",
+                "policy-selection.md",
             },
         )
 
@@ -232,13 +232,15 @@ class GenODEInterfaceTests(unittest.TestCase):
         from genode.gico.train_gico import build_argparser
 
         options = {option for action in build_argparser()._actions for option in action.option_strings}
-        self.assertEqual(options, {"-h", "--help", "--config", "--student-kind", "--teacher-score-weight", "--dry-run"})
+        self.assertEqual(
+            options, {"-h", "--help", "--config", "--policy-kind", "--utility-surrogate-only", "--dry-run"}
+        )
 
     def test_full_pipeline_public_contract_routes_explicit_gico_configuration(self) -> None:
         from genode.pipeline.full_pipeline import DEFAULT_STAGES, PIPELINE_STAGE_ORDER, build_argparser
 
         options = {option for action in build_argparser()._actions for option in action.option_strings}
-        self.assertTrue({"--gico-config", "--student-kind", "--teacher-score-weight"} <= options)
+        self.assertTrue({"--gico-config", "--policy-kind"} <= options)
         self.assertEqual(DEFAULT_STAGES, ("backbone_training", "schedule_rows_seen", "schedule_rows_unseen"))
         self.assertEqual(PIPELINE_STAGE_ORDER, ("data_prep", *DEFAULT_STAGES, "gico_training"))
         self.assertNotIn("--ablation_first", options)
@@ -260,10 +262,10 @@ class GenODEInterfaceTests(unittest.TestCase):
                 (PROJECT_ROOT / "genode" / "paper_datasets" / "example").resolve(),
             )
 
-    def test_gico_policy_public_surface_excludes_teacher_prediction_helper(self) -> None:
+    def test_gico_policy_public_surface_excludes_utility_surrogate_prediction_helper(self) -> None:
         from genode.gico import policy
 
-        helper_name = "build_teacher_weighted_density_" + "prediction_rows"
+        helper_name = "build_utility_surrogate_weighted_density_" + "prediction_rows"
         self.assertFalse(hasattr(policy, helper_name))
         self.assertNotIn(helper_name, getattr(policy, "__all__", ()))
 

@@ -206,7 +206,7 @@ def test_imagenet_scale_balances_classes_with_unequal_panel_counts():
     assert baseline.reward_scale == pytest.approx(2.0)
 
 
-@pytest.mark.parametrize("kind", ["GICO-det-policy", "GICO-sto-policy"])
+@pytest.mark.parametrize("kind", ["deterministic", "stochastic"])
 def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind, monkeypatch):
     import hashlib
     import json
@@ -226,19 +226,19 @@ def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind
         rows,
         contexts,
         destination,
-        student_kind=kind,
+        policy_kind=kind,
         device="cpu",
-        teacher_steps=2,
-        student_steps=2,
-        teacher_checkpoint_every=1,
-        student_checkpoint_every=1,
-        teacher_score_weight=0.05,
+        utility_surrogate_steps=2,
+        policy_steps=2,
+        utility_surrogate_checkpoint_every=1,
+        policy_checkpoint_every=1,
+        refinement_weight=0.05,
         stochastic_likelihood_samples=1,
         stochastic_score_samples=1,
         purpose="functional",
     )
     assert metadata["image_objective"]["protocol"] == "paired-lpips-v1"
-    policy = load_policy(destination, student_kind=kind)
+    policy = load_policy(destination, policy_kind=kind)
     first = policy.materialize([0.0, 0.0], "euler", 4, seed=2, request_id="sample")
     assert first == policy.materialize([0.0, 0.0], "euler", 4, seed=2, request_id="sample")
     assert len(first) == 5 and all(a < b for a, b in zip(first[:-1], first[1:], strict=True))
@@ -246,10 +246,10 @@ def test_image_fit_artifact_roundtrip_and_old_objective_rejection(tmp_path, kind
     del payload["metadata"]["image_objective"]
     torch.save(payload, destination / "policy.pt")
     manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
-    manifest["policy_sha256"] = hashlib.sha256((destination / "policy.pt").read_bytes()).hexdigest()
+    manifest["artifact_sha256"] = hashlib.sha256((destination / "policy.pt").read_bytes()).hexdigest()
     (destination / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="supported KID"):
-        load_policy(destination, student_kind=kind)
+        load_policy(destination, policy_kind=kind)
 
 
 def test_target_checkpoint_must_match_bound_candidate_checkpoint():

@@ -403,7 +403,7 @@ class BackboneMatrixTests(unittest.TestCase):
                 "train_budget_label": "4k",
                 "target_nfe": 10,
                 "solver_key": "euler",
-                "scheduler_key": "GICO-det-policy",
+                "scheduler_key": "deterministic",
                 "forecast_crps": 3.0,
                 "experiment_scope": "main",
             },
@@ -424,7 +424,7 @@ class BackboneMatrixTests(unittest.TestCase):
         ]
         enriched = augment_rows_with_relative_metrics(rows)
         by_schedule = {(row["train_steps"], row["scheduler_key"]): row for row in enriched}
-        self.assertAlmostEqual(by_schedule[4000, "GICO-det-policy"]["forecast_relative_crps_gain_vs_uniform"], 0.25)
+        self.assertAlmostEqual(by_schedule[4000, "deterministic"]["forecast_relative_crps_gain_vs_uniform"], 0.25)
 
 
 if __name__ == "__main__":

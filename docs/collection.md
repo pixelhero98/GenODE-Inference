@@ -1,6 +1,6 @@
 # Shared complete-solve collection
 
-Collection finishes before teacher or student fitting. `genode-collect-gico` plans a fixed set of complete generator solves and records their measurements; fitting and checkpoint selection consume only that saved evidence and frozen-teacher predictions.
+Collection finishes before utility surrogate or policy fitting. `genode-collect-gico` plans a fixed set of complete generator solves and records their measurements; fitting and checkpoint selection consume only that saved evidence and frozen-utility surrogate predictions.
 
 | Task | Default budget per NFE | Fitting / held out |
 |---|---|---|
@@ -42,7 +42,7 @@ The Python equivalents are `plan_collection(...)`, `collect(manifest, measure)` 
   "collection_manifest": "collected.json",
   "contexts": "contexts.npz",
   "output": "policy",
-  "student_kind": "GICO-det-policy"
+  "policy_kind": "deterministic"
 }
 ```
 
@@ -51,4 +51,4 @@ genode-train-gico --config train.json --dry-run
 genode-train-gico --config train.json
 ```
 
-Both students reuse this evidence and its context holdout. Explicit `--student-kind both` trains both with one selected frozen teacher. No generator or terminal scorer is available through fitting interfaces.
+Both policies reuse this evidence and its context holdout. Explicit `--policy-kind both` trains both with one selected frozen utility surrogate. No generator or terminal scorer is available through fitting interfaces.

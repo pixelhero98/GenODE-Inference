@@ -1,6 +1,6 @@
 # Collection and explicit measurement reports
 
-Neither student fitting nor checkpoint selection calls a generator or terminal scorer. For collection use `genode.gico.evaluators:build_collector`, with request-keyed templates/cases described in [collection](collection.md). The task runtime configurations below apply to collection and reporting.
+Neither policy fitting nor checkpoint selection calls a generator or terminal scorer. For collection use `genode.gico.evaluators:build_collector`, with request-keyed templates/cases described in [collection](collection.md). The task runtime configurations below apply to collection and reporting.
 
 For an explicit post-fit paired measurement report, `build_evaluator` returns a callback usable by `genode.gico.reporting.evaluate_policy_report`. Its configuration is shown below. It is not accepted by training configuration. These adapters support every retained task, native image KID, explicit GICO-TF LPIPS and frozen BézierFlow KID.
 

@@ -133,7 +133,7 @@ def build_evaluator(config):
         destination.mkdir()
         requests = []
         for anchor in anchors:
-            count = replicates if candidate.student_kind == "GICO-sto-policy" else 1
+            count = replicates if candidate.policy_kind == "stochastic" else 1
             for replicate in range(count):
                 clocks = []
                 for member in range(anchor["ensemble_size"]):
@@ -164,12 +164,12 @@ def build_evaluator(config):
                     )
                 row = copy.deepcopy(anchor)
                 row.update(
-                    schedule_key="student",
+                    schedule_key="policy",
                     selection_checkpoint_id=candidate.checkpoint_id,
                     clock_replicate=replicate,
-                    student_kind=candidate.student_kind,
+                    policy_kind=candidate.policy_kind,
                 )
-                if candidate.student_kind == "GICO-sto-policy" and len(clocks) > 1:
+                if candidate.policy_kind == "stochastic" and len(clocks) > 1:
                     row.pop("density_mass", None)
                     row.pop("time_grid", None)
                     row["sample_clocks"] = clocks
@@ -178,7 +178,7 @@ def build_evaluator(config):
                 requests.append(
                     {
                         "anchor": anchor,
-                        "student": row,
+                        "policy": row,
                         "clocks": clocks,
                         "context": contexts[anchor["context_id"]].tolist(),
                         "case": cases[measurement_identity(anchor)],
@@ -214,7 +214,7 @@ def execute_request(request, *, runtime=None):
     runtime = load_task_evaluator(request["runtime"]) if runtime is None else runtime
     measured, uniform_cache = [], {}
     for index, item in enumerate(request["requests"]):
-        anchor, student = item["anchor"], item["student"]
+        anchor, policy = item["anchor"], item["policy"]
         runtime.verify_frozen()
         identity = content_hash(anchor)
         if identity not in uniform_cache:
@@ -231,13 +231,13 @@ def execute_request(request, *, runtime=None):
             ):
                 raise ValueError("Executed uniform metrics differ from the frozen selection evidence; recollect it.")
             uniform_cache[identity] = actual
-        student["metrics"] = runtime.measure(
-            student, item["clocks"], item["context"], item["case"], destination / f"student-{index}"
+        policy["metrics"] = runtime.measure(
+            policy, item["clocks"], item["context"], item["case"], destination / f"policy-{index}"
         )
         runtime.verify_frozen()
         uniform = copy.deepcopy(anchor)
-        uniform.update(metrics=uniform_cache[identity], clock_replicate=student["clock_replicate"])
-        measured.extend((uniform, student))
+        uniform.update(metrics=uniform_cache[identity], clock_replicate=policy["clock_replicate"])
+        measured.extend((uniform, policy))
     _write(destination / "measurements.json", measured)
     return measured
 

@@ -31,10 +31,8 @@ def test_pipeline_routes_explicit_gico_config_to_common_cli(tmp_path: Path):
             "gico_training",
             "--gico-config",
             str(config),
-            "--student-kind",
-            "GICO-sto-policy",
-            "--teacher-score-weight",
-            "0.05",
+            "--policy-kind",
+            "stochastic",
         ]
     )
     stages = _build_stage_commands(args, tmp_path)
@@ -44,10 +42,8 @@ def test_pipeline_routes_explicit_gico_config_to_common_cli(tmp_path: Path):
     assert command[3:] == [
         "--config",
         str(config),
-        "--student-kind",
-        "GICO-sto-policy",
-        "--teacher-score-weight",
-        "0.05",
+        "--policy-kind",
+        "stochastic",
     ]
 
 

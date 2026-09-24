@@ -110,21 +110,28 @@ def _geometry() -> Tensor:
     )
 
 
-class DensityTeacher(_Transformer):
+class UtilitySurrogate(_Transformer):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
         self.register_buffer("geometry", _geometry(), persistent=False)
         self.input = _projection(3, config.width)
         self.output = nn.Linear(config.width, config.metric_count)
+        self.density_only = False
+        self.native_context_width: int | None = None
 
     def forward(self, condition: Tensor, mass: Tensor) -> Tensor:
-        # Do not use no_grad here: students need the teacher's density gradient.
+        # Policies need the utility surrogate's density gradient during refinement.
+        if self.density_only:
+            width = self.native_context_width
+            if width is None or not 0 < width < condition.shape[-1]:
+                raise ValueError("Density-only utility surrogate requires its native context width.")
+            condition = torch.cat((torch.zeros_like(condition[..., :width]), condition[..., width:]), dim=-1)
         log_mass = guarded_mass(mass).log().to(condition.dtype)
         features = torch.cat((log_mass[..., None], self.geometry[None].expand(len(mass), -1, -1)), dim=-1)
         return self.output(self.encode(condition, self.input(features)).mean(dim=1))
 
 
-class DeterministicStudent(_Transformer):
+class DeterministicPolicy(_Transformer):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
         self.register_buffer("geometry", _geometry(), persistent=False)
@@ -136,7 +143,7 @@ class DeterministicStudent(_Transformer):
         return self.output(self.encode(condition, queries)).squeeze(-1).double().softmax(-1)
 
 
-class StochasticStudent(_Transformer):
+class StochasticPolicy(_Transformer):
     """Continuous causal Gaussian log ratios, with no finite-support decoder."""
 
     def __init__(
@@ -174,7 +181,7 @@ class StochasticStudent(_Transformer):
 
     def conditional_parameters(self, condition: Tensor, ratios: Tensor) -> tuple[Tensor, Tensor]:
         if ratios.shape != (len(condition), RATIO_COUNT):
-            raise ValueError("Teacher-forced ratios must have shape [batch,63].")
+            raise ValueError("UtilitySurrogate-forced ratios must have shape [batch,63].")
         shifted = torch.cat((torch.zeros_like(ratios[:, :1]), ratios[:, :-1]), dim=1)
         return self._distribution_head(condition, shifted)
 

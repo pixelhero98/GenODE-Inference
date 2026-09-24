@@ -62,7 +62,7 @@ def write_cost_ledger(root: str | Path, destination: Path, methods: list[dict]) 
         if method["method"] == "gico":
             from genode.gico.policy import load_policy
 
-            metadata = load_policy(method["checkpoint"], student_kind=method["student_kind"]).metadata
+            metadata = load_policy(method["checkpoint"], policy_kind=method["policy_kind"]).metadata
             row["calibration_trajectories_accessed"] = sum(metadata["measurement_counts"].values())
             row["fit_wall_seconds"] = metadata["fitting_wall_seconds"]
         elif method["fit_report"]:

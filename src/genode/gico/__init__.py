@@ -1,6 +1,6 @@
-"""Unified GICO teacher, density students, calibrated rewards, and policies."""
+"""Unified GICO utility_surrogate, density policies, calibrated rewards, and policies."""
 
-from genode.gico.networks import DensityTeacher, DeterministicStudent, ModelConfig, StochasticStudent
+from genode.gico.networks import DeterministicPolicy, ModelConfig, StochasticPolicy, UtilitySurrogate
 from genode.gico.policy import GICO_PROTOCOL, GICOPolicy, load_policy
 from genode.gico.rewards import RewardCalibration, calibrate_rewards, construct_rewards
 
@@ -9,9 +9,9 @@ __all__ = [
     "GICOPolicy",
     "load_policy",
     "ModelConfig",
-    "DensityTeacher",
-    "DeterministicStudent",
-    "StochasticStudent",
+    "UtilitySurrogate",
+    "DeterministicPolicy",
+    "StochasticPolicy",
     "RewardCalibration",
     "calibrate_rewards",
     "construct_rewards",

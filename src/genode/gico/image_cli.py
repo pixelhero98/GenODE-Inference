@@ -36,22 +36,20 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     prepare.add_argument("--manifest", required=True)
     prepare.add_argument("--output", required=True)
-    train = commands.add_parser("train", help="Fit the common teacher and requested student architectures.")
+    train = commands.add_parser("train", help="Fit the common utility_surrogate and requested policy architectures.")
     train.add_argument("--evidence", required=True)
     train.add_argument("--output", required=True)
-    train.add_argument(
-        "--student-kind", choices=("GICO-det-policy", "GICO-sto-policy", "both"), default="GICO-det-policy"
-    )
-    train.add_argument("--teacher-score-weight", type=float, choices=(0.01, 0.05, 0.1))
-    train.add_argument("--teacher-steps", type=int)
-    train.add_argument("--student-steps", type=int)
+    train.add_argument("--policy-kind", choices=("deterministic", "stochastic", "both"))
+    train.add_argument("--utility-surrogate-only", action="store_true")
+    train.add_argument("--utility-surrogate-steps", type=int)
+    train.add_argument("--policy-steps", type=int)
     train.add_argument("--fitting-profile", help="JSON object of common task-profile overrides.")
     train.add_argument("--seed", type=int)
     train.add_argument("--device", default="cuda")
     train.add_argument("--purpose", choices=("research", "functional"), default="research")
     validate = commands.add_parser("validate", help="Validate a common GICO artifact and its identities.")
     validate.add_argument("--policy", required=True)
-    validate.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy"), default="GICO-det-policy")
+    validate.add_argument("--policy-kind", choices=("deterministic", "stochastic"), default="deterministic")
     materialize = commands.add_parser("materialize", help="Decode a complete clock using the common policy.")
     materialize.add_argument("--policy", required=True)
     materialize.add_argument("--evidence", required=True)
@@ -59,9 +57,7 @@ def build_argparser() -> argparse.ArgumentParser:
     materialize.add_argument(
         "--sample-keys", required=True, help="Comma-separated independent clock request identities."
     )
-    materialize.add_argument(
-        "--student-kind", choices=("GICO-det-policy", "GICO-sto-policy"), default="GICO-det-policy"
-    )
+    materialize.add_argument("--policy-kind", choices=("deterministic", "stochastic"), default="deterministic")
     materialize.add_argument("--nfe", type=int, required=True)
     materialize.add_argument("--clock-seed", type=int, default=0)
     materialize.add_argument("--output", required=True)
@@ -85,6 +81,9 @@ def main(argv=None) -> int:
     elif args.command == "train":
         from genode.gico.training import fit
 
+        if args.utility_surrogate_only and args.policy_kind is not None:
+            raise ValueError("Choose either a policy kind or utility-surrogate-only fitting.")
+
         evidence = _read(args.evidence)
         rows = evidence["rows"]
         if any(row["split"] == "test" for row in rows):
@@ -94,14 +93,14 @@ def main(argv=None) -> int:
         if any(row["task"] not in {"cifar10", "imagenet64"} for row in rows):
             raise ValueError("The image CLI trains only small-image tasks.")
         fitting = _read(args.fitting_profile) if args.fitting_profile else {}
-        for key in ("teacher_steps", "student_steps", "seed", "teacher_score_weight"):
+        for key in ("utility_surrogate_steps", "policy_steps", "seed"):
             if getattr(args, key) is not None:
                 fitting[key] = getattr(args, key)
         result = fit(
             rows,
             evidence["contexts"],
             args.output,
-            student_kind=args.student_kind,
+            policy_kind=None if args.utility_surrogate_only else (args.policy_kind or "deterministic"),
             **fitting,
             device=args.device,
             purpose=args.purpose,
@@ -111,7 +110,7 @@ def main(argv=None) -> int:
     else:
         from genode.gico.policy import load_policy
 
-        policy = load_policy(args.policy, student_kind=args.student_kind)
+        policy = load_policy(args.policy, policy_kind=args.policy_kind)
         if policy.metadata["task"] not in {"cifar10", "imagenet64"}:
             raise ValueError("The image CLI requires a small-image policy.")
         result = {"artifact_sha256": policy.artifact_sha256, "metadata": policy.metadata}
@@ -124,7 +123,7 @@ def main(argv=None) -> int:
                 raise ValueError("Provide one unique nonempty clock sample key per context ID.")
             result = {
                 "artifact_sha256": policy.artifact_sha256,
-                "student_kind": args.student_kind,
+                "policy_kind": args.policy_kind,
                 "nfe": args.nfe,
                 "clock_seed": args.clock_seed,
                 "sample_keys": keys,

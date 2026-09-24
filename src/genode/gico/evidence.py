@@ -96,7 +96,7 @@ def prepare_evidence(
         if row["context_id"] not in contexts:
             raise ValueError(f"Missing native context {row['context_id']!r}.")
         if row["schedule_key"] not in REFERENCE_KEYS:
-            raise ValueError("Teacher evidence must use the declared reference-clock pool.")
+            raise ValueError("UtilitySurrogate evidence must use the declared reference-clock pool.")
     if calibration_rows is not None:
         if any(r["context_id"] in phase_contexts["validation"] for r in calibration_rows):
             raise ValueError("Validation contexts cannot be used to calibrate rewards.")

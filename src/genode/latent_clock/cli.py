@@ -76,7 +76,7 @@ def _prepare_collection(args: argparse.Namespace) -> None:
         method=args.method,
         checkpoint=args.checkpoint,
         freeze_path=args.freeze,
-        student_kind=args.student_kind,
+        policy_kind=args.policy_kind,
         clock_seed=args.clock_seed,
     )
 
@@ -111,8 +111,7 @@ def _fit_gico(args: argparse.Namespace) -> None:
         json.dumps(
             fit_gico(
                 config_path=args.config,
-                student_kind=args.student_kind,
-                teacher_score_weight=args.teacher_score_weight,
+                policy_kind=args.policy_kind,
                 dry_run=args.dry_run,
             )
         )
@@ -176,7 +175,7 @@ def _prepare_geneval(args: argparse.Namespace) -> None:
         nfe=args.nfe,
         checkpoint=args.checkpoint,
         freeze_path=args.freeze,
-        student_kind=args.student_kind,
+        policy_kind=args.policy_kind,
         clock_seed=args.clock_seed,
     )
 
@@ -222,7 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--method", default="support")
     prepare.add_argument("--checkpoint")
     prepare.add_argument("--freeze")
-    prepare.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy"), default="GICO-det-policy")
+    prepare.add_argument("--policy-kind", choices=("deterministic", "stochastic"), default="deterministic")
     prepare.add_argument("--clock-seed", type=int, default=0)
     prepare.set_defaults(run=_prepare_collection)
     collect = commands.add_parser("collect")
@@ -244,8 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     evidence.set_defaults(run=_prepare_gico)
     fit = commands.add_parser("fit-gico")
     fit.add_argument("--config", required=True)
-    fit.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy", "both"))
-    fit.add_argument("--teacher-score-weight", type=float, choices=(0.01, 0.05, 0.1))
+    fit.add_argument("--policy-kind", choices=("deterministic", "stochastic", "both"))
     fit.add_argument("--dry-run", action="store_true")
     fit.set_defaults(run=_fit_gico)
     search = commands.add_parser("fit-search")
@@ -275,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("source", "output", "method", "freeze"):
         geneval.add_argument("--" + name, required=True)
     geneval.add_argument("--checkpoint")
-    geneval.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy"), default="GICO-det-policy")
+    geneval.add_argument("--policy-kind", choices=("deterministic", "stochastic"), default="deterministic")
     geneval.add_argument("--clock-seed", type=int, default=0)
     geneval.add_argument("--nfe", type=int, required=True)
     geneval.set_defaults(run=_prepare_geneval)

@@ -194,7 +194,7 @@ def test_unconditional_cifar_executes_a_content_identified_policy() -> None:
 class _CommonPolicyFixture:
     artifact_sha256 = "a" * 64
 
-    def __init__(self, backbone, student_kind="GICO-sto-policy"):
+    def __init__(self, backbone, policy_kind="stochastic"):
         from genode.backbones.registry import get_image_backbone_spec
         from genode.gico.image_conditional_context import native_contexts
 
@@ -205,29 +205,29 @@ class _CommonPolicyFixture:
             "backbone_binding": binding,
         }
         self.contexts = []
-        self.student_kind = student_kind
+        self.policy_kind = policy_kind
 
     def density(self, context, solver, nfe, *, seed=0, request_id=""):
         from genode.gico.clocks import clock_generator
 
         self.contexts.append(np.asarray(context).copy())
         assert solver == "euler"
-        identity = request_id if self.student_kind == "GICO-sto-policy" else str(np.asarray(context).tolist())
+        identity = request_id if self.policy_kind == "stochastic" else str(np.asarray(context).tolist())
         values = torch.softmax(torch.randn(64, generator=clock_generator(seed, identity)), dim=0)
         mass = values.numpy().astype(np.float64)
         return mass / mass.sum()
 
 
-@pytest.mark.parametrize("student_kind", ["GICO-det-policy", "GICO-sto-policy"])
+@pytest.mark.parametrize("policy_kind", ["deterministic", "stochastic"])
 @pytest.mark.parametrize("clock_seed", [0, 8, 51])
-def test_common_image_measurement_exports_raw_mass_and_exact_decoded_grid(student_kind, clock_seed):
+def test_common_image_measurement_exports_raw_mass_and_exact_decoded_grid(policy_kind, clock_seed):
     from dataclasses import replace
 
     from genode.gico.clocks import materialize, verify_measurement_clock
 
     backbone = _frozen_cifar_backbone(digest="b" * 64)
     sampler = ImageEulerSampler(backbone, device="cpu")
-    policy = _CommonPolicyFixture(backbone, student_kind)
+    policy = _CommonPolicyFixture(backbone, policy_kind)
     schedule = sampler.gico_schedule(
         policy, target_nfe=8, class_labels=None, sample_keys=("first", "second"), clock_seed=clock_seed
     )
@@ -244,7 +244,7 @@ def test_common_image_measurement_exports_raw_mass_and_exact_decoded_grid(studen
     with pytest.raises(ValueError, match="uniform mixture|shared density decoder"):
         replace(schedule, gico_density_mass=schedule.density_mass)
     # Shared deterministic rows also retain raw provenance when collapsed for hashing.
-    if student_kind == "GICO-det-policy":
+    if policy_kind == "deterministic":
         single = replace(
             schedule,
             density_mass=schedule.density_mass[:1],

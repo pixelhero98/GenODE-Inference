@@ -4,10 +4,10 @@ import torch
 
 from genode.gico.clocks import clock_generator
 from genode.gico.evidence import content_hash
+from genode.gico.policy_selection import balanced_mean, select_checkpoint
 from genode.gico.selection import candidate_fingerprint
-from genode.gico.student_selection import balanced_mean, select_checkpoint
 
-STOCHASTIC_SELECTION_PROTOCOL = "heldout_expected_teacher_utility_distribution_kl"
+STOCHASTIC_SELECTION_PROTOCOL = "heldout_expected_utility_surrogate_utility_distribution_kl"
 
 
 def select_stochastic(records, allowance=0.20):
@@ -46,16 +46,18 @@ def distribution_kl(model, condition, references, weights, noise, smoothing):
 
 
 @torch.no_grad()
-def score_stochastic(model, teacher, conditioning, targets, groups, evidence, weights, step, teacher_id, config):
+def score_stochastic(
+    model, utility_surrogate, conditioning, targets, groups, evidence, weights, step, utility_surrogate_id, config
+):
     if (
         model.training
-        or any(m.training for m in teacher.modules())
-        or any(p.requires_grad or p.grad is not None for p in teacher.parameters())
+        or any(m.training for m in utility_surrogate.modules())
+        or any(p.requires_grad or p.grad is not None for p in utility_surrogate.parameters())
     ):
-        raise ValueError("Stochastic selection requires an evaluated policy and frozen teacher.")
+        raise ValueError("Stochastic selection requires an evaluated policy and frozen utility_surrogate.")
     utilities, divergences, identities = [], [], []
     for target, group in zip(targets, groups, strict=True):
-        condition, references, probability, _, _, teacher_condition = target
+        condition, references, probability, _, _, utility_surrogate_condition = target
         row = group[0]
         identity = content_hash([row["context_id"], row["solver"], row["nfe"]])
         generator = clock_generator(config.seed, f"selection-target:{identity}", device=str(condition.device))
@@ -65,7 +67,7 @@ def score_stochastic(model, teacher, conditioning, targets, groups, evidence, we
         )
         generator = clock_generator(config.seed, f"selection-policy:{identity}", device=str(condition.device))
         mass = model.sample(condition.expand(config.selection_clock_replicates, -1), generator=generator)
-        predictions = teacher(teacher_condition.expand(len(mass), -1), mass)
+        predictions = utility_surrogate(utility_surrogate_condition.expand(len(mass), -1), mass)
         utility = (predictions * predictions.new_tensor(weights)).sum(-1).double()
         utility *= evidence.calibrations[row["solver"]].reward_scale
         utilities.append(float(utility.mean()))
@@ -74,8 +76,8 @@ def score_stochastic(model, teacher, conditioning, targets, groups, evidence, we
         "selection_protocol": STOCHASTIC_SELECTION_PROTOCOL,
         "validation_distillation": balanced_mean(divergences, groups, evidence.task),
         "predicted_utility": balanced_mean(utilities, groups, evidence.task),
-        "selection_checkpoint_id": candidate_fingerprint(model, conditioning, "GICO-sto-policy", step),
-        "selection_teacher_fingerprint": teacher_id,
+        "selection_checkpoint_id": candidate_fingerprint(model, conditioning, "stochastic", step),
+        "selection_utility_surrogate_fingerprint": utility_surrogate_id,
         "selection_contexts": sorted({g[0]["context_id"] for g in groups}),
         "selection_groups": len(groups),
         "clock_replicates": config.selection_clock_replicates,

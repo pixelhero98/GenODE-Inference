@@ -117,13 +117,13 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test", con
 
         learned = row["schedule_key"] not in REFERENCE_KEYS and row.get("measurement_role") != "baseline"
         if learned and (
-            row.get("policy_sha256") != policy.artifact_sha256 or row.get("student_kind") != policy.student_kind
+            row.get("policy_sha256") != policy.artifact_sha256 or row.get("policy_kind") != policy.policy_kind
         ):
-            raise ValueError("Report policy identity/student kind is required for learned-policy measurements.")
+            raise ValueError("Report policy identity/policy kind is required for learned-policy measurements.")
         if "policy_sha256" in row and (
-            row["policy_sha256"] != policy.artifact_sha256 or row.get("student_kind") != policy.student_kind
+            row["policy_sha256"] != policy.artifact_sha256 or row.get("policy_kind") != policy.policy_kind
         ):
-            raise ValueError("Report policy identity/student kind differs from the selected artifact.")
+            raise ValueError("Report policy identity/policy kind differs from the selected artifact.")
         if "sample_clocks" in row:
             if "density_mass" in row or "time_grid" in row:
                 raise ValueError("Declare either a fixed clock or sample_clocks, not both.")
@@ -138,7 +138,7 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test", con
         if learned:
             if contexts is None or row["context_id"] not in contexts:
                 raise ValueError("Learned-policy reports require native contexts for executed clock replay.")
-            _check_clock({**row, "schedule_key": "student"}, policy, contexts[row["context_id"]], clock_identities)
+            _check_clock({**row, "schedule_key": "policy"}, policy, contexts[row["context_id"]], clock_identities)
     raw_rows = rows
     rows = collapse_clock_replicates(raw_rows)
     measurements_sha256 = content_hash(raw_rows)
@@ -148,7 +148,7 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test", con
         if subset:
             for row in construct_rewards(subset, RewardCalibration.from_payload(calibration), varying_clocks=True):
                 learned = row["schedule_key"] not in REFERENCE_KEYS and row.get("measurement_role") != "baseline"
-                schedule = policy.student_kind if learned else row["schedule_key"]
+                schedule = policy.policy_kind if learned else row["schedule_key"]
                 groups[(solver, row["nfe"], schedule)].append(row)
     output = []
     for (solver, nfe, schedule), cells in sorted(groups.items()):
@@ -189,7 +189,7 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test", con
         )
     return {
         "artifact_sha256": policy.artifact_sha256,
-        "student_kind": policy.student_kind,
+        "policy_kind": policy.policy_kind,
         "measurements_sha256": measurements_sha256,
         "split": split,
         "results": output,
@@ -203,14 +203,14 @@ def summarize_measurements(rows: list[dict], policy, *, split: str = "test", con
 def report_main(*, default_split: str) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", required=True)
-    parser.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy"), required=True)
+    parser.add_argument("--policy-kind", choices=("deterministic", "stochastic"), required=True)
     parser.add_argument("--rows", required=True, help="Paired JSONL terminal measurements, including uniform anchors.")
     parser.add_argument("--contexts", help="Native context NPZ required for learned-policy clock replay.")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     report = summarize_measurements(
         read_rows(args.rows),
-        load_policy(args.artifact, student_kind=args.student_kind),
+        load_policy(args.artifact, policy_kind=args.policy_kind),
         split=default_split,
         contexts=load_context_embedding_table(args.contexts) if args.contexts else None,
     )

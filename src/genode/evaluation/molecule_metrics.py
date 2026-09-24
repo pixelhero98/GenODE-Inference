@@ -259,7 +259,7 @@ def _sample_molecule_ar_rollout(
                     "clock_request_id": clock_request_id,
                     "generation_seed": seed,
                     "policy_sha256": policy.artifact_sha256,
-                    "student_kind": policy.student_kind,
+                    "policy_kind": policy.policy_kind,
                     "solver": solver,
                     "nfe_per_horizon": target_nfe,
                     "trajectory_nfe": target_nfe * rollout_steps,

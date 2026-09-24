@@ -19,7 +19,7 @@ from genode.gico.collection import (
 )
 from genode.gico.deterministic_selection import select_deterministic
 from genode.gico.evidence import prepare_evidence
-from genode.gico.networks import DensityTeacher, ModelConfig, StochasticStudent
+from genode.gico.networks import ModelConfig, StochasticPolicy, UtilitySurrogate
 from genode.gico.profiles import TrainingConfig
 from genode.gico.stochastic_selection import distribution_kl, score_stochastic, select_stochastic
 
@@ -85,7 +85,7 @@ def test_manifest_semantics_cannot_be_bypassed_by_rehashing(mutation):
         validate_collection(manifest)
 
 
-def test_sparse_students_use_full_support_without_measurement_calls(monkeypatch):
+def test_sparse_policies_use_full_support_without_measurement_calls(monkeypatch):
     from genode.gico import evaluators, task_evaluators, training
 
     rows, contexts, manifest = sparse_evidence()
@@ -95,7 +95,7 @@ def test_sparse_students_use_full_support_without_measurement_calls(monkeypatch)
     seen = []
 
     def no_optimizer(model, optimizer, groups, loss_fn, **kwargs):
-        if isinstance(model, DensityTeacher):
+        if isinstance(model, UtilitySurrogate):
             for _, masses, _, _ in groups:
                 assert not {density_identity(m.tolist()) for m in masses} & set(evidence.density_holdout["euler:4"])
         else:
@@ -111,16 +111,16 @@ def test_sparse_students_use_full_support_without_measurement_calls(monkeypatch)
     monkeypatch.setattr(evaluators, "execute_request", forbidden)
     monkeypatch.setattr(task_evaluators, "load_task_evaluator", forbidden)
     monkeypatch.setattr(evaluators, "build_collector", forbidden)
-    teacher, students, history = training.fit_models(
+    utility_surrogate, policies, history = training.fit_models(
         evidence,
-        replace(TrainingConfig(), teacher_steps=1, student_steps=1, stochastic_likelihood_samples=2),
-        student_kind="both",
+        replace(TrainingConfig(), utility_surrogate_steps=1, policy_steps=1, stochastic_likelihood_samples=2),
+        policy_kind="both",
         device="cpu",
     )
-    assert set(seen) == {"DeterministicStudent", "StochasticStudent"}
-    assert all(p.grad is None and not p.requires_grad for p in teacher.parameters())
-    assert history["teacher_selection"]["density_regret"] is not None
-    assert len(students) == 2
+    assert set(seen) == {"DeterministicPolicy", "StochasticPolicy"}
+    assert all(p.grad is None and not p.requires_grad for p in utility_surrogate.parameters())
+    assert history["utility_surrogate_selection"]["density_regret"] is not None
+    assert len(policies) == 2
 
 
 def test_policy_gates_use_final_minimum_and_earlier_ties():
@@ -205,17 +205,35 @@ def test_stochastic_selection_is_replayable_and_rng_isolated():
         None
     ].float()
     config = ModelConfig(evidence.conditioning.width, 2)
-    model = StochasticStudent(config).eval()
-    teacher = DensityTeacher(config).eval().requires_grad_(False)
+    model = StochasticPolicy(config).eval()
+    utility_surrogate = UtilitySurrogate(config).eval().requires_grad_(False)
     mass = torch.tensor([r["density_mass"] for r in group], dtype=torch.double)
     target = (condition, mass, torch.ones(len(mass)) / len(mass), torch.tensor(0), torch.tensor(1), condition)
     profile = TrainingConfig()
     torch_state, np_state, py_state = torch.random.get_rng_state(), np.random.get_state(), random.getstate()
     first = score_stochastic(
-        model, teacher, evidence.conditioning, [target], [group], evidence, [0.5, 0.5], 100, "teacher", profile
+        model,
+        utility_surrogate,
+        evidence.conditioning,
+        [target],
+        [group],
+        evidence,
+        [0.5, 0.5],
+        100,
+        "utility_surrogate",
+        profile,
     )
     second = score_stochastic(
-        model, teacher, evidence.conditioning, [target], [group], evidence, [0.5, 0.5], 100, "teacher", profile
+        model,
+        utility_surrogate,
+        evidence.conditioning,
+        [target],
+        [group],
+        evidence,
+        [0.5, 0.5],
+        100,
+        "utility_surrogate",
+        profile,
     )
     assert first == second
     assert first["clock_replicates"] == 4 and first["kl_samples_per_reference"] == 32

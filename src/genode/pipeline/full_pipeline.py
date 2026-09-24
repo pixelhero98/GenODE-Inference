@@ -202,10 +202,8 @@ def _build_stage_commands(args: argparse.Namespace, run_root: Path) -> list[Stag
                     [
                         "--config",
                         config_path,
-                        "--student-kind",
-                        args.student_kind,
-                        "--teacher-score-weight",
-                        args.teacher_score_weight,
+                        "--policy-kind",
+                        args.policy_kind,
                     ],
                 )
             ]
@@ -292,8 +290,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--molecule_backbone_root", default=str(project_outputs_root() / "molecule_3d_backbones"))
     parser.add_argument("--use_provided_backbones", action="store_true")
     parser.add_argument("--gico-config", default="")
-    parser.add_argument("--student-kind", choices=("GICO-det-policy", "GICO-sto-policy", "both"), default="both")
-    parser.add_argument("--teacher-score-weight", type=float, choices=(0.01, 0.05, 0.1), default=0.01)
+    parser.add_argument("--policy-kind", choices=("deterministic", "stochastic", "both"), default="both")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")

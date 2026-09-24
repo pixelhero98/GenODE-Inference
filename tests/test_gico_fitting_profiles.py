@@ -7,15 +7,15 @@ import numpy as np
 import pytest
 import torch
 
-from genode.gico.networks import DensityTeacher, DeterministicStudent, ModelConfig, StochasticStudent
+from genode.gico.networks import DeterministicPolicy, ModelConfig, StochasticPolicy, UtilitySurrogate
 from genode.gico.profiles import resolve_profile
 from genode.gico.rewards import MOLECULE_METRICS, RewardCalibration
 from genode.gico.training import (
     accumulated_step,
+    policy_losses,
     sample_groups,
     scalarize,
     selection_key,
-    student_losses,
     utility_regret,
 )
 
@@ -31,16 +31,16 @@ def cpu_threads():
 def test_profiles_preserve_task_settings_and_reject_obsolete_options():
     for task in ("sana", "sd15", "weather_daily", "molecule_3d_set1"):
         p = resolve_profile(task)
-        assert p.teacher_steps == p.student_steps == 2000 and p.dropout == 0.01
-        assert p.teacher_batch_groups == 64 and p.student_batch_contexts == 512
-        assert p.teacher_learning_rate == p.student_learning_rate == 0.001
-        assert p.teacher_score_weight == (0.05 if task in ("sana", "sd15") else 0.01)
+        assert p.utility_surrogate_steps == p.policy_steps == 2000 and p.dropout == 0.01
+        assert p.utility_surrogate_batch_groups == 64 and p.policy_batch_contexts == 512
+        assert p.utility_surrogate_learning_rate == p.policy_learning_rate == 0.001
+        assert p.refinement_weight == 0.05
     for task in ("cifar10", "imagenet64"):
         p = resolve_profile(task)
-        assert p.student_steps == 2000 and p.dropout == 0 and p.student_learning_rate == 0.001
+        assert p.policy_steps == 2000 and p.dropout == 0 and p.policy_learning_rate == 0.001
     with pytest.raises(ValueError, match="Unknown fitting"):
         resolve_profile("sana", steps=500)
-    p = resolve_profile("sana", teacher_learning_rate=0.002, student_steps=600)
+    p = resolve_profile("sana", utility_surrogate_learning_rate=0.002, policy_steps=600)
     assert resolve_profile("sana", **asdict(p)) == p
 
 
@@ -138,31 +138,31 @@ def test_molecular_scalarization_is_weighted_log_improvement():
     assert RewardCalibration.from_payload(calibration.to_payload()) == calibration
 
 
-@pytest.mark.parametrize("kind", ("GICO-det-policy", "GICO-sto-policy"))
-@pytest.mark.parametrize("coefficient", (0.01, 0.05, 0.1))
-def test_actual_student_objective_score_term_has_gradients_without_teacher_updates(kind, coefficient):
+@pytest.mark.parametrize("kind", ("deterministic", "stochastic"))
+@pytest.mark.parametrize("coefficient", (0.05,))
+def test_actual_policy_objective_score_term_has_gradients_without_utility_surrogate_updates(kind, coefficient):
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(8)
         architecture = ModelConfig(5, 2, dropout=0.05)
-        teacher = DensityTeacher(architecture).eval().requires_grad_(False)
+        utility_surrogate = UtilitySurrogate(architecture).eval().requires_grad_(False)
         model = (
-            DeterministicStudent(architecture) if kind == "GICO-det-policy" else StochasticStudent(architecture)
+            DeterministicPolicy(architecture) if kind == "deterministic" else StochasticPolicy(architecture)
         ).eval()
     context = torch.zeros(1, 5)
     refs = torch.softmax(torch.stack((torch.linspace(-1, 1, 64), torch.linspace(1, -1, 64))), -1).double()
     with torch.no_grad():
-        scores = scalarize(teacher(context.expand(2, -1), refs))
+        scores = scalarize(utility_surrogate(context.expand(2, -1), refs))
     groups = [(context, refs, torch.tensor([0.4, 0.6], dtype=torch.float64), scores.mean(), torch.tensor(1.0), context)]
-    original = deepcopy(teacher.state_dict())
+    original = deepcopy(utility_surrogate.state_dict())
     config = resolve_profile("sana", stochastic_likelihood_samples=2, stochastic_score_samples=1)
     values = []
     for beta in (0, coefficient):
         model.zero_grad(set_to_none=True)
-        value = student_losses(
+        value = policy_losses(
             groups,
             model=model,
             kind=kind,
-            teacher=teacher,
+            utility_surrogate=utility_surrogate,
             config=config,
             weights=(0.5, 0.5),
             coefficient=beta,
@@ -173,14 +173,14 @@ def test_actual_student_objective_score_term_has_gradients_without_teacher_updat
         values.append(torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]))
     difference = values[1] - values[0]
     assert torch.isfinite(difference).all() and difference.abs().max() > 0
-    assert all(p.grad is None for p in teacher.parameters())
+    assert all(p.grad is None for p in utility_surrogate.parameters())
     for key in original:
-        torch.testing.assert_close(original[key], teacher.state_dict()[key], atol=0, rtol=0)
+        torch.testing.assert_close(original[key], utility_surrogate.state_dict()[key], atol=0, rtol=0)
 
 
 def test_dropout_is_disabled_for_deterministic_and_replayable_stochastic_inference():
     config = ModelConfig(5, 2, dropout=0.05)
-    model = DeterministicStudent(config)
+    model = DeterministicPolicy(config)
     # Unzero output so hidden dropout affects visible predictions.
     torch.nn.init.normal_(model.output.weight, std=0.01)
     context = torch.zeros(1, 5)
@@ -188,7 +188,7 @@ def test_dropout_is_disabled_for_deterministic_and_replayable_stochastic_inferen
     assert not torch.equal(model(context), model(context))
     model.eval()
     torch.testing.assert_close(model(context), model(context), atol=0, rtol=0)
-    stochastic = StochasticStudent(config).eval()
+    stochastic = StochasticPolicy(config).eval()
     a = stochastic.sample(context, generator=torch.Generator().manual_seed(12))
     b = stochastic.sample(context, generator=torch.Generator().manual_seed(12))
     torch.testing.assert_close(a, b, atol=0, rtol=0)
@@ -214,17 +214,17 @@ def test_global_conditioning_preserves_settings_and_zeroes_only_context():
     assert Conditioning.from_payload(global_condition.to_payload()).context_mode == "global"
     with pytest.raises(ValueError, match="width"):
         global_condition.transform([1], "euler", 4)
-    model = DeterministicStudent(ModelConfig(len(a), 2, dropout=0.05)).eval()
+    model = DeterministicPolicy(ModelConfig(len(a), 2, dropout=0.05)).eval()
     torch.testing.assert_close(model(torch.tensor(a[None])), model(torch.tensor(b[None])), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
     "option,value",
     [
-        ("teacher_context_mode", "unknown"),
-        ("student_context_mode", "unknown"),
+        ("utility_surrogate_context_mode", "unknown"),
+        ("policy_context_mode", "unknown"),
         ("width", 64),
-        ("teacher_density_normalization", "training_reference"),
+        ("utility_surrogate_density_normalization", "training_reference"),
     ],
 )
 def test_ablation_profiles_reject_unknown_semantics(option, value):
@@ -239,70 +239,64 @@ def test_rope_and_causal_parameters_match_every_prefix():
     x = torch.randn(2, 4, 64, 32)
     for length in (1, 2, 17, 63):
         torch.testing.assert_close(density_rope(x[..., :length, :]), density_rope(x)[..., :length, :], atol=0, rtol=0)
-    student = StochasticStudent(ModelConfig(5, 2, dropout=0.05)).eval()
-    torch.nn.init.normal_(student.output.weight, std=0.03)
+    policy = StochasticPolicy(ModelConfig(5, 2, dropout=0.05)).eval()
+    torch.nn.init.normal_(policy.output.weight, std=0.03)
     condition, ratios = torch.randn(2, 5), torch.randn(2, 63)
-    full_mean, full_std = student.conditional_parameters(condition, ratios)
+    full_mean, full_std = policy.conditional_parameters(condition, ratios)
     for length in (1, 2, 17, 63):
         shifted = torch.cat((torch.zeros(2, 1), ratios[:, : length - 1]), 1)
-        mean, std = student._distribution_head(condition, shifted)
+        mean, std = policy._distribution_head(condition, shifted)
         torch.testing.assert_close(mean, full_mean[:, :length], atol=2e-6, rtol=1e-5)
         torch.testing.assert_close(std, full_std[:, :length], atol=2e-6, rtol=1e-5)
 
 
-@pytest.mark.parametrize("kind", ("GICO-det-policy", "GICO-sto-policy"))
-def test_global_student_score_chasing_keeps_original_teacher_contexts(kind):
+@pytest.mark.parametrize("kind", ("deterministic", "stochastic"))
+def test_global_policy_score_chasing_keeps_original_utility_surrogate_contexts(kind):
     from unittest.mock import patch
 
     torch.manual_seed(43)
     config = resolve_profile(
         "sana",
-        teacher_context_mode="native",
-        student_context_mode="global",
+        utility_surrogate_context_mode="native",
+        policy_context_mode="global",
         stochastic_likelihood_samples=2,
         stochastic_score_samples=2,
     )
     architecture = ModelConfig(5, 2)
-    teacher = DensityTeacher(architecture).eval().requires_grad_(False)
-    model = (
-        DeterministicStudent(architecture) if kind == "GICO-det-policy" else StochasticStudent(architecture)
-    ).eval()
-    teacher_contexts = torch.tensor([[1.0, 2.0, 0.0, 0.0, 1.0], [3.0, -4.0, 0.0, 0.0, 1.0]])
-    student_context = torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0]])
+    utility_surrogate = UtilitySurrogate(architecture).eval().requires_grad_(False)
+    model = (DeterministicPolicy(architecture) if kind == "deterministic" else StochasticPolicy(architecture)).eval()
+    utility_surrogate_contexts = torch.tensor([[1.0, 2.0, 0.0, 0.0, 1.0], [3.0, -4.0, 0.0, 0.0, 1.0]])
+    policy_context = torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0]])
     refs = torch.softmax(torch.randn(2, 64), -1).double()
     groups = [
-        (student_context, refs, torch.tensor([0.4, 0.6]), torch.tensor(0.0), torch.tensor(1.0), c[None])
-        for c in teacher_contexts
+        (policy_context, refs, torch.tensor([0.4, 0.6]), torch.tensor(0.0), torch.tensor(1.0), c[None])
+        for c in utility_surrogate_contexts
     ]
-    with patch.object(teacher, "forward", wraps=teacher.forward) as observed:
-        losses = student_losses(
+    with patch.object(utility_surrogate, "forward", wraps=utility_surrogate.forward) as observed:
+        losses = policy_losses(
             groups,
             model=model,
             kind=kind,
-            teacher=teacher,
+            utility_surrogate=utility_surrogate,
             config=config,
             weights=(0.5, 0.5),
             coefficient=0.05,
             generator=torch.Generator().manual_seed(1),
             score_rng=torch.Generator().manual_seed(2),
         )
-    expected = teacher_contexts if kind == "GICO-det-policy" else teacher_contexts.repeat_interleave(2, 0)
+    expected = (
+        utility_surrogate_contexts if kind == "deterministic" else utility_surrogate_contexts.repeat_interleave(2, 0)
+    )
     torch.testing.assert_close(observed.call_args.args[0], expected, atol=0, rtol=0)
     assert losses.shape == (2,)
     losses.mean().backward()
     assert any(p.grad is not None and p.grad.abs().max() > 0 for p in model.parameters())
-    assert all(p.grad is None for p in teacher.parameters())
+    assert all(p.grad is None for p in utility_surrogate.parameters())
 
 
 def test_backbone_specific_parameters_are_not_shared():
-    a = resolve_profile(
-        "sana", backbone="checkpoint-a", teacher_score_weight=0.05, temperatures=(0.025,), preferred_temperature=0.025
-    )
-    b = resolve_profile(
-        "sana", backbone="checkpoint-b", teacher_score_weight=0.1, temperatures=(0.1,), preferred_temperature=0.1
-    )
-    assert (
-        a.backbone != b.backbone
-        and a.temperatures != b.temperatures
-        and a.teacher_score_weight != b.teacher_score_weight
-    )
+    a = resolve_profile("sana", backbone="checkpoint-a", refinement_weight=0.05, seed=1)
+    b = resolve_profile("sana", backbone="checkpoint-b", refinement_weight=0.05, seed=2)
+    assert a.backbone != b.backbone and a.seed != b.seed
+    assert a.refinement_weight == b.refinement_weight == 0.05
+    assert a.temperatures == b.temperatures == (0.05, 0.1, 0.5)

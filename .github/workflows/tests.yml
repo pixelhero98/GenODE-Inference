@@ -111,6 +111,10 @@ jobs:
               "tests/test_ptg_" + "observed_gain_figure.py",
           )
           content_patterns = {
+              "repository self-link": re.compile(
+                  rb"github[.]com/[^/\s]+/" rb"GenODE[-]Inference", re.IGNORECASE
+              ),
+              "personal email": re.compile(rb"[\w.+-]+@[\w.-]+[.][A-Za-z]{2,}"),
               "private filesystem path": re.compile(
                   rb"/(?:scr" rb"atch|pro" rb"jects|ho" rb"me)/[^\s\"']+|"
                   rb"[A-Z]:[/\\]Us" rb"ers[/\\][^\s\"']+",
@@ -179,7 +183,7 @@ jobs:
                   "genode/gico/conditioning.py",
                   "genode/gico/collection.py",
                   "genode/gico/stochastic_selection.py",
-                  "genode/gico/student_selection.py",
+                  "genode/gico/policy_selection.py",
                   "genode/gico/evaluators.py",
                   "genode/gico/task_evaluators.py",
                   "genode/gico/image_evaluator.py",
@@ -270,5 +274,5 @@ jobs:
           "$SDIST_PYTHON" -m pytest -q \
             tests/test_image_gico_cli.py \
             tests/test_image_gico_supervision.py \
-            tests/test_student_utility_selection.py
+            tests/test_policy_utility_selection.py
           "$RUNNER_TEMP/genode-sdist-venv/bin/genode-image-gico" --help

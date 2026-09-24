@@ -57,8 +57,8 @@ class CanonicalSeenUnseenLayoutTests(unittest.TestCase):
     def test_gico_parser_preserves_config_defaults(self) -> None:
         args = build_gico_argparser().parse_args(["--config", "training.json"])
         self.assertEqual(args.config, "training.json")
-        self.assertIsNone(args.student_kind)
-        self.assertIsNone(args.teacher_score_weight)
+        self.assertIsNone(args.policy_kind)
+        self.assertFalse(args.utility_surrogate_only)
         self.assertFalse(args.dry_run)
 
     def test_solver_protocol_is_canonical_and_aliases_do_not_persist(self) -> None:

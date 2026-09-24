@@ -11,13 +11,13 @@ def evaluator_for(rows, contexts, *, factor=0.9, replicates=4):
         for anchor in rows:
             if anchor["split"] != "validation" or anchor["schedule_key"] != "uniform":
                 continue
-            count = replicates if candidate.student_kind == "GICO-sto-policy" else 1
+            count = replicates if candidate.policy_kind == "stochastic" else 1
             for rep in range(count):
                 uniform = deepcopy(anchor)
                 uniform["clock_replicate"] = rep
-                student = deepcopy(uniform)
-                student.update(schedule_key="student", selection_checkpoint_id=candidate.checkpoint_id)
-                student["metrics"] = {k: v * factor for k, v in anchor["metrics"].items()}
+                policy = deepcopy(uniform)
+                policy.update(schedule_key="policy", selection_checkpoint_id=candidate.checkpoint_id)
+                policy["metrics"] = {k: v * factor for k, v in anchor["metrics"].items()}
                 clocks = []
                 for member in range(anchor["ensemble_size"]):
                     request = (
@@ -34,29 +34,31 @@ def evaluator_for(rows, contexts, *, factor=0.9, replicates=4):
                             "clock_request_id": request,
                         }
                     )
-                if candidate.student_kind == "GICO-sto-policy" and anchor["ensemble_size"] > 1:
-                    student.pop("density_mass")
-                    student.pop("time_grid")
-                    student["sample_clocks"] = clocks
+                if candidate.policy_kind == "stochastic" and anchor["ensemble_size"] > 1:
+                    policy.pop("density_mass")
+                    policy.pop("time_grid")
+                    policy["sample_clocks"] = clocks
                 else:
-                    student.update(clocks[0])
-                measured.extend((uniform, student))
+                    policy.update(clocks[0])
+                measured.extend((uniform, policy))
         return measured
 
     return evaluate
 
 
-def fixture_history(students, evidence, rows, contexts, *, teacher, conditioning=None, step=2000, coefficient=0.01):
+def fixture_history(
+    policies, evidence, rows, contexts, *, utility_surrogate, conditioning=None, step=2000, coefficient=0.05
+):
     """Synthetic complete checkpoint records for artifact-only tests."""
     from genode.gico.deterministic_selection import DETERMINISTIC_SELECTION_PROTOCOL
     from genode.gico.evidence import content_hash
-    from genode.gico.selection import candidate_fingerprint, teacher_fingerprint
+    from genode.gico.selection import candidate_fingerprint, utility_surrogate_fingerprint
     from genode.gico.stochastic_selection import STOCHASTIC_SELECTION_PROTOCOL
     from genode.gico.training import score_coefficient
 
     selected, histories = {}, {}
-    for kind, model in students.items():
-        cadence = 10 if kind == "GICO-det-policy" else 100
+    for kind, model in policies.items():
+        cadence = 10 if kind == "deterministic" else 100
         history = []
         for checkpoint in range(cadence, step + 1, cadence):
             record = {
@@ -67,13 +69,15 @@ def fixture_history(students, evidence, rows, contexts, *, teacher, conditioning
             if record["coefficient"] > 0:
                 record.update(
                     selection_protocol=DETERMINISTIC_SELECTION_PROTOCOL
-                    if kind == "GICO-det-policy"
+                    if kind == "deterministic"
                     else STOCHASTIC_SELECTION_PROTOCOL,
                     predicted_utility=checkpoint / step,
                     selection_checkpoint_id=candidate_fingerprint(
                         model, conditioning or evidence.conditioning, kind, checkpoint
                     ),
-                    selection_teacher_fingerprint=teacher_fingerprint(teacher, evidence.conditioning, 20, 0.05),
+                    selection_utility_surrogate_fingerprint=utility_surrogate_fingerprint(
+                        utility_surrogate, evidence.conditioning, 20, 0.05
+                    ),
                     selection_contexts=sorted({r["context_id"] for r in rows if r["split"] == "validation"}),
                     selection_groups=len(evidence.groups("validation")),
                     predictions_sha256=content_hash([kind, checkpoint]),
@@ -82,4 +86,4 @@ def fixture_history(students, evidence, rows, contexts, *, teacher, conditioning
                 )
             history.append(record)
         histories[kind], selected[kind] = history, history[-1]
-    return {"students": histories, "student_selection": selected}
+    return {"policies": histories, "policy_selection": selected}

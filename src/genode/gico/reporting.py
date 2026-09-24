@@ -27,7 +27,7 @@ class PolicyCandidate:
 
     model: torch.nn.Module
     conditioning: Conditioning
-    student_kind: str
+    policy_kind: str
     step: int
     coefficient: float
     checkpoint_id: str
@@ -35,7 +35,7 @@ class PolicyCandidate:
     def density(self, context, solver, nfe, *, seed=0, request_id=""):
         from genode.gico.policy import sample_density
 
-        return sample_density(self.model, self.conditioning, self.student_kind, context, solver, nfe, seed, request_id)
+        return sample_density(self.model, self.conditioning, self.policy_kind, context, solver, nfe, seed, request_id)
 
     def materialize(self, context, solver, nfe, *, seed=0, request_id=""):
         return materialize(self.density(context, solver, nfe, seed=seed, request_id=request_id), solver, nfe)
@@ -43,8 +43,8 @@ class PolicyCandidate:
 
 def _check_clock(row, candidate, context, identities):
     if (
-        row["schedule_key"] == "student"
-        and candidate.student_kind == "GICO-sto-policy"
+        row["schedule_key"] == "policy"
+        and candidate.policy_kind == "stochastic"
         and row["ensemble_size"] > 1
         and "sample_clocks" not in row
     ):
@@ -57,11 +57,11 @@ def _check_clock(row, candidate, context, identities):
         if row["schedule_key"] == "uniform":
             expected = np.full(64, 1 / 64)
         else:
-            if candidate.student_kind == "GICO-sto-policy" and (
+            if candidate.policy_kind == "stochastic" and (
                 type(clock.get("clock_seed")) is not int or not clock.get("clock_request_id")
             ):
                 raise ValueError("Stochastic selection requires replayable, independent clock RNG identities.")
-            if candidate.student_kind == "GICO-sto-policy":
+            if candidate.policy_kind == "stochastic":
                 identity = (
                     clock["clock_seed"],
                     clock["clock_request_id"],
@@ -87,7 +87,7 @@ def measured_utility(
 ) -> dict:
     """Pair first, average repeated metrics, then apply the frozen task calibration."""
     if not rows or any(row.get("split") != "validation" for row in rows):
-        raise ValueError("Student selection accepts held-out validation measurements only.")
+        raise ValueError("Policy selection accepts held-out validation measurements only.")
     validate_image_rows(rows)
     expected = {
         (group[0]["context_id"], group[0]["solver"], group[0]["nfe"]): next(
@@ -95,7 +95,7 @@ def measured_utility(
         )
         for group in evidence.groups("validation")
     }
-    count = clock_replicates if candidate.student_kind == "GICO-sto-policy" else 1
+    count = clock_replicates if candidate.policy_kind == "stochastic" else 1
     measurements = defaultdict(dict)
     identities = set()
     for row in rows:
@@ -110,10 +110,10 @@ def measured_utility(
             raise ValueError("Selection error metrics must be nonnegative before repeat averaging.")
         if type(row.get("seed")) is not int:
             raise ValueError("Selection generation seed must be an integer.")
-        if row["schedule_key"] not in ("uniform", "student"):
-            raise ValueError("Selection requires exactly student and uniform measurements.")
-        if row["schedule_key"] == "student" and row.get("selection_checkpoint_id") != candidate.checkpoint_id:
-            raise ValueError("Selection measurement refers to a different student checkpoint.")
+        if row["schedule_key"] not in ("uniform", "policy"):
+            raise ValueError("Selection requires exactly policy and uniform measurements.")
+        if row["schedule_key"] == "policy" and row.get("selection_checkpoint_id") != candidate.checkpoint_id:
+            raise ValueError("Selection measurement refers to a different policy checkpoint.")
         for field in (
             "task",
             "backbone",
@@ -144,16 +144,16 @@ def measured_utility(
     for key, panel in measurements.items():
         anchor = expected[key]
         support = {
-            (kind, seed, rep) for kind in ("uniform", "student") for seed in anchor["seeds"] for rep in range(count)
+            (kind, seed, rep) for kind in ("uniform", "policy") for seed in anchor["seeds"] for rep in range(count)
         }
         if set(panel) != support:
-            raise ValueError("Student and uniform seed/clock replicate panels are incomplete.")
+            raise ValueError("Policy and uniform seed/clock replicate panels are incomplete.")
         metric_keys = evidence.calibrations[key[1]].metric_keys
         for seed in anchor["seeds"]:
             uniform = [panel["uniform", seed, rep] for rep in range(count)]
             if any(row["metrics"] != uniform[0]["metrics"] for row in uniform[1:]):
                 raise ValueError("Uniform measurements changed between clock-only replicates.")
-            for kind in ("uniform", "student"):
+            for kind in ("uniform", "policy"):
                 repeated = [panel[kind, seed, rep] for rep in range(count)]
                 collapsed.append(
                     {
@@ -176,7 +176,7 @@ def measured_utility(
             for row in construct_rewards(
                 [r for r in collapsed if r["solver"] == solver], calibration, varying_clocks=True
             )
-            if row["schedule_key"] == "student"
+            if row["schedule_key"] == "policy"
         )
     settings = defaultdict(list)
     for cell in cells:
@@ -192,7 +192,7 @@ def measured_utility(
             utilities.append(float(np.mean([cell["reward"] for cell in group])))
     utility = float(np.mean(utilities))
     if not np.isfinite(utility):
-        raise ValueError("Nonfinite held-out student utility.")
+        raise ValueError("Nonfinite held-out policy utility.")
     return {
         "utility": utility,
         "selection_protocol": REPORT_PROTOCOL,
@@ -201,7 +201,7 @@ def measured_utility(
         "selection_contexts": sorted({key[0] for key in expected}),
         "selection_groups": len(expected),
         "clock_replicates": count,
-        "candidate_trajectories": sum(r["ensemble_size"] for r in rows if r["schedule_key"] == "student"),
+        "candidate_trajectories": sum(r["ensemble_size"] for r in rows if r["schedule_key"] == "policy"),
     }
 
 
