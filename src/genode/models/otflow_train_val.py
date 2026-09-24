@@ -485,12 +485,18 @@ def train_loop(
         scaler.scale(loss_for_backward).backward()
         if micro_step % accum_steps != 0:
             continue
-        opt_step += 1
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        scale_before = scaler.get_scale()
         scaler.step(opt)
         scaler.update()
+        step_succeeded = scaler.get_scale() >= scale_before
         opt.zero_grad(set_to_none=True)
+        if not step_succeeded:
+            # AMP may skip an update when gradients overflow. Such a batch must
+            # not consume an exact-budget checkpoint step or advance its schedule.
+            continue
+        opt_step += 1
         if scheduler is not None:
             scheduler.step()
         if ema is not None:
