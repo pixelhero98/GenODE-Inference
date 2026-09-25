@@ -270,6 +270,11 @@ class OTFlowCoreCleanupTest(unittest.TestCase):
             loaded, loaded_cfg = load_checkpoint_model(ckpt_path, torch.device("cpu"))
         self.assertIsInstance(loaded, OTFlow)
         self.assertFalse(hasattr(loaded_cfg.model, "baseline_latent_dim"))
+        self.assertFalse(loaded.training)
+        self.assertFalse(loaded.backbone.context_encoder.training)
+        self.assertTrue(
+            all(not parameter.requires_grad and parameter.grad is None for parameter in loaded.parameters())
+        )
 
 
 if __name__ == "__main__":

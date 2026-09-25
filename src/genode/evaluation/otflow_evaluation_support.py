@@ -601,7 +601,7 @@ def load_checkpoint_model(ckpt_path: Path, device: torch.device) -> tuple[OTFlow
         raise RuntimeError(
             f"Checkpoint model_state is incompatible: missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}"
         )
-    model.eval()
+    model.eval().requires_grad_(False)
     return (model, cfg)
 
 
